@@ -1,42 +1,174 @@
-// API root resolution and the bootstrap/fallback loader.
+// The canonical browser client: root resolution, the shared transport, paging, and the
+// routes every pane is built on (T23 migration of the H4/R4/R6/R8 suites).
 //
-// H4: the UI must work against the canonical service root /v1/harness (bootstrap
-// document at GET root) and the standalone /api root (root is a 404, individual
-// routes are the source). The root is chosen at runtime and validated: a query
-// override may not smuggle a scheme, credentials, query string or fragment into
-// every request URL.
+// WHAT CHANGED WITH THE CANONICAL CONTRACT (and why each old expectation moved)
+//   - `API_ROOT` defaults to `/v1/harness` (../shared/harness-api.ts:39). The legacy `/api`
+//     mount is gone from the client: standalone and gateway-mounted deployments answer the
+//     SAME path, so there is no per-mount root and no root-404 fallback chain.
+//   - `getBootstrap()` (one document at the root) is gone. `loadBootstrap()` now COMPOSES
+//     six bounded reads — `GET /`, `/config`, `/harnesses?limit=25`, `/tools?limit=25`,
+//     `/agents?limit=25`, `/sessions?limit=25` — so booting against 100 sessions costs the
+//     same bytes as against one (./api.ts:1287).
+//   - `enqueueTask` → `submitTask`, which answers a `TaskReceipt`, not `{ session, turn }`.
+//   - `observeSession` (SSE `GET /sessions/:id/events`) is gone: realtime lives in
+//     ./stream.ts over the `harness.v1` WebSocket, pinned in ./stream.test.ts. What stays
+//     in THIS file is the socket's URL derivation, because it must follow the same resolved
+//     root as every REST call.
+//   - Deletes and cancels answer receipts. `deleteHarness` reports `undefined` for an
+//     unknown name ("already gone" is the end state) instead of the legacy boolean.
 //
-// Run: npx vitest run --config src/frontend/vitest.config.ts
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+// WHAT THIS FILE STILL OWNS UNCHANGED: the credential-root resolution and trust rule (a
+// runtime root may only name the page's own origin or a loopback host, because the saved
+// provider key is posted there), the header/error/accept semantics of the transport, and
+// the encoding of every id that is user data.
+//
+// Run: npx vitest run --config src/frontend/vitest.config.ts api.test.ts
+
+import { HARNESS_PAGE_LIMIT, HARNESS_ROUTES } from '../shared/harness-api';
+import type { GlobalConfigDocument, HarnessCard, ServiceInfo, ToolSummary, AgentSummary, SessionSummary } from '../shared/harness-api';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { normalizeApiRoot } from './api';
 
-const descriptor = {
-    name: 'demo',
-    title: 'Demo',
-    description: 'demo preset',
-    requiresEndpoint: false,
-    agents: ['writer'],
-    tools: []
-};
-
-const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
-
-const session = {
-    id: 's1',
-    harness: 'demo',
-    status: 'idle' as const,
-    model: 'm1',
-    createdAt: 1,
-    updatedAt: 2,
-    messages: [],
-    turns: []
-};
+const CANONICAL = '/v1/harness';
 
 const json = (value: unknown, status = 200): Response =>
     new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
 
+type Call = { method: string; url: string; body: unknown; keepalive: boolean | undefined };
+
+let calls: Call[] = [];
+
+// A stub that records every request and THROWS for a route it does not declare, so a
+// client that invents a read (or falls back to a mount it no longer uses) fails here.
+const serve = (routes: Record<string, unknown>, statuses: Record<string, number> = {}): void => {
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            const url = String(input);
+
+            calls.push({
+                method,
+                url,
+                body: init?.body === undefined ? undefined : JSON.parse(String(init.body)),
+                keepalive: init?.keepalive
+            });
+
+            const key = `${method} ${url}`;
+            const value = routes[key] ?? routes[url];
+
+            if (value === undefined) throw new Error(`unexpected request: ${method} ${url}`);
+
+            return new Response(JSON.stringify(value), {
+                status: statuses[key] ?? statuses[url] ?? 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        })
+    );
+};
+
+// ---------------------------------------------------------------------------
+// Fixtures: the constant-size boot documents
+// ---------------------------------------------------------------------------
+
+const info: ServiceInfo = {
+    api_root: '/v1/harness',
+    service: 'underload-harness',
+    api_version: 'v1',
+    build_version: '1.2.3',
+    server_time: 1_700_000_000_000,
+    epoch: 'epoch-7',
+    capabilities: {
+        websocket_stream: true,
+        tool_execution: true,
+        tool_registration: true,
+        transcript_editing: true,
+        command_dispatch: true,
+        model_discovery: true,
+        harness_definition_writes: true,
+        agent_writes: true,
+        persistent_threads: true
+    },
+    limits: {
+        body_bytes: 1_000_000,
+        submit_body_bytes: 16_777_216,
+        input_chars: 200_000,
+        pending_tasks: 100,
+        thread_records: 256,
+        attachments_per_turn: 4,
+        attachment_bytes: 4_194_304,
+        total_attachment_bytes: 8_388_608,
+        result_references: 16,
+        pending_actions: 4,
+        steer_records: 64,
+        created_tools: 32,
+        tool_result_bytes: 65_536,
+        page_limit_default: 25,
+        page_limit_max: 100
+    },
+    links: { sessions: '/v1/harness/sessions', stream: '/v1/harness/stream' }
+};
+
+const config: GlobalConfigDocument = {
+    defaults: { base_url: 'http://provider/v1', model: 'm1', has_api_key: false },
+    writable_fields: ['settings.base_url', 'settings.model', 'settings.api_key'],
+    revision: 2
+};
+
+// A CARD: no instruction text, no per-agent model map, no resolved core-tool set.
+const card: HarnessCard = {
+    name: 'demo',
+    title: 'Demo',
+    description: 'demo preset',
+    requires_endpoint: false,
+    primary: 'instruct',
+    subagents: [],
+    agents: ['instruct'],
+    tools: ['read'],
+    builtin: true,
+    definition_revision: 3
+};
+
+const tool: ToolSummary = {
+    name: 'read',
+    group: 'files',
+    description: 'Read a file.',
+    tags: ['files'],
+    visibility: 'core',
+    session_bound: false
+};
+
+const agentRow: AgentSummary = {
+    name: 'instruct',
+    title: 'Instruct',
+    description: 'General agent.',
+    has_instruction_override: false,
+    has_global_override: false
+};
+
+const sessionRow: SessionSummary = {
+    id: 's1',
+    harness: 'demo',
+    status: 'idle',
+    model: 'm1',
+    created_at: 1,
+    updated_at: 2,
+    turn_count: 0,
+    thread_count: 0,
+    revision: 4
+};
+
+const pageOf = <T>(items: T[], next_cursor: string | null = null) => ({
+    limit: HARNESS_PAGE_LIMIT.default,
+    next_cursor,
+    observed_at: 1_700_000_000_000,
+    revision: 9,
+    items
+});
+
 beforeEach(() => {
     vi.resetModules();
+    calls = [];
     window.history.replaceState(null, '', '/');
 });
 
@@ -46,23 +178,28 @@ afterEach(() => {
     delete (globalThis as { __HARNESS_CONFIG__?: unknown }).__HARNESS_CONFIG__;
 });
 
+// ---------------------------------------------------------------------------
+// Root syntax (unchanged): what may end up in front of every request URL
+// ---------------------------------------------------------------------------
+
 describe('normalizeApiRoot', () => {
     it('keeps rooted paths and strips trailing slashes', () => {
-        expect(normalizeApiRoot('/v1/harness/', '/api')).toBe('/v1/harness');
-        expect(normalizeApiRoot('/api', '/api')).toBe('/api');
+        expect(normalizeApiRoot('/v1/harness/', CANONICAL)).toBe('/v1/harness');
         // A root of "/" means the origin itself; the concatenation stays correct.
-        expect(normalizeApiRoot('/', '/api')).toBe('');
-        expect(normalizeApiRoot('', '/api')).toBe('/api');
-        expect(normalizeApiRoot(undefined, '/api')).toBe('/api');
+        expect(normalizeApiRoot('/', CANONICAL)).toBe('');
+        expect(normalizeApiRoot('', CANONICAL)).toBe(CANONICAL);
+        expect(normalizeApiRoot(undefined, CANONICAL)).toBe(CANONICAL);
     });
 
     it('accepts absolute http(s) roots without a trailing slash', () => {
-        expect(normalizeApiRoot('http://127.0.0.1:5000/v1/harness/', '/api')).toBe(
+        expect(normalizeApiRoot('http://127.0.0.1:5000/v1/harness/', CANONICAL)).toBe(
             'http://127.0.0.1:5000/v1/harness'
         );
-        expect(normalizeApiRoot('https://api.example.test/api', '/api')).toBe('https://api.example.test/api');
+        expect(normalizeApiRoot('https://api.example.test/v1/harness', CANONICAL)).toBe(
+            'https://api.example.test/v1/harness'
+        );
         // An origin-only URL is a valid mount at the root path.
-        expect(normalizeApiRoot('https://api.example.test/', '/api')).toBe('https://api.example.test');
+        expect(normalizeApiRoot('https://api.example.test/', CANONICAL)).toBe('https://api.example.test');
     });
 
     it('rejects anything that is not a plain path or http(s) origin', () => {
@@ -71,25 +208,29 @@ describe('normalizeApiRoot', () => {
             '//evil.example/api', // protocol-relative: silently another origin
             '/\\evil.example/api', // backslash: the URL parser treats it as "//"
             '/\\/evil.example/api', // same, with the slash after it escaped
-            '/api\u0000', // control characters are stripped/reinterpreted by fetch
+            '/v1/harness\u0000', // control characters are stripped/reinterpreted by fetch
             'javascript:alert(1)',
             'ftp://example.test/api',
-            '/api?apiKey=secret', // a secret must never travel in a URL
-            '/api#fragment',
-            'http://user:pass@example.test/api',
-            'http://example.test/api?key=secret'
+            '/v1/harness?apiKey=secret', // a secret must never travel in a URL
+            '/v1/harness#fragment',
+            'http://user:pass@example.test/v1/harness',
+            'http://example.test/v1/harness?key=secret'
         ];
 
         for (const value of invalid) {
-            expect(() => normalizeApiRoot(value, '/api')).toThrow();
+            expect(() => normalizeApiRoot(value, CANONICAL)).toThrow();
         }
     });
 });
 
+// ---------------------------------------------------------------------------
+// Root resolution and the credential trust rule (F1) — semantics preserved
+// ---------------------------------------------------------------------------
+
 describe('resolveApiRoot', () => {
-    it('defaults to /api', async () => {
+    it('defaults to the canonical /v1/harness root', async () => {
         const module = await import('./api');
-        expect(module.API_ROOT).toBe('/api');
+        expect(module.API_ROOT).toBe('/v1/harness');
     });
 
     it('never probes off a Pages host', async () => {
@@ -97,21 +238,18 @@ describe('resolveApiRoot', () => {
         // relative fallback is correct and the local/LAN chain of
         // ./api-static-host.test.ts must stay out of the way: no candidates, and
         // `ensureApiRoot` makes no request.
-        const calls: string[] = [];
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL) => {
-                calls.push(String(input));
+        const urls: string[] = [];
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            urls.push(String(input));
 
-                throw new TypeError('Failed to fetch');
-            })
-        );
+            throw new TypeError('Failed to fetch');
+        }));
 
         const module = await import('./api');
 
         expect(module.apiRootCandidates()).toEqual([]);
-        expect(await module.ensureApiRoot()).toBe('/api');
-        expect(calls).toEqual([]);
+        expect(await module.ensureApiRoot()).toBe('/v1/harness');
+        expect(urls).toEqual([]);
     });
 
     it('takes a rooted path from ?apiRoot', async () => {
@@ -129,24 +267,23 @@ describe('resolveApiRoot', () => {
     it('ignores an invalid override instead of refusing to boot', async () => {
         window.history.replaceState(null, '', '/?apiRoot=javascript%3Aalert(1)');
         const module = await import('./api');
-        expect(module.API_ROOT).toBe('/api');
+        expect(module.API_ROOT).toBe(CANONICAL);
     });
 
-    // F1: the saved provider key is posted to the resolved root. A runtime
-    // override therefore may only name the page's own origin or a loopback host;
-    // any other absolute origin would be a credential-exfiltration path.
     it('refuses a cross-origin absolute ?apiRoot', async () => {
-        window.history.replaceState(null, '', '/?apiRoot=https%3A%2F%2Fevil.example%2Fapi');
+        // F1: the saved provider key is posted to the resolved root, so a runtime
+        // override may only name the page's own origin or a loopback host.
+        window.history.replaceState(null, '', '/?apiRoot=https%3A%2F%2Fevil.example%2Fv1%2Fharness');
         const module = await import('./api');
-        expect(module.API_ROOT).toBe('/api');
+        expect(module.API_ROOT).toBe(CANONICAL);
     });
 
     it('refuses a query root that escapes the origin only after URL decoding', async () => {
-        // %5C decodes to a backslash; fetch() would resolve "/\evil.example/api"
-        // against the page as "//evil.example/api" - another origin.
-        window.history.replaceState(null, '', '/?apiRoot=%2F%5Cevil.example%2Fapi');
+        // %5C decodes to a backslash; fetch() would resolve "/\evil.example/x" against
+        // the page as "//evil.example/x" — another origin.
+        window.history.replaceState(null, '', '/?apiRoot=%2F%5Cevil.example%2Fv1%2Fharness');
         const module = await import('./api');
-        expect(module.API_ROOT).toBe('/api');
+        expect(module.API_ROOT).toBe(CANONICAL);
     });
 
     it('accepts same-origin and loopback absolute roots', async () => {
@@ -157,31 +294,23 @@ describe('resolveApiRoot', () => {
         expect(module.API_ROOT).toBe(`${origin}/v1/harness`);
 
         vi.resetModules();
-        window.history.replaceState(
-            null,
-            '',
-            '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness'
-        );
+        window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness');
         module = await import('./api');
         expect(module.API_ROOT).toBe('http://localhost:5000/v1/harness');
 
         vi.resetModules();
-        window.history.replaceState(
-            null,
-            '',
-            '/?apiRoot=http%3A%2F%2F%5B%3A%3A1%5D%3A5000%2Fv1%2Fharness'
-        );
+        window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2F%5B%3A%3A1%5D%3A5000%2Fv1%2Fharness');
         module = await import('./api');
         expect(module.API_ROOT).toBe('http://[::1]:5000/v1/harness');
     });
 
     it('applies the same trust rule to injected config', async () => {
         (globalThis as { __HARNESS_CONFIG__?: { apiRoot?: string } }).__HARNESS_CONFIG__ = {
-            apiRoot: 'https://evil.example/api'
+            apiRoot: 'https://evil.example/v1/harness'
         };
 
         let module = await import('./api');
-        expect(module.API_ROOT).toBe('/api');
+        expect(module.API_ROOT).toBe(CANONICAL);
 
         vi.resetModules();
         (globalThis as { __HARNESS_CONFIG__?: { apiRoot?: string } }).__HARNESS_CONFIG__ = {
@@ -192,8 +321,8 @@ describe('resolveApiRoot', () => {
     });
 
     it('trusts a cross-origin build-time VITE_HARNESS_API', async () => {
-        // Build-time config is compiled by the operator, not taken from a URL a
-        // user can be tricked into opening, so it may name another origin.
+        // Build-time config is compiled by the operator, not taken from a URL a user can
+        // be tricked into opening, so it may name another origin.
         vi.stubEnv('VITE_HARNESS_API', 'https://api.example.test/v1/harness');
 
         const module = await import('./api');
@@ -201,39 +330,23 @@ describe('resolveApiRoot', () => {
     });
 
     it('sends a saved provider key only to the validated root', async () => {
-        window.history.replaceState(null, '', '/?apiRoot=https%3A%2F%2Fevil.example%2Fapi');
+        window.history.replaceState(null, '', '/?apiRoot=https%3A%2F%2Fevil.example%2Fv1%2Fharness');
 
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                calls.push({
-                    url: String(input),
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-
-                return json({ session });
-            })
-        );
+        serve({ 'POST /v1/harness/sessions': { session: sessionRow } });
 
         const module = await import('./api');
-        const settings = {
-            baseURL: 'http://provider/v1',
-            apiKey: 'saved-provider-key',
-            model: 'm1'
-        };
+        const settings = { base_url: 'http://provider/v1', api_key: 'saved-provider-key', model: 'm1' };
 
-        await module.createSession('demo', settings);
+        await module.createSession({ harness: 'demo', settings });
 
-        // The hostile root was discarded, so the key goes to the page's documented
-        // /api mount and is never part of a URL.
+        // The hostile root was discarded, so the key goes to the page's canonical mount
+        // and is never part of a URL.
         expect(calls).toEqual([
             {
-                url: '/api/sessions',
                 method: 'POST',
-                body: { harness: 'demo', settings }
+                url: '/v1/harness/sessions',
+                body: { harness: 'demo', settings },
+                keepalive: undefined
             }
         ]);
     });
@@ -241,371 +354,393 @@ describe('resolveApiRoot', () => {
     it('routes every request through the resolved root', async () => {
         window.history.replaceState(null, '', '/?apiRoot=%2Fv1%2Fharness');
 
-        const calls: string[] = [];
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL) => {
-                const url = String(input);
-                calls.push(url);
-
-                if (url === '/v1/harness') {
-                    return json({ rootPath: 'D:/repo', presets: [descriptor], tools: [], defaults, sessions: [session] });
-                }
-
-                if (url === '/v1/harness/sessions/a%2Fb') return json({ session });
-
-                throw new Error(`unexpected request: ${url}`);
-            })
-        );
+        serve({ 'GET /v1/harness/sessions/a%2Fb': { session: sessionRow } });
 
         const module = await import('./api');
-        const bootstrap = await module.getBootstrap();
-
-        expect(bootstrap).toEqual({
-            rootPath: 'D:/repo',
-            presets: [descriptor],
-            tools: [],
-            defaults,
-            sessions: [session]
-        });
-        expect(calls).toEqual(['/v1/harness']);
+        expect(await module.getSession('a/b')).toEqual(sessionRow);
 
         // Session ids are path segments and must be encoded, never interpolated.
-        await module.getSession('a/b');
-        expect(calls).toEqual(['/v1/harness', '/v1/harness/sessions/a%2Fb']);
+        expect(calls).toEqual([
+            { method: 'GET', url: '/v1/harness/sessions/a%2Fb', body: undefined, keepalive: undefined }
+        ]);
     });
 });
 
-describe('loadBootstrap', () => {
-    it('carries the agent library through the standalone fallback', async () => {
-        const agent = {
-            name: 'instruct',
-            title: 'Instruct',
-            description: 'General agent.',
-            instruction: 'Answer directly.',
-            guidelines: ['Be concise.']
-        };
+// ---------------------------------------------------------------------------
+// The transport: markers, counters, and one error path
+// ---------------------------------------------------------------------------
 
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL) => {
-                const url = String(input);
-
-                if (url === '/api') return json({ error: { message: 'Unknown API route.' } }, 404);
-                if (url === '/api/harnesses') return json({ harnesses: [descriptor], defaults, agents: [agent] });
-                if (url === '/api/tools') return json({ tools: [] });
-                if (url === '/api/sessions') return json({ sessions: [] });
-
-                throw new Error(`unexpected request: ${url}`);
-            })
-        );
-
-        const module = await import('./api');
-        const bootstrap = await module.loadBootstrap();
-
-        // The picker is server-driven: the fallback keeps the same agent presets
-        // the canonical bootstrap document carries.
-        expect(bootstrap.agents).toEqual([agent]);
-        expect(bootstrap.presets).toEqual([descriptor]);
-    });
-
-    it('uses the canonical root document when it answers', async () => {
-        window.history.replaceState(null, '', '/?apiRoot=%2Fv1%2Fharness');
-
-        const calls: string[] = [];
-        const bootstrap = {
-            rootPath: 'D:/repo',
-            presets: [descriptor],
-            tools: [],
-            defaults,
-            sessions: [session]
-        };
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL) => {
-                const url = String(input);
-                calls.push(url);
-                if (url === '/v1/harness') return json(bootstrap);
-                throw new Error(`unexpected request: ${url}`);
-            })
-        );
-
-        const module = await import('./api');
-        expect(await module.loadBootstrap()).toEqual(bootstrap);
-        // One request, not four: the canonical document is complete.
-        expect(calls).toEqual(['/v1/harness']);
-    });
-
-    it('falls back to the standalone routes when the root is a 404', async () => {
-        // No ?apiRoot: the default /api mount, whose root is the documented 404.
-        const calls: Array<{ url: string; method: string | undefined }> = [];
+describe('the shared transport', () => {
+    it('stamps the client markers and reads the epoch/revision headers back', async () => {
+        const seen: Array<{ headers: Record<string, string> }> = [];
 
         vi.stubGlobal(
             'fetch',
             vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                calls.push({ url, method: init?.method });
+                seen.push({ headers: (init?.headers ?? {}) as Record<string, string> });
 
-                if (url === '/api') return json({ error: { message: 'Unknown API route.' } }, 404);
-                if (url === '/api/harnesses') return json({ harnesses: [descriptor], defaults });
-                if (url === '/api/tools') return json({ tools: [] });
-                if (url === '/api/sessions') return json({ sessions: [session] });
-
-                throw new Error(`unexpected request: ${url}`);
+                return new Response(JSON.stringify({ session: sessionRow }), {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Harness-Epoch': 'epoch-7',
+                        'X-Harness-Revision': '12'
+                    }
+                });
             })
         );
 
         const module = await import('./api');
-        const bootstrap = await module.loadBootstrap();
+        const read = await module.requestResource<{ session: SessionSummary }>(HARNESS_ROUTES.sessionsBySessionId('s1'));
 
-        expect(bootstrap).toEqual({
-            // Standalone advertises no filesystem root; "" means "not reported".
-            rootPath: '',
-            presets: [descriptor],
-            tools: [],
-            defaults,
-            // T5 R1: the fallback composes the CATALOGUE only. The conversation directory is a
-            // separate, compact read (`GET /views`, ./view-api.ts `listViews`), so this path never
-            // embeds raw `{sessions}` snapshots — the shape that carried every recorded event.
-            sessions: []
-        });
-        // Three reads, and NO `GET /api/sessions`: the raw session index is not part of the
-        // default bootstrap path any more (the route stays declared in the stub above, so a
-        // regression that re-added the read would show up as an extra entry here).
-        expect(calls).toEqual([
-            { url: '/api', method: undefined },
-            { url: '/api/harnesses', method: undefined },
-            { url: '/api/tools', method: undefined }
+        expect(read).toEqual({ data: { session: sessionRow }, epoch: 'epoch-7', revision: 12 });
+        expect(seen).toEqual([
+            { headers: { 'Content-Type': 'application/json', 'X-Harness-Client': 'ui' } }
         ]);
     });
 
-    it('surfaces the fallback failure when the server is unreachable', async () => {
+    it('omits a counter the server did not stamp instead of inventing one', async () => {
         vi.stubGlobal(
             'fetch',
-            vi.fn(async (input: RequestInfo | URL) => {
-                throw new TypeError(`connect ECONNREFUSED ${String(input)}`);
-            })
+            vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
         );
 
         const module = await import('./api');
-        await expect(module.loadBootstrap()).rejects.toThrow('The harness server is unreachable');
+
+        expect(await module.requestResource(HARNESS_ROUTES.health())).toEqual({ data: { ok: true } });
+    });
+
+    it('flattens the one error envelope and never swallows it', async () => {
+        serve({ 'GET /v1/harness/health': { error: { message: 'The store is closed.' } } }, { 'GET /v1/harness/health': 503 });
+
+        const module = await import('./api');
+
+        await expect(module.getHealth()).rejects.toThrow('The store is closed.');
+    });
+
+    it('degrades a non-JSON failure body to the status line', async () => {
+        // A proxy with no upstream answers its own HTML page, which is not the
+        // contract's envelope.
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>bad gateway</html>', { status: 502, statusText: 'Bad Gateway', headers: { 'Content-Type': 'text/html' } })));
+
+        const module = await import('./api');
+
+        await expect(module.getHealth()).rejects.toThrow('HTTP 502 Bad Gateway');
     });
 
     it('names the route when a successful response is not JSON', async () => {
-        // A proxy with no upstream can answer 200 with its own HTML/plain-text
-        // page. The caller must get an actionable message, not a raw SyntaxError.
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(
-                async () =>
-                    new Response('upstream unavailable', {
-                        status: 200,
-                        headers: { 'Content-Type': 'text/plain' }
-                    })
-            )
-        );
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('upstream unavailable', { status: 200, headers: { 'Content-Type': 'text/plain' } })));
 
         const module = await import('./api');
-        // The canonical root attempt is discarded; /harnesses is the first
-        // standalone fallback route and therefore the reported route.
-        await expect(module.loadBootstrap()).rejects.toThrow(
-            'The harness server returned a non-JSON response for /harnesses (HTTP 200).'
+
+        // The message carries the contract-relative path, not the mount, so the offline
+        // pane can name the operation that failed.
+        await expect(module.getSession('a/b')).rejects.toThrow(
+            'The harness server returned a non-JSON response for /sessions/a%2Fb (HTTP 200).'
         );
+    });
+
+    it('keeps an abort as an abort instead of rewriting it as an unreachable server', async () => {
+        const controller = new AbortController();
+        controller.abort();
+
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new DOMException('The operation was aborted.', 'AbortError');
+        }));
+
+        const module = await import('./api');
+
+        await expect(
+            module.listProviderModels({ model: 'm1' }, controller.signal)
+        ).rejects.toThrow('The operation was aborted');
+    });
+
+    it('wraps a real connection failure in one actionable sentence', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new TypeError('connect ECONNREFUSED 127.0.0.1:5000');
+        }));
+
+        const module = await import('./api');
+
+        await expect(module.getServiceInfo()).rejects.toThrow(
+            'The harness server is unreachable: connect ECONNREFUSED 127.0.0.1:5000'
+        );
+    });
+
+    it('builds the realtime socket on the SAME root as the REST reads', async () => {
+        const module = await import('./api');
+        const origin = window.location.origin;
+        const scheme = origin.startsWith('https:') ? 'wss:' : 'ws:';
+
+        // Root-relative API -> a socket on this page's origin, at the contract path.
+        expect(module.streamSocketUrl()).toBe(`${scheme}//${origin.slice(origin.indexOf('//') + 2)}/v1/harness/stream`);
+    });
+
+    it('dials the socket at an absolute build-time root, with the matching scheme', async () => {
+        vi.stubEnv('VITE_HARNESS_API', 'https://api.example.test/v1/harness');
+
+        const module = await import('./api');
+
+        expect(module.streamSocketUrl()).toBe('wss://api.example.test/v1/harness/stream');
     });
 });
 
-describe('tool calls', () => {
-    it('sends a sessionId only when one is captured for a core call', async () => {
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+// ---------------------------------------------------------------------------
+// Boot: six bounded reads, no document, no fallback mount
+// ---------------------------------------------------------------------------
 
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                calls.push({
-                    url: String(input),
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
+describe('loadBootstrap', () => {
+    it('composes the boot from six first-page reads and nothing heavier', async () => {
+        serve({
+            'GET /v1/harness': info,
+            'GET /v1/harness/config': config,
+            'GET /v1/harness/harnesses?limit=25': pageOf([card]),
+            'GET /v1/harness/tools?limit=25': pageOf([tool]),
+            'GET /v1/harness/agents?limit=25': pageOf([agentRow]),
+            'GET /v1/harness/sessions?limit=25': pageOf([sessionRow], 'cursor-sessions')
+        });
 
-                return json({ ok: true, result: { enabled: [] }, durationMs: 3 });
-            })
-        );
+        const module = await import('./api');
+        const bootstrap = await module.loadBootstrap();
+
+        expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+            'GET /v1/harness',
+            'GET /v1/harness/config',
+            'GET /v1/harness/harnesses?limit=25',
+            'GET /v1/harness/tools?limit=25',
+            'GET /v1/harness/agents?limit=25',
+            'GET /v1/harness/sessions?limit=25'
+        ]);
+
+        // The whole boot, exactly. Note what is NOT here: no turn, thread, transcript or
+        // display read, and the document the legacy root used to answer is not requested.
+        expect(bootstrap).toEqual({
+            rootPath: '/v1/harness',
+            info,
+            presets: [
+                {
+                    name: 'demo',
+                    title: 'Demo',
+                    description: 'demo preset',
+                    requiresEndpoint: false,
+                    primary: 'instruct',
+                    subagents: [],
+                    agents: ['instruct'],
+                    tools: ['read'],
+                    builtin: true,
+                    definitionRevision: 3
+                }
+            ],
+            tools: [
+                {
+                    name: 'read',
+                    group: 'files',
+                    description: 'Read a file.',
+                    tags: ['files'],
+                    visibility: 'core',
+                    sessionBound: false
+                }
+            ],
+            // A row carries no instruction TEXT, so the picker's preview stays empty
+            // rather than claiming a prompt this read never published.
+            agents: [
+                {
+                    name: 'instruct',
+                    title: 'Instruct',
+                    description: 'General agent.',
+                    instruction: '',
+                    guidelines: [],
+                    hasInstructionOverride: false,
+                    hasGlobalOverride: false
+                }
+            ],
+            defaults: config.defaults,
+            sessions: [sessionRow],
+            cursors: { harnesses: null, tools: null, agents: null, sessions: 'cursor-sessions' }
+        });
+    });
+
+    it('surfaces the failure when the server is unreachable', async () => {
+        vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+            throw new TypeError(`connect ECONNREFUSED ${String(input)}`);
+        }));
 
         const module = await import('./api');
 
-        // A catalogue tool keeps the pre-R8 body: no sessionId key at all.
+        await expect(module.loadBootstrap()).rejects.toThrow('The harness server is unreachable');
+    });
+
+    it('names a non-JSON boot answer instead of a raw SyntaxError', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('upstream unavailable', { status: 200, headers: { 'Content-Type': 'text/plain' } })));
+
+        const module = await import('./api');
+
+        await expect(module.loadBootstrap()).rejects.toThrow(/non-JSON response/);
+    });
+
+    it('patches the provider defaults with the whole-field document the contract asks for', async () => {
+        serve({ 'PATCH /v1/harness/config': { ...config, revision: 3 } });
+
+        const module = await import('./api');
+
+        expect((await module.updateGlobalConfig({ model: 'm2' })).revision).toBe(3);
+        expect(calls).toEqual([
+            { method: 'PATCH', url: '/v1/harness/config', body: { settings: { model: 'm2' } }, keepalive: undefined }
+        ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Tools: the two execution scopes, stated by the path
+// ---------------------------------------------------------------------------
+
+describe('tool calls', () => {
+    it('sends the catalogue call and the session call to different routes', async () => {
+        serve({
+            'POST /v1/harness/tools/read/executions': { ok: true, result: { enabled: [] }, duration_ms: 3 },
+            'POST /v1/harness/tools/toolRequest/executions': { ok: true, result: {}, duration_ms: 2 },
+            'POST /v1/harness/sessions/session-1/tools/toolRequest/executions': { ok: true, result: {}, duration_ms: 1 }
+        });
+
+        const module = await import('./api');
+
+        // Both outcomes are a 200; the caller branches on `ok`, never on the status.
         expect(await module.callTool('read', { path: 'a.txt' })).toEqual({
             ok: true,
             result: { enabled: [] },
-            durationMs: 3
+            duration_ms: 3
         });
         await module.callTool('toolRequest', { tags: ['web'] }, 'session-1');
         // An empty id is "no session" for this purpose, not a session lookup.
         await module.callTool('toolRequest', { tags: ['web'] }, '');
 
+        expect(calls.map((call) => [call.method, call.url, call.body])).toEqual([
+            ['POST', '/v1/harness/tools/read/executions', { parameters: { path: 'a.txt' } }],
+            ['POST', '/v1/harness/sessions/session-1/tools/toolRequest/executions', { parameters: { tags: ['web'] } }],
+            ['POST', '/v1/harness/tools/toolRequest/executions', { parameters: { tags: ['web'] } }]
+        ]);
+    });
+
+    it('posts provider discovery with the key in the body, never the URL', async () => {
+        serve({ 'POST /v1/harness/models': { models: ['m1', 'm2'], observed_at: 1 } });
+
+        const module = await import('./api');
+
+        expect(await module.listProviderModels({ base_url: 'http://provider/v1', api_key: 'secret', model: 'm1' })).toEqual(['m1', 'm2']);
         expect(calls).toEqual([
             {
-                url: '/api/tools/read',
                 method: 'POST',
-                body: { parameters: { path: 'a.txt' } }
-            },
-            {
-                url: '/api/tools/toolRequest',
-                method: 'POST',
-                body: { parameters: { tags: ['web'] }, sessionId: 'session-1' }
-            },
-            {
-                url: '/api/tools/toolRequest',
-                method: 'POST',
-                body: { parameters: { tags: ['web'] } }
+                url: '/v1/harness/models',
+                body: { settings: { base_url: 'http://provider/v1', api_key: 'secret', model: 'm1' } },
+                keepalive: undefined
             }
         ]);
     });
+
+    it('answers an empty model list when the provider served nothing usable', async () => {
+        serve({ 'POST /v1/harness/models': { models: [], observed_at: 1 } });
+
+        const module = await import('./api');
+
+        expect(await module.listProviderModels({})).toEqual([]);
+    });
 });
+
+// ---------------------------------------------------------------------------
+// Definition and session writes
+// ---------------------------------------------------------------------------
 
 describe('harness mutations', () => {
-    const agent = {
-        name: 'instruct',
-        title: 'Instruct',
-        description: 'General agent.',
-        instruction: 'Answer directly.',
-        guidelines: []
-    };
-    const custom = { ...descriptor, name: 'release-captain', title: 'Release captain' };
+    it('pages cards, creates a definition, and patches one by encoded name', async () => {
+        const custom = { ...card, name: 'release-captain', title: 'Release captain' };
 
-    it('lists agent presets and sends the documented request bodies', async () => {
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                calls.push({
-                    url,
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-
-                if (url === '/api/agents') return json({ agents: [agent] });
-                if (url === '/api/harnesses' && init?.method === 'POST') {
-                    return json({ harness: custom }, 201);
-                }
-                // Harness names are path segments and must be encoded.
-                if (url === '/api/harnesses/a%2Fb' && init?.method === 'PATCH') {
-                    return json({ harness: custom });
-                }
-
-                throw new Error(`unexpected request: ${url}`);
-            })
-        );
+        serve({
+            'GET /v1/harness/agents?limit=25': pageOf([agentRow]),
+            'POST /v1/harness/harnesses': { harness: custom },
+            'PATCH /v1/harness/harnesses/a%2Fb': { harness: custom }
+        });
 
         const module = await import('./api');
 
-        expect(await module.listAgents()).toEqual([agent]);
-
+        expect((await module.listAgents()).items).toEqual([agentRow]);
         expect(
-            await module.createHarness({
-                name: 'release-captain',
-                title: 'Release captain',
-                primary: 'instruct',
-                subagents: ['helper']
-            })
+            await module.createHarness({ name: 'release-captain', title: 'Release captain', primary: 'instruct', subagents: ['helper'] })
         ).toEqual(custom);
+        expect(await module.updateHarness('a/b', { primary: 'helper', subagents: ['instruct'] })).toEqual(custom);
 
-        expect(await module.updateHarness('a/b', { primary: 'helper', subagents: ['instruct'] })).toEqual(
-            custom
-        );
-
-        expect(calls).toEqual([
-            { url: '/api/agents', method: undefined, body: undefined },
-            {
-                url: '/api/harnesses',
-                method: 'POST',
-                body: {
-                    name: 'release-captain',
-                    title: 'Release captain',
-                    primary: 'instruct',
-                    subagents: ['helper']
-                }
-            },
-            {
-                url: '/api/harnesses/a%2Fb',
-                method: 'PATCH',
-                body: { primary: 'helper', subagents: ['instruct'] }
-            }
+        expect(calls.map((call) => [call.method, call.url, call.body])).toEqual([
+            ['GET', '/v1/harness/agents?limit=25', undefined],
+            [
+                'POST',
+                '/v1/harness/harnesses',
+                { name: 'release-captain', title: 'Release captain', primary: 'instruct', subagents: ['helper'] }
+            ],
+            ['PATCH', '/v1/harness/harnesses/a%2Fb', { primary: 'helper', subagents: ['instruct'] }]
         ]);
     });
 });
 
-// R6 — the harness delete transport, and the unload-only session delete.
+// R6 — the harness delete receipt, and the unload-only session delete.
 describe('harness delete (R6)', () => {
-    it('deletes one harness by encoded name and reports whether it was removed', async () => {
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                calls.push({
-                    url,
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-
-                // The accepted contract: 200 with `{ deleted: true }`, built-ins included.
-                if (url === '/api/harnesses/a%2Fb' && init?.method === 'DELETE') return json({ deleted: true });
-
-                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-            })
-        );
+    it('deletes one harness by encoded name and answers the removal receipt', async () => {
+        const receipt = {
+            deleted: true,
+            harness_name: 'a/b',
+            tombstoned: true,
+            restored_by_restart: false
+        };
+        serve({ 'DELETE /v1/harness/harnesses/a%2Fb': receipt });
 
         const module = await import('./api');
 
-        expect(await module.deleteHarness('a/b')).toBe(true);
-        expect(calls).toEqual([{ url: '/api/harnesses/a%2Fb', method: 'DELETE', body: undefined }]);
+        expect(await module.deleteHarness('a/b')).toEqual(receipt);
+        expect(calls).toEqual([
+            { method: 'DELETE', url: '/v1/harness/harnesses/a%2Fb', body: undefined, keepalive: undefined }
+        ]);
     });
 
     it('treats a 404 as already gone instead of an error', async () => {
-        const calls: Array<{ url: string; method: string | undefined }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                calls.push({ url, method: init?.method });
-
-                // The other half of the accepted contract: an unknown harness is a 404.
-                if (url === '/api/harnesses/ghost' && init?.method === 'DELETE') {
-                    return json({ error: { message: 'Unknown harness ghost' } }, 404);
-                }
-
-                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-            })
+        serve(
+            { 'DELETE /v1/harness/harnesses/ghost': { error: { message: 'Unknown harness ghost' } } },
+            { 'DELETE /v1/harness/harnesses/ghost': 404 }
         );
 
         const module = await import('./api');
 
-        // "It is already gone" IS the desired end state for a delete, so the caller gets
-        // a resolved `false` (nothing removed now) rather than a thrown error.
-        expect(await module.deleteHarness('ghost')).toBe(false);
-        expect(calls).toEqual([{ url: '/api/harnesses/ghost', method: 'DELETE' }]);
+        // "It is already gone" IS the desired end state for a delete, so the caller gets a
+        // resolved value rather than a thrown error. The declared contract of this function
+        // is `DeleteHarnessResult | undefined` (./api.ts:665) and its own comment says the
+        // 404 is "reported as `undefined`"; the legacy `false` is gone with the legacy
+        // boolean return.
+        //
+        // PRODUCT DEFECT (T23 evidence, asserted from the contract not the implementation):
+        // `requestResource` only substitutes `undefined` when an accepted status has a
+        // NON-JSON body (./api.ts:461). A contract-conformant 404 carries an `ErrorBody`
+        // JSON envelope, so this call currently resolves to
+        // `{ error: { message: 'Unknown harness ghost' } }` — an object typed as
+        // `DeleteHarnessResult` that satisfies none of its fields. Fix the client (drop the
+        // accepted-status body, like `getHarness` does by unwrapping `.harness`), not this
+        // assertion.
+        expect(await module.deleteHarness('ghost')).toBeUndefined();
+        expect(calls).toEqual([
+            { method: 'DELETE', url: '/v1/harness/harnesses/ghost', body: undefined, keepalive: undefined }
+        ]);
+    });
+
+    it('resolves rather than rejects when the accepted 404 has no readable body', async () => {
+        // The half of the same rule the transport DOES honour: an accepted status whose
+        // body is not JSON (a proxy's HTML page) is not a parse failure worth reporting.
+        vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>not found</html>', { status: 404, headers: { 'Content-Type': 'text/html' } })));
+
+        const module = await import('./api');
+
+        expect(await module.deleteHarness('ghost')).toBeUndefined();
     });
 
     it('rejects a real failure with the server message and never swallows it', async () => {
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-
-                // A 500 is NOT in the accepted list, so it stays an Error whose message is
-                // the server's own — which is what makes the UI's failure path actionable.
-                if (url === '/api/harnesses/alpha' && init?.method === 'DELETE') {
-                    return json({ error: { message: 'The registry could not be written' } }, 500);
-                }
-
-                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-            })
+        serve(
+            { 'DELETE /v1/harness/harnesses/alpha': { error: { message: 'The registry could not be written' } } },
+            { 'DELETE /v1/harness/harnesses/alpha': 500 }
         );
 
         const module = await import('./api');
@@ -614,19 +749,10 @@ describe('harness delete (R6)', () => {
     });
 
     it('sends the unload cleanup with keepalive and the normal delete without it', async () => {
-        const seen: Array<{ url: string; keepalive: boolean | undefined }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                seen.push({ url, keepalive: init?.keepalive });
-
-                if (init?.method === 'DELETE') return json({ deleted: true });
-
-                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-            })
-        );
+        serve({
+            'DELETE /v1/harness/sessions/s1': { deleted: true, session_id: 's1', aborted_turns: 0, dropped_queued_tasks: 0 },
+            'DELETE /v1/harness/sessions/s2': { deleted: true, session_id: 's2', aborted_turns: 1, dropped_queued_tasks: 2 }
+        });
 
         const module = await import('./api');
 
@@ -635,216 +761,141 @@ describe('harness delete (R6)', () => {
 
         // R7: only the unload path asks the browser to keep the request alive, because a
         // plain fetch started from `pagehide` may never leave.
-        expect(seen).toEqual([
-            { url: '/api/sessions/s1', keepalive: undefined },
-            { url: '/api/sessions/s2', keepalive: true }
+        expect(calls.map((call) => [call.url, call.keepalive])).toEqual([
+            ['/v1/harness/sessions/s1', undefined],
+            ['/v1/harness/sessions/s2', true]
         ]);
     });
 });
 
 describe('task queue (R4)', () => {
-    const turn = {
-        id: 't1',
-        index: 0,
-        prompt: 'queued task',
-        status: 'queued',
-        updatedAt: 4,
-        events: []
-    };
-
-    it('enqueues with POST /tasks and unwraps { session, turn } quickly', async () => {
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                calls.push({
-                    url: String(input),
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-
-                return json({ session: { ...session, turns: [turn] }, turn }, 202);
-            })
-        );
-
-        const module = await import('./api');
-        const answer = await module.enqueueTask('a/b', 'queued task');
-
-        expect(answer).toEqual({ session: { ...session, turns: [turn] }, turn });
-        expect(calls).toEqual([
-            { url: '/api/sessions/a%2Fb/tasks', method: 'POST', body: { input: 'queued task' } }
-        ]);
-    });
-
-    it('observes GET /events and parses every SessionStreamItem frame exactly once', async () => {
-        const frames = [
-            { type: 'snapshot', session: { ...session, turns: [turn] } },
-            { type: 'turn', turn: { ...turn, status: 'running' } },
-            { type: 'event', turnId: 't1', event: { type: 'start', agent: 'writer', model: 'm1' }, at: 5 },
-            { type: 'snapshot', session: { ...session, turns: [{ ...turn, status: 'done' }] } }
-        ];
-
-        const body = new ReadableStream<Uint8Array>({
-            start(controller) {
-                controller.enqueue(
-                    new TextEncoder().encode(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''))
-                );
-                controller.close();
+    it('submits with POST /tasks and answers the 202 receipt', async () => {
+        const receipt = {
+            session_id: 'a/b',
+            turn_id: 'u9',
+            status: 'queued',
+            thread_id: 'th-a',
+            queue_position: 1,
+            session_revision: 8,
+            accepted_at: 2_500,
+            links: {
+                turn: '/v1/harness/sessions/a%2Fb/turns/u9',
+                turns: '/v1/harness/sessions/a%2Fb/turns?limit=25',
+                thread: '/v1/harness/sessions/a%2Fb/threads/th-a',
+                stream: '/v1/harness/stream'
             }
-        });
-
-        const calls: string[] = [];
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL) => {
-                calls.push(String(input));
-                // An SSE body, exactly what the server returns for the observer.
-                return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
-            })
-        );
+        };
+        serve({ 'POST /v1/harness/sessions/a%2Fb/tasks': receipt });
 
         const module = await import('./api');
-        const seen: unknown[] = [];
-        const controller = new AbortController();
+        const answer = await module.submitTask('a/b', { input: 'queued task' });
 
-        await module.observeSession('s1', (item) => seen.push(item), controller.signal);
-
-        expect(calls).toEqual(['/api/sessions/s1/events']);
-        expect(seen).toEqual(frames);
+        // A receipt, not `{ session, turn }`: the row itself arrives on the stream.
+        expect(answer).toEqual(receipt);
+        expect(calls).toEqual([
+            { method: 'POST', url: '/v1/harness/sessions/a%2Fb/tasks', body: { input: 'queued task' }, keepalive: undefined }
+        ]);
     });
 
     it('cancels the active task and the retained queue with an explicit all body', async () => {
-        const calls: Array<{ url: string; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                calls.push({
-                    url: String(input),
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-                return json({ cancelled: true });
-            })
-        );
+        serve({
+            'POST /v1/harness/sessions/s1/cancel': {
+                cancelled: true,
+                session_id: 's1',
+                dropped_queued_tasks: 2,
+                revision: 9
+            }
+        });
 
         const module = await import('./api');
 
-        expect(await module.cancelSession('s1', true)).toBe(true);
-        // The legacy no-body call still means "active only".
-        expect(await module.cancelSession('s1')).toBe(true);
+        expect((await module.cancelSession('s1', true)).cancelled).toBe(true);
+        // An absent body means "active run only" — the contract's reading of `{}`.
+        expect((await module.cancelSession('s1')).cancelled).toBe(true);
 
-        expect(calls).toEqual([
-            { url: '/api/sessions/s1/cancel', body: { all: true } },
-            { url: '/api/sessions/s1/cancel', body: undefined }
+        expect(calls.map((call) => [call.url, call.body])).toEqual([
+            ['/v1/harness/sessions/s1/cancel', { all: true }],
+            ['/v1/harness/sessions/s1/cancel', undefined]
         ]);
+    });
+
+    it('reads the queue as bounded previews with exact lengths', async () => {
+        const page = {
+            ...pageOf([{ id: 'u9', index: 9, prompt_preview: 'the first 200 characters', prompt_chars: 400, agent: 'instruct', enqueued_at: 1 }], null),
+            session_id: 's1'
+        };
+        serve({ 'GET /v1/harness/sessions/s1/queue?limit=25': page });
+
+        const module = await import('./api');
+        const read = await module.listQueue('s1');
+
+        expect(read).toEqual({
+            items: page.items,
+            nextCursor: null,
+            revision: 9,
+            limit: HARNESS_PAGE_LIMIT.default
+        });
     });
 });
 
 describe('session model updates', () => {
-
-    it('PATCHes the live model map and unwraps the GET-session envelope', async () => {
-        // R2: the session's `agentModels` map is live; the route answers with the
-        // same `{ session }` envelope as GET /sessions/:id, which `updateSession`
-        // unwraps so main.ts can apply it like a re-read snapshot.
-        const moved = { ...session, agentModels: { writer: 'm2' } };
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                calls.push({
-                    url,
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-
-                if (url === '/api/sessions/a%2Fb' && init?.method === 'PATCH') {
-                    return json({ session: moved });
-                }
-
-                throw new Error(`unexpected request: ${url}`);
-            })
-        );
+    it('PATCHes the live model map in snake_case and unwraps the GET-session envelope', async () => {
+        // The session's `agent_models` map is live; the route answers with the same
+        // `{ session }` envelope as GET /sessions/{id}, which `updateSession` unwraps.
+        const moved = { ...sessionRow, agent_models: { writer: 'm2' } };
+        serve({ 'PATCH /v1/harness/sessions/a%2Fb': { session: moved } });
 
         const module = await import('./api');
 
-        expect(await module.updateSession('a/b', { agentModels: { writer: 'm2' } })).toEqual(moved);
+        expect(await module.updateSession('a/b', { agent_models: { writer: 'm2' } })).toEqual(moved);
         expect(calls).toEqual([
             {
-                url: '/api/sessions/a%2Fb',
                 method: 'PATCH',
-                body: { agentModels: { writer: 'm2' } }
+                url: '/v1/harness/sessions/a%2Fb',
+                body: { agent_models: { writer: 'm2' } },
+                keepalive: undefined
             }
         ]);
     });
 
     it('reports the server message when a session patch is rejected', async () => {
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                const url = String(input);
-                if (url === '/api/sessions/s1' && init?.method === 'PATCH') {
-                    return json({ error: { message: 'That model is not available.' } }, 400);
-                }
-
-                throw new Error(`unexpected request: ${url}`);
-            })
+        serve(
+            { 'PATCH /v1/harness/sessions/s1': { error: { message: 'That model is not available.' } } },
+            { 'PATCH /v1/harness/sessions/s1': 400 }
         );
 
         const module = await import('./api');
 
-        await expect(module.updateSession('s1', { agentModels: {} })).rejects.toThrow(
-            'That model is not available.'
-        );
+        await expect(module.updateSession('s1', { agent_models: {} })).rejects.toThrow('That model is not available.');
     });
 });
 
-// R8: permanent session removal. The wire contract is fixed — one DELETE on
-// `/sessions/:id`, no body — and a 404 keeps surfacing the server's own message so
-// main.ts can recognise "Unknown session" as already-gone rather than inventing a
-// second route or swallowing the error.
+// R8: permanent session removal. One DELETE on `/v1/harness/sessions/{session_id}`, no
+// body, and a 404 keeps surfacing the server's own message so the shell can recognise
+// "Unknown session" as already-gone rather than inventing a second route.
 describe('session deletion', () => {
-    it('sends DELETE /sessions/:id with no body and resolves on { deleted: true }', async () => {
-        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
-
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                calls.push({
-                    url: String(input),
-                    method: init?.method,
-                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
-                });
-                return json({ deleted: true });
-            })
-        );
+    it('sends DELETE /sessions/{id} with no body and answers the disposal receipt', async () => {
+        const receipt = { deleted: true, session_id: 'a/b', aborted_turns: 1, dropped_queued_tasks: 0 };
+        serve({ 'DELETE /v1/harness/sessions/a%2Fb': receipt });
 
         const module = await import('./api');
 
-        // `void` on purpose: the UI only needs the acknowledgement, and the record
-        // is gone once this resolves.
-        await expect(module.deleteSession('a/b')).resolves.toBeUndefined();
+        expect(await module.deleteSession('a/b')).toEqual(receipt);
         expect(calls).toEqual([
-            { url: '/api/sessions/a%2Fb', method: 'DELETE', body: undefined }
+            { method: 'DELETE', url: '/v1/harness/sessions/a%2Fb', body: undefined, keepalive: undefined }
         ]);
     });
 
     it('surfaces the server 404 message for an unknown session', async () => {
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-                if (String(input) === '/api/sessions/s1' && init?.method === 'DELETE') {
-                    return json({ error: { message: 'Unknown session "s1".' } }, 404);
-                }
-
-                throw new Error(`unexpected request: ${String(input)}`);
-            })
+        serve(
+            { 'DELETE /v1/harness/sessions/s1': { error: { message: 'Unknown session "s1".' } } },
+            { 'DELETE /v1/harness/sessions/s1': 404 }
         );
 
         const module = await import('./api');
 
+        // Unlike a harness delete, a session DELETE does not accept the 404: the caller
+        // decides whether "unknown" is already-gone, because a rail row can be stale.
         await expect(module.deleteSession('s1')).rejects.toThrow('Unknown session "s1".');
     });
 });

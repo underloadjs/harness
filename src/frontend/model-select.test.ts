@@ -189,7 +189,7 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
             }
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -346,7 +346,7 @@ it('names the server fallback when the stored settings model is blank', async ()
             if (url === '/api/models') return json({ models: ['m1', 'm2'] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -377,7 +377,7 @@ it('shows a model-change error and keeps the last server-confirmed selection', a
             }
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -438,7 +438,7 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
                 }
 
                 throw new Error(`unexpected request: ${url}`);
-            }))
+            }, { root: '/api' }))
         );
     });
 
@@ -510,7 +510,7 @@ it('clears the accessible status diagnostic when the state resets', async () => 
             }
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -587,7 +587,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
             if (url === '/api/sessions/s9') return json({ session: saved });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -736,7 +736,7 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
             if (url === '/api/sessions/s7') return json({ session: running });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -825,7 +825,7 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
             if (url === '/api/sessions/s9') return json({ session: saved });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

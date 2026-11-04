@@ -141,7 +141,7 @@ const stubServer = (restored: SessionSnapshot, globFiles?: string[]): Call[] => 
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;

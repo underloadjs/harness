@@ -80,8 +80,11 @@
 //   - ../api.ts  — descriptors resolved from the same preset metadata
 
 import { agent, harness, presetTools, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
-import type { Agent, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
-import { agentInstruction, agentProfile } from '../../agents';
+import type { Agent, AgentConfiguration, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
+import { agentInstruction, agentProfile, isAgentProfileName } from '../../agents';
+// T19: the global agent overlay (effective profile text + the retirement error). One
+// direction only — ./agent-state.ts imports nothing from here, so there is no cycle.
+import { AgentStateError, effectiveAgentProfile } from './agent-state';
 import { PRESET_DESCRIPTORS, RUNTIME_DESCRIPTORS, isCoreRegistered } from '../../tools/descriptors';
 import {
     EXAMPLE_APP_TOOL_SOURCES,
@@ -257,22 +260,58 @@ export const providerOf = (settings: RunnerSettings) => ({
 // here), and `agentInstruction` applies it to the identity sentence only, so the
 // profile's guidelines stay in force. Absent/blank means "the trusted profile",
 // which is why an untouched harness produces byte-identical system messages.
+//
+// T27: the CONFIGURATION form is split out because a host that adds a member to an
+// ALREADY-BUILT harness (`harness.addAgent`, the server's session agent-binding route)
+// needs the same trusted composition without constructing a brain the runtime would
+// then throw away. `agentFromProfile` is exactly `agent()` over this value, so a fresh
+// session and a session-scoped binding can never compose a prompt differently.
+export const agentConfigurationFromProfile = (
+    name: string,
+    settings: RunnerSettings,
+    model?: string,
+    instruction?: string
+): AgentConfiguration => {
+    // T19: the text comes from the EFFECTIVE profile — the trusted catalogue entry with the
+    // global override layer merged (./agent-state.ts). The catalogue object itself stays
+    // frozen; a merged profile is always a fresh object, so nothing here can write back into
+    // `src/agents`. Resolution happens NOW (at session build), which is precisely why a
+    // global agent edit reaches future sessions only: an agent built earlier is a separate
+    // object that nobody re-seeds.
+    //
+    // An unknown id still throws the catalogue's own error (it lists the known set), and a
+    // RETIRED profile is a 409 naming the retirement rather than a crash or a silent fall
+    // back to the shipped text.
+    if (!isAgentProfileName(name)) agentProfile(name);
+
+    const profile = effectiveAgentProfile(name);
+
+    if (profile === undefined) {
+        throw new AgentStateError(
+            409,
+            `Agent "${name}" has been retired on this deployment, so a new session cannot select it. Existing sessions keep the agents they were built with.`
+        );
+    }
+
+    const override = model === undefined ? '' : model.trim();
+
+    return {
+        name,
+        model: override.length > 0 ? override : settings.model,
+        // The per-HARNESS override wins over the global one (a harness-level choice is the
+        // more specific decision); the profile's guidelines — global override or shipped —
+        // are always composed below the identity sentence.
+        instruction: agentInstruction(profile, instruction),
+        provider: providerOf(settings)
+    };
+};
+
 export const agentFromProfile = (
     name: string,
     settings: RunnerSettings,
     model?: string,
     instruction?: string
-): Agent => {
-    const profile = agentProfile(name);
-    const override = model === undefined ? '' : model.trim();
-
-    return agent({
-        name,
-        model: override.length > 0 ? override : settings.model,
-        instruction: agentInstruction(profile, instruction),
-        provider: providerOf(settings)
-    });
-};
+): Agent => agent(agentConfigurationFromProfile(name, settings, model, instruction));
 
 // Build the agent registry for a selected set. Order is the caller's: primary
 // first, then the allowlist, matching the descriptor's `agents` list. `agentModels`

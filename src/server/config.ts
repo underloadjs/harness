@@ -11,9 +11,15 @@
 // the server key". Without this rule a foreign base URL plus a blank key would
 // send the server's credential to a host of the caller's choosing.
 //
+// T28: the credential and the effective endpoint are separate arguments (`ProviderCredential`)
+// because the REST dispatcher's advertised `defaults` document is key-free by contract, while
+// its provider calls still need the real key. Nothing here accepts a boolean in place of a
+// key: an absent credential is "no key", never a placeholder string.
+//
 // Cross-references:
-//   - ./api.ts      — POST /models merges over the STORE's live settings
-//   - ./sessions.ts — SessionStore.create merges over the same settings
+//   - ./api.ts      — POST /models merges over the API's private settings channel
+//                     (`createHarnessApi({ settings })`) and passes `providerCredential()`
+//   - ./sessions.ts — SessionStore.create merges over the same settings, no credential arg
 //   - src/server/api.ts — maps SettingsError to its 400 status
 
 import type { RunnerSettings } from './harnesses/types';
@@ -374,19 +380,37 @@ export const loadConfiguration = (): ServerConfiguration => {
     };
 };
 
+// T28: a deployment credential, named APART from the settings it is scoped to.
+//
+// The rule this type exists to keep honest: a key belongs to ONE provider — the origin
+// and base path it was configured with. `defaults.baseURL` in `mergeSettings` is the
+// EFFECTIVE endpoint (it can move, e.g. a `PATCH /config base_url`), so it is not always
+// the provider the secret belongs to. A caller that holds the key separately (the REST
+// dispatcher: its `defaults` document is key-free by contract) states the pair here, and
+// the scope check compares against `credential.baseURL` instead.
+export type ProviderCredential = {
+    apiKey: string;
+    // The provider this key was issued for (origin + base path).
+    baseURL: string;
+};
+
 // Merge a client's per-session settings over the server defaults.
 //
 // Key resolution, in order:
 //   1. an explicit non-blank client key is used as given (trimmed);
 //   2. otherwise the server key is used ONLY when the effective base URL is the
-//      configured provider (same origin + base path, trailing slashes ignored);
+//      provider the key belongs to (same origin + base path, trailing slashes
+//      ignored) — `credential.baseURL` when one is supplied, else `defaults.baseURL`;
 //   3. otherwise the key is empty — the request goes out unauthenticated.
 //
 // `baseURL: ''` is kept as empty, which is how a live preset reports that it
 // needs one. `model: ''` falls back to the server model, like before.
 export const mergeSettings = (
     defaults: RunnerSettings,
-    input: Partial<RunnerSettings> | undefined
+    input: Partial<RunnerSettings> | undefined,
+    // Omitted = the credential lives in `defaults.apiKey` and is scoped to
+    // `defaults.baseURL` (the store's own settings object, unchanged behavior).
+    credential?: ProviderCredential
 ): RunnerSettings => {
     const requestedBaseURL = optionalString(input?.baseURL, 'baseURL');
     const requestedModel = optionalString(input?.model, 'model');
@@ -406,11 +430,19 @@ export const mergeSettings = (
     }
 
     const explicitKey = requestedApiKey?.trim() ?? '';
+
+    // T28: the (key, provider) pair the server credential belongs to. Stating it separately
+    // is what preserves the origin+base-path scope when the EFFECTIVE base URL has moved —
+    // a `/config` base_url patch changes where sessions go, not whose secret may travel.
+    // With no credential supplied the pair is the defaults themselves, exactly as before.
+    const serverKey = credential === undefined ? defaults.apiKey : credential.apiKey;
+    const scopeBaseURL = credential === undefined ? defaults.baseURL : credential.baseURL;
+
     const apiKey =
         explicitKey.length > 0
             ? explicitKey
-            : isSameProvider(baseURL, defaults.baseURL)
-              ? defaults.apiKey.trim()
+            : isSameProvider(baseURL, scopeBaseURL)
+              ? serverKey.trim()
               : '';
 
     return { baseURL, model, apiKey };

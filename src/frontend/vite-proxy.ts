@@ -1,9 +1,17 @@
-// The `/api` dev/preview proxy, kept out of `vite.config.ts` so it can be unit
-// tested without evaluating the whole Vite config (whose `import.meta.url` root
-// is not a file URL under Vitest).
+// The canonical dev/preview proxy (T14), kept out of `vite.config.ts` so it can be
+// unit tested without evaluating the whole Vite config (whose `import.meta.url`
+// root is not a file URL under Vitest).
 //
 // Both `yarn dev:frontend` and `yarn preview:frontend` use this single factory,
 // so the two launch modes can never drift onto different APIs.
+//
+// The browser now dials the SAME path it will use in production —
+// `/v1/harness/...` — because `/api` is gone from the contract. The proxy therefore
+// no longer rewrites a mount; it forwards the canonical path to wherever
+// HARNESS_DEV_API says the API lives (a service gateway mount, or any host/port),
+// and it must carry `ws: true`: the realtime plane is a WebSocket upgrade at
+// `/v1/harness/stream`, and an upgrade Vite does not proxy is a 404 the UI reads as
+// "no socket", not as a page error.
 
 // Where the harness API lives during UI development. The service gateway is the
 // normal host; the optional standalone launcher (`yarn dev:server`) serves the
@@ -79,26 +87,32 @@ export type ApiProxy = {
     // Overrides request headers on the proxied request. `origin` is the target's
     // URL.origin, making the request same-origin for the harness gate.
     headers: { origin: string };
+    // Proxy the HTTP upgrade as well. Without this the REST reads work and the
+    // realtime plane silently does not: `GET /v1/harness/stream` is an Upgrade
+    // request, and Vite answers an unproxied upgrade with its own 404.
+    ws: boolean;
     rewrite: (path: string) => string;
 };
 
-// The `/api` proxy must match the API mount, not every module whose filename
-// begins with "api". `main.ts` imports `./api` (the browser client), which Vite
-// rewrites to `/api.ts`; with a plain `'/api'` prefix the proxy intercepted that
-// source module and answered it with the upstream's connection error, so the
-// whole entry module graph failed and the page stayed blank — even though the
-// offline pane in main.ts (`showOffline`) was ready to render. Anchoring the
-// match to "/api" alone or "/api/..." keeps `/api.ts` (and any other `api*`
-// module) on the Vite side. Vite treats a proxy key starting with `^` as a
-// RegExp (https://vite.dev/config/server-options#server-proxy).
-export const API_PROXY_KEY = '^/api(?:/|$)';
+// The proxy must match the API mount, not every module whose filename begins with
+// "v1". Vite treats a proxy key starting with `^` as a RegExp
+// (https://vite.dev/config/server-options#server-proxy), so the anchored form
+// matches exactly `/v1/harness` and `/v1/harness/...`.
+export const API_PROXY_KEY = '^/v1/harness(?:/|$)';
 
-// Build the `/api` proxy from one mount base. The browser always asks for
-// `/api/...`; the target's path is the server's mount, so the same helper serves
-// both hosts:
+// The canonical path the browser dials, and the prefix the rewrite recognizes.
+// Kept as a literal (mirroring `HARNESS_API_ROOT` in ../shared/harness-api.ts,
+// which this config must not import at build time) so the proxy and the client
+// agree on one string.
+const CANONICAL_ROOT = '/v1/harness';
+
+// Build the proxy from one mount base. The browser always asks for
+// `/v1/harness/...`; the target's PATH is the upstream mount, so the same helper
+// serves every deployment:
 //
-//   http://127.0.0.1:5000/v1/harness -> /api/health => /v1/harness/health
-//   http://127.0.0.1:5181/api        -> /api/health => /api/health
+//   http://127.0.0.1:5000/v1/harness -> /v1/harness/health => /v1/harness/health
+//   http://127.0.0.1:5000            -> /v1/harness/health => /v1/harness/health
+//   http://127.0.0.1:5181/api        -> /v1/harness/health => /api/health
 //
 // Validated once here because this value ends up as every UI request's target.
 // A trailing slash is normalized away so the default does not produce `//`.
@@ -128,8 +142,12 @@ export const createApiProxy = (base: string): ApiProxy => {
     return {
         target: origin,
         changeOrigin: true,
+        ws: true,
         headers: { origin },
-        rewrite: (path: string) => path.replace(/^\/api/, mount)
+        // Swap ONLY the mount prefix: a query string (`?limit=25&cursor=…`) and the
+        // rest of the path survive untouched, which is what keeps a paged read and a
+        // cursor-based resume working through the dev proxy.
+        rewrite: (path: string) => `${mount}${path.slice(CANONICAL_ROOT.length)}`
     };
 };
 

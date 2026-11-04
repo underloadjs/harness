@@ -162,6 +162,11 @@ export type HarnessSessionRecord = {
     // Frozen descriptor the session reports (`harnessDefinition`).
     definition: HarnessDescriptor;
     settings: HarnessSessionSettingsRecord;
+    // T16 (ADDITIVE): the session's display title. `SessionSummary.title` /
+    // `UpdateSessionRequest.title` are contract-visible, so the field is durable: a rail that
+    // names a conversation must still name it after a restart. Absent means "no title" (every
+    // pre-T16 document), and it is preserved as absent on a round trip.
+    title?: string;
     status: SessionStatus;
     createdAt: number;
     updatedAt: number;
@@ -233,6 +238,52 @@ export type HarnessSessionRecord = {
     // Live per-agent models, recorded beside the snapshot so a PATCH accepted
     // during a run (where snapshot() refuses) still survives a restart.
     agentModels?: Record<string, string>;
+    // T27 (ADDITIVE): the agents BOUND AT SESSION SCOPE by `POST /sessions/{id}/agents`,
+    // as opposed to the members the harness definition shipped with. Membership itself is
+    // already durable inside `preset`/`definition` (both are the session's own frozen
+    // copies, and the runtime roster is rebuilt from them); this list carries only the
+    // provenance the contract exposes as `SessionAgentBinding.origin`. Absent means "no
+    // session-scoped binding" (every pre-T27 document) and stays absent on a round trip.
+    // Values are trimmed and de-duplicated, because the roster budget is a bound on REAL
+    // members and a duplicate entry would report one binding twice.
+    sessionAgents?: string[];
+};
+
+// T16: the persisted shape of the operator's global provider defaults. Deliberately
+// credential-free: the secret rule for `state.json` is that no api key is ever written into it,
+// so a key set over HTTP lives in the process only and a restart falls back to the environment.
+export type HarnessGlobalSettingsRecord = {
+    baseURL: string;
+    model: string;
+};
+
+// T19 (ADDITIVE): one trusted-catalogue agent profile as the GLOBAL override layer
+// records it. The shipped profile itself is compiled in (`src/agents`), so a record
+// stores ONLY what the operator changed plus the retirement flag — never a copy of the
+// catalogue text. A restart therefore replays decisions, not prompts, and an improved
+// shipped instruction still reaches a profile nobody overrode.
+//
+//   - `title`/`description`/`instruction`/`guidelines`: a stated field REPLACES the
+//     catalogue value for FUTURE sessions (existing sessions hold the agents they were
+//     built with, so they are untouched);
+//   - `retired: true`: the profile is out of the selectable catalogue (the DELETE
+//     route's tombstone). Absent means "not retired".
+//
+// WHY A SIBLING FILE AND NOT A `state.json` FIELD
+// -----------------------------------------------
+// `state.json` is one whole-document commit unit, and its writer (./sessions.ts
+// `document()`) builds every field it knows from the live store. The agent overlay is
+// REGISTRY state, not session state, and the store's document builder does not own it,
+// so the overlay lives in `<root>/harness/agents.json` with the same staging+rename
+// discipline. One writer per file means no carry-forward rule, no cross-thread cache,
+// and no chance of a session checkpoint silently dropping an operator's agent decision.
+export type HarnessAgentRecord = {
+    name: string;
+    title?: string;
+    description?: string;
+    instruction?: string;
+    guidelines?: string[];
+    retired?: boolean;
 };
 
 export type HarnessDatabase = {
@@ -247,6 +298,13 @@ export type HarnessDatabase = {
     // round trip. A deleted USER harness needs no entry here: its row is gone, and
     // nothing ships it.
     deleted?: string[];
+    // T16 (ADDITIVE): the operator's GLOBAL provider defaults, as changed by
+    // `PATCH /v1/harness/config`. Key-free by construction - the credential never enters this
+    // document (the secret rule: `state.json` holds no api key), so a process-start key from the
+    // environment stays the only source of one, and an explicitly overridden key stays in memory
+    // for the life of the process (documented on the route). Absent means "the shipped
+    // environment defaults" (every pre-T16 document).
+    globalSettings?: HarnessGlobalSettingsRecord;
     sessions: HarnessSessionRecord[];
 };
 
@@ -367,6 +425,54 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
         ...(agentInstructions === undefined ? {} : { agentInstructions }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`)
+    };
+};
+
+// T19: one global agent overlay record (see `HarnessAgentRecord`). An override field
+// that is present must be non-blank text; `guidelines` must be a list of non-blank
+// strings (an empty list is the explicit "no guidelines" the PATCH contract allows);
+// `retired` is the tombstone. A record with NO override and NO tombstone is accepted
+// and simply states "the shipped profile", which is what a rolled-back edit leaves.
+const readAgentRecord = (value: unknown, label: string): HarnessAgentRecord => {
+    const record = requireRecord(value, label);
+    const name = requireString(record.name, `${label}.name`).trim();
+
+    if (name.length === 0) throw new TypeError(`${label}.name must not be blank.`);
+
+    const optionalText = (field: string): string | undefined => {
+        const entry = record[field];
+
+        if (entry === undefined) return undefined;
+
+        const text = requireString(entry, `${label}.${field}`);
+
+        return text;
+    };
+
+    const guidelines =
+        record.guidelines === undefined
+            ? undefined
+            : (() => {
+                  const lines = requireStringArray(record.guidelines, `${label}.guidelines`);
+
+                  for (const [index, line] of lines.entries()) {
+                      if (line.trim().length === 0) {
+                          throw new TypeError(`${label}.guidelines[${index}] must not be blank.`);
+                      }
+                  }
+
+                  return lines;
+              })();
+
+    return {
+        name,
+        ...(optionalText('title') === undefined ? {} : { title: optionalText('title')! }),
+        ...(optionalText('description') === undefined ? {} : { description: optionalText('description')! }),
+        ...(optionalText('instruction') === undefined ? {} : { instruction: optionalText('instruction')! }),
+        ...(guidelines === undefined ? {} : { guidelines }),
+        ...(record.retired === undefined
+            ? {}
+            : { retired: requireBoolean(record.retired, `${label}.retired`) })
     };
 };
 
@@ -934,6 +1040,51 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
                   return mapped;
               })();
 
+    // T27 (durability): the session's display title. `sessions.ts` WRITES this field
+    // (sessionRecord, line 2506) and reads it back on restore (line 2973), and
+    // `SessionSummary.title` / `UpdateSessionRequest.title` are contract-visible — but this
+    // loader used to drop it, so a rename survived in memory only until the next restart:
+    // the document on disk named the conversation and the rebuilt session did not. It is
+    // now validated and preserved, and preserved as ABSENT when absent (a pre-T16 document
+    // still round-trips byte-for-byte).
+    //
+    // Normalization is a trim, plus "blank means no title". The length cap is the WRITER's
+    // (sessions.ts `renameSession` slices to 200) and is deliberately NOT enforced here:
+    // throwing on an over-long hand-edited value would drop the whole session
+    // (readHarnessDatabase fails => the store reports a restore error for that record),
+    // which is a worse outcome than displaying a long name.
+    const title = (() => {
+        if (record.title === undefined) return undefined;
+
+        const text = requireString(record.title, `${label}.title`).trim();
+
+        return text.length === 0 ? undefined : text;
+    })();
+
+    // T27: the session-scoped binding list. OPTIONAL in both directions; values are trimmed,
+    // a blank entry is corruption of the named slot (a roster member name cannot be blank),
+    // and duplicates collapse because they name one binding.
+    const sessionAgents =
+        record.sessionAgents === undefined
+            ? undefined
+            : (() => {
+                  const names: string[] = [];
+
+                  const listed = requireStringArray(record.sessionAgents, `${label}.sessionAgents`);
+
+                  for (const [index, entry] of listed.entries()) {
+                      const name = entry.trim();
+
+                      if (name.length === 0) {
+                          throw new TypeError(`${label}.sessionAgents[${index}] must not be blank.`);
+                      }
+
+                      if (!names.includes(name)) names.push(name);
+                  }
+
+                  return names;
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         harness: requireString(record.harness, `${label}.harness`),
@@ -947,6 +1098,9 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         createdAt: requireNumber(record.createdAt, `${label}.createdAt`),
         updatedAt: requireNumber(record.updatedAt, `${label}.updatedAt`),
         ...(lastError === undefined ? {} : { lastError }),
+        // T27: preserved only when the document actually carries it (see above).
+        ...(title === undefined ? {} : { title }),
+        ...(sessionAgents === undefined ? {} : { sessionAgents }),
         turns,
         queue,
         ...(threadSequence === undefined ? {} : { threadSequence }),
@@ -1016,6 +1170,63 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
                   return names;
               })();
 
+    // T27 (durability): the operator's saved global provider defaults. `sessions.ts` WRITES
+    // this field (`databaseRecord`, line 2602) and `createHarnessApi` reads it back at
+    // construction (`store.globalSettings`, api.ts:756) — but this loader dropped it, so a
+    // saved `PATCH /config` was durable on disk and forgotten on the next boot: the file
+    // carried the operator's base URL/model while every session got the shipped defaults.
+    //
+    // Rules, in the order the type allows:
+    //   - OPTIONAL in both directions: an absent field stays absent, so a document from a
+    //     deployment that never touched `/config` keeps its exact pre-T16 shape;
+    //   - each present value must be a non-blank string after trimming (the same shape the
+    //     writer produces — `updateGlobalSettings` stores exactly what `/config` validated);
+    //   - either field may appear alone, because `HarnessGlobalSettingsRecord` is built as a
+    //     partial by the writer and a reset deletes one key rather than the whole map;
+    //   - an `apiKey` key is REFUSED, not dropped, mirroring the per-session rule above: the
+    //     documented invariant is that state.json holds no credential, so a foreign writer
+    //     that stored one must surface as corruption rather than silently lose the secret.
+    const globalSettings =
+        record.globalSettings === undefined
+            ? undefined
+            : (() => {
+                  const entry = requireRecord(record.globalSettings, 'The harness database globalSettings');
+
+                  if (Object.prototype.hasOwnProperty.call(entry, 'apiKey')) {
+                      throw new TypeError('The harness database globalSettings must not contain an API key.');
+                  }
+
+                  const readField = (key: 'baseURL' | 'model'): string | undefined => {
+                      const value = entry[key];
+
+                      if (value === undefined) return undefined;
+
+                      const text = requireString(value, `The harness database globalSettings.${key}`).trim();
+
+                      if (text.length === 0) {
+                          throw new TypeError(
+                              `The harness database globalSettings.${key} must not be blank.`
+                          );
+                      }
+
+                      return text;
+                  };
+
+                  const baseURL = readField('baseURL');
+                  const model = readField('model');
+
+                  if (baseURL === undefined && model === undefined) {
+                      throw new TypeError(
+                          'The harness database globalSettings must carry at least one of baseURL or model.'
+                      );
+                  }
+
+                  return {
+                      ...(baseURL === undefined ? {} : { baseURL }),
+                      ...(model === undefined ? {} : { model })
+                  } as HarnessGlobalSettingsRecord;
+              })();
+
     // Duplicate ids would make the Map silently keep only one session.
     const ids = new Set<string>();
     for (const session of sessions) {
@@ -1031,6 +1242,9 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
         savedAt: requireNumber(record.savedAt, 'The harness database savedAt'),
         registry,
         ...(deleted === undefined ? {} : { deleted }),
+        // Key order mirrors `sessions.ts` `databaseRecord`, so a load+save of a document that
+        // already carries the field does not reorder it.
+        ...(globalSettings === undefined ? {} : { globalSettings }),
         sessions
     };
 };
@@ -1382,3 +1596,90 @@ export class HarnessPersistence {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// T19: the durable global AGENT overlay (`<root>/harness/agents.json`)
+// ---------------------------------------------------------------------------
+//
+// One JSON array of `HarnessAgentRecord`, committed with the same staging+fsync+rename
+// discipline as `state.json` (it IS `writeHarnessDatabaseFile`, whose durability boundary
+// and staging-collision rules are already the package's). The file is small and written
+// only by an operator agent mutation, so a synchronous commit is the right trade and
+// keeps the mutation's "durable before the response" rule identical to a harness edit.
+//
+// A missing file means "no decisions recorded" (every pre-T19 database), and an empty
+// array round-trips to the same file shape, so `PATCH`-then-revert leaves an auditable
+// empty document rather than deleting state behind the operator's back.
+export const HARNESS_AGENT_FILE = 'agents.json';
+
+export const harnessAgentFileOf = (root: string): string =>
+    path.join(resolveHarnessDatabaseRoot(root), HARNESS_DATABASE_DIRECTORY, HARNESS_AGENT_FILE);
+
+// Read the overlay. Absent file -> []; a corrupt or foreign file is a LOUD failure
+// naming the path, exactly like `state.json` (a silently ignored overlay would let a
+// restart resurrect a retired agent while claiming durability).
+export const readHarnessAgentRecords = (root: string | undefined): HarnessAgentRecord[] => {
+    if (root === undefined || root.length === 0) return [];
+
+    const file = harnessAgentFileOf(root);
+
+    let text: string;
+
+    try {
+        text = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+        const failure = error as NodeJS.ErrnoException;
+
+        if (failure.code === 'ENOENT') return [];
+
+        throw new HarnessPersistenceError(file, `Could not read the harness agent overlay: ${messageOf(error)}`);
+    }
+
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(text);
+    } catch (error) {
+        throw new HarnessPersistenceError(file, `The harness agent overlay is not valid JSON: ${messageOf(error)}`);
+    }
+
+    if (!Array.isArray(parsed)) {
+        throw new TypeError('The harness agent overlay must be an array of agent records.');
+    }
+
+    const records = parsed.map((entry, index) => readAgentRecord(entry, `agents[${index}]`));
+    const seen = new Set<string>();
+
+    for (const record of records) {
+        if (seen.has(record.name)) {
+            throw new TypeError(`The harness agent overlay lists agent "${record.name}" more than once.`);
+        }
+
+        seen.add(record.name);
+    }
+
+    return records;
+};
+
+// Commit the overlay. No root means an in-memory deployment: nothing is durable and the
+// caller's answer says so (`restored_by_restart`), so this is a no-op rather than a lie.
+let agentStaging = createHarnessStagingSequence();
+
+export const writeHarnessAgentRecords = (
+    root: string | undefined,
+    records: readonly HarnessAgentRecord[]
+): void => {
+    if (root === undefined || root.length === 0) return;
+
+    const file = harnessAgentFileOf(root);
+
+    writeHarnessDatabaseFile(
+        path.dirname(file),
+        file,
+        JSON.stringify([...records], null, 2),
+        // The staging prefix is `state.json.` by construction of that helper; the
+        // `agents` owner keeps this writer's names disjoint from the store's and from
+        // any other process, which is the property that matters.
+        { owner: 'agents', sequence: agentStaging }
+    );
+};

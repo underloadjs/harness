@@ -178,6 +178,27 @@ import {
     readAgentResultReferenceList
 } from '../shared/agent-results';
 import type { AgentResultBlock, AgentResultReference, AgentResultTurn } from '../shared/agent-results';
+// T16: the stream contract's resource-kind vocabulary, deep-imported (the shared barrel collides
+// with the server's own names). It is a TYPE-only dependency: the store answers the broker's
+// existence question with the same key the hub and REST stamp revisions under.
+import type { StreamResourceKind } from '../shared/harness-stream';
+
+/**
+ * T16: split a hub composite key (`session:turn`, `session:thread`) into its parts, accepting the
+ * plain id form a subscription carries too. The fallback session id comes from the subscription's
+ * own `session_id`, which is how a turn/thread resource addressed under a session scope resolves.
+ */
+const splitStreamKey = (id: string, fallbackSessionId?: string): [string | undefined, string | undefined] => {
+    const separator = id.indexOf(':');
+
+    if (separator < 0) {
+        // A plain child id is meaningless without its session scope, and a plain session id is a
+        // whole id: with a scope present, treat it as the child; without one, as the session.
+        return fallbackSessionId === undefined ? [id, undefined] : [fallbackSessionId, id];
+    }
+
+    return [id.slice(0, separator), id.slice(separator + 1)];
+};
 import { validateActionChoice } from '../core/action';
 // C4: the ONE transcript reader (`readHarnessMessages`) shared by snapshot(),
 // restore() and the transcript editor, so the server can never persist a
@@ -190,6 +211,14 @@ import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
 // executes it, so a host can never disagree with the server about what "/x" means.
 import { parseCommandLine } from '../core/command';
 import { describeHarness } from './harnesses/descriptor';
+// T27: a session-scoped agent binding composes its brain from the SAME trusted profile the
+// preset factory uses (./harnesses/toolbox.ts `agentConfigurationFromProfile`), so a member
+// added at runtime and a member a restart rebuilds cannot disagree about the prompt, the
+// model, or the provider transport. `effectiveAgentProfile`/`agentInstruction` are the two
+// halves of clearing an override back to the deployment's current text.
+import { agentConfigurationFromProfile } from './harnesses/toolbox';
+import { effectiveAgentProfile } from './harnesses/agent-state';
+import { agentInstruction, isAgentProfileName } from '../agents';
 import {
     createHarnessRegistry,
     HarnessRegistryError,
@@ -225,7 +254,7 @@ import { openHarnessIoClient } from './workers';
 import type { HarnessIoClient, IoCloseSummary } from './workers';
 import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
-import type { HarnessDatabase, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
+import type { HarnessDatabase, HarnessGlobalSettingsRecord, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
 import type {
     CancelThreadResult,
     HarnessDescriptor,
@@ -306,6 +335,24 @@ const ACTION_SESSION_GONE_MESSAGE =
     'The session was removed before the action request was answered.';
 const ACTION_DUPLICATE_MESSAGE = 'An action request with this requestId is already pending.';
 
+/**
+ * T16: map an action settlement to the contract's closed `action.closed` reason set
+ * (`WsActionClosed.reason`, src/shared/harness-stream.ts). The store's rejection TEXT is written
+ * for the model, so the classification is done on the stable phrases above rather than on a
+ * guess: cancel wording is `cancelled`, a run that finished without an answer is `ended`, and
+ * everything else (a removed session, a stale promise) is `expired`.
+ */
+const actionClosedReason = (outcome: { ok: boolean; error?: unknown }): 'answered' | 'expired' | 'cancelled' | 'ended' => {
+    if (outcome.ok) return 'answered';
+
+    const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error ?? '');
+
+    if (/cancel/i.test(message)) return 'cancelled';
+    if (/ended/i.test(message)) return 'ended';
+
+    return 'expired';
+};
+
 // One unanswered owner question, registered by the host callback that the runtime
 // awaits. The store owns the resolver: POST /sessions/:id/actions/:requestId/answer
 // settles it exactly once, and cancellation/removal rejects it so the runtime's
@@ -320,6 +367,12 @@ type PendingAction = {
     // route re-validates the choice against it, so an option id the model never
     // offered is a 400 rather than an answer the runtime must trust.
     request: HarnessActionRequest;
+    // T13: the requesting agent and the instant the question opened. The canonical
+    // `PendingAction` row (src/shared/harness-api.ts) states `agent` and `received_at`,
+    // and this record is the ONLY place those facts exist while the question is live: the
+    // recorded `action_request` event belongs to a turn that may already have moved on.
+    agent: string;
+    openedAt: number;
     // The handler's own promise settlement (exposed so the store can settle it).
     settle: (outcome: HarnessActionOutcome) => void;
     // Run signal the runtime supplied; an abort expires the pending entry.
@@ -373,7 +426,7 @@ const VIEW_CHECKPOINT_INTERVAL_MS = 2_000;
 //     sibling lane's work.
 // Independent lanes execute concurrently; the session-level `busy` gate (legacy
 // run or manual tool call) parks every lane's pump, exactly like the legacy queue.
-type ThreadLane = {
+export type ThreadLane = {
     threadId: string;
     queue: SessionTurn[];
     active?: SessionTurn;
@@ -416,7 +469,11 @@ type TurnExecutionOptions = {
     freshBlock?: boolean;
 };
 
-type Session = {
+// T13: exported for the canonical REST read model (./api-reads.ts), which needs the LIVE
+// record to build bounded pages. The name stays internal otherwise; `SessionRecord` is the
+// alias the read layer imports so a reader knows it is a live view, never a detached
+// snapshot. Nothing outside this package should treat these fields as a wire contract.
+export type Session = {
     id: string;
     // The resolved preset THIS session runs. Captured at creation; the registry
     // replacing its entry later does not reach into this object.
@@ -430,6 +487,19 @@ type Session = {
     createdAt: number;
     updatedAt: number;
     lastError?: string;
+    // T16: the session's display title (durable, see `HarnessSessionRecord.title`). The contract
+    // names the field on a session row and on a session PATCH, so it lives on the record rather
+    // than in a process-only map.
+    title?: string;
+    // T27: the members BOUND AT SESSION SCOPE (`POST /sessions/{id}/agents`) rather than
+    // inherited from the harness definition. Membership itself lives in `definition.agents`
+    // and `preset.agents` (the session's own frozen copies), so this list carries exactly the
+    // one fact those copies cannot state: which rows the contract reports as
+    // `origin: "session"` instead of `origin: "definition"`, and therefore which bindings a
+    // later `DELETE` may detach again. Durable (`HarnessSessionRecord.sessionAgents`); a
+    // session that never bound anything keeps its pre-T27 document shape with the field
+    // absent.
+    sessionAgents: string[];
     controller?: AbortController;
     // Assigned only while a run is streaming. A progress event with no sink (the
     // harness should not produce one then) is dropped rather than buffered.
@@ -587,6 +657,13 @@ type Session = {
     checkpointAt: number;
 };
 
+// T13: the two aliases the canonical read model imports (./api-reads.ts). A live view,
+// never a detached copy: the read layer must not pay a `snapshot()` to answer a page, and
+// it must never write through these. `ThreadLaneInfo` exists for the same reason - the
+// per-lane backlog is where `queue_depth` and the queue page actually live.
+export type SessionRecord = Session;
+export type ThreadLaneInfo = ThreadLane;
+
 // What start.ts/runtime.ts hand the store (R3b). `persistence` owns the file,
 // `database` is the document already loaded from it. Both are optional: without
 // them the store is the previous in-memory implementation. `onPersistenceError`
@@ -642,6 +719,40 @@ export class SessionError extends Error {
 // `settled` resolves when THIS turn is terminal (or dropped by a cancel-all), so
 // tests and tools can await the server's work without polling. The HTTP layer
 // ignores it: a submit must never wait for execution.
+/**
+ * T16: one live change the store announces to the realtime hub (see `SessionStore.setStreamObserver`).
+ *
+ * Identity only, plus the display ops the recorder already produced. A signal never carries a
+ * turn record, a session snapshot, or a view document: the observer rebuilds the one small wire
+ * body (a `TurnSummary` row, a `SessionStatePatch`, a `UsagePatch`, a roster row, a transcript
+ * signal) from the live record, which keeps a live update's cost proportional to what changed.
+ */
+export type StoreStreamSignal =
+    | { kind: 'turn.upsert'; sessionId: string; turnId: string; at: number }
+    | { kind: 'turn.removed'; sessionId: string; turnId: string; at: number }
+    | { kind: 'session.state'; sessionId: string; at: number }
+    | { kind: 'display.ops'; sessionId: string; turnId: string; ops: TurnDisplayOp[]; at: number }
+    | { kind: 'usage.updated'; sessionId: string; turnId: string; at: number }
+    | { kind: 'action.opened'; sessionId: string; requestId: string; at: number }
+    | {
+          kind: 'action.closed';
+          sessionId: string;
+          requestId: string;
+          // Why the question stopped waiting, in the contract's closed vocabulary: answered by an
+          // owner, expired with its run, cancelled, or ended when the run finished without one.
+          reason: 'answered' | 'expired' | 'cancelled' | 'ended';
+          at: number;
+      }
+    | { kind: 'thread.upsert'; sessionId: string; threadId: string; at: number }
+    | { kind: 'thread.removed'; sessionId: string; threadId: string; at: number }
+    | { kind: 'transcript.updated'; sessionId: string; threadId: string; at: number };
+
+/** The live-change observer shape installed by the REST owner (./api.ts owns the hub). */
+export type StoreStreamObserver = (signal: StoreStreamSignal) => void;
+
+/** The resource-existence question the stream broker asks before it accepts a subscription. */
+export type StreamScopeIdView = { session_id?: string; thread_id?: string; turn_id?: string };
+
 export type EnqueuedTask = {
     session: SessionSnapshot;
     turn: SessionTurn;
@@ -1299,6 +1410,9 @@ export class SessionStore {
     // created LAZILY: an inline store never touches `node:worker_threads`, and a worker store
     // with no running session spawns nothing.
     private readonly runtime: ServerRuntimeConfiguration;
+    // T16: the operator's saved global provider defaults (credential-free; see
+    // `HarnessGlobalSettingsRecord`). `undefined` means "the shipped environment defaults".
+    private global: HarnessGlobalSettingsRecord | undefined;
 
     private host?: LaneHost;
 
@@ -1360,6 +1474,11 @@ export class SessionStore {
         this.persistence = options.persistence;
         this.onPersistenceError = options.onPersistenceError;
         this.onRestoreError = options.onRestoreError;
+
+        // T16: the operator's saved GLOBAL provider defaults (base URL + model). Read straight
+        // from the document the host already loaded, so a `PATCH /config` survives a restart
+        // instead of silently reverting to the environment. The credential is never in here.
+        this.global = options.database?.globalSettings;
 
         // R3: the runtime is already validated (./config.ts resolveRuntimeConfiguration), and
         // ./runtime.ts asserted readiness BEFORE constructing this store. A missing option is
@@ -1512,6 +1631,194 @@ export class SessionStore {
         return this.sessions.size;
     }
 
+    // -----------------------------------------------------------------------
+    // T13: bounded reads for the canonical REST surface (./api-reads.ts).
+    //
+    // These hand out the LIVE record, never a `snapshot()`. `get()`/`list()` deep-copy
+    // every turn, every event, the transcripts, and the core snapshot - which is exactly
+    // the multi-megabyte boot cost the target contract removes. A REST page instead reads
+    // counters (`turns.length`), the per-turn projection cache, and the harness thread
+    // RECORDS, so its cost is the page size and nothing else. Read-only by contract: the
+    // read layer never writes through these.
+    // -----------------------------------------------------------------------
+
+    /** The live record of one session. Unknown id answers 404, exactly like `get()`. */
+    liveSession(id: string): SessionRecord {
+        return this.require(id);
+    }
+
+    /** Every live record, insertion order. Identity and counters only - no turn is copied. */
+    liveSessions(): SessionRecord[] {
+        return [...this.sessions.values()];
+    }
+
+    /** The live record when it exists, without throwing (for reads that answer 404 themselves). */
+    peekSession(id: string): SessionRecord | undefined {
+        return this.sessions.get(id);
+    }
+
+    /**
+     * The display projector of one turn: the SAME cached instance the recorder folds every
+     * stored event through, so `summary()`/`display()` are cache reads. A turn the store
+     * has never projected (a restored document) is folded here once and cached, which is
+     * the only case where a request pays for a fold at all.
+     */
+    turnProjector(id: string, turnId: string): TurnProjector | undefined {
+        const session = this.require(id);
+
+        return this.peekTurnProjector(session, turnId);
+    }
+
+    /** Projector lookup against a record already in hand (no second id resolution). */
+    peekTurnProjector(session: SessionRecord, turnId: string): TurnProjector | undefined {
+        const turn = session.turns.find((candidate) => candidate.id === turnId);
+
+        if (turn === undefined) return undefined;
+
+        return this.projectorFor(session, turn);
+    }
+
+    /** The live turn record (not copied) for count and ordinal reads. */
+    peekTurn(session: SessionRecord, turnId: string): SessionTurn | undefined {
+        return session.turns.find((candidate) => candidate.id === turnId);
+    }
+
+    /**
+     * T16: the stream broker's existence question (`src/server/stream/mount.ts` calls this
+     * through `StreamStoreLookups.streamExists`), answered from the live maps.
+     *
+     * WHY THE STORE OWNS IT: `unknown_resource` is a claim about the server's data, so the
+     * component that holds the data answers it. The bridge previously accepted any id because no
+     * lookup existed; with this one a subscription to a conversation, turn, or session that is
+     * not there is refused honestly.
+     *
+     * WHY IT IS CHEAP: every branch is a map lookup or an id scan of a bounded list, and nothing
+     * here builds a snapshot, folds a projection, or copies a record. The composite hub key
+     * (`session:turn`, `session:thread`) and the plain subscription ids are both accepted, so the
+     * counter key and the existence question address the same instance.
+     */
+    streamExists(
+        resource: StreamResourceKind,
+        id: string | null,
+        ids: StreamScopeIdView = {}
+    ): boolean {
+        // Host-wide kinds have no instance to look up: the registry/catalogue owns them, and a
+        // subscription to the collection is always addressable.
+        if (id === null) return true;
+
+        if (resource === 'harnesses' || resource === 'agents' || resource === 'tools' || resource === 'config') {
+            return true;
+        }
+
+        if (resource === 'turn' || resource === 'turn_display' || resource === 'turn_events') {
+            const [sessionId, turnId] = splitStreamKey(id, ids.session_id);
+
+            return this.hasTurn(sessionId, turnId);
+        }
+
+        if (resource === 'thread' || resource === 'transcript' || resource === 'transcript_messages') {
+            const [sessionId, threadId] = splitStreamKey(id, ids.session_id);
+
+            return this.hasThread(sessionId, threadId);
+        }
+
+        return this.hasSession(id);
+    }
+
+    /** Cheap session existence check (no snapshot, no copy). */
+    hasSession(id: string | undefined): boolean {
+        return id !== undefined && this.sessions.has(id);
+    }
+
+    /** Cheap conversation existence check, including a conversation that is only an unreadable transcript. */
+    hasThread(sessionId: string | undefined, threadId: string | undefined): boolean {
+        if (sessionId === undefined || threadId === undefined) return false;
+
+        const session = this.sessions.get(sessionId);
+
+        if (session === undefined) return false;
+        if (session.invalidThreads.has(threadId)) return true;
+
+        return this.threadsSupported(session) && session.harness.thread(threadId) !== undefined;
+    }
+
+    /** Cheap turn existence check. */
+    hasTurn(sessionId: string | undefined, turnId: string | undefined): boolean {
+        if (sessionId === undefined || turnId === undefined) return false;
+
+        const session = this.sessions.get(sessionId);
+
+        return session !== undefined && session.turns.some((turn) => turn.id === turnId);
+    }
+
+    // -----------------------------------------------------------------------
+    // T16: the durable fields the canonical contract names
+    // -----------------------------------------------------------------------
+
+    /**
+     * Rename a session (`PATCH /sessions/{id}` with `title`), durably: the document carrying the
+     * new title is written BEFORE the caller answers, which is the store's rule for every
+     * structural mutation. `null` (or blank) clears the title. The in-memory store has no
+     * persistence, so the same call is a plain state change there - the shape of the answer does
+     * not differ between the two modes.
+     */
+    async renameSession(id: string, title: string | null): Promise<SessionRecord> {
+        const session = this.require(id);
+
+        if (title === null) delete session.title;
+        else {
+            // Bound here rather than in the dispatcher: the field is user text, and the store is
+            // the component that decides what its document may hold.
+            const trimmed = title.trim();
+
+            if (trimmed.length === 0) delete session.title;
+            else session.title = trimmed.slice(0, 200);
+        }
+
+        session.updatedAt = Date.now();
+
+        await this.persistOrThrow();
+
+        return session;
+    }
+
+    /**
+     * The operator's saved global provider defaults, or `undefined` when the deployment has never
+     * changed them. Credential-free by construction: `state.json` holds no api key, so a key set
+     * over HTTP is PROCESS-ONLY and a restart falls back to the environment (the route says so).
+     */
+    get globalSettings(): HarnessGlobalSettingsRecord | undefined {
+        return this.global;
+    }
+
+    /**
+     * Change the global defaults (`PATCH /config`) and make the change durable BEFORE the answer.
+     * A `null` value resets that field to the shipped default, which is what the contract's
+     * `null`-means-reset rule requires, so the reset target survives a restart too.
+     */
+    async updateGlobalSettings(settings: {
+        baseURL?: string | null;
+        model?: string | null;
+    }): Promise<HarnessGlobalSettingsRecord | undefined> {
+        const current: Partial<HarnessGlobalSettingsRecord> = { ...(this.global ?? {}) };
+
+        if (settings.baseURL !== undefined) {
+            if (settings.baseURL === null) delete current.baseURL;
+            else current.baseURL = settings.baseURL;
+        }
+
+        if (settings.model !== undefined) {
+            if (settings.model === null) delete current.model;
+            else current.model = settings.model;
+        }
+
+        this.global = Object.keys(current).length === 0 ? undefined : (current as HarnessGlobalSettingsRecord);
+
+        await this.persistOrThrow();
+
+        return this.global;
+    }
+
     // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
     // still returns after the synchronous rename; with an IO client it resolves on the
     // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
@@ -1551,6 +1858,21 @@ export class SessionStore {
         try {
             harness = this.buildHarness(preset, settings, () => session);
         } catch (error) {
+            // T27: a build failure that ALREADY carries an HTTP status is propagated, not
+            // re-numbered. The case that matters is a retired agent profile: `agent-state`
+            // decides `AgentStateError(409, "…retired…cannot select it")` because the
+            // refusal is a deployment decision, not a malformed request, and this catch used
+            // to turn it into a 400 with the same text. A client that branches on 409 (the
+            // profile is unusable here, so offer another) was told its body was wrong.
+            //
+            // The rule is by capability, not by class name: anything that states a status
+            // (`AgentStateError`, `HarnessRegistryError`, a `SessionError` from deeper in the
+            // build) keeps its own status and message, and only a statusless throw — a real
+            // configuration bug in the preset factory — becomes the 400 receipt.
+            const status = (error as { status?: unknown } | undefined)?.status;
+
+            if (typeof status === 'number' && status >= 400) throw error;
+
             throw new SessionError(400, `Could not build harness "${presetName}": ${messageOf(error)}`);
         }
 
@@ -1582,6 +1904,8 @@ export class SessionStore {
             invocationThreads: new Map(),
             // C4: a fresh session has no unreadable transcript by construction.
             invalidThreads: new Map(),
+            // T27: a fresh session has exactly the members its definition shipped with.
+            sessionAgents: [],
             legacyRunning: false,
             watchers: new Set(),
             pumping: false,
@@ -1908,6 +2232,9 @@ export class SessionStore {
                 requestId: context.requestId,
                 ...(scopedThreadId === undefined ? {} : { threadId: scopedThreadId }),
                 request: context.request,
+                // T13: the agent the runtime named, plus the accept time of the question.
+                agent: context.agent,
+                openedAt: Date.now(),
                 signal,
                 settled: false,
                 onAbort: () => {
@@ -1978,6 +2305,18 @@ export class SessionStore {
         pending.signal.removeEventListener('abort', pending.onAbort);
 
         this.rememberCompletedAction(session, pending.requestId);
+
+        // T16: one `action.closed` per settlement, from the ONE settlement point, so a client
+        // clears exactly one question card and the `actions` counter moves whether the answer
+        // came from an owner, an abort, or the run ending. The reason is the contract's closed
+        // vocabulary; the readable text stays in the rejection the runtime already sees.
+        this.notifyStream({
+            kind: 'action.closed',
+            sessionId: session.id,
+            requestId: pending.requestId,
+            reason: actionClosedReason(outcome),
+            at: Date.now()
+        });
 
         pending.settle(outcome);
     }
@@ -2132,7 +2471,40 @@ export class SessionStore {
     // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
     // drops the await cannot claim the mutation survived a restart.
     async persistRegistry(): Promise<void> {
+        // T27: a registry commit is also a SESSION-document commit — `databaseRecord` writes
+        // every session's `core` into the same file — so the snapshots it persists have to
+        // describe the harnesses as they now are. Before this, a REST tool write
+        // (`PATCH/DELETE /sessions/{id}/tools/{name}`, a registration, a `toolManage`
+        // enable/disable/remove) mutated the live harness and committed a document whose `core`
+        // was whatever the run-boundary observer had last captured, because the registration
+        // kernel reports through its own result rather than through `stateChange`. The route
+        // worked around that by taking a throwaway snapshot for its receipt, which left the
+        // PERSISTED document behind: a restart came back with the pre-write core, and
+        // `GET /sessions/{id}` disagreed with the response it had just produced.
+        //
+        // The refresh is here, in the store's own durable-commit boundary, so no dispatcher can
+        // forget it. Sessions with live work are SKIPPED: their `core` is maintained at
+        // mutation boundaries by the observer, and snapshotting mid-run here would attribute a
+        // half-finished turn's partial state to a registry edit that has nothing to do with it.
+        this.refreshIdleCores();
+
         await this.persistOrThrow();
+    }
+
+    // Rewind-proof core refresh: one snapshot per idle session, best-effort. A snapshot that
+    // throws (a harness in a state its own snapshot refuses) leaves that session's last good
+    // `core` in place rather than failing a registry write for an unrelated session.
+    private refreshIdleCores(): void {
+        for (const session of this.sessions.values()) {
+            if (session.busy || this.laneActive(session)) continue;
+
+            try {
+                session.core = session.harness.snapshot();
+            } catch {
+                // The previous snapshot stays committed; the run-boundary observer is still the
+                // owner of this session's state, and a later boundary refreshes it.
+            }
+        }
     }
 
     // T5: run a registry mutation (create / patch / DELETE) and commit it as ONE
@@ -2196,6 +2568,15 @@ export class SessionStore {
                 baseURL: session.settings.baseURL,
                 model: session.settings.model
             },
+            // T16: written only when the session actually has a title, so a document for an
+            // untouched session keeps its pre-T16 shape byte for byte.
+            ...(session.title === undefined ? {} : { title: session.title }),
+            // T27: the session-scoped binding list, written only when there is one (same
+            // additive rule as the title). Detached copy: the document handed to the writer is
+            // never the live array.
+            ...(session.sessionAgents.length === 0
+                ? {}
+                : { sessionAgents: [...session.sessionAgents] }),
             status: session.status,
             createdAt: session.createdAt,
             updatedAt: session.updatedAt,
@@ -2289,6 +2670,9 @@ export class SessionStore {
             // the row is simply missing from `registry`, and a fresh registry seeds
             // itself from the shipped templates.
             ...(deletedBuiltins.length === 0 ? {} : { deleted: [...deletedBuiltins] }),
+            // T16: the operator's global defaults, written only once they have been changed, so a
+            // document from a deployment that never touched `/config` keeps its exact shape.
+            ...(this.global === undefined ? {} : { globalSettings: { ...this.global } }),
             sessions: [...this.sessions.values()].map(
                 (session) => overrides?.get(session.id) ?? this.sessionRecord(session)
             )
@@ -2657,6 +3041,14 @@ export class SessionStore {
                     : record.lastError === undefined
                       ? {}
                       : { lastError: record.lastError }),
+                // T16: a saved title survives a restart, so a named conversation is still named
+                // when the rail comes back.
+                ...(record.title === undefined ? {} : { title: record.title }),
+                // T27: the session-scoped binding list. The roster itself is rebuilt from
+                // `record.preset`/`record.definition` (both copies carry the added member, which
+                // is why `presetFromRecord` below re-creates the team), and this list only marks
+                // which of those members the contract reports as `origin: "session"`.
+                sessionAgents: record.sessionAgents === undefined ? [] : [...record.sessionAgents],
                 busy: false,
                 cancelled: false,
                 turns,
@@ -3670,6 +4062,11 @@ export class SessionStore {
     private publishViewOps(session: Session, turnId: string, at: number, ops: TurnDisplayOp[]): void {
         if (ops.length === 0) return;
 
+        // T16: the ops list the recorder ALREADY produced rides to the hub by reference, so a
+        // live display update adds no fold, no copy, and no snapshot to the run - and the
+        // `turn_display` counter moves in the same instant the frame is fanned out.
+        this.notifyStream({ kind: 'display.ops', sessionId: session.id, turnId, ops, at });
+
         this.publishView(session, { type: 'ops', turnId, at, ops });
     }
 
@@ -4142,6 +4539,514 @@ export class SessionStore {
             if (!session.busy) session.core = session.harness.snapshot();
             throw error;
         }
+
+        return this.snapshot(session);
+    }
+
+    // -----------------------------------------------------------------------
+    // T27: session-scoped AGENT BINDINGS
+    // -----------------------------------------------------------------------
+    //
+    // WHAT THIS IS, AND WHY IT IS NOT A REBUILD
+    // -----------------------------------------
+    // A session's team used to be fixed at `POST /sessions`: whatever the harness definition
+    // listed. These three operations let one conversation gain a member, lose one, or retune
+    // what a member's prompt says, WITHOUT touching the conversation itself. The alternative
+    // every caller had was a history reset — the runtime's only wholesale text write was
+    // `setThreadMessages`, which replaces a committed transcript to change a prompt — so a
+    // retitled role cost the session its memory. It does not any more.
+    //
+    // THREE COPIES OF THE TRUTH MOVE TOGETHER, IN THIS ORDER:
+    //   1. the live runtime (`harness.addAgent`/`removeAgent`/`setAgentInstruction`) — what
+    //      the next turn actually runs, and the source every live read reports;
+    //   2. `session.preset` (a fresh LOCAL copy, never the registry object) — what a restart
+    //      rebuilds the team from, because `restoreSession` falls through to
+    //      `presetFromRecord(record.preset, …)` the moment this copy differs from the registry
+    //      entry, and that factory seeds each member from its trusted profile with exactly the
+    //      `agentModels`/`agentInstructions` maps written here;
+    //   3. `session.definition` (also a fresh copy) — what the roster read enumerates
+    //      (`api-reads.sessionAgentRowsOf` iterates `definition.agents`, and
+    //      `getSessionAgentInstruction` gates membership on it).
+    // Doing 1 without 2 gives a session that works until the next restart and then loses the
+    // member; 2 without 1 answers a read with a brain that does not exist. 3 is what makes the
+    // binding visible to the contract at all.
+    //
+    // WHAT STAYS FROZEN: `definition.agentModels`/`definition.agentInstructions` are the
+    // CREATION-time inherited baseline — that is what `SessionAgentBinding.inherited_model`
+    // reports — so a session override writes `preset.agentModels`/`preset.agentInstructions`
+    // only. Membership (`agents`/`subagents`) is the single definition field a binding is
+    // allowed to change, because the roster budget in the contract is defined over it.
+    //
+    // THE IDENTITY RULE (`name` must equal `profile`)
+    // -----------------------------------------------
+    // `CreateSessionAgentRequest` carries both, so a client may ask for a member called
+    // `extra` bound to profile `instruct`. That cannot be honoured across a restart: the team
+    // a session rebuilds from is the preset's `agents`/`subagents` NAME LIST, and each name is
+    // resolved through `agentFromProfile(name)` (./harnesses/toolbox.ts), so a roster key that
+    // is not itself a trusted profile id makes the restored session throw and get DROPPED. A
+    // rename would also silently change which profile the next build resolves. The store
+    // therefore refuses the mismatch up front instead of creating a session that cannot load.
+    //
+    // PROTECTED MEMBERS: the primary is never removable (it is the entry point, and
+    // `harness.name`/`handle.agent` point at it), and `session.definition.primary` is never
+    // replaced by a binding — promoting a member is a harness-definition edit
+    // (`PATCH /harnesses/{name}`), not a session-scoped binding.
+    //
+    // WHY THE IDLE GATE IS TOTAL: these writes change structure the run loop reads (the
+    // delegate allowlist, the per-request declaration list, the agent roster a snapshot
+    // enumerates). `busyOrPending` covers a legacy run, an active lane, AND accepted-but
+    // -unstarted turns, so a binding can never land between "a turn has read the roster" and
+    // "the same turn calls a member that just left". A 409 is retryable on a settled session;
+    // an unsafe history reset would have been silently destructive.
+
+    // The contract's roster budget (src/shared/harness-api.ts:951 states "the 64-binding
+    // roster budget"), and the same instruction ceiling the harness-definition PATCH applies
+    // (./harnesses/registry.ts:148). Named here because the store is the component that
+    // decides what its own document may hold.
+    private readonly maxSessionAgents = 64;
+    private readonly maxAgentInstructionChars = 8_000;
+
+    // The gate every binding write shares. `pendingCount` is included deliberately: a queued
+    // turn has already been accepted against the CURRENT roster.
+    private assertBindingIdle(session: Session, operation: string): void {
+        if (this.busyOrPending(session)) {
+            throw new SessionError(
+                409,
+                `Cannot ${operation} while session "${session.id}" has a live run or queued work; wait for it to settle or cancel it first.`
+            );
+        }
+    }
+
+    // Everything a binding write can change, captured BEFORE it mutates. `core` is the runtime
+    // half: `harness.restore(previousCore)` is the one structure-level undo the runtime offers,
+    // and it is safe precisely because the idle gate above proved no run owns this harness.
+    private captureBindingState(session: Session): {
+        preset: HarnessPreset;
+        definition: HarnessDescriptor;
+        sessionAgents: string[];
+        core: HarnessSnapshot;
+        updatedAt: number;
+    } {
+        return {
+            preset: session.preset,
+            definition: session.definition,
+            sessionAgents: [...session.sessionAgents],
+            core: session.core,
+            updatedAt: session.updatedAt
+        };
+    }
+
+    // Put the session back exactly as it was after a FAILED durable commit. The document was
+    // never replaced (`persistOrThrow` throws before the rename), so a restart already agrees
+    // with this state; only memory has to be rewound.
+    private rollbackBindingState(
+        session: Session,
+        previous: {
+            preset: HarnessPreset;
+            definition: HarnessDescriptor;
+            sessionAgents: string[];
+            core: HarnessSnapshot;
+            updatedAt: number;
+        }
+    ): void {
+        session.preset = previous.preset;
+        session.definition = previous.definition;
+        session.sessionAgents = previous.sessionAgents;
+        session.updatedAt = previous.updatedAt;
+
+        try {
+            session.harness.restore(previous.core);
+        } catch {
+            // A restore of a snapshot THIS harness produced cannot reasonably fail; if it does,
+            // the caller already has its 500 and the durable document is still the truth. The
+            // next restart replays that document, so the failed write is still not observable.
+        }
+
+        session.core = previous.core;
+    }
+
+    // Rewrite the two metadata copies for one binding change. `removed` drops the member from
+    // the roster lists and from both override maps; `added` appends it (after the primary, so
+    // `[primary, ...subagents]` stays the documented derivation); `model`/`instruction` are the
+    // session-scoped overrides to record, or `undefined` to leave the map alone (`null` clears
+    // an existing entry).
+    private applyBindingMaps(
+        session: Session,
+        agent: string,
+        change: {
+            added?: boolean;
+            removed?: boolean;
+            model?: string | null;
+            instruction?: string | null;
+        }
+    ): void {
+        const keep = (list: readonly string[]): string[] =>
+            change.removed === true ? list.filter((entry) => entry !== agent) : [...list];
+
+        const withAgent = (list: readonly string[]): string[] => {
+            const next = keep(list);
+
+            // Appended after the primary, which is already first by construction.
+            if (change.added === true && !next.includes(agent)) next.push(agent);
+
+            return next;
+        };
+
+        const override = (
+            map: Record<string, string> | undefined,
+            value: string | null | undefined
+        ): Record<string, string> => {
+            const next: Record<string, string> = { ...(map ?? {}) };
+
+            if (value === null || change.removed === true) delete next[agent];
+            else if (typeof value === 'string') next[agent] = value;
+
+            return next;
+        };
+
+        const previous = session.preset;
+        const models = override(previous.agentModels, change.model);
+        const instructions = override(previous.agentInstructions, change.instruction);
+
+        session.preset = {
+            ...previous,
+            agents: withAgent(previous.agents),
+            subagents: withAgent(previous.subagents),
+            ...(Object.keys(models).length === 0 ? {} : { agentModels: models }),
+            ...(Object.keys(instructions).length === 0 ? {} : { agentInstructions: instructions })
+        };
+
+        const definition = session.definition;
+
+        session.definition = {
+            ...copyDescriptor(definition),
+            agents: withAgent(definition.agents),
+            subagents: withAgent(definition.subagents)
+        };
+    }
+
+    /**
+     * Bind a trusted profile into THIS session (`POST /sessions/{id}/agents`).
+     *
+     * Returns the roster binding id, the model it runs, and the instruction source the
+     * contract reports, so the caller does not have to re-read the roster to answer 201.
+     * A refusal mutates nothing: validation runs before the runtime call, and a failed
+     * durable commit rewinds memory (see `rollbackBindingState`).
+     */
+    async addSessionAgent(
+        id: string,
+        input: { name?: unknown; profile?: unknown; model?: unknown; instruction?: unknown; role?: unknown }
+    ): Promise<SessionSnapshot> {
+        const session = this.require(id);
+
+        this.assertBindingIdle(session, 'bind an agent to a session');
+
+        const name = typeof input.name === 'string' ? input.name.trim() : '';
+
+        if (name.length === 0) {
+            throw new SessionError(400, 'A session agent binding needs a non-blank "name".');
+        }
+
+        // An omitted `profile` binds the profile the name already spells, which is the only
+        // pair the identity rule below can ever accept anyway.
+        const profile = typeof input.profile === 'string' && input.profile.trim().length > 0
+            ? input.profile.trim()
+            : name;
+
+        if (profile !== name) {
+            throw new SessionError(
+                400,
+                `A session agent binding must use its profile's own name: "name" is "${name}" but "profile" is "${profile}". The roster key is the trusted profile id, which is what a restart rebuilds this session's team from.`
+            );
+        }
+
+        if (session.definition.agents.includes(name)) {
+            throw new SessionError(409, `Agent "${name}" is already a member of session "${id}".`);
+        }
+
+        if (session.definition.agents.length >= this.maxSessionAgents) {
+            throw new SessionError(
+                409,
+                `A session roster holds at most ${this.maxSessionAgents} agents; session "${id}" already has ${session.definition.agents.length}.`
+            );
+        }
+
+        // Unknown profile id: the catalogue lists the known set, so a client can correct it.
+        if (!isAgentProfileName(name)) {
+            throw new SessionError(404, `Unknown agent profile "${name}".`);
+        }
+
+        // A RETIRED profile is a deployment decision, not a bad request, and it is the exact
+        // 409 text `agentFromProfile` states for a new session that selects one: the profile is
+        // out of the selectable catalogue while existing sessions keep what they were built with.
+        if (effectiveAgentProfile(name) === undefined) {
+            throw new SessionError(
+                409,
+                `Agent "${name}" has been retired on this deployment, so it cannot be bound to a session. Existing sessions keep the agents they were built with.`
+            );
+        }
+
+        const model = typeof input.model === 'string' && input.model.trim().length > 0
+            ? input.model.trim()
+            : session.settings.model;
+
+        const instruction = typeof input.instruction === 'string' && input.instruction.trim().length > 0
+            ? input.instruction.trim()
+            : undefined;
+
+        if (instruction !== undefined && instruction.length > this.maxAgentInstructionChars) {
+            throw new SessionError(
+                400,
+                `An agent instruction cannot exceed ${this.maxAgentInstructionChars} characters.`
+            );
+        }
+
+        // The primary is structural. Refusing here (rather than quietly binding a subagent and
+        // ignoring the requested role) is what keeps the receipt honest about what happened.
+        if (input.role === 'primary') {
+            throw new SessionError(
+                409,
+                `A session binding cannot take the primary role; "${session.definition.primary}" stays the entry point of session "${id}". Change the harness definition to replace it.`
+            );
+        }
+
+        // Composed from the trusted profile + this session's provider settings, i.e. the same
+        // call the preset factory makes, so a bound member and a rebuilt member run byte-identical
+        // prompts and the same transport.
+        const configuration = agentConfigurationFromProfile(profile, session.settings, model, instruction);
+
+        const previous = this.captureBindingState(session);
+
+        try {
+            session.harness.addAgent(name, configuration, { delegate: true });
+        } catch (error) {
+            // A runtime refusal here is a structural conflict (already registered, roster busy),
+            // so it surfaces as 409 with the runtime's own reason.
+            throw new SessionError(409, messageOf(error));
+        }
+
+        this.applyBindingMaps(session, name, { added: true, model, instruction: instruction ?? null });
+        session.sessionAgents = [...previous.sessionAgents, name];
+        session.updatedAt = Date.now();
+
+        try {
+            // The roster changed, so the persisted snapshot must change with it: a bound member
+            // has a default conversation, and `agentModels` in the document enumerates the live
+            // brains (see `sessionRecord`).
+            session.core = session.harness.snapshot();
+            await this.persistOrThrow();
+        } catch (error) {
+            this.rollbackBindingState(session, previous);
+
+            throw error;
+        }
+
+        return this.snapshot(session);
+    }
+
+    /**
+     * Detach one member of THIS session (`DELETE /sessions/{id}/agents/{agent_id}`).
+     *
+     * `detachedThreads` is the number of host conversations owned by that member that went with
+     * it — the receipt the contract's `DeleteSessionAgentResult` states. History already written
+     * by the member is never rewritten: a delegated answer copied into another transcript stays,
+     * and every OTHER member's transcript is untouched.
+     */
+    async removeSessionAgent(
+        id: string,
+        agentId: string
+    ): Promise<{ session: SessionSnapshot; detachedThreads: number }> {
+        const session = this.require(id);
+
+        this.assertBindingIdle(session, 'remove an agent from a session');
+
+        const agent = typeof agentId === 'string' ? agentId.trim() : '';
+
+        if (!session.definition.agents.includes(agent)) {
+            throw new SessionError(404, `Agent "${agent}" is not a member of session "${id}".`);
+        }
+
+        if (agent === session.definition.primary) {
+            throw new SessionError(
+                409,
+                `Agent "${agent}" is the primary agent of session "${id}" and cannot be detached; every session needs an entry point.`
+            );
+        }
+
+        const previous = this.captureBindingState(session);
+
+        // Host threads owned by this member are detached first, through the runtime's own
+        // terminal-only rule. Every one is terminal here because the idle gate proved nothing is
+        // running, so a refusal below means an owned child of a run that has not settled — and
+        // then NOTHING has been removed yet.
+        const owned = session.harness.threads().filter((thread) => thread.agent === agent);
+
+        let detachedThreads = 0;
+
+        try {
+            for (const thread of owned) {
+                session.harness.deleteThread(thread.id);
+                detachedThreads += 1;
+            }
+
+            session.harness.removeAgent(agent);
+        } catch (error) {
+            if (detachedThreads === 0) throw new SessionError(409, messageOf(error));
+
+            // Threads went and the roster did not: rewind the whole harness from the snapshot
+            // taken before this call, so a refusal cannot half-apply.
+            this.rollbackBindingState(session, previous);
+
+            throw new SessionError(409, messageOf(error));
+        }
+
+        this.applyBindingMaps(session, agent, { removed: true });
+        session.sessionAgents = previous.sessionAgents.filter((entry) => entry !== agent);
+        session.updatedAt = Date.now();
+
+        try {
+            session.core = session.harness.snapshot();
+            await this.persistOrThrow();
+        } catch (error) {
+            this.rollbackBindingState(session, previous);
+
+            throw error;
+        }
+
+        // The invocation→thread joins of the detached conversations go with them, or a later
+        // deletion would try to purge agent results that this removal already dropped.
+        for (const thread of owned) {
+            const invocation = thread.invocationId;
+
+            if (invocation !== undefined) session.invocationThreads.delete(invocation);
+            if (thread.id !== undefined) session.lanes.delete(thread.id);
+        }
+
+        return { session: this.snapshot(session), detachedThreads };
+    }
+
+    /**
+     * Set or CLEAR one member's session-scoped INSTRUCTION
+     * (`PATCH /sessions/{id}/agents/{agent_id}` with `instruction`).
+     *
+     * A string REPLACES the text the member runs; `null` clears the session override, which
+     * re-seeds the deployment's current effective profile text (global layer first, shipped
+     * catalogue second). Either way ONLY the leading system block changes — the member's
+     * committed turns, and every other member's transcript, are untouched, and the change is
+     * what a later `reset()` returns to, because the runtime also reseeds the agent's baseline.
+     */
+    async setSessionAgentInstruction(
+        id: string,
+        agentId: string,
+        instruction: string | null
+    ): Promise<SessionSnapshot> {
+        const session = this.require(id);
+
+        this.assertBindingIdle(session, 'change an agent instruction in a session');
+
+        const agent = typeof agentId === 'string' ? agentId.trim() : '';
+
+        if (!session.definition.agents.includes(agent)) {
+            throw new SessionError(404, `Agent "${agent}" is not a member of session "${id}".`);
+        }
+
+        // What the member runs after this call, and what the durable override records. They are
+        // deliberately NOT the same string: the contract's `instruction` field is the
+        // IDENTITY-SENTENCE override, while the agent's system message is the composed prompt
+        // (override + the profile's trusted guidelines). `agentInstruction` is the single place
+        // that joins them (src/agents/index.ts:113), and it is the same call `agentFromProfile`
+        // makes when a restart rebuilds this member — so composing here is what keeps the live
+        // text and the restored text byte-identical instead of trading one guideline for a 500.
+        const profile = effectiveAgentProfile(agent);
+
+        if (profile === undefined) {
+            // A retired profile has no current text to restore or compose against. The member
+            // still runs the text it was seeded with, so the refusal must not pretend the
+            // override is gone.
+            throw new SessionError(
+                409,
+                `Agent "${agent}" has been retired on this deployment, so its session instruction cannot be changed here.`
+            );
+        }
+
+        let override: string | null;
+
+        if (instruction === null) {
+            override = null;
+        } else {
+            if (typeof instruction !== 'string') {
+                throw new SessionError(400, 'An agent instruction must be a string or null.');
+            }
+
+            override = instruction.trim();
+
+            if (override.length === 0) {
+                throw new SessionError(
+                    400,
+                    'An agent instruction must not be blank. Send null to restore the inherited profile text.'
+                );
+            }
+
+            if (override.length > this.maxAgentInstructionChars) {
+                throw new SessionError(
+                    400,
+                    `An agent instruction cannot exceed ${this.maxAgentInstructionChars} characters.`
+                );
+            }
+        }
+
+        // `null` clears the session override, which means "run the deployment's current
+        // effective profile text" — the global agent layer first, the shipped catalogue second
+        // (`effectiveAgentProfile`), never the stale text this session happened to start with.
+        const liveText = agentInstruction(profile, override ?? undefined);
+
+        const previous = this.captureBindingState(session);
+
+        try {
+            session.harness.setAgentInstruction(agent, liveText);
+        } catch (error) {
+            throw new SessionError(409, messageOf(error));
+        }
+
+        // The durable half: the session's own preset copy carries the RAW override, which is
+        // what `presetFromRecord` feeds back into `agentFromProfile` on the next build. Storing
+        // the composed text here instead would bake today's guidelines into the record and make
+        // a later guideline edit unreachable for this member.
+        this.applyBindingMaps(session, agent, { instruction: override });
+
+        session.updatedAt = Date.now();
+
+        try {
+            session.core = session.harness.snapshot();
+            await this.persistOrThrow();
+        } catch (error) {
+            this.rollbackBindingState(session, previous);
+
+            throw error;
+        }
+
+        return this.snapshot(session);
+    }
+
+    /**
+     * Re-read the live harness into `session.core` and commit the document (T27).
+     *
+     * WHY THIS EXISTS: a REST tool write (enable/disable/remove/replace an installed revision)
+     * mutates the LIVE harness through `harness.toolManage`/`registerTool`, and the runtime's
+     * `stateChange` observer only refreshes `core` when it fires for a run boundary. A manual
+     * registration reports through the factory's own result instead, so the dispatcher used to
+     * answer with a snapshot the persisted document did not have yet, and a caller had to re-read
+     * a fresh snapshot itself to see the change. This is the store-side operation: take the
+     * snapshot NOW (the harness is idle by construction for these calls — a manual mutation is
+     * refused while the session is busy) and make it durable before the response, so every
+     * channel — `core`, `GET /sessions/{id}`, and the next restart — agrees.
+     */
+    async refreshCore(id: string): Promise<SessionSnapshot> {
+        const session = this.require(id);
+
+        if (!session.busy) session.core = session.harness.snapshot();
+
+        await this.persistOrThrow();
 
         return this.snapshot(session);
     }
@@ -5873,6 +6778,106 @@ export class SessionStore {
         resolve();
     }
 
+    // -----------------------------------------------------------------------
+    // T16: the live-change signal plane (the realtime hub's source of truth).
+    //
+    // WHY SIGNALS AND NOT A WATCHER
+    // ----------------------------
+    // The stream owner needs to know WHEN a turn row, a display fold, a usage tally, an
+    // owner question, a conversation, or a transcript changed, so the shared epoch/revision
+    // hub (./api-events.ts) can move the right counters and the broker can fan a small target
+    // update out. It must NOT get that by opening a `watch()`/`watchView()` subscription or
+    // calling `get()`/`getView()`: every one of those builds a full snapshot or a whole
+    // compiled view document, which is exactly the payload class the target contract removed,
+    // and a per-connection observer would pay it again per client.
+    //
+    // So the store emits an IDENTITY-ONLY signal at the hooks it already has (`publish`,
+    // `publishViewOps`, the action settlement, the thread/transcript writes). Nothing here
+    // copies a turn, and the display OPS list - which the recorder already computed for the
+    // view surface - rides by reference. The observer (installed by ./api.ts, which owns the
+    // hub) rebuilds the one small wire body from the live record it is allowed to read, and
+    // the counters move in ONE place for both HTTP and WS.
+    //
+    // The observer is a fan-out, never a gate: it runs synchronously inside the mutation and
+    // an observer that throws is ignored, so a broken transport can never fail a run.
+    // -----------------------------------------------------------------------
+
+    /**
+     * One live change, stated as identity plus (at most) the ops the recorder already made.
+     * The payload body is the observer's job; the store only ever names WHAT moved.
+     */
+    streamObserver: StoreStreamObserver | undefined;
+
+    /** Install (or clear) the live-change observer. One per store, owned by ./api.ts. */
+    setStreamObserver(observer?: StoreStreamObserver): void {
+        this.streamObserver = observer;
+    }
+
+    /** Fan one signal out. Never throws: a dead hub must not break a run or a write. */
+    private notifyStream(signal: StoreStreamSignal): void {
+        const observer = this.streamObserver;
+
+        if (observer === undefined) return;
+
+        try {
+            observer(signal);
+        } catch {
+            // The hub/transport layer owns its own failures; the mutation already committed.
+        }
+    }
+
+    /**
+     * Derive the signal a raw frame implies. Only the kinds the contract STREAMS are mapped:
+     * a `text`/`reasoning` delta is carried by `display.ops`, and a `tool_call`/`tool_result`
+     * pair by the display row's step, so per-event frames here stay rare and bounded.
+     */
+    private signalForFrame(session: Session, item: SessionStreamItem): void {
+        if (this.streamObserver === undefined) return;
+
+        const at = Date.now();
+
+        if (item.type === 'turn') {
+            this.notifyStream({ kind: 'turn.upsert', sessionId: session.id, turnId: item.turn.id, at });
+
+            // The server-summed tally rides the turn record, so the row transition is the moment
+            // the figures are true. `usage.updated` is announced here (once, on the terminal
+            // transition) rather than per delta, because it is a figure update and not a stream of
+            // figures - a client applies the patch or re-reads, and can never double-count.
+            if (
+                item.turn.usage !== undefined &&
+                (item.turn.status === 'done' || item.turn.status === 'error' || item.turn.status === 'cancelled')
+            ) {
+                this.notifyStream({ kind: 'usage.updated', sessionId: session.id, turnId: item.turn.id, at });
+            }
+
+            return;
+        }
+
+        if (item.type === 'snapshot') {
+            // A snapshot frame means session metadata (status/queue/last error) moved, which is
+            // a `session.updated` patch - never a snapshot transfer.
+            this.notifyStream({ kind: 'session.state', sessionId: session.id, at });
+
+            return;
+        }
+
+        // Only the two event kinds the contract STREAMS as their own update are mapped here; a
+        // `failed` frame carries no event, and text/reasoning deltas ride `display.ops`.
+        if (item.type !== 'event') return;
+
+        const event = item.event;
+
+        if (event.type === 'action_request' && event.request !== undefined) {
+            this.notifyStream({ kind: 'action.opened', sessionId: session.id, requestId: event.request.requestId, at });
+
+            return;
+        }
+
+        if (event.type === 'usage') {
+            this.notifyStream({ kind: 'usage.updated', sessionId: session.id, turnId: item.turnId, at });
+        }
+    }
+
     // Fan a frame out to every watcher. NEVER throws and never awaits: a dead,
     // slow, or hostile watcher is dropped/ignored, so it can neither cancel a turn
     // nor block the pump. Each watcher gets its OWN deep copy, the same rule
@@ -5880,6 +6885,10 @@ export class SessionStore {
     // frame cannot corrupt a sibling's.
     private publish(session: Session, item: SessionStreamItem): void {
         if (session.disposed) return;
+
+        // T16: the hub signal rides the fan-out the store already performs, so a run that
+        // nobody is watching over SSE still moves the shared counters the stream needs.
+        this.signalForFrame(session, item);
 
         for (const watcher of [...session.watchers]) {
             let frame: SessionStreamItem;
@@ -6695,6 +7704,10 @@ export class SessionStore {
         await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
         this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
 
+        // T16: the conversation itself changed state (stopped), so the roster row is what a
+        // client needs again - identity only, the observer reads the one row.
+        this.notifyStream({ kind: 'thread.upsert', sessionId: session.id, threadId, at: Date.now() });
+
         return { cancelled, session: this.snapshot(session) };
     }
 
@@ -6947,6 +7960,11 @@ export class SessionStore {
 
         await this.persistOrThrow();
         this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+
+        // T16: the transcript's counts/revision moved (valid draft or unreadable raw), which is
+        // exactly the `transcript.updated` signal - message bodies never ride the stream, so an
+        // editor re-pages the messages route instead of receiving them.
+        this.notifyStream({ kind: 'transcript.updated', sessionId: session.id, threadId, at: Date.now() });
 
         return {
             session: this.snapshot(session),
@@ -7326,6 +8344,17 @@ export class SessionStore {
         this.releaseDrain(session);
 
         this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+
+        // T16: every deleted conversation and every deleted row is an invalidation the stream
+        // states by id - clients re-page the roster and the turns page rather than being handed
+        // a snapshot of what is left.
+        for (const targetId of removedIds) {
+            this.notifyStream({ kind: 'turn.removed', sessionId: session.id, turnId: targetId, at: Date.now() });
+        }
+
+        for (const targetId of doomed) {
+            this.notifyStream({ kind: 'thread.removed', sessionId: session.id, threadId: targetId, at: Date.now() });
+        }
 
         return this.snapshot(session);
     }

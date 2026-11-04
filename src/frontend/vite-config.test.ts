@@ -87,17 +87,23 @@ const requestThrough = (
     });
 
 describe('vite API proxy', () => {
-    it('proxies /api and /api/... but never the api.ts source module', () => {
+    it('proxies /v1/harness and everything under it, and nothing else', () => {
         const pattern = new RegExp(API_PROXY_KEY);
 
-        // The mount and every route under it still reach the upstream.
+        // The canonical mount and every route under it reach the upstream — including
+        // the WebSocket upgrade path, which is a request like any other to Vite's
+        // matcher (the `ws: true` flag below is what actually forwards the upgrade).
         expect(
-            ['/api', '/api/', '/api/harnesses', '/api/sessions/x', '/api/models'].map((path) => pattern.test(path))
+            ['/v1/harness', '/v1/harness/', '/v1/harness/sessions', '/v1/harness/stream', '/v1/harness/health?probe=1'].map(
+                (path) => pattern.test(path)
+            )
         ).toEqual([true, true, true, true, true]);
 
-        // `./api` (rewritten to /api.ts) and other api-prefixed modules stay on
-        // Vite. The old `'/api'` prefix matched all of these.
-        expect(['/api.ts', '/apiRoot', '/main.ts', '/v1/harness', '/'].map((path) => pattern.test(path))).toEqual([
+        // The legacy `/api*` paths and every unrelated module path stay on Vite. The
+        // UI no longer dials `/api` at all, so a proxy entry for it would only hide a
+        // client that still does.
+        expect(['/api', '/api.ts', '/apiRoot', '/main.ts', '/views/s1', '/'].map((path) => pattern.test(path))).toEqual([
+            false,
             false,
             false,
             false,
@@ -107,8 +113,8 @@ describe('vite API proxy', () => {
     });
 
     it('applies the anchored key to both dev and preview through one route map', () => {
-        expect(API_PROXY_KEY).toBe('^/api(?:/|$)');
-        expect(Object.keys(apiProxyRoutes)).toEqual(['^/api(?:/|$)']);
+        expect(API_PROXY_KEY).toBe('^/v1/harness(?:/|$)');
+        expect(Object.keys(apiProxyRoutes)).toEqual(['^/v1/harness(?:/|$)']);
 
         // Factory output is deterministic: the shell environment cannot change
         // what this test pins. The config passes HARNESS_DEV_API into the same
@@ -124,28 +130,37 @@ describe('vite API proxy', () => {
         expect(DEFAULT_DEV_API).toBe('http://127.0.0.1:5000/v1/harness');
         expect(route.target).toBe('http://127.0.0.1:5000');
 
+        // The realtime plane is part of the dev workflow: without `ws` the REST reads
+        // work and the socket silently 404s at Vite.
+        expect(route.ws).toBe(true);
+
         // The outgoing Origin must equal the target origin; with changeOrigin
         // rewriting Host, this is what makes the harness gate see same-origin.
         expect(route.headers).toEqual({ origin: 'http://127.0.0.1:5000' });
 
-        // The rewrite still maps the browser's `/api` onto the service mount.
-        expect(route.rewrite('/api')).toBe('/v1/harness');
-        expect(route.rewrite('/api/sessions')).toBe('/v1/harness/sessions');
+        // The browser dials the canonical path and the target's mount is the service
+        // mount, so the canonical deployment is an identity rewrite. A query string
+        // (a page size, a cursor) survives untouched.
+        expect(route.rewrite('/v1/harness')).toBe('/v1/harness');
+        expect(route.rewrite('/v1/harness/sessions')).toBe('/v1/harness/sessions');
+        expect(route.rewrite('/v1/harness/sessions/s1/turns?limit=25&cursor=c1')).toBe(
+            '/v1/harness/sessions/s1/turns?limit=25&cursor=c1'
+        );
     });
 
     it('stamps the target origin for a custom mount and port', () => {
-        // The standalone API launcher is the documented HARNESS_DEV_API target.
-        // A custom origin must be stamped as-is, including its port, while the
-        // mount and target keep the usual trailing-slash normalization.
+        // A gateway or standalone launcher mounted somewhere else is still reached at
+        // the canonical path by the browser; the rewrite swaps only the mount.
         const proxy = createApiProxy('https://harness.example.test:8443/custom/api/');
 
         expect(proxy).toMatchObject({
             target: 'https://harness.example.test:8443',
             changeOrigin: true,
+            ws: true,
             headers: { origin: 'https://harness.example.test:8443' }
         });
-        expect(proxy.rewrite('/api/sessions')).toBe('/custom/api/sessions');
-        expect(proxy.rewrite('/api')).toBe('/custom/api');
+        expect(proxy.rewrite('/v1/harness/sessions')).toBe('/custom/api/sessions');
+        expect(proxy.rewrite('/v1/harness')).toBe('/custom/api');
     });
 });
 
@@ -223,7 +238,7 @@ describe('dev server dual-stack LAN binding', () => {
             // proxy. The Host header is the `localhost:<port>` a localhost page
             // sends; `origin` is the loopback page origin, which the proxy must
             // replace with the target's.
-            const loopback = `/api/health?probe=1`;
+            const loopback = `/v1/harness/health?probe=1`;
             const viaIpv4 = await requestThrough('127.0.0.1', port, loopback, {
                 host: `localhost:${port}`,
                 origin: `http://localhost:${port}`

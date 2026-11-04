@@ -106,7 +106,7 @@ import type {
     SessionThread,
     SessionTurn
 } from '../../server/protocol';
-import type { ThreadTranscriptPayload } from '../api';
+import type { ThreadTranscriptPayload } from '../view-model';
 import { UNKNOWN_THREAD_LABEL, invalidThreadsOf, threadNameOf, turnThreadIdOf } from './threads';
 import type { InvalidThreadRecord, SessionThreadEntry } from './threads';
 // The app's one payload viewer (line numbers + soft wrap + byte-exact text). It lives in

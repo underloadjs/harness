@@ -26,8 +26,11 @@ describe('frontend barrel', () => {
         expect(document.body.innerHTML).toBe(bodyBefore);
         expect(document.querySelectorAll('style')).toHaveLength(stylesBefore);
 
-        // The client is the same one the app shell uses.
-        expect(client.API_ROOT).toBe('/api');
+        // The client is the same one the app shell uses. The canonical contract root
+        // (../shared/harness-api.ts `HARNESS_API_ROOT`); the legacy `/api` mount is gone,
+        // so a barrel that still defaulted there would be dialling a route the server
+        // no longer mounts.
+        expect(client.API_ROOT).toBe('/v1/harness');
         expect(typeof client.loadBootstrap).toBe('function');
         expect(typeof client.callTool).toBe('function');
         expect(typeof client.createTurnBoard).toBe('function');

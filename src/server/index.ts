@@ -59,6 +59,76 @@ export type {
     HarnessApiStream
 } from './api';
 
+// T15: the realtime transport surface, exported name-by-name (the same reason `./api` is listed
+// above: `export *` from two barrels would make names ambiguous at the package root, and a
+// declaration file that cannot resolve a name is a published breakage).
+export {
+    HARNESS_WS_CLOSE_CODES,
+    HARNESS_WS_STREAM_PATH,
+    HARNESS_WS_SCOPE_BASELINES,
+    HARNESS_WS_SCOPE_FILTERS,
+    HARNESS_WS_SCOPE_IDS,
+    HARNESS_WS_SCOPE_PUBLISHES,
+    HARNESS_WS_KIND_RESOURCES,
+    HARNESS_WS_TUNABLE_BOUNDS,
+    WEBSOCKET_STATE,
+    chunkStreamPayload,
+    createStreamBroker,
+    createStreamBridge,
+    createStreamSources,
+    bridgeEventHub,
+    decodeStreamCursor,
+    defaultStreamLink,
+    encodeStreamCursor,
+    hubResourceId,
+    hubStreamSources,
+    HARNESS_STREAM_EPOCH,
+    performUpgrade,
+    rejectUpgrade,
+    parseClientFrame,
+    publishStreamEvent,
+    resolveStreamLimits,
+    startStreamConnection,
+    streamScopePublishes
+} from './stream';
+export type {
+    ClientFrameResult,
+    HarnessSocket,
+    HarnessSocketSendMeta,
+    HarnessSocketSendResult,
+    HarnessStreamBridge,
+    HarnessStreamBroker,
+    HarnessStreamMount,
+    HarnessStreamMountOptions,
+    HarnessUpgradeOptions,
+    StreamBrokerSources,
+    StreamConnection,
+    StreamConnectionOptions,
+    StreamCursor,
+    StreamDelivery,
+    StreamEvent,
+    StreamEventFor,
+    StreamFailure,
+    StreamOriginPolicy,
+    StreamRegistryLookups,
+    StreamResourceRef,
+    StreamScopeIds,
+    StreamSessionHandle,
+    StreamSink,
+    StreamStoreLookups,
+    StreamSubscribeFrame,
+    StreamSubscribeOutcome,
+    StreamSubscribeRequest
+} from './stream';
+// T27: this barrel used to re-export `StreamUpgradeHandler` from './stream'. No such
+// declaration exists anywhere in the transport (./stream/{protocol,broker,transport,
+// connection,mount}.ts, all re-exported by ./stream/index.ts), so the name was a stale
+// entry that made the whole barrel fail TS2305. The upgrade hook the gateway actually
+// consumes is `ServiceUpgradeHandler` (./service.ts:419), which `export * from './service'`
+// (line 38 above) already publishes; the per-mount upgrade method is a member of
+// `HarnessStreamMount.upgrade` (./stream/mount.ts:108), also already exported. Nothing
+// referenced `StreamUpgradeHandler`, so dropping the phantom name removes no capability.
+
 // The catalogue the CLI and the server share (see ./harnesses/index.ts).
 export {
     AGENT_PROFILES,

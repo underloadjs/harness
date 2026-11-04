@@ -111,7 +111,7 @@ const mount = async (session: SessionSnapshot): Promise<void> => {
             }
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

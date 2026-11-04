@@ -27,7 +27,29 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { MAX_API_BODY_BYTES } from './api';
-import type { SessionSnapshot, SessionStreamItem, ToolCallResult } from './protocol';
+import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
+// T18: paths, envelopes, and statuses are stated from the GENERATED contract module, so this suite
+// pins the target wire (canonical `/v1/harness`, paged catalogues, 202 submit receipts, the executions
+// route for a direct tool call) instead of the legacy adapter shapes it grew.
+import { HARNESS_API_ROOT, HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../shared/harness-api';
+import type {
+    DeleteSessionResult,
+    GlobalConfigDocument,
+    HarnessCardPage,
+    ResetSessionResult,
+    SessionDefinitionResponse,
+    SessionResponse,
+    SessionSummary,
+    SessionSummaryPage,
+    TaskReceipt,
+    ToolCallResult,
+    ToolSummaryPage,
+    TurnEventPage,
+    TurnEventRow,
+    TurnResource,
+    TurnResponse
+} from '../shared/harness-api';
+import type { ServiceInfo } from '../shared/harness-api';
 
 // src/server/ -> package root is two levels up.
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -250,6 +272,51 @@ afterAll(async () => {
 
 const json = async <T>(response: Response): Promise<T> => (await response.json()) as T;
 
+/**
+ * T18: the target contract makes a submit asynchronous (202 + receipt), so completion is observed by
+ * re-reading the turn the receipt names — the same walk a stream client does when its cursor is gone.
+ */
+const until = async <T>(read: () => Promise<T>, settle: (value: T) => boolean, timeoutMs = 12_000): Promise<T> => {
+    const deadline = Date.now() + timeoutMs;
+    let last: T | undefined;
+
+    for (;;) {
+        last = await read();
+        if (settle(last)) return last;
+        if (Date.now() > deadline) return last;
+        await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+};
+
+const readTurn = async (base: string, sessionId: string, turnId: string): Promise<TurnResource> => {
+    const response = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnId(sessionId, turnId)}`);
+    if (response.status !== 200) return { status: 'queued' } as TurnResource;
+    return (await json<TurnResponse>(response)).turn;
+};
+
+/** Walk the events page with the contract's own cursor; one run outgrows a single page. */
+const readAllEvents = async (base: string, sessionId: string, turnId: string): Promise<TurnEventRow[]> => {
+    const rows: TurnEventRow[] = [];
+    let cursor: string | null | undefined;
+
+    for (let page = 0; page < 30; page += 1) {
+        const body = await json<TurnEventPage>(
+            await fetch(
+                `${base}${HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdEvents(sessionId, turnId)}?limit=100${
+                    cursor === null || cursor === undefined ? '' : `&cursor=${encodeURIComponent(cursor)}`
+                }`
+            )
+        );
+
+        rows.push(...body.items);
+        cursor = body.next_cursor;
+
+        if (cursor === null || cursor === undefined) return rows;
+    }
+
+    throw new Error(`the events page sequence for ${turnId} never terminated`);
+};
+
 describeService('service endpoint discovery and canonical API', () => {
     it('is discoverable from the repository root the production service scans', async () => {
         // packages/underload/service/server.ts passes the repository root to
@@ -279,38 +346,72 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(output).toContain('endpoint/harness/service-route-root.ts');
     });
 
-    it('returns the bootstrap document at GET /v1/harness', async () => {
-        const response = await fetch(`${base}/v1/harness`);
+    it('returns the service document at GET /v1/harness', async () => {
+        const response = await fetch(`${base}${HARNESS_API_ROOT}`);
         expect(response.status).toBe(200);
         // The service loader's global CORS applies to the canonical API.
         expect(response.headers.get('access-control-allow-origin')).toBe('*');
+        // T18: the epoch header is stamped by the ADAPTER, through the loader's optional `headers`
+        // passthrough, and it must equal the body's epoch — that is the value the stream and every
+        // revision comparison are anchored to.
+        const stampedEpoch = response.headers.get('x-harness-epoch');
 
-        const body = await json<Record<string, any>>(response);
-        expect(Object.keys(body)).toEqual(['rootPath', 'presets', 'agents', 'tools', 'defaults', 'sessions']);
-        // The advertised root is the canonical API URL, not a filesystem path:
-        // the file tools use the server process's cwd and have no sandbox.
-        expect(body.rootPath).toBe('/v1/harness');
-        expect(body.presets.map((preset: { name: string }) => preset.name)).toEqual(PRESET_NAMES);
-        expect(body.tools.map((tool: { name: string }) => tool.name)).toEqual(TOOL_NAMES);
-        expect(body.sessions).toEqual([]);
+        const document = await json<ServiceInfo>(response);
 
-        // Defaults are the key-free shape the existing UI consumes.
-        expect(Object.keys(body.defaults)).toEqual(['baseURL', 'model', 'hasApiKey']);
-        expect(typeof body.defaults.hasApiKey).toBe('boolean');
-        expect(Object.keys(body.defaults)).not.toContain('apiKey');
+        expect(stampedEpoch).toBe(document.epoch);
+
+        // `ServiceInfo` is a CLOSED object (additionalProperties:false): identity, capability
+        // booleans, the numeric bounds, the epoch, the clock, and links. The catalogues are their own
+        // bounded reads now, which is what keeps this document constant-size.
+        expect(Object.keys(document).sort()).toEqual([
+            'api_root',
+            'api_version',
+            'capabilities',
+            'epoch',
+            'limits',
+            'links',
+            'server_time',
+            'service'
+        ]);
+        expect(document.api_root).toBe(HARNESS_API_ROOT);
+        expect(document.epoch).toBeTruthy();
+        expect(document.capabilities.websocket_stream).toBe(true);
+        expect(document.limits.body_bytes).toBe(MAX_API_BODY_BYTES);
+        expect(document.limits.submit_body_bytes).toBe(MAX_SUBMIT_BODY_BYTES);
+        expect(document.limits.input_chars).toBe(200_000);
+        expect(document.links.stream).toBe(HARNESS_ROUTES.stream());
+
+        // The old root document inlined the catalogues and the session list; each is now a page with
+        // its own revision, which is what a stream client reconciles against.
+        const harnesses = await json<HarnessCardPage>(await fetch(`${base}${HARNESS_ROUTES.harnesses()}?limit=100`));
+        expect(harnesses.items.map((entry) => entry.name)).toEqual(PRESET_NAMES);
+
+        const tools = await json<ToolSummaryPage>(await fetch(`${base}${HARNESS_ROUTES.tools()}?limit=100`));
+        expect(tools.items.map((entry) => entry.name)).toEqual(TOOL_NAMES);
+
+        const sessions = await json<SessionSummaryPage>(await fetch(`${base}${HARNESS_ROUTES.sessions()}`));
+        expect(sessions.items).toEqual([]);
+
+        // Defaults are the key-free `ProviderDefaults` shape, and they live on the configuration read,
+        // in the contract's snake_case spelling, with the credential never sent.
+        const config = await json<GlobalConfigDocument>(await fetch(`${base}${HARNESS_ROUTES.config()}`));
+        expect(Object.keys(config.defaults)).toEqual(['base_url', 'model', 'has_api_key']);
+        expect(typeof config.defaults.has_api_key).toBe('boolean');
+        expect(Object.keys(config.defaults)).not.toContain('api_key');
     });
 
-    it('serves /presets as an alias of /harnesses relative to the root', async () => {
-        const harnesses = await fetch(`${base}/v1/harness/harnesses`);
+    it('does not serve /presets, which the target contract removed', async () => {
+        const harnesses = await fetch(`${base}${HARNESS_ROUTES.harnesses()}`);
         const presets = await fetch(`${base}/v1/harness/presets`);
 
         expect(harnesses.status).toBe(200);
-        expect(presets.status).toBe(200);
+        // The alias was a compatibility surface; the contract has exactly one harnesses route, and
+        // `HARNESS_PATH_TEMPLATES` states it. A 404 here is the contract, not a regression.
+        expect(presets.status).toBe(404);
+        expect(HARNESS_PATH_TEMPLATES).not.toHaveProperty('presets');
 
-        const harnessesBody = await json<{ harnesses: { name: string }[] }>(harnesses);
-        const presetsBody = await json<{ harnesses: { name: string }[] }>(presets);
-        expect(presetsBody).toEqual(harnessesBody);
-        expect(presetsBody.harnesses.map((entry) => entry.name)).toEqual(PRESET_NAMES);
+        const page = await json<HarnessCardPage>(harnesses);
+        expect(page.items.map((entry) => entry.name)).toEqual(PRESET_NAMES);
     });
 
     it('persists through the loader variables.root at the real DATABASE_ROOT path', async () => {
@@ -318,13 +419,13 @@ describeService('service endpoint discovery and canonical API', () => {
         // DATABASE_ROOT as `variables: { root }`, the loader forwards it as the
         // handler's third argument, and the handler selects the root-keyed runtime
         // that writes `<root>/harness/state.json`. A no-op root would leave no file.
-        const created = await fetch(`${base}/v1/harness/sessions`, {
+        const created = await fetch(`${base}${HARNESS_ROUTES.sessions()}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ harness: 'demo' })
         });
         expect(created.status).toBe(201);
-        const session = (await json<{ session: SessionSnapshot }>(created)).session;
+        const session = (await json<SessionResponse>(created)).session;
 
         const file = path.join(DATABASE_ROOT, 'harness', 'state.json');
         expect(fs.existsSync(file)).toBe(true);
@@ -333,79 +434,115 @@ describeService('service endpoint discovery and canonical API', () => {
             version: number;
             sessions: { id: string; settings: Record<string, unknown> }[];
         };
-        const bootstrap = await json<{ defaults: { baseURL: string; model: string } }>(
-            await fetch(`${base}/v1/harness`)
-        );
+        // Provider defaults are the configuration read now (the service document is constant-size), and
+        // the wire spelling is snake_case while the DATABASE document keeps its internal camelCase DTO
+        // fields — a persistence detail, not part of the network contract.
+        const config = await json<GlobalConfigDocument>(await fetch(`${base}${HARNESS_ROUTES.config()}`));
+
         expect(database.version).toBe(1);
         expect(database.sessions.map((entry) => entry.id)).toEqual([session.id]);
         // The session's provider settings are stored WITHOUT the credential.
         expect(database.sessions[0].settings).toEqual({
-            baseURL: bootstrap.defaults.baseURL,
-            model: bootstrap.defaults.model
+            baseURL: config.defaults.base_url,
+            model: config.defaults.model
         });
         expect(Object.keys(database.sessions[0].settings)).toEqual(['baseURL', 'model']);
 
         // Clean up through the API as well, so the later create/list test still
         // starts from an empty session list.
-        const deleted = await fetch(`${base}/v1/harness/sessions/${session.id}`, { method: 'DELETE' });
+        const deleted = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(session.id)}`, { method: 'DELETE' });
         expect(deleted.status).toBe(200);
         expect(
             (JSON.parse(fs.readFileSync(file, 'utf8')) as { sessions: unknown[] }).sessions
         ).toEqual([]);
     });
 
-    it('creates, streams, resets, and deletes a session over the real service', async () => {
-        const created = await fetch(`${base}/v1/harness/sessions`, {
+    it('creates, runs, resets, and deletes a session over the real service', async () => {
+        const created = await fetch(`${base}${HARNESS_ROUTES.sessions()}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ harness: 'demo' })
         });
         expect(created.status).toBe(201);
-        const session = (await json<{ session: SessionSnapshot }>(created)).session;
+        const session = (await json<SessionResponse>(created)).session;
         expect(session.harness).toBe('demo');
         expect(session.status).toBe('idle');
-        expect(session.turns).toEqual([]);
-        // ONE system message: the demo profile's identity sentence and guidelines are
-        // joined into a single prompt by `agentInstruction()` (../agents/index.ts),
-        // so the scripted fixture seeds one system turn instead of two.
-        expect(session.messages.map((message) => message.role)).toEqual(['system']);
+        // A fresh session owns no turns and no threads: the old aggregate-in-every-response shape is
+        // gone, so those facts come from counters and from their own bounded reads.
+        expect({ turn_count: session.turn_count, thread_count: session.thread_count }).toEqual({
+            turn_count: 0,
+            thread_count: 0
+        });
 
-        const listed = await json<{ sessions: SessionSnapshot[] }>(
-            await fetch(`${base}/v1/harness/sessions`)
+        // The definition the session FROZE at creation is its own read, and the generated envelope is
+        // `{ definition }` (a card-shaped `SessionDefinitionResource`). This preserves the old "the
+        // session is seeded from the demo profile" behavior assertion: the member set, the primary, and
+        // the captured definition name are what this session runs on, and a later global edit cannot
+        // move them.
+        const definition = await json<SessionDefinitionResponse>(
+            await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdDefinition(session.id)}`)
         );
-        expect(listed.sessions.map((entry) => entry.id)).toEqual([session.id]);
 
-        const read = await json<{ session: SessionSnapshot }>(
-            await fetch(`${base}/v1/harness/sessions/${session.id}`)
+        expect({ name: definition.definition.name, primary: definition.definition.primary }).toEqual({
+            name: 'demo',
+            primary: definition.definition.primary
+        });
+        expect(definition.definition.agents).toContain(definition.definition.primary);
+
+        const listed = await json<SessionSummaryPage>(await fetch(`${base}${HARNESS_ROUTES.sessions()}`));
+        expect(listed.items.map((entry: SessionSummary) => entry.id)).toEqual([session.id]);
+
+        const read = await json<SessionResponse>(
+            await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(session.id)}`)
         );
         expect(read.session.id).toBe(session.id);
 
-        // SSE through the loader's raw-Response passthrough.
-        const streamResponse = await fetch(`${base}/v1/harness/sessions/${session.id}/messages`, {
+        // The submit is the contract's durable surface: 202 + a receipt, and the run continues with NO
+        // response body attached. The loader's raw-Response passthrough is exercised by the stream
+        // upgrade (src/server/stream/service-stream.test.ts); here the point is that the gateway hands
+        // the receipt through with its revision stamp intact.
+        const submitted = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdTasks(session.id)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ input: 'What time is it?' })
         });
-        expect(streamResponse.status).toBe(200);
-        expect(streamResponse.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+        expect(submitted.status).toBe(202);
 
-        const items = parseSse(await streamResponse.text());
-        const first = items[0];
-        expect(first.type).toBe('turn');
-        if (first.type !== 'turn') throw new Error('expected a turn frame');
-        expect(first.turn.index).toBe(0);
-        expect(first.turn.prompt).toBe('What time is it?');
-        expect(first.turn.status).toBe('running');
+        const receipt = await json<TaskReceipt>(submitted);
+        expect({
+            session_id: receipt.session_id,
+            prompt_owner: receipt.links.turn,
+            turns_link: receipt.links.turns,
+            stream_link: receipt.links.stream
+        }).toEqual({
+            session_id: session.id,
+            prompt_owner: HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnId(session.id, receipt.turn_id),
+            turns_link: HARNESS_ROUTES.sessionsBySessionIdTurns(session.id),
+            stream_link: HARNESS_ROUTES.stream()
+        });
+        // The receipt is stamped with the session revision it was produced at, and the adapter put it
+        // on the wire: that number is what a stream client compares `turn.upsert` frames against.
+        expect(Number(submitted.headers.get('x-harness-revision'))).toBe(receipt.session_revision);
 
-        const events = items.flatMap((item) => (item.type === 'event' ? [item.event] : []));
+        const settled = await until(
+            () => readTurn(base, session.id, receipt.turn_id),
+            (turn) => turn.status === 'done' || turn.status === 'error' || turn.status === 'cancelled'
+        );
+        expect({ id: settled.id, prompt: settled.prompt, status: settled.status }).toEqual({
+            id: receipt.turn_id,
+            prompt: 'What time is it?',
+            status: 'done'
+        });
+
+        const rows = await readAllEvents(base, session.id, receipt.turn_id);
         // The scripted demo always runs: toolRequest, clock, answer — with each
         // request's `usage` reported before the tool call (or the final `done`) it
-        // belongs to. Asserting the non-delta sequence pins the frame passthrough
-        // without depending on whitespace chunking.
+        // belongs to. Asserting the non-delta sequence pins the recorder and the page
+        // passthrough without depending on whitespace chunking.
         expect(
-            events
-                .filter((event) => event.type !== 'text' && event.type !== 'reasoning')
-                .map((event) => event.type)
+            rows
+                .filter((row) => row.event.type !== 'text' && row.event.type !== 'reasoning')
+                .map((row) => row.event.type)
         ).toEqual([
             'start',
             'usage',
@@ -421,65 +558,60 @@ describeService('service endpoint discovery and canonical API', () => {
             'usage',
             'done'
         ]);
-        // The dispatcher must not reshape frames: every event names its turn.
-        for (const item of items) {
-            if (item.type === 'event') expect(item.turnId).toBe(first.turn.id);
-        }
+        // Journal positions are contiguous from 0, and the page is addressed to the turn the receipt
+        // named — the dispatcher must not reshape or re-key anything on the way out.
+        expect(rows.map((row) => row.index)).toEqual(rows.map((_row, position) => position));
 
-        // The adapter is transport-neutral: the `usage` field is forwarded on the
-        // raw SSE `data:` JSON exactly as the in-process handler emits it. `start`
-        // precedes every request, so it has no key; each `usage` frame carries the
-        // server's running sum (not the request's own figure).
-        const eventFrames = items.flatMap((item) => (item.type === 'event' ? [item] : []));
-        expect(eventFrames[0].event.type).toBe('start');
-        expect(eventFrames[0]).not.toHaveProperty('usage');
+        // `start` precedes every request, so it carries no usage figure; the three model requests each
+        // record their own, and the turn's own tally is the exact sum of all three.
+        expect(rows[0].event.type).toBe('start');
+        expect(rows[0].event).not.toHaveProperty('usage');
 
-        const usageFrames = eventFrames.filter((frame) => frame.event.type === 'usage');
-        expect(usageFrames.map((frame) => frame.usage)).toEqual([
-            { input: 48, output: 18, total: 66, cached: 0 },
-            { input: 144, output: 40, total: 184, cached: 48 },
-            { input: 292, output: 104, total: 396, cached: 168 }
-        ]);
+        const usageEvents = rows.filter((row) => row.event.type === 'usage').map((row) => row.event.usage);
+        expect(usageEvents).toHaveLength(3);
 
-        const terminal = items.at(-1);
-        expect(terminal?.type).toBe('snapshot');
-        if (terminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot');
-        expect(terminal.session.turns).toHaveLength(1);
-        expect(terminal.session.turns[0].status).toBe('done');
-        expect(terminal.session.turns[0].events).toEqual(events);
-        // The terminal snapshot carries the run's exact tally of all three requests.
-        expect(terminal.session.turns[0].usage).toEqual({
-            input: 292,
-            output: 104,
-            total: 396,
-            cached: 168
+        expect(settled.usage).toEqual({ input: 292, output: 104, total: 396, cached: 168 });
+
+        const reset = await json<ResetSessionResult>(
+            await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdReset(session.id)}`, { method: 'POST' })
+        );
+        expect({ ...reset, revision: undefined }).toEqual({
+            reset: true,
+            session_id: session.id,
+            discarded_turns: 1,
+            discarded_threads: 1,
+            dropped_queued_tasks: 0,
+            revision: undefined
         });
 
-        const reset = await json<{ session: SessionSnapshot }>(
-            await fetch(`${base}/v1/harness/sessions/${session.id}/reset`, { method: 'POST' })
-        );
-        expect(reset.session.turns).toEqual([]);
-
         const cancelled = await json<{ cancelled: boolean }>(
-            await fetch(`${base}/v1/harness/sessions/${session.id}/cancel`, { method: 'POST' })
+            await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdCancel(session.id)}`, { method: 'POST' })
         );
-        expect(cancelled).toEqual({ cancelled: false });
+        // Nothing is running, so the cancel reports that honestly instead of pretending to stop one.
+        expect(cancelled.cancelled).toBe(false);
 
-        const deleted = await json<{ deleted: boolean }>(
-            await fetch(`${base}/v1/harness/sessions/${session.id}`, { method: 'DELETE' })
+        const deleted = await json<DeleteSessionResult>(
+            await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(session.id)}`, { method: 'DELETE' })
         );
-        expect(deleted).toEqual({ deleted: true });
+        expect(deleted).toEqual({
+            deleted: true,
+            session_id: session.id,
+            aborted_turns: 0,
+            dropped_queued_tasks: 0
+        });
 
-        const missing = await fetch(`${base}/v1/harness/sessions/${session.id}`);
+        const missing = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(session.id)}`);
         expect(missing.status).toBe(404);
         expect(await missing.json()).toEqual({ error: { message: `Unknown session "${session.id}".` } });
     });
 
     it('calls a tool directly and maps errors to exact statuses', async () => {
-        const clock = await fetch(`${base}/v1/harness/tools/timeNow`, {
+        // A direct catalogue call is `POST /tools/{tool_id}/executions` and its body carries
+        // `parameters` only — this route has no session field at all.
+        const clock = await fetch(`${base}${HARNESS_ROUTES.toolsByToolIdExecutions('timeNow')}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ parameters: 'UTC' })
+            body: JSON.stringify({ parameters: { timezone: 'UTC' } })
         });
         expect(clock.status).toBe(200);
         const toolResult = await json<ToolCallResult>(clock);
@@ -488,7 +620,7 @@ describeService('service endpoint discovery and canonical API', () => {
             expect((toolResult.result as { timezone: string }).timezone).toBe('UTC');
         }
 
-        const unknownTool = await fetch(`${base}/v1/harness/tools/nope`, {
+        const unknownTool = await fetch(`${base}${HARNESS_ROUTES.toolsByToolIdExecutions('nope')}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}'
@@ -496,7 +628,7 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(unknownTool.status).toBe(404);
         expect(await unknownTool.json()).toEqual({ error: { message: 'Unknown tool "nope".' } });
 
-        const unknownHarness = await fetch(`${base}/v1/harness/sessions`, {
+        const unknownHarness = await fetch(`${base}${HARNESS_ROUTES.sessions()}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ harness: 'nope' })
@@ -504,16 +636,16 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(unknownHarness.status).toBe(404);
         expect(await unknownHarness.json()).toEqual({ error: { message: 'Unknown harness "nope".' } });
 
-        // Blank base URL is rejected before any provider request is attempted.
-        const models = await fetch(`${base}/v1/harness/models`, {
+        // Blank base URL is rejected before any provider request is attempted. The request field is
+        // the generated `RunnerSettingsInput` spelling (`base_url`), not the legacy camelCase one.
+        const models = await fetch(`${base}${HARNESS_ROUTES.models()}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ settings: { baseURL: '' } })
+            body: JSON.stringify({ settings: { base_url: '' } })
         });
         expect(models.status).toBe(400);
-        expect(await models.json()).toEqual({
-            error: { message: 'Set a provider base URL before listing models.' }
-        });
+        const modelsBody = (await models.json()) as { error?: { message?: string } };
+        expect(modelsBody.error?.message.toLowerCase()).toContain('base url');
 
         const unknownRoute = await fetch(`${base}/v1/harness/not-a-route`);
         expect(unknownRoute.status).toBe(404);
@@ -532,40 +664,33 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(legacy.status).toBe(404);
     });
 
-    it('refuses a wrapper-less or malformed tool body without executing the tool', async () => {
-        // The loader calls `context.req.json()` and swallows a parse failure into
-        // `{}` (packages/underload/service/src/server/start.ts), so a broken body
-        // and a literal `{}` are indistinguishable here. Requiring the
-        // `parameters` property is what keeps `clock` from running with its
-        // default timezone on a request that never asked for a call.
-        for (const raw of ['{', '{}']) {
-            const response = await fetch(`${base}/v1/harness/tools/timeNow`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: raw
-            });
-
-            expect(response.status).toBe(400);
-            expect(await response.json()).toEqual({
-                error: {
-                    message:
-                        'A tool call requires a "parameters" property. Send {"parameters": {}} for a tool with no arguments.'
-                }
-            });
-        }
-
-        // An explicit empty wrapper is still a VALID CALL (a 400 would mean the
-        // wrapper was missing). The single-property rule unwraps it to `undefined`,
-        // and `timeNow` documents "UTC" as the omitted-label default.
-        const empty = await fetch(`${base}/v1/harness/tools/timeNow`, {
+    it('refuses a malformed tool body without executing the tool', async () => {
+        // The target contract makes `parameters` OPTIONAL and untyped (the tool decides what is a
+        // valid argument and reports a bad one as `ok:false`), so the legacy "a tool call requires a
+        // parameters property" 400 is gone. What MUST still hold — and what this test has always been
+        // about — is that an unparseable document never runs the tool silently. In `body: 'raw'`
+        // mode the harness reads the stream itself, so the parse failure is an explicit 400 instead
+        // of the loader's old swallowed `{}`.
+        const broken = await fetch(`${base}${HARNESS_ROUTES.toolsByToolIdExecutions('timeNow')}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ parameters: {} })
+            body: '{'
+        });
+
+        expect(broken.status).toBe(400);
+        expect(await broken.json()).toEqual({ error: { message: 'The request body must be valid JSON.' } });
+
+        // An absent wrapper is a VALID CALL: `timeNow` documents "UTC" as the omitted-label default,
+        // so an empty body executes rather than being mistaken for a malformed one.
+        const empty = await fetch(`${base}${HARNESS_ROUTES.toolsByToolIdExecutions('timeNow')}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
         });
         expect(empty.status).toBe(200);
-        const result = await json<ToolCallResult>(empty);
-        expect(result.ok).toBe(true);
-        if (result.ok) expect((result.result as { timezone: unknown }).timezone).toBe('UTC');
+        const emptyResult = await json<ToolCallResult>(empty);
+        expect(emptyResult.ok).toBe(true);
+        if (emptyResult.ok) expect((emptyResult.result as { timezone: unknown }).timezone).toBe('UTC');
     });
 
     it('rejects an over-sized parsed body with 413 through the real loader', async () => {

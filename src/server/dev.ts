@@ -31,6 +31,8 @@
 
 import { parseArgs } from 'node:util';
 import { startHarnessServer } from './index';
+// The canonical root, from the generated contract module — not a string spelled twice here.
+import { HARNESS_API_ROOT } from '../shared/harness-api';
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -40,9 +42,10 @@ const printUsage = (): void => {
 Usage:
   yarn dev:server [options]
 
-This process serves the harness API only (mount /api) and starts no UI or Vite
-dev server. In normal development the @underload/service gateway already hosts
-/v1/harness on :5000; use that instead unless a separate process is needed.
+This process serves the harness API only (mount ${HARNESS_API_ROOT}) and starts no UI or Vite
+dev server. In normal development the @underload/service gateway already hosts the same mount on
+:5000; use that instead unless a separate process is needed. The live update stream is served on the
+same host and port: ws://<host>:<port>${HARNESS_API_ROOT}/stream.
 
 Options:
   --port <port>           Server port (default: 5181; 0 = OS-assigned)
@@ -102,8 +105,11 @@ const main = async (): Promise<void> => {
         });
 
         console.log(`Harness server listening at ${server.url}`);
-        console.log(`  API  ${server.url}/api`);
-        if (server.persistence !== undefined) console.log(`  DB   ${server.persistence.file}`);
+        console.log(`  API    ${server.url}${HARNESS_API_ROOT}`);
+        // T15: the update stream shares this listener's host, port and root; only the scheme
+        // differs, which is the whole point of not inventing a second port for WebSocket.
+        console.log(`  STREAM ${server.url.replace(/^http/, 'ws')}${server.stream.path}`);
+        if (server.persistence !== undefined) console.log(`  DB     ${server.persistence.file}`);
         console.log('Ctrl+C to stop.');
 
         const shutdown = (): void => {

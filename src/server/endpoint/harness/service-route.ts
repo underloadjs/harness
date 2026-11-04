@@ -24,5 +24,9 @@ import { createHarnessServiceHandler, SERVICE_WILDCARD_ROUTE } from '../../servi
 
 export default {
     route: SERVICE_WILDCARD_ROUTE,
-    handler: createHarnessServiceHandler()
+    handler: createHarnessServiceHandler(),
+    // T15: the loader must NOT pre-buffer and pre-parse the submit bodies this route serves (a
+    // 16 MiB base64 attachment is allocated twice when it does). With `raw`, the harness reads the
+    // stream itself and rejects at the route cap instead — see ../../service.ts "BODY BOUNDS".
+    body: 'raw' as const
 };

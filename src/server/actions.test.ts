@@ -644,7 +644,7 @@ describe('SessionStore owner interaction', () => {
 
 describe('POST /sessions/:id/actions/:requestId/answer', () => {
     const route = (sessionId: string, requestId: string): string =>
-        `/api/sessions/${sessionId}/actions/${requestId}/answer`;
+        `/v1/harness/sessions/${sessionId}/actions/${requestId}/answer`;
 
     const call = async (
         store: SessionStore,
@@ -662,7 +662,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
         return api({
             method: 'POST',
             pathname: route(sessionId, requestId),
-            mount: '/api',
+            mount: '/v1/harness',
             readBody: async <T>() => body as T
         });
     };
@@ -676,12 +676,14 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
 
         const result = jsonOf(
             await call(store, preset, created.id, 'req-api', {
-                choice: { kind: 'option', optionId: 'b' }
+                // The wire spelling is snake_case (`option_id`); the dispatcher maps it to the
+                // recorded domain choice, which keeps `optionId`.
+                choice: { kind: 'option', option_id: 'b' }
             })
         );
 
         expect(result.status).toBe(200);
-        expect(result.body).toEqual({ ok: true });
+        expect(result.body).toEqual({ ok: true, request_id: 'req-api', resolved_at: expect.any(Number) });
         await expect(awaiting).resolves.toEqual({ kind: 'option', optionId: 'b' });
     });
 
@@ -694,7 +696,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
 
         const malformed = jsonOf(
             await call(store, preset, created.id, 'req-api-2', {
-                choice: { kind: 'option', optionId: 'missing' }
+                choice: { kind: 'option', option_id: 'missing' }
             })
         );
         expect(malformed.status).toBe(400);
@@ -711,7 +713,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
             })
         );
         expect(accepted.status).toBe(200);
-        expect(accepted.body).toEqual({ ok: true });
+        expect(accepted.body).toEqual({ ok: true, request_id: 'req-api-2', resolved_at: expect.any(Number) });
 
         const repeated = jsonOf(
             await call(store, preset, created.id, 'req-api-2', {
@@ -752,7 +754,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
         const missing = jsonOf(await call(store, preset, created.id, 'req-api-3', {}));
         expect(missing.status).toBe(400);
         expect(missing.body).toEqual({
-            error: { message: 'An action answer requires a `choice`.' }
+            error: { message: 'An action answer requires a "choice".' }
         });
 
         const extra = jsonOf(
@@ -781,15 +783,17 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
             await api({
                 method: 'GET',
                 pathname: route(created.id, 'req-1'),
-                mount: '/api',
+                mount: '/v1/harness',
                 readBody: async <T>() => ({}) as T
             })
         );
 
         expect(result.status).toBe(405);
+        // A 405 quotes the URL the caller actually used (the mount plus the real ids), which
+        // is what makes the refusal actionable from a browser network log alone.
         expect(result.body).toEqual({
             error: {
-                message: 'Use POST for /api/sessions/:id/actions/:requestId/answer.'
+                message: `Use POST for /v1/harness/sessions/${created.id}/actions/req-1/answer.`
             }
         });
     });

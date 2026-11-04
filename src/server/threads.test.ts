@@ -1,4 +1,4 @@
-// Persistent threads in the SERVER store (R1-R6) — store AND HTTP contract.
+﻿// Persistent threads in the SERVER store (R1-R6) — store AND HTTP contract.
 //
 // Coverage map:
 //   - an unfocused submit opens a standalone host thread (fresh transcript) and
@@ -31,6 +31,18 @@ import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { HARNESS_DATABASE_VERSION, HarnessPersistence, readHarnessDatabase } from './persistence';
 import { SessionError, SessionStore } from './sessions';
+import type {
+    CancelSessionResult,
+    CancelThreadResult,
+    DeleteThreadResult,
+    TaskReceipt,
+    ThreadSummary,
+    ThreadSummaryPage,
+    TurnResource,
+    TurnResponse,
+    TurnSummary,
+    TurnSummaryPage
+} from '../shared/harness-api';
 import type { SessionSnapshot, SessionThread, SessionView } from './protocol';
 import { listAgentResultBlocks, REFERENCED_RESULTS_FOOTER, REFERENCED_RESULTS_HEADER } from '../shared/agent-results';
 
@@ -1228,92 +1240,150 @@ describe('thread HTTP contract', () => {
             loadEnvironment: false
         });
 
-    it('accepts threadId on /tasks, reports steering, and serves cancel/delete routes', async () => {
+    // Canonical reads used by the migrated HTTP-contract assertions below. The submit
+    // answer is a slim receipt (T17), so every "what did the server actually record"
+    // question is answered by an explicit paged/identified read instead of a fat body.
+    const turnOf = async (runtime: HarnessRuntime, sessionId: string, turnId: string): Promise<TurnResource> => {
+        const result = await jsonOf<TurnResponse>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}`)
+        );
+
+        expect(result.status).toBe(200);
+        return result.body.turn;
+    };
+
+    const threadRosterOf = async (runtime: HarnessRuntime, sessionId: string): Promise<ThreadSummary[]> => {
+        const result = await jsonOf<ThreadSummaryPage>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/threads`)
+        );
+
+        expect(result.status).toBe(200);
+        return result.body.items;
+    };
+
+    const turnRowsOf = async (runtime: HarnessRuntime, sessionId: string): Promise<TurnSummary[]> => {
+        const result = await jsonOf<TurnSummaryPage>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/turns`)
+        );
+
+        expect(result.status).toBe(200);
+        return result.body.items;
+    };
+
+    it('accepts thread_id on /tasks, reports steering, and serves cancel/delete routes', async () => {
         const fixture = createFixture();
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'probe');
 
-        // Unfocused submit: 202 `{session, turn}` with the new thread id.
-        const accepted = await jsonOf<{ session: SessionSnapshot; turn: { threadId?: string; id: string } }>(
+        // Unfocused submit: 202 receipt naming the thread the task opened.
+        const accepted = await jsonOf<TaskReceipt>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: 'first' })
         );
         expect(accepted.status).toBe(202);
-        expect(accepted.body.turn.threadId).toBe('thread-1');
+        expect(accepted.body.thread_id).toBe('thread-1');
+        expect(accepted.body.session_id).toBe(id);
+        expect(accepted.body.links.turn).toBe(`/v1/harness/sessions/${id}/turns/${accepted.body.turn_id}`);
         await runtime.store.waitForIdle(id);
 
+        // The durable record of that task carries the same thread routing.
+        expect(await turnOf(runtime, id, accepted.body.turn_id)).toMatchObject({
+            id: accepted.body.turn_id,
+            index: 0,
+            thread_id: 'thread-1',
+            status: 'done'
+        });
+
         // Continuation through the SAME thread keeps the envelope (no `steered`).
-        const continued = await jsonOf<{ turn: { threadId?: string; index: number }; steered?: true }>(
+        const continued = await jsonOf<TaskReceipt>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
                 input: 'second',
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             })
         );
         expect(continued.status).toBe(202);
-        expect(continued.body.turn).toEqual(
-            expect.objectContaining({ threadId: 'thread-1', index: 1 })
-        );
+        expect(continued.body.thread_id).toBe('thread-1');
         expect(continued.body.steered).toBeUndefined();
         await runtime.store.waitForIdle(id);
 
+        expect(await turnOf(runtime, id, continued.body.turn_id)).toMatchObject({
+            index: 1,
+            thread_id: 'thread-1'
+        });
+
         // Steering a RUNNING thread: `steered: true` and the owning turn.
         fixture.gate('third');
-        const running = await jsonOf<{ turn: { id: string } }>(
+        const running = await jsonOf<TaskReceipt>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
                 input: 'third',
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             })
         );
         await fixture.started('third').promise;
 
-        const steered = await jsonOf<{ turn: { id: string }; steered?: true }>(
+        const steered = await jsonOf<TaskReceipt>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
                 input: 'steered text',
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             })
         );
         expect(steered.status).toBe(202);
         expect(steered.body.steered).toBe(true);
-        expect((steered.body as { steeredThreadId?: string }).steeredThreadId).toBe('thread-1');
-        expect(steered.body.turn.id).toBe(running.body.turn.id);
+        expect(steered.body.steered_thread_id).toBe('thread-1');
+        expect(steered.body.turn_id).toBe(running.body.turn_id);
 
         // Unknown thread id over HTTP is a 404.
         const unknown = await jsonOf<{ error: { message: string } }>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
                 input: 'x',
-                threadId: 'thread-404'
+                thread_id: 'thread-404'
             })
         );
         expect(unknown).toEqual({ status: 404, body: { error: { message: 'Unknown thread "thread-404".' } } });
 
-        // Stop ONE thread: `{cancelled, session}`.
-        const cancelled = await jsonOf<{ cancelled: boolean; session: SessionSnapshot }>(
+        // Stop ONE thread: the canonical receipt states the thread and its new status,
+        // and the roster read is the authoritative proof the stop landed.
+        const cancelled = await jsonOf<CancelThreadResult>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/cancel`)
         );
         expect(cancelled.status).toBe(200);
-        expect(cancelled.body.cancelled).toBe(true);
-        expect(cancelled.body.session.threads![0].status).toBe('stopped');
+        expect(cancelled.body).toMatchObject({
+            cancelled: true,
+            thread_id: 'thread-1',
+            session_id: id,
+            status: 'stopped'
+        });
+        expect(
+            (await threadRosterOf(runtime, id)).find((row) => row.id === 'thread-1')!.status
+        ).toBe('stopped');
 
         fixture.gate('third').resolve();
         await runtime.store.waitForIdle(id);
 
-        // A stopped thread deletes; a second delete is a 404.
-        const deleted = await jsonOf<{ deleted: true; session: SessionSnapshot }>(
+        // A stopped thread deletes; the cascade is reported by the receipt, and the
+        // roster/turn pages prove the removal.
+        const deleted = await jsonOf<DeleteThreadResult>(
             await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}/threads/thread-1`)
         );
-        expect(deleted).toEqual({
-            status: 200,
-            body: { deleted: true, session: deleted.body.session }
+        expect(deleted.status).toBe(200);
+        expect(deleted.body).toMatchObject({
+            deleted: true,
+            thread_id: 'thread-1',
+            session_id: id
         });
-        expect(deleted.body.session.turns).toEqual([]);
-        expect(deleted.body.session.threads).toBeUndefined();
+        expect((await threadRosterOf(runtime, id)).map((row) => row.id)).not.toContain('thread-1');
+        expect((await turnRowsOf(runtime, id)).map((row) => row.threadId)).not.toContain('thread-1');
 
         const missing = await jsonOf<{ error: { message: string } }>(
             await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}/threads/thread-1`)
         );
-        expect(missing).toEqual({ status: 404, body: { error: { message: 'Unknown thread "thread-1".' } } });
+        expect(missing).toEqual({
+            status: 404,
+            // The canonical 404 scopes the miss to the session in the path.
+            body: { error: { message: `Unknown thread "thread-1" in session "${id}".` } }
+        });
     });
 
-    it('keeps /cancel { all: true } and the legacy cancel envelope', async () => {
+    it('keeps /cancel { all: true } and reports the canonical cancel receipt', async () => {
         const fixture = createFixture();
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'probe');
@@ -1322,15 +1392,25 @@ describe('thread HTTP contract', () => {
         void callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: 'active' });
         await fixture.started('active').promise;
 
-        const all = await jsonOf<{ cancelled: boolean }>(
+        const all = await jsonOf<CancelSessionResult>(
             await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`, { all: true })
         );
-        expect(all).toEqual({ status: 200, body: { cancelled: true } });
+
+        // No legacy `{cancelled}`-only envelope: the receipt names the session, the run it
+        // stopped, the queued tasks it dropped, and the revision the caller compares next.
+        expect(all.status).toBe(200);
+        expect(Object.keys(all.body).sort()).toEqual(
+            ['active_turn_id', 'cancelled', 'dropped_queued_tasks', 'revision', 'session_id'].sort()
+        );
+        expect(all.body.cancelled).toBe(true);
+        expect(all.body.session_id).toBe(id);
+        expect(all.body.dropped_queued_tasks).toBe(0);
 
         fixture.gate('active').resolve();
         await runtime.store.waitForIdle(id);
     });
 });
+
 
 // ---------------------------------------------------------------------------
 // Delegated child conversations on the server roster

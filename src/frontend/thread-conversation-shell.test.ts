@@ -172,7 +172,7 @@ const stubServer = (
             // The shell may probe thread routes only on explicit actions.
             void stream;
             throw new Error(`unexpected request: ${method} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return stub;

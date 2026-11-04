@@ -21,6 +21,13 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+// The launcher serves the canonical root, and the assertion below must not drift from it: imported
+// from the same module the launcher's adapter mounts on, rather than re-spelled here.
+import { STANDALONE_MOUNT } from './api';
+// The generated health envelope and route builders, so the launcher test states the target
+// contract's fields rather than the implementation's current output.
+import { HARNESS_ROUTES } from '../shared/harness-api';
+import type { HarnessCardPage, HealthResponse } from '../shared/harness-api';
 
 // src/server -> package root is two levels up.
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -114,10 +121,24 @@ describe('standalone server launcher', () => {
                 const url = await waitForUrl(child, () => stdout, () => stderr);
                 expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
 
-                // The API is live on the OS-assigned port.
-                const health = await fetch(`${url}/api/health`, { headers: CLIENT });
-                expect(health.status).toBe(200);
-                expect(await health.json()).toEqual({ ok: true, sessions: 0 });
+                // The API is live on the OS-assigned port, under the canonical root (there is no
+                // `/api` mount any more, and the client-hint header is no longer required). The
+                // envelope is the generated `HealthResponse`: liveness, the session count, and the
+                // process EPOCH — the field the target contract added so a monitor detects a restart
+                // without parsing a version string, and the same value the stream's `welcome` carries.
+                const healthResponse = await fetch(`${url}${STANDALONE_MOUNT}/health`, { headers: CLIENT });
+                expect(healthResponse.status).toBe(200);
+                expect(healthResponse.headers.get('x-harness-epoch')).toBeTruthy();
+
+                const health = (await healthResponse.json()) as HealthResponse;
+                expect(health.ok).toBe(true);
+                expect(health.sessions).toBe(0);
+                expect(health.epoch).toMatch(/^[0-9a-z]+-[0-9a-z]+$/);
+
+                // The banner advertises the mount and the stream URL on the SAME host and port,
+                // which is the point of not inventing a second listener for WebSocket.
+                expect(stdout).toContain(`  API    ${url}${STANDALONE_MOUNT}`);
+                expect(stdout).toContain(`  STREAM ${url.replace('http://', 'ws://')}${STANDALONE_MOUNT}/stream`);
 
                 // staticRoot: null — the launcher is not a UI host.
                 const root = await fetch(`${url}/`);
@@ -134,10 +155,12 @@ describe('standalone server launcher', () => {
                 // runnable configurations, no scripted demo and no card that fails on
                 // purpose (T5). This is the whole point of the removal, so it is
                 // asserted against a REAL launched server, not only against the store.
-                const catalogue = await fetch(`${url}/api/harnesses`, { headers: CLIENT });
+                // T18: the read is the contract's `HarnessCardPage` (`items` plus `PageMeta`), not the
+                // legacy `{ harnesses }` index, and the route comes from the generated builders.
+                const catalogue = await fetch(`${url}${HARNESS_ROUTES.harnesses()}`, { headers: CLIENT });
                 expect(catalogue.status).toBe(200);
-                const index = (await catalogue.json()) as { harnesses: { name: string }[] };
-                expect(index.harnesses.map((harness) => harness.name)).toEqual([
+                const index = (await catalogue.json()) as HarnessCardPage;
+                expect(index.items.map((harness) => harness.name)).toEqual([
                     'instruct',
                     'research',
                     'workspace',
@@ -149,7 +172,7 @@ describe('standalone server launcher', () => {
                 // A shipped role is used (not the offline fixture, which this build no
                 // longer lists); creating a session never contacts the provider, so the
                 // child stays offline while still exercising the durable write.
-                const created = await fetch(`${url}/api/sessions`, {
+                const created = await fetch(`${url}${STANDALONE_MOUNT}/sessions`, {
                     method: 'POST',
                     headers: { ...CLIENT, 'content-type': 'application/json' },
                     body: JSON.stringify({ harness: 'instruct' })

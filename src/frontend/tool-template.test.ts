@@ -245,7 +245,7 @@ beforeEach(() => {
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 });
 

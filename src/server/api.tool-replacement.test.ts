@@ -1,4 +1,4 @@
-// R4 of the self-modifying-tools task: the server API must execute a named
+﻿// R4 of the self-modifying-tools task: the server API must execute a named
 // session's LIVE tool registry, not the detached static catalogue.
 //
 // These tests use a real SessionStore + real harness, but replace entries by
@@ -7,9 +7,10 @@
 // independent of the not-yet-final kernel registration interface, while still
 // proving the routing rule:
 //
-//   POST /tools/:name { sessionId } -> store.callTool -> live harness entry
+//   POST /v1/harness/sessions/:id/tools/:name/executions -> store.callTool -> live harness entry
 //
-// A no-session call keeps the static direct runner. Every assertion is exact.
+// A no-session call (`POST /v1/harness/tools/:name/executions`) keeps the static direct
+// runner. Every assertion is exact.
 //
 // Cross-references:
 //   - ../api.ts              — callToolRoute (session branch precedes static entry)
@@ -23,7 +24,9 @@ import { createHarnessRegistry, createToolboxHarness, agentsFromProfiles, preset
 import type { HarnessPreset } from './harnesses';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
-import type { SessionSnapshot, ToolCallResult } from './protocol';
+// ToolCallResult is the canonical wire shape (ok + duration_ms), from the contract.
+import type { ToolCallResult } from '../shared/harness-api';
+import type { SessionSnapshot } from './protocol';
 
 afterEach(() => {
     vi.useRealTimers();
@@ -109,12 +112,23 @@ const callApi = (runtime: HarnessRuntime, method: string, pathname: string, body
         bootstrapRoot: true
     });
 
+// Canonical tool execution (T26): the global catalogue call is
+// `POST /v1/harness/tools/{tool_id}/executions`, and a call that must run inside a
+// session is `POST /v1/harness/sessions/{session_id}/tools/{tool_id}/executions`. The
+// session used to travel in the body; on the canonical surface the path IS the session,
+// so a body can never reach another session's registry.
+const executionPath = (name: string, sessionId?: string): string =>
+    sessionId === undefined
+        ? `/v1/harness/tools/${name}/executions`
+        : `/v1/harness/sessions/${sessionId}/tools/${name}/executions`;
+
 const callTool = async (
     runtime: HarnessRuntime,
     name: string,
-    body: unknown
+    body: unknown,
+    sessionId?: string
 ): Promise<ToolCallResult> => {
-    const result = await callApi(runtime, 'POST', `/v1/harness/tools/${name}`, body);
+    const result = await callApi(runtime, 'POST', executionPath(name, sessionId), body);
 
     if (result.kind !== 'json') throw new Error('expected a JSON tool response');
     expect(result.status).toBe(200);
@@ -140,15 +154,12 @@ describe('session-aware tool execution (R4)', () => {
         // original app definition.
         (live.tools as Record<string, Tool>).timeNow = replacementTimeNow;
 
-        const viaSession = await callTool(runtime, 'timeNow', {
-            sessionId: session.id,
-            parameters: {}
-        });
+        const viaSession = await callTool(runtime, 'timeNow', { parameters: {} }, session.id);
 
         expect(viaSession).toEqual({
             ok: true,
             result: { replaced: 'timeNow-v2' },
-            durationMs: expect.any(Number)
+            duration_ms: expect.any(Number)
         });
 
         // No session: the static catalogue's direct runner is unchanged, including
@@ -177,7 +188,7 @@ describe('session-aware tool execution (R4)', () => {
                     ]
                 }
             ],
-            durationMs: expect.any(Number)
+            duration_ms: expect.any(Number)
         });
     });
 
@@ -191,22 +202,17 @@ describe('session-aware tool execution (R4)', () => {
         // The static catalogue has no such entry; only this session's registry does.
         (live.tools as Record<string, Tool>).sessionOnly = sessionOnly;
 
-        const viaSession = await callTool(runtime, 'sessionOnly', {
-            sessionId: session.id,
-            parameters: {}
-        });
+        const viaSession = await callTool(runtime, 'sessionOnly', { parameters: {} }, session.id);
 
         expect(viaSession).toEqual({
             ok: true,
             result: { sessionOnly: true },
-            durationMs: expect.any(Number)
+            duration_ms: expect.any(Number)
         });
 
         // Without a session there is no registry to resolve it: the historical 404
         // still applies to a name the static catalogue does not know.
-        const direct = await callApi(runtime, 'POST', '/v1/harness/tools/sessionOnly', {
-            parameters: {}
-        });
+        const direct = await callApi(runtime, 'POST', executionPath('sessionOnly'), { parameters: {} });
         expect(direct).toEqual({
             kind: 'json',
             status: 404,
@@ -242,18 +248,18 @@ export const execute = () => {
 `
         });
 
-        const result = await callApi(runtime, 'POST', '/v1/harness/tools/hostileThrow', {
-            sessionId: session.id,
-            parameters: {}
-        });
+        const result = await callApi(runtime, 'POST', executionPath('hostileThrow', session.id), { parameters: {} });
 
         expect(result).toEqual({
             kind: 'json',
             status: 200,
+            // Every canonical response carries the server epoch header (contract
+            // `HARNESS_EPOCH_HEADER`), including a 200 tool-error answer.
+            headers: { 'X-Harness-Epoch': expect.any(String) },
             body: {
                 ok: false,
                 error: { message: 'Unknown harness error' },
-                durationMs: expect.any(Number)
+                duration_ms: expect.any(Number)
             }
         });
     });
@@ -269,15 +275,14 @@ export const execute = () => {
         // must not execute a detached catalogue copy behind the session's back.
         delete (live.tools as Record<string, Tool>).timeNow;
 
-        const result = await callApi(runtime, 'POST', '/v1/harness/tools/timeNow', {
-            sessionId: session.id,
-            parameters: 'UTC'
-        });
+        const result = await callApi(runtime, 'POST', executionPath('timeNow', session.id), { parameters: 'UTC' });
 
-        expect(result).toEqual({
-            kind: 'json',
-            status: 404,
-            body: { error: { message: 'Tool "timeNow" is not available in this session.' } }
+        expect(result.kind).toBe('json');
+        expect(result.status).toBe(404);
+        // The canonical 404 says the name is unknown IN THIS SESSION, which is the
+        // routing rule this test exists for: no silent fallback to the static catalogue.
+        expect((result as { body: unknown }).body).toEqual({
+            error: { message: `Unknown tool "timeNow" in session "${session.id}".` }
         });
     });
 });

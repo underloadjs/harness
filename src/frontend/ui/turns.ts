@@ -196,7 +196,7 @@ import type { FilePreviewReader, FilePreviewResolver } from './file-preview';
 import { openAttachmentDialog, enhanceImages, openImageDialog } from './preview';
 // C5 transcript editing: the PUT answer's transcript document. TYPE-ONLY, so this
 // never pulls the fetch client into the UI graph at runtime.
-import type { ThreadTranscriptPayload } from '../api';
+import type { ThreadTranscriptPayload } from '../view-model';
 import {
     closeThreadTranscript,
     openThreadTranscript,
@@ -510,6 +510,22 @@ export type TurnBoardOptions = {
     // Sends one human answer to the harness server. Omitted in standalone tests and
     // on a page with no wiring; the card then reports a recoverable local error.
     answerAction?: (input: AnswerActionInput) => Promise<void>;
+    // T21 (5): an owner question as the COMPACT wire sees it. The canonical
+    // `DisplayStep` publishes no `action` payload (its required set is
+    // kind/id/turnId/sectionId/name/state, harness.swagger.yaml L6253), so the card's
+    // REAL choices come from one of two authoritative sources, never a fake default:
+    //   - `actionRequestFor` answers synchronously from the session's pending actions
+    //     (`PendingAction.request` — the exact recorded request the answer route
+    //     validates a choice against);
+    //   - `loadActionRequest` fills a settled/historical card from its verbatim
+    //     `action_request` opening event on the step detail route.
+    // A step with neither source renders the question line the row does carry plus a
+    // stated "choices unavailable — open the details" note, and the answer control is
+    // disabled rather than offering an empty option list.
+    actionRequestFor?: (step: DisplayStep) => HarnessActionRequest | undefined;
+    // Repaint request after a lazy action read landed (T21 (5)).
+    onActionHydrated?: (turnId: string) => void;
+    loadActionRequest?: (step: DisplayStep) => Promise<HarnessActionRequest | undefined>;
     // Reads a bounded window of one LOCAL RELATIVE file for the R11 preview dialog.
     // Injected by the app shell (main.ts -> `callTool('read', ...)`) so the UI
     // layer owns no network code. Omitted in standalone use: clicking a file link
@@ -1579,6 +1595,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // list is computed live so a streaming turn's new nested block appears without
     // an extra subscription.
     const blocks = (): AgentBlockDescriptor[] => turns.flatMap((turn) => turn.blocks());
+    // T21 (5) / T29: hydrated owner-question requests, keyed per board, plus the steps a read
+    // was already attempted for (one attempt, never a retry loop on a permanent 404).
+    //
+    // The key is the step's OWN identity (`turnId|stepId`), not the paint-time thread-entry
+    // key: `entry.key` is minted whenever the flow is (re)built, so a keyed cache could
+    // never be found again after the lazy read landed — the card asked, got its recorded
+    // request, and then painted as if nothing had arrived. Turn and step ids are server
+    // minted and stable for the board's lifetime, which is the lifetime of the cache.
+    const hydratedRequests = new Map<string, HarnessActionRequest>();
+    const hydratedAttempts = new Set<string>();
+
     let expandedTurn: TurnHandle | undefined;
     // S1: focus is EXPLICIT state, not a function of whichever tile happens to be
     // expanded. A background adoption (another tab's turn, a snapshot arriving
@@ -4889,7 +4916,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // guard, so the card never sees a partially-malformed payload.
         const mountActionCard = (entry: ThreadEntry, request: HarnessActionRequest): ActionRequestCard => {
             const existing = actionCards.get(request.requestId);
-            if (existing !== undefined) return existing;
+            if (existing !== undefined) {
+                // T29: a re-paint rebuilds the section flow, and a card registered under
+                // this request id left with the old one. A registered card whose element
+                // is no longer in the document is NOT "mounted": re-attach the SAME card
+                // (its submitting/answered/expired state is live and must survive) instead
+                // of leaving the question row absent while its state stays registered.
+                if (existing.element.isConnected === false) {
+                    entry.section.flow.append(existing.element);
+                    if (entry.section.pending !== undefined) entry.section.flow.append(entry.section.pending);
+                }
+
+                return existing;
+            }
 
             const interactive = entry.key === ROOT_KEY && !isSettledTurn();
             const stored = actionAnswers.get(request.requestId);
@@ -6469,13 +6508,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return handle;
         };
 
-        // An owner question from the compact wire. The card's request is rebuilt from
-        // the bounded summary — the question stays answerable without a detail fetch.
+        // An owner question from the compact wire. The canonical row carries the
+        // question line only, so the choices are taken from an authoritative source
+        // in this order: the tree's own `action` summary (a producer that publishes
+        // it), the session's pending actions (`PendingAction.request`, the exact
+        // recorded request the answer route validates against), a previously hydrated
+        // request for this step, and finally the verbatim `action_request` opening
+        // event on the step detail route — fetched once, after which the shell
+        // repaints this tile through `onActionHydrated`. Nothing is invented: with no
+        // source the card states that the choices are unavailable instead of mounting
+        // an empty option list the reader could not read as anything but "no answers".
         const paintCompiledAction = (entry: ThreadEntry, step: DisplayStep): CompiledHandle => {
+            const hydratedKey = `${step.turnId}|${step.id}`;
             const action = step.action;
             const requestId = action?.requestId ?? step.callId ?? step.id;
+            const supplied = action === undefined
+                ? (options.actionRequestFor?.(step) ?? hydratedRequests.get(hydratedKey))
+                : undefined;
 
-            const request: HarnessActionRequest = {
+            const request: HarnessActionRequest = supplied ?? {
                 requestId,
                 question: action?.question ?? step.name,
                 recommended: action?.recommended ?? '',
@@ -6491,6 +6542,42 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             closeToolGroup(entry.section);
 
             const card = mountActionCard(entry, request);
+
+            // One lazy read per step, and only when the card has no real choices.
+            if (action === undefined && supplied === undefined && !hydratedAttempts.has(hydratedKey)) {
+                hydratedAttempts.add(hydratedKey);
+
+                void Promise.resolve(options.loadActionRequest?.(step))
+                    .then((resolved) => {
+                        if (resolved === undefined) return false;
+
+                        hydratedRequests.set(hydratedKey, resolved);
+
+                        // T29: the provisional card was built from the question LINE with a
+                        // request id guessed off the step, and both `actionCards` and
+                        // `answerCards` are keyed by `requestId`. Until that registration is
+                        // retired, the recorded request can never mount in this slot — the
+                        // registry would hand back the option-less card forever. Retire it
+                        // here (element and both registries) so the repaint below mounts the
+                        // card the agent actually asked.
+                        const provisional = actionCards.get(requestId);
+
+                        if (provisional !== undefined) {
+                            actionCards.delete(requestId);
+                            forgetAnswerCard(requestId);
+                            provisional.destroy();
+                            provisional.element.remove();
+                        }
+
+                        return true;
+                    })
+                    // The shell owns the repaint: it re-applies this turn's compiled
+                    // document, and the card mounts with its recorded options.
+                    .then((hydrated) => {
+                        if (hydrated) options.onActionHydrated?.(step.turnId);
+                    })
+                    .catch(() => undefined);
+            }
 
             // The recorded answer, when there is one, is authoritative: the card
             // shows it instead of an open question (the same `action_answer` effect).
@@ -8808,6 +8895,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // T6/R5: the confirmation layer names a thread of the conversation being
             // left; confirming it here could only ever target the wrong roster.
             closeThreadDeleteConfirmation();
+            // T29: an owner question belongs to the conversation that asked it. Turn and
+            // step ids are minted inside ONE session, so both the hydrated request and
+            // the "already asked" marker are dropped with the session — otherwise a
+            // re-opened conversation would re-present a stale option list and a step the
+            // board never actually re-read.
+            hydratedRequests.clear();
+            hydratedAttempts.clear();
             // In-flight deletes belong to the session being left. A late resolution
             // removes only its own composite key/token, so the new binding's state
             // cannot be cleared by the old request.

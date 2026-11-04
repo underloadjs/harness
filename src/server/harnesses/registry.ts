@@ -85,7 +85,9 @@
 import { agentProfiles, isAgentProfileName } from '../../agents';
 import type { AgentProfile } from '../../agents';
 import type { HarnessPreset } from './types';
-import type { HarnessPresetRecord } from '../persistence';
+import type { HarnessAgentRecord, HarnessPresetRecord } from '../persistence';
+import { attachDefaultAgentState, createAgentState } from './agent-state';
+import type { AgentProfilePatch, AgentState } from './agent-state';
 import { ALL_PRESET_TEMPLATES, LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
 import {
@@ -202,6 +204,11 @@ export type HarnessPatch = {
 export type HarnessRegistrySnapshot = {
     entries: readonly (readonly [string, HarnessPreset])[];
     deletedBuiltins: readonly string[];
+    // T19: the global agent overlay travels with the registry snapshot, because the agent
+    // layer is registry-owned state committed through the SAME durable unit. A store that
+    // rolls a failed commit back with `restore(snapshot)` therefore rolls an agent edit
+    // back too, without any change to the store's commit code.
+    agents: readonly HarnessAgentRecord[];
 };
 
 export type HarnessRegistry = {
@@ -212,8 +219,31 @@ export type HarnessRegistry = {
     // Resolve a name, including a legacy alias. Undefined means 404 for a session
     // request.
     find: (name: string) => HarnessPreset | undefined;
-    // The trusted agent profiles a client may select as primary/subagent.
+    // The trusted agent profiles a client may select as primary/subagent. T19: these are
+    // the EFFECTIVE profiles — the shipped catalogue with the global override layer merged
+    // and retired profiles removed — so every existing reader of `agents()` (harness
+    // validation, instruction projections, the agent catalogue) states the operator's
+    // configuration without knowing the layer exists.
     agents: () => readonly AgentProfile[];
+    // T19: the global agent overlay itself (./agent-state.ts). Exposed so the API can state
+    // `has_global_override` / `instruction_source` from ONE authority instead of re-deriving
+    // it, and so a host can persist `agentRecords()` without reaching into the layer.
+    agentState: () => AgentState;
+    // T19: declarative text override of one trusted profile. Never touches the shipped
+    // catalogue object; affects FUTURE sessions only. Throws AgentStateError (400/404).
+    patchAgent: (name: string, patch: AgentProfilePatch) => AgentProfile;
+    // T19: retire one profile (the DELETE route): it leaves the selectable catalogue for
+    // new sessions and new member selections, and leaves a durable tombstone.
+    retireAgent: (name: string) => string;
+    // T19: the durable projection of the overlay (overrides + retirement).
+    agentRecords: () => HarnessAgentRecord[];
+    // T19: retired profile ids, in retirement order.
+    deletedAgents: () => readonly string[];
+    // T19: whether one id may be SELECTED by new work (known and not retired).
+    isAgentSelectable: (name: string) => boolean;
+    // T19: replay the durable overlay onto a freshly built registry (startup restore).
+    // Idempotent and never throws.
+    restoreAgentRecords: (records: readonly HarnessAgentRecord[]) => void;
     create: (registration: HarnessRegistration) => HarnessPreset;
     update: (name: string, patch: HarnessPatch) => HarnessPreset;
     // T5: remove one harness. Direct name only, like update() — a legacy alias is a
@@ -289,7 +319,18 @@ const normalizeDescription = (value: unknown): string => {
 
 // Validate a trusted agent id. The message lists the known set so a client (and
 // its user) can correct a typo without a second discovery call.
-const requireAgent = (value: unknown, field: string): string => {
+//
+// T19: `selectable` is the GLOBAL agent overlay's gate. The id must always be a
+// catalogue identity; when a checker is supplied, a RETIRED profile is refused too,
+// because an HTTP write that selected it could never run in a new session. A restored
+// saved row deliberately passes no checker: a harness that already selects a profile the
+// operator retired stays replayable (its own sessions keep working), and the refusal
+// happens when someone tries to select it NEW.
+const requireAgent = (
+    value: unknown,
+    field: string,
+    selectable?: (name: string) => boolean
+): string => {
     const name = requireString(value, field);
 
     if (!isAgentProfileName(name)) {
@@ -301,6 +342,13 @@ const requireAgent = (value: unknown, field: string): string => {
         );
     }
 
+    if (selectable !== undefined && !selectable(name)) {
+        throw new HarnessRegistryError(
+            409,
+            `Agent "${name}" is retired and can no longer be selected. Existing harnesses and sessions that already select it are unaffected.`
+        );
+    }
+
     return name;
 };
 
@@ -309,7 +357,8 @@ const requireAgent = (value: unknown, field: string): string => {
 // ambiguous, and the registry should not guess which occurrence was meant.
 const normalizeSubagents = (
     value: unknown,
-    primary: string
+    primary: string,
+    selectable?: (name: string) => boolean
 ): string[] => {
     if (!Array.isArray(value)) {
         throw new HarnessRegistryError(400, '`subagents` must be an array of agent names.');
@@ -322,8 +371,7 @@ const normalizeSubagents = (
     const resolved: string[] = [];
 
     for (const entry of value) {
-        const name = requireAgent(entry, 'subagents');
-
+        const name = requireAgent(entry, 'subagents', selectable);
         if (name === primary) {
             throw new HarnessRegistryError(
                 400,
@@ -794,9 +842,17 @@ export const isLegacyShippedDefinition = (
 export const restoreHarnessRegistry = (
     registry: HarnessRegistry,
     records: readonly HarnessPresetRecord[],
-    deletedBuiltins: readonly string[] = []
+    deletedBuiltins: readonly string[] = [],
+    // T19 (ADDITIVE): the durable global agent overlay (`agents.json`). Replayed first, so
+    // the entry loop below compares and patches against the EFFECTIVE profiles rather than
+    // the shipped ones.
+    agentRecords: readonly HarnessAgentRecord[] = []
 ): void => {
     registry.restoreDeletedBuiltins(deletedBuiltins);
+
+    if (Array.isArray(agentRecords) && agentRecords.length > 0) {
+        registry.restoreAgentRecords(agentRecords);
+    }
 
     const known = new Map(registry.list().map((preset) => [preset.name, presetToRecord(preset)]));
 
@@ -879,6 +935,15 @@ export type HarnessRegistryOptions = {
     // appears here is NOT inserted, so a shipped default stays removed across
     // restarts. Order is preserved, which keeps the saved document stable.
     deletedBuiltins?: readonly string[];
+    // T19: the durable global agent overlay (`<root>/harness/agents.json`), replayed
+    // before the first read so a restart does not resurrect a retired profile or forget
+    // an operator's text override.
+    agentRecords?: readonly HarnessAgentRecord[];
+    // T19: inject an existing overlay layer instead of building one. A host that keeps
+    // several registries (or a test that wants an isolated catalogue) passes one; without
+    // it, this registry's layer also becomes the PROCESS default that ./toolbox.ts
+    // resolves profile text through — see the note in ./agent-state.ts.
+    agentState?: AgentState;
 };
 
 export const createHarnessRegistry = (
@@ -887,6 +952,22 @@ export const createHarnessRegistry = (
 ): HarnessRegistry => {
     // Insertion-ordered map: list() is stable, and update() preserves position.
     const entries = new Map<string, HarnessPreset>();
+
+    // T19: the global agent overlay this registry resolves profiles through. Built from
+    // the durable records BEFORE anything reads `agents()`, so a restart cannot serve a
+    // retired profile for one request. It also becomes the PROCESS default
+    // (./agent-state.ts `attachDefaultAgentState`), which is what lets a captured harness
+    // factory — a shipped template included — resolve the operator's text at the moment a
+    // NEW session is built. One server process therefore owns one registry; a host that
+    // keeps several passes its own `agentState` and pins the default itself.
+    const agentState = options.agentState ?? createAgentState(options.agentRecords ?? []);
+
+    attachDefaultAgentState(agentState);
+
+    // Selectability gate for NEW selections only (see `requireAgent`): the id must be a
+    // catalogue identity AND not retired. A name this harness already selects bypasses the
+    // check, so a saved row that keeps a retired member stays replayable and patchable.
+    const selectableAgent = (name: string): boolean => agentState.isKnown(name);
 
     // Deleted built-in tombstones (T5). An insertion-ordered Set, so
     // `deletedBuiltins()` — and therefore the saved document — does not reshuffle
@@ -954,11 +1035,11 @@ export const createHarnessRegistry = (
             throw new HarnessRegistryError(409, `Harness "${name}" already exists.`);
         }
 
-        const primary = requireAgent(registration?.primary, 'primary');
+        const primary = requireAgent(registration?.primary, 'primary', selectableAgent);
         const subagents =
             registration.subagents === undefined
                 ? []
-                : normalizeSubagents(registration.subagents, primary);
+                : normalizeSubagents(registration.subagents, primary, selectableAgent);
 
         // The final member set: one primary then its allowlist. The per-agent
         // model map is validated against exactly this, so a key can never name an
@@ -1043,8 +1124,18 @@ export const createHarnessRegistry = (
         // R20.1: no read-only gate. Every entry is an editable application copy;
         // the previous 403 branch is intentionally gone, and `editable` is a wire
         // compatibility field only.
+        //
+        // T19 selectability: a name this entry ALREADY selects stays valid after the
+        // operator retires the profile (that is what keeps a saved row restorable and an
+        // existing team runnable), while a name the patch INTRODUCES must be selectable.
+        const previouslySelected = new Set(current.agents);
+        const selectableHere = (name: string): boolean =>
+            selectableAgent(name) || previouslySelected.has(name);
+
         const primary =
-            patch.primary === undefined ? current.primary : requireAgent(patch.primary, 'primary');
+            patch.primary === undefined
+                ? current.primary
+                : requireAgent(patch.primary, 'primary', selectableHere);
 
         // Changing the primary without restating the allowlist must not leave the
         // new primary inside `subagents` (a harness has exactly one primary). When
@@ -1052,7 +1143,7 @@ export const createHarnessRegistry = (
         const subagents =
             patch.subagents === undefined
                 ? current.subagents.filter((entry) => entry !== primary)
-                : normalizeSubagents(patch.subagents, primary);
+                : normalizeSubagents(patch.subagents, primary, selectableHere);
 
         const agents = [primary, ...subagents];
 
@@ -1219,9 +1310,24 @@ export const createHarnessRegistry = (
         }
     };
 
+    // T19: agent-layer operations, exposed through the registry so the dispatcher's commit
+    // unit (`store.mutateRegistry`) covers them with the SAME snapshot/restore it already
+    // uses for a harness create/patch/delete: `snapshot()` captures the overlay, and a
+    // failed durable write restores it, so an agent edit is never half-applied.
+    const patchAgent = (name: string, patch: AgentProfilePatch): AgentProfile =>
+        agentState.patch(name, patch);
+
+    const retireAgent = (name: string): string => agentState.retire(name);
+
+    // A repeat DELETE of an already-retired profile is 404 (`Unknown agent`), which is what
+    // `agentState.retire` already answers; a repeat DELETE of an unknown id is the same.
+
     const snapshot = (): HarnessRegistrySnapshot => ({
         entries: [...entries.entries()],
-        deletedBuiltins: [...deleted]
+        deletedBuiltins: [...deleted],
+        // A detached copy (the layer returns fresh records), so a later mutation cannot
+        // write through the captured rollback value.
+        agents: agentState.snapshot()
     });
 
     // Replace the whole mutable state with a captured one. Order is rebuilt from the
@@ -1239,12 +1345,25 @@ export const createHarnessRegistry = (
         deleted.clear();
 
         for (const name of captured.deletedBuiltins) deleted.add(name);
+
+        // T19: the overlay rolls back with the entries. Guarded, because a snapshot
+        // captured by a caller built before the agent layer carries no `agents` field, and
+        // wiping the overlay in that case would silently un-apply an operator's decisions.
+        if (Array.isArray(captured.agents)) agentState.restoreSnapshot(captured.agents);
     };
 
     return {
         list: () => [...entries.values()],
         find,
-        agents: () => agentProfiles(),
+        // T19: the EFFECTIVE profiles (catalogue + global overlay, retired ones removed).
+        agents: () => agentState.profiles(),
+        agentState: () => agentState,
+        patchAgent,
+        retireAgent,
+        agentRecords: () => agentState.records(),
+        deletedAgents: () => agentState.retired(),
+        isAgentSelectable: (name: string) => agentState.isKnown(name),
+        restoreAgentRecords: (records: readonly HarnessAgentRecord[]) => agentState.restore(records),
         create,
         update,
         remove,

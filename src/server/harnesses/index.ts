@@ -85,6 +85,18 @@ export {
     restoreHarnessRegistry
 } from './registry';
 export type { HarnessPatch, HarnessRegistration, HarnessRegistry, HarnessRegistryOptions, HarnessRegistrySnapshot } from './registry';
+// T19: the global agent-override layer (the one place that knows how a trusted catalogue
+// profile and an operator's stored decision combine). Exported so the server, a host, and
+// tests all resolve profile text through the SAME authority.
+export {
+    AgentStateError,
+    attachDefaultAgentState,
+    createAgentState,
+    defaultAgentState,
+    effectiveAgentProfile,
+    shippedAgentProfile
+} from './agent-state';
+export type { AgentOverrideFields, AgentProfilePatch, AgentState } from './agent-state';
 export { describeAgent, describeAgents, describeHarness } from './descriptor';
 export type { DescriptorCatalogue } from './descriptor';
 export {

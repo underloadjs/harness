@@ -1,22 +1,28 @@
-// The lazy block-detail route and the raw `GET /harnesses/:name` read (T11).
+// The lazy block-detail read on the CANONICAL mount (T11 → T23), and the boundary the
+// facade owns between the wire record and the render model.
 //
-// Two surfaces, one rule each, and both are about WHEN a browser is allowed to ask for text:
+// One rule drives this file: WHEN a browser is allowed to ask for a segment's text.
+// `GET /v1/harness/sessions/{session_id}/turns/{turn_id}/blocks/{block_id}` (generated in
+// ../shared/harness-api.ts:97) is reached only from a context-segment click. A rows page
+// and a display tree both carry the segment's DESCRIPTOR (identity, label, chars, state,
+// event span) and never its bytes, so the assertions that matter are:
 //
-//   - `GET views/:id/turns/:tid/blocks/:bid` is the R8 answer to "what did this segment
-//     actually contain". It is reached only from a segment click, so the assertion that
-//     matters is the exact address and the envelope field the answer is read from
-//     (`{ block }`, ../server/protocol.ts:712).
-//   - `GET /harnesses/:name` exists because a `/views` frame OMITS
-//     `harnessDefinition.agentInstructions` (../server/protocol.ts:655-663). The
-//     configuration dialog reads it on an explicit open, and a gateway that has not mounted
-//     the route (405) or has forgotten the harness (404) must degrade to "keep what you have"
-//     rather than throw at the reader.
+//   - the exact canonical address and the envelope field the answer is read from
+//     (`{ block }`, ../shared/harness-api.ts:1593 `TurnBlockDetailResponse`);
+//   - the ONE rename the facade owns: the wire's `label` is the render model's `name`,
+//     and `inPrompt` is not published any more, so it is filled as the projector does
+//     (./view-api.ts:591 `readBlockDetail` -> ./display-project.ts);
+//   - a 404 stays a failure: the caller renders the refusal, so the transport must not
+//     swallow it into a fake empty block.
 //
-// Run: npx vitest run --config src/frontend/vitest.config.ts view-api-blocks.test.ts api-harness-read.test.ts
+// The legacy `/api/views/:id/turns/:tid/blocks/:bid` mirror is gone, and with it the
+// `getBlockDetail` export — the facade now answers the PROJECTED detail, not the record.
+//
+// Run: npx vitest run --config src/frontend/vitest.config.ts view-api-blocks.test.ts
 
-import type { TurnBlockDetail } from '../server/protocol';
+import type { TurnBlockDetail } from '../shared/harness-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getBlockDetail } from './view-api';
+import { readBlockDetail } from './view-api';
 
 const T = 1_700_000_000_000;
 
@@ -41,28 +47,25 @@ const serve = (routes: Record<string, unknown>, statuses: Record<string, number>
             if (value === undefined) throw new Error(`unexpected request: ${method} ${url}`);
 
             return new Response(JSON.stringify(value), {
-                status: statuses[key] ?? 200,
+                status: statuses[key] ?? statuses[url] ?? 200,
                 headers: { 'Content-Type': 'application/json' }
             });
         })
     );
 };
 
+// A tool segment as the identified read publishes it: the recorded argument value and
+// result text, verbatim, which nothing on the rows or tree path carries.
 const block: TurnBlockDetail = {
     kind: 'tool',
     id: '0-tool-7',
     turnId: 't 1',
     sectionId: 't1:0',
-    name: 'read',
+    label: 'read',
     chars: 54,
-    argsChars: 28,
-    resultChars: 26,
-    inPrompt: true,
-    state: 'ok',
+    state: 'done',
     eventFrom: 7,
     eventTo: 9,
-    at: T,
-    endedAt: T + 800,
     sessionId: 's 1',
     args: '{"path":"notes.md","max":20}',
     result: 'the whole recorded file body'
@@ -76,45 +79,67 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-describe('getBlockDetail', () => {
-    it('addresses ONE segment by its exact route and unwraps the block envelope', async () => {
-        serve({ 'GET /api/views/s%201/turns/t%201/blocks/0-tool-7': { block } });
+describe('readBlockDetail', () => {
+    it('addresses ONE segment by its exact canonical route and unwraps the block envelope', async () => {
+        serve({ 'GET /v1/harness/sessions/s%201/turns/t%201/blocks/0-tool-7': { block } });
 
-        expect(await getBlockDetail('s 1', 't 1', '0-tool-7')).toEqual(block);
-        expect(calls).toEqual([{ method: 'GET', url: '/api/views/s%201/turns/t%201/blocks/0-tool-7', body: '', keepalive: false }]);
+        // The facade's answer is the wire record with `name` derived from `label` and the
+        // unpublished `inPrompt` filled, exactly as ./view-api.ts:600 states it.
+        expect(await readBlockDetail('s 1', 't 1', '0-tool-7')).toEqual({
+            ...block,
+            name: 'read',
+            inPrompt: true
+        });
+        expect(calls).toEqual([
+            { method: 'GET', url: '/v1/harness/sessions/s%201/turns/t%201/blocks/0-tool-7', body: '', keepalive: false }
+        ]);
     });
 
-    it('encodes a block id the way the step route does, because ids are user-visible data', async () => {
-        serve({ 'GET /api/views/s1/turns/t1/blocks/0-system-instructions': { block: { ...block, kind: 'system', entries: ['Answer directly.'] } } });
+    it('falls back to the kind when the segment carries no label', async () => {
+        const unlabelled = { ...block, id: '0-system-instructions', kind: 'system', label: '', entries: ['Answer directly.'] };
+        serve({ 'GET /v1/harness/sessions/s1/turns/t1/blocks/0-system-instructions': { block: unlabelled } });
 
-        const detail = await getBlockDetail('s1', 't1', '0-system-instructions');
+        const detail = await readBlockDetail('s1', 't1', '0-system-instructions');
 
+        // `label ?? kind` is nullish, not falsy: an empty label is a published value, so
+        // the render name is the empty string and only an ABSENT label falls back.
+        expect(detail.name).toBe('');
         expect(detail.entries).toEqual(['Answer directly.']);
-        expect(calls.map((call) => call.url)).toEqual(['/api/views/s1/turns/t1/blocks/0-system-instructions']);
+        expect(calls.map((call) => call.url)).toEqual(['/v1/harness/sessions/s1/turns/t1/blocks/0-system-instructions']);
+    });
+
+    it('encodes an id that needs it, because ids are user-visible data', async () => {
+        serve({ 'GET /v1/harness/sessions/s1/turns/t%201/blocks/0-tool%207': { block: { ...block, id: '0-tool 7' } } });
+
+        expect((await readBlockDetail('s1', 't 1', '0-tool 7')).id).toBe('0-tool 7');
+        expect(calls.map((call) => call.url)).toEqual(['/v1/harness/sessions/s1/turns/t%201/blocks/0-tool%207']);
     });
 
     it('keeps an absent payload field absent instead of reading the error envelope', async () => {
         // 404 for a block the bar never minted (or one dropped with a failed attempt) is the
         // SERVER's honest answer; the caller renders the failure, so the transport must not
         // swallow it into a fake empty block.
-        serve({ 'GET /api/views/s1/turns/t1/blocks/nope': { error: { message: 'Unknown block "nope".' } } }, { 'GET /api/views/s1/turns/t1/blocks/nope': 404 });
+        serve(
+            { 'GET /v1/harness/sessions/s1/turns/t1/blocks/nope': { error: { message: 'Unknown block "nope".' } } },
+            { 'GET /v1/harness/sessions/s1/turns/t1/blocks/nope': 404 }
+        );
 
-        await expect(getBlockDetail('s1', 't1', 'nope')).rejects.toThrow('Unknown block "nope".');
+        await expect(readBlockDetail('s1', 't1', 'nope')).rejects.toThrow('Unknown block "nope".');
         expect(calls).toHaveLength(1);
     });
 
     it('asks once per click and never for the whole bar', async () => {
         serve({
-            'GET /api/views/s1/turns/t1/blocks/0-tool-7': { block },
-            'GET /api/views/s1/turns/t1/blocks/0-tool-9': { block: { ...block, id: '0-tool-9' } }
+            'GET /v1/harness/sessions/s1/turns/t1/blocks/0-tool-7': { block },
+            'GET /v1/harness/sessions/s1/turns/t1/blocks/0-tool-9': { block: { ...block, id: '0-tool-9' } }
         });
 
-        await getBlockDetail('s1', 't1', '0-tool-7');
-        await getBlockDetail('s1', 't1', '0-tool-9');
+        await readBlockDetail('s1', 't1', '0-tool-7');
+        await readBlockDetail('s1', 't1', '0-tool-9');
 
         expect(calls.map((call) => call.url)).toEqual([
-            '/api/views/s1/turns/t1/blocks/0-tool-7',
-            '/api/views/s1/turns/t1/blocks/0-tool-9'
+            '/v1/harness/sessions/s1/turns/t1/blocks/0-tool-7',
+            '/v1/harness/sessions/s1/turns/t1/blocks/0-tool-9'
         ]);
     });
 });

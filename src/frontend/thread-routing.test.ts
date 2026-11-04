@@ -203,7 +203,7 @@ const stubServer = (initial: SessionSnapshot, options: { steer?: boolean } = {})
             }
 
             throw new Error(`unexpected request: ${method} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return stub;

@@ -27,3 +27,12 @@ export * from './frontend';
 // two shapes are identical and frozen (T3); the RUNTIME one is authoritative, so
 // name it explicitly to resolve the star-export ambiguity.
 export type { HarnessPendingTool } from './harness';
+// T27: the same class of ambiguity for the display wire row. `TurnSummary` is DECLARED
+// once (src/shared/turn-display.ts:1019) and reaches this root twice — through
+// `./server` (./server/protocol.ts re-exports the shared display contract) and through
+// `./frontend` (./frontend/api.ts:1322 re-exports it for browser callers). Star exports
+// resolve ambiguity by name, not by declaration, so TS2308 fires even though both sides
+// are the identical type. Naming the declaring module explicitly keeps exactly the API a
+// consumer already gets (one `TurnSummary`, the shared definition) and cannot change any
+// shape, because the type is the same declaration either way.
+export type { TurnSummary } from './shared/turn-display';

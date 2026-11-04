@@ -37,6 +37,16 @@ import type { ServerRuntimeConfiguration } from './config';
 import { loadEnvironmentFile } from './environment';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
+// T15: the realtime stream. The runtime owns ONE broker per database root, so the epoch, the
+// addressed revision counters, and the live subscriptions are the same objects the HTTP API and
+// the WebSocket conversation report on. The stream module never imports this file, so there is no
+// cycle: runtime -> stream, never stream -> runtime.
+import { bridgeEventHub, createHarnessStreamMount, createStreamBridge, createStreamSources, hubStreamSources } from './stream';
+import type { HarnessStreamBridge, HarnessStreamMount } from './stream';
+// T13's epoch/revision hub: the one place a revision is minted, shared by the dispatcher and the
+// stream so a REST header and a stream frame can never disagree.
+import { createHarnessEventHub } from './api-events';
+import type { HarnessEventHub } from './api-events';
 // The deployment-level check that a configured worker runtime would REALLY isolate a
 // thread. Importing the workers barrel here (rather than the module directly) is
 // what keeps `src/server/workers` a single subsystem boundary.
@@ -44,7 +54,8 @@ import { assertWorkerRuntimeReady } from './workers';
 import {
     HarnessPersistence,
     HarnessPersistenceError,
-    normalizeHarnessDatabaseRoot
+    normalizeHarnessDatabaseRoot,
+    readHarnessAgentRecords
 } from './persistence';
 
 // Error text helper kept local so this module has no dependency on the store.
@@ -69,6 +80,20 @@ export type HarnessRuntime = {
     // getHarnessRuntime), so a supplied root can never be silently ignored.
     root?: string;
     persistence?: HarnessPersistence;
+    // T15: the live update stream for THIS runtime (one broker, one epoch, one subscription set).
+    // The standalone listener attaches it to its own `http.Server`; the service gateway reaches it
+    // through the endpoint module's `upgrade` export, so both mounts share the same epoch. Always
+    // present: a broker with no connection costs nothing (no timers, no buffers), so there is no
+    // "stream disabled" state to reason about.
+    stream: HarnessStreamMount;
+    // The publish/counters surface the REST side calls without importing the stream module.
+    streamBridge: HarnessStreamBridge;
+    // T13's shared epoch/revision hub this runtime publishes through. Exposed because the epoch it
+    // mints is the epoch BOTH transports must report, and an embedder may publish domain changes
+    // into it directly.
+    events: HarnessEventHub;
+    // Detach the hub -> stream listener (a disposable runtime; production lives with the process).
+    detachStreamBridge: () => void;
 };
 
 export type HarnessRuntimeOptions = {
@@ -102,6 +127,13 @@ export type HarnessRuntimeOptions = {
     // Skip the .env load. Tests that inject every dependency use this to avoid
     // mutating process environment; production always loads.
     loadEnvironment?: boolean;
+    // T15: inject the stream mount (an embedder that owns its own broker, or a test that wants a
+    // fixed epoch). Omitted means "build one over THIS runtime's store and registry", which is what
+    // keeps one epoch and one subscription set per process.
+    stream?: HarnessStreamMount;
+    // T15/T13: inject the epoch/revision hub (an embedder that already publishes domain changes).
+    // Omitted means "create the process hub", which is what mints the epoch everything reports.
+    events?: HarnessEventHub;
 };
 
 export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): HarnessRuntime => {
@@ -121,12 +153,19 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     // Catalogue first: the describer below needs it, and it is the runtime
     // snapshot of which credential-backed tools this host can run.
     const catalogue = options.catalogue ?? createToolCatalogue();
-    const registry = options.registry ?? createHarnessRegistry();
 
     // R3b: one durable database per resolved root. Read BEFORE sessions exist so
     // the registry is rebuilt first; a session's harness is then rebuilt from its
     // own frozen preset record, which is independent of later registry patches.
     const root = normalizeHarnessDatabaseRoot(options.root);
+
+    // T19: the global agent overlay is durable registry state (`<root>/harness/agents.json`),
+    // so it is read at the same moment as `state.json` and replayed onto the registry BEFORE
+    // its first `agents()` read. An injected registry gets the same replay below, after the
+    // database load, so a host that owns its registry is not second-class.
+    const agentRecords = readHarnessAgentRecords(root);
+
+    const registry = options.registry ?? createHarnessRegistry(undefined, { agentRecords });
 
     if (options.store !== undefined && root !== undefined) {
         throw new Error(
@@ -136,6 +175,13 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
 
     const persistence = root === undefined ? undefined : new HarnessPersistence(root);
     const database = persistence?.load();
+
+    // T19: a host-injected registry was built without this root's overlay, so replay it
+    // here. A registry this function created already carries it, and replaying twice would
+    // be a no-op anyway (`restoreAgentRecords` is total).
+    if (options.registry !== undefined && agentRecords.length > 0) {
+        registry.restoreAgentRecords(agentRecords);
+    }
 
     if (database !== undefined && persistence !== undefined) {
         try {
@@ -153,10 +199,16 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
 
     // The store owns no catalogue, so bind its describer to this runtime's. A
     // supplied store keeps its own registry/settings (tests) and is used as-is.
+    // ONE provider-settings object per runtime (T28): the store builds harnesses with it, and
+    // the dispatcher authenticates its OWN provider calls (`POST /models`) with the SAME
+    // credential through a private channel. A service deployment therefore cannot report one
+    // provider on `/config` and dial another — or an unauthenticated one — on discovery.
+    const serverSettings = options.settings ?? configuration.settings;
+
     const store =
         options.store ??
         new SessionStore(
-            options.settings ?? configuration.settings,
+            serverSettings,
             registry,
             (preset) => describeHarness(preset, catalogue),
             {
@@ -168,9 +220,53 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
             }
         );
 
-    const defaults = options.defaults ?? configuration.defaults;
+    // T28: same rule as ./start.ts — an advertised document derived from the settings this
+    // process actually holds can never disagree with what sessions dial.
+    const defaults =
+        options.defaults ??
+        (options.settings === undefined
+            ? configuration.defaults
+            : {
+                  baseURL: serverSettings.baseURL,
+                  model: serverSettings.model,
+                  hasApiKey: serverSettings.apiKey.trim().length > 0
+              });
 
-    const api = createHarnessApi({ store, defaults, registry, catalogue });
+    // T15/T13 integration: ONE epoch/revision hub per runtime. The dispatcher stamps the hub's
+    // counters on every REST read, and the stream reads the SAME counters for
+    // `subscription_state.revisions` and answers `welcome` with the SAME epoch — the only way the
+    // contract's "compare a revision within one epoch" rule can hold across HTTP and WS.
+    // `createStreamSources` stays underneath, so existence still answers from the store even before
+    // the hub grows that surface, and `hubStreamSources` supplies the counters and the resync links.
+    const events = options.events ?? createHarnessEventHub();
+
+    const stream =
+        options.stream ??
+        createHarnessStreamMount({ sources: hubStreamSources(events, createStreamSources({ store, registry })) });
+
+    // Every REST write the hub publishes becomes exactly one stream fan-out. The hub has already
+    // moved the counters, so the bridge mirrors them instead of bumping (see ./stream/mount.ts).
+    const detachStreamBridge = bridgeEventHub(events, stream.broker);
+
+    const api = createHarnessApi({
+        store,
+        defaults,
+        // T28: the private credential channel. A host that supplies its own STORE (tests, or a
+        // embedding service) still hands the dispatcher the settings it wants OUTBOUND reads to
+        // use; the store keeps its own copy for sessions, and the credential-scope rule in
+        // ./config.ts is what stops either one from sending a key to the wrong provider.
+        settings: serverSettings,
+        // T28: the resolved runtime block, so `/config` reports the execution model this
+        // runtime's store actually enforces (rather than a second environment parse).
+        runtime,
+        registry,
+        catalogue,
+        events,
+        // T19: the durable target of the global agent overlay (`PATCH/DELETE /agents/{id}`).
+        // One value decides BOTH whether an agent edit is durable and what the receipt says
+        // about a restart, so the answer can never claim more than the deployment stores.
+        ...(root === undefined ? {} : { databaseRoot: root })
+    });
 
     return {
         store,
@@ -179,6 +275,10 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
         runtime,
         registry,
         api,
+        stream,
+        streamBridge: createStreamBridge(stream.broker),
+        events,
+        detachStreamBridge,
         ...(root === undefined ? {} : { root }),
         ...(persistence === undefined ? {} : { persistence })
     };

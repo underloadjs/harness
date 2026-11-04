@@ -1,0 +1,450 @@
+// Foundation tests for the generated harness contract (src/shared/harness-api.ts and
+// src/shared/harness-stream.ts). Two jobs:
+//   1. Pin the shared constants/route tables to the exact values the spec states, so a spec edit
+//      that changes a number, a path, or a discriminator tag fails here loudly.
+//   2. Assert at COMPILE time that every "verbatim alias" still equals the in-repo model it points
+//      at, and that the WS unions really are discriminated (narrowing works). Run through
+//      `npx tsc` as well as vitest: tsconfig excludes test files from `npm run typecheck`, so the
+//      scoped command recorded in the task report is what proves the type assertions.
+import { describe, expect, it } from 'vitest';
+
+import {
+    HARNESS_API_ROOT,
+    HARNESS_EPOCH_HEADER,
+    HARNESS_PAGE_LIMIT,
+    HARNESS_PATH_TEMPLATES,
+    HARNESS_REVISION_HEADER,
+    HARNESS_ROUTES,
+    HARNESS_SERVICE_CAPABILITIES,
+    HARNESS_SERVICE_LIMITS,
+    HARNESS_WS_SUBPROTOCOL,
+} from './harness-api';
+import {
+    HARNESS_STREAM_RESOURCE_KINDS,
+    HARNESS_WS_CLIENT_MESSAGE_TYPES,
+    HARNESS_WS_PROTOCOL_CODES,
+    HARNESS_WS_SCOPES,
+    HARNESS_WS_SERVER_MESSAGE_TYPES,
+    HARNESS_WS_STREAM_LIMITS,
+    HARNESS_WS_UPDATE_KINDS,
+    isHarnessServerFrame,
+} from './harness-stream';
+import type {
+    AnswerActionResult,
+    CreateSessionRequest,
+    DisplayState,
+    HarnessUsage,
+    PageMeta,
+    SessionResponse,
+    SessionSummaryPage,
+    TaskReceipt,
+    TranscriptWriteReceipt,
+    TurnDisplay,
+    TurnSummaryPage,
+    UpdateThreadTranscriptRequest,
+} from './harness-api';
+import type * as Projector from './turn-display';
+import type * as Domain from '../types';
+import type {
+    WsSubscribe,
+    WsSubscribeSession,
+    WsUpdate,
+    WsUpdateDisplayOps,
+    WsUpdateTurnRemoved,
+    WsWelcome,
+} from './harness-stream';
+
+/** Structural equality (mutual assignability) used for the compile-time alias guards. */
+type Equal<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/** Compile-time assertion: the declared type must be exactly `true`. */
+type Expect<T extends true> = T;
+
+// A replacement value per path parameter name, used to render every template into a concrete URL.
+const PARAM_SAMPLES: Record<string, string> = {
+    harness_name: 'demo',
+    agent_id: 'research',
+    tool_id: 'shell',
+    session_id: 'ses_1',
+    thread_id: 'thr_1',
+    turn_id: 'turn_1',
+    step_id: '7',
+    block_id: '2-tool-7',
+    attachment_id: 'att_1',
+    request_id: 'act_1',
+};
+
+describe('harness contract root and headers', () => {
+    it('exposes /v1/harness as the single root with no /api anywhere', () => {
+        expect(HARNESS_API_ROOT).toBe('/v1/harness');
+        const roots = Object.values(HARNESS_PATH_TEMPLATES);
+        expect(roots.every((path) => path.startsWith('/v1/harness'))).toBe(true);
+        expect(roots.some((path) => path.includes('/api'))).toBe(false);
+    });
+
+    it('names the epoch and revision headers and the stream subprotocol exactly', () => {
+        expect(HARNESS_EPOCH_HEADER).toBe('X-Harness-Epoch');
+        expect(HARNESS_REVISION_HEADER).toBe('X-Harness-Revision');
+        expect(HARNESS_WS_SUBPROTOCOL).toBe('harness.v1');
+    });
+
+    it('states the one paging envelope every collection route shares', () => {
+        expect(HARNESS_PAGE_LIMIT).toEqual({ min: 1, default: 25, max: 100 });
+        // The published ServiceLimits numbers must agree with the paging constants.
+        expect(HARNESS_SERVICE_LIMITS.page_limit_default).toBe(HARNESS_PAGE_LIMIT.default);
+        expect(HARNESS_SERVICE_LIMITS.page_limit_max).toBe(HARNESS_PAGE_LIMIT.max);
+    });
+});
+
+describe('harness contract route tables', () => {
+    it('covers all 45 spec paths', () => {
+        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(45);
+        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(45);
+    });
+
+    it('renders every path template into the builder output with no leftover placeholders', () => {
+        // One rule for both tables: substituting PARAM_SAMPLES into a template must equal the
+        // builder called with the same values in path order.
+        const mismatches: string[] = [];
+        const builders = HARNESS_ROUTES as unknown as Record<string, (...values: string[]) => string>;
+        for (const [id, template] of Object.entries(HARNESS_PATH_TEMPLATES)) {
+            const params = [...template.matchAll(/\{([a-z_]+)\}/g)].map((match) => match[1]);
+            const args = params.map((name) => {
+                if (!(name in PARAM_SAMPLES)) mismatches.push(`missing sample for {${name}}`);
+                return PARAM_SAMPLES[name];
+            });
+            const rendered = template.replace(/\{([a-z_]+)\}/g, (_m, name) => PARAM_SAMPLES[name]);
+            if (typeof builders[id] !== 'function') {
+                mismatches.push(`${id}: no builder for this template id`);
+            } else {
+                const value = builders[id](...args);
+                if (value !== rendered) mismatches.push(`${id}: ${value} != ${rendered}`);
+            }
+            if (rendered.includes('{') || rendered.includes('}')) {
+                mismatches.push(`${id}: unresolved placeholder in ${rendered}`);
+            }
+        }
+        expect(mismatches).toEqual([]);
+    });
+
+    it('builds the deep addressable reads one level at a time', () => {
+        expect(HARNESS_ROUTES.root()).toBe('/v1/harness');
+        expect(HARNESS_ROUTES.health()).toBe('/v1/harness/health');
+        expect(HARNESS_ROUTES.stream()).toBe('/v1/harness/stream');
+        expect(HARNESS_ROUTES.sessionsBySessionIdTasks('ses_1')).toBe(
+            '/v1/harness/sessions/ses_1/tasks',
+        );
+        expect(HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdDisplay('ses_1', 'turn_9')).toBe(
+            '/v1/harness/sessions/ses_1/turns/turn_9/display',
+        );
+        expect(HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscriptMessages('ses_1', 'thr_3')).toBe(
+            '/v1/harness/sessions/ses_1/threads/thr_3/transcript/messages',
+        );
+        expect(
+            HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdAttachmentsByAttachmentId('ses_1', 'turn_9', 'att_2'),
+        ).toBe('/v1/harness/sessions/ses_1/turns/turn_9/attachments/att_2');
+        expect(
+            HARNESS_ROUTES.sessionsBySessionIdActionsByRequestIdAnswer('ses_1', 'act_4'),
+        ).toBe('/v1/harness/sessions/ses_1/actions/act_4/answer');
+        expect(
+            HARNESS_ROUTES.harnessesByHarnessNameInstructionsByAgentId('demo', 'research'),
+        ).toBe('/v1/harness/harnesses/demo/instructions/research');
+    });
+});
+
+describe('harness contract published numbers', () => {
+    it('publishes the exact ServiceLimits block from the boot document', () => {
+        expect(HARNESS_SERVICE_LIMITS).toEqual({
+            body_bytes: 1000000,
+            submit_body_bytes: 16777216,
+            input_chars: 200000,
+            pending_tasks: 100,
+            thread_records: 256,
+            attachments_per_turn: 4,
+            attachment_bytes: 4194304,
+            total_attachment_bytes: 8388608,
+            result_references: 16,
+            pending_actions: 4,
+            steer_records: 64,
+            created_tools: 32,
+            tool_result_bytes: 65536,
+            page_limit_default: 25,
+            page_limit_max: 100,
+        });
+    });
+
+    it('advertises all nine capabilities as booleans', () => {
+        expect(HARNESS_SERVICE_CAPABILITIES).toEqual({
+            websocket_stream: true,
+            tool_execution: true,
+            tool_registration: true,
+            transcript_editing: true,
+            command_dispatch: true,
+            model_discovery: true,
+            harness_definition_writes: true,
+            agent_writes: true,
+            persistent_threads: true,
+        });
+    });
+});
+
+describe('harness stream contract', () => {
+    it('carries the exact WsStreamLimits defaults in force', () => {
+        expect(HARNESS_WS_STREAM_LIMITS).toEqual({
+            subscriptions_per_connection: 64,
+            ops_per_update_frame: 32,
+            delta_chars_per_append_op: 2000,
+            events_per_update_frame: 16,
+            ids_per_invalidation_frame: 64,
+            max_client_frame_bytes: 16384,
+            max_server_frame_bytes: 65536,
+            client_messages_per_second: 32,
+            heartbeat_interval_ms: 15000,
+            heartbeat_timeout_intervals: 3,
+            heartbeat_timeout_close_code: 4408,
+            replay_frames: 512,
+            replay_seconds: 60,
+            send_queue_frames: 256,
+            send_queue_bytes: 1048576,
+            sustained_stall_ms: 10000,
+            ack_timeout_ms: 5000,
+            revision_records_per_state: 20,
+        });
+        // The constant-size guarantee the stream rests on: one revision record per published kind.
+        expect(HARNESS_WS_STREAM_LIMITS.revision_records_per_state).toBe(
+            HARNESS_STREAM_RESOURCE_KINDS.length,
+        );
+    });
+
+    it('enumerates the closed client and server frame vocabularies', () => {
+        expect(HARNESS_WS_CLIENT_MESSAGE_TYPES).toEqual([
+            'hello',
+            'subscribe',
+            'unsubscribe',
+            'ack',
+            'ping',
+            'bye',
+        ]);
+        expect(HARNESS_WS_SERVER_MESSAGE_TYPES).toEqual([
+            'welcome',
+            'subscription_state',
+            'update',
+            'resync_required',
+            'error',
+            'heartbeat',
+            'pong',
+        ]);
+        expect(HARNESS_WS_SCOPES).toEqual(['global', 'session', 'thread', 'turn']);
+    });
+
+    it('enumerates the fifteen update kinds in spec order', () => {
+        expect(HARNESS_WS_UPDATE_KINDS).toEqual([
+            'session.updated',
+            'turn.upsert',
+            'turn.removed',
+            'display.ops',
+            'usage.updated',
+            'action.opened',
+            'action.closed',
+            'thread.upsert',
+            'thread.removed',
+            'transcript.updated',
+            'tool.registry_updated',
+            'agent.registry_updated',
+            'run.event',
+            'catalogue.updated',
+            'config.updated',
+        ]);
+    });
+
+    it('enumerates the nine protocol error codes', () => {
+        expect(HARNESS_WS_PROTOCOL_CODES).toEqual([
+            'invalid_payload',
+            'unknown_subscription',
+            'unknown_resource',
+            'unsupported_filter',
+            'late_hello',
+            'too_many_subscriptions',
+            'frame_too_large',
+            'rate_limited',
+            'internal',
+        ]);
+    });
+
+    it('accepts only frames whose tag is in the server vocabulary', () => {
+        expect(isHarnessServerFrame({ type: 'welcome', epoch: '9f2c17a4', limits: HARNESS_WS_STREAM_LIMITS })).toBe(true);
+        expect(isHarnessServerFrame({ type: 'update', kind: 'turn.removed' })).toBe(true);
+        expect(isHarnessServerFrame({ type: 'made_up_frame' })).toBe(false);
+        expect(isHarnessServerFrame({ type: 1 })).toBe(false);
+        expect(isHarnessServerFrame({})).toBe(false);
+        expect(isHarnessServerFrame(null)).toBe(false);
+        expect(isHarnessServerFrame('update')).toBe(false);
+        expect(isHarnessServerFrame(7)).toBe(false);
+    });
+});
+
+describe('harness contract DTO shapes', () => {
+    it('pages carry limit, next_cursor, observed_at and revision', () => {
+        // Exact PageMeta fields: `next_cursor` is nullable, never absent-by-design.
+        type PageShape = Required<Omit<PageMeta, 'next_cursor'>> & Pick<PageMeta, 'next_cursor'>;
+        const page: PageShape = { limit: 25, next_cursor: null, observed_at: 1762250000000, revision: 0 };
+        const filled: PageShape = {
+            limit: 100,
+            next_cursor: 'eyJlIjoiOWYyYzE3YTQiLCJzIjo0Mn0',
+            observed_at: 1762250000001,
+            revision: 42,
+        };
+        expect(page.next_cursor).toBeNull();
+        expect(filled.limit).toBe(100);
+        expect(filled.revision).toBe(42);
+    });
+
+    it('writes answer with receipts, never an aggregate tree', () => {
+        // A submit answers one receipt: the minted turn, its thread, and the session revision it landed at.
+        const receipt: TaskReceipt = {
+            session_id: 'ses_1',
+            turn_id: 'turn_1',
+            thread_id: 'thr_1',
+            status: 'queued',
+            session_revision: 7,
+            accepted_at: 1762250000000,
+            links: {
+                turn: HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnId('ses_1', 'turn_1'),
+                turns: HARNESS_ROUTES.sessionsBySessionIdTurns('ses_1'),
+                thread: HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadId('ses_1', 'thr_1'),
+                stream: HARNESS_ROUTES.stream(),
+            },
+        };
+        expect(receipt.status).toBe('queued');
+        expect(receipt.links.stream).toBe('/v1/harness/stream');
+
+        const transcriptWrite: TranscriptWriteReceipt = {
+            session_id: 'ses_1',
+            thread_id: 'thr_1',
+            accepted_as: 'transcript',
+            message_count: 12,
+            revision: 4,
+        };
+        expect(transcriptWrite.revision).toBe(4);
+
+        const actionAnswer: AnswerActionResult = {
+            ok: true,
+            request_id: 'act_1',
+            resolved_at: 1762250000001,
+        };
+        expect(actionAnswer.ok).toBe(true);
+    });
+
+    it('sends no eager history when creating or paging a session', () => {
+        // CreateSessionRequest carries the definition name and settings only: no transcript, no turns.
+        const create: CreateSessionRequest = { harness: 'demo' };
+        expect(create).toEqual({ harness: 'demo' });
+
+        // A session page carries summaries; `SessionResponse` carries one resource, no tree.
+        type SessionPageKeys = keyof SessionSummaryPage;
+        const pageKeys: SessionPageKeys[] = ['items', 'limit', 'next_cursor', 'observed_at', 'revision'];
+        expect(pageKeys).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+
+        type TurnPageKeys = keyof TurnSummaryPage;
+        const turnKeys: TurnPageKeys[] = ['items', 'limit', 'next_cursor', 'observed_at', 'revision'];
+        expect(turnKeys).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+
+        // The one optimistic lock in the contract lives on transcript replacement.
+        type TranscriptWriteFields = keyof UpdateThreadTranscriptRequest;
+        const fields: TranscriptWriteFields[] = ['messages', 'if_revision'];
+        expect(fields).toEqual(['messages', 'if_revision']);
+    });
+});
+
+describe('harness contract type wiring (compile time)', () => {
+    it('aliases stay identical to the in-repo models they reuse', () => {
+        // Each Expect<...> fails to COMPILE if the spec shape and the in-repo model drift apart.
+        type AliasGuards = [
+            Expect<Equal<DisplayState, Projector.TurnDisplayState>>,
+            Expect<Equal<Projector.SectionDisplayState, import('./harness-api').SectionDisplayState>>,
+            Expect<Equal<Projector.StepDisplayState, import('./harness-api').StepDisplayState>>,
+            Expect<Equal<Projector.DisplayBlockSummary, import('./harness-api').DisplayBlockSummary>>,
+            Expect<
+                Equal<Projector.DisplayAttachmentSummary, import('./harness-api').DisplayAttachmentSummary>
+            >,
+            Expect<Equal<Projector.DisplayTail, import('./harness-api').DisplayTail>>,
+            Expect<Equal<Domain.HarnessUsage, HarnessUsage>>,
+            Expect<Equal<Domain.HarnessErrorInfo, import('./harness-api').HarnessErrorInfo>>,
+            Expect<Equal<Domain.HarnessMessage, import('./harness-api').HarnessMessage>>,
+            Expect<Equal<Domain.HarnessThread, import('./harness-api').HarnessThread>>,
+            Expect<Equal<Domain.HarnessAttachment, import('./harness-api').HarnessAttachment>>,
+            Expect<Equal<Domain.HarnessToolCall, import('./harness-api').HarnessToolCall>>,
+            Expect<Equal<Domain.HarnessPendingTool, import('./harness-api').HarnessPendingTool>>,
+            Expect<Equal<Domain.HarnessActionRequest, import('./harness-api').HarnessActionRequest>>,
+            Expect<Equal<Domain.HarnessActionOption, import('./harness-api').HarnessActionOption>>,
+            Expect<Equal<Domain.ToolMediaDescriptor, import('./harness-api').ToolMediaDescriptor>>,
+            Expect<
+                Equal<
+                    import('./agent-results').AgentResultReference,
+                    import('./harness-api').AgentResultReference
+                >
+            >,
+        ];
+        const guards: AliasGuards = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
+        expect(guards.every((guard) => guard)).toBe(true);
+    });
+
+    it('narrows update frames on kind and message frames on type', () => {
+        const removed: WsUpdateTurnRemoved = {
+            type: 'update',
+            subscription_id: 'sub_1',
+            sequence: 3,
+            cursor: 'c3',
+            at: 1762250000003,
+            kind: 'turn.removed',
+            turn_id: 'turn_1',
+        };
+        const displayOps: WsUpdateDisplayOps = {
+            type: 'update',
+            subscription_id: 'sub_1',
+            sequence: 4,
+            cursor: 'c4',
+            at: 1762250000004,
+            kind: 'display.ops',
+            turn_id: 'turn_1',
+            ops: [{ op: 'node:append', turnId: 'turn_1', sectionId: '1', nodeId: '7', delta: 'hel' }],
+        };
+
+        // A frame typed as the union narrows on `kind`; the payload field is only reachable there.
+        const frame: WsUpdate = removed;
+        let seen = '';
+        if (frame.kind === 'turn.removed') seen = frame.turn_id;
+        expect(seen).toBe('turn_1');
+        expect(displayOps.ops[0].op).toBe('node:append');
+
+        const welcome: WsWelcome = {
+            type: 'welcome',
+            protocol: HARNESS_WS_SUBPROTOCOL,
+            epoch: '9f2c17a4',
+            at: 1762250000000,
+            limits: HARNESS_WS_STREAM_LIMITS,
+        };
+        const message: import('./harness-stream').WsServerMessage = welcome;
+        expect(message.type).toBe('welcome');
+
+        // Subscribing is scope-discriminated, and a session scope needs only session_id.
+        const subscribe: WsSubscribe = {
+            type: 'subscribe',
+            subscription_id: 'sub_1',
+            scope: 'session',
+            session_id: 'ses_1',
+        } satisfies WsSubscribeSession;
+        expect(subscribe.scope).toBe('session');
+
+        // Display tree is the turn-scoped read: sections only, no recorded event array, no transcript.
+        const display: TurnDisplay = {
+            turnId: 'turn_1',
+            revision: 2,
+            sections: [],
+        };
+        expect(display.sections).toEqual([]);
+
+        const response: SessionResponse = { session: { id: 'ses_1', revision: 1 } as never };
+        expect(response.session.id).toBe('ses_1');
+    });
+});

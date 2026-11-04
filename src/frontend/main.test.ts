@@ -193,7 +193,7 @@ const stubFetch = (
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
 
             return response;
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;
@@ -1305,7 +1305,7 @@ const selectionStub = (
             }
 
             return undefined;
-        }))
+        }, { root: '/api' }))
     );
 
     return {
@@ -1627,7 +1627,7 @@ const enterStub = (
             }
 
             return undefined;
-        }))
+        }, { root: '/api' }))
     );
 
     return {
@@ -2594,7 +2594,7 @@ it('stops every task in the originating session while a run is in flight', async
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [transcript] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -3332,7 +3332,7 @@ it('hydrates a queued session on reload and stops the whole queue explicitly', a
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [queued] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -3734,7 +3734,7 @@ it('deletes the running current session, stops watching and creates no replaceme
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

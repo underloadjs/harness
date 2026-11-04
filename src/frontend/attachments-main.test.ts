@@ -153,7 +153,7 @@ const stubServer = (restored?: SessionSnapshot, taskError?: string): Call[] => {
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;
@@ -215,7 +215,7 @@ const gatedServer = (): { calls: Call[]; release: (response: Response) => void }
             if (url === '/api/sessions' && method === undefined) return json({ sessions: [] });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return {

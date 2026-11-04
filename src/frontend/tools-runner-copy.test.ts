@@ -98,7 +98,7 @@ const boot = async (): Promise<Call[]> => {
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

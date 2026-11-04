@@ -33,6 +33,7 @@ import {
     REFERENCED_RESULTS_HEADER,
     listAgentResultBlocks
 } from '../shared/agent-results';
+import type { TaskReceipt, TurnResponse } from '../shared/harness-api';
 import type { SessionSnapshot, SessionTurn } from './protocol';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -724,7 +725,17 @@ describe('POST /tasks references', () => {
         });
         if (accepted.kind !== 'json') throw new Error('expected JSON');
         expect(accepted.status).toBe(202);
-        expect((accepted.body as { turn: SessionTurn }).turn.references).toEqual([
+
+        // T17: the 202 answer is a slim receipt, never the turn aggregate. The reference
+        // array is pinned where it is durable — the canonical turn read.
+        const receipt = accepted.body as TaskReceipt;
+
+        expect(receipt.session_id).toBe(id);
+
+        const recorded = await callApi(runtime, 'GET', `/v1/harness/sessions/${id}/turns/${receipt.turn_id}`);
+        if (recorded.kind !== 'json') throw new Error('expected JSON');
+        expect(recorded.status).toBe(200);
+        expect((recorded.body as TurnResponse).turn.references).toEqual([
             { turnId: first.turn.id, label: 'PE1' }
         ]);
 
@@ -741,7 +752,7 @@ describe('POST /tasks references', () => {
         });
     });
 
-    it('rejects references explicitly on the legacy /messages endpoint', async () => {
+    it('drops the legacy /messages route instead of accepting a context-free submit', async () => {
         const fixture = probeFixture();
         const runtime = runtimeOf([fixture.preset]);
 
@@ -753,30 +764,28 @@ describe('POST /tasks references', () => {
         await first.settled;
         await runtime.store.waitForIdle(id);
 
-        // An explicit reference array is not forwarded by the legacy SSE route:
-        // it is a clear 400, never a silently context-free run.
+        // T13/T17 removed the response-owned SSE surface: `/messages` is not mounted any
+        // more, so a submit that relies on references cannot land on a route that would
+        // accept it and then ignore them. A stale client gets a 404 naming the root.
         const payload = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/messages`, {
             input: 'use it',
             references: [{ turnId: first.turn.id, label: 'PE1' }]
         });
         if (payload.kind !== 'json') throw new Error('expected JSON');
-        expect(payload.status).toBe(400);
+        expect(payload.status).toBe(404);
         expect(payload.body).toEqual({
-            error: {
-                message: 'Result references are not supported by /messages; submit this task through /tasks.'
-            }
+            error: { message: `Unknown API route: POST /v1/harness/sessions/${id}/messages` }
         });
 
-        // A typed #LABEL is likewise not silently ignored on this route.
+        // A typed #LABEL on the stale route is refused the same way, never silently
+        // stripped; the canonical /tasks route is the only submit surface.
         const typed = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/messages`, {
             input: 'reuse #PE1'
         });
         if (typed.kind !== 'json') throw new Error('expected JSON');
-        expect(typed.status).toBe(400);
+        expect(typed.status).toBe(404);
         expect(typed.body).toEqual({
-            error: {
-                message: 'Result references are not supported by /messages; submit this task through /tasks.'
-            }
+            error: { message: `Unknown API route: POST /v1/harness/sessions/${id}/messages` }
         });
     });
 });

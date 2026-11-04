@@ -161,7 +161,7 @@ const stubServer = (options: {
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;

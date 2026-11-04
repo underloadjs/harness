@@ -12,6 +12,13 @@
 //                              and the marker helper shared by composer + server
 //   - ./agent-results.ts     — block labels, result-block projection, reference
 //                              parsing/validation, and delimited prompt composition
+//   - ./harness-api.ts       — GENERATED REST contract for `/v1/harness`: DTO/resource types,
+//                              route tables, and the published limit constants. Deliberately NOT
+//                              re-exported here: its names are the spec's, so they collide with the
+//                              domain names the root barrels (`src/index.ts`, `src/browser.ts`)
+//                              already star-export from `./harness` (TS2308 ambiguity). Import it by
+//                              path, or add a package `exports` subpath when owners need it external.
+//   - ./harness-stream.ts    — GENERATED WebSocket frame unions and the stream constants (same rule)
 //   - ../server/service.ts   — inbound gate
 //   - ../frontend/api.ts     — outbound gate
 //   - ../shared             — also reachable as `@underload/harness/shared`

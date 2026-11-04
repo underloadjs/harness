@@ -201,7 +201,7 @@ const stubServer = (sessions: SessionSnapshot[], options: { holdTasks?: boolean 
             }
 
             throw new Error(`unexpected request: ${method} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return stub;

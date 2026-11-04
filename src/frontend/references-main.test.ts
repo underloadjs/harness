@@ -222,7 +222,7 @@ const stubServer = (
             if (url === '/api/sessions' && method === undefined) return json({ sessions: [session] });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;

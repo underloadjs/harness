@@ -6,14 +6,16 @@
 //   - `yarn dev:frontend` runs ONLY Vite. It never imports or starts the harness
 //     server; the API is expected to already be running, normally as the
 //     @underload/service gateway on :5000 (`yarn start-service` at the repo root).
-//   - `yarn preview:frontend` serves the built UI with the same `/api` proxy.
+//   - `yarn preview:frontend` serves the built UI with the same `/v1/harness` proxy.
 //
 // The UI is a browser client only: it calls the API, and the server owns every
-// harness. Both dev and preview therefore rewrite the client's default `/api`
-// root onto `HARNESS_DEV_API` (default: the service mount
+// harness. Both dev and preview therefore forward the client's canonical
+// `/v1/harness` path (REST and the `harness.v1` WebSocket upgrade alike, via
+// `ws: true`) onto `HARNESS_DEV_API` (default: the service mount
 // `http://127.0.0.1:5000/v1/harness`). A page-level `?apiRoot=` or a build-time
 // `VITE_HARNESS_API` still replaces this default at runtime; see
-// src/frontend/api.ts `resolveApiRoot`.
+// src/frontend/api.ts `resolveApiRoot`. The legacy `/api` rewrite is gone: the
+// contract has one root, and the dev proxy must not pretend otherwise.
 //
 // `base` comes from PLAYGROUND_BASE (name kept for deployment compatibility) so
 // the same build can be mounted under a subpath. The UI is normally served by the

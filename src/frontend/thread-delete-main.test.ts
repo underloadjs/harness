@@ -156,7 +156,7 @@ const stubFetch = (
             const response = handler(url, method);
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
             return response;
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;

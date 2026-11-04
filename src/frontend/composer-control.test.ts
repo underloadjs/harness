@@ -166,7 +166,7 @@ const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return server;

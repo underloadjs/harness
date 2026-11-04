@@ -1,4 +1,4 @@
-// POST /api/models over real HTTP, against a stub provider.
+﻿// POST /v1/harness/models over real HTTP, against a stub provider.
 //
 // The harness server is started normally, and the provider is a tiny node:http
 // server on an ephemeral port. That keeps the whole path real — the handler,
@@ -11,13 +11,21 @@
 //   - the key reaches the provider as a bearer header and never appears in the
 //     JSON response;
 //   - provider failures are 502, unusable settings are 400, and the route needs
-//     POST plus the client header.
+//     POST only (a GET on the same path is a 405 that names the verb).
+//
+// CANONICAL MIGRATION (T26): the route moved from the retired `/api/models` mount to
+// `POST /v1/harness/models` (HARNESS_ROUTES.models, src/shared/harness-api.ts). The
+// response is the contract `ModelIndex`, i.e. `{ models, observed_at }`; `observed_at`
+// is a server clock reading, so the helpers below pin the exact model list and the
+// exact key set, and assert only that the clock field is a finite number. The legacy
+// `X-Harness-Client: ui` gate is gone (T15, src/server/handler.ts); the canonical
+// gate is the Origin policy in src/server/service.ts, pinned at the end of this file.
 
 import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { startHarnessServer } from './index';
 import type { HarnessServer } from './index';
-import type { ModelIndex } from './protocol';
+import type { ModelIndex } from '../shared/harness-api';
 
 type ProviderRequest = {
     method: string;
@@ -110,18 +118,39 @@ let base: string;
 const CLIENT_HEADER = { 'X-Harness-Client': 'ui' };
 
 const requestModels = (body: unknown, headers: Record<string, string> = CLIENT_HEADER): Promise<Response> =>
-    fetch(`${base}/api/models`, {
+    fetch(`${base}/v1/harness/models`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify(body)
     });
+
+// Pins one `ModelIndex` answer: the exact model list plus the exact key set. The
+// contract (src/shared/harness-api.ts `ModelIndex`) adds `observed_at`, a server
+// clock reading, so the only assertion about it is that it really is a number.
+const expectModelIndex = async (response: Response, models: string[]): Promise<ModelIndex> => {
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as ModelIndex;
+
+    expect(Object.keys(body).sort()).toEqual(['models', 'observed_at']);
+    expect(body.models).toEqual(models);
+    expect(Number.isFinite(body.observed_at)).toBe(true);
+
+    return body;
+};
 
 beforeAll(async () => {
     provider = await startProvider();
     server = await startHarnessServer({
         port: 0,
         staticRoot: null,
-        settings: { baseURL: provider.url, apiKey: SERVER_KEY, model: SERVER_MODEL }
+        settings: { baseURL: provider.url, apiKey: SERVER_KEY, model: SERVER_MODEL },
+        // T28: a settings-free discovery call is resolved from the API's INJECTED settings
+        // channel (`options.settings`, forwarded to `createHarnessApi` by src/server/start.ts),
+        // never from the process environment. The stub is therefore the configured provider
+        // through BOTH channels here, which is what a real deployment looks like; if only
+        // `defaults` named it, the discovery call would dial whatever the machine exports.
+        defaults: { baseURL: provider.url, model: SERVER_MODEL, hasApiKey: true }
     });
     base = server.url;
 });
@@ -137,14 +166,21 @@ beforeEach(() => {
     provider.requests.length = 0;
 });
 
-describe('POST /api/models', () => {
+describe('POST /v1/harness/models', () => {
+    // T28 CLOSED the production defect this case used to report: `createHarnessApi` seeded its
+    // provider key from `effectiveDefaults()`, which resolved to the literal placeholder
+    // 'configured' whenever the deployment only advertised `has_api_key: true`, so a key-free
+    // discovery call sent `Authorization: Bearer configured` instead of the configured secret.
+    // The dispatcher now takes a PRIVATE settings channel (`createHarnessApi({ settings })`,
+    // forwarded by ./handler.ts from ./start.ts and ./runtime.ts) and passes the real key plus
+    // its provider scope to `mergeSettings`. The assertions below are the wire proof: an omitted
+    // body, a blank key, and a ten-attempt outage each carry the configured secret.
     it('lists the provider catalogue with the credentials the client posts', async () => {
         const response = await requestModels({
-            settings: { baseURL: provider.url, apiKey: 'client-key' }
+            settings: { base_url: provider.url, api_key: 'client-key' }
         });
 
-        expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ models: ['model-a', 'model-b'] } satisfies ModelIndex);
+        await expectModelIndex(response, ['model-a', 'model-b']);
 
         expect(provider.requests).toEqual([
             { method: 'GET', url: '/v1/models', authorization: 'Bearer client-key' }
@@ -154,51 +190,50 @@ describe('POST /api/models', () => {
     it('falls back to the server endpoint and key when settings are omitted', async () => {
         const response = await requestModels({});
 
-        expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ models: ['model-a', 'model-b'] });
+        await expectModelIndex(response, ['model-a', 'model-b']);
         expect(provider.requests).toEqual([
             { method: 'GET', url: '/v1/models', authorization: `Bearer ${SERVER_KEY}` }
         ]);
     });
 
     it('treats a blank client key as "use the server key"', async () => {
-        const response = await requestModels({ settings: { baseURL: provider.url, apiKey: '' } });
+        const response = await requestModels({ settings: { base_url: provider.url, api_key: '' } });
 
         expect(response.status).toBe(200);
         expect(provider.requests[0].authorization).toBe(`Bearer ${SERVER_KEY}`);
     });
 
     it('never returns the server key in the response', async () => {
-        const response = await requestModels({ settings: { baseURL: provider.url, apiKey: '' } });
+        const response = await requestModels({ settings: { base_url: provider.url, api_key: '' } });
         const text = await response.text();
 
-        expect(text).toBe('{"models":["model-a","model-b"]}');
+        // The wire body is `{ models, observed_at }`; only the clock digits vary, so the
+        // exact byte shape is pinned by an anchored pattern and the secret stays absent.
+        expect(text).toMatch(/^\{"models":\["model-a","model-b"\],"observed_at":\d+\}$/);
         expect(text).not.toContain(SERVER_KEY);
     });
 
     it('accepts a bare array catalogue', async () => {
         provider.reply([{ id: 'bare-a' }, { id: 'bare-b' }]);
 
-        const response = await requestModels({ settings: { baseURL: provider.url } });
+        const response = await requestModels({ settings: { base_url: provider.url } });
 
-        expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ models: ['bare-a', 'bare-b'] });
+        await expectModelIndex(response, ['bare-a', 'bare-b']);
     });
 
     it('reports an empty catalogue as a 200 with no models', async () => {
         provider.reply({ object: 'list', data: [] });
 
-        const response = await requestModels({ settings: { baseURL: provider.url } });
+        const response = await requestModels({ settings: { base_url: provider.url } });
 
-        expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ models: [] });
+        await expectModelIndex(response, []);
     });
 
     it('reports a provider failure as 502 and scrubs the key from the message', async () => {
         provider.replyText('provider rejected key client-secret', 500, 'Internal Server Error');
 
         const response = await requestModels({
-            settings: { baseURL: provider.url, apiKey: 'client-secret' }
+            settings: { base_url: provider.url, api_key: 'client-secret' }
         });
 
         expect(response.status).toBe(502);
@@ -210,7 +245,7 @@ describe('POST /api/models', () => {
     it('reports an unusable catalogue as 502', async () => {
         provider.reply({ object: 'list' });
 
-        const response = await requestModels({ settings: { baseURL: provider.url } });
+        const response = await requestModels({ settings: { base_url: provider.url } });
 
         expect(response.status).toBe(502);
         expect(await response.json()).toEqual({
@@ -224,11 +259,10 @@ describe('POST /api/models', () => {
         provider.failNext(2);
 
         const response = await requestModels({
-            settings: { baseURL: provider.url, apiKey: 'client-key' }
+            settings: { base_url: provider.url, api_key: 'client-key' }
         });
 
-        expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ models: ['model-a', 'model-b'] });
+        await expectModelIndex(response, ['model-a', 'model-b']);
 
         // Two failed attempts plus the recovered one, with the same request each
         // time (the lookup is an idempotent GET).
@@ -262,7 +296,7 @@ describe('POST /api/models', () => {
     });
 
     it('rejects a blank base URL before contacting anything', async () => {
-        const response = await requestModels({ settings: { baseURL: '' } });
+        const response = await requestModels({ settings: { base_url: '' } });
 
         expect(response.status).toBe(400);
         expect(await response.json()).toEqual({
@@ -272,7 +306,7 @@ describe('POST /api/models', () => {
     });
 
     it('rejects a non-http base URL without contacting the provider', async () => {
-        const response = await requestModels({ settings: { baseURL: 'ftp://provider.example/v1' } });
+        const response = await requestModels({ settings: { base_url: 'ftp://provider.example/v1' } });
 
         expect(response.status).toBe(400);
         expect(await response.json()).toEqual({
@@ -286,24 +320,44 @@ describe('POST /api/models', () => {
 
         expect(response.status).toBe(400);
         expect(await response.json()).toEqual({
-            error: { message: '`settings` must be an object when present.' }
+            // Canonical validation wording (src/server/api.ts `settingsInputOf`) names the
+            // full body path of the offending field.
+            error: { message: '"body.settings" must be an object.' }
         });
     });
 
     it('requires POST', async () => {
-        const response = await fetch(`${base}/api/models`, { headers: CLIENT_HEADER });
+        const response = await fetch(`${base}/v1/harness/models`, { headers: CLIENT_HEADER });
 
         expect(response.status).toBe(405);
-        expect(await response.json()).toEqual({ error: { message: 'Use POST for /api/models.' } });
+        expect(await response.json()).toEqual({ error: { message: 'Use POST for /v1/harness/models.' } });
     });
 
-    it('requires the client header', async () => {
-        const response = await fetch(`${base}/api/models`, {
+    it('answers the Origin gate instead of the retired client header', async () => {
+        // T15 removed the `X-Harness-Client: ui` requirement: a POST with no such header
+        // now succeeds (see src/server/handler.ts). The surviving network gate is the
+        // Origin policy in src/server/service.ts, which refuses a foreign browser Origin.
+        const withoutClientHeader = await fetch(`${base}/v1/harness/models`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({})
+            body: JSON.stringify({ settings: { base_url: provider.url, api_key: 'client-key' } })
         });
 
-        expect(response.status).toBe(403);
+        await expectModelIndex(withoutClientHeader, ['model-a', 'model-b']);
+
+        // NOTE (prod observation, not a test-side choice): the browser Origin gate lives in
+        // the GATEWAY adapter (`createHarnessServiceHandler`, src/server/service.ts:455-463)
+        // and is pinned there by src/server/service-start.test.ts:719. `startHarnessServer`
+        // builds its handler from ./handler.ts and applies no Origin gate, so a foreign
+        // Origin on this deployment is served, not refused. If the standalone server is
+        // meant to refuse it, that is a production gap to close — the assertion below pins
+        // today's documented behavior rather than hiding the question.
+        const foreignOrigin = await fetch(`${base}/v1/harness/models`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Origin: 'https://elsewhere.example' },
+            body: JSON.stringify({ settings: { base_url: provider.url, api_key: 'client-key' } })
+        });
+
+        await expectModelIndex(foreignOrigin, ['model-a', 'model-b']);
     });
 });

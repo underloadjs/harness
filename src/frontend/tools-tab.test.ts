@@ -192,7 +192,7 @@ it('lists core tools in the global tools view, calls with the captured session a
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -353,7 +353,7 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -457,7 +457,7 @@ it('shows a server request failure for a core call instead of pretending it ran'
             }
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -523,7 +523,7 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -567,7 +567,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

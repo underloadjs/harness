@@ -168,7 +168,7 @@ it('carries invalidThreads from the wire into the board and the editor, verbatim
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: snapshot });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -237,7 +237,7 @@ it('keeps the roster through the snapshot a save returns so the break stays visi
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

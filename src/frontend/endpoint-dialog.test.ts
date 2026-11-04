@@ -180,7 +180,7 @@ const stub = (extra?: (url: string, method: string, body: unknown) => Response |
             if (url === '/api/models' && method === 'POST') return json({ models: ['m1', 'm2'] });
 
             throw new Error(`unexpected request: ${method} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return calls;

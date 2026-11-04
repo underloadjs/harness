@@ -21,10 +21,21 @@ import type { ServerRuntimeConfiguration } from './config';
 import { loadEnvironmentFile } from './environment';
 import { createHarnessHandler } from './handler';
 import type { HarnessHandler } from './handler';
+// The mount constant is the REST owner's single source of truth (./api.ts); the stream path is
+// derived from it rather than repeated here, so the two can never disagree.
+import { STANDALONE_MOUNT } from './api';
 import { packagePath } from './package-root';
 import type { RunnerSettings } from './harnesses/types';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
+// T15: the update stream. This listener owns its own broker (one epoch for this process), attaches
+// it to the SAME http.Server that answers the REST mount — no second port, no second root — and
+// closes it before the listener tears down. The hub beside it is the single source of the epoch and
+// the resource revisions (T13), so REST headers and stream frames are always the same numbers.
+import { bridgeEventHub, createHarnessStreamMount, createStreamSources, hubStreamSources } from './stream';
+import type { HarnessStreamMount } from './stream';
+import { createHarnessEventHub } from './api-events';
+import type { HarnessEventHub } from './api-events';
 // Same subsystem boundary as ./runtime.ts: the worker readiness gate lives with the
 // worker code, not with the server entry points.
 import { assertWorkerRuntimeReady } from './workers';
@@ -60,6 +71,13 @@ export type StartServerOptions = {
     // refused by this build until the lane coordinator lands, and the refusal is an
     // error rather than a silent inline fallback.
     runtime?: Partial<ServerRuntimeConfiguration>;
+    // T15: inject the update-stream mount (an embedder that already owns a broker, or a test with a
+    // fixed epoch). Omitted means "create one for this listener", which is the normal case: the
+    // standalone process then has exactly one epoch and one subscription set, shared by REST and WS.
+    stream?: HarnessStreamMount;
+    // T15/T13: inject the epoch/revision hub (a host that already publishes domain changes into one).
+    // Omitted means "create it", which is what mints the process epoch REST and WS both report.
+    events?: HarnessEventHub;
 };
 
 export type HarnessServer = {
@@ -71,6 +89,13 @@ export type HarnessServer = {
     runtime: ServerRuntimeConfiguration;
     // Present when a database root was supplied; the resolved root and file owner.
     persistence?: HarnessPersistence;
+    // T15: the live update stream mounted at `/v1/harness/stream` on THIS listener (`ws://` on the
+    // same host and port as `url`). Exposed so an embedder can publish, count connections, or close
+    // it independently of the listener.
+    stream: HarnessStreamMount;
+    // The shared epoch/revision hub (T13) this listener publishes through: `events.epoch` is the
+    // epoch both the REST headers and the stream `welcome` carry.
+    events: HarnessEventHub;
     close: () => Promise<void>;
 };
 
@@ -152,8 +177,16 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
     // The store owns no catalogue, so bind the describer here: every session's
     // frozen `harnessDefinition` reflects what THIS host can actually run
     // (search only when a key resolved).
+    // ONE provider-settings object per listener (T28): the store builds harnesses with it and
+    // the dispatcher authenticates its own provider calls (`POST /models`) with the SAME
+    // credential. Reading `configuration.settings` twice would let a session and a discovery
+    // call disagree about the provider after a `.env` change, and the API would then have only
+    // the key-free `defaults` document to work from — which is how a placeholder reached the
+    // Authorization header.
+    const serverSettings = options.settings ?? configuration.settings;
+
     const store = new SessionStore(
-        options.settings ?? configuration.settings,
+        serverSettings,
         registry,
         (preset) => describeHarness(preset, catalogue),
         {
@@ -178,11 +211,51 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
 
     if (readiness !== undefined) await readiness;
 
+    // T15: one stream broker for this listener, plus the epoch/revision hub the dispatcher publishes
+    // through. Building them binds nothing: no timers, no buffers, and no socket until a client
+    // upgrades, so an API-only host is unchanged. The path FOLLOWS the REST mount (the same constant
+    // the dispatcher is mounted on), so REST and WS can never end up under two different roots, and
+    // the epoch is the hub's, so `welcome` and `X-Harness-Epoch` carry one value.
+    const events = options.events ?? createHarnessEventHub();
+
+    const stream =
+        options.stream ??
+        createHarnessStreamMount({
+            path: `${STANDALONE_MOUNT}/stream`,
+            sources: hubStreamSources(events, createStreamSources({ store, registry }))
+        });
+
+    // Every REST write published into the hub becomes exactly one stream fan-out.
+    const detachStreamBridge = bridgeEventHub(events, stream.broker);
+
+    // T28: when the host supplies settings without an advertised document, the document is
+    // derived from those SAME settings, so `/config` can never report a different provider than
+    // the one sessions and discovery actually dial. `hasApiKey` remains an advertisement only.
+    const defaults =
+        options.defaults ??
+        (options.settings === undefined
+            ? configuration.defaults
+            : {
+                  baseURL: serverSettings.baseURL,
+                  model: serverSettings.model,
+                  hasApiKey: serverSettings.apiKey.trim().length > 0
+              });
+
     const api: HarnessHandler = createHarnessHandler({
         store,
-        defaults: options.defaults ?? configuration.defaults,
+        defaults,
+        // T28: the private channel — the real credential for this process (see above).
+        settings: serverSettings,
+        // T28: the SAME validated runtime the store enforces and `startHarnessServer().runtime`
+        // reports. Without this the dispatcher re-parses the environment and can state a
+        // different execution model than the sessions are actually running under.
+        runtime,
         registry,
-        catalogue
+        catalogue,
+        // T15 integration point: the dispatcher and the store publish through THIS hub and THIS
+        // broker, so a REST write's revision and the frame it causes share one epoch.
+        stream,
+        events
     });
 
     // Default static root: the UI application build inside the package. Resolved
@@ -207,6 +280,11 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
             }
         })();
     });
+
+    // T15: the WebSocket upgrade rides the SAME listener as the REST mount (same host, same port,
+    // same `/v1/harness` root). Without this listener Node destroys an upgrade socket, which is how
+    // "the service has it, the standalone does not" would otherwise happen silently.
+    const detachStream = stream.attach(server);
 
     const host = options.host ?? DEFAULT_HOST;
     const requestedPort = options.port ?? DEFAULT_PORT;
@@ -235,8 +313,18 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         url: `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`,
         store,
         runtime,
+        stream,
+        events,
         ...(persistence === undefined ? {} : { persistence }),
         close: async (): Promise<void> => {
+            // T15: stop the hub -> stream fan-out first, then close every live stream with 1001
+            // (`going_away`, "host shutdown while background work drains") BEFORE the listener stops,
+            // so a client sees an honest close code rather than a dropped socket. Detaching the
+            // `upgrade` listener means a reused port can never resurrect a dead broker.
+            detachStreamBridge();
+            detachStream();
+            stream.close(1001);
+
             // D4: `dispose()` queues the graceful document and FIRES the IO drain; awaiting
             // `drainIo()` here - the same cached promise - is what turns "the process may exit
             // now" into "the last document is on disk". A write that did not make it is reported

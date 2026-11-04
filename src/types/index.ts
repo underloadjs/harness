@@ -690,6 +690,12 @@ export type HarnessToolListEntry = {
 
 // toolManage operations. Reads are always available; create/update/reload go
 // through the same kernel as toolCreate/toolRegistry.
+//
+// T19 adds the three OPERATOR switches behind the REST session-tool routes
+// (`enable`/`disable` = the discovery slot only, `remove` = unregister the whole
+// registration). They are host-side operations: the model-facing `toolManage` schema
+// (./core/metadata.ts) keeps its own narrower operation list, so a run cannot quietly
+// unregister a tool the operator installed.
 export type HarnessToolManageOperation =
     | 'list'
     | 'details'
@@ -697,7 +703,10 @@ export type HarnessToolManageOperation =
     | 'path'
     | 'create'
     | 'update'
-    | 'reload';
+    | 'reload'
+    | 'enable'
+    | 'disable'
+    | 'remove';
 
 export type HarnessToolManageParameters = {
     operation: HarnessToolManageOperation;
@@ -2776,6 +2785,51 @@ export type Harness = {
     // while the thread (or an owned child) is running, and for an agent's default
     // conversation (use reset() for session memory).
     deleteThread: (threadId: string) => void;
+    // T27: agent-roster mutation for a host that changes WHICH brains a live session
+    // uses — the server's session-scoped agent binding routes
+    // (`POST`/`DELETE /sessions/{id}/agents`, `PATCH .../agents/{id}` with `instruction`).
+    //
+    // These exist because the alternative every caller had was a history reset: the only
+    // wholesale text write the runtime offered was `setThreadMessages`, which replaces a
+    // committed transcript to change a prompt, and rebuilding the harness loses the
+    // conversation. Roster membership and the leading instruction block are separate
+    // pieces of state from the transcript, so they are edited directly.
+    //
+    // SAFETY (all three): they mutate structure the run loop reads, so each one refuses
+    // with `HarnessError` while ANY run is in flight (`activeRuns > 0`) — the same gate
+    // `restore()` uses. A caller that needs "the change is real only if it is durable"
+    // (the server store) additionally refuses a session with live lane work or queued
+    // turns, and re-snapshots `core` afterwards; the runtime does not notify
+    // `stateChange` for these, because a mid-run notification is exactly the case they
+    // refuse and the host owns the commit.
+    //
+    //   - `addAgent(name, configuration, options?)` — build and register a NEW brain
+    //     under `name`, give it its default `agent:<name>` conversation, and (unless
+    //     `options.delegate === false`) put it in the primary's delegation allowlist,
+    //     which also installs the `delegate` tool the first time the roster gains a
+    //     subagent and re-projects its allowlist schema. Throws for a blank/unknown name
+    //     shape, a name that is already registered, or a configuration with no model.
+    addAgent: (
+        name: string,
+        configuration: AgentConfiguration,
+        options?: { delegate?: boolean }
+    ) => Agent;
+    //   - `removeAgent(name)` — detach one registry agent: it leaves `agents`,
+    //     `subagents`, and the delegation allowlist, and its DEFAULT conversation is
+    //     dropped with it (a host thread owned by that agent is not). Throws for an
+    //     unknown agent, for the primary (the entry point is not removable — that is a
+    //     redefinition, not a binding change), and while its default conversation has
+    //     live or queued work. Committed history in OTHER agents is never rewritten: a
+    //     delegated answer already copied into the primary's transcript stays.
+    removeAgent: (name: string) => void;
+    //   - `setAgentInstruction(name, instruction)` — replace the agent's leading system
+    //     block IN PLACE with one system message, and reseed its `instructions` baseline
+    //     so a later `reset()` returns to the new prompt. The number of messages replaced
+    //     is exactly the current instruction count (`agent.instructions.length`), which
+    //     is how many leading system entries `agent()` seeded; everything after them —
+    //     seeded context, turns, tool results — is untouched, and no transcript is ever
+    //     rebuilt. Throws for an unknown agent or blank/non-string text.
+    setAgentInstruction: (name: string, instruction: string) => void;
     // Reset to "start over": EVERY agent's conversation goes back to its seeded
     // instructions (R12 — a subagent kept its old transcript before this), tool
     // discovery is forgotten, and the session todo list and record stores are

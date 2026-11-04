@@ -211,7 +211,7 @@ it('saves through PUT and applies the returned session through the snapshot path
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -280,7 +280,7 @@ it('keeps the editor and marks the board when the saved transcript is unreadable
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

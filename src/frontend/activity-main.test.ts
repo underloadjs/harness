@@ -7,12 +7,15 @@
 //   - a reload/poll only derives activity from a turn that is STILL running, so
 //     opening a finished conversation never animates old work.
 //
-// The stream is a controlled ReadableStream so the test can assert between frames
-// (a fully-enqueued stream would be consumed before the first assertion).
+// The stream is the canonical `harness.v1` WebSocket double, which the test drives the same way
+// it used to drive a controlled ReadableStream: push frames, assert between pushes. The double
+// folds each RAW frame through the server's own projector (`toViewItem`) and delivers the
+// `turn.upsert`/`display.ops`/`session.updated` frames the real stream would send.
 
 import type { HarnessDescriptor, HarnessEvent, SessionSnapshot, SessionTurn } from '../server/protocol';
-import { viewAwareFetch } from './view-test-support';
+import { viewAwareFetch, installHarnessStream } from './view-test-support';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { resetHarnessStream } from './stream';
 
 const SESSION_KEY = 'underload-harness-app:session';
 const T = 1_700_000_000_000;
@@ -161,10 +164,13 @@ beforeEach(() => {
 afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    // The socket singleton is process-wide; leaving it alive leaks this test's double (and its
+    // reconnect timers) into the next one.
+    resetHarnessStream();
 });
 
 it('lights on start, keeps a delegated sibling lit, and clears on done/terminal', async () => {
-    const stream = controlled();
+    const stream = installHarnessStream({ sessionId: 's1', snapshot: () => snapshot() });
     let messageRequests = 0;
 
     vi.stubGlobal(
@@ -188,7 +194,7 @@ it('lights on start, keeps a delegated sibling lit, and clears on done/terminal'
             if (url === '/api/sessions/s1/events') return stream.response;
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -260,7 +266,7 @@ it('lights on start, keeps a delegated sibling lit, and clears on done/terminal'
 });
 
 it('clears every ring as soon as Stop is pressed', async () => {
-    const stream = controlled();
+    const stream = installHarnessStream({ sessionId: 's1', snapshot: () => snapshot() });
 
     vi.stubGlobal(
         'fetch',
@@ -287,7 +293,7 @@ it('clears every ring as soon as Stop is pressed', async () => {
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [] });
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');
@@ -321,6 +327,9 @@ it('clears every ring as soon as Stop is pressed', async () => {
 });
 
 it('derives rings from a still-running polled turn and never from completed history', async () => {
+    // The double is installed even for a polled test: jsdom supplies a real `WebSocket`, and an
+    // undriven socket would reconnect on fake timers the test never advances.
+    installHarnessStream({ sessionId: 'r1', snapshot: () => snapshot({ id: 'r1' }) });
     vi.useFakeTimers();
 
     // An older, finished turn that ended with the parent active-looking; it must
@@ -365,7 +374,7 @@ it('derives rings from a still-running polled turn and never from completed hist
             }
 
             throw new Error(`unexpected request: ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

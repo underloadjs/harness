@@ -108,7 +108,11 @@ import type {
     ToolDescriptor
 } from '../server/protocol';
 import type { HarnessUsage } from '../types';
-import type { TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlockDetail } from '../shared/turn-display';
+import type { DisplayStep, TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlockDetail } from '../shared/turn-display';
+// The pending-tool figure a cold display tree states per section (./view-api.ts
+// `readTurnDisplayWithPending`), seeded into the store as the `pending:set` ops it
+// would have arrived as on a live connection.
+import type { HarnessPendingTool } from '../shared/harness-api';
 // The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
 // and every submit below speaks `/views`, so no round trip on this path can carry a
 // recorded event. The raw client (./api.ts) stays imported for the catalogue routes
@@ -119,6 +123,7 @@ import {
     cancelView,
     cancelViewThread,
     createView as createViewSession,
+    createDisplayPlane,
     deleteView,
     deleteViewOnUnload,
     deleteViewThread,
@@ -127,12 +132,19 @@ import {
     getBlockDetail,
     getView,
     listViews,
+    observeTurn,
     observeView,
     resetView,
     submitViewTask,
     updateThreadTranscript as updateViewThreadTranscript,
     updateView
-} from './view-api';
+} from './view-shell';
+import type { DisplayPlane, ViewStreamItem } from './view-shell';
+// The lazy payload reads the display plane needs: one turn's tree (the focused
+// subscription's resync recovery), the out-of-band pending figure a cold tree states,
+// and the frozen definition — the only remaining source of a conversation's
+// discovered toolbox, read when the tools surface opens (./view-api.ts header).
+import { readDefinition, readTurnDisplay, readTurnDisplayWithPending } from './view-api';
 import {
     activeAgentsOf,
     applyOpsToActivity,
@@ -148,7 +160,7 @@ import {
 // The unwrap of ONE lazy step detail (explicit clicks only): the panel expansion and
 // the tool chip's detail loader are its only callers.
 import { stepDetailPayloadOf } from './view-detail';
-import type { HarnessActionChoice, HarnessAttachment } from '../types';
+import type { HarnessActionChoice, HarnessActionRequest, HarnessAttachment } from '../types';
 import { validateAttachments } from '../shared/attachments';
 import {
     API_ROOT,
@@ -159,21 +171,20 @@ import {
     createHarness,
     createSession,
     deleteHarness,
+    descriptorOf,
     deleteSession,
     deleteSessionOnUnload,
     deleteSessionThread,
-    enqueueTask,
     getSession,
     listProviderModels,
     listSessions,
     loadBootstrap,
-    observeSession,
     updateHarness,
     getHarness,
     updateSession,
-    updateThreadTranscript
 } from './api';
-import type { HarnessBootstrap, ThreadTranscriptPayload } from './api';
+import type { HarnessBootstrap } from './api';
+import type { SessionView as RenderSessionView, ThreadTranscriptPayload } from './view-model';
 import {
     agentInstructionsOf,
     agentModelsOf,
@@ -425,6 +436,101 @@ const loadRememberedSession = (): string | undefined => {
     }
 };
 
+// T29: `discoveredTools` is the ONE figure the compact session row stopped publishing
+// (./view-model.ts header: the canonical open carries metadata + rows + trees, and the
+// frozen definition is a separate lazy read). `GET /sessions/{id}/definition` is its
+// remaining source, so it is read when a surface that SHOWS it opens — the tools view,
+// the playground note, the agent dialog — never at boot, never on the transcript path,
+// and at most once per conversation (the promise is the cache).
+//
+// A failed read is cached as "nothing to report": the note omits its `enabled there`
+// clause rather than inventing a toolbox, and the entry is dropped so a later open can
+// ask again.
+const discoveredReads = new Map<string, Promise<string[]>>();
+
+const discoveredToolsOf = (sessionId: string, refresh = false): Promise<string[]> => {
+    const cached = discoveredReads.get(sessionId);
+    if (cached !== undefined && !refresh) return cached;
+
+    const read = readDefinition(sessionId)
+        .then((definition) => (Array.isArray(definition.discovered_tools) ? [...definition.discovered_tools] : []))
+        .catch(() => {
+            discoveredReads.delete(sessionId);
+
+            return [];
+        });
+
+    discoveredReads.set(sessionId, read);
+
+    return read;
+};
+
+// The tools view's lazy reads, fired when the view OPENS (never at boot):
+//   - the selected conversation's discovered toolbox lands on the render document,
+//     which is where every renderer reads `SessionView.discoveredTools`;
+//   - the playground note's `enabled there` clause comes from the PLAYGROUND session,
+//     whose figure the compact view never carried (`refresh: true` after a tool call so
+//     a fresh discovery shows up).
+// Both are guarded on their own conversation, so a late answer cannot paint another
+// session's toolbox, and each costs at most one read per conversation.
+const hydratePlaygroundDiscovered = (refresh = false): void => {
+    const playgroundSession = playground.sessionId;
+    if (playgroundSession === undefined) return;
+
+    void discoveredToolsOf(playgroundSession, refresh)
+        .then((names) => {
+            if (playground.sessionId !== playgroundSession) return;
+
+            playground.discovered = names;
+            renderPlaygroundNote();
+        })
+        .catch(() => undefined);
+};
+
+// The conversation-level lazy read, fired by the surface that shows THIS conversation's
+// frozen team and toolbox: the agent/configuration dialog. `GET /sessions/{id}/definition`
+// is the only route that still answers `discoveredTools` (the compact row stopped
+// publishing it, ./view-model.ts:113-116), and the same answer carries the member set,
+// models and per-agent overrides the dialog edits — so one read feeds the whole surface,
+// cached per conversation, and a chat that is only being read never pays for it.
+const hydrateSessionDefinition = (instance: Instance | undefined, refresh = false): void => {
+    const sessionId = instance?.sessionId;
+    const document = instance === undefined ? undefined : renderDocument(instance);
+
+    if (instance === undefined || sessionId === undefined || document === undefined) return;
+
+    void discoveredToolsOf(sessionId, refresh)
+        .then((names) => {
+            // Stale guard: the reader left this conversation while the read ran.
+            if (instance.sessionId !== sessionId) return;
+
+            document.discoveredTools = names;
+            instance.discovered = names;
+
+            const frozen = frozenDefinitions.get(sessionId);
+            if (frozen !== undefined) instance.frozen = frozen;
+        })
+        .catch(() => undefined);
+};
+
+// T29: the frozen team of one conversation, cached per conversation. The canonical
+// document carries no `harnessDefinition` (./view-api.ts:6-29), so the team is recorded
+// here whenever the conversation-level definition read runs (the agent/configuration
+// dialog), and every later document for the same conversation re-uses that answer instead
+// of wiping the team it reopened with.
+//
+// What this cache deliberately does NOT do: invent an ARCHIVED harness's team. The
+// definition route answers with a NAMED record even for a conversation that never
+// captured one, so using the route to decide "refuse or reopen" fabricates data the
+// contract refuses to state. The document's own field stays the source for that decision;
+// a DTO that states "this session froze a definition" is the missing piece.
+const frozenDefinitions = new Map<string, HarnessDescriptor>();
+
+// The one read a conversation's frozen team comes from: the document's own field when a
+// producer published it, otherwise the cached definition answer.
+const frozenTeamOf = (session: { harnessDefinition?: HarnessDescriptor; id: string }): HarnessDescriptor | undefined =>
+    frozenDefinitionOf(session) ?? frozenDefinitions.get(session.id);
+
 const rememberSession = (id: string): void => {
     try {
         localStorage.setItem(SESSION_KEY, id);
@@ -559,6 +665,49 @@ type View = {
     blocks: () => AgentBlockDescriptor[];
     // Stop every live timer this view owns (elapsed labels, tool durations).
     dispose: () => void;
+    // --- T24 lazy display wiring -----------------------------------------
+    // Installs the shell's lazy sources once the INSTANCE exists (the plane reads
+    // the instance's session id, which does not exist while `createView` runs).
+    // Every board callback below delegates through this binding, so the renderer
+    // still owns no network code — the same rule `readFile`/`loadStepDetail` follow.
+    bindLazy: (binding: LazyDisplayBinding) => void;
+    // Requests a tree for every row the reader can SEE (plus the expanded tile) and
+    // repaints the "load older" affordance. Called on a document landing, on scroll,
+    // and whenever an expansion changes — never once per row of loaded history.
+    reveal: () => void;
+    // The rows currently inside this pane's viewport, plus the expanded tile's id.
+    // This is what `DisplayPlane.ensureVisible` is allowed to ask trees for.
+    visibleTurnIds: () => string[];
+    // The turn the reader has open right now (the focused flow subscription's key).
+    expandedTurnId: () => string | undefined;
+    // Re-evaluates the "load older" button (label, disabled, hidden) from the plane.
+    paintOlder: () => void;
+};
+
+// The lazy sources one pane gets from the shell (T24). Declared as a type because
+// `createView` closes over it BEFORE the instance exists: the binding is installed
+// later by `bindLazy`, and every board callback reads it through the closure.
+type LazyDisplayBinding = {
+    // The instance's display plane (./view-shell.ts `createDisplayPlane`), capped at
+    // 4 concurrent tree reads, deduped and generation-guarded inside.
+    ensureVisible: (turnIds?: readonly string[]) => string[];
+    // Walks exactly one page from the cursor the server issued.
+    loadOlder: () => Promise<boolean>;
+    hasOlder: () => boolean;
+    loadingOlder: () => boolean;
+    // The tile the reader expanded, so the shell can move its `turn`-scope flow
+    // subscription to the conversation whose streamed text matters.
+    focusTurn?: (turnId: string | undefined) => void;
+    // An owner question as the COMPACT wire sees it: answered synchronously from the
+    // session's live pending actions, so a card carries the REAL recorded options
+    // (./ui/turns.ts:513). Undefined = not pending, which the lazy read below settles.
+    requestFor?: (step: DisplayStep) => HarnessActionRequest | undefined;
+    // A settled/historical card's choices: ONE step-detail read for the verbatim
+    // `action_request` opening event.
+    loadRequest?: (step: DisplayStep) => Promise<HarnessActionRequest | undefined>;
+    // The read above landed: the shell repaints that ONE tile from the compiled
+    // document so the card mounts with its recorded options.
+    actionHydrated?: (turnId: string) => void;
 };
 
 // R8 re-introduces per-thread actions on the EXPANDED thread surfaces themselves
@@ -614,6 +763,12 @@ const createView = (
         )
     );
 
+    // T24: the shell's lazy sources, installed by `bindLazy` once the instance (and
+    // therefore its display plane) exists. Declared before the board because every
+    // board callback below is created here and must read the CURRENT binding rather
+    // than one captured at construction.
+    let lazy: LazyDisplayBinding | undefined;
+
     // One tile per user turn. The board owns expansion state (exactly one tile
     // open, newest auto-opened) and keeps every tile's DOM, so reading an older
     // turn is never interrupted by deltas arriving for a newer one.
@@ -625,6 +780,15 @@ const createView = (
         // R11+: the same links often name a file by BARE BASENAME; this turns that
         // name into the real workspace path (or a pick-list) instead of an ENOENT.
         resolveFile: resolveFileForPreview,
+        // T24 (item 5): an owner question's REAL choices, never a fabricated option
+        // list. `actionRequestFor` answers synchronously from the session's pending
+        // actions (the exact recorded request the answer route validates against); a
+        // settled card with no live request costs ONE step-detail read for its
+        // verbatim `action_request` opening event, after which `onActionHydrated`
+        // asks the shell to repaint that tile with the recorded options.
+        actionRequestFor: (step) => lazy?.requestFor?.(step),
+        loadActionRequest: (step) => lazy?.loadRequest?.(step) ?? Promise.resolve(undefined),
+        onActionHydrated: (turnId) => lazy?.actionHydrated?.(turnId),
         ...(answer === undefined ? {} : { answerAction: answer }),
         ...(refreshTranscript === undefined
             ? {}
@@ -638,6 +802,16 @@ const createView = (
         // steering target stays visible in the same tick the reader
         // expands/collapses a conversation.
         onFocusChange: () => {
+            // T24: an expansion is also (a) a request for that row's display tree
+            // NOW and (b) the conversation whose streamed text the reader is
+            // watching, which is what the `turn`-scope flow subscription follows.
+            // Guarded on `lazy` because the board can notify during construction,
+            // before `reveal` exists.
+            if (lazy !== undefined) {
+                lazy.focusTurn?.(board.expanded()?.id());
+                reveal();
+            }
+
             // Only the SELECTED view owns the composer; a background harness's
             // reconcile must not repaint the routing line of another conversation.
             // Identity is the view's own pane, the one thing available before the
@@ -648,6 +822,107 @@ const createView = (
 
     const log = el('div', 'log');
     log.append(board.element);
+
+    // T24 (item 3): the ONLY way history grows — one button, one issued cursor, one
+    // page per press. The shell never walks history on its own, and the control
+    // retires when the server says the beginning is already loaded.
+    const older = el('button', 'load-older') as HTMLButtonElement;
+    older.type = 'button';
+    older.textContent = 'Load older messages';
+    older.hidden = true;
+
+    const paintOlder = (): void => {
+        const binding = lazy;
+
+        // No plane bound yet, or nothing older than this window: no affordance at
+        // all, rather than a control that would answer nothing.
+        if (binding === undefined || !binding.hasOlder()) {
+            older.hidden = true;
+            older.disabled = false;
+            older.textContent = 'Load older messages';
+
+            return;
+        }
+
+        older.hidden = false;
+        // While a page is in flight the button stays VISIBLE and disabled: hiding it
+        // would read as "there is nothing older" to a reader who just pressed it.
+        older.disabled = binding.loadingOlder();
+        older.textContent = binding.loadingOlder() ? 'Loading older…' : 'Load older messages';
+    };
+
+    older.addEventListener('click', () => {
+        const binding = lazy;
+        if (binding === undefined) return;
+
+        // Reflect the in-flight state immediately; the plane also refuses a second
+        // concurrent page (`loadingOlder`), so a double click costs one request.
+        paintOlder();
+
+        void binding
+            .loadOlder()
+            .catch(() => undefined)
+            .finally(() => {
+                // The prepend repaints the rows through the plane's own `repaint`;
+                // this re-evaluates the affordance and asks for the trees of the rows
+                // that just entered the viewport.
+                paintOlder();
+                reveal();
+            });
+    });
+
+    // The rows inside this pane's viewport, plus the expanded tile. Synchronous
+    // viewport math rather than an IntersectionObserver: the pane is ONE scroll
+    // container (`log-wrap`), the row count is bounded by the loaded window, and a
+    // read cannot miss a row the reader already sees. A host with no layout (jsdom, a
+    // detached pane) reports zero-area rects, which all count as inside the viewport
+    // — the safe direction, because the plane still caps concurrency at 4 and dedupes.
+    const visibleTurnIds = (): string[] => {
+        const ids: string[] = [];
+        const view = logWrap.getBoundingClientRect();
+
+        for (const handle of board.turns()) {
+            const id = handle.id();
+            if (id === undefined) continue;
+
+            const rect = handle.element.getBoundingClientRect();
+            if (rect.bottom >= view.top && rect.top <= view.bottom) ids.push(id);
+        }
+
+        // The opened conversation is by definition being read, even if its header
+        // scrolled past while its flow fills the pane.
+        const opened = board.expanded()?.id();
+        if (opened !== undefined && !ids.includes(opened)) ids.push(opened);
+
+        return ids;
+    };
+
+    // Ask for trees for what the reader can actually SEE, then refresh the
+    // affordance. Safe to call on every scroll/repaint: the loader drops a row it
+    // already holds or already has in flight, so a scroll gesture cannot start the
+    // same read twice and a fully-loaded window issues zero requests.
+    const reveal = (): void => {
+        if (lazy === undefined) return;
+
+        lazy.ensureVisible(visibleTurnIds());
+        paintOlder();
+    };
+
+    // Scrolling INTO unloaded history is the request for it (T24 item 2).
+    logWrap.addEventListener('scroll', () => reveal(), { passive: true });
+
+    // A click anywhere in the transcript is the reader changing WHAT THEY ARE LOOKING
+    // AT, and it is not always a focus change: two tiles of the SAME conversation
+    // switch the expanded tile without moving the steering target, so `onFocusChange`
+    // stays silent. Without this the flow subscription would follow the thread and not
+    // the tile, and the newly opened tile would stream nothing. `followTurnFlow` is
+    // idempotent for the same turn, so a click that changed nothing costs no request.
+    board.element.addEventListener('click', () => {
+        if (lazy === undefined) return;
+
+        lazy.focusTurn?.(board.expanded()?.id());
+        reveal();
+    });
 
     // R9 (T5): the per-view serialized transcript text/dialog is removed with the
     // composer button that opened it. Nothing else in this view depended on it.
@@ -666,7 +941,7 @@ const createView = (
         sessionNote.hidden = value.length === 0;
     };
 
-    logWrap.append(log);
+    logWrap.append(older, log);
     // Only the session outcome line sits between the harness head and the
     // transcript. The former thread strip band was removed (see the ui/threads
     // import comment): thread focus is expressed by the expanded tile plus the
@@ -811,7 +1086,15 @@ const createView = (
             // overlay of its own; the shared agent dialog is app-scoped and closed
             // by the shell's lifecycle helpers.
             board.destroy();
-        }
+        },
+        bindLazy: (binding) => {
+            lazy = binding;
+            paintOlder();
+        },
+        reveal: () => reveal(),
+        visibleTurnIds: () => visibleTurnIds(),
+        expandedTurnId: () => board.expanded()?.id(),
+        paintOlder: () => paintOlder()
     };
 };
 
@@ -1724,7 +2007,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             // call's panels are data in THIS pane, not something injected into the
             // conversation the reader is looking at.
             setResponse(JSON.stringify(response, null, 2), false);
-            outputLabelNode.textContent = `response · ${response.durationMs}ms`;
+            outputLabelNode.textContent = `response · ${response.duration_ms}ms`;
 
             // toolRequest caps its answer (5 tools). The raw payload stays; the
             // hint names the remaining count and the next move.
@@ -1768,7 +2051,12 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             active = entry;
 
             const single = singleProperty(entry.parameters);
-            const properties = entry.parameters.properties;
+            // T29: a catalogue entry may publish NO `parameters` schema at all (a tool
+            // listed without one, or a roster rebuilt after its harness was deleted).
+            // Reading `.properties` off an absent schema threw HERE, which left the
+            // runner half-mounted with no argument box — the whole row became unusable
+            // instead of merely schema-less. The schema is data to tolerate.
+            const properties = (entry.parameters as { properties?: unknown } | undefined)?.properties;
             const count = properties && typeof properties === 'object' ? Object.keys(properties).length : 0;
             // 'unconfigured' is the server's answer that the tool exists but has
             // no credential. Listing it is the point; calling it is not offered.
@@ -1783,7 +2071,10 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             // re-laid-out in place because the row set is derived from the payload's own
             // newlines, and swapping the host would orphan a box a consumer already holds.
             // `.transcript` keeps its own disclosure behaviour.
-            const schemaJson = JSON.stringify(entry.parameters, null, 2);
+            // An absent schema still has an honest answer: an empty object. Handing
+            // `undefined` to the code painter used to throw on its length, which aborted
+            // the rest of the runner mount (no argument box at all).
+            const schemaJson = JSON.stringify(entry.parameters ?? {}, null, 2);
             paintCodeBlock(schemaBody, schemaJson, 'json');
 
             // R8: the preset buttons are painted first and the first one fills the box,
@@ -2168,7 +2459,7 @@ const refreshModels = async (): Promise<void> => {
     setModelStatus(`Loading models from ${baseURL}…`);
 
     try {
-        const ids = await listProviderModels({ baseURL, apiKey }, controller.signal);
+        const ids = await listProviderModels({ base_url: baseURL, api_key: apiKey }, controller.signal);
         if (ticket !== modelTicket) return;
 
         modelIds = ids;
@@ -4351,6 +4642,18 @@ type Instance = {
     // frame and a drain frame reconcile the SAME object. Named `compiled` (not
     // `view`) because `Instance.view` is the DOM view wrapper.
     compiled?: SessionView;
+    // T24: the lazy display plane for THIS conversation — the single bounded queue
+    // (4 concurrent, deduped, generation-guarded) that decides which display trees
+    // are fetched, and the only way an older page is ever walked. Created with the
+    // instance because it reads the instance's live session id and document; optional
+    // only because it is built after the object literal (it reads the id eagerly).
+    plane?: DisplayPlane;
+    // The live flow subscription for the ONE tile the reader has open (T24). The
+    // contract publishes `display.ops` on the `turn` scope ONLY
+    // (../shared/harness-stream.ts:201, harness.swagger.yaml:2429), so a session-level
+    // subscription cannot deliver streamed text; this is the connection that does.
+    // Aborting it unsubscribes and never cancels a task.
+    turnWatch?: { turnId: string; sessionId: string; controller: AbortController };
 };
 
 const instances = new Map<string, Instance>();
@@ -4571,6 +4874,10 @@ const ensurePlaygroundSession = async (): Promise<string | undefined> => {
             ? [...session.discoveredTools]
             : undefined;
         renderPlaygroundNote();
+        // T29: the canonical session row no longer carries `discoveredTools`, so the
+        // note's `enabled there` clause comes from the definition read — fired here, on
+        // the surface that shows it, and never at boot.
+        hydratePlaygroundDiscovered();
 
         return session.id;
     } finally {
@@ -4616,6 +4923,10 @@ const runner = createToolRunner({
             ? [...session.discoveredTools]
             : undefined;
         renderPlaygroundNote();
+        // T29: a core call may have just enabled a tool, so this is the one place the
+        // figure is REFRESHED (the cache is bypassed), and the source is the definition
+        // read the compact row can no longer answer with.
+        hydratePlaygroundDiscovered(true);
     }
 });
 
@@ -4692,6 +5003,51 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
         threadTombstones: new Set<string>(),
         turnTombstones: new Set<string>()
     };
+
+    // T24: the plane and the pane's lazy sources are wired HERE rather than in the
+    // literal, because `createDisplayPlane` reads the session id immediately and the
+    // id belongs to the object that does not exist until this line has run.
+    instance.plane = createDisplayPlane({
+        // Read per call: the same card is reused across selections, and a captured id
+        // would paint another conversation's tree onto these rows. The STORE is the
+        // document's mutation point (see `Instance.compiled`), so the plane writes its
+        // adopted trees into exactly the object every renderer reads.
+        sessionId: () => instance.sessionId ?? '',
+        document: () => renderDocument(instance),
+        // A tree that landed, or an older page that was prepended, repaints from the
+        // one document this instance already owns.
+        repaint: () => repaintPlane(instance),
+        // 4 concurrent identified reads — the cap the loader's own rules name
+        // (./view-api.ts:592). A 25-row window drains in bounded batches.
+        concurrency: 4,
+        // The cold tree read also carries the sections' still-running background
+        // calls, which the render model cannot express; seeded as their own ops.
+        fetch: async (sessionId, turnId) => {
+            const cold = await readTurnDisplayWithPending(sessionId, turnId);
+
+            // Stale guard: a tree for a conversation the reader left seeds nothing.
+            if (instance.sessionId !== sessionId) return cold.display;
+
+            seedColdPending(instance, turnId, cold.pending);
+
+            return cold.display;
+        }
+    });
+
+    // The pane now has real lazy sources: trees for what is on screen, one cursor
+    // walk per "load older" press, and the two authoritative sources behind an owner
+    // question's choices.
+    instance.view.bindLazy({
+        ensureVisible: (turnIds) => instance.plane?.ensureVisible(turnIds) ?? [],
+        loadOlder: () => instance.plane?.loadOlder() ?? Promise.resolve(false),
+        hasOlder: () => instance.plane?.hasOlder() ?? false,
+        loadingOlder: () => instance.plane?.loadingOlder() ?? false,
+        focusTurn: (turnId) => followTurnFlow(instance, turnId),
+        requestFor: (step) => actionRequestForStep(instance, step),
+        loadRequest: (step) => loadActionRequestFor(instance, step),
+        actionHydrated: (turnId) => repaintActionCard(instance, turnId)
+    });
+
     instances.set(descriptor.name, instance);
 
     return instance;
@@ -4857,6 +5213,17 @@ const selectHarness = (
     // and leaving a running conversation simply unsubscribes (work continues).
     setBusy(current.pending);
 
+    // T24: selection cleanup + the lazy reveal. Only the SELECTED pane is on screen,
+    // so every other card's focused-turn flow subscription goes with its visibility
+    // (a background card never spends an identified read on rows nobody can see), and
+    // the rows this pane just showed are the rows whose trees are worth fetching now.
+    for (const instance of instances.values()) {
+        if (instance !== current) stopTurnFlow(instance);
+    }
+
+    followTurnFlow(current, current.view.expandedTurnId());
+    current.view.reveal();
+
     // T24: entering a harness resolves its conversation the way the first load does —
     // its most recently used row (T21 R21) — when this harness has nothing selected yet.
     // Everything that only REDRAWS the current harness (a session open, which arrives
@@ -5000,7 +5367,7 @@ const deleteHarnessRow = async (name: string): Promise<void> => {
     let deleted = false;
 
     try {
-        deleted = await deleteHarness(name);
+        deleted = (await deleteHarness(name)) !== undefined;
     } catch (error) {
         setStatus('error', `delete harness: ${messageOf(error)}`);
         removingHarnesses.delete(name);
@@ -5421,7 +5788,7 @@ const loadHarnessInstructions = (instance: Instance): void => {
             // No such route (or an answer that names a different harness): keep what we have.
             if (fetched === undefined || fetched.name !== name) return;
 
-            const stored = agentInstructionsOf(fetched);
+            const stored = agentInstructionsOf(descriptorOf(fetched));
 
             // A harness with no stored override needs no repaint at all: every member
             // already renders the trusted preset text, which is the correct answer.
@@ -5446,6 +5813,12 @@ const loadHarnessInstructions = (instance: Instance): void => {
 const openAgentDialogForCurrent = (): void => {
     const instance = current;
     if (instance === undefined) return;
+
+    // T29: this dialog is the surface that shows the conversation's frozen team and its
+    // discovered toolbox. The canonical document carries neither (./view-api.ts:6-29), so
+    // the dialog's open is what asks `GET /sessions/{id}/definition` for them — one read
+    // per conversation, cached, and never paid for by a chat that is only being read.
+    hydrateSessionDefinition(instance);
 
     const view = agentViewOf(instance);
     // One dialog at a time. A second programmatic open replaces the previous layer
@@ -5745,7 +6118,10 @@ const patchAgents = async (
                 ? { agentInstructions: instructions }
                 : {})
         });
-        replaceDescriptor(updated);
+        // descriptorOf is the canonical card/definition -> render descriptor mapping (./api.ts);
+        // the cast is nominal only: the protocol type carries legacy optional fields this
+        // deployment no longer publishes.
+        replaceDescriptor(descriptorOf(updated) as unknown as HarnessDescriptor);
         buildHarnesses();
         renderHarnessChrome();
 
@@ -6003,6 +6379,11 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     // the only tool listing (R21.2).
     showingTools = true;
     paintToolsToggle();
+    // T29: opening the tools surface is the request for the figure its note shows. A
+    // direct (no-session) call has no playground context yet, so this costs NO read:
+    // `hydratePlaygroundDiscovered` is a no-op until a temporary session exists, which
+    // is what the canonical playground suite pins.
+    hydratePlaygroundDiscovered();
 
     for (const [name, button] of toolTabButtons) {
         button.setAttribute('aria-pressed', name === entry.name ? 'true' : 'false');
@@ -6104,6 +6485,14 @@ const setToolsView = (open: boolean): void => {
     // R7: a fresh playground visit starts with a fresh context (the previous one was
     // released when the view closed), and the note states that up front.
     renderPlaygroundNote();
+    // T29: the tools view is the surface that shows the playground context's discovered
+    // toolbox. `GET /sessions/{id}/definition` is the only route that still answers it
+    // (the compact session row stopped publishing `discoveredTools`), so the read is
+    // paid for HERE — cached in `discoveredReads`, and a no-op while no temporary session
+    // exists, which is exactly what "a direct call costs no session traffic" pins. The
+    // selected CHAT's definition is a different surface's read (the agent dialog), and
+    // opening the catalogue must not spend a session read on it.
+    hydratePlaygroundDiscovered();
 
     agentSlot.hidden = true;
     composer.hidden = true;
@@ -7054,6 +7443,186 @@ const openPanelDetail = (instance: Instance, entry: PanelSummarySource): void =>
         });
 };
 
+// The live render document (./view-model.ts `SessionView`) in the spelling the
+// display plane and the action lookup need. `ViewStateStore` is still typed with the
+// legacy protocol document (../server/protocol.ts:681), which does not NAME the two
+// windowing fields the composed answer actually carries (`olderCursor`, `actions`).
+// Every object in the store comes from ./view-api.ts `openSession`, so this widening
+// is nominal only — and without it `loadOlder` could not see the cursor it walks.
+const renderDocument = (instance: Instance): RenderSessionView | undefined =>
+    instance.store.view() as unknown as RenderSessionView | undefined;
+
+// ---------------------------------------------------------------------------
+// The lazy display plane, per instance (T24 items 1-6)
+// ---------------------------------------------------------------------------
+//
+// A session open costs 25 ROWS plus at most 10 display trees (./view-api.ts
+// `MAX_VISIBLE_DISPLAYS_PER_OPEN`); every other tree is a user action. The plane
+// (./view-shell.ts `createDisplayPlane`) is the one queue that decides which, so a
+// scroll, an expansion, an ops frame and an older page all go through the same
+// bounded loader (4 in flight, deduped, generation-guarded, failure-not-retried)
+// instead of each starting their own fetch-everything.
+//
+// The plane writes the tree INTO the document it was given (`displays[turnId]`) and
+// asks for this repaint; the board then reads the same object it always read, so no
+// second copy of a turn's flow exists anywhere in the browser.
+const repaintPlane = (instance: Instance): void => {
+    const view = instance.compiled;
+    if (view === undefined) return;
+
+    // Panels come from the display trees, so a newly adopted tree can contribute a
+    // card — the same derivation every other document path runs.
+    derivePanels(instance);
+
+    // `reconcileView` patches tiles in place and re-runs `syncDisplay`, which is how
+    // a tree that arrived after the row got painted reaches the DOM without touching
+    // the reader's expansion or scroll position.
+    instance.view.reconcileView(view, instance.sessionModel);
+
+    if (current === instance) paintPanels();
+    instance.view.paintOlder();
+};
+
+// A cold display tree states its still-running background calls OUT OF BAND: the
+// render model holds that figure only in a `pending:set` op, so a reload of a
+// running turn would otherwise lose its "N still running" affordance. The read
+// above returns them beside the tree; they land in the store as the ops they are.
+const seedColdPending = (
+    instance: Instance,
+    turnId: string,
+    pending: { sectionId: string; pending: HarnessPendingTool[] }[]
+): void => {
+    if (pending.length === 0) return;
+
+    instance.store.applyOps(
+        turnId,
+        pending.map((entry) => ({
+            op: 'pending:set',
+            turnId,
+            sectionId: entry.sectionId,
+            pending: entry.pending
+        }))
+    );
+};
+
+// The live owner question one card answers (T24 item 5). The compact step publishes
+// the question line only, so the choices come from the session's pending actions —
+// `PendingAction.request` is the exact recorded request the answer route validates a
+// choice against. The id contract is the board's own: `step.callId` (the recorded
+// `action_request.callId`) and, for a step that carries none, the step id.
+const actionRequestForStep = (instance: Instance, step: DisplayStep): HarnessActionRequest | undefined => {
+    // The pending questions ride the render document (./view-model.ts
+    // `SessionView.actions`), which the store owns; the legacy protocol spelling does
+    // not name that field (see `renderDocument`).
+    const actions = renderDocument(instance)?.actions;
+    if (actions === undefined || actions.length === 0) return undefined;
+
+    const requestId = step.action?.requestId ?? step.callId ?? step.id;
+
+    return actions.find((action) => action.request.requestId === requestId)?.request;
+};
+
+// A settled/historical card's choices: ONE step-detail read for its verbatim
+// `action_request` opening event. Called by the board at most once per step, and
+// only for a card that has no live request, so history costs nothing until opened.
+const loadActionRequestFor = (instance: Instance, step: DisplayStep): Promise<HarnessActionRequest | undefined> => {
+    const sessionId = instance.sessionId;
+    if (sessionId === undefined) return Promise.resolve(undefined);
+
+    return getStepDetail(sessionId, step.turnId, step.id)
+        .then((detail) => stepDetailPayloadOf(detail).request)
+        .catch(() => undefined);
+};
+
+// The hydrated request is authoritative for that card only, so the repaint is
+// tile-scoped: re-syncing the whole document would re-paint every row for one card.
+// The tree itself did not change (the choices came from a side read the board cached),
+// so this is a re-render of the SAME tree, not a reconcile: `renderDisplay` re-runs
+// the compiled paint, which is where the cached request becomes the card's option list.
+const repaintActionCard = (instance: Instance, turnId: string): void => {
+    const handle = instance.view.turn(turnId);
+    const tree = instance.compiled?.displays[turnId];
+
+    if (handle !== undefined && tree !== undefined) {
+        handle.renderDisplay(tree);
+
+        return;
+    }
+
+    // No adopted tree yet (the row's tree is still in flight on the plane): the
+    // document re-apply below paints the card with the cached request the moment the
+    // tree lands, so the reader still gets the recorded choices without a second click.
+    repaintPlane(instance);
+};
+
+// Recovery for a gap on the focused turn's own subscription: one bounded re-read of
+// THAT turn's tree (the turn scope's full state), never a history snapshot.
+const reloadTurnTree = (instance: Instance, sessionId: string, turnId: string): void => {
+    void readTurnDisplay(sessionId, turnId)
+        .then((tree) => {
+            const view = instance.compiled;
+
+            // Stale guard: the reader left this conversation while the read ran.
+            if (view === undefined || instance.sessionId !== sessionId) return;
+
+            view.displays[turnId] = tree;
+            repaintPlane(instance);
+        })
+        .catch(() => undefined);
+};
+
+// One frame from the FOCUSED TURN's subscription (T24 item 6). `display.ops` is a
+// turn-scope kind — the contract's scope table publishes it nowhere else — so these
+// frames are how streamed text reaches an opened tile at all. The reducer work is
+// the ops branch of `onViewItem`, shared so a turn frame and a session frame patch
+// the same document the same way.
+const onTurnItem = (instance: Instance, sessionId: string, item: ViewStreamItem): void => {
+    if (instance.sessionId !== sessionId) return;
+    if (item.type !== 'ops') return;
+
+    applyOpsFrame(instance, item);
+};
+
+// Move the flow subscription to the tile the reader is looking at. Exactly one at a
+// time, per instance: an unbounded set of turn subscriptions is how a 25-row window
+// turns back into 25 connections.
+const followTurnFlow = (instance: Instance, turnId: string | undefined): void => {
+    const sessionId = instance.sessionId;
+    const previous = instance.turnWatch;
+
+    if (previous !== undefined && (previous.turnId !== turnId || previous.sessionId !== sessionId)) {
+        previous.controller.abort();
+        instance.turnWatch = undefined;
+    }
+
+    instance.plane?.setFocusedTurn(turnId);
+
+    if (turnId === undefined || sessionId === undefined) return;
+    if (instance.turnWatch !== undefined) return;
+
+    const controller = new AbortController();
+    instance.turnWatch = { turnId, sessionId, controller };
+
+    void observeTurn(
+        sessionId,
+        turnId,
+        (item) => onTurnItem(instance, sessionId, item),
+        controller.signal,
+        { onResync: (id) => void reloadTurnTree(instance, sessionId, id) }
+    ).catch(() => {
+        // A refused subscription costs this tile its live flow, nothing else: the
+        // session subscription still carries the rows, and the plane still loads trees.
+        if (instance.turnWatch?.controller === controller) instance.turnWatch = undefined;
+    });
+};
+
+// Drop the flow subscription (session switch, new conversation, delete, teardown).
+// Aborting only unsubscribes: execution is server-owned.
+const stopTurnFlow = (instance: Instance): void => {
+    if (instance.turnWatch !== undefined) instance.turnWatch.controller.abort();
+    instance.turnWatch = undefined;
+};
+
 const applyView = (instance: Instance, session: SessionView): void => {
     // R8: a snapshot for a session this page deleted must never re-point the card
     // at it. The tombstone covers the observer/poll/resync/openSession/enqueue
@@ -7137,7 +7706,7 @@ const applyView = (instance: Instance, session: SessionView): void => {
     // The frozen definition is the conversation's own team. Assign even when the
     // server omitted it (legacy): keeping a previous session's frozen team would
     // describe the wrong chat.
-    instance.frozen = frozenDefinitionOf(session);
+    instance.frozen = frozenTeamOf(session);
 
     // The session's LIVE effective per-agent models + the settings model they
     // inherit from (R2). The frozen `harnessDefinition` above is historical; this
@@ -7274,6 +7843,13 @@ const applyView = (instance: Instance, session: SessionView): void => {
     paintPanels();
     runner.sync();
     setBusy(instance.pending);
+
+    // T24 (item 1): the document just became the authority the plane reads rows and
+    // trees from, so THIS is where the trees for the rows the reader can see are
+    // requested. A session open fetched at most `MAX_VISIBLE_DISPLAYS_PER_OPEN`
+    // trees; every other row is one the reader has not scrolled to, and a background
+    // card's pane is not on screen at all (it reveals when the harness is selected).
+    instance.view.reveal();
 };
 
 // R7 explicit-open freshness, on the display wire (T5 R3). The board asks for ONE read
@@ -7477,10 +8053,13 @@ const saveThreadTranscriptFor = async (
 
     const result = await updateViewThreadTranscript(sessionId, threadId, messages);
 
-    // The document is applied even when the watermark rejects it as older than a
-    // streamed frame: nothing else about the session changes, and the returned
-    // `transcript` remains the newest authority for the editable value.
-    applyView(instance, result.view);
+    // A transcript save answers a WRITE RECEIPT plus the document, never a whole
+    // view (T14). The receipt's `revision` is the figure the stream compares against,
+    // and `transcript` is the newest authority for the editable value the dialog
+    // repaints from. Nothing else on the board moved — a transcript edit changes one
+    // conversation's stored value, and the stream's `transcript.updated` frame
+    // invalidates the roster copy — so no document is re-downloaded here.
+    void result.receipt;
 
     return result.transcript;
 };
@@ -7548,6 +8127,77 @@ const stopWatching = (): void => {
     watch = undefined;
 };
 
+// Apply one projected ops frame to this instance's document and DOM (T24).
+//
+// Split out of `onViewItem` because TWO subscriptions now deliver ops: the session
+// scope (a `turn.upsert` row patch) and the focused turn's own scope (the
+// `display.ops` flow the session scope does not publish). Both must land on the same
+// store, the same record map and the same tile, so there is exactly one reducer here
+// and neither path keeps a private copy of the rules.
+const applyOpsFrame = (
+    instance: Instance,
+    item: Extract<ViewStreamItem, { type: 'ops' }>
+): void => {
+    // S3: a turn removed by a delete this client performed must never come back.
+    // The tombstone — not arrival order — decides.
+    if (instance.turnTombstones.has(item.turnId)) return;
+
+    // The document as it stood WHEN this frame arrived. The activity reducer resolves
+    // an agent by section id against it, because `section:remove` names a section the
+    // post-state no longer holds.
+    const before = instance.store.view();
+
+    // 1. state first: the store applies every addressed mutation to the one
+    //    document this instance renders.
+    instance.store.applyItem(item);
+    const view = instance.store.view();
+    if (view === undefined) return;
+    instance.compiled = view;
+
+    // 2. the row upsert that rode inside the frame (`{ op: 'turn' }`) refreshes
+    //    the record cache and the derived chrome. A frame that only patches nodes
+    //    changes none of that, so this stays cheap.
+    const summaryOp = (item.ops ?? []).find((op) => op.op === 'turn');
+    if (summaryOp !== undefined && summaryOp.op === 'turn') {
+        if (!turnTombstoned(instance, summaryOp.summary))
+            instance.records.set(summaryOp.summary.id, summaryOp.summary);
+
+        refreshPending(instance);
+    }
+
+    // 3. DOM: route the ops to the tile by explicit turn id. A missing tile means
+    //    this frame belongs to a turn this view does not hold (another tab, or the
+    //    row has not arrived yet): the closing `view` frame reconciles it, so
+    //    guessing here would be a client-side projection.
+    const applied = instance.view.applyOps(item.turnId, item.ops ?? [], view);
+
+    if (!applied) return;
+
+    // Panels: the compact trees changed, so the scratch board follows — the
+    // same derivation the document path uses, never an event scan.
+    derivePanels(instance);
+
+    // Activity: the raw stream mutated the live ring set from every event
+    // (ui/activity.ts); the display wire mutates the SAME set from the addressed
+    // ops this frame names. A frame that ENDS a turn instead recomputes from the
+    // document, because the row it just upserted is now the authority for what is
+    // still running (and a `view` frame does the same in `applyView`).
+    const settlesTurn = (item.ops ?? []).some(
+        (op) => op.op === 'turn' && op.summary.status !== 'running'
+    );
+
+    if (settlesTurn) refreshActivity(instance);
+    else {
+        applyOpsToActivity(instance.activity, before, item.turnId, item.ops ?? []);
+        if (current === instance) paintAgentRings(instance.activity);
+    }
+
+    if (current === instance) {
+        paintPanels();
+        setBusy(instance.pending);
+    }
+};
+
 // One frame from the DISPLAY observer (T5 R1/R3). Items for a session/observer this
 // view no longer owns are dropped: a late frame must not paint into a conversation the
 // reader left.
@@ -7561,71 +8211,17 @@ const stopWatching = (): void => {
 const onViewItem = (
     instance: Instance,
     sessionId: string,
-    item: SessionViewStreamItem,
+    item: ViewStreamItem,
     controller: AbortController
 ): void => {
     if (instance.sessionId !== sessionId) return;
     if (watch === undefined || watch.controller !== controller) return;
 
     if (item.type === 'ops') {
-        // S3: a turn removed by a delete this client performed must never come back.
-        // The tombstone — not arrival order — decides.
-        if (instance.turnTombstones.has(item.turnId)) return;
-
-        // The document as it stood WHEN this frame arrived. The activity reducer resolves
-        // an agent by section id against it, because `section:remove` names a section the
-        // post-state no longer holds.
-        const before = instance.store.view();
-
-        // 1. state first: the store applies every addressed mutation to the one
-        //    document this instance renders.
-        instance.store.applyItem(item);
-        const view = instance.store.view();
-        if (view === undefined) return;
-        instance.compiled = view;
-
-        // 2. the row upsert that rode inside the frame (`{ op: 'turn' }`) refreshes
-        //    the record cache and the derived chrome. A frame that only patches nodes
-        //    changes none of that, so this stays cheap.
-        const summaryOp = (item.ops ?? []).find((op) => op.op === 'turn');
-        if (summaryOp !== undefined && summaryOp.op === 'turn') {
-            if (!turnTombstoned(instance, summaryOp.summary))
-                instance.records.set(summaryOp.summary.id, summaryOp.summary);
-
-            refreshPending(instance);
-        }
-
-        // 3. DOM: route the ops to the tile by explicit turn id. A missing tile means
-        //    this frame belongs to a turn this view does not hold (another tab, or the
-        //    row has not arrived yet): the closing `view` frame reconciles it, so
-        //    guessing here would be a client-side projection.
-        const applied = instance.view.applyOps(item.turnId, item.ops ?? [], view);
-
-        if (applied) {
-            // Panels: the compact trees changed, so the scratch board follows — the
-            // same derivation the document path uses, never an event scan.
-            derivePanels(instance);
-
-            // Activity: the raw stream mutated the live ring set from every event
-            // (ui/activity.ts); the display wire mutates the SAME set from the addressed
-            // ops this frame names. A frame that ENDS a turn instead recomputes from the
-            // document, because the row it just upserted is now the authority for what is
-            // still running (and a `view` frame does the same in `applyView`).
-            const settlesTurn = (item.ops ?? []).some(
-                (op) => op.op === 'turn' && op.summary.status !== 'running'
-            );
-
-            if (settlesTurn) refreshActivity(instance);
-            else {
-                applyOpsToActivity(instance.activity, before, item.turnId, item.ops ?? []);
-                if (current === instance) paintAgentRings(instance.activity);
-            }
-
-            if (current === instance) {
-                paintPanels();
-                setBusy(instance.pending);
-            }
-        }
+        // T24: the same reducer the focused turn's subscription uses, so a row patch
+        // that arrives on the session scope and a flow frame that arrives on the turn
+        // scope mutate ONE document in exactly one way.
+        applyOpsFrame(instance, item);
 
         return;
     }
@@ -7797,6 +8393,15 @@ const releaseSessionState = (instance: Instance): void => {
     instance.store.reset();
     instance.view.setSessionSnapshot(undefined);
     instance.view.setSessionView(undefined);
+
+    // T24: the plane and the flow subscription belong to the conversation being
+    // released. `invalidate` is the strong one of the two plane calls — it bumps the
+    // generation, so a tree still in flight for the conversation the reader left
+    // resolves to nothing and is never painted onto the next one — and the flow
+    // subscription dies with it, because a `turn` id is minted inside one session.
+    instance.plane?.invalidate();
+    stopTurnFlow(instance);
+    instance.view.paintOlder();
 };
 
 // Select and render an existing session. Everything drawn here comes from the
@@ -7857,6 +8462,11 @@ const openSession = async (
         // inside the snapshot (the team, models and tools the run actually used), NOT a
         // registry entry: nothing is re-added to `presetDescriptors`, so a deleted harness
         // is never silently resurrected by reading one of its chats.
+        // The ARCHIVED decision is made on the document's own field ONLY, never on the
+        // cached definition answer: a record that never captured a team must be refused,
+        // and the conversation-level definition read (which the agent dialog triggers for
+        // its own purposes) answers with a named record regardless. `frozenTeamOf` is for
+        // the chrome paths that must not WIPE a team this page already knows.
         const frozen = frozenDefinitionOf(session);
 
         if (frozen === undefined) {
@@ -7866,6 +8476,10 @@ const openSession = async (
             return;
         }
 
+        // Cache it so `applyView` below (which re-derives the team from the document, and
+        // finds none on the canonical wire) keeps describing THIS conversation rather than
+        // wiping the team it just reopened with.
+        frozenDefinitions.set(id, frozen);
         descriptor = frozen;
     }
 
@@ -7909,7 +8523,7 @@ const openSession = async (
     // N3: an answer card from the conversation being left cannot follow the
     // reader here; binding expires it before the new transcript is drawn.
     target.view.bindSession(id);
-    target.frozen = frozenDefinitionOf(session);
+    target.frozen = frozenTeamOf(session);
 
     // R6: for an archived harness this passes the frozen definition, because the registry
     // has no entry to look up. The instance key is the record's own harness name, so the
@@ -8173,7 +8787,7 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     // task is enqueued, so bind here: any action card that arrives with the run is
     // answerable against this id.
     instance.view.bindSession(session.id);
-    instance.frozen = frozenDefinitionOf(session);
+    instance.frozen = frozenTeamOf(session);
     // The creation answer carries this session's effective model map, which is also
     // the map a later PATCH /views/:id replaces (R2).
     instance.sessionModels = agentModelsOf(session);
@@ -8703,7 +9317,7 @@ const createPanel = createCreateHarnessPanel({
     onSubmit: async (request) => {
         // The server stores the harness and answers with its descriptor; the rail
         // and the centre are rebuilt from that answer, never from the draft.
-        const descriptor = await createHarness(request);
+        const descriptor = descriptorOf(await createHarness(request)) as unknown as HarnessDescriptor;
         replaceDescriptor(descriptor);
         buildHarnesses();
         selectHarness(descriptor.name);
@@ -8754,7 +9368,12 @@ window.addEventListener('pagehide', () => {
     // reader can delete like any other session.
     releasePlaygroundSession({ unload: true });
 
-    for (const instance of instances.values()) instance.view.dispose();
+    for (const instance of instances.values()) {
+        // T24: every focused-turn flow subscription dies with the page. Aborting is
+        // an unsubscribe only — the server keeps running whatever is pending (R4).
+        stopTurnFlow(instance);
+        instance.view.dispose();
+    }
 });
 
 // ---------------------------------------------------------------------------
@@ -8769,7 +9388,7 @@ const applyDefaults = (defaults: HarnessBootstrap['defaults']): void => {
 
     if (hasStoredSettings) return;
 
-    if (defaults.baseURL.trim().length > 0) settings.baseURL = defaults.baseURL;
+    if (defaults.base_url.trim().length > 0) settings.baseURL = defaults.base_url;
     if (defaults.model.trim().length > 0) settings.model = defaults.model;
 
     for (const [key, control] of controls) {
@@ -8886,17 +9505,17 @@ const boot = async (): Promise<void> => {
         renderModelOptions();
         void refreshModels();
 
-        presetDescriptors = data.presets;
+        presetDescriptors = data.presets as unknown as HarnessDescriptor[];
         // The agent library is server data. An older server has no list, so derive
         // a minimal one from its descriptors: the picker still works, and the
         // detail panel says the server did not advertise instructions.
         agentLibrary =
             Array.isArray(data.agents) && data.agents.length > 0
                 ? data.agents
-                : agentsFromDescriptors(data.presets);
+                : agentsFromDescriptors(data.presets as unknown as readonly HarnessDescriptor[]);
 
         buildHarnesses();
-        buildTools(data.tools);
+        buildTools(data.tools as unknown as readonly ToolDescriptor[]);
 
         // T5 R1: the conversation directory is the COMPACT surface. The bootstrap document already
         // embeds one row per conversation (the server's own catalogue read), which is the cheapest

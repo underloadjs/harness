@@ -1,4 +1,4 @@
-// T5 regression tests: per-session isolation while restoring the durable database.
+﻿// T5 regression tests: per-session isolation while restoring the durable database.
 //
 // The failure these tests reproduce is the one an operator hits after a tool
 // rename: a session persisted by an OLDER build names tools this build no longer
@@ -43,6 +43,8 @@ import { HarnessPersistence, HarnessPersistenceError } from './persistence';
 import type { HarnessDatabase } from './persistence';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
+// Canonical session list page for the migrated route assertions.
+import type { SessionResource, SessionSummaryPage } from '../shared/harness-api';
 import type { SessionSnapshot } from './protocol';
 import { SessionError, SessionStore } from './sessions';
 
@@ -211,8 +213,9 @@ const callApi = async (
     return { status: result.status, body: result.body };
 };
 
-const sessionIdsOf = (body: unknown): string[] =>
-    (body as { sessions: SessionSnapshot[] }).sessions.map((session) => session.id);
+// Canonical list page (T26): `GET /v1/harness/sessions` answers `SessionSummaryPage`,
+// whose rows live under `items` — the legacy `{ sessions }` envelope is gone.
+const sessionIdsOf = (body: unknown): string[] => (body as SessionSummaryPage).items.map((session) => session.id);
 
 // D4: the strict store methods are async, so a refused write arrives as a REJECTION -
 // an async helper is the only way to observe its status and message. Same contract, awaited.
@@ -291,9 +294,11 @@ describe('per-session restore isolation (T5/R6)', () => {
 
         const created = await callApi(second, 'POST', '/v1/harness/sessions', { harness: 'two' });
         expect(created.status).toBe(201);
-        const createdSession = (created.body as { session: SessionSnapshot }).session;
+        // Canonical create answer is a `SessionResource`: a fresh session reports
+        // `turn_count: 0` and never carries a `turns` array (T17 dropped the aggregate).
+        const createdSession = (created.body as { session: SessionResource }).session;
         expect(createdSession.harness).toBe('two');
-        expect(createdSession.turns).toEqual([]);
+        expect(createdSession.turn_count).toBe(0);
         expect(createdSession.id).not.toBe(broken.id);
 
         const stale = await callApi(second, 'GET', `/v1/harness/sessions/${broken.id}`);

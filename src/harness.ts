@@ -354,6 +354,7 @@ import { runPlugins } from './plugin';
 import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
+    AgentConfiguration,
     Harness,
     HarnessActionAnswer,
     HarnessActionChoice,
@@ -1924,6 +1925,140 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 const target = persistentTargetFor(values, operation);
                 return persistAndRegister(values, operation, target);
+            }
+
+            // T19: the operator-facing session-tool configuration switches (`PATCH
+            // /sessions/:id/tools/:tool_id {enabled}` and
+            // `DELETE /sessions/:id/tools/:tool_id`). They live HERE rather than in the
+            // server because the enabled set, the registry, the source records, and the
+            // created-tool budget are all harness-owned state, and only this closure can
+            // change all four consistently.
+            //
+            // Policy vs mechanism: WHICH names may be switched or dropped at all (a
+            // harness-owned control tool, a declared preset tool, a busy session) is the
+            // caller's decision — ./server/api.ts answers 403/409 before reaching this
+            // switch. What this switch guarantees is the invariant: an operation never
+            // leaves a name registered-but-unresolvable, and every successful change
+            // notifies the persistence observer so the committed snapshot matches the answer
+            // the client just got.
+            //
+            // These are OPERATOR operations: the model-facing `toolManage` schema
+            // (./core/metadata.ts) keeps its own operation list, so a model cannot quietly
+            // unregister a tool the operator installed.
+            case 'enable':
+            case 'disable': {
+                if (typeof values.name !== 'string' || values.name.length === 0) {
+                    throw new HarnessError(`toolManage ${operation} requires \`name\`.`);
+                }
+
+                const switchable = values.name;
+
+                if (tools[switchable] === undefined) {
+                    throw new HarnessError(`Tool "${switchable}" is not registered in this harness.`);
+                }
+
+                // A core declaration is always in the model's context and never occupies a
+                // cap slot, so switching it on or off would be a no-op the client believes
+                // took effect. That is a refusal, not a silent success.
+                if (!occupiesSearchableSlot(switchable)) {
+                    throw new HarnessError(
+                        `Tool "${switchable}" is a core declaration; it is always in context and cannot be enabled or disabled.`
+                    );
+                }
+
+                const enabledNow = currentEnabledSet();
+
+                if (operation === 'disable') {
+                    // Idempotent: disabling a tool that is already off changes nothing and
+                    // says so (`changed: false`), which is what lets the route skip the
+                    // revision bump instead of claiming a mutation that did not happen.
+                    if (!enabledNow.has(switchable)) {
+                        return { name: switchable, operation, enabled: false, changed: false };
+                    }
+
+                    // Every survivor keeps its relative position; the disabled name leaves
+                    // the capped set. The registration itself stays, so re-enabling costs no
+                    // budget and a manual/host `executeTool` still reaches the implementation
+                    // (discovery gates the MODEL, not its operator).
+                    setActiveTools(currentEnabledNames().filter((entry) => entry !== switchable));
+                    notifyStateChange('tool_create', { tool: switchable });
+
+                    return { name: switchable, operation, enabled: false, changed: true };
+                }
+
+                if (enabledNow.has(switchable)) {
+                    return { name: switchable, operation, enabled: true, changed: false };
+                }
+
+                // Newest-first insertion with the documented eviction of whatever falls off
+                // the cap, so an explicit enable behaves exactly like a `toolRequest` match.
+                const outcome = enableTools([switchable, ...currentEnabledNames()]);
+
+                notifyStateChange('tool_create', { tool: switchable });
+
+                return {
+                    name: switchable,
+                    operation,
+                    enabled: true,
+                    changed: true,
+                    ...(outcome.evicted.length === 0 ? {} : { evicted: outcome.evicted })
+                };
+            }
+
+            case 'remove': {
+                if (typeof values.name !== 'string' || values.name.length === 0) {
+                    throw new HarnessError('toolManage remove requires `name`.');
+                }
+
+                const removed = values.name;
+                const definition = tools[removed];
+
+                if (definition === undefined) {
+                    throw new HarnessError(`Tool "${removed}" is not registered in this harness.`);
+                }
+
+                // Defense in depth for the route's protected-name policy: a core entry is the
+                // harness's own capability surface (and most of them are built-in, so a
+                // restart would silently bring the name back after a "deleted" answer).
+                if (definition.visibility === 'core') {
+                    throw new HarnessError(
+                        `Tool "${removed}" is a core harness tool and cannot be unregistered.`
+                    );
+                }
+
+                // Capture BEFORE the deletes: the receipt names the revision and the owning
+                // file the caller may want to report or clean up.
+                const previousRevision = toolSourceRecords.get(removed)?.revision;
+                const sourcePath = toolOwningPaths.get(removed);
+                const wasCreated = createdToolRecords.has(removed);
+
+                // One atomic un-publish: implementation, captured source revision, owning-path
+                // association, the created-tool record, and the enabled slot all go together,
+                // so no view of the harness can still name the removed tool.
+                delete tools[removed];
+                toolSourceRecords.delete(removed);
+                toolOwningPaths.delete(removed);
+                setActiveTools(currentEnabledNames().filter((entry) => entry !== removed));
+
+                // A created tool that leaves the harness also leaves the durable created-tool
+                // set, and the lifetime counter pair moves with it (exactly as a disk-backed
+                // takeover does above in `acceptTool`): keeping the count while dropping the
+                // record is what a snapshot-restore disagreement looks like.
+                if (wasCreated) {
+                    createdToolRecords.delete(removed);
+                    createdTools = Math.max(0, createdTools - 1);
+                }
+
+                notifyStateChange('tool_create', { tool: removed });
+
+                return {
+                    name: removed,
+                    operation,
+                    removed: true,
+                    created: wasCreated,
+                    ...(previousRevision === undefined ? {} : { previousRevision }),
+                    ...(sourcePath === undefined ? {} : { sourcePath })
+                };
             }
 
             case 'reload': {
@@ -7340,11 +7475,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 .map((name) => name.toLowerCase())
         );
 
+        // T27: exactly one name is exempt from the collision rule — the delegation row.
+        //
+        // Whether `delegate` exists at all is a property of the ROSTER: its descriptor is gated on
+        // `activation: 'subagents'`, so a harness built without a subagent never registers it and a
+        // harness built with one always does. A roster is now mutable at session scope
+        // (`addAgent`/`removeAgent` above, driven by `POST`/`DELETE /sessions/{id}/agents`), so a
+        // snapshot taken AFTER the first subagent joined records a `delegate` registration that the
+        // same build performs from its own startup loop when it rebuilds that session. Refusing the
+        // collision would make every later restore of that session fail on a name both sides
+        // compiled from the same descriptor row, which is a worse outcome than replacing an entry
+        // whose projected allowlist the target regenerates from its own roster anyway.
+        //
+        // Nothing else is exempt: `harness.snapshot.test.ts:767` pins the refusal for a genuinely
+        // created tool, where a collision really does mean the snapshot came from another harness.
+        const rosterConditional = new Set(
+            delegateDescriptorName === undefined ? [] : [delegateDescriptorName.toLowerCase()]
+        );
+
         for (const prepared of restoredCandidates) {
             const definition = prepared.tool;
             const key = definition.name.toLowerCase();
 
-            if (occupied.has(key)) {
+            if (occupied.has(key) && !rosterConditional.has(key)) {
                 throw new HarnessError(
                     `Tool "${definition.name}" is already registered in this harness; the snapshot cannot be restored.`
                 );
@@ -8023,6 +8176,289 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const executeTool = (name: string, parameters: unknown): Promise<unknown> =>
         observeToolRejection(executeToolInternal(name, parameters));
 
+    // -------------------------------------------------------------------
+    // T27: agent-roster mutation for a host that changes the session's team
+    // -------------------------------------------------------------------
+    //
+    // WHY THIS LIVES IN THE RUNTIME AND NOT IN THE SERVER
+    // ---------------------------------------------------
+    // The server's session-scoped agent routes (POST/DELETE /sessions/{id}/agents and the
+    // per-agent instruction PATCH) need three things the handle did not offer: register a
+    // brain after construction, detach one, and change the prompt an EXISTING brain runs
+    // with. Before this, the only wholesale text write was `setThreadMessages`, which
+    // replaces a committed transcript to edit a prompt, and rebuilding the harness loses
+    // the conversation entirely. Roster membership and the leading instruction block are
+    // not transcript state, so they are edited directly and nothing else moves.
+    //
+    // INVARIANTS each operation preserves (the store's durability story depends on them):
+    //   - snapshot identity: `snapshot()` enumerates `agents`, and `restore()` validates
+    //     the snapshot against the agent set of the rebuilt harness. Both maps below are
+    //     updated together, so a snapshot taken after a roster change restores only into
+    //     a harness rebuilt with the same roster — which is what the store does by
+    //     rewriting the session's frozen preset record alongside the call;
+    //   - thread ownership: every registry agent owns exactly one default conversation
+    //     (`agent:<name>`), added on the same terms as the plugin `createAgent` path
+    //     (see the registry api `createAgent` closure above). Removing an agent removes
+    //     that conversation, and an agent whose conversation (or any host thread it owns)
+    //     still has work cannot be removed;
+    //   - delegation: `subagentNames` IS the primary's allowlist. It is what `delegateFor`
+    //     checks at call time (see the allowlist error there), so updating it in place
+    //     takes effect on the very next delegation, and re-projecting the installed
+    //     `delegate` declaration keeps what the model can SEE equal to what it can CALL.
+
+    // The single structural gate. `activeRuns` counts every run this harness owns — the
+    // root call, `ctx.run` children, delegated runs, and thread turns — so one check covers
+    // every way the roster could be read while it is being rewritten. Same gate, same
+    // message shape as `restore()` uses (see the `activeRuns > 0` refusal there).
+    const assertRosterIdle = (operation: string): void => {
+        if (activeRuns > 0) {
+            throw new HarnessError(
+                `Cannot ${operation} while an agent run is in progress; wait for the run to settle.`
+            );
+        }
+    };
+
+    // Keep the installed `delegate` declaration honest about the CURRENT allowlist.
+    //
+    // A harness built with no subagents never registered the tool at all (its descriptor
+    // row is gated on `activation: 'subagents'`), so the first added subagent has to
+    // install it through the same baseline kernel the startup loop uses — including the
+    // per-definition policy markers, because `answerExtraction` and `primaryOnly` are read
+    // off the DEFINITION object, not the name. Once installed the tool stays (dropping it
+    // between two model turns would tear the declaration list); with an empty allowlist
+    // `delegateFor` refuses every target, which is the pre-existing behavior for a
+    // harness whose last subagent was removed.
+    const syncDelegateDeclaration = (): void => {
+        const descriptor = toolDescriptors.find((row) => row.name === delegateDescriptorName);
+
+        if (descriptor === undefined) {
+            // No delegation row in this build's discovery scan: nothing to install or sync.
+            return;
+        }
+
+        const projected = agentDelegateMetadata(subagentNames);
+        const overrides = {
+            description: projected.description,
+            tags: projected.tags,
+            parameters: projected.parameters
+        };
+
+        const installed = tools[descriptor.name];
+
+        if (installed !== undefined) {
+            // Re-project IN PLACE: the same definition object is what the declaration
+            // list, `toolList`, and the pending-run loop read, so a mutation here is
+            // visible on the next request without re-registering (and without a new
+            // registration consuming the created-tool budget).
+            installed.description = projected.description;
+            installed.parameters = projected.parameters;
+            installed.tags = [...projected.tags];
+
+            return;
+        }
+
+        // Exactly the fallback the startup descriptor loop builds for this row.
+        const fallback = (): Tool =>
+            descriptor.control === undefined
+                ? lazyBaselineTool(descriptor)
+                : defineTool({
+                      ...metadataOf(descriptor),
+                      ...overrides,
+                      execute: () => {
+                          throw new HarnessError(
+                              `${descriptor.name} requires the harness run that owns the conversation; call it from a model tool call.`
+                          );
+                      }
+                  });
+
+        const prepared = registerDescriptor(descriptor, fallback, overrides);
+        const definition = prepared.tool;
+
+        if (descriptor.pendingOnly === true) definition.visibility = 'searchable';
+        if (descriptor.primaryOnly === true) primaryOnlyDefinitions.add(definition);
+        if (descriptor.answerExtraction === true) delegateAnswerDefinitions.add(definition);
+        if (descriptor.pendingOnly === true) pendingOnlyDefinitions.add(definition);
+
+        const marker = controlMarkerOf(descriptor.control);
+        if (marker !== undefined) runtimeControlDefinitions.set(definition, marker);
+    };
+
+    // Register a NEW brain after construction. `configuration` is a full agent
+    // configuration (the server builds it from a trusted profile plus the session's
+    // provider settings — see `agentConfigurationFromProfile` in ./server/harnesses/
+    // toolbox.ts), so the runtime never invents a transport and a host can add a brain
+    // built from anything it already trusts.
+    const addAgent = (
+        name: string,
+        configuration: AgentConfiguration,
+        options: { delegate?: boolean } = {}
+    ): Agent => {
+        assertRosterIdle('change the agent roster');
+
+        if (typeof name !== 'string' || name.trim().length === 0) {
+            throw new HarnessError('An agent needs a non-blank name.');
+        }
+
+        // The registry key is the identity, so it is trimmed once here and every later
+        // lookup uses that exact string (same rule as the construction loop, which
+        // overwrites `brain.name` with the key).
+        const key = name.trim();
+
+        if (Object.prototype.hasOwnProperty.call(agents, key)) {
+            throw new HarnessError(`Agent "${key}" is already registered.`);
+        }
+
+        if (configuration === undefined || configuration === null) {
+            throw new HarnessError(`Agent "${key}" requires an agent configuration.`);
+        }
+
+        const brain = createAgent({ ...configuration, name: key });
+
+        // The construction loop's rule: the key and the brain's own name can never
+        // disagree, because the name is what progress events and `run(name)` report.
+        brain.name = key;
+        agents[key] = brain;
+
+        // R2: a registry agent owns a default conversation from the moment it exists, or
+        // `threads()`/`threadSend`/`sendThreadInput('agent:<name>')` could not address it.
+        threadStates.set(defaultThreadIdOf(key), {
+            record: {
+                id: defaultThreadIdOf(key),
+                agent: key,
+                origin: 'agent',
+                status: 'idle',
+                sequence: ++threadSequence
+            },
+            agent: brain,
+            queue: [],
+            generation: 0
+        });
+
+        // The primary is never its own delegate (`roleOf` and the construction allowlist
+        // both enforce that), so a brain added under the primary's name — impossible
+        // while it is registered, and `delegate: false` is the explicit opt-out for a
+        // host that wants a reachable-but-not-delegatable member — stays out of the list.
+        if (options.delegate !== false && key !== primaryName) {
+            if (!subagentNames.includes(key)) subagentNames.push(key);
+            subagents[key] = brain;
+            syncDelegateDeclaration();
+        }
+
+        return brain;
+    };
+
+    // Detach one registry agent. Every read the runtime does about the roster goes through
+    // `agents`/`subagents`/`subagentNames`, all three of which are the live objects the
+    // handle exposes, so the change is visible on the next request without a rebuild.
+    const removeAgent = (name: string): void => {
+        assertRosterIdle('change the agent roster');
+
+        const key = typeof name === 'string' ? name.trim() : '';
+
+        if (!Object.prototype.hasOwnProperty.call(agents, key)) {
+            throw new HarnessError(
+                `Agent "${key}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        // The entry point is structural, not a binding: removing it would leave a harness
+        // whose callable root and `handle.name` point at a brain that is gone. That is a
+        // redefinition (`PATCH /harnesses/{name}` with a new primary), never a detach.
+        if (key === primaryName) {
+            throw new HarnessError(
+                `Agent "${key}" is the primary agent and cannot be removed; change the harness definition instead.`
+            );
+        }
+
+        const defaultThread = threadStates.get(defaultThreadIdOf(key));
+
+        if (defaultThread !== undefined) {
+            if (defaultThread.run !== undefined || defaultThread.queue.length > 0) {
+                throw new HarnessError(
+                    `Cannot remove agent "${key}" while its conversation has live or queued work; stop it first.`
+                );
+            }
+        }
+
+        // Thread ownership: a HOST thread is an independent conversation backed by its own
+        // Agent clone, but its record names the owning agent, and `threadSend`/`threadList`
+        // still address it. Removing the agent under those conditions would leave a live
+        // conversation with no roster entry, so it is refused; the host stops/deletes its
+        // threads first.
+        for (const state of threadStates.values()) {
+            if (state.record.origin === 'host' && state.record.agent === key) {
+                throw new HarnessError(
+                    `Cannot remove agent "${key}" while it owns thread "${state.record.id}"; delete the thread first.`
+                );
+            }
+        }
+
+        delete agents[key];
+        delete subagents[key];
+
+        const index = subagentNames.indexOf(key);
+        if (index !== -1) subagentNames.splice(index, 1);
+
+        // The default conversation is the agent's transcript: it goes with the agent. Its
+        // sequence number is NOT reused (the counter is monotonic, like thread ids).
+        if (defaultThread !== undefined) threadStates.delete(defaultThreadIdOf(key));
+
+        // Keep the model-facing allowlist in step with the real one.
+        syncDelegateDeclaration();
+    };
+
+    // Replace the leading system block of one agent, leaving the conversation intact.
+    const setAgentInstruction = (name: string, instruction: string): void => {
+        assertRosterIdle('change an agent instruction');
+
+        const key = typeof name === 'string' ? name.trim() : '';
+
+        if (!Object.prototype.hasOwnProperty.call(agents, key)) {
+            throw new HarnessError(
+                `Agent "${key}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        if (typeof instruction !== 'string' || instruction.trim().length === 0) {
+            throw new HarnessError(`Agent "${key}" needs non-blank instruction text.`);
+        }
+
+        const brain = agents[key];
+        const history = brain.messages;
+        // `instructions` is typed `readonly string[]` on the public Agent (a caller must
+        // not treat it as its own list), but it IS the live array the brain seeds from, so
+        // the reseed below writes through a widened local rather than replacing the
+        // reference — a holder of `agent.instructions` must see the new baseline.
+        const baseline = brain.instructions as string[];
+
+        // `agent()` seeds the transcript as [every instruction, ...configuration.messages]
+        // (see core/agent.ts `seed`), so the CURRENT instruction list is exactly how many
+        // leading system messages belong to the prompt. Using that count — instead of
+        // "every leading system message" — is what makes this safe for an agent seeded
+        // with its own system context messages: those are history, and they stay.
+        const replace = baseline.length;
+
+        for (let index = 0; index < replace; index += 1) {
+            if (history[index]?.role !== 'system') {
+                throw new HarnessError(
+                    `Agent "${key}" no longer starts with its seeded instruction block; refusing to rewrite its transcript.`
+                );
+            }
+        }
+
+        const text = instruction.trim();
+
+        // Both arrays are the LIVE objects the handle exposes (`agent.messages` and
+        // `agent.instructions` are handed out by reference), so they are mutated in place:
+        // a server holding either reference sees the new state, and `reset()` — which
+        // re-seeds from `instructions` — returns to the new prompt instead of the old one.
+        baseline.length = 0;
+        baseline.push(text);
+
+        if (replace === 0) history.unshift({ role: 'system', content: text });
+        else history.splice(0, replace, { role: 'system', content: text });
+    };
+
     // The harness is a function you call. Properties ride on it so a CLI has
     // everything in one handle without a second lookup object.
     const run = (input: string, options?: HarnessRunOptions) =>
@@ -8130,6 +8566,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         stopThread,
         stopAllThreads,
         deleteThread,
+        // T27: roster mutation (see the block above for the invariants). These are on the
+        // handle because a host — the server store — owns the roster change and its
+        // durability; the runtime only refuses to do it under a live run.
+        addAgent,
+        removeAgent,
+        setAgentInstruction,
         // R3a persistence. `snapshot` never mutates; `restore` validates fully
         // and recompiles created-tool sources without executing them.
         snapshot,

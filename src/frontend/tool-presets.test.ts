@@ -452,7 +452,7 @@ const boot = async (subagents: readonly string[] = ['research', 'workspace']): P
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

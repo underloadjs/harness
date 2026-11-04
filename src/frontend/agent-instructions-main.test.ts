@@ -176,7 +176,7 @@ const stubHarnessWrites = (initial: HarnessDescriptor) => {
             if (url === '/api/harnesses/instruct' && init === undefined) return json({ harness: current });
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     return { patches, updated: () => current };
@@ -429,7 +429,7 @@ it('refuses an instruction delta on a saved conversation instead of reporting it
             if (url === '/api/sessions/s9') return json({ session: saved });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }))
+        }, { root: '/api' }))
     );
 
     await import('./main');

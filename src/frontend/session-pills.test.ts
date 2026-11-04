@@ -115,7 +115,7 @@ const stubFetch = (
     // answered from the raw fixtures this test already declares
     // (./view-test-support.ts `withViewRoutes` rewrites the request and compiles the
     // answer). The recorded `calls` still show the URL the browser actually asked for.
-    const answer = withViewRoutes(handler as (url: string, method?: string, body?: unknown) => Response | undefined);
+    const answer = withViewRoutes(handler as (url: string, method?: string, body?: unknown) => Response | undefined, { root: '/api' });
 
     vi.stubGlobal(
         'fetch',
