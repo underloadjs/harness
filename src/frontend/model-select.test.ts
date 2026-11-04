@@ -670,8 +670,10 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
             body: { agentModels: { instruct: 'm3', summarizer: 'm1' } }
         }
     ]);
-    // The frozen definition is historical: no harness PATCH races the edit.
-    expect(calls.some((call) => call.url.startsWith('/api/harnesses/'))).toBe(false);
+    // The frozen definition is historical: no harness PATCH races the edit. (T11: opening the
+    // configuration dialog DOES read `GET /harnesses/:name` for the instruction text a compiled
+    // view omits, so the assertion is about WRITES, which is what this test was always about.)
+    expect(calls.some((call) => call.method === 'PATCH' && call.url.startsWith('/api/harnesses/'))).toBe(false);
 
     // The answer is applied like any GET snapshot, so the control shows the new id
     // and m2 (no longer effective) disappears from the options.
@@ -856,5 +858,7 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
         document.querySelector('.agent-dialog-agent[data-agent="instruct"] .agent-dialog-agent-model')?.textContent
     ).toBe('m2');
     expect(calls).toContain('PATCH /api/sessions/s9');
-    expect(calls.some((call) => call.includes('/api/harnesses/'))).toBe(false);
+    expect(
+        calls.some((call) => call.startsWith('PATCH') && call.includes('/api/harnesses/'))
+    ).toBe(false);
 });

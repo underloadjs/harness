@@ -15,6 +15,7 @@
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 import type { HarnessAssistantMessage, HarnessEvent, SessionTurn } from '../../server/protocol';
+import { agentColorOf } from './agent-color';
 import { createTurnBoard } from './turns';
 
 const doneMessage = (agent: string): HarnessAssistantMessage => ({
@@ -32,6 +33,25 @@ const mount = () => {
     const board = createTurnBoard({ empty });
     document.body.replaceChildren(board.element);
     return { board, empty };
+};
+
+// T5/R4: an agent's tone is DRAWN BY THE UI for the current page (randomly, once), so a
+// transcript test can no longer hardcode "writer is violet". What these tests own is that
+// every agent-owned block is painted with the tone the SHARED mapping reports for THAT
+// block's agent — the colour assignment itself is pinned in ui/agent-color.test.ts, and
+// the cross-surface parity (composer / dialog / thread labels) in
+// ui/agent-color-surfaces.test.ts.
+//
+// `[color, line]` pairs, so a test that only checks one of the two properties still
+// catches a component painting the wrong one.
+const toneOf = (agent: string): [string, string] => {
+    const tone = agentColorOf(agent);
+    return [tone.color, tone.line];
+};
+
+const paintedTone = (node: Element): [string, string] => {
+    const element = node as HTMLElement;
+    return [element.style.getPropertyValue('--agent-color'), element.style.getPropertyValue('--agent-line')];
 };
 
 describe('createTurnBoard', () => {
@@ -141,13 +161,12 @@ describe('createTurnBoard', () => {
         // owns the block. `data-role` above is the structural attribute only.
         expect(agents[1]?.querySelector('.agent-role')).toBeNull();
         expect(turn.element.querySelectorAll('.agent-role, .thread-role')).toHaveLength(0);
-        // Each section carries its own agent colour (name colour + outline var).
-        // `writer`/`helper` are not built-in profile ids, so they use the palette
-        // hash: writer → violet (slot 2), helper → teal (slot 5).
-        expect(agents.map((agent) => agent.style.getPropertyValue('--agent-color'))).toEqual([
-            '#a78bfa',
-            '#2dd4bf'
-        ]);
+        // R4: each section carries its own agent colour (name colour + outline var). The
+        // tone is DRAWN per page, so the expectation is the tone the shared mapping
+        // reports for that section's own agent: the `writer` section must not be painted
+        // from the `helper` entry (and the outline must move with the name, or a block is
+        // framed by one agent while its label shows another).
+        expect(agents.map(paintedTone)).toEqual([toneOf('writer'), toneOf('helper')]);
 
         // `done` closes the agent turn, not the user turn: the primary still has
         // to return from its tool call.
@@ -181,17 +200,19 @@ describe('createTurnBoard', () => {
         expect(turn.element.style.getPropertyValue('--agent-color')).toBe('');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        // R3: the main block is agent-owned exactly like a nested block. `writer` is
-        // not a built-in profile id, so it takes the palette hash (violet, slot 2).
+        // R3: the main block is agent-owned exactly like a nested block. R4: the tone is
+        // the one this page drew for `writer`, name and outline together — a tile painted
+        // from a different identity than its own label is the failure this pins.
         expect(turn.element.dataset.agent).toBe('writer');
-        expect(turn.element.style.getPropertyValue('--agent-color')).toBe('#a78bfa');
-        expect(turn.element.style.getPropertyValue('--agent-line')).toBe('rgba(167, 139, 250, 0.6)');
+        expect(paintedTone(turn.element)).toEqual(toneOf('writer'));
 
-        // A different primary agent gets a different, deterministic tone.
+        // A different primary agent is painted from ITS OWN identity, not by copying the
+        // tile that happened to be painted first. (After R4 the values are per-page; what
+        // is fixed is the routing from the event's agent to the block's tone.)
         const other = board.begin('second');
         other.apply({ type: 'start', agent: 'researcher', model: 'm1' });
         expect(other.element.dataset.agent).toBe('researcher');
-        expect(other.element.style.getPropertyValue('--agent-line')).toBe('rgba(244, 114, 182, 0.6)');
+        expect(paintedTone(other.element)).toEqual(toneOf('researcher'));
     });
 
     it('keeps an unattributable placeholder agent neutral on both the tile and its section', () => {
@@ -2405,9 +2426,27 @@ describe('inline reasoning chips (think)', () => {
 
         const text = '# not **markdown** <script>';
         expect(thinkingTexts(turn)).toEqual([text]);
-        expect(chips(turn)[0].querySelector('.reasoning')?.innerHTML).toBe(
-            '# not **markdown** &lt;script&gt;'
+
+        // R1 moved this pane onto the shared payload viewer, so the round is no longer a
+        // bare escaped `pre`: it is ONE `.code-line` row whose text is byte-identical to
+        // the round and whose MARKUP is escaped/highlighter output only. Both halves are
+        // pinned exactly, because that is the whole safety claim — the viewer never PARSES
+        // the payload.
+        const pane = chips(turn)[0].querySelector('.reasoning');
+        if (pane === null) throw new Error('missing the reasoning payload viewer');
+        expect(pane.textContent).toBe(text);
+        expect(pane.querySelector<HTMLElement>('.code-line')?.innerHTML).toBe(
+            '# not **markdown** <span class="hljs-tag">&lt;<span class="hljs-name">script</span>&gt;</span>'
         );
+        // Nothing became an ELEMENT: no Markdown heading or emphasis from `#`/`**`, and no
+        // live `<script>` the round could have injected. The highlighter's `hljs-tag` /
+        // `hljs-name` spans wrap TEXT, which is why `innerHTML` above shows `&lt;` and the
+        // query below finds nothing. (`code` is excluded on purpose: the viewer's own text
+        // column IS a `<code>` element, built by the viewer, not parsed out of the round.)
+        expect(pane.querySelectorAll('h1, h2, h3, p, ul, ol, li, strong, em, script')).toHaveLength(0);
+        // One logical line in, one row out (the gutter is CSS generated content, never text).
+        expect(pane.dataset.codeLines).toBe('1');
+        expect(pane.querySelectorAll('.code-line')).toHaveLength(1);
     });
 
     // (d) half 1: with no denominator there is no percentage. The pill claims nothing

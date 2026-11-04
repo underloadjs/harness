@@ -258,14 +258,16 @@ it('keeps the header neutral and the failure detail scoped when switching sessio
         id: 's1',
         status: 'error',
         lastError: FAILURE,
-        updatedAt: T + 200,
-        turns: [turn({ status: 'error', prompt: 'broken task', updatedAt: T + 200 })]
+        // T21 R21: a first load opens the newest conversation, and this test starts on
+        // the FAILED one — so s1 carries the newer of the two update stamps.
+        updatedAt: T + 300,
+        turns: [turn({ status: 'error', prompt: 'broken task', updatedAt: T + 300 })]
     });
     const healthy = snapshot({
         id: 's2',
         status: 'idle',
-        updatedAt: T + 300,
-        turns: [turn({ id: 't2', status: 'done', prompt: 'fine task', updatedAt: T + 300 })]
+        updatedAt: T + 200,
+        turns: [turn({ id: 't2', status: 'done', prompt: 'fine task', updatedAt: T + 200 })]
     });
 
     localStorage.setItem(SESSION_KEY, 's1');

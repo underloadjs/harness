@@ -262,6 +262,9 @@ it('runs a session-bound call in its own session and never adopts it into the ch
         tools: [coreTool('toolRequest', ['tags']), fileReadTool]
     });
     await boot();
+    // T21 R21: boot opened the reader's conversation, so the playground assertions below
+    // measure only the traffic that follows the first load.
+    const bootCalls = calls.length;
 
     // Boot selects the first harness, and the reader's conversation exists in the roster.
     expect(sessionPills()).toEqual([CHAT]);
@@ -287,17 +290,19 @@ it('runs a session-bound call in its own session and never adopts it into the ch
         body: { parameters: { tags: ['web'] }, sessionId: 'temp-1' }
     });
 
-    // No chat traffic at all: the runner re-read only its own temporary session, and the
-    // conversation was never opened or refreshed.
-    expect(byPrefix(calls, '/api/sessions/chat-1')).toEqual([]);
+    // No chat traffic from the playground: the runner re-read only its own temporary
+    // session. T21 R21 opened the reader's conversation ONCE during boot (it is the newest
+    // one alpha owns), so the assertion counts what happened after that.
+    expect(byPrefix(calls.slice(bootCalls), '/api/sessions/chat-1')).toEqual([]);
 
     // The temporary session is not a conversation: no row in the directory (the server's
-    // list answer literally contains it), and it is not the session this browser remembers.
+    // list answer literally contains it), and it is not the session this browser remembers
+    // — the pointer still names the conversation boot opened.
     // T9 removed the manual Refresh control, so the proof is the dashboard itself once the
     // tools view has handed the head back to the harness.
     await backToChat();
     expect(sessionPills()).toEqual([CHAT]);
-    expect(localStorage.getItem('underload-harness-app:session')).toBeNull();
+    expect(localStorage.getItem('underload-harness-app:session')).toBe(CHAT);
 
     // The scratch board stayed untouched: a playground call paints no panels anywhere.
     expect(document.querySelectorAll('.rail-right .panel')).toHaveLength(0);
@@ -458,6 +463,9 @@ it('calls a tool that needs no session directly, with no session traffic at all'
         tools: [coreTool('toolRequest', ['tags']), fileReadTool]
     });
     await boot();
+    // T21 R21: the first load opened the reader's conversation, so its one read is not
+    // playground traffic. Everything below measures what the tool call itself caused.
+    const bootCalls = calls.length;
 
     await openTool('read');
     argsBox().value = '["package.json"]';
@@ -473,7 +481,8 @@ it('calls a tool that needs no session directly, with no session traffic at all'
         body: { parameters: ['package.json'] }
     });
     expect(posts(calls, '/api/sessions', 'POST')).toHaveLength(0);
-    expect(byPrefix(calls, '/api/sessions/')).toEqual([]);
+    // No session read, refresh or create after the boot open: the runner borrowed nothing.
+    expect(byPrefix(calls.slice(bootCalls), '/api/sessions/')).toEqual([]);
 
     // The session line is hidden for a tool that needs no context.
     expect(document.querySelector<HTMLElement>('.tool-session')?.hidden).toBe(true);

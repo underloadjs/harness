@@ -110,4 +110,27 @@ it('places the thread identity left of the header measurements (R1)', () => {
     expect(badge).not.toContain('max-width');
     expect(badge).not.toContain('overflow: hidden');
     expect(badge).not.toContain('text-overflow');
+
+    // T5/R4: the badge is the agent's IDENTITY (`IT1`/`IT2`/`IT3`), so it is painted with
+    // the agent's hue — the same tone the tile outline and the nested `.thread-name`
+    // already carry. It used to read `var(--text-dim)`, and `--text-dim` is not defined in
+    // `:root` at all: an undefined custom property in a `color` declaration is invalid at
+    // computed-value time and falls back to INHERIT, so the "muted" badge was actually
+    // just borrowing an ancestor's colour by accident. Naming `--agent-color` makes that
+    // the documented contract instead of an undefined-token side effect.
+    expect(badge).toContain('color: var(--agent-color)');
+    // The rule must carry NO other `color` declaration, and in particular none that reads
+    // the undefined token. Matched as a DECLARATION (the pattern `.tile.is-expanded
+    // .tile-thread` below already uses), not as a substring: `blockOf` returns the rule
+    // with its comments, and the comment above explains that old token by NAME — a plain
+    // `not.toContain` would then fail on the documentation of the fix rather than on the
+    // thing being fixed.
+    expect(badge).not.toMatch(/(^|\n)\s*color\s*:[^;]*--text-dim/);
+
+    // The expanded header differs ONLY in alignment: the old `var(--text-muted)` override
+    // was a second undefined token, and dropping it keeps the identity readable in both
+    // header shapes.
+    const expanded = blockOf('.tile.is-expanded .tile-thread {');
+    expect(expanded).toContain('align-self: flex-start');
+    expect(/(^|\n)\s*color\s*:/.test(expanded)).toBe(false);
 });

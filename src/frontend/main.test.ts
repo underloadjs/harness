@@ -611,33 +611,6 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(tile.querySelector('.tile-index')).toBeNull();
     expect(tile.querySelector('.tile-status-text')?.textContent).toBe('done');
     expect(tile.querySelector('.turn-prompt')?.textContent).toBe('say hi\n');
-    console.warn(
-        '[boot probe]',
-        'tiles:',
-        document.querySelectorAll('.tile').length,
-        'turn-tiles:',
-        document.querySelectorAll('.turn-tile').length,
-        'turn-row:',
-        document.querySelectorAll('.turn-row').length,
-        'tile children classes:',
-        [...(tile.children ?? [])].map((n) => n.className).join(' | '),
-        'descendant classes:',
-        [...tile.querySelectorAll('*')].map((n) => n.className).filter(Boolean).slice(0, 30).join(' | '),
-        'connected:',
-        tile.isConnected,
-        'ancestors:',
-        (() => {
-            const chain: string[] = [];
-            let node: HTMLElement | null = tile;
-            while (node !== null && chain.length < 8) {
-                chain.push(node.tagName + '.' + String(node.className).replace(/\s+/g, '.'));
-                node = node.parentElement;
-            }
-            return chain.join(' < ');
-        })(),
-        'flow html:',
-        document.querySelector('.tile-flow')?.outerHTML.slice(0, 260).replace(/\s+/g, ' ')
-    );
     expect(tile.querySelector('.agent-text')?.innerHTML).toBe('<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n');
     // R5: the block footer no longer prints the model / stop reason line — those
     // figures are header facts (`.tile-top`, asserted below). The footer is the
@@ -670,8 +643,18 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     // R4: the server's startedAt/updatedAt and eventTimes decide the labels.
     expect(tile.querySelector('.tile-elapsed')?.textContent).toBe('3.6s');
-    expect(tile.querySelector('.tool-name')?.textContent).toBe('read');
-    expect(tile.querySelector('.tool-duration')?.textContent).toBe('0.8s');
+    // T11 (R7): the recorded call is ONE SEGMENT of this turn's context bar, not a card. Every
+    // figure the chip used to print is still on screen — the name, the settled state, the
+    // EXACT recorded characters (args 23 + result 11) and the recorded span (eventTimes
+    // T+200 -> T+1000) — and no `.tool` card is minted for it any more.
+    const callSegment = tile.querySelector<HTMLElement>('.context-bar-segment[data-kind="tool"]');
+
+    expect(tile.querySelectorAll('.tool')).toHaveLength(0);
+    expect(callSegment?.dataset.tone).toBe('ok');
+    expect(callSegment?.dataset.chars).toBe('34');
+    expect(callSegment?.dataset.durationMs).toBe('800');
+    expect(callSegment?.title).toContain('read · tool · ok · 34 characters · args 23 + result 11 · 800ms');
+    // The one lazy route this turn can cost is still click-only: nothing was fetched to paint.
     expect(tile.classList.contains('is-expanded')).toBe(true);
 
     // The terminal snapshot populated the directory and the remembered pointer. T9: the
@@ -1088,10 +1071,21 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(writes).toBe(0);
     expect(tileStates()).toEqual(['done', 'error']);
     expect(tileElapsed()).toEqual(['3.6s', '1.0s']);
-    // R4: recorded tool span from eventTimes (T+200 → T+1700).
-    expect(document.querySelector('.tool-duration')?.textContent).toBe('1.5s');
-    // The legacy call has no recorded duration.
-    expect(document.querySelectorAll('.tool-duration')[1]?.textContent).toBe('');
+    // T11 (R7): a recorded call's span travels on its segment now, from eventTimes
+    // (T+200 -> T+1700), because the bar is the surface that shows calls.
+    const tiles = Array.from(document.querySelectorAll<HTMLElement>('.tile'));
+    const timed = tiles[0].querySelector<HTMLElement>('.context-bar-segment[data-kind="tool"]');
+
+    expect(tiles[0].querySelectorAll('.tool')).toHaveLength(0);
+    expect(timed?.dataset.tone).toBe('ok');
+    expect(timed?.dataset.durationMs).toBe('1500');
+
+    // The legacy call has no recorded timing at all, so its segment states a duration for
+    // neither half rather than inventing one.
+    const legacyCall = tiles[1].querySelector<HTMLElement>('.context-bar-segment[data-kind="tool"]');
+
+    expect(legacyCall?.dataset.durationMs).toBe('');
+    expect(tiles[1].querySelectorAll('.tool')).toHaveLength(0);
     // No NaN anywhere, including legacy timing.
     expect(document.body.textContent ?? '').not.toContain('NaN');
 
@@ -1167,6 +1161,740 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(applyAction().textContent).toBe('Save configuration');
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(writes).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// T21 R21 + R22: the conversation a FIRST LOAD opens, and what is expanded
+// ---------------------------------------------------------------------------
+//
+// R21 (main.ts `recencyOf`/`latestSession`/`initialSession`, called by `boot`): the
+// app chooses a conversation exactly ONCE — when a harness is first loaded — and the
+// choice is the most recently used row of the harness on screen: the server's
+// `updatedAt`, then `createdAt`, then the directory's own order (the server lists its
+// sessions oldest first, so the later row is the newer conversation). A pointer saved
+// by an earlier visit never beats a newer conversation, and nothing picks again after
+// boot: a stream frame, a poll or a directory refresh cannot move the reader.
+//
+// R22 (main.ts `openSession` + `View.collapseForLoad`): a loaded conversation renders
+// with EVERY thread collapsed. The board's first-content rule opens the newest surface
+// while the document is applied (ui/turns.ts `reconcileView`'s `!hadTurns` /
+// `pendingFirstFocus` branches); the shell drops that expansion before anything can
+// read it as a focus choice. Only a click opens a thread, and after a click every
+// later frame keeps it open.
+
+// One persistent thread of a fixture conversation. The roster is what lets the
+// composer's routing line say `New thread` at all (a legacy session with no threads
+// shows no label), so R22's assertions need real rows.
+type DirectoryThread = {
+    id: string;
+    agent: string;
+    origin: 'host';
+    status: 'idle' | 'running' | 'stopped';
+    sequence: number;
+    label?: string;
+};
+
+// One recorded run of a fixture conversation. A settled turn carries its whole event
+// list so the compiled document paints a real answer; a running one stops at the
+// text delta, which is what keeps the session pending and the observer open.
+const selectionTurn = (
+    id: string,
+    index: number,
+    prompt: string,
+    threadId: string,
+    at: number,
+    status: 'done' | 'running' = 'done'
+): SessionTurn =>
+    ({
+        id,
+        index,
+        prompt,
+        status,
+        threadId,
+        startedAt: at,
+        updatedAt: at,
+        events:
+            status === 'done'
+                ? [
+                      { type: 'start', agent: 'instruct', model: 'm1' },
+                      { type: 'text', agent: 'instruct', delta: `answer to ${prompt}` },
+                      { type: 'done', agent: 'instruct', message: assistant() }
+                  ]
+                : [
+                      { type: 'start', agent: 'instruct', model: 'm1' },
+                      { type: 'text', agent: 'instruct', delta: `working on ${prompt}` }
+                  ]
+    }) as unknown as SessionTurn;
+
+// A directory row that is ALSO the document `GET /sessions/:id` answers with, so one
+// fixture drives both the pick (the row's stamps) and the render (its turns).
+const conversation = (
+    id: string,
+    usedAt: number,
+    options: {
+        harness?: string;
+        status?: 'idle' | 'running';
+        turns?: SessionTurn[];
+        threads?: DirectoryThread[];
+    } = {}
+): SessionSnapshot =>
+    ({
+        id,
+        harness: options.harness ?? 'instruct',
+        status: options.status ?? 'idle',
+        model: 'm1',
+        // A conversation created a while before its last use: `createdAt` only breaks a
+        // tie between identical `updatedAt` stamps, it never wins on its own.
+        createdAt: usedAt - 10_000,
+        updatedAt: usedAt,
+        messages: [],
+        turns: options.turns ?? [selectionTurn(`t-${id}`, 0, `task in ${id}`, `thread-${id}`, usedAt)],
+        ...(options.threads === undefined ? {} : { threads: options.threads })
+    }) as unknown as SessionSnapshot;
+
+// The whole server surface the selection tests need: the catalogue with its embedded
+// directory rows, the compact list route (the fallback the shell reads when the
+// catalogue carries none), ONE read per conversation, and an OPEN observer stream for
+// the conversation that is still working. `reads` is the evidence for "opened exactly
+// one conversation, and never a second time"; `emit` pushes a live frame into it.
+const selectionStub = (
+    rows: SessionSnapshot[],
+    // The catalogue's harness rows. Only the cross-harness resume needs a second one.
+    options: { presets?: HarnessDescriptor[] } = {}
+): { reads: string[]; emit: (item: unknown) => void } => {
+    const reads: string[] = [];
+    let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            const method = init?.method;
+
+            if (url === '/api') {
+                return json(
+                    bootstrap({
+                        sessions: rows,
+                        ...(options.presets === undefined ? {} : { presets: options.presets })
+                    })
+                );
+            }
+            if (url === '/api/models') return json({ models: ['m1'] });
+            if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
+
+            const events = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
+            if (events !== null && method === undefined) {
+                return new Response(
+                    new ReadableStream<Uint8Array>({
+                        start(next) {
+                            stream = next;
+                        }
+                    }),
+                    { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+                );
+            }
+
+            const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
+            if (read !== null && method === undefined) {
+                const record = rows.find((row) => row.id === read[1]);
+                if (record === undefined) return json({ error: { message: `unknown session ${read[1]}` } }, 404);
+
+                reads.push(read[1]);
+
+                return json({ session: record });
+            }
+
+            return undefined;
+        }))
+    );
+
+    return {
+        reads,
+        emit: (item: unknown): void => {
+            stream?.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
+        }
+    };
+};
+
+// The pills that say they ARE the conversation on screen (`data-active`), read through
+// the dashboard layer the strip lives in since T9.
+const activePillIds = (): (string | undefined)[] =>
+    readPills((bar) =>
+        [...bar.querySelectorAll<HTMLElement>('.session-pill-select')]
+            .filter((node) => node.dataset.active === 'true')
+            .map((node) => node.dataset.sessionId)
+    );
+
+// Every surface the board marks open. R22 is about ALL of them: the tile card, its
+// row wrapper, and the conversation group that owns the nested continuations.
+const expandedTiles = (): HTMLElement[] =>
+    [...document.querySelectorAll<HTMLElement>('.tile.is-expanded')];
+
+it('opens the most recently used conversation of the selected harness on a first load', async () => {
+    const older = conversation('s-old', T + 1_000);
+    const middle = conversation('s-mid', T + 3_000);
+    const newest = conversation('s-new', T + 5_000);
+
+    // Deliberately shuffled: the pick comes from the stamps, never from where a row
+    // happens to sit in the server's answer.
+    const stub = selectionStub([middle, newest, older]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Exactly one conversation read, and it is the newest one.
+    expect(stub.reads).toEqual(['s-new']);
+    // The pointer now names what the shell actually opened.
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-new');
+    // Every surface that names the conversation on screen agrees.
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-new');
+    expect(activePillIds()).toEqual(['s-new']);
+    expect(tileStates()).toEqual(['done']);
+    expect(document.querySelector('.agent-text')?.textContent).toBe('answer to task in s-new\n');
+});
+
+it('breaks an identical timestamp with the directory order, whose last row is the newest', async () => {
+    // The same instant to the millisecond, and the same creation stamp: the directory's
+    // own order is the remaining authority, and the server lists oldest first.
+    const first = conversation('s-first', T + 1_000);
+    const second = conversation('s-second', T + 1_000);
+
+    const stub = selectionStub([first, second]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['s-second']);
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-second');
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-second');
+});
+
+it('opens the newest conversation even when the browser remembers an older one', async () => {
+    const older = conversation('s-old', T + 1_000);
+    const newest = conversation('s-new', T + 5_000);
+
+    // A pointer from the last visit, still held by this server, but NOT the newest
+    // conversation: R21 puts latest-first ahead of it.
+    localStorage.setItem(SESSION_KEY, 's-old');
+
+    const stub = selectionStub([newest, older]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The remembered row is never even read, and the pointer moves to what is open.
+    expect(stub.reads).toEqual(['s-new']);
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-new');
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-new');
+});
+
+it('still resumes a saved conversation of another harness when the harness on screen has none', async () => {
+    const workspace = descriptor({
+        name: 'workspace',
+        title: 'Workspace',
+        agents: ['workspace'],
+        primary: 'workspace',
+        requiresEndpoint: false
+    });
+    const saved = conversation('s-ws', T + 1_000, { harness: 'workspace' });
+
+    localStorage.setItem(SESSION_KEY, 's-ws');
+
+    const stub = selectionStub([saved], { presets: [descriptor(), workspace] });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Instruct (the first catalogue entry) owns no conversation, so the saved pointer
+    // decides — the reload-where-you-left behaviour R21 does not take away.
+    expect(stub.reads).toEqual(['s-ws']);
+    expect(document.querySelector('.main-title')?.textContent).toBe('Workspace');
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-ws');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-ws');
+});
+
+it('never re-picks the conversation while the live stream keeps arriving', async () => {
+    const live = conversation('s-new', T + 5_000, {
+        status: 'running',
+        turns: [selectionTurn('ta', 0, 'running task', 'thread-ta', T + 5_000, 'running')]
+    });
+    const older = conversation('s-old', T + 1_000);
+
+    // A NEWER row than the one on screen, so a re-pick would be visible: the directory
+    // answers with `s-old` last, and only the boot decision may look at it.
+    const stub = selectionStub([live, older]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['s-new']);
+    expect(tileStates()).toEqual(['streaming']);
+
+    // A terminal frame lands: the turn settles, the selection does not move, and no
+    // second conversation is opened.
+    stub.emit({
+        type: 'snapshot',
+        session: conversation('s-new', T + 6_000, {
+            turns: [selectionTurn('ta', 0, 'running task', 'thread-ta', T + 6_000)]
+        })
+    });
+    await flush();
+    await flush();
+
+    expect(tileStates()).toEqual(['done']);
+    expect(stub.reads).toEqual(['s-new']);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-new');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-new');
+});
+
+it('loads a conversation with every thread collapsed and the composer on a new thread', async () => {
+    const threads: DirectoryThread[] = [
+        { id: 'thread-1', agent: 'instruct', origin: 'host', status: 'idle', sequence: 1, label: 'RR1' },
+        { id: 'thread-2', agent: 'instruct', origin: 'host', status: 'idle', sequence: 2, label: 'RR2' }
+    ];
+    const loaded = conversation('s1', T + 5_000, {
+        threads,
+        turns: [
+            selectionTurn('ta', 0, 'first task', 'thread-1', T + 1_000),
+            selectionTurn('tb', 1, 'second task', 'thread-1', T + 2_000),
+            selectionTurn('tc', 2, 'third task', 'thread-2', T + 3_000)
+        ]
+    });
+
+    const stub = selectionStub([loaded]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The conversation IS open — three settled rows, the pointer and the pill name it.
+    expect(stub.reads).toEqual(['s1']);
+    expect(document.querySelectorAll('.tile')).toHaveLength(3);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s1');
+
+    // Nothing is expanded, on ANY surface. Before R22 the newest tile (and its
+    // conversation group) opened by itself on every load.
+    expect(expandedTiles()).toEqual([]);
+    expect(document.querySelectorAll('.thread-row.is-expanded')).toHaveLength(0);
+    expect(document.querySelectorAll('.conversation.is-expanded')).toHaveLength(0);
+    expect(document.querySelectorAll('.tile-select[aria-expanded="true"]')).toHaveLength(0);
+    [...document.querySelectorAll<HTMLElement>('.tile-select')].forEach((control) =>
+        expect(control.getAttribute('aria-expanded')).toBe('false')
+    );
+
+    // The composer therefore routes the next message to a NEW thread: focus is the
+    // expanded conversation, and nothing is expanded.
+    const target = byClass('.composer-target', 'p');
+    expect(target.hidden).toBe(false);
+    expect(target.dataset.mode).toBe('new');
+    expect(target.textContent).toBe('New thread');
+});
+
+it('keeps the thread the reader expanded open across a later stream frame', async () => {
+    const threads: DirectoryThread[] = [
+        { id: 'thread-1', agent: 'instruct', origin: 'host', status: 'idle', sequence: 1, label: 'RR1' },
+        // The roster rows are what the routing line reads; the session-level `running`
+        // status below is what keeps the observer open for the frame.
+        { id: 'thread-2', agent: 'instruct', origin: 'host', status: 'idle', sequence: 2, label: 'RR2' }
+    ];
+    const turns = [
+        selectionTurn('ta', 0, 'first task', 'thread-1', T + 1_000),
+        selectionTurn('tb', 1, 'second task', 'thread-1', T + 2_000),
+        selectionTurn('tc', 2, 'third task', 'thread-2', T + 3_000, 'running')
+    ];
+    const loaded = conversation('s1', T + 5_000, { status: 'running', threads, turns });
+
+    const stub = selectionStub([loaded]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Fresh load: collapsed, and the reader has to choose.
+    expect(expandedTiles()).toEqual([]);
+
+    // The explicit choice: the newest conversation's card.
+    const tiles = [...document.querySelectorAll<HTMLElement>('.tile')];
+    const chosen = tiles[2];
+    chosen?.querySelector<HTMLButtonElement>('.tile-select')?.click();
+
+    expect(expandedTiles()).toEqual([chosen]);
+    expect(tiles[0]?.classList.contains('is-expanded')).toBe(false);
+    const target = byClass('.composer-target', 'p');
+    expect(target.dataset.mode).toBe('continue');
+    expect(target.textContent).toBe('Continuing RR2');
+
+    // A later authoritative frame: the same document, now settled. It must merge into
+    // the open card, not rebuild the focus decision.
+    stub.emit({
+        type: 'snapshot',
+        session: conversation('s1', T + 6_000, {
+            threads,
+            turns: [
+                selectionTurn('ta', 0, 'first task', 'thread-1', T + 1_000),
+                selectionTurn('tb', 1, 'second task', 'thread-1', T + 2_000),
+                selectionTurn('tc', 2, 'third task', 'thread-2', T + 6_000)
+            ]
+        })
+    });
+    await flush();
+    await flush();
+
+    // Exactly one surface is open, and it is STILL the card the reader clicked. The
+    // disclosure state rides the tile and its own `.tile-select`, and the steering
+    // target is still the conversation the reader chose.
+    expect(expandedTiles()).toEqual([chosen]);
+    expect(document.querySelectorAll('.tile-select[aria-expanded="true"]')).toHaveLength(1);
+    expect(chosen.querySelector('.tile-select')?.getAttribute('aria-expanded')).toBe('true');
+    expect(byClass('.composer-target', 'p').textContent).toBe('Continuing RR2');
+    expect(stub.reads).toEqual(['s1']);
+});
+
+// ---------------------------------------------------------------------------
+// T24: ENTERING a harness resolves ITS latest conversation
+// ---------------------------------------------------------------------------
+//
+// T21 R21 fixed only the app's first load. The user rule is "when first loaded a
+// harness, it should select the latest session", so every FIRST entry into a harness (a
+// rail row this visit has not resolved yet) resolves to that harness's most recently used
+// conversation, through the same `latestSession` authority and the same `openSession`
+// path (so T21 R22's collapse-on-load still renders nothing expanded). Guards:
+//   - a harness with a conversation bound, or one already resolved in this visit, or one
+//     the reader emptied with `+ New session`, is never re-picked — an explicit selection
+//     outlives polling, refreshes and switches;
+//   - a harness with NO conversations stays eligible (nothing was resolved), and
+//   - the record read is guarded, because the reader can be somewhere else entirely by the
+//     time a slow answer lands: rapid rail switching must never let the harness they left
+//     take the screen back.
+
+const workspaceHarness = (): HarnessDescriptor =>
+    descriptor({
+        name: 'workspace',
+        title: 'Workspace',
+        agents: ['workspace'],
+        primary: 'workspace',
+        requiresEndpoint: false
+    });
+
+const gammaHarness = (): HarnessDescriptor =>
+    descriptor({
+        name: 'gamma',
+        title: 'Gamma',
+        agents: ['gamma'],
+        primary: 'gamma',
+        requiresEndpoint: false
+    });
+
+// The multi-harness stub: the catalogue, the list route and one read per record, with
+// `hold` naming the record whose read stays unanswered until `release(id)` — the only way
+// to OBSERVE the rapid-switch race instead of tripping over it by accident.
+const enterStub = (
+    rows: SessionSnapshot[],
+    presets: HarnessDescriptor[],
+    hold: string[] = []
+): { reads: string[]; release: (id: string) => void } => {
+    const reads: string[] = [];
+    const waiters = new Map<string, (response: Response) => void>();
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            const method = init?.method;
+
+            if (url === '/api') return json(bootstrap({ presets, sessions: rows }));
+            if (url === '/api/models') return json({ models: ['m1'] });
+            if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
+
+            const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
+            if (read !== null && method === undefined) {
+                const id = decodeURIComponent(read[1]);
+                const record = rows.find((row) => row.id === id);
+                if (record === undefined) return json({ error: { message: `unknown session ${id}` } }, 404);
+
+                reads.push(id);
+
+                if (hold.includes(id)) {
+                    return await new Promise<Response>((resolve) => waiters.set(id, resolve));
+                }
+
+                return json({ session: record });
+            }
+
+            return undefined;
+        }))
+    );
+
+    return {
+        reads,
+        release: (id: string): void => {
+            const settle = waiters.get(id);
+            const record = rows.find((row) => row.id === id);
+            if (settle === undefined || record === undefined) {
+                throw new Error(`no held read for ${id}`);
+            }
+
+            waiters.delete(id);
+            settle(json({ session: record }));
+        }
+    };
+};
+
+it('opens the most recently used conversation of the harness the reader enters', async () => {
+    const instructRow = conversation('in-1', T + 2_000);
+    // Shuffled on purpose, and the newest row of the entered harness is NOT the last one
+    // listed: the pick comes from that harness's own stamps (T21 R21), never from position.
+    const rows = [
+        instructRow,
+        conversation('ws-mid', T + 5_000, { harness: 'workspace' }),
+        conversation('ws-new', T + 9_000, { harness: 'workspace' }),
+        conversation('ws-old', T + 1_000, { harness: 'workspace' })
+    ];
+
+    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Boot resolved the harness it landed on (T21 R21), and only that one.
+    expect(stub.reads).toEqual(['in-1']);
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+
+    // Exactly one extra read: the newest WORKSPACE conversation.
+    expect(stub.reads).toEqual(['in-1', 'ws-new']);
+    expect(document.querySelector('.main-title')?.textContent).toBe('Workspace');
+    expect(byClass('.harness-item[data-harness="workspace"]', 'button').getAttribute('aria-pressed')).toBe(
+        'true'
+    );
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('ws-new');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('ws-new');
+    expect(activePillIds()).toEqual(['ws-new']);
+    // T21 R22 is unchanged by an entry: the conversation opens, no thread expands.
+    expect(expandedTiles()).toEqual([]);
+});
+
+it('enters a harness with no conversations as an empty view and opens nothing', async () => {
+    const rows = [conversation('in-1', T + 2_000)];
+    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['in-1']);
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+
+    // The harness is selected, the centre column is the empty one, and no record was read
+    // for it: "latest session" of an empty directory is no session, not an error.
+    expect(stub.reads).toEqual(['in-1']);
+    expect(document.querySelector('.main-title')?.textContent).toBe('Workspace');
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+    expect(document.querySelector('.empty-text')?.textContent).toBe('Send a task below to start this harness.');
+    // The pointer still names the conversation last actually viewed.
+    expect(localStorage.getItem(SESSION_KEY)).toBe('in-1');
+
+    // And the harness stays ELIGIBLE: conversations that show up later are picked up by
+    // the next entry rather than leaving a permanently empty view.
+    expect(stub.reads).toEqual(['in-1']);
+});
+
+it('keeps the harness the reader switched to when the abandoned harness answers late', async () => {
+    const rows = [
+        conversation('in-1', T + 2_000),
+        conversation('ws-slow', T + 8_000, { harness: 'workspace' }),
+        conversation('gamma-1', T + 3_000, { harness: 'gamma' })
+    ];
+
+    // `ws-slow` is the newest workspace row, so entering workspace reads it — and that read
+    // is held while the reader moves on to gamma.
+    const stub = enterStub(rows, [descriptor(), workspaceHarness(), gammaHarness()], ['ws-slow']);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+
+    // The read is still in flight; the reader enters another harness, which resolves at
+    // once from its own newest row.
+    expect(stub.reads).toEqual(['in-1', 'ws-slow']);
+    byClass('.harness-item[data-harness="gamma"]', 'button').click();
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['in-1', 'ws-slow', 'gamma-1']);
+    expect(document.querySelector('.main-title')?.textContent).toBe('Gamma');
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('gamma-1');
+
+    // Now the abandoned answer lands. It must not select workspace, bind its conversation
+    // or move the pointer: the reader is on gamma.
+    stub.release('ws-slow');
+    await flush();
+    await flush();
+
+    expect(document.querySelector('.main-title')?.textContent).toBe('Gamma');
+    expect(byClass('.harness-item[data-harness="gamma"]', 'button').getAttribute('aria-pressed')).toBe(
+        'true'
+    );
+    expect(byClass('.harness-item[data-harness="workspace"]', 'button').getAttribute('aria-pressed')).toBe(
+        'false'
+    );
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('gamma-1');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('gamma-1');
+    expect(document.querySelector('.stage')?.textContent).not.toContain('task in ws-slow');
+});
+
+it('opens an entered conversation collapsed and keeps the reader expansion through a frame', async () => {
+    const threads: DirectoryThread[] = [
+        { id: 'thread-1', agent: 'instruct', origin: 'host', status: 'idle', sequence: 1, label: 'RR1' },
+        { id: 'thread-2', agent: 'instruct', origin: 'host', status: 'idle', sequence: 2, label: 'RR2' }
+    ];
+    const entered = conversation('ws-1', T + 5_000, {
+        harness: 'workspace',
+        status: 'running',
+        threads,
+        turns: [
+            selectionTurn('ta', 0, 'workspace first', 'thread-1', T + 1_000),
+            selectionTurn('tb', 1, 'workspace second', 'thread-2', T + 2_000, 'running')
+        ]
+    });
+
+    // instruct (the first catalogue entry) has no conversation at all, so boot opens
+    // nothing and the entry below is the first resolution workspace gets.
+    const stub = selectionStub([entered], { presets: [descriptor(), workspaceHarness()] });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['ws-1']);
+    // Every card collapsed on entry, and the composer offers a new thread.
+    expect(expandedTiles()).toEqual([]);
+    expect(byClass('.composer-target', 'p').dataset.mode).toBe('new');
+
+    // The reader opens one conversation, and that becomes the steering target.
+    const tiles = [...document.querySelectorAll<HTMLElement>('.tile')];
+    const chosen = tiles[1];
+    chosen?.querySelector<HTMLButtonElement>('.tile-select')?.click();
+    expect(expandedTiles()).toEqual([chosen]);
+    expect(byClass('.composer-target', 'p').textContent).toBe('Continuing RR2');
+
+    // The live document settles: the open card merges in place and stays open.
+    stub.emit({
+        type: 'snapshot',
+        session: conversation('ws-1', T + 6_000, {
+            harness: 'workspace',
+            threads,
+            turns: [
+                selectionTurn('ta', 0, 'workspace first', 'thread-1', T + 1_000),
+                selectionTurn('tb', 1, 'workspace second', 'thread-2', T + 6_000)
+            ]
+        })
+    });
+    await flush();
+    await flush();
+
+    expect(expandedTiles()).toEqual([chosen]);
+    expect(byClass('.composer-target', 'p').textContent).toBe('Continuing RR2');
+    expect(stub.reads).toEqual(['ws-1']);
+});
+
+it('keeps the conversation the reader chose when they leave a harness and come back', async () => {
+    const rows = [
+        conversation('ws-old', T + 1_000, { harness: 'workspace' }),
+        conversation('ws-new', T + 9_000, { harness: 'workspace' }),
+        conversation('in-1', T + 2_000)
+    ];
+
+    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Entry resolves workspace to its newest row…
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('ws-new');
+
+    // …then the reader picks another conversation of the same harness explicitly.
+    dashboard();
+    byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="ws-old"]', 'button').click();
+    await flush();
+    await flush();
+    expect(stub.reads).toEqual(['in-1', 'ws-new', 'ws-old']);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('ws-old');
+
+    // Away and back: instruct keeps its own bound conversation (no read), and workspace
+    // keeps the one the READER chose — the entry rule fires once per harness per visit.
+    byClass('.harness-item[data-harness="instruct"]', 'button').click();
+    await flush();
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('in-1');
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['in-1', 'ws-new', 'ws-old']);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('ws-old');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('ws-old');
+    expect(activePillIds()).toEqual(['ws-old']);
+});
+
+it('leaves a harness empty across a switch when the reader started a new session', async () => {
+    const rows = [conversation('in-1', T + 2_000), conversation('ws-1', T + 7_000, { harness: 'workspace' })];
+
+    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+    expect(stub.reads).toEqual(['in-1', 'ws-1']);
+
+    // `+ New session` is the explicit choice of an empty conversation.
+    byClass('.harness-title-row .new-session', 'button').click();
+    await flush();
+    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+
+    // Away and straight back: the empty composer is what the reader left, and the entry
+    // rule does not hand them a saved conversation instead.
+    byClass('.harness-item[data-harness="instruct"]', 'button').click();
+    await flush();
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('in-1');
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+    await flush();
+
+    expect(stub.reads).toEqual(['in-1', 'ws-1']);
+    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
 });
 
 it('creates a harness from preset agents with an initial primary', async () => {
@@ -2852,7 +3580,15 @@ it('deletes an inactive session on the first click, with no confirmation panel',
         events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
     };
     const current = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn] });
-    const other = snapshot({ id: 's2', harnessDefinition: descriptor() });
+    const other = snapshot({
+        id: 's2',
+        harnessDefinition: descriptor(),
+        // Older than `current` (whose stamps are the fixture defaults): T21 R21 opens
+        // the newest conversation on a first load, and this test's whole point is the
+        // pill of the conversation that is NOT on screen.
+        createdAt: 0,
+        updatedAt: 1
+    });
 
     localStorage.setItem(SESSION_KEY, 's1');
 
@@ -3234,7 +3970,15 @@ it('never resurrects a deleted session from a stale session-list answer', async 
             }
         ]
     });
-    const survivor = snapshot({ id: 's2', harnessDefinition: descriptor() });
+    const survivor = snapshot({
+        id: 's2',
+        harnessDefinition: descriptor(),
+        // Older than `deleted` (whose stamps are the fixture defaults): T21 R21 opens
+        // the newest conversation on a first load, and this test follows the
+        // conversation named in its pointer, s1.
+        createdAt: 0,
+        updatedAt: 1
+    });
 
     localStorage.setItem(SESSION_KEY, 's1');
 
@@ -3435,19 +4179,23 @@ it('keeps one session dashboard for the dialog across the phone breakpoint (desk
     const details = byClass('.harness-details', 'div');
     expect(dialog.getAttribute('aria-modal')).toBe('true');
 
-    // R3 (T9): the Sessions dashboard is part of this layer at EVERY width, so it is here
-    // first, painted from the directory the header no longer shows.
+    // R3 (T9): the Sessions dashboard is part of this layer at EVERY width, painted from
+    // the directory the header no longer shows. R3 (this pass): it is the LAST block, under
+    // a semantic `<hr>` that closes the harness's own details.
     expect(details.querySelector('.harness-details-section')?.textContent).toBe('Sessions');
     expect([...details.children].map((node) => node.className)).toEqual([
-        'harness-details-section',
-        'session-pills-bar session-pills-bar-dialog',
         'harness-details-description',
         // The aggregate totals ride the same projection, between the copy and the template
         // metadata line.
         'harness-details-stats',
         'harness-details-meta',
-        'harness-details-note'
+        'harness-details-note',
+        // R3 (this pass): the Sessions dashboard is the LAST block, under a semantic rule.
+        'harness-details-divider',
+        'harness-details-section',
+        'session-pills-bar session-pills-bar-dialog'
     ]);
+    expect(details.querySelectorAll('hr.harness-details-divider')).toHaveLength(1);
     // Two conversations, neither with a turn: the thread count is the only derivable
     // figure, and the token/time figures are absent because nothing was reported.
     expect(details.querySelector('.harness-details-stats')?.textContent).toBe('0 threads');
@@ -3456,7 +4204,9 @@ it('keeps one session dashboard for the dialog across the phone breakpoint (desk
     expect(
         [...bar.querySelectorAll<HTMLElement>('.session-pill')].map((node) => node.dataset.sessionId)
     ).toEqual(['s1', 's2']);
-    expect(bar.querySelector('.new-session')?.textContent).toBe('+');
+    // R3: the dashboard has no create control; the header's `+` is the only one.
+    expect(bar.querySelector('.new-session')).toBeNull();
+    expect(document.querySelectorAll('.new-session')).toHaveLength(1);
     expect(bar.querySelector('.refresh-sessions')).toBeNull();
     // Only ONE strip in the page — the dialog's. T9 deleted the header copy rather than
     // hiding it, so there is nothing to keep in sync across a resize.
@@ -3518,6 +4268,11 @@ it('opens the session dashboard from the tools-view title at a desktop width, de
     const second = snapshot({
         id: 's2',
         harnessDefinition: descriptor(),
+        // Older than `first` (whose stamps are the fixture defaults): T21 R21 opens the
+        // newest conversation on a first load, and this test drives the dashboard from
+        // the conversation its pointer names, s1.
+        createdAt: 0,
+        updatedAt: 1,
         turns: [
             {
                 id: 't-second',
@@ -3577,7 +4332,8 @@ it('opens the session dashboard from the tools-view title at a desktop width, de
     ]);
     expect(bar.querySelector('.session-pill[data-session-id="s1"]')?.dataset.active).toBe('true');
     expect(bar.querySelectorAll('.session-pill-delete')).toHaveLength(2);
-    expect(byClass('.session-pills-bar-dialog .new-session', 'button').textContent).toBe('+');
+    // R3: no create affordance in the tools-view dashboard either.
+    expect(document.querySelector('.session-pills-bar-dialog .new-session')).toBeNull();
 
     // Deleting here is the same one-click DELETE, and the tools view underneath is not
     // disturbed: no navigation, no chat repaint, the catalogue is still the stage.

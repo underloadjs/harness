@@ -317,7 +317,13 @@ it('deletes the selected harness after the second press and reselects another on
     // Reselect sensibly: the remaining production harness is now the selected one.
     expect(pressedHarnesses()).toEqual(['beta']);
     expect(document.querySelector('.main-title')?.textContent).toBe('Beta');
-    expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    // T24: reselecting IS entering, and entering a harness resolves its most recently used
+    // conversation. beta holds `chat-b`, so the centre column now shows that saved
+    // conversation — which is exactly why the editable-harness note is gone (a saved
+    // session prints no note at all) and why the header cycler names an id.
+    expect(document.querySelector<HTMLElement>('.session-cycle')?.dataset.sessionId).toBe('chat-b');
+    expect(document.querySelector('.harness-note')?.textContent).toBe('');
+    expect(document.querySelector('.harness-note')?.hidden).toBe(true);
     expect(selectFor('beta').disabled).toBe(false);
 
     // R6: a harness delete never removes conversations. Only the harness route was hit.
@@ -585,12 +591,20 @@ it('keeps a deleted harness session reachable as an archived pill and reopens it
     expect(select?.textContent).toBe('chat-a');
     expect(select?.title).toBe('alpha · idle · chat-a');
 
-    // Opening it is the normal path: one GET of the record, nothing else.
+    // Opening it is the normal path: one GET of the record, nothing else. The count is
+    // taken from here because T21 R21 already opened this conversation on the first load
+    // (alpha was the harness on screen) — the point of the assertion is that the REOPEN
+    // after the delete costs exactly one read.
+    const readsBefore = calls.filter(
+        (call) => call.url === '/api/sessions/chat-a' && call.method === undefined
+    ).length;
     pill?.querySelector<HTMLButtonElement>('.session-pill-select')?.click();
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.url === '/api/sessions/chat-a' && call.method === undefined)).toHaveLength(1);
+    expect(
+        calls.filter((call) => call.url === '/api/sessions/chat-a' && call.method === undefined)
+    ).toHaveLength(readsBefore + 1);
 
     // The chat renders the FROZEN definition, and says what the harness no longer is.
     expect(document.querySelector('.main-title')?.textContent).toBe('Alpha (frozen)');

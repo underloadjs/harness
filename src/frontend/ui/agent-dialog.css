@@ -143,12 +143,15 @@
     background: var(--bg-input);
 }
 
+/* R4: the picker option is painted with the tone the badge gets once it joins, so
+   "add Reviewer" is the same colour before and after the add (ui/agent-dialog.ts
+   `paintAgentColor`). The hover accent stays: it is the press feedback, not identity. */
 .agent-dialog-add-option {
     padding: 5px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-elevated);
-    color: var(--text);
+    color: var(--agent-color);
     font: inherit;
     font-size: 12px;
     text-align: left;
@@ -260,8 +263,16 @@
     border-color: var(--accent);
 }
 
+/* T5/R4: the badge's name is the agent's IDENTITY, so it carries the agent's hue.
+   ui/agent-dialog.ts `paintAgentColor` sets `--agent-color` on the badge itself, and
+   custom properties inherit, so this rule needs no per-span paint and a rebuild
+   re-reads the same page-lifetime tone. The badge's own frame stays `--border`, and
+   `--accent` stays reserved for selection (`[aria-selected='true']`) and activity
+   (`[data-activity='active']`) — identity colour and state colour are two different
+   facts and must stay readable as such. The role/model captions stay `--muted`: they
+   are facts about the agent, not the agent. */
 .agent-dialog-agent-name {
-    color: var(--text);
+    color: var(--agent-color);
 }
 
 .agent-dialog-agent-role,

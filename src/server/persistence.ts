@@ -56,6 +56,12 @@ import type {
 import type { HarnessDescriptor, SessionStatus, SessionTurn } from './protocol';
 import { validateAttachments } from '../shared/attachments';
 import { agentLabelParts, readAgentResultReferenceList } from '../shared/agent-results';
+// The durable per-turn instruction snapshot (see
+// `HarnessSessionRecord.turnInstructionSources` below) reuses the SHARED display
+// contract type, so the value written to disk, the value the projector reads back, and
+// the `system` context block it produces are one definition, not three shapes that have
+// to agree.
+import type { TurnInstructionSource } from '../shared/turn-display';
 
 // Bumped only when the on-disk document becomes incompatible. The core snapshot
 // carries its own version (HARNESS_SNAPSHOT_VERSION); this one gates the
@@ -159,6 +165,22 @@ export type HarnessSessionRecord = {
     // This is the join the snapshot roster exposes as originInvocationId; it lives
     // beside the turns so a restart keeps the mapping.
     turnInvocations?: Record<string, string>;
+    // T9 (ADDITIVE, declared with the display contract; the store writes and reads it
+    // in the projector pass): the system-instruction text each turn's agents ACTUALLY
+    // ran with, keyed by turn id, one entry per agent (`TurnInstructionSource`).
+    //
+    // Why it has to be durable here rather than derived on read: the context bar's
+    // `system` block counts the instruction characters (R6), and the only other places
+    // that text exists are live (`Agent.instructions`) or the CURRENT snapshot
+    // transcript — both of which move when an instruction is edited or a transcript is
+    // rewritten. Freezing the source with the turn is what keeps a recorded count from
+    // silently changing under a restart, and it is what lets the block detail route
+    // answer with the exact bytes a historical turn ran with.
+    //
+    // Optional by design: absent means no recorded source (every document written
+    // before T9), and the fold then emits NO system block for that agent — the loader
+    // must never reconstruct one from the live catalogue.
+    turnInstructionSources?: Record<string, TurnInstructionSource[]>;
     // Every invocation observed in a persistent conversation (invocation id → thread
     // id). Needed so a delete after a restart purges exactly the agent-result records
     // the runtime removes — including a child conversation's EARLIER runs, which its
@@ -492,8 +514,60 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
         ...(usage === undefined ? {} : { usage }),
         ...(record.steers === undefined
             ? {}
-            : { steers: readSteerRecords(record.steers, `${label}.steers`) })
+            : { steers: readSteerRecords(record.steers, `${label}.steers`) }),
+        // T14: the per-turn steer TEXT archive. Validated (not passed through) because it
+        // is what the context bar's lazy detail route answers a click with: a corrupt entry
+        // would surface as a segment that opens with nothing in it.
+        ...(record.steerTexts === undefined
+            ? {}
+            : { steerTexts: readSteerTexts(record.steerTexts, `${label}.steerTexts`) })
     };
+};
+
+// Deliberately UNBOUNDED (T15). The archive holds the text the USER submitted, and a submit
+// the server accepted is data, not cache: dropping one to keep a document small would lose a
+// fact the conversation already contains. Its size is bounded at the source instead — one
+// entry per accepted steer, and steering is only possible while a thread runs (the runtime
+// drains the queue at the next safe boundary), each submit already capped by
+// ../server/sessions.ts `MAX_INPUT_LENGTH` (200,000 characters) exactly like any other turn
+// prompt. `turn.events` is unbounded on the same reasoning; the 64-entry cap above belongs to
+// the AUDIT ring (a rolling operational record), not to this archive. The reader therefore
+// validates every ENTRY (below) and refuses no length.
+const readSteerTexts = (value: unknown, label: string): SessionTurn['steerTexts'] => {
+    if (!Array.isArray(value)) throw new TypeError(`${label} must be an array.`);
+
+    return value.map((entry, index) => {
+        const itemLabel = `${label}[${index}]`;
+        const item = requireRecord(entry, itemLabel);
+
+        // The identity is mandatory here (unlike the audit ring, where an older record may
+        // predate it): the archive is addressed BY that id, and a blank key would make the
+        // entry unreachable by the very route that reads it.
+        const id = requireString(item.id, `${itemLabel}.id`);
+
+        if (id.trim().length === 0) {
+            throw new TypeError(`${itemLabel}.id must not be blank.`);
+        }
+
+        const threadId =
+            item.threadId === undefined
+                ? undefined
+                : (() => {
+                      const text = requireString(item.threadId, `${itemLabel}.threadId`);
+                      if (text.trim().length === 0) {
+                          throw new TypeError(`${itemLabel}.threadId must not be blank.`);
+                      }
+
+                      return text;
+                  })();
+
+        return {
+            id,
+            at: requireNumber(item.at, `${itemLabel}.at`),
+            prompt: requireString(item.prompt, `${itemLabel}.prompt`),
+            ...(threadId === undefined ? {} : { threadId })
+        };
+    });
 };
 
 // Optional `{ key: number }` map used by the label-seed record. Values are
@@ -524,6 +598,42 @@ const readStringMap = (value: unknown, label: string): Record<string, string> =>
 
     for (const [key, entry] of Object.entries(record)) {
         mapped[key] = requireString(entry, `${label}.${key}`);
+    }
+
+    return mapped;
+};
+
+// Optional `turnId -> instruction snapshots` map (T9/T10, see `HarnessSessionRecord
+// .turnInstructionSources`). Validated entry by entry rather than passed through: the
+// fold COUNTS these strings to produce the context bar's `system` segment, so a
+// non-string entry would silently mis-count characters instead of failing the load,
+// and an empty `instructions` list is a legitimate value ("this agent ran with no
+// system message") that must survive as an empty list, not collapse to absent.
+const readInstructionSources = (value: unknown, label: string): Record<string, TurnInstructionSource[]> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, TurnInstructionSource[]> = {};
+
+    for (const [turnId, entry] of Object.entries(record)) {
+        const itemLabel = `${label}.${turnId}`;
+
+        if (!Array.isArray(entry)) throw new TypeError(`${itemLabel} must be an array of instruction sources.`);
+
+        mapped[turnId] = entry.map((raw, index) => {
+            const itemLabelWithIndex = `${itemLabel}[${index}]`;
+            const item = requireRecord(raw, itemLabelWithIndex);
+
+            if (!Array.isArray(item.instructions)) {
+                throw new TypeError(`${itemLabelWithIndex}.instructions must be an array of instruction strings.`);
+            }
+
+            return {
+                agent: requireString(item.agent, `${itemLabelWithIndex}.agent`),
+                instructions: item.instructions.map((text, position) =>
+                    requireString(text, `${itemLabelWithIndex}.instructions[${position}]`)
+                ),
+                ...(item.at === undefined ? {} : { at: requireNumber(item.at, `${itemLabelWithIndex}.at`) })
+            };
+        });
     }
 
     return mapped;
@@ -600,7 +710,24 @@ const readSteerRecords = (value: unknown, label: string): SessionTurn['steers'] 
                       return value;
                   })();
 
+        // T13: the submit's durable identity. OPTIONAL — a document written before the
+        // field existed has no key, and the fold derives one for it — but when it is there
+        // it must survive the load, because the context bar keys its segment from it and a
+        // dropped id would renumber every steer segment of a restored turn.
+        const id =
+            record.id === undefined
+                ? undefined
+                : (() => {
+                      const value = requireString(record.id, `${at}.id`);
+                      if (value.trim().length === 0) {
+                          throw new TypeError(`${at}.id must not be blank.`);
+                      }
+
+                      return value;
+                  })();
+
         return {
+            ...(id === undefined ? {} : { id }),
             at: requireNumber(record.at, `${at}.at`),
             prompt: requireString(record.prompt, `${at}.prompt`),
             ...(threadId === undefined ? {} : { threadId }),
@@ -701,6 +828,13 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
             ? undefined
             : readStringMap(record.turnInvocations, `${label}.turnInvocations`);
 
+    // T9/T10: an absent field stays absent through a round trip (a pre-T10 document is
+    // byte-identical after a load+save), and a present one is re-validated on read.
+    const turnInstructionSources =
+        record.turnInstructionSources === undefined
+            ? undefined
+            : readInstructionSources(record.turnInstructionSources, `${label}.turnInstructionSources`);
+
     const labelHighWater =
         record.labelHighWater === undefined
             ? undefined
@@ -781,6 +915,7 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         ...(threadLabels === undefined ? {} : { threadLabels }),
         ...(threadLabelHighWater === undefined ? {} : { threadLabelHighWater }),
         ...(turnInvocations === undefined ? {} : { turnInvocations }),
+        ...(turnInstructionSources === undefined ? {} : { turnInstructionSources }),
         ...(invocationThreads === undefined ? {} : { invocationThreads }),
         ...(invalidThreads === undefined ? {} : { invalidThreads }),
         core: core as unknown as HarnessSnapshot,

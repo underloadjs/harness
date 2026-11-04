@@ -33,14 +33,24 @@
 // surfaced as the tooltip and inside the dialog instead of pretending the button is
 // unavailable.
 //
+// IDENTITY COLOUR (T5/R4): the wrapper is painted through ui/agent-color.ts, so the
+// composer's agent name (`Instruct`) and its compact code (`IT`) carry the SAME tone as
+// that agent's transcript blocks and its dialog badge. Painting the WRAPPER rather than
+// the label is deliberate: custom properties inherit, so one call covers the name, the
+// code and the activity frame, and `data-agent` lands on the host ui/activity.ts
+// selects. styles.css keeps the accent colour reserved for hover/activity, so the
+// identity colour never has to compete with a state colour for the same property.
+//
 // Cross-references:
 //   - src/frontend/main.ts          builds the control + opens the dialog
+//   - src/frontend/ui/agent-color.ts paintAgentColor (the identity tone of this button)
 //   - src/frontend/ui/agent-dialog.ts  the modal content (deck + instructions)
 //   - src/frontend/ui/agents.ts     createAgentRow / createAgentModelSelect
 //   - src/frontend/ui/agent-label.ts agentCodeOf (shared threading code)
 //   - src/frontend/styles.css       `.agent-control*`, `.composer-controls`
 
 import type { AgentDescriptor } from '../../server/protocol';
+import { paintAgentColor } from './agent-color';
 import { agentCodeOf } from './agent-label';
 
 // The component is a handle (not only its node) so the shell can restore focus to
@@ -91,7 +101,17 @@ export const createAgentControl = (options: AgentControlOptions): AgentControl =
     // ui/activity.ts paints its ring through exactly this selector, and styles.css
     // owns the compact shape.
     const wrapper = el('div', 'agent-control');
-    wrapper.dataset.agent = options.primary;
+    // R4 (T5): ONE paint sets the identity tone for the whole control — the name, the
+    // compact code and the frame the activity ring draws — and writes `data-agent`,
+    // the attribute ui/activity.ts `paintActivity` selects on. Custom properties
+    // inherit, so the two labels need no paint of their own and a chrome rebuild
+    // cannot desynchronise them.
+    //
+    // The id stored here is the CANONICAL one (trimmed). The previous raw write only
+    // ever mattered for a padded id, and a padded `data-agent` could not match the
+    // server's activity names anyway; a blank/`unknown` primary now carries no identity
+    // attribute at all, exactly like the transcript's unattributable tiles.
+    paintAgentColor(wrapper, options.primary);
 
     const title = titleOf(options.agents, options.primary);
 

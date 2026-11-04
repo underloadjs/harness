@@ -60,6 +60,14 @@
 //   byte-identical to the payload. The rules are scoped to `.tool-code`, so Markdown
 //   fences keep their existing sideways-scroll behaviour.
 //
+// R1 (payload views) — that viewer is the app's ONE payload surface. Every dialog that
+//   shows a recorded payload (a think round, a context-bar segment, a thread transcript,
+//   the manual tool runner's response box, a file preview) renders through
+//   `createCodeBlock`/`createPayloadViewer`, so wrapping, the gutter and the byte-exact
+//   text are the same everywhere and no surface re-invents a `pre` with its own cascade
+//   fight. Media (an image), prose notes and FORMS (the argument textarea, the
+//   transcript editor) are not payloads and keep their own controls.
+//
 // FILE LINKS (R11/R12): the argument/result code blocks are the same readable
 // surfaces a user inspects in the modal, so local paths inside them use the SAME
 // `enhanceFileLinks` transform as transcript prose. The transform is applied to the
@@ -85,7 +93,9 @@
 //   requested word, not `reasoning`), is painted amber, and its pill shows the share of
 //   the block's accumulated CONTEXT the round occupies — not a character count, because
 //   what matters is how much context the thinking is using. Its whole text is readable in
-//   the dialog with its own per-pane Copy. See the section above `THINK_LABEL`.
+//   the dialog with its own per-pane Copy, in the SAME line-numbered, soft-wrapped payload
+//   viewer a tool pane uses (`createPayloadViewer`, carried on the `.reasoning` node).
+//   See the section above `THINK_LABEL`.
 //
 // Cross-references:
 //   - created by: src/frontend/ui/turns.ts (per-agent flow)
@@ -478,6 +488,11 @@ const COPY_THINK_LABEL = 'Copy thinking';
 // `code-block tool-code` className of a pane).
 export const TOOL_CODE_CLASS = 'tool-code';
 
+// The class hook of the think chip's payload pane. It is the SAME node the transcript
+// reads (`.tool.think .reasoning`) and the node styles.css sizes inside the dialog, so
+// the viewer carries it and gains the wrap through `createPayloadViewer`.
+export const REASONING_VIEWER_CLASS = 'reasoning';
+
 // `openFile` is supplied only for the tool dialog's argument/result blocks. The
 // transform runs on a detached highlighter host first (never inside `pre`/`code`,
 // which `file-links.ts` deliberately treats as literal), then the SAME highlight
@@ -491,19 +506,30 @@ export const TOOL_CODE_CLASS = 'tool-code';
 // the line-number gutter.
 //
 // `viewerClass` selects a DIFFERENT scoping class over the same line machinery, which
-// is how the file-preview dialog reuses this builder without inheriting the tool
-// pane's soft wrap: it passes `preview-code`, and `ui/dialog.css` gives that class the
-// no-wrap, sticky-gutter editor layout. The row/break/highlight contract (and
-// therefore `code.textContent`) is identical for every flavour, which is exactly why
-// this is one builder rather than two.
-export const createCodeBlock = (
+// is how the file-preview dialog reuses this builder with its OWN counter start: it
+// passes `preview-code`, and `ui/dialog.css` gives that class the same SOFT WRAP R1 asks
+// for on every payload surface (only the numbering origin differs). The row/break/
+// highlight contract (and therefore `code.textContent`) is identical for every flavour,
+// which is exactly why this is one builder rather than two — and the same reason a
+// repaint re-uses it (see `paintCodeBlock`).
+//
+// The ONE builder behind every payload viewer: it lays `code` out inside `host` as one
+// `.code-line` row per logical line. `createCodeBlock` calls it on a fresh `<pre>`, and
+// `paintCodeBlock` calls it on a host that already exists — one row builder, one gutter
+// rule and one text contract for both, never two cascades that could drift apart.
+//
+// `viewerClass` re-stamps the flavour ONLY when it is given: a repaint of a live surface
+// passes `undefined` and keeps the class list it was created with, because that list is
+// where the wrap, the flex chain, the height cap and the focus ring of the surface live
+// (`createPayloadViewer` composes it from the host class plus `TOOL_CODE_CLASS`).
+const paintCodeBlockInto = (
+    host: HTMLElement,
     code: string,
     language: string | undefined,
-    openFile?: (path: string) => void,
-    viewerClass: string = TOOL_CODE_CLASS
+    openFile: ((path: string) => void) | undefined,
+    viewerClass?: string
 ): HTMLElement => {
-    const pre = document.createElement('pre');
-    pre.className = `code-block ${viewerClass}`;
+    if (viewerClass !== undefined) host.className = `code-block ${viewerClass}`;
 
     const block = document.createElement('code');
     block.className = language === undefined ? 'hljs' : `hljs language-${language}`;
@@ -547,14 +573,64 @@ export const createCodeBlock = (
     // for both the number column and the text indent.
     const digits = Math.max(MIN_GUTTER_DIGITS, String(rows.length).length);
     block.style.setProperty('--code-gutter', `${digits}ch`);
-    // The logical line count, for the stylesheet contract and for a test that wants
-    // to prove a soft-wrapped payload is still numbered once per source line.
-    pre.dataset.codeLines = String(rows.length);
 
-    pre.append(block);
+    // ONE child, always: the host owns the frame, the `<code>` owns the text column.
+    host.replaceChildren(block);
+    // The logical line count, for the stylesheet contract and for a test that wants to
+    // prove a soft-wrapped payload is still numbered once per source line.
+    host.dataset.codeLines = String(rows.length);
 
-    return pre;
+    return host;
 };
+
+export const createCodeBlock = (
+    code: string,
+    language: string | undefined,
+    openFile?: (path: string) => void,
+    viewerClass: string = TOOL_CODE_CLASS
+): HTMLElement =>
+    paintCodeBlockInto(document.createElement('pre'), code, language, openFile, viewerClass);
+
+// Every DIALOG PAYLOAD SURFACE that is not a tool pane is THIS builder plus its own
+// scoping class (R1: one editor-style, soft-wrapped payload view everywhere).
+//
+// `hostClass` is the class the surface is already addressed by — its flex chain in
+// styles.css (`.thread-transcript-json`, `.card-body`, `.block-detail-text`), its focus
+// ring, its height cap — and `TOOL_CODE_CLASS` is appended so the pane's soft-wrap and
+// gutter rules apply ON TOP of it. Both classes end up on ONE <pre>
+// (`code-block <hostClass> tool-code`), which is what breaks the `.dialog-body pre`
+// cascade trap: that shell rule is `pre` + one class (0,1,1) and sets `white-space: pre`,
+// so a single-class payload surface loses its wrap to it (the defect this removes), while
+// `.tool-code.code-block` (0,2,0) wins and keeps the wrap without touching styles.css.
+//
+// Nothing else changes for a consumer: `pre.textContent` (and therefore the Copy
+// payload, and every test that reads the surface) stays byte-identical to the code, and
+// the line numbers are CSS generated content.
+export const createPayloadViewer = (
+    code: string,
+    language: string | undefined,
+    hostClass: string,
+    openFile?: (path: string) => void
+): HTMLElement => createCodeBlock(code, language, openFile, `${hostClass} ${TOOL_CODE_CLASS}`);
+
+// Re-paint an EXISTING viewer host with a new payload, in place (R2: the surface stays
+// the same node). The row set is derived from the payload's own newlines, so a repaint
+// has to rebuild the rows — but it must NOT rebuild the `<pre>`: consumers hold the box
+// they rendered (the playground's response box is read through the node captured before
+// the call, scratch-board.test.ts / playground-context.test.ts), a repaint that swaps the
+// host would leave that reference pointing at a detached node, and its `textContent`
+// would keep answering with the stale prompt. Only the `<code>` column is replaced, and
+// the host keeps its class list (which is where the wrap, the flex chain and the focus
+// ring live), its `data-language` and every other attribute a consumer set on it.
+//
+// `textContent` of the host is again byte-identical to `code`, and `data-code-lines` is
+// refreshed from the new row count, so the stylesheet contract holds after a repaint.
+export const paintCodeBlock = (
+    host: HTMLElement,
+    code: string,
+    language: string | undefined,
+    openFile?: (path: string) => void
+): HTMLElement => paintCodeBlockInto(host, code, language, openFile);
 
 export const createToolCallCard = (
     name: string,
@@ -659,30 +735,40 @@ export const createToolCallCard = (
     const argsHeading = createPaneHeading(argsLabel, COPY_ARGUMENTS_LABEL, () => argumentsText);
     argsSection.append(argsHeading, argsCode);
 
-    // Replace the arguments code block IN PLACE (heading node untouched, same parent,
-    // same position). The lazy detail repaints this pane exactly once, and the DOM
-    // shape stays `section.tool-section > (.tool-label + code block)` for styles.css
-    // and for every existing selector.
+    // Replace the arguments code block with the new view of the same payload (heading
+    // node untouched, same parent, same position). The lazy detail repaints this pane
+    // exactly once, and the DOM shape stays
+    // `section.tool-section > (.tool-heading(.tool-label + .tool-copy) + code block)` for
+    // styles.css and for every existing selector.
+    //
+    // It REBUILDS the section rather than swapping one child in: the loading/failure note
+    // path below writes this section with `replaceChildren`, which detaches the code view.
+    // Assuming `argsCode` was still a child would make a SUCCESSFUL detail load throw here
+    // (`replaceChild` on a non-child), and the pane would report a phantom failure instead
+    // of the recorded arguments — the one R2 affordance this code exists for.
     const renderArguments = (value: string): void => {
-        const next = createCodeBlock(
+        argsCode = createCodeBlock(
             prettyJson(value),
             looksLikeJson(value) ? 'json' : undefined,
             openFile
         );
 
-        argsSection.replaceChild(next, argsCode);
-        argsCode = next;
+        argsSection.replaceChildren(argsHeading, argsCode);
     };
 
-    // A neutral in-pane note (loading / failure). `data-detail` lets the styling and
-    // the tests name the state without scraping text out of the DOM.
+    // A neutral in-pane note (loading / failure). `data-detail` lets the styling and the
+    // tests name the state without scraping text out of the DOM. The heading — the pane's
+    // label and its own Copy control — STAYS: a note replaces the payload view, not the
+    // pane's identity, and the copy affordance still hands over the preview that remains
+    // on screen. It also keeps `argsLabel` inside its heading, which is what lets
+    // `renderArguments` rebuild the section without re-parenting the label.
     const renderArgumentsNote = (text: string, state: 'loading' | 'error'): HTMLElement => {
         const note = document.createElement('p');
         note.className = 'tool-pending';
         note.dataset.detail = state;
         note.textContent = text;
 
-        argsSection.replaceChildren(argsLabel, note);
+        argsSection.replaceChildren(argsHeading, note);
 
         return note;
     };
@@ -1217,6 +1303,11 @@ export type ReasoningCard = {
     // because the server owns the token arithmetic and its figure is the one the
     // block's header tally prints. `undefined` restores the local estimate.
     setShare: (percent: number | undefined) => void;
+    // Display-wire path: paint the EXACT recorded length of this round
+    // (`DisplayReasoningNode.chars`). The chip prints this figure — its `text` is a
+    // bounded preview once the window passes `DISPLAY_NODE_PREVIEW_CHARS`, so measuring
+    // the text would understate the round. `undefined` restores the local measurement.
+    setChars: (characters: number | undefined) => void;
     // The text currently held (the dialog's Copy button reads it at CLICK time, so it is
     // always the whole round, never a streaming prefix of it).
     text: () => string;
@@ -1271,12 +1362,25 @@ export const createReasoningCard = (): ReasoningCard => {
     // R1 display wire: a share the server computed. When present it is the figure —
     // the local character estimate is the raw-path fallback, never a override.
     let serverShare: number | undefined;
+    // T13 display wire: the EXACT recorded length of this round (`DisplayReasoningNode
+    // .chars`, ../shared/turn-display.ts:684). A compiled think window is BOUNDED on the
+    // wire, so measuring `current` after the cap would print the preview's length (320)
+    // instead of the round's real one. The raw-event path never sets this, and there
+    // `current` IS the whole round, so its length stays the honest figure.
+    let recordedChars: number | undefined;
+
+    // The one character figure every surface of this chip prints: the server's exact
+    // count when it sent one, the held text's length otherwise.
+    const charCount = (): number =>
+        typeof recordedChars === 'number' && Number.isFinite(recordedChars)
+            ? Math.trunc(Math.max(recordedChars, 0))
+            : current.length;
 
     // The one share this card reports: the server's figure when it sent one,
     // otherwise the local estimate against the block's context.
     const shareOf = (): string =>
         serverShare === undefined
-            ? formatThinkShare(current.length, contextTokens)
+            ? formatThinkShare(charCount(), contextTokens)
             : formatServerThinkShare(serverShare);
 
     const section = document.createElement('section');
@@ -1284,12 +1388,30 @@ export const createReasoningCard = (): ReasoningCard => {
     const heading = document.createElement('div');
     heading.className = 'tool-label';
     heading.textContent = THINK_LABEL;
-    // `.reasoning` keeps its class (and its plain-text scroll box) so the transcript's
-    // long thinking text stays readable in the modal exactly as it was in the block.
-    const textHost = document.createElement('div');
-    textHost.className = 'reasoning';
+
+    // R1 (dialog payload views): the round is a PAYLOAD, so it gets the same
+    // line-numbered, soft-wrapped viewer as a tool pane, inside the modal this chip's
+    // body only ever renders in (the `<details>` never opens inline). `.reasoning` keeps
+    // the node's identity as a class hook: styles.css sizes this pane through
+    // `.dialog-body > .tool-body > .tool-section > .reasoning`, the transcript reads the
+    // round through it, and the host class plus `tool-code` is what outranks the
+    // `.dialog-body pre` no-wrap rule (see `createPayloadViewer`). No language is passed:
+    // thinking is prose, so it is carried as escaped text, never highlighted or parsed.
+    const textHost = createPayloadViewer('', undefined, REASONING_VIEWER_CLASS);
     section.append(createPaneHeading(heading, COPY_THINK_LABEL, () => current), textHost);
     body.append(section);
+
+    // The round's viewer is ONE node for the life of the chip: streaming repaints its
+    // `<code>` column in place (`paintCodeBlock`), because the row/gutter structure is
+    // derived from the payload's own newlines and a longer round is a new row SET, not new
+    // text inside old rows. Rebuilding the `<pre>` per delta was both the slower path (a
+    // full re-highlight plus a re-mount per streamed round) and a contract break: the
+    // transcript and any open dialog read the round through THIS node
+    // (`.tool.think .reasoning`), so the host has to stay the host. `textContent` of the
+    // host is still EXACTLY the round.
+    const paintReasoningText = (): void => {
+        paintCodeBlock(textHost, current, undefined);
+    };
     element.append(summary, body);
 
     let dialog: DialogHandle | undefined;
@@ -1300,7 +1422,9 @@ export const createReasoningCard = (): ReasoningCard => {
     const dialogTitle = (): string => {
         if (current.length === 0) return THINK_LABEL;
 
-        const chars = `${thinkCount(current.length)} chars`;
+        // `charCount()` is the server's exact figure when the wire sent one, so a bounded
+        // think window never advertises the preview's length as the round's size.
+        const chars = `${thinkCount(charCount())} chars`;
         const share = shareOf();
 
         return share.length === 0
@@ -1319,8 +1443,9 @@ export const createReasoningCard = (): ReasoningCard => {
         count.hidden = share.length === 0;
 
         // Plain text, never Markdown: scratch space can contain anything the model wrote,
-        // and this path adds no HTML parse of its own.
-        textHost.textContent = current;
+        // and the viewer adds no HTML parse of its own (it re-uses the escaped/highlighted
+        // fragment path, so `<script>` in a round stays inert text).
+        paintReasoningText();
 
         summary.setAttribute(
             'aria-label',
@@ -1330,13 +1455,16 @@ export const createReasoningCard = (): ReasoningCard => {
         );
 
         // The arithmetic stays on hover. In the row it would be noise; to a reader who
-        // wonders what the percentage was built from it is the whole answer.
+        // wonders what the percentage was built from it is the whole answer. The character
+        // figure is the recorded one (`charCount`), so a bounded preview on the wire still
+        // reports the round's true size — and the token estimate is stated as the estimate
+        // it is, derived from that same figure.
         summary.title =
             current.length === 0
                 ? THINK_LABEL
                 : contextTokens === undefined
-                  ? `${thinkCount(current.length)} characters ≈ ${thinkCount(thinkTokens(current.length))} tokens · no context size reported yet`
-                  : `≈ ${thinkCount(thinkTokens(current.length))} of ${thinkCount(contextTokens)} context tokens (${share || '<0.1%'})`;
+                  ? `${thinkCount(charCount())} characters ≈ ${thinkCount(thinkTokens(charCount()))} tokens · no context size reported yet`
+                  : `≈ ${thinkCount(thinkTokens(charCount()))} of ${thinkCount(contextTokens)} context tokens (${share || '<0.1%'})`;
 
         // The open dialog tracks the round live, the way a running tool chip's dialog
         // tracks its state.
@@ -1407,6 +1535,18 @@ export const createReasoningCard = (): ReasoningCard => {
             if (finite === serverShare) return;
 
             serverShare = finite;
+            paint();
+        },
+        setChars: (characters: number | undefined): void => {
+            // The display wire's exact count (`DisplayReasoningNode.chars`). A bounded
+            // think window's text is only a preview, so the chip prints THIS figure; a
+            // non-number clears it and the card goes back to measuring its own text,
+            // which is the raw-event path where the text IS the whole round.
+            const finite =
+                typeof characters === 'number' && Number.isFinite(characters) ? Math.trunc(Math.max(characters, 0)) : undefined;
+            if (finite === recordedChars) return;
+
+            recordedChars = finite;
             paint();
         },
         text: () => current,

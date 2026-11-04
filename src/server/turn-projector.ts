@@ -34,7 +34,9 @@
 //                                        without discarding and detach the writers
 //   - ../frontend/ui/turns.ts:4262-4328  pending snapshot rules (an ABSENT `pending`
 //                                        array is not a drain signal) plus the exact
-//                                        retry / wakeup / pending line texts
+//                                        wakeup / pending line texts. A transient
+//                                        `retry` deliberately has NO line of its own
+//                                        here (T16/R16a) — see the `retry` handler.
 //   - ../frontend/ui/turns.ts:5154-5186  the parent's tool_result is the authoritative
 //                                        completion of the child its call spawned
 //   - ../frontend/ui/time.ts:19 and ./cli/render.ts:83  `formatDuration`
@@ -56,6 +58,7 @@ import {
     DISPLAY_BLOCK_PREVIEW_CHARS,
     DISPLAY_ERROR_CHARS,
     DISPLAY_MEDIA_PER_STEP,
+    DISPLAY_NODE_PREVIEW_CHARS,
     DISPLAY_NOTICE_CHARS,
     DISPLAY_PANEL_PREVIEW_CHARS,
     DISPLAY_PANEL_TITLE_CHARS,
@@ -63,19 +66,27 @@ import {
     DISPLAY_PREVIEW_CHARS
 } from '../shared/turn-display';
 import type {
+    ContextBlock,
+    ContextBlockKind,
+    ContextBlockPatch,
     DisplayActionSummary,
     DisplayMediaSummary,
     DisplayNode,
     DisplayPanelBlockSummary,
     DisplayPanelSummary,
     DisplayProjectContext,
+    DisplayReasoningNode,
     DisplayRole,
     DisplayStep,
+    DisplayTail,
+    DisplayTailKind,
+    DisplayTextNode,
     DisplayedTurn,
     SectionDisplayState,
     StepDisplayState,
     TurnDisplay,
     TurnDisplayOp,
+    TurnInstructionSource,
     TurnProjector,
     TurnRecordStatus,
     TurnSection,
@@ -157,6 +168,124 @@ const outcomeOfResult = (event: HarnessEvent): HarnessToolOutcome => {
 };
 
 const finiteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+
+// A usable epoch-ms timestamp, or `undefined` for "the record does not say". 0 is the
+// projector's documented sentinel (DISPLAY_NO_TIMESTAMP below), and no block, notice or
+// duration may report a time the record does not actually hold.
+const finiteAtValue = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+
+/**
+ * The context-segment key of one recorded steered submit.
+ *
+ * A submit with a recorded `id` (T13 — the server mints one with `randomUUID()` when it
+ * accepts the guidance, and the durable document keeps it) is keyed by THAT: the identity
+ * is intrinsic to the submit, so it cannot collide with another submit, cannot be
+ * renumbered when the bounded `SessionTurn.steers` ring (./sessions.ts
+ * `MAX_STEER_RECORDS`) truncates an older entry, and still resolves after a restart. The
+ * `i` prefix keeps it distinguishable from the derived form below and from the fixed
+ * `prompt` / `instructions` keys, and a UUID is URL-safe, so the block route needs no
+ * escaping beyond what the id already has.
+ *
+ * A submit with NO id — a record written before the field existed — falls back to the
+ * derived key: its own timestamp plus the length of its text, position-independent for the
+ * same ring reason. `occurrence` numbers repeats of that derived pair (`-1`, `-2`) so two
+ * submits in one millisecond with equal text length keep one segment each instead of
+ * collapsing into the first one (R6 counts every segment exactly once).
+ *
+ * Exported because the store resolves a clicked segment back to the recorded submit with
+ * the SAME keys (./sessions.ts `blockDetail`); one definition, no drift.
+ */
+export const steerBlockKeyOf = (steer: { id?: string; at?: number; prompt: string }, occurrence = 0): string => {
+    const recorded = typeof steer?.id === 'string' ? steer.id.trim() : '';
+
+    if (recorded.length > 0) return `i${recorded}`;
+
+    const base = `s${finiteAtValue(steer?.at) ?? 0}-${typeof steer?.prompt === 'string' ? steer.prompt.length : 0}`;
+
+    return occurrence > 0 ? `${base}-${occurrence}` : base;
+};
+
+/**
+ * The COMPLETE list of submits one turn recorded, in the order the server accepted them —
+ * the single source both the fold and the store resolve a steered context segment from.
+ *
+ * T14/T15: `steers` is the bounded operational AUDIT ring (a rolling 64 entries,
+ * ../server/sessions.ts `MAX_STEER_RECORDS`) and `steerTexts` is the durable TEXT archive —
+ * EVERY submit the turn accepted, keyed by its own id, and NOT truncated itself (an accepted
+ * submit is user data, so the archive keeps all of it; only the audit ring rolls). The merged
+ * list is therefore:
+ *   1. the submits the archive does not name — only possible on a record written before the
+ *      archive existed (or before submits carried ids) — kept in front, where they belong in
+ *      time; then
+ *   2. the archive, in acceptance order.
+ * Idempotent and deterministic in both directions: the live fold and a cold replay merge the
+ * same two arrays the same way, so the bar mints the same segments, and `blockDetail` finds
+ * the same submit for the same key. Without this merge a 65th steer would have stranded the
+ * bar's own segment for an older guidance text: the segment stays displayed, and its click
+ * still answers with the exact recorded prompt.
+ */
+export const steerSubmitList = <
+    T extends { id?: string; at?: number; prompt: string; threadId?: string }
+>(turn: { steers?: readonly T[]; steerTexts?: readonly T[] }): T[] => {
+    const archive = Array.isArray(turn.steerTexts) ? [...turn.steerTexts] : [];
+    const archived = new Set(archive.map((submit) => (typeof submit?.id === 'string' ? submit.id : '')));
+    const ring = Array.isArray(turn.steers) ? [...turn.steers] : [];
+    // A submit the archive does not name (no id, or an older document): it is older than
+    // anything the archive holds, so it keeps its recorded position at the front.
+    const legacy = ring.filter((submit) => !(typeof submit?.id === 'string' && archived.has(submit.id)));
+
+    return [...legacy, ...archive];
+};
+
+/**
+ * One key per recorded submit, in array order. Idented submits are keyed by their own
+ * identity and never participate in the fallback numbering; a keyless submit is numbered
+ * against the earlier keyless submits that share its derived `(at, length)` pair.
+ * Deterministic and shared: the fold mints segments with these
+ * (./turn-projector.ts `syncSteerBlocks`) and the store matches a clicked segment back to
+ * its bytes with the same list, so minting and lookup cannot drift, and a live stream and a
+ * cold replay number the same prefix identically (the list only ever grows at the end).
+ */
+export const steerBlockKeysOf = (steers: readonly { id?: string; at?: number; prompt: string }[]): string[] => {
+    const seen = new Map<string, number>();
+
+    return steers.map((steer) => {
+        const value = steer ?? ({ prompt: '' } as { id?: string; at?: number; prompt: string });
+        const recorded = typeof value.id === 'string' ? value.id.trim() : '';
+
+        // An idented submit needs no numbering: its identity already IS the key.
+        if (recorded.length > 0) return `i${recorded}`;
+
+        const derived = steerBlockKeyOf(value);
+        const occurrence = seen.get(derived) ?? 0;
+
+        seen.set(derived, occurrence + 1);
+
+        return steerBlockKeyOf(value, occurrence);
+    });
+};
+
+/**
+ * The growth patch of a prose/think window: the exact running character count, the
+ * last event index the window consumed, and the recorded span — but ONLY once a second
+ * recorded event proves the window bracketed real time (`openedAt < stamp`). A
+ * one-event window reports no duration at all, because the record cannot bracket it and
+ * a fabricated `0` would read as "instantaneous" (../shared/turn-display.ts
+ * `ContextBlock.durationMs`).
+ */
+export const flowWindowPatch = (
+    openedAt: number | undefined,
+    stamp: number | undefined,
+    chars: number,
+    index: number
+): ContextBlockPatch => {
+    const patch: ContextBlockPatch = { chars, eventTo: index };
+
+    if (openedAt !== undefined && stamp !== undefined && stamp > openedAt) patch.durationMs = stamp - openedAt;
+
+    return patch;
+};
 
 // A `pending` array only counts when every entry is usable — the same validator the
 // browser applies (../frontend/contract.ts:651). An ABSENT array is a different
@@ -316,6 +445,13 @@ const summarizeMedia = (media: unknown): { media?: DisplayMediaSummary[] } => {
 type AttemptWindow = {
     nodeIds: string[];
     stepIds: string[];
+    // Bar segments this attempt minted, so a `retry` removes exactly its own
+    // segments and a sibling's stay (the same scoping as `nodeIds`).
+    blockIds: string[];
+    // Prose windows opened by this attempt, in order. A `done` frame mints an
+    // `assistant` segment from the message content ONLY when this stayed empty —
+    // otherwise the deltas already counted the same bytes.
+    textKeys: string[];
     // Placeholder rows this attempt minted. A failed attempt never executed its
     // calls, so its child row goes with it — and only its own (F2).
     sectionKeys: string[];
@@ -331,8 +467,23 @@ type SectionRecord = {
     agent: string;
     attempt?: AttemptWindow;
     // The live stream writers. Closing one detaches the pointer; the node stays.
+    // Each writer names the context segment it is counting, so a delta updates the
+    // segment's exact length without a search.
     text?: DisplayNode & { kind: 'text' };
     reasoning?: DisplayNode & { kind: 'reasoning' };
+    textBlockId?: string;
+    reasoningBlockId?: string;
+    // The recorded time each writer OPENED with, so the segment can report the span of
+    // its window once a second event proves one (and never before).
+    textOpenedAt?: number;
+    reasoningOpenedAt?: number;
+    // R23 (T23): the stamp of the tail descriptor this section CURRENTLY publishes
+    // (`tailStampOf`). The designation is recomputed at the end of every frame, and only
+    // a stamp that actually moved costs an op — so a 500-delta thinking window sends one
+    // `tail:set`, not 500. Kept beside the section rather than derived from
+    // `section.tail` because `chars` moves every delta and deliberately does NOT
+    // re-publish the descriptor (the exact figure rides `context:set`).
+    tailStamp?: string;
     // This invocation's authoritative pending snapshot (turns.ts:4287).
     pendingCalls: Map<string, HarnessPendingTool>;
     started: boolean;
@@ -350,11 +501,31 @@ type SectionRecord = {
 
 // A step plus its detail addressing, kept together so the op stream and the lazy
 // detail route can never disagree about which event opened and which settled it.
+// `blockId` is the SAME pairing for the context bar: one recorded call is ONE
+// segment, updated (never re-minted) when its result lands.
 type StepRecord = {
     step: DisplayStep;
     sectionKey: string;
     openingIndex: number;
     resultIndex?: number;
+    blockId?: string;
+};
+
+// Where a section's ONE system block and the turn's prompt block rank inside the
+// bar. The system message heads every request and the prompt heads the turn, so both
+// precede the event-derived segments regardless of what the record timestamps.
+const BLOCK_RANK_SYSTEM = 0;
+const BLOCK_RANK_PROMPT = 1;
+const BLOCK_RANK_FLOW = 2;
+
+// A block's rank is derivable from the block itself, using only server-decided
+// identity fields: the fixed `instructions`/`prompt` names (see `ContextBlock.name`)
+// vs every flow segment.
+const blockRankOf = (block: ContextBlock): number => {
+    if (block.kind === 'system') return BLOCK_RANK_SYSTEM;
+    if (block.kind === 'user' && block.name === 'prompt') return BLOCK_RANK_PROMPT;
+
+    return BLOCK_RANK_FLOW;
 };
 
 const sectionStateOf = (status: TurnRecordStatus): SectionDisplayState =>
@@ -426,6 +597,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     let lastError: string | undefined;
     let settledStatus: TurnRecordStatus | undefined;
     let settledAt: number | undefined;
+    // The timestamp of the most recently folded event (undefined for a record with no
+    // `eventTimes`). Reads use it as the steer-adoption gate so a poll and a live
+    // watcher adopt a steered submit at the same point of the stream.
+    let lastAppliedStamp: number | undefined;
 
     // Memoization: `listViews()`/`getView()` ask for the same row on every render,
     // and rebuilding it walks the tree and re-projects blocks. The stamp covers
@@ -444,7 +619,26 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     // -----------------------------------------------------------------------
 
     const newSection = (key: string, agent: string, parentKey: string | undefined, placeholder: boolean): SectionRecord => {
-        const parent = parentKey === undefined ? undefined : byKey.get(parentKey);
+        // R18/T20: a parent is resolved through BOTH identity maps, and the second one is
+        // not redundant.
+        //   - `byKey` holds SECTION keys: `ROOT_KEY`, an invocation id only AFTER a row was
+        //     adopted/created with that id, `call:<callId>` for an un-adopted placeholder,
+        //     `inline:<agent>` for a threadless flow.
+        //   - `byInvocation` holds the runtime INVOCATION ids the same rows answer frames
+        //     with, including the turn's own flow, which is registered under `ROOT_KEY`
+        //     while its frames name its invocation (see `route`'s conversation-root branch).
+        //
+        // A child's `thread.parentId`, and a branch's `sourceThreadId`
+        // (../types/index.ts:930 — "the INVOCATION identity of the requester"), are
+        // therefore NOT section keys when the requester is the turn's own flow. Before the
+        // second lookup, such a child only got a `parentSectionId` if its spawn `delegate`
+        // call happened to be recorded first (the placeholder path passes
+        // `record.key`, a section key); with no preceding call frame — a hand-written
+        // reporter, a dropped/spawn call with unparseable args, a root-requested fork — the
+        // parent resolved to `undefined` and the hierarchy link was lost on the wire even
+        // though the fold knows exactly who spawned it.
+        const parent =
+            parentKey === undefined ? undefined : byKey.get(parentKey) ?? byInvocation.get(parentKey);
         const ordinal = sectionOrdinal++;
         const role: DisplayRole =
             parent === undefined && key === ROOT_KEY ? (agent === context.primary ? 'primary' : 'subagent') : 'subagent';
@@ -468,6 +662,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 agentLabel: key === ROOT_KEY ? turn.threadLabel ?? '' : '',
                 ...(turn.threadId === undefined ? {} : { threadId: key === ROOT_KEY ? turn.threadId : undefined }),
                 nodes: [],
+                // The bar is always present on a server-produced section: `[]` is the
+                // authoritative "nothing to report", while an absent field means a
+                // producer that said nothing at all (../shared/turn-display.ts).
+                context: [],
                 state: 'open'
             }
         };
@@ -484,6 +682,16 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
     const conversationLabelOf = (invocationId: string | undefined): string | undefined =>
         invocationId === undefined ? undefined : context.threadLabels?.get(invocationId);
+
+    // R18/T18: the PERSISTENT conversation one invocation ran in. The store owns this
+    // join (../sessions.ts `Session.invocationThreads`, handed in as
+    // `DisplayProjectContext.invocationThreadIds`) and it is LIVE, so a delegated
+    // child's entry already exists by the time its own `start` frame is folded
+    // (../sessions.ts records it immediately BEFORE `projector.apply`). The fold reads
+    // it and mints nothing: `undefined` means "no recorded join", and the section then
+    // omits `threadId` exactly as a pre-T18 record does.
+    const conversationThreadIdOf = (invocationId: string | undefined): string | undefined =>
+        invocationId === undefined ? undefined : context.invocationThreadIds?.get(invocationId);
 
     const openSection = (record: SectionRecord, ops: TurnDisplayOp[]): void => {
         ops.push({ op: 'section:open', turnId: turn.id, section: { ...copyValue(record.section), nodes: [] } });
@@ -552,6 +760,14 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         byInvocation.set(meta.id, record);
 
         const label = conversationLabelOf(meta.id);
+        // R18/T18: an adopted placeholder IS a delegated conversation (its spawn frame
+        // named the parent's `delegate` call), so the join is looked up on the invocation
+        // id this frame carries. A row that already names a conversation keeps it — the
+        // `branch_start` frame's own `threadId` is direct evidence, this join is only a
+        // fallback — and a row with no join stays exactly as it was before.
+        const threadId = record.section.threadId ?? conversationThreadIdOf(meta.id);
+
+        if (threadId !== undefined) record.section.threadId = threadId;
 
         patchSection(
             record,
@@ -559,6 +775,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 invocationId: meta.id,
                 ...(meta.branchId === undefined ? {} : { branchId: meta.branchId }),
                 ...(record.terminal ? {} : { state: 'streaming' }),
+                ...(threadId === undefined ? {} : { threadId }),
                 ...(label === undefined ? {} : { agentLabel: label, threadLabel: label })
             },
             ops
@@ -584,7 +801,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         record.section.invocationId = meta.id;
         record.section.branchId = options.branchId ?? meta.branchId;
         record.section.model = options.model;
-        record.section.threadId = options.threadId;
+        // R18/T18: a frame-supplied id (a branch names its source conversation) wins;
+        // otherwise the store's invocation → conversation join is adopted verbatim, so a
+        // delegated child is born addressable instead of indistinguishable from its
+        // parent's flow. `undefined` omits the field on the wire, as before.
+        record.section.threadId = options.threadId ?? conversationThreadIdOf(meta.id);
         record.section.agentLabel = label ?? '';
         record.section.threadLabel = label;
         record.section.state = options.state ?? 'streaming';
@@ -611,6 +832,49 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
     const queuedPlaceholder = (agent: string): SectionRecord | undefined =>
         sections.find((record) => record.placeholder && record.agent === agent);
+
+    // R18/T18: adopt a delegated conversation's id for sections that were folded BEFORE
+    // the store could record the join, and emit the `section:set` patch for it.
+    //
+    // The normal live path needs nothing here: the recorder writes the invocation →
+    // conversation entry at the child's own `start` frame, immediately BEFORE folding it
+    // (../sessions.ts:5478-5504), and a cold replay folds with the fully loaded map — so
+    // `adoptPlaceholder`/`createChild` mint the id and this pass is a no-op. What it
+    // covers is the honest late case: a projector created from a document whose roster
+    // did not yet name the conversation, a host-supplied runtime that binds the roster
+    // slot after the run starts, or a reporter whose child frames precede the identity
+    // write. Without this pass such a section would stream its whole life without an
+    // address, and the id would only appear after a restart.
+    //
+    // Rules, in order, each one a case that must NOT change:
+    //   - the ROOT section is skipped: its conversation is `turn.threadId`, which the
+    //     record states directly (the join never overrides the record);
+    //   - a section that already names a thread keeps it (first evidence wins, so a
+    //     `branch_start` frame's `threadId` is never replaced by a join lookup);
+    //   - a BRANCH section is skipped: a branch owns no persistent conversation, the
+    //     store never records a join for its frames, and its id is not an invocation id;
+    //   - an un-adopted placeholder has no `invocationId` and is therefore skipped by the
+    //     second rule, which keeps a never-ran delegation row exactly as it is today.
+    const syncThreadIds = (ops: TurnDisplayOp[]): void => {
+        const join = context.invocationThreadIds;
+
+        if (join === undefined) return;
+
+        for (const record of sections) {
+            if (record.key === ROOT_KEY) continue;
+            if (record.section.threadId !== undefined || record.section.branchId !== undefined) continue;
+
+            const invocationId = record.section.invocationId;
+
+            if (invocationId === undefined) continue;
+
+            const threadId = join.get(invocationId);
+
+            if (threadId === undefined) continue;
+
+            patchSection(record, { threadId }, ops);
+        }
+    };
 
     const route = (event: HarnessEvent, ops: TurnDisplayOp[]): SectionRecord => {
         const meta = event.thread;
@@ -715,7 +979,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     // -----------------------------------------------------------------------
 
     const beginAttempt = (record: SectionRecord): AttemptWindow => {
-        record.attempt ??= { nodeIds: [], stepIds: [], sectionKeys: [], callIds: [] };
+        record.attempt ??= { nodeIds: [], stepIds: [], blockIds: [], textKeys: [], sectionKeys: [], callIds: [] };
 
         return record.attempt;
     };
@@ -726,6 +990,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     const closeWriters = (record: SectionRecord): void => {
         record.text = undefined;
         record.reasoning = undefined;
+        record.textBlockId = undefined;
+        record.reasoningBlockId = undefined;
+        record.textOpenedAt = undefined;
+        record.reasoningOpenedAt = undefined;
     };
 
     const commitAttempt = (record: SectionRecord, ops: TurnDisplayOp[]): void => {
@@ -748,7 +1016,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         }
 
         // The copy target is the LAST committed prose node of this attempt (a pointer,
-        // so the prose is carried once rather than duplicated).
+        // so the prose is carried once rather than duplicated). R23 (T23): bounding the
+        // prose this commit superseded is no longer done here — the tail designation
+        // (`syncTails`, at the end of the frame) owns which body is whole, so an answer a
+        // later CALL superseded is compact too instead of riding every later frame.
         for (let position = record.section.nodes.length - 1; position >= 0; position -= 1) {
             const node = record.section.nodes[position];
 
@@ -790,6 +1061,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         }
 
         record.attempt = undefined;
+
+        // A retried attempt's segments leave the bar with its rows: they were never
+        // committed, so their bytes were never part of the conversation either.
+        for (const blockId of window.blockIds) removeBlock(record, blockId, ops);
+
         ops.push({ op: 'attempt:discard', turnId: turn.id, sectionId: record.section.id, nodeIds: [...window.nodeIds] });
         invalidate();
     };
@@ -876,7 +1152,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
     const insertNode = (record: SectionRecord, node: DisplayNode, ops: TurnDisplayOp[], attemptOwned: boolean): void => {
         record.section.nodes.push(node);
-        ops.push({ op: 'node:insert', turnId: turn.id, sectionId: record.section.id, node: copyValue(node) });
+        // The INTERNAL node keeps the exact text; the inserted copy is the bounded wire
+        // shape (../shared/turn-display.ts `TurnDisplay`), so ops and a cold view agree.
+        ops.push({ op: 'node:insert', turnId: turn.id, sectionId: record.section.id, node: wireNodeOf(record, node) });
 
         const window = attemptOwned ? record.attempt : undefined;
 
@@ -953,6 +1231,513 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     };
 
     // -----------------------------------------------------------------------
+    // Context blocks — the ONE bar per turn (R6/R8)
+    //
+    // A block is METADATA ONLY (no text), so the internal state and the wire copy of
+    // a block are the same object shape — unlike a prose node, which keeps the exact
+    // recorded text internally and is bounded on the way out (`wireNodeOf` below).
+    // Every segment therefore reports counts measured from recorded bytes, never from
+    // a preview (invariant 5, ../shared/turn-display.ts).
+    // -----------------------------------------------------------------------
+
+    // Ids are position-independent (`ordinal-kind-key`), so a discarded attempt's
+    // removal can never renumber a surviving segment, before or after a restart.
+    const blockIdOf = (record: SectionRecord, kind: ContextBlockKind, key: string): string =>
+        `${record.ordinal}-${kind}-${key}`;
+
+    // Bar order inside one section: the system block (it heads every request), then
+    // the turn's prompt, then every flow segment in recorded time order. Two rules
+    // make a live stream and a cold replay converge on the SAME array: insertion is
+    // always positional by (rank, time), and a segment with no recorded time keeps
+    // its mint position (a legacy record without `eventTimes` has none anywhere).
+    const contextIndexFor = (list: ContextBlock[], block: ContextBlock): number => {
+        const rank = blockRankOf(block);
+        const at = finiteAtValue(block.at);
+
+        for (let position = 0; position < list.length; position += 1) {
+            const existing = list[position];
+            const existingRank = blockRankOf(existing);
+
+            if (existingRank > rank) return position;
+            if (existingRank < rank) continue;
+
+            const existingAt = finiteAtValue(existing.at);
+
+            if (at !== undefined && existingAt !== undefined && existingAt > at) return position;
+        }
+
+        return list.length;
+    };
+
+    const addBlock = (record: SectionRecord, block: ContextBlock, ops: TurnDisplayOp[]): void => {
+        const list = (record.section.context ??= []);
+        const index = contextIndexFor(list, block);
+
+        list.splice(index, 0, block);
+        ops.push({
+            op: 'context:add',
+            turnId: turn.id,
+            sectionId: record.section.id,
+            block: copyValue(block),
+            // Absent `index` already means "append", so only an out-of-order insert
+            // pays for the position (the same rule `node:insert` follows).
+            ...(index === list.length - 1 ? {} : { index })
+        });
+        invalidate();
+    };
+
+    const patchBlock = (record: SectionRecord, blockId: string | undefined, patch: ContextBlockPatch, ops: TurnDisplayOp[]): void => {
+        if (blockId === undefined) return;
+
+        const block = record.section.context?.find((entry) => entry.id === blockId);
+        if (block === undefined) return;
+
+        // Only the fields that ACTUALLY moved travel: a segment that already reports
+        // `chars: 12` needs no second 12, so a long stream of deltas stays one op per
+        // real change instead of one per event.
+        const moved = Object.fromEntries(
+            Object.entries(patch).filter(([key, value]) => block[key as keyof ContextBlock] !== value)
+        ) as ContextBlockPatch;
+
+        if (Object.keys(moved).length === 0) return;
+
+        Object.assign(block, moved);
+        ops.push({ op: 'context:set', turnId: turn.id, sectionId: record.section.id, blockId, patch: copyValue(moved) });
+        invalidate();
+    };
+
+    const removeBlock = (record: SectionRecord, blockId: string, ops: TurnDisplayOp[]): void => {
+        const list = record.section.context;
+        if (list === undefined) return;
+
+        const index = list.findIndex((entry) => entry.id === blockId);
+        if (index < 0) return;
+
+        list.splice(index, 1);
+        ops.push({ op: 'context:remove', turnId: turn.id, sectionId: record.section.id, blockId });
+        invalidate();
+    };
+
+    // The store owns the instruction evidence (no harness event carries it), so the
+    // fold reads it and NEVER reconstructs one: an agent with no recorded source gets
+    // no system segment at all, which is what keeps a legacy document honest.
+    const instructionSourceFor = (agent: string): TurnInstructionSource | undefined => {
+        const sources = context.instructionSourcesOf?.(turn);
+
+        if (!Array.isArray(sources)) return undefined;
+
+        return sources.find(
+            (entry) => entry !== null && typeof entry === 'object' && entry.agent === agent && Array.isArray(entry.instructions)
+        );
+    };
+
+    const charsOfEntries = (entries: readonly string[]): number =>
+        entries.reduce((total, entry) => total + (typeof entry === 'string' ? entry.length : 0), 0);
+
+    // Mint the two non-event segments of a section: its ONE system block, and (the
+    // turn's root flow only) the user prompt block. Idempotent, so it runs on every
+    // event without duplicating either.
+    const syncRecordBlocks = (record: SectionRecord, ops: TurnDisplayOp[]): void => {
+        const list = (record.section.context ??= []);
+
+        if (!list.some((entry) => entry.kind === 'system')) {
+            const source = instructionSourceFor(record.agent);
+
+            if (source !== undefined) {
+                const at = finiteAtValue(source.at);
+
+                addBlock(
+                    record,
+                    {
+                        kind: 'system',
+                        id: blockIdOf(record, 'system', 'instructions'),
+                        turnId: turn.id,
+                        sectionId: record.section.id,
+                        name: 'instructions',
+                        ...(at === undefined ? {} : { at }),
+                        chars: charsOfEntries(source.instructions),
+                        inPrompt: true
+                    },
+                    ops
+                );
+            }
+        }
+
+        if (record.key === ROOT_KEY && !list.some((entry) => entry.kind === 'user' && entry.name === 'prompt')) {
+            const at = finiteAtValue(turn.startedAt);
+
+            addBlock(
+                record,
+                {
+                    kind: 'user',
+                    id: blockIdOf(record, 'user', 'prompt'),
+                    turnId: turn.id,
+                    sectionId: record.section.id,
+                    name: 'prompt',
+                    ...(at === undefined ? {} : { at }),
+                    // The row already carries the FULL prompt (`TurnSummary.prompt`), so
+                    // the segment counts it and duplicates nothing.
+                    chars: typeof turn.prompt === 'string' ? turn.prompt.length : 0,
+                    inPrompt: true
+                },
+                ops
+            );
+        }
+    };
+
+    // Steers are record mutations, not events, so the fold adopts them on the next
+    // stored event and picks up every remainder at `settle`. The `at <= stamp` gate is
+    // what makes a live stream and a cold replay agree: a replay sees the whole
+    // `steers` list from the first event, while the live run only saw the entries
+    // recorded up to that moment.
+    const syncSteerBlocks = (stamp: number | undefined, ops: TurnDisplayOp[]): void => {
+        // T14: the fold mints from the COMPLETE submit list, not from the audit ring. The
+        // archive (`SessionTurn.steerTexts`) keeps every submit the server accepted, so a
+        // bar re-projected after a restart reproduces the same segments — including the
+        // submits the 64-entry ring has already truncated — and each of them still answers
+        // a click with its own recorded text (R8). A record with no archive behaves exactly
+        // as before: the ring is the whole list it has.
+        const steers = steerSubmitList(turn as { steers?: SessionTurn['steers']; steerTexts?: SessionTurn['steerTexts'] }) as {
+            id?: string;
+            at?: number;
+            prompt: string;
+            threadId?: string;
+        }[];
+        // Numbered over the WHOLE submit list, so the adoption gate below can skip a
+        // submit that has not happened yet without renumbering the ones that have.
+        const keys = steerBlockKeysOf(steers);
+
+        for (let position = 0; position < steers.length; position += 1) {
+            const steer = steers[position];
+
+            if (steer === null || typeof steer !== 'object' || typeof steer.prompt !== 'string') continue;
+
+            const at = finiteAtValue(steer.at);
+
+            if (stamp !== undefined && at !== undefined && at > stamp) continue;
+
+            // Destination = the section whose conversation the steer actually reached,
+            // else the turn's own root flow — the identical rule `steerSummaries`
+            // publishes on the row.
+            const target =
+                steer.threadId === undefined
+                    ? undefined
+                    : sections.find((entry) => entry.section.threadId !== undefined && entry.section.threadId === steer.threadId);
+            const owner = target ?? byKey.get(ROOT_KEY) ?? sections[0];
+
+            if (owner === undefined) continue;
+
+            // Position-independent key: the steer list is a bounded ring, so a
+            // surviving steer keeps its id when an older one is truncated away. The
+            // store reads the SAME function back when it resolves a segment's payload,
+            // so minting and lookup cannot drift. Two submits that share a millisecond
+            // AND a text length are numbered apart, so each keeps its own segment (R6).
+            const key = keys[position];
+            const id = blockIdOf(owner, 'user', key);
+
+            if ((owner.section.context ?? []).some((entry) => entry.id === id)) continue;
+
+            addBlock(
+                owner,
+                {
+                    kind: 'user',
+                    id,
+                    turnId: turn.id,
+                    sectionId: owner.section.id,
+                    name: 'steer',
+                    ...(at === undefined ? {} : { at }),
+                    chars: steer.prompt.length,
+                    inPrompt: true
+                },
+                ops
+            );
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // Wire sanitization — exact inside, bounded on the way out (R1/R3)
+    //
+    // The internal node keeps the FULL recorded text, because `chars` and the lazy
+    // block detail must have exact bytes to be about. Only the copy that leaves the
+    // process is truncated, and only for the ONE block the server designates as the
+    // section's tail is the wire copy allowed to hold a whole body (R23, T23): a
+    // thinking window, an answer, or a tool call. `TurnSection.tail` is that
+    // designation, so the rule lives in one place and a live frame, a rebuild and a
+    // cold reload agree by construction.
+    // -----------------------------------------------------------------------
+
+    /**
+     * The tail kind a node carries, or undefined when it is not displayable content.
+     *
+     * Eligible (R23): a recorded thinking window, an answer, and a tool call — "whatever
+     * block it is, it is in the tail, like tool call". Excluded, and why:
+     *   - `notice`  — server-written status prose (wake, error, answered, the pending
+     *     line). A notice must never erase the block a reader is looking at, and T16/R16a
+     *     already removed the per-attempt retry chatter from this tree;
+     *   - an `action` step — an interactive owner question that renders its own card with
+     *     the full question and every option INLINE (answering may not cost a round trip),
+     *     and which mints no context segment at all (../shared/turn-display.ts:357);
+     *   - `user` / `system` — not nodes: the prompt rides `TurnSummary.prompt` and a
+     *     steered submit renders as its own node, and instructions have no board surface.
+     */
+    const tailKindOf = (node: DisplayNode): DisplayTailKind | undefined => {
+        if (node.kind === 'reasoning') return 'reasoning';
+        if (node.kind === 'text') return 'assistant';
+        if (node.kind === 'tool') return 'tool';
+
+        return undefined;
+    };
+
+    // The segment this node's bytes compose. Resolved by the SAME id derivation
+    // `addBlock` used (a prose window is `n<eventIndex>` and its segment is keyed by
+    // `<eventIndex>`; a step node IS the event index), then VERIFIED against this
+    // section's own list — so a hand-written producer with a different id scheme gets
+    // `blockId` absent instead of a guessed pairing. A `tool` step already carries the
+    // exact id on its `StepRecord`, which is the O(1) path for a 300-call turn.
+    const blockIdForNode = (record: SectionRecord, node: DisplayNode): string | undefined => {
+        const kind = tailKindOf(node);
+
+        if (kind === undefined) return undefined;
+
+        if (node.kind === 'tool') {
+            const known = steps.get(node.id)?.blockId;
+
+            return known !== undefined && record.section.context?.some((entry) => entry.id === known)
+                ? known
+                : undefined;
+        }
+
+        const key = node.id.startsWith('n') ? node.id.slice(1) : node.id;
+        const id = blockIdOf(record, kind, key);
+
+        return record.section.context?.some((entry) => entry.id === id) ? id : undefined;
+    };
+
+    /**
+     * The recorded bytes of one call, read back out of the durable record.
+     *
+     * The projector never copies a payload into its own memory: `turn.events` already
+     * holds both events verbatim (and the lazy step/block routes answer from exactly
+     * those bytes), so the tail reads them from the two indices the `StepRecord` already
+     * pins. Live, replay and a restart therefore see identical bytes — and a call that
+     * recorded no `tool_call` (a result-only frame) honestly reports no arguments.
+     */
+    const recordedCallOf = (entry: StepRecord): { args?: string; result?: string } => {
+        const opening = turn.events?.[entry.openingIndex] as HarnessEvent | undefined;
+        const closing =
+            entry.resultIndex === undefined ? opening : (turn.events?.[entry.resultIndex] as HarnessEvent | undefined);
+
+        const args = opening?.type === 'tool_call' && typeof opening.call?.arguments === 'string'
+            ? opening.call.arguments
+            : undefined;
+        const result = closing?.type === 'tool_result' && typeof closing.content === 'string'
+            ? closing.content
+            : undefined;
+
+        return {
+            ...(args === undefined ? {} : { args }),
+            ...(result === undefined ? {} : { result })
+        };
+    };
+
+    // One tail payload field: the EXACT recorded bytes, with no cap of the display
+    // contract's own (T25, R23). "The current block in full" is the whole recorded string;
+    // what bounds it is the runtime that recorded it (../core/result-budget.ts), not this
+    // projection. `over` stays in the shape so the descriptor's `truncated` flag keeps one
+    // definition — it is always false here, and the caption therefore never hedges a body
+    // that is actually complete (invariant 5 keeps the exact figure on the segment).
+    const tailFieldOf = (value: string | undefined): { text?: string; over: boolean } =>
+        value === undefined ? { over: false } : { text: value, over: false };
+
+    /**
+     * Resolve this section's CURRENT tail block: the newest eligible node, in the
+     * section's own recorded display order.
+     *
+     * Walking `section.nodes` from the end is an order read of the sequence the fold
+     * already wrote — not a compilation: nothing is paired, sorted or re-derived, and the
+     * exact figures come from the section's context segment. Prose carries no payload here
+     * (its whole text rides the designated node); a tool carries the recorded request and,
+     * once settled, the recorded response.
+     */
+    const resolveTail = (record: SectionRecord): DisplayTail | undefined => {
+        const nodes = record.section.nodes;
+
+        for (let position = nodes.length - 1; position >= 0; position -= 1) {
+            const node = nodes[position];
+            const kind = tailKindOf(node);
+
+            if (kind === undefined) continue;
+
+            const blockId = blockIdForNode(record, node);
+            const segment = blockId === undefined ? undefined : record.section.context?.find((entry) => entry.id === blockId);
+
+            if (kind === 'tool') {
+                const entry = steps.get(node.id);
+                const recorded = entry === undefined ? {} : recordedCallOf(entry);
+                const args = tailFieldOf(recorded.args);
+                const result = tailFieldOf(recorded.result);
+
+                return {
+                    kind,
+                    nodeId: node.id,
+                    ...(blockId === undefined ? {} : { blockId }),
+                    // The segment's EXACT figure (`argsChars + resultChars`, invariant 5),
+                    // and the recorded bytes otherwise — never the length of a bound field.
+                    chars: segment?.chars ?? (recorded.args?.length ?? 0) + (recorded.result?.length ?? 0),
+                    truncated: args.over || result.over,
+                    ...(args.text === undefined ? {} : { args: args.text }),
+                    ...(result.text === undefined ? {} : { result: result.text })
+                };
+            }
+
+            const prose = node as DisplayTextNode | DisplayReasoningNode;
+            const stated = segment?.chars ?? prose.chars ?? prose.text.length;
+
+            return {
+                kind,
+                nodeId: node.id,
+                ...(blockId === undefined ? {} : { blockId }),
+                chars: Number.isFinite(stated) ? Math.max(0, Math.trunc(stated)) : prose.text.length,
+                // A designated prose body is whole BY CONSTRUCTION (the tail node is the
+                // only node whose text is never bounded), so this never claims a preview
+                // that the wire does not carry.
+                truncated: false
+            };
+        }
+
+        return undefined;
+    };
+
+    /**
+     * The identity of a designation: what makes the descriptor worth re-sending.
+     *
+     * Deliberately excludes prose `chars`: an answer's running length moves with every
+     * delta and already rides `context:set` on its own segment, so republishing the
+     * pointer per token would be the "full payload repeated every frame" failure in
+     * miniature. A tool's payload lengths DO count, because a call that settles changes
+     * the bytes the reader sees.
+     */
+    const tailStampOf = (tail: DisplayTail | undefined): string => {
+        if (tail === undefined) return '';
+
+        if (tail.kind !== 'tool') return `${tail.kind}:${tail.nodeId}:${tail.blockId ?? ''}`;
+
+        return `tool:${tail.nodeId}:${tail.blockId ?? ''}:${tail.args?.length ?? -1}:${tail.result?.length ?? -1}`;
+    };
+
+    const isFullCarrier = (record: SectionRecord, node: DisplayNode): boolean =>
+        (node.kind === 'text' || node.kind === 'reasoning') && record.section.tail?.nodeId === node.id;
+
+    const wireNodeOf = (record: SectionRecord, node: DisplayNode): DisplayNode => {
+        if (node.kind !== 'text' && node.kind !== 'reasoning') return copyValue(node);
+
+        const wire = copyValue(node) as DisplayTextNode | DisplayReasoningNode;
+        const chars = node.text.length;
+
+        // A bounded node states its exact length and says so; the designated carrier
+        // carries the whole text, so its length IS the count. The `redacted` marker is
+        // dropped here on purpose: a node printed in full must never claim to be a
+        // preview, and one printed as a preview must never claim to be whole.
+        if (isFullCarrier(record, node) || chars <= DISPLAY_NODE_PREVIEW_CHARS) {
+            delete wire.redacted;
+
+            return { ...wire, chars };
+        }
+
+        return { ...wire, text: previewText(node.text, DISPLAY_NODE_PREVIEW_CHARS), chars, redacted: true };
+    };
+
+    /**
+     * Move the wire bodies to match a designation, in BOTH directions (R23).
+     *
+     * The node that LOST the tail becomes history: one patch carrying the
+     * `DISPLAY_NODE_PREVIEW_CHARS` preview, the exact length, and `redacted: true`. The
+     * node that GAINED it back (a retry discarded the block that superseded it) is
+     * restored: one patch carrying the full recorded text and `unredacted: true`, so a
+     * live client cannot keep a preview the cold document no longer shows.
+     *
+     * Nodes at or below the bound need no patch either way — their text is already the
+     * whole content — which is what keeps a stream of short windows free of churn.
+     * `ops` is omitted by the read path, which only needs the same decision, not the
+     * traffic.
+     */
+    const moveTailBodies = (record: SectionRecord, next: DisplayTail | undefined, ops?: TurnDisplayOp[]): void => {
+        for (const node of record.section.nodes) {
+            if (node.kind !== 'text' && node.kind !== 'reasoning') continue;
+
+            const over = node.text.length > DISPLAY_NODE_PREVIEW_CHARS;
+
+            if (next !== undefined && next.nodeId === node.id) {
+                if (node.redacted !== true) continue;
+
+                delete node.redacted;
+                node.chars = node.text.length;
+                ops?.push({
+                    op: 'node:set',
+                    turnId: turn.id,
+                    sectionId: record.section.id,
+                    nodeId: node.id,
+                    patch: { text: node.text, chars: node.chars, unredacted: true }
+                });
+
+                continue;
+            }
+
+            if (!over || node.redacted === true) continue;
+
+            node.redacted = true;
+            node.chars = node.text.length;
+            ops?.push({
+                op: 'node:set',
+                turnId: turn.id,
+                sectionId: record.section.id,
+                nodeId: node.id,
+                patch: {
+                    text: previewText(node.text, DISPLAY_NODE_PREVIEW_CHARS),
+                    chars: node.chars,
+                    redacted: true
+                }
+            });
+        }
+    };
+
+    /**
+     * One pass per frame: re-resolve every section's tail and publish what moved.
+     *
+     * It runs at the END of `apply`/`settle` because the designation depends on the whole
+     * frame (a call that settles in ANOTHER section moves that section's tail, not the
+     * routed one). Sections with an unchanged stamp emit nothing, so a long round costs
+     * one `tail:set` for its first delta and none for the other 499.
+     */
+    const syncTails = (ops: TurnDisplayOp[]): void => {
+        for (const record of sections) {
+            const next = resolveTail(record);
+            const stamp = tailStampOf(next);
+
+            if (stamp === record.tailStamp) continue;
+
+            const previous = record.section.tail;
+            record.tailStamp = stamp;
+            moveTailBodies(record, next, ops);
+
+            if (next === undefined) {
+                // Nothing left to display: the section's last eligible node went with a
+                // discarded attempt, or it never produced model content at all. Stated
+                // explicitly, because an absent field means a silent producer instead.
+                if (previous !== undefined) {
+                    delete record.section.tail;
+                    ops.push({ op: 'tail:clear', turnId: turn.id, sectionId: record.section.id });
+                }
+
+                continue;
+            }
+
+            record.section.tail = next;
+            ops.push({ op: 'tail:set', turnId: turn.id, sectionId: record.section.id, tail: copyValue(next) });
+        }
+    };
+
+    // -----------------------------------------------------------------------
     // apply(): one recorded event -> ops
     // -----------------------------------------------------------------------
 
@@ -966,6 +1751,23 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // is written anywhere (the tile must not invent a duration).
         const stamp = finiteNumber(at) && at > 0 ? at : undefined;
         const record = route(event, ops);
+
+        lastAppliedStamp = stamp;
+
+        // The non-event segments of the bar (this section's system block, the turn's
+        // prompt block) and any steer recorded since the last stored event, so the bar
+        // is complete on EVERY frame and never needs a client-side rule about which
+        // segments "should" exist.
+        syncRecordBlocks(record, ops);
+
+        // R18/T18: a conversation id learned after a section was folded still lands on
+        // that section, as its own patch, on the SAME frame (see `syncThreadIds`). This
+        // runs BEFORE the steer pass because a steer's destination is resolved by
+        // `section.threadId` — the id has to be on the row before the segment it owns is
+        // minted, or guidance addressed to a delegated conversation would be painted onto
+        // the parent's bar.
+        syncThreadIds(ops);
+        syncSteerBlocks(stamp, ops);
 
         switch (event.type) {
             case 'start': {
@@ -1004,15 +1806,52 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             case 'text': {
                 if (typeof event.delta !== 'string' || event.delta.length === 0) break;
 
-                beginAttempt(record);
+                const window = beginAttempt(record);
 
                 if (record.text === undefined) {
-                    record.text = { kind: 'text', id: `n${index}`, text: '', committed: false };
+                    // A superseded writer never reopens: `closeWriters` detached it, so
+                    // the node about to be minted IS the section's newest block. The
+                    // prose it replaces is bounded at the END of this frame, by the same
+                    // tail pass that designates this node (R23) — one rule, one order, no
+                    // second copy of the redaction logic.
+                    record.text = { kind: 'text', id: `n${index}`, text: '', committed: false, chars: 0 };
                     insertNode(record, record.text, ops, true);
+
+                    const blockId = blockIdOf(record, 'assistant', String(index));
+
+                    record.textBlockId = blockId;
+                    record.textOpenedAt = stamp;
+                    window.textKeys.push(blockId);
+                    // A retried attempt removes its own prose segment too (the
+                    // `textKeys` list only answers "did this attempt stream prose").
+                    window.blockIds.push(blockId);
+                    addBlock(
+                        record,
+                        {
+                            kind: 'assistant',
+                            id: blockId,
+                            turnId: turn.id,
+                            sectionId: record.section.id,
+                            name: 'answer',
+                            ...(stamp === undefined ? {} : { at: stamp }),
+                            chars: 0,
+                            // Committed prose is replayed to the model on every later
+                            // request of this conversation.
+                            inPrompt: true,
+                            eventFrom: index,
+                            eventTo: index
+                        },
+                        ops
+                    );
                 }
 
                 record.text.text += event.delta;
+                record.text.chars = record.text.text.length;
+
+                // A current answer streams in FULL: one append per delta, and its bar
+                // segment carries the exact running length (invariant 5).
                 ops.push({ op: 'node:append', turnId: turn.id, sectionId: record.section.id, nodeId: record.text.id, delta: event.delta });
+                patchBlock(record, record.textBlockId, flowWindowPatch(record.textOpenedAt, stamp, record.text.chars, index), ops);
                 invalidate();
                 break;
             }
@@ -1020,15 +1859,59 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             case 'reasoning': {
                 if (typeof event.delta !== 'string' || event.delta.length === 0) break;
 
-                beginAttempt(record);
+                const window = beginAttempt(record);
 
                 if (record.reasoning === undefined) {
-                    record.reasoning = { kind: 'reasoning', id: `n${index}`, text: '' };
+                    record.reasoning = { kind: 'reasoning', id: `n${index}`, text: '', chars: 0 };
                     insertNode(record, record.reasoning, ops, true);
+
+                    const blockId = blockIdOf(record, 'reasoning', String(index));
+
+                    record.reasoningBlockId = blockId;
+                    record.reasoningOpenedAt = stamp;
+                    window.blockIds.push(blockId);
+                    addBlock(
+                        record,
+                        {
+                            kind: 'reasoning',
+                            id: blockId,
+                            turnId: turn.id,
+                            sectionId: record.section.id,
+                            name: 'reasoning',
+                            ...(stamp === undefined ? {} : { at: stamp }),
+                            chars: 0,
+                            // Thinking is recorded and shown, never replayed into the
+                            // next request — the one segment class that is not prompt
+                            // text, stated explicitly rather than left to a bar.
+                            inPrompt: false,
+                            eventFrom: index,
+                            eventTo: index
+                        },
+                        ops
+                    );
                 }
 
                 record.reasoning.text += event.delta;
-                ops.push({ op: 'node:append', turnId: turn.id, sectionId: record.section.id, nodeId: record.reasoning.id, delta: event.delta });
+                record.reasoning.chars = record.reasoning.text.length;
+
+                // R23 (T23): a thinking window streams its bytes WHOLE, exactly like an
+                // answer does, because while it is open it IS the section's newest block
+                // and therefore its designated tail (`closeWriters` detaches the writer at
+                // every boundary, so a live writer is always the last eligible node). The
+                // `DISPLAY_NODE_PREVIEW_CHARS` bound arrives later, as ONE `node:set` patch
+                // from the frame-end tail pass, at the moment a newer block takes the tail
+                // — which is when the body stops being displayed and the exact length moves
+                // to the segment. A reconnect therefore replays only the CURRENT window in
+                // full, never a historical one.
+                ops.push({
+                    op: 'node:append',
+                    turnId: turn.id,
+                    sectionId: record.section.id,
+                    nodeId: record.reasoning.id,
+                    delta: event.delta
+                });
+
+                patchBlock(record, record.reasoningBlockId, flowWindowPatch(record.reasoningOpenedAt, stamp, record.reasoning.chars, index), ops);
                 applyShares(record, ops);
                 invalidate();
                 break;
@@ -1041,7 +1924,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 const rawArgs = typeof event.call?.arguments === 'string' ? event.call.arguments : '';
 
                 // Text before a call is finished text: close the writer so the call is
-                // a node of its own and post-tool prose starts a fresh block.
+                // a node of its own and post-tool prose starts a fresh block. The prose
+                // that just closed loses its body in THIS frame's tail pass (the call is
+                // the newest block now, so the prose becomes history: bounded, with its
+                // exact length on its segment) — R23 keeps that one rule for every kind
+                // of supersession instead of repeating it per handler.
                 closeWriters(record);
 
                 const step: DisplayStep = {
@@ -1062,6 +1949,35 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 };
 
                 const entry = pushStep(record, step, index, ops, true);
+
+                // ONE segment per recorded call, opened by this event and updated (not
+                // re-minted) when its result lands. `argsChars` is the exact length of
+                // the raw arguments the record holds right now, which for a call still
+                // running is everything it has.
+                const blockId = blockIdOf(record, 'tool', String(index));
+
+                entry.blockId = blockId;
+                window.blockIds.push(blockId);
+                addBlock(
+                    record,
+                    {
+                        kind: 'tool',
+                        id: blockId,
+                        turnId: turn.id,
+                        sectionId: record.section.id,
+                        name,
+                        ...(stamp === undefined ? {} : { at: stamp }),
+                        chars: rawArgs.length,
+                        argsChars: rawArgs.length,
+                        // The call's arguments travelled with the committed assistant
+                        // message; the result joins them when it is recorded below.
+                        inPrompt: true,
+                        state: 'running',
+                        eventFrom: index,
+                        eventTo: index
+                    },
+                    ops
+                );
 
                 if (callId !== undefined) {
                     openCalls.push(entry);
@@ -1156,6 +2072,29 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                     if (pending !== undefined) paintPending(record, pending, ops);
                     else prunePending(record, entry.step.callId ?? callId, ops);
+
+                    // ONE bar segment for the WHOLE call: the recorded arguments PLUS
+                    // the recorded result text (`chars` = the two parts, which is why
+                    // `argsChars`/`resultChars` travel beside it), the tool's own
+                    // measured span, and the settled state that colours the segment.
+                    const owner = sectionOfEntry(entry);
+                    const segment = owner?.section.context?.find((candidate) => candidate.id === entry.blockId);
+                    const argsChars = segment?.argsChars ?? 0;
+
+                    patchBlock(
+                        owner ?? record,
+                        entry.blockId,
+                        {
+                            state,
+                            chars: argsChars + content.length,
+                            resultChars: content.length,
+                            inPrompt: true,
+                            ...(stamp === undefined ? {} : { endedAt: stamp }),
+                            ...(duration === undefined ? {} : { durationMs: duration }),
+                            eventTo: index
+                        },
+                        ops
+                    );
                 } else if (settledStatus === undefined) {
                     // The gate is the PROJECTOR's settled flag, never `turn.status`:
                     // a cold fold replays the events of an ALREADY-terminal record,
@@ -1185,7 +2124,35 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                         detail: { stepId: String(index), hasResult: false, truncated: content.length > DISPLAY_PREVIEW_CHARS }
                     };
 
-                    pushStep(record, step, index, ops, true);
+                    const duration = finiteNumber(event.durationMs) ? event.durationMs : undefined;
+                    const entry = pushStep(record, step, index, ops, true);
+                    const blockId = blockIdOf(record, 'tool', String(index));
+
+                    entry.blockId = blockId;
+                    record.attempt?.blockIds.push(blockId);
+                    addBlock(
+                        record,
+                        {
+                            kind: 'tool',
+                            id: blockId,
+                            turnId: turn.id,
+                            sectionId: record.section.id,
+                            name: typeof event.name === 'string' ? event.name : '',
+                            ...(stamp === undefined ? {} : { at: stamp, endedAt: stamp }),
+                            // NO matching call was recorded, so there are no argument
+                            // bytes to report: `chars` is the result text alone, and
+                            // `argsChars` stays absent rather than claiming a zero that
+                            // never happened.
+                            chars: content.length,
+                            resultChars: content.length,
+                            inPrompt: true,
+                            state,
+                            ...(duration === undefined ? {} : { durationMs: duration }),
+                            eventFrom: index,
+                            eventTo: index
+                        },
+                        ops
+                    );
                 }
 
                 // The parent's result for the SPAWNING call is the authoritative
@@ -1248,7 +2215,37 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                 if (pending !== undefined) paintPending(record, pending, ops);
 
+                // Captured BEFORE the commit clears the window: a `done` frame repeats
+                // the response text, so it counts as an `assistant` segment ONLY when no
+                // prose delta was streamed for this request (a reporter that answers
+                // without streaming). Otherwise the deltas already counted those bytes,
+                // and counting them twice would inflate the bar.
+                const streamedProse = (record.attempt?.textKeys.length ?? 0) > 0;
+
                 commitAttempt(record, ops);
+
+                if (!streamedProse) {
+                    const content = (event.message as { content?: unknown } | undefined)?.content;
+
+                    if (typeof content === 'string' && content.length > 0) {
+                        addBlock(
+                            record,
+                            {
+                                kind: 'assistant',
+                                id: blockIdOf(record, 'assistant', String(index)),
+                                turnId: turn.id,
+                                sectionId: record.section.id,
+                                name: 'answer',
+                                ...(stamp === undefined ? {} : { at: stamp }),
+                                chars: content.length,
+                                inPrompt: true,
+                                eventFrom: index,
+                                eventTo: index
+                            },
+                            ops
+                        );
+                    }
+                }
 
                 // `done` closes one AGENT turn, not the user's turn: the root keeps
                 // streaming until the turn settles (turns.ts:5241), and a response
@@ -1271,19 +2268,35 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             }
 
             case 'retry': {
+                // T16 (R16a): a transient retry mints NO notice node, in either direction
+                // of the one-rule-above (live `apply()` and the cold `projectTurn()` fold
+                // run this same handler, so a reload cannot disagree with the stream).
+                //
+                // WHY THE LINE IS GONE RATHER THAN RESTYLED: the agent owns the retry loop
+                // (../core/agent.ts:584-624) and re-sends the SAME request, so a failed
+                // attempt is not an outcome the reader acts on — it is the server still
+                // working. Eleven attempts printed eleven of these lines, and the tile's
+                // status next to them read as a run that was failing.
+                //
+                // WHAT IS PRESERVED, EXACTLY:
+                //   - the retry MECHANISM lives in `agent.ts` and is untouched here; the
+                //     raw `retry` frame stays in `turn.events`, so the journal, the CLI
+                //     (./cli/render.ts:193) and `GET /sessions/:id/events` keep the
+                //     attempt/backoff/error evidence verbatim;
+                //   - the attempt's PARTIAL OUTPUT still goes: `discardAttempt` below is
+                //     what stops a failed attempt's prose/calls/segments being read as part
+                //     of the answer, and it stays the only thing this handler does;
+                //   - the EXHAUSTED case is still terminal and still visible: when the
+                //     budget runs out the agent throws the LAST attempt's own error
+                //     (../core/agent.ts:604-605), the harness turns that into the turn's
+                //     `error` event, and the `error` handler below mints its notice. Only
+                //     the per-attempt chatter is gone.
+                //
+                // Nothing here touches the section's state, so the turn keeps reading
+                // `streaming` through the backoff (the tile derives its state from
+                // `TurnSection.state`, turns.ts:5376, and the activity ring from ops that
+                // name the agent, ../view-state.ts:820).
                 discardAttempt(record, ops);
-
-                noticeNode(
-                    record,
-                    'retry',
-                    // Exact existing tile text (turns.ts:4644).
-                    `attempt ${event.attempt} of ${event.maxAttempts} failed \u00b7 retrying in ${formatDuration(event.delayMs)} \u00b7 ${messageOf(event.error)}`,
-                    `n${index}`,
-                    stamp,
-                    undefined,
-                    ops
-                );
-
                 invalidate();
                 break;
             }
@@ -1301,6 +2314,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 if (pending === undefined) break;
 
                 closeWriters(record);
+                // A wake boundary ends the prose window like any other close, so the next
+                // request streams into nodes of its own. It does NOT take the tail: a wake
+                // line is server status, not model content (R23 — `tailKindOf`), so the
+                // block the reader was looking at stays displayed beside this notice
+                // instead of being replaced by a line it cannot act on.
                 noticeNode(
                     record,
                     'wake',
@@ -1321,6 +2339,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             case 'error': {
                 const message = messageOf(event.error);
 
+                // R23: the error LINE is server status, not a content block, so it does
+                // not take the tail and does not bound the block behind it. A reader who
+                // lost an answer to a failed request still sees the answer (or the failed
+                // call's own recorded result) as the section's one body, with this notice
+                // printed beside it — which is what keeps a terminal error from being
+                // mistaken for, or replacing, the meaningful evidence.
                 closeWriters(record);
                 lastError = previewText(message, DISPLAY_ERROR_CHARS);
                 noticeNode(record, 'error', message, `n${index}`, stamp, undefined, ops);
@@ -1496,6 +2520,14 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 break;
         }
 
+        // R23 (T23): the frame is done, so this is where the ONE displayed body moves —
+        // for every section, because a `tool_result` can settle a call that lives in
+        // ANOTHER section (the parent's result completing a delegated row) and a retried
+        // attempt can hand the tail back to the block before it. Runs after every op this
+        // event produced, so a client never sees a designation that names a node it has
+        // not received yet, and a section whose stamp did not move costs no op at all.
+        syncTails(ops);
+
         return ops;
     };
 
@@ -1559,6 +2591,17 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         settledStatus = status;
         settledAt = finiteNumber(at) && at > 0 ? at : undefined;
 
+        // R18/T18: settle is the last frame this projector will ever emit, so an id the
+        // store learned late must ride the terminal ops — otherwise a live watcher would
+        // keep a delegated row without an address until the next reload, while the cold
+        // replay (a full map from the first fold) would have had it from the start.
+        syncThreadIds(ops);
+
+        // Every steer this turn recorded is now final, including one that arrived after
+        // the last stored event (the gate is off at settle, so both a live run and a
+        // cold replay end with the SAME set of segments).
+        syncSteerBlocks(undefined, ops);
+
         for (const record of sections) {
             if (record.terminal) continue;
 
@@ -1600,13 +2643,33 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
             Object.assign(entry.step, patch);
             ops.push({ op: 'step:set', turnId: turn.id, sectionId: owner.section.id, step: copyValue(entry.step) });
+
+            // The segment follows the row: the state it ended in and the time the turn
+            // closed. NO duration is invented for a call that never reported one, and
+            // its `chars` stays the argument bytes it really recorded.
+            patchBlock(
+                owner,
+                entry.blockId,
+                {
+                    state: abandonedStateOf(status),
+                    ...(settledAt === undefined ? {} : { endedAt: settledAt })
+                },
+                ops
+            );
         }
 
-        // Nothing is pending once the turn ended, and the line must not linger.
+        // Nothing is pending once the turn ended, and the line must not linger. The ONE
+        // body rule is then settled the same way every other frame settles it: the final
+        // pass below names this turn's last eligible block (so a turn that ends on a
+        // thinking window, on an answer, or on a call shows THAT in full, live and after a
+        // reload) and bounds every older body, which is what stops a settled turn from
+        // replaying a superseded payload forever.
         for (const record of sections) {
             record.pendingCalls.clear();
             syncPendingLine(record, ops);
         }
+
+        syncTails(ops);
 
         openCalls.length = 0;
         invalidate();
@@ -1620,10 +2683,29 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     // frame (the same rule `copyTurn`/`publish` enforce for the raw surface)
     // -----------------------------------------------------------------------
 
-    const display = (): TurnDisplay => ({
-        turnId: turn.id,
-        sections: sections.map((record) => copyValue(record.section))
-    });
+    const display = (): TurnDisplay => {
+        // A read must not lag the record: adopt the segments the NEXT stored event
+        // would have minted anyway. The gate is the last event's timestamp (or the
+        // settle time), so a poll cannot pull a steer into the bar earlier than a live
+        // watcher would have seen it — the fold still adopts a submit on the next
+        // stored event, in both paths.
+        for (const record of sections) syncRecordBlocks(record, []);
+        syncSteerBlocks(settledAt ?? lastAppliedStamp, []);
+
+        // The wire copy is built here, from the exact recorded text: the block the
+        // section designates as its tail (T23, R23) stays whole — an answer, a thinking
+        // window, or the current call's recorded request/response — and everything else
+        // arrives bounded with its exact `chars` beside it. `record.section.tail` is the
+        // designation the op stream just published, so this is the SAME projection the
+        // stream delivered, which is why a reload paints what the stream painted.
+        return {
+            turnId: turn.id,
+            sections: sections.map((record) => ({
+                ...copyValue(record.section),
+                nodes: record.section.nodes.map((node) => wireNodeOf(record, node))
+            }))
+        };
+    };
 
     const attachmentSummaries = () =>
         (turn.attachments ?? []).map((attachment) => {
@@ -1653,6 +2735,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 steer.threadId === undefined ? undefined : sections.find((record) => record.section.threadId === steer.threadId);
 
             return {
+                // The submit's durable identity travels on the row, because it is also the
+                // context bar's key for this segment (`ContextBlock.id`): one identity per
+                // recorded guidance text, from the audit record through the projection to
+                // the click that resolves it (T13). Absent for a pre-T13 record, whose
+                // segment key the fold derives instead.
+                ...(steer.id === undefined ? {} : { id: steer.id }),
                 at: steer.at,
                 prompt: steer.prompt,
                 ...(target === undefined ? {} : { sectionId: target.section.id }),
@@ -1729,6 +2817,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             turn.status,
             turn.updatedAt,
             turn.events.length,
+            // T14: the row publishes the steer AUDIT ring, so its length is part of the
+            // row's identity. Without it a cached row would keep the pre-steer list after
+            // the store accepted guidance (a steer changes no event and no status).
+            turn.steers?.length ?? 0,
             sectionOrdinal,
             stepCount,
             settledStatus ?? '',
@@ -1745,7 +2837,26 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         return summaryCache;
     };
 
-    return { turnId: () => turn.id, apply, settle, summary, display };
+    // T14: adopt this turn's steer RECORD mutations right away. A steered submit is not an
+    // event (`SessionTurn.steers`/`steerTexts` are record fields), so a fold that only runs
+    // on `apply`/`settle` would draw the segment for guidance the user already typed only at
+    // the next recorded event. The store calls this the moment it accepts a submit, with the
+    // submit's own timestamp as the adoption stamp — the same `at <= stamp` gate that keeps a
+    // live stream and a cold replay agreeing. The returned ops are the segments it minted,
+    // exactly like `apply` returns them, so a live watcher sees the bar move with the steer.
+    const syncSteers = (at: number): TurnDisplayOp[] => {
+        const ops: TurnDisplayOp[] = [];
+
+        // R18/T18: a steer addressed to a delegated conversation resolves its bar segment
+        // by `section.threadId`, so the id must be adopted in the SAME frame the submit is
+        // minted — this path is the only fold step that runs without a stored event.
+        syncThreadIds(ops);
+        syncSteerBlocks(finiteAtValue(at), ops);
+
+        return ops;
+    };
+
+    return { turnId: () => turn.id, apply, settle, syncSteers, summary, display };
 };
 
 /**

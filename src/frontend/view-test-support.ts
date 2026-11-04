@@ -38,7 +38,7 @@
 
 import type { AgentResultBlock, AgentResultTurn } from '../shared/agent-results';
 import { listAgentResultBlocks } from '../shared/agent-results';
-import type { DisplayProjectContext, TurnDisplay, TurnProjector, TurnSummary } from '../shared/turn-display';
+import type { DisplayProjectContext, TurnDisplay, TurnDisplayOp, TurnProjector, TurnSummary } from '../shared/turn-display';
 import { createTurnProjector, projectTurn, DISPLAY_NO_TIMESTAMP } from '../server/turn-projector';
 import type {
     SessionInvalidThread,
@@ -254,6 +254,11 @@ export type LiveFold = {
     projector: TurnProjector;
 };
 
+// Terminal turn statuses — the same definition `src/server/sessions.ts:853` keeps local, and the
+// gate `mirrorView` uses to choose between `settle` and a plain row upsert (sessions.ts:2835).
+const isTerminalTurn = (status: SessionTurn['status']): boolean =>
+    status === 'done' || status === 'error' || status === 'cancelled';
+
 // The entry agent of a recorded turn when the caller gave no host snapshot: the agent of the first
 // ROOT `start` (a root run's events carry no `thread`, types/index.ts:1659). Falls back to the
 // first `start` of any kind, and to '' when the fixture has none — the fold then treats every
@@ -277,9 +282,10 @@ const primaryOf = (turn: SessionTurn): string => {
 // Translate one RAW frame into the display-wire frame a browser receives.
 //
 //   - `snapshot`  -> `view`      (the atomic state at registration, self-sufficient);
-//   - `turn`      -> `ops`       with the single `{ op: 'turn' }` row upsert the server publishes
-//                                 around a status transition (sessions.ts:4303) — a row patch,
-//                                 never a re-send of the tree;
+//   - `turn`      -> `ops`       EXACTLY as `SessionStore.mirrorView` publishes them: a terminal
+//                                 turn settles its rows (`settle`), any other status upserts the
+//                                 compact row (`{op:'turn'}`) and leaves every section open
+//                                 (sessions.ts:2832);
 //   - `event`     -> `ops`       from the SAME `apply()` the recorder calls, so the ops are exactly
 //                                 the ones that live stream would have sent;
 //   - `failed`    -> `failed`    with the full `view` (the error terminal stays self-sufficient).
@@ -319,6 +325,9 @@ export const toViewItem = (
                 const at = turn.eventTimes?.[index];
                 fold.projector.apply(turn.events[index], typeof at === 'number' ? at : DISPLAY_NO_TIMESTAMP, index);
             }
+            // `projectorFor` settles a record that is ALREADY terminal (sessions.ts:2546) so a
+            // cold fold never leaves rows "streaming".
+            if (isTerminalTurn(turn.status)) fold.projector.settle(turn.status, turn.updatedAt);
             folds.set(turn.id, fold);
         } else {
             // The record travels by reference, but a later frame may carry a NEWER revision of it
@@ -326,9 +335,13 @@ export const toViewItem = (
             fold.record = turn;
         }
 
-        // `settle` is how the server publishes a status transition (turn-projector.ts:652), and it
-        // returns the row upsert — so a `turn` frame becomes exactly one `{op:'turn'}` op.
-        const ops = fold.projector.settle(turn.status, turn.updatedAt);
+        // EXACTLY `SessionStore.mirrorView` (sessions.ts:2832-2839): only a TERMINAL turn calls
+        // `settle`, because settling a `running` turn would close every section and gate off the
+        // result-only frames that follow. Anything else upserts the row the projector computed —
+        // one `{op:'turn'}` op.
+        const ops: TurnDisplayOp[] = isTerminalTurn(turn.status)
+            ? fold.projector.settle(turn.status, turn.updatedAt)
+            : [{ op: 'turn', turnId: turn.id, summary: fold.projector.summary() }];
 
         return { type: 'ops', turnId: turn.id, at: turn.updatedAt, ops };
     }
@@ -351,6 +364,15 @@ export const toViewItem = (
             } as SessionTurn);
 
         fold = { record, projector: createTurnProjector(record, contextOf(record)) };
+
+        // The seeded record may already hold events (a connection that opens mid-turn): replay
+        // them so the fold's tree matches the store's, exactly as `projectorFor` does.
+        for (let index = 0; index < record.events.length; index += 1) {
+            const at = record.eventTimes?.[index];
+            fold.projector.apply(record.events[index], typeof at === 'number' ? at : DISPLAY_NO_TIMESTAMP, index);
+        }
+        if (isTerminalTurn(record.status)) fold.projector.settle(record.status, record.updatedAt);
+
         folds.set(item.turnId, fold);
     }
 
@@ -449,6 +471,14 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         return payload?.session;
     };
 
+    // The most recent raw document this adapter has SEEN (a translated `{session}` answer, or a
+    // `snapshot`/`failed` stream frame). A live fold needs the same `DisplayProjectContext` the
+    // store supplies — the entry agent, the label seeds, the block prefix — and this document is
+    // that context, without asking the stub for an extra request the browser never makes. The
+    // shell always holds one before it opens an observer (the create/202 answer lands first), so a
+    // stream that begins with a `turn`/`event` frame still folds with the right entry agent.
+    let lastSeenSession: SessionSnapshot | undefined;
+
     // A raw JSON answer -> its display-wire counterpart. Only the two session-carrying envelopes
     // are rewritten; everything else (`{deleted}`, `{cancelled}`, `{ok}`, `{models}`, a tool
     // catalogue, a thread transcript) passes through untouched, in its original status.
@@ -466,47 +496,9 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         if (payload.session === undefined) return jsonOf(payload, status);
 
         const session = payload.session as SessionSnapshot;
+        lastSeenSession = session;
         translated.view = viewOf(session, { primary: options.primary });
         delete translated.session;
-        // TEMP PROBE (T5): what does the compiled answer actually carry?
-        {
-            const view = translated.view as SessionView;
-            for (const turn of Array.isArray(session.turns) ? session.turns : []) {
-                const projected = projectTurn(turn, contextForTurn(session, turn, options));
-                console.warn(
-                    '[fold probe]',
-                    turn.id,
-                    'events:',
-                    JSON.stringify((turn.events ?? []).map((e) => `${e.type}:${(e as { agent?: string }).agent ?? '?'}`)),
-                    'display keys:',
-                    JSON.stringify(Object.keys(projected.display)),
-                    'sections:',
-                    projected.display.sections === undefined ? 'undefined' : projected.display.sections.length,
-                    'summary steps:',
-                    JSON.stringify(projected.summary).slice(0, 220),
-                    'ctx:',
-                    JSON.stringify({
-                        primary: contextForTurn(session, turn, options).primary,
-                        labels: contextForTurn(session, turn, options).labels ? [...contextForTurn(session, turn, options).labels!] : []
-                    })
-                );
-            }
-            console.warn(
-                '[translateJson]',
-                status,
-                Object.keys(payload).join(','),
-                'rows:',
-                (view.turns ?? []).map((row) => `${row.id}:${row.status}`).join('|'),
-                'displays:',
-                JSON.stringify(
-                    Object.entries(view.displays ?? {}).map(([id, display]) =>
-                        `${id}=>${(display.sections ?? [])
-                            .map((s) => `${s.id}:${s.role}:${(s.nodes ?? []).length}n`)
-                            .join(', ')}`
-                    )
-                )
-            );
-        }
 
         // A submit/answer envelope carries the NEW turn record next to the session; on the display
         // wire that field is the turn's compact row (protocol.ts:705), folded with the same seeds
@@ -536,14 +528,26 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         let pending = '';
 
         // The snapshot a stream opens with seeds the per-turn folds, so an `event` frame that
-        // arrives before any `turn` frame still produces real ops. A test that streams frames with
-        // no opening snapshot gets the seed from its own raw session route (read once, lazily).
-        let context: SessionSnapshot | undefined = options.snapshot?.();
+        // arrives before any `turn` frame still produces real ops. Seeding order: the snapshot the
+        // test named, the newest document this adapter has already translated, then — once, lazily —
+        // the test's own session route. A fixture with none of those folds from the turn record's
+        // root `start` (`primaryOf`), which is the honest reading of a stream that never names the
+        // entry agent.
+        let context: SessionSnapshot | undefined = options.snapshot?.() ?? lastSeenSession;
         let seeding: Promise<SessionSnapshot | undefined> | undefined;
+        let seedTried = false;
         const seed = async (): Promise<SessionSnapshot | undefined> => {
-            if (context !== undefined) return context;
+            if (context !== undefined || seedTried) return context;
+            seedTried = true;
             seeding ??= hostOf(sessionId);
-            context = await seeding;
+
+            try {
+                context = await seeding;
+            } catch {
+                // A strict stub throws for a route the browser never asks for; the fallback above
+                // then decides the entry agent from the recorded events.
+                context = undefined;
+            }
 
             return context;
         };
@@ -558,7 +562,10 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             return data.length > 0 ? data : undefined;
         };
 
-        const translateFrame = (block: string): string | undefined => {
+        // ASYNC on purpose: the host document is what makes a live fold equal the server's, and
+        // reading it is a route round trip. `TransformStream` awaits this callback, so frames stay
+        // strictly in order and a test still asserts BETWEEN pushes.
+        const translateFrame = async (block: string): Promise<string | undefined> => {
             const data = dataOf(block);
             if (data === undefined) return undefined;
 
@@ -569,35 +576,24 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                 return undefined;
             }
 
-            if (raw.type === 'snapshot' || raw.type === 'failed') context = raw.session;
+            if (raw.type === 'snapshot' || raw.type === 'failed') {
+                context = raw.session;
+                // A later observer connection (a reconnect) folds against the newest document the
+                // stub has published, exactly as the store's watcher does.
+                lastSeenSession = raw.session;
+            }
+            // A frame that opens a fold before any snapshot frame has arrived still needs the
+            // entry agent, the label seeds and the block prefix the store supplies.
+            else if (context === undefined) await seed();
 
             const item = toViewItem(raw, folds, context, { primary: options.primary });
-
-            // TEMP PROBE (T5): the exact display-wire frames the client receives.
-            console.warn(
-                '[wire]',
-                raw.type,
-                '->',
-                item.type,
-                item.type === 'ops'
-                    ? `${item.turnId} ops=${JSON.stringify((item.ops ?? []).map((op) => op.op))}`
-                    : item.type === 'view'
-                      ? JSON.stringify(
-                            Object.entries(item.view.displays ?? {}).map(([id, display]) =>
-                                `${id}=>${(display.sections ?? [])
-                                    .map((s) => `${s.id}:${s.role}:${(s.nodes ?? []).length}n`)
-                                    .join(', ')}`
-                            )
-                        )
-                      : ''
-            );
 
             return `data: ${JSON.stringify(item)}\n\n`;
         };
 
         const body = source.pipeThrough(
             new TransformStream<Uint8Array, Uint8Array>({
-                transform(chunk, controller) {
+                async transform(chunk, controller) {
                     pending += decoder.decode(chunk, { stream: true });
 
                     // A frame ends at the blank line; anything after the last one is still arriving.
@@ -605,16 +601,16 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                     pending = blocks.pop() ?? '';
 
                     for (const block of blocks) {
-                        const frame = translateFrame(block);
+                        const frame = await translateFrame(block);
                         if (frame !== undefined) controller.enqueue(encoder.encode(frame));
                     }
                 },
-                flush(controller) {
+                async flush(controller) {
                     // A server that closes without a trailing blank line still gets its last frame.
                     pending += decoder.decode();
                     if (pending.trim().length === 0) return;
 
-                    const frame = translateFrame(pending);
+                    const frame = await translateFrame(pending);
                     if (frame !== undefined) controller.enqueue(encoder.encode(frame));
                 }
                 // No `cancel` handler: `pipeThrough` propagates a cancel to the source body, which
@@ -686,6 +682,68 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         });
     };
 
+    // `GET /views/:id/turns/:turnId/blocks/:blockId` - the ONE context-bar segment detail (T11,
+    // R8). Composed exactly the way `stepDetail` composes its pair, from the raw session read the
+    // test already declares: the block is looked up in the COMPILED tree (the same address the
+    // browser holds), and its bytes come from the recorded range the block names
+    // (`eventFrom..eventTo`), which is what `SessionStore.blockDetail` concatenates on the server.
+    // The metadata rides back embedded by value (../shared/turn-display.ts:494), so a test can
+    // prove the segment the browser was given is the segment it gets the text of.
+    const blockDetail = async (sessionId: string, turnId: string, blockId: string): Promise<Response> => {
+        const host = await hostOf(sessionId);
+        const turn = host?.turns?.find((candidate) => candidate.id === turnId);
+        if (turn === undefined) return jsonOf({ error: { message: `Unknown turn ${turnId}` } }, 404);
+
+        const display = displayOfTurn(host ?? ({ turns: [turn] } as unknown as SessionSnapshot), turnId, {
+            primary: options.primary
+        });
+        const section = display?.sections.find((candidate) => (candidate.context ?? []).some((entry) => entry.id === blockId));
+        const block = section?.context?.find((entry) => entry.id === blockId);
+
+        if (block === undefined || section === undefined) return jsonOf({ error: { message: `Unknown block ${blockId}` } }, 404);
+
+        const events = turn.events ?? [];
+        const from = block.eventFrom ?? 0;
+        const to = block.eventTo ?? Math.max(0, events.length - 1);
+        const window = events.slice(from, to + 1);
+        const detail: Record<string, unknown> = { ...block, sessionId };
+
+        if (block.kind === 'tool') {
+            const callEvent = window.find((event) => event.type === 'tool_call');
+            const callId = callEvent?.type === 'tool_call' ? callEvent.call.id : undefined;
+
+            if (callEvent !== undefined && callEvent.type === 'tool_call') detail.args = callEvent.call.arguments ?? '';
+
+            const settled = window.find((event) => event.type === 'tool_result' && (callId === undefined || event.callId === callId));
+            if (settled !== undefined && settled.type === 'tool_result') detail.result = settled.content;
+        } else if (block.kind === 'system') {
+            // The instruction entries the agent ACTUALLY ran with. A fixture with no recorded
+            // source has none, and omitting the field is the honest answer (the server states the
+            // absence the same way, ../shared/turn-display.ts:506).
+            const sources = ((host as { turnInstructionSources?: { agent: string; instructions: readonly string[] }[] } | undefined)?.turnInstructionSources ?? []).filter(
+                (source) => source.agent === section.agent
+            );
+
+            if (sources.length > 0) detail.entries = sources.flatMap((source) => [...source.instructions]);
+        } else if (block.kind === 'user') {
+            // `0-user-prompt` is the turn's own prompt; `0-user-s2` is that steer's recorded
+            // submit (../shared/turn-display.ts:393).
+            const suffix = block.id.split('-').pop() ?? '';
+            const steer = /^\d+$/.test(suffix) ? turn.steers?.[Number(suffix)] : undefined;
+
+            detail.text = steer?.prompt ?? turn.prompt;
+        } else {
+            const wanted = block.kind === 'reasoning' ? 'reasoning' : 'text';
+
+            detail.text = window
+                .filter((event) => event.type === wanted)
+                .map((event) => (event.type === 'text' || event.type === 'reasoning' ? event.delta : ''))
+                .join('');
+        }
+
+        return jsonOf({ block: detail });
+    };
+
     return async (url, method, body, context) => {
         const path = stripOrigin(url, root);
         if (!path.startsWith('/views')) return inner(url, method, body, context);
@@ -698,20 +756,61 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         };
         const raw = (suffix: string): string => `${root}/sessions${suffix}`;
 
+        // A composed route (the lazy step detail, the per-turn raw read, the transcript) offers
+        // the URL the browser ACTUALLY asked for to the test's own handler first. Two reasons:
+        // a stub may declare that route itself and stay authoritative, and a stub that keeps a
+        // request log must see the request the client made — otherwise a test cannot prove the
+        // lazy fetch happened on a click and on exactly one click. A strict stub THROWS for a
+        // route it does not implement, which is the same "no such route" signal `undefined`
+        // carries, so both fall through to the composition.
+        const offer = async (): Promise<Response | undefined> => {
+            try {
+                return await call(url);
+            } catch {
+                return undefined;
+            }
+        };
+
         // Lazy detail: no raw twin (the raw surface has no step route).
         const stepMatch = rest.match(/^\/([^/]+)\/turns\/([^/]+)\/steps\/([^/]+)$/);
-        if (stepMatch && (method === undefined || method === 'GET'))
-            return stepDetail(decodeURIComponent(stepMatch[1]), decodeURIComponent(stepMatch[2]), decodeURIComponent(stepMatch[3]));
+        if (stepMatch && (method === undefined || method === 'GET')) {
+            const direct = await offer();
 
-        // The verbatim raw read (the transcript export). The test's own session route IS that
-        // document, so it is returned untranslated — events and `eventTimes` included.
-        const rawMatch = rest.match(/^\/([^/]+)\/raw$/);
-        if (rawMatch && (method === undefined || method === 'GET')) return call(raw(`/${decodeURIComponent(rawMatch[1])}`));
+            return direct ?? stepDetail(
+                decodeURIComponent(stepMatch[1]),
+                decodeURIComponent(stepMatch[2]),
+                decodeURIComponent(stepMatch[3])
+            );
+        }
+
+        // Lazy detail for ONE context-bar segment (`GET .../turns/:turnId/blocks/:blockId`, T11/R8).
+        // The same offer-first rule as the step route above: a stub that declares this route keeps
+        // its own answer (and keeps its request log honest), and a strict stub that THROWS for a
+        // route it does not implement falls through to the composition, which is what lets a shell
+        // test prove the click costs exactly one fetch without hand-writing a detail body.
+        const blockMatch = rest.match(/^\/([^/]+)\/turns\/([^/]+)\/blocks\/([^/]+)$/);
+        if (blockMatch && (method === undefined || method === 'GET')) {
+            const direct = await offer();
+
+            return direct ?? blockDetail(
+                decodeURIComponent(blockMatch[1]),
+                decodeURIComponent(blockMatch[2]),
+                decodeURIComponent(blockMatch[3])
+            );
+        }
+
+        // The verbatim raw read (the transcript export) is the per-turn route below: the frozen
+        // server has NO session-level `/views/:id/raw` (src/server/api.ts:1873 mounts only
+        // `/views/:id/turns/:turnId/raw`), so a client must not expect one and this adapter does
+        // not invent one.
 
         // A single recorded turn, verbatim (`GET .../turns/:turnId/raw`). Composed from the session
         // read because the raw surface has no per-turn route.
         const turnRawMatch = rest.match(/^\/([^/]+)\/turns\/([^/]+)\/raw$/);
         if (turnRawMatch && (method === undefined || method === 'GET')) {
+            const direct = await offer();
+            if (direct !== undefined) return direct;
+
             const sessionId = decodeURIComponent(turnRawMatch[1]);
             const turnId = decodeURIComponent(turnRawMatch[2]);
             const host = await hostOf(sessionId);
@@ -726,12 +825,17 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         // accepted (`/views/:id/events` is the frozen route, protocol.ts:605).
         const eventsMatch = rest.match(/^\/([^/]+)\/(events|stream)$/);
         if (eventsMatch && (method === undefined || method === 'GET')) {
-            const response = await call(raw(`/${decodeURIComponent(eventsMatch[1])}/events`));
+            const sessionId = decodeURIComponent(eventsMatch[1]);
+            const response = await call(raw(`/${sessionId}/events`));
 
             if (response === undefined) return undefined;
-            if (!(response.headers.get('content-type') ?? '').includes('text/event-stream')) return response;
 
-            return translateStream(response);
+            // The client parses THIS route as an event stream whatever the stub labelled it, so a
+            // body is translated whenever it is not a JSON error answer (a 404 unknown session or a
+            // 405 wrong method arrives as `{ error }`).
+            if ((response.headers.get('content-type') ?? '').includes('application/json')) return response;
+
+            return translateStream(response, sessionId);
         }
 
         // The lazy transcript read (R2): a test that declares the raw route keeps its own answer;
@@ -741,21 +845,25 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         // test that only exercises a different control.
         const transcriptMatch = rest.match(/^\/([^/]+)\/threads\/([^/]+)\/transcript$/);
         if (transcriptMatch && (method === undefined || method === 'GET')) {
-            const direct = await call(raw(rest));
-            if (direct !== undefined) return direct;
-
             const sessionId = decodeURIComponent(transcriptMatch[1]);
             const threadId = decodeURIComponent(transcriptMatch[2]);
-            const session = await call(raw(`/${encodeURIComponent(sessionId)}`));
-            const payload =
-                session === undefined
-                    ? undefined
-                    : ((await readJson(session)) as { session?: SessionSnapshot } | undefined);
-            const thread = payload?.session?.threads?.find((candidate) => candidate.id === threadId);
+
+            // A strict stub THROWS for a route it does not implement; that is the same "no such
+            // route" signal `undefined` carries, and the composition below is the answer either way.
+            let direct: Response | undefined;
+            try {
+                direct = await call(raw(rest));
+            } catch {
+                direct = undefined;
+            }
+            if (direct !== undefined) return direct;
+
+            const payload = await hostOf(sessionId);
+            const thread = payload?.threads?.find((candidate) => candidate.id === threadId);
 
             if (thread === undefined) return jsonOf({ error: { message: `Unknown thread ${threadId}` } }, 404);
 
-            const broken = (payload?.session?.invalidThreads ?? []).find((candidate) => candidate.id === threadId);
+            const broken = (payload?.invalidThreads ?? []).find((candidate) => candidate.id === threadId);
             const messages = Array.isArray(thread.messages) ? thread.messages : [];
 
             return jsonOf({

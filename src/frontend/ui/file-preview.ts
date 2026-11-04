@@ -52,7 +52,8 @@
 //   '\n' so `code.textContent` stays BYTE-IDENTICAL to the window. The gutter is
 //   generated content, so it is never in `textContent`, never in a selection, and
 //   never in the Copy payload. The preview flavour is `preview-code`, whose rules
-//   (no soft wrap, sideways scroll, STICKY gutter) live in ui/dialog.css.
+//   live in ui/dialog.css: SOFT WRAP like every other payload surface, plus the
+//   paged-window counter the tool pane does not need.
 // - Past MAX_HIGHLIGHT_CHARS the builder carries the whole text as escaped text
 //   instead of asking the highlighter for a head-only render, so a long window can
 //   no longer silently lose its tail (that is why `highlightCode` is not called
@@ -84,8 +85,11 @@ import { createCodeBlock } from './tools';
 export const FILE_PREVIEW_MAX_LINES = 200;
 
 // The scoping class of the preview's code view. `createCodeBlock` always emits
-// `code-block <class>`; this class is the hook ui/dialog.css uses for the editor
-// layout (no wrap + sticky gutter), replacing the tool pane's `tool-code` soft wrap.
+// `code-block <class>`; this class is the hook ui/dialog.css uses for the framed,
+// SOFT-WRAPPED payload layout with a per-window counter start. It deliberately does NOT
+// carry the tool pane's `tool-code`: the preview numbers start at the window's own first
+// line (`counter-reset`), which `.tool-code`'s plain `counter-reset: code-line` cannot do,
+// and ui/dialog.css gives `preview-code` the same wrap the tool pane gets.
 export const PREVIEW_CODE_CLASS = 'preview-code';
 
 // Structural view of one `read` entry. Everything is optional/unknown at the
@@ -262,8 +266,9 @@ const previewBody = (path: string, result: FilePreviewResult): PreviewBody => {
         host.append(statusNode('preview-empty', 'This file has no text in the requested window.'));
     } else {
         // The SAME line-per-row builder as the tool panes, scoped to
-        // `preview-code`: line numbers, no soft wrap, sideways scroll, and a
-        // gutter that stays put while the text scrolls (ui/dialog.css).
+        // `preview-code`: line numbers, SOFT WRAP (ui/dialog.css), and numbering that
+        // starts at the window's own first line. One wrapped payload view for every
+        // dialog surface; only the counter start is the preview's own.
         const pre = createCodeBlock(content, language, undefined, PREVIEW_CODE_CLASS);
         // Numbers start at the window's own first line, so a future paged window
         // (`startLine > 1`) is numbered correctly instead of restarting at 1. The

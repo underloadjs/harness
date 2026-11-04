@@ -166,6 +166,53 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     );
 });
 
+// Does a rule declare a `color:` property (as opposed to `border-color:` /
+// `background-color:`, which are different channels)? `toContain('color: …')` would
+// match those too, so every "no colour here" check below uses this instead.
+const declaresColor = (block: string): boolean => /(^|\n)\s*color\s*:/.test(block);
+
+it('paints the agent identity tone on the composer label and the dialog badges (R4)', () => {
+    // T5/R4: the composer's agent name (`Instruct`) and its compact code (`IT`) carry the
+    // agent's own hue. ui/agent-control.ts paints the `.agent-control` WRAPPER, and
+    // custom properties inherit, so the tone has to be read on the button rule — exactly
+    // the property styles.css already uses for the transcript labels.
+    expect(blockOf('.agent-control-button {')).toContain('color: var(--agent-color)');
+
+    // Neither label may set a colour of its own: an inline `color` on the name or the
+    // code would override the inherited identity tone and R4 would silently stop working
+    // (the surfaces test asserts the same thing on the DOM side, from the components).
+    expect(declaresColor(blockOf('.agent-control-name {'))).toBe(false);
+    expect(declaresColor(blockOf('.agent-control-code {'))).toBe(false);
+
+    // `--accent` stays the STATE channel, and it stays on the BORDER: hovering or running
+    // must not erase the hue the reader is using to tell two agents apart.
+    const hover = blockOf('.agent-control-button:hover {');
+    expect(hover).toContain('border-color: var(--accent)');
+    expect(declaresColor(hover)).toBe(false);
+
+    const active = blockOf(".agent-control[data-activity='active'] .agent-control-button {");
+    expect(active).toContain('border-color: var(--accent)');
+    expect(declaresColor(active)).toBe(false);
+
+    // The dialog: the badge NAME is the identity (ui/agent-dialog.ts paints the badge),
+    // and the `[+]` option is painted with the tone its badge will keep. The role and
+    // model captions stay `--muted` — they are facts about the agent, not the agent — and
+    // selection/activity keep the accent border, so identity and state stay two facts.
+    expect(blockOf('.agent-dialog-agent-name {', agentDialogRules)).toContain('color: var(--agent-color)');
+    expect(blockOf('.agent-dialog-add-option {', agentDialogRules)).toContain('color: var(--agent-color)');
+    expect(blockOf('.agent-dialog-agent-role,', agentDialogRules)).toContain('color: var(--muted)');
+    expect(blockOf(".agent-dialog-tab[aria-selected='true'] {", agentDialogRules)).toContain(
+        'border-color: var(--accent)'
+    );
+    expect(blockOf('.agent-dialog-tab {', agentDialogRules)).toContain('color: var(--text)');
+
+    // The fallback that makes an unnamed agent neutral is the SAME value the module
+    // publishes (ui/agent-color.ts `UNKNOWN_AGENT_COLOR`), so a block painted with no
+    // identity looks exactly like a block nobody painted.
+    expect(blockOf(':root {')).toContain('--agent-color: #8b94a7');
+    expect(blockOf(':root {')).toContain('--agent-line: rgba(139, 148, 167, 0.55)');
+});
+
 it('rounds every control with one shared token and keeps surfaces and circles on their own', () => {
     // The per-rule `border-radius: var(--radius-sm)` assertions above are only meaningful
     // if the token VALUES are pinned at the definition: a silent retune of the token would

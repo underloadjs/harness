@@ -1,0 +1,715 @@
+// The COMPILED board path: this tile renderer is driven ONLY by hand-written
+// `TurnDisplayOp` frames and `TurnSummary` rows — no `HarnessEvent`, no raw snapshot, and
+// no raw→display test double anywhere in the file.
+//
+// Why that matters (R1/R2/R3):
+//   - the shell's end-to-end tests answer `/views` routes from RAW fixtures through
+//     `view-test-support.ts`, which is the server's own projector. Excellent evidence
+//     about the wire, but it cannot show that the DOM is built from ADDRESSED state:
+//     a renderer that quietly re-derived the transcript from events would still pass.
+//   - every assertion here is against an op the server would have sent (`section:open`,
+//     `node:insert`, `node:append`, `node:set {text}`, `step:set`, `section:remove`,
+//     `attempt:*`), applied to a document advanced by the SAME reducer the shell runs
+//     first (`view-state.applyOpsToDisplay`, exactly `main.ts onViewItem` step 1), then
+//     routed to the tile by turn id (step 3).
+//   - R2's one-click rule lives here too: the detail loader is a board OPTION, so the
+//     tests can count requests — none while the board renders, one on the reader's click,
+//     none ever again for that step, and the panes then carry the recorded pair verbatim.
+//
+// Run: npx vitest run --config src/frontend/vitest.config.ts ui/turns-compiled.test.ts
+
+import type { SessionView } from '../../server/protocol';
+import type { HarnessPendingTool } from '../../types';
+import type { TurnDisplayOp, TurnSummary, DisplayStep, TurnSection, TurnDisplay } from '../../shared/turn-display';
+import type { TurnStepDetail } from '../../shared/turn-display';
+import type { TurnBoard } from './turns';
+import { createTurnBoard } from './turns';
+import { applyOpsToDisplay } from '../view-state';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const T = 1_700_000_000_000;
+
+// ---------------------------------------------------------------------------
+// Hand-written compiled fixtures (src/shared/turn-display.ts, spelled out)
+// ---------------------------------------------------------------------------
+
+const summary = (overrides: Partial<TurnSummary> = {}): TurnSummary => ({
+    id: 't1',
+    index: 0,
+    prompt: 'read the notes',
+    status: 'running',
+    state: 'streaming',
+    updatedAt: T,
+    sectionCount: 1,
+    stepCount: 0,
+    activeAgents: ['instruct'],
+    blocks: [],
+    ...overrides
+});
+
+const rootSection = (overrides: Partial<TurnSection> = {}): TurnSection => ({
+    id: 't1:0',
+    role: 'primary',
+    agent: 'instruct',
+    agentLabel: 'RR1',
+    state: 'streaming',
+    nodes: [],
+    ...overrides
+});
+
+const childSection = (overrides: Partial<TurnSection> = {}): TurnSection => ({
+    id: 't1:1',
+    parentSectionId: 't1:0',
+    role: 'subagent',
+    agent: 'helper',
+    agentLabel: 'RH1',
+    state: 'streaming',
+    nodes: [],
+    ...overrides
+});
+
+const toolStep = (overrides: Partial<DisplayStep> = {}): DisplayStep => ({
+    kind: 'tool',
+    id: '7',
+    turnId: 't1',
+    sectionId: 't1:0',
+    callId: 'call-1',
+    name: 'read',
+    argsPreview: 'path=notes',
+    state: 'running',
+    startedAt: T,
+    detail: { stepId: '7', hasResult: false, truncated: true },
+    ...overrides
+});
+
+// A document whose trees are advanced by the real reducer, exactly as the shell does
+// before it routes a frame: a hand-painted tree would let renderer and state drift apart
+// without any test noticing.
+const documentOf = (rows: TurnSummary[], sections: Record<string, TurnSection[]>): SessionView =>
+    ({
+        id: 's1',
+        harness: 'instruct',
+        status: 'running',
+        model: 'm1',
+        createdAt: 1,
+        updatedAt: T,
+        turns: rows,
+        displays: Object.fromEntries(Object.entries(sections).map(([turnId, list]) => [turnId, { turnId, sections: list }]))
+    }) as unknown as SessionView;
+
+const pending = new Map<string, HarnessPendingTool[]>();
+
+// Apply one frame the way `main.ts onViewItem` does: state first, then the tile.
+const frame = (board: TurnBoard, document: SessionView, turnId: string, ops: TurnDisplayOp[]): boolean => {
+    applyOpsToDisplay(document, turnId, ops, pending);
+
+    return board.applyViewOps(turnId, ops, document);
+};
+
+// Text rendering is scheduled on an animation frame (one Markdown parse per paint); a
+// tile's `flush()` is the documented synchronous point.
+const mount = (options: Parameters<typeof createTurnBoard>[0] = {}): { board: TurnBoard } => {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    const board = createTurnBoard({ ...options, empty });
+    board.bindSession('s1');
+    document.body.replaceChildren(board.element);
+
+    return { board };
+};
+
+// The recorded pair one click buys (R2): the opening event's arguments and the settled
+// event's content, VERBATIM and both in one answer.
+const recordedPair = (): TurnStepDetail =>
+    ({
+        sessionId: 's1',
+        turnId: 't1',
+        stepId: '7',
+        sectionId: 't1:0',
+        callId: 'call-1',
+        opening: {
+            index: 7,
+            at: T,
+            event: { type: 'tool_call', agent: 'instruct', call: { id: 'call-1', name: 'read', arguments: 'path=notes.md mode=full' } }
+        },
+        result: {
+            index: 9,
+            at: T + 800,
+            event: {
+                type: 'tool_result',
+                agent: 'instruct',
+                callId: 'call-1',
+                name: 'read',
+                content: 'the whole file body, every line of it',
+                isError: false,
+                outcome: 'completed',
+                durationMs: 800
+            }
+        }
+    }) as unknown as TurnStepDetail;
+
+const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+beforeEach(() => {
+    pending.clear();
+    document.body.innerHTML = '<div id="app"></div>';
+});
+
+afterEach(() => {
+    vi.unstubAllGlobals();
+});
+
+// ---------------------------------------------------------------------------
+// R1 — the row and the flow, with no event list in sight
+// ---------------------------------------------------------------------------
+
+describe('the compact row', () => {
+    it('paints a tile from a TurnSummary alone, with no tree and no event', () => {
+        const { board } = mount();
+        const tile = board.upsertView(summary({ status: 'done', state: 'done', detail: 'm1' }), documentOf([], {}));
+
+        expect(tile.compiled()).toBe(true);
+        expect(tile.element.dataset.state).toBe('done');
+        expect(tile.element.dataset.turnId).toBe('t1');
+        expect(tile.element.querySelector('.tile-prompt')?.textContent).toBe('read the notes');
+        expect(tile.element.querySelector('.tile-status-text')?.textContent).toBe('done');
+        // No trees in the document, so no flow was invented: an empty document paints an
+        // empty flow, never a placeholder block.
+        expect(tile.element.querySelectorAll('.agent-text')).toHaveLength(0);
+    });
+
+    it('patches the tile header from a turn upsert that rode inside an ops frame', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        expect(tile.element.dataset.state).toBe('streaming');
+
+        frame(board, document, 't1', [
+            {
+                op: 'turn',
+                turnId: 't1',
+                summary: summary({ status: 'done', state: 'done', detail: 'm1', updatedAt: T + 400, usage: { input: 150, cached: 40, output: 12 } })
+            }
+        ]);
+
+        expect(tile.element.dataset.state).toBe('done');
+        expect(tile.element.querySelector('.tile-status-text')?.textContent).toBe('done');
+    });
+});
+
+describe('the compiled flow', () => {
+    it('streams prose from addressed ops into ONE block that accumulates', () => {
+        const document = documentOf([summary()], { t1: [] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [{ op: 'section:open', turnId: 't1', section: rootSection() }]);
+        frame(board, document, 't1', [{ op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n0', text: 'Hello', committed: false } }]);
+        frame(board, document, 't1', [
+            { op: 'node:append', turnId: 't1', sectionId: 't1:0', nodeId: 'n0', delta: ' **world**' },
+            { op: 'node:append', turnId: 't1', sectionId: 't1:0', nodeId: 'n0', delta: '!' }
+        ]);
+        tile.flush();
+
+        const blocks = tile.element.querySelectorAll('.agent-text');
+        expect(blocks).toHaveLength(1);
+        // One parse of the CUMULATIVE node text — the reason a reconnect cannot duplicate
+        // streamed bytes.
+        expect(blocks[0].textContent).toBe('Hello world!\n');
+        expect(tile.element.querySelector('.tile-flow')?.contains(blocks[0])).toBe(true);
+    });
+
+    it('routes a nested invocation to its own row, and detaches that row on section:remove', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [
+            // The root section's own prose, so "separation" is a real claim: both surfaces
+            // have content, and neither one can absorb the other's.
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n0', text: 'root answer', committed: false } },
+            { op: 'section:open', turnId: 't1', section: childSection() },
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:1', node: { kind: 'text', id: 'n5', text: 'delegated answer', committed: false } }
+        ]);
+        tile.flush();
+
+        const row = board.element.querySelector<HTMLElement>('.thread-row[data-thread-id="t1:1"]');
+        expect(row).not.toBeNull();
+        // The nested invocation's surfaces live in the `.thread-children` host, a SIBLING of
+        // the card (turns.ts:2615-2618) — the turn's own flow never moves, which is also why
+        // `tile.element` (the card) can never contain a delegated block.
+        expect(row?.parentElement?.className).toBe('thread-children');
+        expect(row?.querySelector('.agent-text')?.textContent).toBe('delegated answer\n');
+
+        // Two surfaces, one per section, with no bleed in either direction.
+        const own = tile.element.querySelectorAll('.tile-flow .agent-text');
+        expect(own).toHaveLength(1);
+        expect(own[0].textContent).toBe('root answer\n');
+        expect(board.element.querySelectorAll('.agent-text')).toHaveLength(2);
+
+        // A placeholder section that never produced a node is discarded by id
+        // (turn-projector.ts:1567); its row must go with it, and the turn's own prose stays.
+        frame(board, document, 't1', [{ op: 'section:remove', turnId: 't1', sectionId: 't1:1' }]);
+
+        expect(board.element.querySelectorAll('.thread-row')).toHaveLength(0);
+        expect(board.element.querySelectorAll('.agent-text')).toHaveLength(1);
+        expect(tile.element.querySelector('.tile-flow .agent-text')?.textContent).toBe('root answer\n');
+    });
+
+    it('rewrites a pending status line IN PLACE on a node:set {text} patch', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'notice', id: 'pending', tone: 'info', text: 'pending \u00b7 read 1.2s' } }
+        ]);
+        frame(board, document, 't1', [
+            { op: 'node:set', turnId: 't1', sectionId: 't1:0', nodeId: 'pending', patch: { text: 'pending \u00b7 read 2.4s' } }
+        ]);
+
+        const lines = tile.element.querySelectorAll('.agent-notice');
+        // One line, rewritten — not a second row appended on every tick of the status.
+        expect(lines).toHaveLength(1);
+        expect(lines[0].querySelector('.agent-notice-text')?.textContent).toBe('pending \u00b7 read 2.4s');
+    });
+
+    // T13: `node:set {text}` is the server REPLACING one prose node's bytes, and the
+    // compiled row must show the replacement. Two producers send it — a think window whose
+    // wire text stopped at the cap, and an answer a newer one superseded
+    // (../server/turn-projector.ts `redactSuperseded`) — and the tree a reload receives
+    // carries the same string, so a live board that kept the pre-redaction copy would be
+    // showing a document the server never sent. Rendering an addressed patch is rendering
+    // server state; it compiles no events and fetches nothing.
+    it('replaces a superseded answer with its preview in place, leaving the current one alone', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [{ op: 'section:open', turnId: 't1', section: rootSection() }]);
+        frame(board, document, 't1', [
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n0', text: 'first answer whole', committed: false } }
+        ]);
+        // The commit closes this window, so the next node opens a block of its own.
+        frame(board, document, 't1', [{ op: 'node:set', turnId: 't1', sectionId: 't1:0', nodeId: 'n0', patch: { committed: true } }]);
+        frame(board, document, 't1', [
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n1', text: 'latest answer', committed: false } }
+        ]);
+        tile.flush();
+
+        const before = tile.element.querySelectorAll('.agent-text');
+        expect(before).toHaveLength(2);
+        expect(before[0].textContent).toBe('first answer whole\n');
+        expect(before[1].textContent).toBe('latest answer\n');
+
+        // The exact patch the fold sends for a 400-character answer it has just superseded.
+        frame(board, document, 't1', [
+            {
+                op: 'node:set',
+                turnId: 't1',
+                sectionId: 't1:0',
+                nodeId: 'n0',
+                patch: { text: 'first answer\u2026', chars: 400, redacted: true }
+            }
+        ]);
+        tile.flush();
+
+        const after = tile.element.querySelectorAll('.agent-text');
+        // Repainted IN PLACE: same node, same position in the flow, no duplicate block, and
+        // the reader's current answer untouched.
+        expect(after).toHaveLength(2);
+        expect(after[0]).toBe(before[0]);
+        expect(after[0].textContent).toBe('first answer\u2026\n');
+        expect(after[1].textContent).toBe('latest answer\n');
+    });
+
+    it('replaces a think chip\u2019s body on a text patch and prints the server\u2019s exact length', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [{ op: 'section:open', turnId: 't1', section: rootSection() }]);
+        frame(board, document, 't1', [
+            {
+                op: 'node:insert',
+                turnId: 't1',
+                sectionId: 't1:0',
+                // A window the wire delivered bounded: 320 preview characters beside the
+                // EXACT 515-character count (`DisplayReasoningNode`, turn-display.ts:673).
+                node: { kind: 'reasoning', id: 'r0', text: 'x'.repeat(313) + '\u2026', share: 12, chars: 515, redacted: true }
+            }
+        ]);
+        tile.flush();
+
+        const chip = tile.element.querySelector('details.tool.think');
+        expect(chip).not.toBeNull();
+        const summaryElement = chip?.querySelector('summary');
+        // The chip's figure is the recorded length, never the preview's 320.
+        expect(summaryElement?.getAttribute('title')).toContain('515 characters');
+        expect(chip?.textContent).toContain('x'.repeat(20));
+
+        // The growth patch the fold sends after the cap: the count moves, the body does not.
+        frame(board, document, 't1', [{ op: 'node:set', turnId: 't1', sectionId: 't1:0', nodeId: 'r0', patch: { chars: 900 } }]);
+        expect(tile.element.querySelector('details.tool.think summary')?.getAttribute('title')).toContain('900 characters');
+
+        // And a later replacement patch moves the BODY too — the reason a live chip cannot be
+        // left with an empty or stale think body while the reload shows the preview.
+        frame(board, document, 't1', [
+            { op: 'node:set', turnId: 't1', sectionId: 't1:0', nodeId: 'r0', patch: { text: 'bounded preview\u2026', chars: 1_024, redacted: true } }
+        ]);
+        tile.flush();
+
+        expect(tile.element.querySelector('details.tool.think')?.textContent).toContain('bounded preview\u2026');
+        expect(tile.element.querySelector('details.tool.think summary')?.getAttribute('title')).toContain('1,024 characters');
+    });
+
+    it('replaces the tool chip on a step:set instead of appending a second one', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [{ op: 'step:set', turnId: 't1', sectionId: 't1:0', step: toolStep() }]);
+        expect(tile.element.querySelectorAll('details.tool:not(.think)')).toHaveLength(1);
+        expect(tile.element.querySelector<HTMLElement>('.tool')?.dataset.state).toBe('running');
+
+        // The settled row arrives WHOLE (no field merge), so one chip advances in place.
+        frame(board, document, 't1', [
+            {
+                op: 'step:set',
+                turnId: 't1',
+                sectionId: 't1:0',
+                step: toolStep({
+                    state: 'ok',
+                    outcome: 'completed',
+                    preview: 'ok',
+                    durationMs: 800,
+                    endedAt: T + 800,
+                    detail: { stepId: '7', resultStepId: '9', hasResult: true, truncated: false }
+                })
+            }
+        ]);
+
+        const chips = tile.element.querySelectorAll('details.tool:not(.think)');
+        expect(chips).toHaveLength(1);
+        expect(chips[0].dataset.state).toBe('ok');
+        expect(chips[0].querySelector('.tool-name')?.textContent).toBe('read');
+        // The server-measured span, not a wall-clock guess.
+        expect(chips[0].querySelector('.tool-duration')?.textContent).toBe('0.8s');
+    });
+
+    it('refuses a frame whose turn this board does not hold, and leaves the DOM alone', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        const foreign: TurnDisplayOp[] = [{ op: 'node:insert', turnId: 't9', sectionId: 't9:0', node: { kind: 'text', id: 'n0', text: 'elsewhere', committed: false } }];
+
+        expect(frame(board, document, 't9', foreign)).toBe(false);
+        expect(board.find('t9')).toBeUndefined();
+        expect(tile.element.querySelectorAll('.agent-text')).toHaveLength(0);
+
+        expect(frame(board, document, 't1', [{ op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n0', text: 'mine', committed: false } }])).toBe(true);
+        tile.flush();
+        expect(tile.element.querySelectorAll('.agent-text')).toHaveLength(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — the lazy detail: absent until the click, once, exact, and recoverable
+// ---------------------------------------------------------------------------
+
+describe('the lazy step detail', () => {
+    // The board renders a compact chip whose full payloads live behind ONE route.
+    const withChip = (loadStepDetail: (input: { turnId: string; stepId: string; sessionId?: string }) => Promise<TurnStepDetail>) => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount({ loadStepDetail });
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [{ op: 'step:set', turnId: 't1', sectionId: 't1:0', step: toolStep() }]);
+
+        return { board, document, tile, chip: tile.element.querySelector<HTMLElement>('.tool') as HTMLElement };
+    };
+
+    it('sends no detail request while the board renders, and exactly one on the click', async () => {
+        const load = vi.fn(async () => recordedPair());
+        const { chip } = withChip(load);
+
+        // R3: nothing about a tool call's payload moves before the reader asks.
+        expect(load).not.toHaveBeenCalled();
+
+        chip.querySelector<HTMLElement>('.tool-summary')?.click();
+        await settled();
+
+        expect(load).toHaveBeenCalledTimes(1);
+        // Addressed by the server's own ids, with the board's bound session — never by
+        // name, never by position.
+        expect(load.mock.calls[0]?.[0]).toEqual({ sessionId: 's1', turnId: 't1', stepId: '7' });
+
+        // A reopen is free: the pair is already here, so the route is not asked twice.
+        chip.querySelector<HTMLElement>('.tool-summary')?.click();
+        await settled();
+        expect(load).toHaveBeenCalledTimes(1);
+    });
+
+    it('paints the exact recorded request and response into the open dialog', async () => {
+        const load = vi.fn(async () => recordedPair());
+        const { chip } = withChip(load);
+
+        chip.querySelector<HTMLElement>('.tool-summary')?.click();
+        await settled();
+
+        const dialog = document.querySelector('.dialog');
+        expect(dialog).not.toBeNull();
+
+        // The two panes hold the recorded strings verbatim — the arguments exactly as the
+        // model sent them, the whole result content, neither truncated nor re-projected.
+        // (`:first-child` would miss: the dialog wraps the body in `.dialog-body`.)
+        const panes = dialog?.querySelectorAll<HTMLElement>('.tool-section') ?? [];
+        expect(panes).toHaveLength(2);
+
+        expect(panes[0].querySelector('.code-block code')?.textContent).toBe('path=notes.md mode=full');
+        expect(panes[1].querySelector('.tool-result .code-block code')?.textContent).toBe('the whole file body, every line of it');
+        // The pane headings name the server's outcome, not a client guess.
+        expect(panes[0].querySelector('.tool-label')?.textContent).toBe('arguments');
+        expect(panes[1].querySelector('.tool-label')?.textContent).toBe('result');
+        // The compact placeholders are gone from both panes: no `open for the full result`
+        // and no `loading the recorded request…` left behind.
+        expect(dialog?.querySelectorAll('.tool-pending')).toHaveLength(0);
+    });
+
+    it('keeps the previews, says what failed, and retries on request', async () => {
+        const pair = recordedPair();
+        // First click fails, the retry succeeds: the same loader, re-armed by the dialog.
+        const load = vi
+            .fn()
+            .mockRejectedValueOnce(new Error('detail unavailable'))
+            .mockResolvedValue(pair);
+        const { chip } = withChip(load);
+
+        chip.querySelector<HTMLElement>('.tool-summary')?.click();
+        await settled();
+
+        const dialog = document.querySelector('.dialog');
+        const failure = dialog?.querySelector<HTMLElement>('.tool-pending[data-detail="error"]');
+        expect(failure?.textContent).toContain('the recorded request and response could not be loaded');
+        expect(failure?.textContent).toContain('detail unavailable');
+
+        // A dropped detail must never read as "this tool returned nothing": the Retry
+        // control re-arms THE SAME loader, addressed the same way.
+        const retry = dialog?.querySelector<HTMLButtonElement>('.tool-retry');
+        expect(retry).not.toBeNull();
+        retry?.click();
+        await settled();
+
+        expect(load).toHaveBeenCalledTimes(2);
+        expect(document.querySelector('.dialog')?.querySelector('.tool-pending')).toBeNull();
+        expect(document.querySelector('.dialog')?.querySelector('.tool-result .code-block code')?.textContent).toBe(
+            'the whole file body, every line of it'
+        );
+    });
+
+    it('issues no request at all when the embedding wired no detail route', () => {
+        // `view`, not `document`: the local raw view would otherwise shadow the global
+        // `document` this test needs for the DOM below.
+        const view = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), view);
+
+        frame(board, view, 't1', [{ op: 'step:set', turnId: 't1', sectionId: 't1:0', step: toolStep() }]);
+        tile.element.querySelector<HTMLElement>('.tool-summary')?.click();
+
+        // The chip still opens and still shows its bounded previews: an unwired embed does
+        // not pretend to have the payload.
+        expect(document.querySelector('.dialog')).not.toBeNull();
+        expect(document.querySelector('.tool-peek')?.textContent).toBe('path=notes');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T16 (R16a) — a transient retry is server-internal: no line, status unchanged
+// ---------------------------------------------------------------------------
+
+// The whole browser-visible surface of ONE failed model attempt, exactly as the fold
+// sends it (../server/turn-projector.ts `case 'retry'`, values captured from the real
+// projector): the abandoned attempt's bar segment and its nodes go, and NOTHING is
+// inserted. The `attempt N of M failed · retrying in Xs · <error>` line the fold used to
+// mint is gone, because the server retries the same request internally and eleven lines
+// of it read like eleven failures.
+const abandonedAttempt = (nodes: string[]): TurnDisplayOp[] => [
+    { op: 'context:remove', turnId: 't1', sectionId: 't1:0', blockId: '0-assistant-0' },
+    { op: 'attempt:discard', turnId: 't1', sectionId: 't1:0', nodeIds: nodes }
+];
+
+describe('a retry the reader never sees (T16, R16a)', () => {
+    it('discards the attempt with no notice line and keeps the tile streaming', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        // The abandoned attempt streamed prose, exactly as the fold sends it: an empty
+        // `node:insert`, then one `node:append` per delta, each in its own frame.
+        frame(board, document, 't1', [
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n0', text: '', committed: false } }
+        ]);
+        frame(board, document, 't1', [{ op: 'node:append', turnId: 't1', sectionId: 't1:0', nodeId: 'n0', delta: 'half a sentence' }]);
+        tile.flush();
+
+        expect(tile.element.querySelector('.agent-text')?.textContent).toBe('half a sentence\n');
+
+        frame(board, document, 't1', abandonedAttempt(['n0']));
+        tile.flush();
+
+        // The abandoned prose is gone AND nothing replaced it: no notice line, and the
+        // words that used to make one appear nowhere in the tile.
+        expect(tile.element.querySelectorAll('.agent-text')).toHaveLength(0);
+        expect(tile.element.querySelectorAll('.agent-notice')).toHaveLength(0);
+        expect(tile.element.textContent ?? '').not.toContain('half a sentence');
+        expect(tile.element.textContent ?? '').not.toMatch(/retry/i);
+
+        // R16a's other half: the status is a SERVER section state, and a retry moves none
+        // of it, so the run still reads as streaming while the backoff waits.
+        expect(tile.state()).toBe('streaming');
+        expect(tile.element.dataset.state).toBe('streaming');
+    });
+
+    it('replays the same silence from the compiled document a reload receives', () => {
+        // The tree the fold hands a reload after two abandoned attempts: the surviving
+        // answer only. There is no notice node in it, so the reload path cannot print one.
+        const reloaded = documentOf([summary()], {
+            t1: [rootSection({ nodes: [{ kind: 'text', id: 'n5', text: 'the answer', committed: true }] })]
+        });
+        const { board } = mount();
+        const tile = board.reconcileView(reloaded)[0];
+
+        tile.flush();
+
+        expect(tile.element.querySelectorAll('.agent-text')).toHaveLength(1);
+        expect(tile.element.querySelector('.agent-text')?.textContent).toBe('the answer\n');
+        expect(tile.element.querySelectorAll('.agent-notice')).toHaveLength(0);
+        expect(tile.element.textContent ?? '').not.toMatch(/retry/i);
+        expect(tile.state()).toBe('streaming');
+    });
+
+    it('still prints the terminal failure once the retries run out', () => {
+        // What the fold sends when the budget is exhausted: an `error`-tone notice with
+        // the LAST attempt's own message (../core/agent.ts:604-605 throws it, and the
+        // harness reports it as the turn's `error` event), then the row settling. Dropping
+        // the per-attempt lines must not drop this one — it is the outcome the reader acts
+        // on.
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', abandonedAttempt(['n0']));
+        frame(board, document, 't1', [
+            {
+                op: 'node:insert',
+                turnId: 't1',
+                sectionId: 't1:0',
+                node: { kind: 'notice', id: 'n7', tone: 'error', text: 'Request failed: HTTP 503', at: T }
+            }
+        ]);
+        frame(board, document, 't1', [
+            { op: 'section:set', turnId: 't1', sectionId: 't1:0', patch: { state: 'error', endedAt: T + 100 } },
+            { op: 'turn', turnId: 't1', summary: summary({ status: 'error', state: 'error', detail: 'Request failed: HTTP 503' }) }
+        ]);
+        tile.flush();
+
+        const lines = tile.element.querySelectorAll('.agent-notice');
+
+        expect(lines).toHaveLength(1);
+        expect(lines[0].dataset.tone).toBe('error');
+        expect(lines[0].querySelector('.agent-notice-text')?.textContent).toBe('Request failed: HTTP 503');
+        expect(tile.state()).toBe('error');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R3 — the terminal document reconciles what a partial connection missed
+// ---------------------------------------------------------------------------
+
+describe('reconciling a reconnect', () => {
+    it('keeps streamed text once, advances the chip, and drops a node the record no longer names', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        // Half a live connection: prose, a discarded retry attempt's notice node, one chip.
+        // The notice is what an OLDER recording carries (T16 stopped the server minting one);
+        // R19/T19 keeps the browser from printing it, so this reconciles the same tree the
+        // reconnect path has to tolerate.
+        frame(board, document, 't1', [
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'text', id: 'n0', text: 'Hal', committed: false } },
+            { op: 'node:append', turnId: 't1', sectionId: 't1:0', nodeId: 'n0', delta: 'lo' },
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: { kind: 'notice', id: 'n1', tone: 'retry', text: 'attempt 1 of 3 failed' } },
+            { op: 'step:set', turnId: 't1', sectionId: 't1:0', step: toolStep() }
+        ]);
+        tile.flush();
+        // T19 (R19): the retry-tone node painted NOTHING, and no handle exists for it either —
+        // the prose and the chip are the whole document so far.
+        expect(tile.element.querySelectorAll('.agent-notice')).toHaveLength(0);
+        expect(tile.element.textContent ?? '').not.toMatch(/retry/i);
+
+        // The drain frame: the same tree as the server holds it now — the prose
+        // committed, the retry notice gone, the chip settled. Nothing is appended twice.
+        const drained = documentOf([summary({ status: 'done', state: 'done' })], {
+            t1: [
+                rootSection({
+                    state: 'done',
+                    nodes: [
+                        { kind: 'text', id: 'n0', text: 'Hello', committed: true },
+                        {
+                            kind: 'tool',
+                            id: '7',
+                            turnId: 't1',
+                            sectionId: 't1:0',
+                            callId: 'call-1',
+                            name: 'read',
+                            argsPreview: 'path=notes',
+                            state: 'ok',
+                            outcome: 'completed',
+                            preview: 'ok',
+                            durationMs: 800,
+                            startedAt: T,
+                            endedAt: T + 800,
+                            detail: { stepId: '7', resultStepId: '9', hasResult: true, truncated: false }
+                        }
+                    ]
+                })
+            ]
+        });
+
+        const handles = board.reconcileView(drained);
+        tile.flush();
+
+        expect(handles).toHaveLength(1);
+        expect(handles[0]).toBe(tile);
+        expect(tile.element.querySelectorAll('.agent-text')).toHaveLength(1);
+        expect(tile.element.querySelector('.agent-text')?.textContent).toBe('Hello\n');
+        expect(tile.element.querySelectorAll('.agent-notice')).toHaveLength(0);
+        expect(tile.element.querySelectorAll('details.tool:not(.think)')).toHaveLength(1);
+        expect(tile.element.querySelector<HTMLElement>('.tool')?.dataset.state).toBe('ok');
+        // The tile is the SAME element: no rebuild, so an open dialog or a reader's
+        // scroll position survives the reconnect.
+        expect(tile.element.isConnected).toBe(true);
+    });
+
+    it('never lets a late, older row regress a tile the stream already advanced', () => {
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        // The observer moved the row to `done` (newer stamp)…
+        frame(board, document, 't1', [
+            { op: 'turn', turnId: 't1', summary: summary({ status: 'done', state: 'done', updatedAt: T + 400 }) }
+        ]);
+        expect(tile.element.dataset.state).toBe('done');
+
+        // …then the POST /tasks answer, captured while the task was still queued, lands.
+        board.upsertView(summary({ status: 'queued', state: 'queued', updatedAt: T + 10 }), documentOf([summary({ status: 'queued', state: 'queued', updatedAt: T + 10 })], {}));
+
+        expect(tile.element.dataset.state).toBe('done');
+        expect(tile.element.querySelector('.tile-status-text')?.textContent).toBe('done');
+    });
+});

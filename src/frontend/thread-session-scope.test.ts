@@ -234,6 +234,10 @@ it('does not poison the next session with the previous session thread ids (N1)',
     const stub = stubServer([
         snapshot({
             id: 's1',
+            // T21 R21: a first load opens the newest conversation, and this test starts
+            // in s1 (its two conversations are the baseline for the switch) — so s1
+            // carries the newest update stamp, matching its own remembered pointer.
+            updatedAt: 6,
             turns: [
                 turn({ id: 'turn-1', threadId: 'thread-1' }),
                 turn({ id: 'turn-2', index: 1, threadId: 'thread-2' })
@@ -321,6 +325,10 @@ it('keeps a live turn that an older snapshot no longer lists (N2)', async () => 
         })
     ]);
     await mount();
+    // T21 R22: a load leaves the conversation collapsed, so the steering target comes
+    // from the reader opening the running turn — which is what makes 'Steering' true.
+    byClass('.tile[data-turn-id="turn-1"] .tile-select', 'button').click();
+    await flush(1);
     expect(target()).toBe('Steering IT1');
 
     // A NEWER turn of another conversation arrives live.
@@ -370,6 +378,10 @@ it('does not restore a # chip whose target was deleted while the submit was in f
         { holdTasks: true }
     );
     await mount();
+    // T21 R22: the reader opens the conversation the draft will continue; a load alone
+    // focuses nothing.
+    byClass('.tile[data-turn-id="turn-1"] .tile-select', 'button').click();
+    await flush(1);
     expect(target()).toBe('Continuing IT1');
 
     // A real reference chip binding turn-1, plus surviving text after it.

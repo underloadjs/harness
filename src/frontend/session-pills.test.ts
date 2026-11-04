@@ -17,11 +17,14 @@
 //     rejected-submit test below) and the busy/disabled rules the rail buttons carried are
 //     unchanged;
 //   - empty state: a short hint, not the old "Locked to <harness>" sentence;
-//   - R3 (T9): `openHarnessDetails` puts that Sessions section at the top of the dialog at
+//   - R3 (T9): `openHarnessDetails` puts that Sessions section in the dialog at
 //     EVERY width (jsdom answers `matchMedia` as phone by default, and the desktop stub
 //     below proves the other half); a pill there opens the conversation and closes the
 //     dialog; closing the dialog drops the strip so the single painter never touches a
-//     detached node.
+//     detached node;
+//   - R3 (this pass): that section is the LAST block of the body, under a semantic
+//     `<hr class="harness-details-divider">`, and the dashboard carries NO create control
+//     — the header's `+` is the only one in the page.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts session-pills.test.ts
 
@@ -207,7 +210,15 @@ const stubDesktopViewport = (): void => {
 };
 
 it('lists every saved session of the harness in the dashboard behind the Instruct title', async () => {
-    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    const first = snapshot({
+        // T21 R21: a first load opens the NEWEST conversation, and every assertion below
+        // treats s1 as the one on screen — so s1 carries the newer stamp instead of
+        // tying with s2 on the fixture defaults.
+        createdAt: T,
+        updatedAt: T + 10_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('hello')]
+    });
     const second = snapshot({
         id: 's2',
         status: 'running',
@@ -215,8 +226,8 @@ it('lists every saved session of the harness in the dashboard behind the Instruc
         turns: [doneTurn('second in')]
     });
 
-    // The remembered conversation is the one the strip marks active; boot never opens a
-    // session on its own.
+    // The remembered conversation is also the newest, so the strip marks it active and
+    // the boot selection and the pointer agree (T21 R21).
     localStorage.setItem(SESSION_KEY, 's1');
 
     stubFetch((url) => {
@@ -286,12 +297,15 @@ it('lists every saved session of the harness in the dashboard behind the Instruc
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
     expect(bar.querySelector('.session-pills-empty')).toBeNull();
 
-    // R4 (T9): the dashboard's create control is the compact `+`, named in full because a
-    // bare glyph is not a name an AT can act on…
-    expect(bar.querySelector('.new-session')?.textContent).toBe('+');
-    expect(bar.querySelector('.new-session')?.getAttribute('aria-label')).toBe('New session');
-    expect(bar.querySelector('.new-session')?.title).toBe('New session');
-    // …and the header's `+` is the SAME control, same name, same class.
+    // R3 (this pass): the dashboard has NO create control — a conversation is opened and
+    // deleted here and created from the header, so the strip is its pill list alone (no
+    // button of any kind sits beside it).
+    expect(bar.querySelector('.new-session')).toBeNull();
+    // The bar element is the list container alone. (The pills themselves are `span`s that
+    // hold their own select/delete buttons, so counting buttons here would prove nothing.)
+    expect([...bar.children].map((node) => node.className)).toEqual(['session-pills']);
+    // …and the header's `+` is the page's ONLY create control now, same name, same class.
+    expect(document.querySelectorAll('.new-session')).toHaveLength(1);
     expect(headerNew().textContent).toBe('+');
     expect(headerNew().getAttribute('aria-label')).toBe('New session');
     expect(headerNew().title).toBe('New session');
@@ -331,11 +345,22 @@ it('shows only the first eight characters of a session id, never the full uuid',
 });
 
 it('opens a session from its pill, marking it active, and keeps the harness selected', async () => {
-    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    const first = snapshot({
+        // T21 R21: a first load opens the newest conversation, so this test starts on
+        // s1 and its pill press is the ONLY read of s2.
+        createdAt: T,
+        updatedAt: T + 10_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('hello')]
+    });
+    // A distinct turn id: the server mints ids per conversation, and reusing `t1` for
+    // both rows would let the board legitimately keep the tile that was already on
+    // screen across the switch (the same rule session-cycle.test.ts pins for its
+    // fixtures) instead of proving s2's transcript replaced s1's.
     const second = snapshot({
         id: 's2',
         harnessDefinition: descriptor(),
-        turns: [doneTurn('second in')]
+        turns: [{ ...doneTurn('second in'), id: 't-s2' } as SessionTurn]
     });
 
     const calls = stubFetch((url) => {
@@ -388,7 +413,14 @@ it('opens a session from its pill, marking it active, and keeps the harness sele
 });
 
 it('deletes a session from its pill with one click', async () => {
-    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    const first = snapshot({
+        // T21 R21: the newest conversation is the one a first load opens, and this test
+        // deletes the OTHER one — so s1 must be the newer row, not a tie with s2.
+        createdAt: T,
+        updatedAt: T + 10_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('hello')]
+    });
     const second = snapshot({ id: 's2', harnessDefinition: descriptor() });
 
     // The delete must not disturb the conversation on screen, so one exists.
@@ -579,11 +611,10 @@ it('puts the pills, the `+` and no refresh control at the top of the Instruct di
     const bar = byClass('.session-pills-bar-dialog', 'div');
     expect(dialog.contains(bar)).toBe(true);
 
-    // R3: the directory is the FIRST thing in the dialog, under its own caption — above
-    // the description/meta the dialog already carried.
+    // R3 (this pass): the directory is the LAST thing in the dialog — the harness's own
+    // description, totals and metadata come first, then a real `<hr>` divider, then the
+    // Sessions caption and strip under it.
     expect([...details.children].map((node) => node.className)).toEqual([
-        'harness-details-section',
-        'session-pills-bar session-pills-bar-dialog',
         'harness-details-description',
         // The aggregate totals for the SAME two conversations, between the copy and the
         // template metadata line.
@@ -591,14 +622,26 @@ it('puts the pills, the `+` and no refresh control at the top of the Instruct di
         'harness-details-meta',
         // The harness is unlocked here (no conversation is open), so the note keeps its
         // "edits apply to new sessions" line and the dialog repeats it.
-        'harness-details-note'
+        'harness-details-note',
+        'harness-details-divider',
+        'harness-details-section',
+        'session-pills-bar session-pills-bar-dialog'
     ]);
+    // The divider is a semantic rule, not a styled paragraph: an `<hr>` between the two
+    // sections, and it is the ONLY one in this body.
+    expect(details.querySelector('hr.harness-details-divider')).not.toBeNull();
+    expect(details.querySelectorAll('hr')).toHaveLength(1);
     expect(details.querySelector('.harness-details-section')?.textContent).toBe('Sessions');
+    // The section is what follows the divider, in that exact order.
+    const divider = details.querySelector('.harness-details-divider');
+    expect(divider?.nextElementSibling?.className).toBe('harness-details-section');
+    expect(divider?.nextElementSibling?.nextElementSibling).toBe(bar);
     expect(pillIds(bar)).toEqual(['s1', 's2']);
     expect(bar.querySelector('.session-pills')?.getAttribute('role')).toBe('list');
-    expect(bar.querySelector('.new-session')?.textContent).toBe('+');
+    // R3: no create affordance in the dashboard at all.
+    expect(bar.querySelector('.new-session')).toBeNull();
     expect(bar.querySelector('.refresh-sessions')).toBeNull();
-    // The existing harness context is still below it, unchanged.
+    // The existing harness context is still above the divider, unchanged.
     expect(details.querySelector('.harness-details-description')?.textContent).toBe(
         'A general instruction-following agent.'
     );
@@ -608,7 +651,14 @@ it('puts the pills, the `+` and no refresh control at the top of the Instruct di
 // a desktop browser, the header keeps the SAME two compact controls, no pill strip appears
 // under it, and the title button still opens the session dashboard with its pills.
 it('keeps the same compact header and the same dashboard at a desktop width', async () => {
-    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    const first = snapshot({
+        // T21 R21: the newest row is what a first load opens, and this fixture only
+        // answers the read for s1.
+        createdAt: T,
+        updatedAt: T + 10_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('hello')]
+    });
     const second = snapshot({ id: 's2', harnessDefinition: descriptor() });
 
     localStorage.setItem(SESSION_KEY, 's1');
@@ -651,7 +701,8 @@ it('keeps the same compact header and the same dashboard at a desktop width', as
     expect(pillIds(bar)).toEqual(['s1', 's2']);
     expect(bar.querySelector('.session-pill[data-session-id="s1"]')?.dataset.active).toBe('true');
     expect(bar.querySelectorAll('.session-pill-delete')).toHaveLength(2);
-    expect(byClass('.session-pills-bar-dialog .new-session', 'button').textContent).toBe('+');
+    // R3: the dashboard offers no create control at this width either.
+    expect(bar.querySelector('.new-session')).toBeNull();
 });
 
 // --- the dialog's aggregate totals ---------------------------------------

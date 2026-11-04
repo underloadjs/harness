@@ -158,7 +158,11 @@ const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
             }
 
             if (url === '/api/sessions' && method === undefined) {
-                return json({ sessions: [snapshot({ status: 'running', turns: [turn()] })] });
+                // The directory list mirrors what the bootstrap document embedded, so
+                // T21 R21's first-load pick cannot invent a conversation this test never
+                // asked for: `stubServer()` (no `restored`) means an empty harness, and
+                // the composer tests start on the Send path they describe.
+                return json({ sessions: restored === undefined ? [] : [restored] });
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);

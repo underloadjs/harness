@@ -95,6 +95,7 @@ import type {
     HarnessIndex,
     ModelIndex,
     ModelListRequest,
+    SessionBlockDetailResponse,
     SessionSnapshot,
     SessionStreamItem,
     SessionStepDetailResponse,
@@ -1256,6 +1257,32 @@ export const createHarnessApi = ({
             // record (./sessions.ts restoreSession), and a built-in's removal is
             // remembered as a tombstone so the next start does not re-ship it.
             if (head === 'harnesses' && segments.length === 2) {
+                // GET /harnesses/:name — read ONE definition with the SAME projection the
+                // index uses (./harnesses/descriptor.ts `describeHarness`). It exists
+                // because `agentInstructions` is per-agent instruction TEXT, so a compiled
+                // `/views` frame omits it (./sessions.ts `viewDescriptorOf`,
+                // ./protocol.ts:655-663) and the browser's configuration dialog must ask
+                // for the one definition it is about to show (../frontend/api.ts
+                // `getHarness`, called on an explicit dialog open — never in a render).
+                //
+                // Read semantics match every other catalogue read: `registry.find`
+                // resolves a legacy alias (./harnesses/registry.ts:212), unlike
+                // PATCH/DELETE which take a direct identity only, and an unknown name is
+                // the registry's own 404 wording. No body is read: the path names it.
+                if (method === 'GET') {
+                    const preset = registry.find(first);
+
+                    if (preset === undefined) {
+                        throw new HttpError(404, `Unknown harness "${first}".`);
+                    }
+
+                    return {
+                        kind: 'json',
+                        status: 200,
+                        body: { harness: describeHarness(preset, catalogue) }
+                    };
+                }
+
                 if (method === 'DELETE') {
                     // No body: a delete is identified by the path alone, so reading
                     // one would make a client that sends nothing wait for it.
@@ -1273,7 +1300,7 @@ export const createHarnessApi = ({
                 }
 
                 if (method !== 'PATCH') {
-                    throw new HttpError(405, `Use PATCH or DELETE for ${mount}/harnesses/:name.`);
+                    throw new HttpError(405, `Use GET, PATCH or DELETE for ${mount}/harnesses/:name.`);
                 }
 
                 const body = requireObjectBody<UpdateHarnessRequest>(
@@ -1862,6 +1889,25 @@ export const createHarnessApi = ({
 
                     const response: SessionStepDetailResponse = {
                         detail: store.stepDetail(first, segments[3], segments[5])
+                    };
+
+                    return { kind: 'json', status: 200, body: response };
+                }
+
+                // GET /views/:id/turns/:turnId/blocks/:blockId — ONE segment of the
+                // context bar answered EXACTLY (R8): the segment's own metadata plus its
+                // recorded bytes, for EVERY kind (the prompt, an instruction set, a think
+                // window, a superseded answer, a tool call). The bar carries no text at
+                // all, so this route is the only way a browser ever sees a historical
+                // body — one click, one request, and it answers the same before and after
+                // a restart because it reads the durable record.
+                if (segments.length === 6 && second === 'turns' && segments[4] === 'blocks') {
+                    if (method !== 'GET') {
+                        throw new HttpError(405, `Use GET for ${mount}/views/:id/turns/:turnId/blocks/:blockId.`);
+                    }
+
+                    const response: SessionBlockDetailResponse = {
+                        block: store.blockDetail(first, segments[3], segments[5])
                     };
 
                     return { kind: 'json', status: 200, body: response };

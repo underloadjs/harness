@@ -217,14 +217,22 @@ import type {
     SessionViewStreamItem,
     SessionViewSummary,
     ThreadTranscriptResponse,
+    TurnBlockDetail,
     TurnStepDetail,
     UpdateThreadTranscriptResult
 } from './protocol';
 // R1/R3/R4: the compiled display surface. The fold is SERVER-only (the browser
 // imports the types from ../shared/turn-display.ts and never this runtime), and the
 // journal is the per-step durable log the compiled memory is rebuilt from.
-import type { DisplayProjectContext, TurnDisplay, TurnDisplayOp, TurnProjector } from '../shared/turn-display';
-import { createTurnProjector, refoldTurn } from './turn-projector';
+import type {
+    ContextBlock,
+    DisplayProjectContext,
+    TurnDisplay,
+    TurnDisplayOp,
+    TurnInstructionSource,
+    TurnProjector
+} from '../shared/turn-display';
+import { createTurnProjector, refoldTurn, steerBlockKeyOf, steerBlockKeysOf, steerSubmitList } from './turn-projector';
 import { HarnessJournal } from './journal';
 import type { JournalEventRecord, JournalProblem } from './journal';
 
@@ -249,6 +257,13 @@ const MAX_PENDING_ACTIONS = 4;
 // Steered-submit audit bound per turn (F3). Only identity/timing/link metadata is
 // kept — never a second copy of the event transcript.
 const MAX_STEER_RECORDS = 64;
+
+// This ring is the OPERATIONAL record (and the compact row's list): a rolling last-64. It is
+// NOT the retention limit for what the user typed — every accepted submit's text is archived
+// on the same turn WITHOUT a cap, so a context-bar segment stays resolvable however long the
+// turn was steered (./protocol.ts `SessionTurn.steerTexts`, ./persistence.ts
+// `readSteerTexts`). The fold mints, and this store resolves, from the merged list
+// (./turn-projector.ts `steerSubmitList`).
 
 // How many no-longer-answerable request ids a session remembers. `answerAction`
 // uses this to distinguish "expired/already answered" (409) from "never existed"
@@ -454,6 +469,15 @@ type Session = {
     // Invocation id recorded by each THREAD turn's root run, keyed by turn id. The
     // roster exposes it as originInvocationId and it survives a restart.
     turnInvocations: Map<string, string>;
+    // T9/T10: the system-instruction TEXT each turn's agents actually ran with, keyed
+    // by turn id (one entry per agent). No harness event carries an instruction, so
+    // this is the only honest source for the context bar's `system` segment: the store
+    // freezes it when a turn starts (and again when a new agent's `start` is recorded),
+    // and a later instruction edit cannot move a count that is already recorded.
+    //
+    // Absent for an agent with no recorded evidence (a legacy document), and the fold
+    // then emits NO system segment rather than guessing one from today's catalogue.
+    turnInstructionSources: Map<string, TurnInstructionSource[]>;
     // F6: every invocation observed in a persistent conversation, mapped to that
     // thread (invocation id → persistent thread id). A child conversation can run
     // many times; the runtime record keeps only the LATEST invocation id, so this
@@ -800,12 +824,31 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
         ? {}
         : {
               steers: turn.steers.map((steer) => ({
+                  // T13 identity, copied like every other field: a response must not be
+                  // able to hand back a steer whose segment key differs from the stored
+                  // record's, and the fold keys its context segment from it.
+                  ...(steer.id === undefined ? {} : { id: steer.id }),
                   at: steer.at,
                   prompt: steer.prompt,
                   ...(steer.threadId === undefined ? {} : { threadId: steer.threadId }),
                   ...(steer.references === undefined
                       ? {}
                       : { references: steer.references.map((reference) => ({ ...reference })) })
+              }))
+          }),
+    // T14: the steer text archive rides with the turn record, because that is what makes a
+    // displayed context-bar segment resolvable after the 64-entry audit ring has moved past
+    // it — and what makes it disappear correctly when the turn itself is deleted, reset or
+    // removed with its conversation. Detached like every other field: a response may not
+    // rewrite the stored text.
+    ...(turn.steerTexts === undefined
+        ? {}
+        : {
+              steerTexts: turn.steerTexts.map((entry) => ({
+                  id: entry.id,
+                  at: entry.at,
+                  prompt: entry.prompt,
+                  ...(entry.threadId === undefined ? {} : { threadId: entry.threadId })
               }))
           })
 });
@@ -839,6 +882,23 @@ const addUsage = (prior: HarnessUsage | undefined, next: HarnessUsage): HarnessU
 const copyDescriptor = (descriptor: HarnessDescriptor): HarnessDescriptor =>
     JSON.parse(JSON.stringify(descriptor)) as HarnessDescriptor;
 
+// A descriptor for the COMPACT surface (T10, R3): the same object minus
+// `agentInstructions`, which is per-agent system-prompt TEXT
+// (./protocol.ts `HarnessDescriptor.agentInstructions`). Forwarding it in every view
+// frame would put the whole system prompt of every member on the default wire — the
+// exact payload class R1/R3 removes, and the reason a `/views` client reads instruction
+// content from ONE lazy block instead (`TurnBlockDetail.entries` of a `system`
+// segment). Members, promotion order, models and the rest are untouched, so every
+// existing read of this field keeps working. The RAW surface (`SessionSnapshot`) still
+// reports the descriptor VERBATIM — only the display surface trims it.
+const viewDescriptorOf = (descriptor: HarnessDescriptor): HarnessDescriptor => {
+    const copy = copyDescriptor(descriptor);
+
+    delete copy.agentInstructions;
+
+    return copy;
+};
+
 const copyTurns = (turns: readonly SessionTurn[]): SessionTurn[] => turns.map(copyTurn);
 
 // A timestamp is usable only when it is a real epoch-ms number. 0 is the projector's
@@ -852,6 +912,175 @@ const finiteAt = (value: unknown): value is number =>
 // the frame mirror and the projector agree on one definition.
 const isTerminalTurnStatus = (status: SessionTurn['status']): boolean =>
     status === 'done' || status === 'error' || status === 'cancelled';
+
+// The agent a turn's ROOT run executes as: the owner of the host thread it was
+// submitted to, else the harness entry agent (a legacy `/messages` turn and the
+// default lane both run the entry agent). Threads never change owner
+// (../types/index.ts `HarnessThreadRecord.agent`), so the answer is stable for the
+// whole life of the turn — which is what makes it safe to freeze the entry agent's
+// instruction source at the turn-start boundary.
+const runAgentOf = (session: Session, turn: SessionTurn): string => {
+    if (turn.threadId === undefined) return session.definition.primary;
+
+    return session.harness.threads().find((thread) => thread.id === turn.threadId)?.agent ?? session.definition.primary;
+};
+
+// An index the record can actually address. A segment keeps the event range it was
+// folded from, and a range is only usable while the turn still holds those events —
+// outside it the payload field stays ABSENT rather than guessing at content.
+const recordedEventAt = (turn: SessionTurn, index: number | undefined): HarnessEvent | undefined => {
+    if (index === undefined || !Number.isInteger(index) || index < 0 || index >= turn.events.length) return undefined;
+
+    return turn.events[index];
+};
+
+// The concatenated `delta` bytes of the recorded events in [from..to] of one kind —
+// exactly how a streamed answer or think window was built, so the lazy detail returns
+// the same text the projector counted (and never a preview).
+const recordedStreamText = (
+    turn: SessionTurn,
+    type: 'text' | 'reasoning',
+    from: number | undefined,
+    to: number | undefined
+): string | undefined => {
+    if (from === undefined || to === undefined) return undefined;
+    if (recordedEventAt(turn, from) === undefined || recordedEventAt(turn, to) === undefined) return undefined;
+
+    let text = '';
+    let matched = false;
+
+    for (let index = from; index <= to; index += 1) {
+        const event = turn.events[index];
+
+        if (event.type !== type || typeof event.delta !== 'string') continue;
+        text += event.delta;
+        matched = true;
+    }
+
+    return matched ? text : undefined;
+};
+
+// The EXACT recorded payload of one context segment (../shared/turn-display.ts
+// `TurnBlockDetail`). Sourced ONLY from the durable turn record and the recorded
+// instruction sources: the events in the segment's own range, the turn's prompt, the
+// steer it was minted from. A field is absent when the record holds no such bytes
+// (a call with no recorded result), never synthesized.
+const blockPayloadOf = (
+    turn: SessionTurn,
+    agent: string,
+    block: ContextBlock,
+    sources: readonly TurnInstructionSource[] | undefined
+): Pick<TurnBlockDetail, 'text' | 'args' | 'result' | 'entries'> => {
+    const payload: Pick<TurnBlockDetail, 'text' | 'args' | 'result' | 'entries'> = {};
+
+    if (block.kind === 'user') {
+        if (block.name === 'prompt') {
+            if (typeof turn.prompt === 'string') payload.text = turn.prompt;
+
+            return payload;
+        }
+
+        // Match the segment's OWN key: an idented submit keys off its durable id
+        // (`i${id}`, T13), a submit with no id off its derived `(at, length)` pair, numbered
+        // apart from any earlier submit that derives the same pair (./turn-projector.ts
+        // `steerBlockKeysOf`). The fold mints from the SAME function, so a clicked segment
+        // always resolves to the submit it was drawn from.
+        //
+        // T14: resolved over the MERGED submit list (archive first, then any ring entry the
+        // archive does not name), exactly like `syncSteerBlocks` mints. Searching the
+        // 64-entry audit ring alone is what made a 65th steer strand an older segment: the
+        // bar kept drawing it while this lookup had no bytes to return.
+        const steers = steerSubmitList(
+            turn as { steers?: SessionTurn['steers']; steerTexts?: SessionTurn['steerTexts'] }
+        );
+        const keys = steerBlockKeysOf(steers as { id?: string; at?: number; prompt: string }[]);
+        let matched = -1;
+
+        for (let position = 0; position < keys.length; position += 1) {
+            const steer = steers[position];
+
+            if (steer === null || typeof steer !== 'object' || typeof steer.prompt !== 'string') continue;
+            if (!block.id.endsWith(`-user-${keys[position]}`)) continue;
+
+            matched = position;
+            break;
+        }
+
+        // LEGACY RECORDS ONLY. A submit that carries an id has a unique key, so a miss above
+        // is a real miss and stays an honest absence. Only an id-less ring — where trimming
+        // an older colliding submit renumbered the survivors — may fall back to the key
+        // WITHOUT its occurrence suffix, and even then it answers with the first submit that
+        // still carries that base key.
+        const legacyOnly = steers.every((steer) => typeof steer?.id !== 'string' || steer.id.trim().length === 0);
+
+        if (matched === -1 && legacyOnly) {
+            const suffix = block.id.slice(block.id.lastIndexOf('-user-') + '-user-'.length);
+            const base = suffix.replace(/-\d+$/, '');
+
+            for (let position = 0; position < steers.length; position += 1) {
+                const steer = steers[position];
+
+                if (steer === null || typeof steer !== 'object' || typeof steer.prompt !== 'string') continue;
+                if (steerBlockKeyOf(steer) !== base) continue;
+
+                matched = position;
+                break;
+            }
+        }
+
+        if (matched !== -1) payload.text = (steers[matched] as { prompt: string }).prompt;
+
+        return payload;
+    }
+
+    if (block.kind === 'system') {
+        const source = (sources ?? []).find((entry) => entry.agent === agent);
+
+        if (source !== undefined) payload.entries = source.instructions.map((entry) => entry);
+
+        return payload;
+    }
+
+    if (block.kind === 'reasoning') {
+        const text = recordedStreamText(turn, 'reasoning', block.eventFrom, block.eventTo);
+
+        if (text !== undefined) payload.text = text;
+
+        return payload;
+    }
+
+    if (block.kind === 'assistant') {
+        const text = recordedStreamText(turn, 'text', block.eventFrom, block.eventTo);
+
+        if (text !== undefined) {
+            payload.text = text;
+
+            return payload;
+        }
+
+        // The `done` fallback segment (no streamed deltas): its bytes live on the
+        // recorded response message, and only there.
+        const opening = recordedEventAt(turn, block.eventFrom);
+
+        if (opening?.type === 'done' && typeof opening.message?.content === 'string') payload.text = opening.message.content;
+
+        return payload;
+    }
+
+    // `tool`: the recorded arguments string and the recorded result text, from the two
+    // events the segment names. A call that never settled has NO result bytes, and a
+    // result-only segment has no call — both report exactly what exists.
+    const opening = recordedEventAt(turn, block.eventFrom);
+    const closing = recordedEventAt(turn, block.eventTo);
+
+    if (opening?.type === 'tool_call' && typeof opening.call?.arguments === 'string') payload.args = opening.call.arguments;
+
+    const resultEvent = opening?.type === 'tool_result' ? opening : closing?.type === 'tool_result' ? closing : undefined;
+
+    if (resultEvent !== undefined && typeof resultEvent.content === 'string') payload.result = resultEvent.content;
+
+    return payload;
+};
 
 // Roster WITHOUT the transcript. `SessionThread.messages` is the committed harness
 // transcript — every assistant text and every tool result verbatim (a tool result is
@@ -1176,6 +1405,8 @@ export class SessionStore {
             threadLabels: new Map(),
             threadLabelHighWater: new Map(),
             turnInvocations: new Map(),
+            // T9/T10: nothing has run yet, so no instruction source exists yet.
+            turnInstructionSources: new Map(),
             invocationThreads: new Map(),
             // C4: a fresh session has no unreadable transcript by construction.
             invalidThreads: new Map(),
@@ -1635,6 +1866,23 @@ export class SessionStore {
             ...(session.turnInvocations.size === 0
                 ? {}
                 : { turnInvocations: Object.fromEntries(session.turnInvocations) }),
+            // T9/T10: written only when a turn actually recorded a source, so a session
+            // that never ran keeps its exact pre-T10 document shape. Detached per entry:
+            // the document handed to the writer is never the live map.
+            ...(session.turnInstructionSources.size === 0
+                ? {}
+                : {
+                      turnInstructionSources: Object.fromEntries(
+                          [...session.turnInstructionSources].map(([turnId, sources]) => [
+                              turnId,
+                              sources.map((source) => ({
+                                  agent: source.agent,
+                                  instructions: [...source.instructions],
+                                  ...(source.at === undefined ? {} : { at: source.at })
+                              }))
+                          ])
+                      )
+                  }),
             ...(session.invocationThreads.size === 0
                 ? {}
                 : { invocationThreads: Object.fromEntries(session.invocationThreads) }),
@@ -2027,6 +2275,23 @@ export class SessionStore {
                     Object.entries(record.turnInvocations ?? {}).filter(([turnId]) =>
                         turns.some((turn) => turn.id === turnId)
                     )
+                ),
+                // T9/T10: the frozen instruction sources, keyed by turn id and filtered
+                // to the turns that survived (a stale id must not feed a fold for a turn
+                // nobody can address). `persistence.readSessionRecord` has already
+                // validated the shape; this only detaches the copies so a fold cannot
+                // mutate the parsed document.
+                turnInstructionSources: new Map(
+                    Object.entries(record.turnInstructionSources ?? {})
+                        .filter(([turnId]) => turns.some((turn) => turn.id === turnId))
+                        .map(([turnId, sources]) => [
+                            turnId,
+                            (Array.isArray(sources) ? sources : []).map((source) => ({
+                                agent: source.agent,
+                                instructions: [...source.instructions],
+                                ...(source.at === undefined ? {} : { at: source.at })
+                            }))
+                        ])
                 ),
                 // F6: invocation → conversation, kept across a restart so a later
                 // deletion can purge the runtime's agent-result records exactly.
@@ -2487,11 +2752,15 @@ export class SessionStore {
     // -----------------------------------------------------------------------
 
     // What the fold needs that is NOT inside one turn record: the entry agent (for
-    // `role`), the invocation→conversation label join (R8/T14), the answer-route
-    // expiry set (N4), and the store's own block projection (labels are the store's,
-    // so the fold must not re-mint them).
+    // `role`), the invocation→conversation label join (R8/T14), the invocation→
+    // CONVERSATION join (R18/T18), the answer-route expiry set (N4), and the store's
+    // own block projection (labels are the store's, so the fold must not re-mint them).
     private displayContext(session: Session): DisplayProjectContext {
-        const threadLabels = new Map<string, string>();
+        // What the store had already allocated when this fold was built. Every entry is
+        // keyed by INVOCATION id (the fold's only key space), and it covers all three of
+        // the store's joins: a delegated conversation's run, a turn's root run, and a
+        // host conversation's own latest run (see `invocationThreadLabels`).
+        const knownLabels = new Map<string, string>();
 
         // R8/T14: ADOPT persisted conversation labels before anything mints one.
         // `invocationThreadLabels` allocates for a thread whose name is not recorded,
@@ -2502,17 +2771,136 @@ export class SessionStore {
         this.ensureThreadLabels(session);
 
         for (const [invocationId, label] of Object.entries(this.invocationThreadLabels(session))) {
-            threadLabels.set(invocationId, label);
+            knownLabels.set(invocationId, label);
         }
+
+        // R18/T20: the label join is a LIVE view, exactly like `invocationThreadIds`
+        // below, and for the same reason — a projector is built ONCE per turn
+        // (`projectorFor`, line ~2867) while a delegated conversation is created in the
+        // MIDDLE of that turn.
+        //
+        // WHY IT MATTERS (the gap this closes): a copied map is frozen at the turn's
+        // first event, so `createChild`/`adoptPlaceholder` folded the delegated section
+        // with `agentLabel: ''` (`conversationLabelOf` misses), and the row only received
+        // `HR1` after a restart, when the cold replay read the fully allocated map. The
+        // label is the id a user types (`#HR1`) and the name every later turn, roster row
+        // and `#` reference has to repeat (R18), so a live board showing a DIFFERENT name
+        // than the durable record shows is not a cosmetic difference.
+        //
+        // WHY A VIEW AND NOT A SECOND MAP: allocation stays the store's single canonical
+        // sequence (`ensureThreadLabel` → `nextConversationOrdinal`, T14/F1). The eager
+        // half answers every lookup that was already knowable at fold-build time; the live
+        // half (`liveThreadLabel`) resolves a conversation the store joined after that
+        // point, reading through the SAME in-place maps (`invocationThreads` →
+        // `threadLabels`) that the persisted record is written from. A live fold therefore
+        // mints the name at the delegated run's OWN `start` frame (the recorder writes the
+        // join immediately before folding, line ~5510/5530) and the persisted document
+        // carries that exact value, so a cold replay needs no minting and live ≡ replay by
+        // construction rather than by coincidence of read order.
+        //
+        // The fold reads this map through `get` alone (../turn-projector.ts
+        // `conversationLabelOf`); the enumerable half is the frozen snapshot, which is the
+        // honest answer for `size`/iteration ("labels allocated when this fold was built")
+        // and is documented here because a future consumer that iterates must know it does
+        // not see a mid-turn arrival.
+        const threadLabels: ReadonlyMap<string, string> = {
+            get size(): number {
+                return knownLabels.size;
+            },
+            get: (invocationId: string): string | undefined =>
+                knownLabels.get(invocationId) ?? this.liveThreadLabel(session, invocationId),
+            has: (invocationId: string): boolean =>
+                knownLabels.has(invocationId) || this.liveThreadLabel(session, invocationId) !== undefined,
+            forEach: (
+                callback: (value: string, key: string, map: ReadonlyMap<string, string>) => void,
+                thisArg?: unknown
+            ): void => {
+                for (const [invocationId, label] of knownLabels) callback.call(thisArg, label, invocationId, threadLabels);
+            },
+            // The iterator members are deliberately left unannotated: the emitted lib
+            // types them as `MapIterator<…>` (which carries `Symbol.dispose`), and writing
+            // `IterableIterator<…>` here would narrow the interface and fail `tsc`.
+            keys: () => knownLabels.keys(),
+            values: () => knownLabels.values(),
+            entries: () => knownLabels.entries(),
+            [Symbol.iterator]: () => knownLabels.entries()
+        };
 
         return {
             primary: session.definition.primary,
             threadLabels,
+            // R18/T18: the invocation → persistent conversation join, handed to the fold
+            // as the LIVE map instance — deliberately NOT a snapshot copy.
+            //
+            // WHY LIVE: a projector is created ONCE per turn and cached (`projections`,
+            // line ~548), while this map keeps growing during the run — a delegated
+            // child's entry is written at ITS OWN `start` frame (line ~5484), long after
+            // the root's first event built this context. A copied map would therefore be
+            // frozen at turn start, every delegated child of a live turn would be folded
+            // without a conversation id, and the fold would have to guess one. Reading
+            // through the live instance is also what makes a cold replay produce the
+            // value at the SAME point: restore re-folds with the fully loaded map
+            // (`foldProjections` → `displayContext`), so live and replay agree exactly.
+            //
+            // WHY SAFE TO SHARE: `invocationThreads` is only ever mutated IN PLACE
+            // (`set`/`delete`/`clear`; a purge deletes, a restart rebuilds the Session and
+            // its projection cache together, line ~2298/2320) and never reassigned, so a
+            // cached projector can never be left holding a detached map. If a future
+            // restore ever replaces the field instead of filling it in place — the rule
+            // `restoreCounterMap` (line ~4056) documents for the label maps — the
+            // projector cache must be rebuilt in the same step.
+            //
+            // The fold reads it as a `ReadonlyMap`: the join is the store's authority
+            // (the roster's `SessionThreadView.invocationIds`, protocol.ts:437, is the
+            // same map projected per thread), so the projector adopts it verbatim and
+            // mints nothing of its own.
+            invocationThreadIds: session.invocationThreads,
             expiredRequestIds: new Set(session.completedActions),
             // The callback is handed the LIVE turn record the projector holds, so the
             // cast is exact (see `DisplayTurnInput`, ../shared/turn-display.ts).
-            blocksOf: (turn) => this.blocksFor(session, turn as unknown as SessionTurn)
+            blocksOf: (turn) => this.blocksFor(session, turn as unknown as SessionTurn),
+            // T9/T10: the frozen per-turn instruction sources (see
+            // `noteInstructionSource`). A turn with no recorded source gets NO system
+            // segment — the fold never substitutes today's catalogue text for evidence
+            // the record does not hold (a legacy document therefore has no system
+            // segment, honestly, instead of a fabricated count).
+            instructionSourcesOf: (turn) =>
+                session.turnInstructionSources.get((turn as unknown as SessionTurn).id)
         };
+    }
+
+    // Freeze the instruction text an agent ACTUALLY runs with — once per turn, per
+    // agent (see the field on `Session`, and `TurnInstructionSource` for why this is
+    // recorded instead of derived).
+    //
+    // Called BEFORE the turn-start checkpoint and again for every recorded `start`
+    // frame, so:
+    //   - the entry agent's source is durable before provider time is spent, and an
+    //     interrupted turn rebuilds its system segment with the same counts after a
+    //     restart (R4);
+    //   - a delegated child's agent is captured at its own first frame, so a preset
+    //     edit made mid-session cannot retro-mutate an older turn's recorded metadata
+    //     (R6).
+    private noteInstructionSource(session: Session, turnId: string, agent: string): void {
+        const recorded = session.turnInstructionSources.get(turnId);
+
+        if (recorded?.some((entry) => entry.agent === agent)) return;
+
+        const instructions = session.harness.agents?.[agent]?.instructions;
+
+        // `undefined`/non-array means NO evidence for this name (an unknown agent, or
+        // a runtime without the accessor). An EMPTY list IS evidence — the agent runs
+        // with no system message — and is recorded so the segment reports zero
+        // characters rather than disappearing.
+        if (!Array.isArray(instructions)) return;
+
+        const source: TurnInstructionSource = {
+            agent,
+            instructions: instructions.map((entry) => (typeof entry === 'string' ? entry : '')),
+            at: Date.now()
+        };
+
+        session.turnInstructionSources.set(turnId, [...(recorded ?? []), source]);
     }
 
     // One turn's result blocks, memoized by the inputs the projection reads. Without
@@ -2618,7 +3006,10 @@ export class SessionStore {
             ...(session.labelHighWater.size === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
-            harnessDefinition: copyDescriptor(session.definition),
+            // Instruction text is deliberately absent here (see `viewDescriptorOf`):
+            // the bar's `system` segment carries the COUNT, and the exact text is one
+            // block detail away.
+            harnessDefinition: viewDescriptorOf(session.definition),
             discoveredTools: [...session.harness.discoveredTools],
             turns,
             displays
@@ -2651,7 +3042,7 @@ export class SessionStore {
             ...(session.labelHighWater.size === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
-            harnessDefinition: copyDescriptor(session.definition),
+            harnessDefinition: viewDescriptorOf(session.definition),
             discoveredTools: [...session.harness.discoveredTools],
             turns
         };
@@ -2740,6 +3131,57 @@ export class SessionStore {
         }
 
         return detail;
+    }
+
+    // The lazy context-bar lookup (R8): ONE segment answered with its EXACT recorded
+    // bytes. The METADATA comes from the compiled bar itself, so an answer can never
+    // disagree with the segment that was clicked; the PAYLOAD comes from the durable
+    // turn record (the segment's own recorded event range, the turn's prompt, the steer
+    // it was minted from, or the recorded instruction source). Nothing here re-reads a
+    // preview, so the route answers identically live, after a restart, and for a session
+    // folded from a checkpoint whose journal is gone.
+    blockDetail(id: string, turnId: string, blockId: string): TurnBlockDetail {
+        const session = this.require(id);
+        const turn = session.turns.find((candidate) => candidate.id === turnId);
+
+        if (turn === undefined) throw new SessionError(404, `Unknown turn "${turnId}" in session "${id}".`);
+
+        if (typeof blockId !== 'string' || blockId.length === 0) {
+            throw new SessionError(400, 'A context block id must be the server-minted segment id.');
+        }
+
+        const display = this.projectorFor(session, turn).display();
+        const section = display.sections.find((entry) => entry.context?.some((segment) => segment.id === blockId));
+        const block = section?.context?.find((segment) => segment.id === blockId);
+
+        if (section === undefined || block === undefined) {
+            // Either it was never minted, or it belonged to a discarded attempt and was
+            // removed by id — both are honest 404s, never a synthesized body.
+            throw new SessionError(404, `Unknown context block "${blockId}" in turn "${turnId}".`);
+        }
+
+        const payload = blockPayloadOf(turn, section.agent, block, session.turnInstructionSources.get(turn.id));
+
+        // T14: a steered segment's ONLY purpose is to answer with the text the user typed.
+        // If the record cannot name that submit, this route must not answer "success" with
+        // a body-less detail: the reader clicked a segment and got an empty panel. With the
+        // durable text archive (../server/protocol.ts `SessionTurn.steerTexts`) every submit
+        // the bar draws is resolvable, so this is the legacy-document case — a submit whose
+        // audit entry the 64-entry ring has already truncated and that predates the archive.
+        // A 404 says "this segment's text is not in this document", which the board shows as
+        // an unavailable detail instead of an empty one.
+        if (block.kind === 'user' && block.name === 'steer' && !('text' in payload)) {
+            throw new SessionError(
+                404,
+                `The text of steered segment "${blockId}" is not in this turn's record.`
+            );
+        }
+
+        return {
+            ...block,
+            sessionId: session.id,
+            ...payload
+        };
     }
 
     // The whole recorded turn, verbatim — the transcript copy/export surface, which
@@ -3656,6 +4098,31 @@ export class SessionStore {
         return labels;
     }
 
+    // R18/T20: resolve the conversation label of ONE invocation at LOOKUP time, for the
+    // live fold (see `displayContext`). This is the same join the eager
+    // `invocationThreadLabels` map is built from — invocation → conversation
+    // (`session.invocationThreads`) → conversation label (`session.threadLabels`) — read
+    // through the store's own allocator, so nothing here numbers a conversation
+    // differently: `ensureThreadLabel` returns the recorded name when there is one and is
+    // the single mint for a name that is not.
+    //
+    // In the normal live path the name already exists by the time this is consulted,
+    // because the recorder allocates it in the same step it records the join
+    // (`noteInvocationThread`); the mint below is therefore only reached for a
+    // host-supplied runtime that binds the roster slot without ever passing through that
+    // recorder, and it produces exactly the value the next cold replay would read from
+    // disk. A branch invocation is never in the join map, so a branch row still resolves
+    // nothing (R18: the fold mints no identity the record does not justify).
+    private liveThreadLabel(session: Session, invocationId: string): string | undefined {
+        if (!this.threadsSupported(session)) return undefined;
+
+        const threadId = session.invocationThreads.get(invocationId);
+
+        if (threadId === undefined) return undefined;
+
+        return this.ensureThreadLabel(session, threadId);
+    }
+
     // The label counters a NEW turn starts from: one chained allocator over the
     // conversation prefix, honouring every recorded seed, raised to the tombstone
     // high-water so a retired textual label is never re-minted after its turns are
@@ -4292,6 +4759,11 @@ export class SessionStore {
 
             this.journalAppend(session, turn.id, index, at, stored);
 
+            // T10: same freeze as the model-run recorder, so a command turn's section
+            // reports the same kind of system segment (and an interrupted command turn
+            // still rebuilds it).
+            if (stored.type === 'start') this.noteInstructionSource(session, turn.id, stored.agent);
+
             const ops = projector.apply(stored, at, index);
 
             // Background durability for a non-delta event (every event here is one),
@@ -4514,25 +4986,72 @@ export class SessionStore {
         // appears in the conversation at the next model boundary; the owning turn
         // keeps what was sent, when, and which blocks it carried.
         const at = Date.now();
-        owning.steers = [
-            ...(owning.steers ?? []),
+        const submit = {
+            // T13: the submit's own durable identity, minted ONCE here. The context
+            // bar keys one segment per submit, and the two figures it used to derive
+            // that key from (`at` + text length) are not unique — a double Enter on two
+            // equal-length messages lands in the same millisecond. An id also survives
+            // the ring truncation below: trimming an older submit can never renumber a
+            // surviving one, and it is the key the T14 text archive is addressed by.
+            id: randomUUID(),
+            at,
+            prompt: input,
+            // T12b: attribute the steer to the conversation it actually
+            // reached. A parent turn owning a running CHILD records the child
+            // id; a normal steer into the owner's own thread omits the field
+            // (keeping the pre-T12b wire shape for root conversations).
+            ...(owning.threadId !== undefined && owning.threadId !== threadId
+                ? { threadId }
+                : {}),
+            ...(references.length === 0
+                ? {}
+                : { references: references.map((reference) => ({ ...reference })) })
+        };
+
+        owning.steers = [...(owning.steers ?? []), submit].slice(-MAX_STEER_RECORDS) as SessionTurn['steers'];
+
+        // T14: the durable TEXT archive, keyed by that same identity. The ring above is the
+        // operational audit (and the compact row), so its 65th submit used to strand the
+        // context bar's own segment for an older guidance text: the segment stayed on the
+        // bar, while its click had nothing left to return. This archive keeps the EXACT
+        // submitted text of EVERY submit the server accepted, so any segment the bar draws
+        // resolves — now, after a restart, and however long the turn was steered — and it is
+        // what the fold mints steered segments from (./turn-projector.ts `syncSteerBlocks`).
+        // T15: it is NOT truncated. An accepted submit is the user's own data, so the archive
+        // keeps all of it; its volume is bounded at the source instead — one entry per accepted
+        // steer, guidance is only accepted while a thread runs (the runtime drains the queue at
+        // the next safe boundary), and every submit is already capped at 200,000 characters by
+        // `validateInput`/`MAX_INPUT_LENGTH` above (line 1130) before it can reach this line.
+        // That is the same reasoning that leaves `turn.events` unbounded. The 64-entry cap
+        // above belongs to the rolling audit ring, not to this record. It carries only what a
+        // text answer needs (no `references`: the audit ring above is where the bound blocks
+        // live).
+        owning.steerTexts = [
+            ...(owning.steerTexts ?? []),
             {
+                id: submit.id,
                 at,
                 prompt: input,
-                // T12b: attribute the steer to the conversation it actually
-                // reached. A parent turn owning a running CHILD records the child
-                // id; a normal steer into the owner's own thread omits the field
-                // (keeping the pre-T12b wire shape for root conversations).
-                ...(owning.threadId !== undefined && owning.threadId !== threadId
-                    ? { threadId }
-                    : {}),
-                ...(references.length === 0
-                    ? {}
-                    : { references: references.map((reference) => ({ ...reference })) })
+                ...(submit.threadId === undefined ? {} : { threadId: submit.threadId })
             }
-        ].slice(-MAX_STEER_RECORDS) as SessionTurn['steers'];
+        ] as SessionTurn['steerTexts'];
 
         session.updatedAt = at;
+
+        // T14: steer the DISPLAY as well as the record. A steered submit is not a recorded
+        // event, so the cached fold would otherwise not draw this submit's context segment
+        // until the run's next event — while the reader has already typed it and (with the
+        // archive above) its text is durable. Adopting here means the segment is on the bar
+        // and resolvable through `blockDetail` from the moment the submit is accepted, and
+        // the returned ops go to live display watchers exactly like a recorded event's do.
+        // No cached projector means nothing to adopt yet: the turn's first event (or its
+        // settle) folds the whole submit list anyway.
+        const liveProjection = session.projections.get(owning.id);
+
+        if (liveProjection !== undefined) {
+            this.publishViewOps(session, owning.id, at, liveProjection.syncSteers(at));
+        }
+
         // Steering is delivered to a LIVE run and is lost on restart by definition
         // (the run is interrupted). The audit record is durable, but a write failure
         // must not claim the guidance was rejected: it IS queued in the runtime, so
@@ -5011,6 +5530,12 @@ export class SessionStore {
             // any provider work, so a crash mid-run leaves an explicit interrupted
             // turn instead of a prompt that vanished. A write failure here fails the
             // turn (the catch below) BEFORE it spends provider time.
+            //
+            // T10: the entry agent's instruction source is frozen INTO that same write,
+            // so an interrupted turn still rebuilds its `system` segment with the counts
+            // it ran with — and a preset/instruction edit made later cannot silently
+            // move a number a client has already been shown (R4/R6).
+            this.noteInstructionSource(session, turn.id, runAgentOf(session, turn));
             this.persistOrThrow();
 
             // Legacy disconnect → cancel THIS run only. Registered after the
@@ -5065,6 +5590,12 @@ export class SessionStore {
                 ) {
                     this.noteInvocationThread(session, record.thread.id);
                 }
+
+                // T10: freeze every agent's instruction source the moment its first
+                // frame is recorded — BEFORE the display fold reads it, so the section's
+                // `system` segment counts the bytes this run really carried, and before
+                // the next checkpoint makes them durable (live ≡ replay).
+                if (record.type === 'start') this.noteInstructionSource(session, turn.id, record.agent);
 
                 // Token tally, accumulated here so every client reads the SERVER's
                 // figure. Only the per-request `usage` event counts: the harness also
@@ -5616,6 +6147,15 @@ export class SessionStore {
             if (record.invocationId !== invocationId) continue;
 
             session.invocationThreads.set(invocationId, record.id);
+            // R18/T20: allocate the conversation's DISPLAY NAME in the same step that
+            // records the join, through the store's existing allocator (`ensureThreadLabel`,
+            // NOT a second numbering scheme). This is the earliest moment the conversation
+            // is known to exist, and the recorder folds this frame right after (line
+            // ~5530), so the delegated section is BORN with the same `agentLabel` the cold
+            // replay reads back from `threadLabels` after a restart — live ≡ replay for the
+            // label, not only for the id. A name that already exists is returned untouched,
+            // so a resumed run of one conversation never consumes another ordinal.
+            this.ensureThreadLabel(session, record.id, record.agent);
             return;
         }
     }
@@ -6052,6 +6592,10 @@ export class SessionStore {
         // conversations' raw values leave the durable record with them. (A stale
         // entry would otherwise be re-offered for a thread that no longer exists.)
         const invalidEntries = [...session.invalidThreads].filter(([id]) => !doomed.has(id));
+        // T10: an instruction snapshot belongs to a turn, so the doomed turns'
+        // snapshots leave the durable record with them (a stale key would otherwise
+        // keep re-feeding a fold for a turn the document no longer lists).
+        const instructionEntries = [...session.turnInstructionSources].filter(([turnId]) => !removedIds.has(turnId));
 
         const previous = this.sessionRecord(session);
 
@@ -6064,6 +6608,20 @@ export class SessionStore {
             ...(invocationEntries.length === 0
                 ? {}
                 : { turnInvocations: Object.fromEntries(invocationEntries) }),
+            ...(instructionEntries.length === 0
+                ? {}
+                : {
+                      turnInstructionSources: Object.fromEntries(
+                          instructionEntries.map(([turnId, sources]) => [
+                              turnId,
+                              sources.map((source) => ({
+                                  agent: source.agent,
+                                  instructions: [...source.instructions],
+                                  ...(source.at === undefined ? {} : { at: source.at })
+                              }))
+                          ])
+                      )
+                  }),
             ...(highWaterEntries.length === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries(highWaterEntries) }),
@@ -6080,6 +6638,7 @@ export class SessionStore {
         // projection (sessionRecord may have included them above).
         if (seedEntries.length === 0) delete projected.labelSeeds;
         if (invocationEntries.length === 0) delete projected.turnInvocations;
+        if (instructionEntries.length === 0) delete projected.turnInstructionSources;
         if (highWaterEntries.length === 0) delete projected.labelHighWater;
         if (threadLabelEntries.length === 0) delete projected.threadLabels;
         if (threadLabelHighWaterEntries.length === 0) delete projected.threadLabelHighWater;
@@ -6130,6 +6689,7 @@ export class SessionStore {
         for (const removed of removedIds) {
             session.labelSeeds.delete(removed);
             session.turnInvocations.delete(removed);
+            session.turnInstructionSources.delete(removed);
 
             // Release anyone awaiting a removed turn's completion (nothing else
             // will settle it) and forget its cached settler.
@@ -6214,6 +6774,11 @@ export class SessionStore {
         session.threadLabels.clear();
         session.threadLabelHighWater.clear();
         session.turnInvocations.clear();
+        // T10: the recorded instruction snapshots belong to the conversation that just
+        // ended. The NEXT turn re-freezes them from the agent it actually runs with, so
+        // a reset is also the one moment a historical `system` count is allowed to
+        // change — there is no historical turn left to hold it.
+        session.turnInstructionSources.clear();
         session.invocationThreads.clear();
         // C4: every conversation is gone, so an unreadable transcript from this
         // conversation has nothing left to describe. A reset starts the raw-JSON

@@ -26,7 +26,7 @@
 //   GET    views/:id/events            SSE SessionViewStreamItem
 //   POST   views/:id/tasks             202                   -> SubmitTaskViewResult
 //   POST   views/:id/actions/:requestId/answer               -> { ok }
-//   GET    views/:id/threads/:threadId/transcript            -> { transcript }
+//   GET    views/:id/threads/:threadId/transcript            -> ThreadTranscriptResponse (bare)
 //   PUT    views/:id/threads/:threadId/transcript            -> { view, transcript }
 //   POST   views/:id/threads/:threadId/cancel                -> { cancelled, view }
 //   DELETE views/:id/threads/:threadId                       -> { deleted, view }
@@ -63,6 +63,7 @@ import type {
     SessionViewStreamItem,
     SessionViewSummary,
     SubmitTaskViewResult,
+    TurnBlockDetail,
     TurnStepDetail
 } from '../server/protocol';
 import { apiUrl, readEventStream, readStreamError, request } from './api';
@@ -243,15 +244,28 @@ export const answerViewAction = async (
 export type ThreadTranscriptViewPayload = ThreadTranscriptResponse;
 
 // `GET views/:id/threads/:threadId/transcript`.
+//
+// The two surfaces envelope the SAME value differently: the display route answers with the
+// bare `ThreadTranscriptResponse` (`{threadId, agent, messages, raw, invalid?}`,
+// protocol.ts:856, served at src/server/api.ts:1923) while its raw twin wraps it in
+// `{ transcript }` (src/server/api.ts:1636). Accepted in either shape so one client reads
+// both mirrors, and a malformed 200 still yields a document the editor can show rather
+// than an `undefined` it would throw on — the dialog's own "unreadable transcript" path
+// is for a value the USER broke, not for an envelope the server changed.
 export const getThreadTranscript = async (
     sessionId: string,
     threadId: string
 ): Promise<ThreadTranscriptViewPayload> => {
-    const body = await request<{ transcript: ThreadTranscriptViewPayload }>(
+    const body = await request<ThreadTranscriptViewPayload & { transcript?: ThreadTranscriptViewPayload }>(
         `/views/${encodeURIComponent(sessionId)}/threads/${encodeURIComponent(threadId)}/transcript`
     );
+    const candidate = body?.transcript ?? body;
 
-    return body.transcript;
+    if (candidate === null || typeof candidate !== 'object' || typeof candidate.threadId !== 'string') {
+        return { threadId, agent: '', messages: [], raw: '[]' };
+    }
+
+    return candidate;
 };
 
 // `PUT views/:id/threads/:threadId/transcript` — replace the transcript. The body is
@@ -363,6 +377,31 @@ export const getStepDetail = async (
     return body.detail;
 };
 
+// `GET views/:id/turns/:turnId/blocks/:blockId` — the ONE on-click request for one
+// segment of a turn's context bar (T11, R8). `blockId` is `ContextBlock.id`
+// (`${sectionOrdinal}-${kind}-${key}`, src/shared/turn-display.ts:381), an id the bar
+// never renumbers, so an address captured before a restart still resolves after it
+// (invariant 4).
+//
+// The answer is `{ block: TurnBlockDetail }`: the segment's OWN metadata embedded by
+// value, plus the exact recorded bytes for that kind — `text` for a prompt/answer/
+// reasoning window, `args`+`result` for a tool call, `entries` for an instruction set
+// (../server/protocol.ts:701-714). Nothing on the default wire carries any of that text,
+// which is why opening one segment costs one request and rendering five hundred costs
+// none. A 404 names an unknown session/turn/block, and the caller renders that as a
+// stated failure rather than an empty payload.
+export const getBlockDetail = async (
+    sessionId: string,
+    turnId: string,
+    blockId: string
+): Promise<TurnBlockDetail> => {
+    const body = await request<{ block: TurnBlockDetail }>(
+        `/views/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/blocks/${encodeURIComponent(blockId)}`
+    );
+
+    return body.block;
+};
+
 // `GET views/:id/turns/:turnId/raw` — the verbatim recorded turn (events +
 // eventTimes). Reached ONLY from an explicit copy/export action (the JSON transcript
 // in ui/thread-transcript.ts), never from a render path.
@@ -409,39 +448,31 @@ export const getThreadTurnsRaw = async (
 // A session-level raw read, for the ONE surface that quotes recorded events (the
 // thread transcript / JSON export). Explicit user action only.
 //
-// Preferred route: `GET views/:id/raw` -> the verbatim recorded document, one
-// request. When a server has not (yet) mounted that route, the same document is
-// COMPOSED from the frozen per-turn route: the caller passes the turn ids the
-// transcript actually needs (./view-state.ts `transcriptTurnIdsOf` derives them from
-// COMPILED rows and section invocations, so no event is read to decide what to
-// fetch), and each named turn is fetched verbatim. Composition therefore stays
-// bounded to the turns that matter instead of pulling every event of every
-// conversation, which is what made the raw `GET /sessions/:id` answer enormous.
+// There is NO session-level raw route on the display surface (`GET /views/:id/raw` is not
+// mounted — src/server/api.ts routes `views/:id` read/patch/delete and nothing else), so
+// the document is COMPOSED from the frozen routes the browser can always rely on:
+//
+//   1. `GET /views/:id`                  — the header, the compact roster (`threadViews`)
+//                                          and the invalid-thread records;
+//   2. `GET .../threads/:id/transcript`  — each conversation's committed `messages`, which
+//                                          the compact roster reports as a COUNT only;
+//   3. `GET .../turns/:id/raw`           — the verbatim recorded turns the document quotes.
+//
+// Everything is bounded to what the export names: `turnIds` selects the turns
+// (`./view-state.ts` `transcriptTurnIdsOf` derives them from COMPILED rows and section
+// invocations, so no event is read to decide what to fetch) and the roster subset selects
+// the transcripts. Composing therefore stays far below the raw `GET /sessions/:id` answer,
+// which ships every event of every turn AND every thread's full transcript.
+//
+// The roster is rebuilt as `SessionThread[]` (identity fields verbatim from
+// `SessionThreadView`, plus the messages) because `ui/thread-transcript.ts` quotes the raw
+// roster shape: `buildThreadTranscriptJson` reads `snapshot.threads[].messages`, and a
+// document without them would report the conversation as an unknown thread.
 // Omit `turnIds` to compose every turn of the session.
 export const getRawSession = async (
     sessionId: string,
     turnIds?: readonly string[]
 ): Promise<SessionSnapshot> => {
-    let session: SessionSnapshot | undefined;
-
-    try {
-        // The answer is accepted in EITHER shape: the bare document, or the `{session}` envelope
-        // the raw read uses on the `/sessions` surface (protocol.ts:458). A server is free to mount
-        // this route either way, and a client that guesses one shape loses the transcript on the
-        // other — which is exactly the failure this normalizer exists to prevent.
-        const payload = await request<SessionSnapshot & { session?: SessionSnapshot }>(
-            `/views/${encodeURIComponent(sessionId)}/raw`
-        );
-        const candidate = payload?.session ?? payload;
-        session = typeof candidate?.id === 'string' ? candidate : undefined;
-    } catch {
-        // Not mounted, or the route itself answered an error: compose below from the
-        // frozen per-turn contract, which the browser can always rely on.
-    }
-
-    // A session-level answer already satisfies an unfiltered request.
-    if (session !== undefined && (turnIds === undefined || turnIds.length === 0)) return session;
-
     const view = await getView(sessionId);
     const rows = Array.isArray(view.turns) ? view.turns : [];
     const ids =
@@ -450,16 +481,50 @@ export const getRawSession = async (
             : rows.map((summary) => (summary as { id: string }).id);
 
     const turns = await getThreadTurnsRaw(sessionId, view, ids);
+    const threads = await getRosterWithTranscripts(sessionId, view);
 
-    // The named-turns variant keeps every header field of the answer this browser
-    // already renders (roster, harness definition, invalid threads) and swaps in the
-    // recorded turns the export quotes. `messages` is the entry agent's transcript,
-    // which the view does not ship, so an empty array is the honest answer.
-    if (session !== undefined) return { ...session, turns };
-
+    // Every header field of the document this browser renders (roster, harness definition,
+    // invalid threads) survives; `messages` is the ENTRY agent's transcript, which the
+    // compiled view does not ship at all, so an empty array is the honest answer.
     return {
         ...(view as unknown as Omit<SessionSnapshot, 'turns' | 'messages'>),
         messages: [],
+        ...(threads.length === 0 ? {} : { threads }),
         turns
     } as SessionSnapshot;
+};
+
+// The compact roster expanded into the raw shape, one lazy transcript read per
+// conversation. Sequential on purpose (the same rule as `getThreadTurnsRaw`): opening one
+// transcript must not fan out a burst of requests. A conversation whose transcript read
+// fails keeps `messages: []` — the roster identity is what the document needs to exist,
+// and the dialog reports an unreadable transcript from `invalidThreads` (the view carries
+// those records verbatim), never from a missing row.
+export const getRosterWithTranscripts = async (
+    sessionId: string,
+    view: SessionView
+): Promise<SessionThread[]> => {
+    // A document that already carries the raw roster (a raw-surface read, or a server that
+    // ships `threads` on the view) needs no extra request at all.
+    if (Array.isArray(view.threads) && view.threads.length > 0) return view.threads;
+
+    const compact = Array.isArray(view.threadViews) ? view.threadViews : [];
+
+    const threads: SessionThread[] = [];
+    for (const entry of compact) {
+        let messages: SessionThread['messages'] = [];
+
+        try {
+            const transcript = await getThreadTranscript(sessionId, entry.id);
+
+            messages = Array.isArray(transcript.messages) ? transcript.messages : [];
+        } catch {
+            // Gone between the compiled read and this export: the identity row still
+            // describes the conversation, and its transcript is simply empty here.
+        }
+
+        threads.push({ ...(entry as unknown as SessionThread), messages });
+    }
+
+    return threads;
 };

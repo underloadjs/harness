@@ -371,10 +371,15 @@ it('opens a new unfocused submit as an independent RR4 conversation', async () =
         'thread-3'
     ]);
 
-    // Explicit unfocus. The `.thread-strip-unfocus` band is gone (ui/threads.ts no
+    // Explicit unfocus. T21 R22: a load opens NOTHING, so "unfocused" is where the
+    // reader starts — and the collapse below needs an open card, so the reader expands
+    // one first. The `.thread-strip-unfocus` band is gone (ui/threads.ts no
     // longer builds `.thread-strip*`), so the remaining "New thread" gesture is the
     // tile-header collapse: clicking `.tile-select` of the ALREADY-EXPANDED tile runs
     // ui/turns.ts `collapse` (line ~1527), which sets `explicitUnfocus = true`.
+    byClass('.tile .tile-select', 'button').click();
+    await flush();
+
     const expanded = document.querySelector<HTMLElement>('.tile.is-expanded');
     if (expanded === null) throw new Error('missing element .tile.is-expanded');
     const unfocus = expanded.querySelector<HTMLButtonElement>('.tile-select');

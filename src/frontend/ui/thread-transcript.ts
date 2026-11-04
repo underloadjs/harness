@@ -109,6 +109,10 @@ import type {
 import type { ThreadTranscriptPayload } from '../api';
 import { UNKNOWN_THREAD_LABEL, invalidThreadsOf, threadNameOf, turnThreadIdOf } from './threads';
 import type { InvalidThreadRecord, SessionThreadEntry } from './threads';
+// The app's one payload viewer (line numbers + soft wrap + byte-exact text). It lives in
+// ./tools.ts next to the tool panes it was built for; see `readContent` below for why this
+// surface needs the `tool-code` class rather than its own.
+import { createPayloadViewer } from './tools';
 
 // One invocation event found in a turn owned by ANOTHER thread. `threadId` is the
 // persistent conversation the invocation was attributed to (absent when the event
@@ -582,6 +586,20 @@ const metaRow = (text: string, copy: () => string): HTMLParagraphElement => {
 // scroll, then the action row — styles.css `.dialog-body--fill > .thread-transcript` is
 // the flex chain that keeps the first and the last row on screen while the middle one
 // scrolls.
+//
+// R1 (payload views): the document renders through `createPayloadViewer` — the same
+// line-numbered, soft-wrapped viewer a tool pane uses — with `json` as its language, so
+// the transcript reads like the code it is. Two contracts this has to keep exactly:
+//   - `documentCopyText` reads `surface.textContent`, and the viewer's rows/separators are
+//     laid out so that text is BYTE-IDENTICAL to `input.json` (the numbers are CSS
+//     generated content, never text nodes), so Copy and every consumer are unchanged;
+//   - the host class stays on the node, because styles.css owns its flex sizing, its
+//     height cap and its `:focus-visible` ring through `.thread-transcript-json`. The
+//     viewer adds `.tool-code`, which is what outranks `ui/dialog.css`
+//     `.dialog-body pre { white-space: pre }` (0,1,1 beats 0,1,0) — the cascade trap that
+//     made this box scroll sideways instead of wrapping.
+export const THREAD_TRANSCRIPT_JSON_CLASS = 'thread-transcript-json';
+
 const readContent = (input: {
     name: string;
     meta: string;
@@ -590,8 +608,7 @@ const readContent = (input: {
 }): HTMLElement => {
     const host = el('div', 'thread-transcript');
 
-    const json = el('pre', 'thread-transcript-json');
-    json.textContent = input.json;
+    const json = createPayloadViewer(input.json, 'json', THREAD_TRANSCRIPT_JSON_CLASS);
     // Screen readers get the same disclosure that is copied; the <pre> is the
     // accessible reading surface for the document.
     json.setAttribute('aria-label', `JSON transcript of thread ${input.name}`);

@@ -169,6 +169,12 @@ const stubHarnessWrites = (initial: HarnessDescriptor) => {
                 return json({ harness: current });
             }
 
+            // T11: opening the configuration dialog reads ONE definition, because a `/views`
+            // frame omits `agentInstructions` (../server/protocol.ts:655-663). The answer is
+            // the same authoritative descriptor the catalogue holds, so a test that never opens
+            // the dialog never sees this branch.
+            if (url === '/api/harnesses/instruct' && init === undefined) return json({ harness: current });
+
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
         }))
     );

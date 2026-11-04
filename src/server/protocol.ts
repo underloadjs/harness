@@ -23,7 +23,7 @@ import type { AgentResultReference } from '../shared/agent-results';
 // envelopes below embed its shapes. `import type` only: this file stays free of any
 // runtime dependency, and `../shared/turn-display.ts` never imports this file back,
 // so the dependency direction is one-way with no cycle at any level.
-import type { TurnDisplay, TurnDisplayOp, TurnStepDetail, TurnSummary } from '../shared/turn-display';
+import type { TurnBlockDetail, TurnDisplay, TurnDisplayOp, TurnStepDetail, TurnSummary } from '../shared/turn-display';
 
 export type {
     HarnessActionAnswer,
@@ -59,6 +59,9 @@ export type { AgentResultReference, AgentResultBlock, AgentResultStatus } from '
 // anything that names `SessionThread`/`HarnessDescriptor`/`SessionSteerRecord` is
 // declared here instead.
 export type {
+    ContextBlock,
+    ContextBlockKind,
+    ContextBlockPatch,
     DisplayActionOption,
     DisplayActionSummary,
     DisplayAttachmentSummary,
@@ -81,9 +84,11 @@ export type {
     DisplayTurnInput,
     SectionDisplayState,
     StepDisplayState,
+    TurnBlockDetail,
     TurnDisplay,
     TurnDisplayOp,
     TurnDisplayState,
+    TurnInstructionSource,
     TurnProjector,
     TurnRecordStatus,
     TurnSection,
@@ -174,10 +179,58 @@ export type SessionTurn = {
     // exact shape. Never contains attachments (those are never steered — see
     // SubmitTaskRequest.threadId).
     steers?: SessionSteerRecord[];
+    // T14 (ADDITIVE): the durable TEXT ARCHIVE of this turn's steered submits.
+    //
+    // `steers` above is the operational AUDIT ring: the store keeps the last 64 (see
+    // ./sessions.ts `MAX_STEER_RECORDS`, and ./persistence.ts enforces the same bound when
+    // it reads a document), and the compact row publishes that ring. That bound is about
+    // the size of the audit and the wire, NOT about how much of the conversation the UI may
+    // show: every submit the context bar drew must stay clickable, and a 65th steer used to
+    // silently strand its own segment — the bar still showed it, while its detail had
+    // nothing to return. This archive keeps the exact submitted text of EVERY submit the
+    // server accepted, keyed by the submit's own `id`, so a segment resolves now, after a
+    // restart, and after the ring has moved on.
+    //
+    // T15: the list is UNBOUNDED on purpose. A submit the server accepted is the user's own
+    // data, so nothing is discarded to keep a document small; the count is already limited at
+    // the source (guidance is only accepted while a thread runs, and ./sessions.ts
+    // `validateInput` caps every submit at `MAX_INPUT_LENGTH` characters), exactly as
+    // `events` above is unbounded for the same reason. The reader therefore validates every
+    // entry and refuses no length (./persistence.ts `readSteerTexts`).
+    //
+    // Deliberately NOT part of the default wire: the bar is metadata (`ContextBlock`), the
+    // row carries the bounded audit ring, and the archived text is read only by the one
+    // lazy route a click costs (./sessions.ts `blockDetail`). Optional and additive: a
+    // document written before this build has no archive, and the fold/lookup fall back to
+    // whatever the surviving ring still holds rather than inventing text.
+    steerTexts?: SessionSteerText[];
+};
+
+// One archived steered submit: identity, timing, destination and the EXACT text the user
+// submitted (the same `prompt` bytes the audit ring keeps, kept for every submit instead of
+// only the last 64). `references` is intentionally absent: the archive exists to answer a
+// click with text, and the audit ring stays the place the bound blocks are recorded.
+export type SessionSteerText = {
+    // The submit's durable identity (`SessionSteerRecord.id`): the context bar keys its
+    // segment from it, which is what makes an archived entry resolvable after the ring
+    // truncates the audit entry it came from.
+    id: string;
+    at: number;
+    prompt: string;
+    threadId?: string;
 };
 
 // One steered submit, recorded on the turn that owned the running thread.
 export type SessionSteerRecord = {
+    // T13: the submit's OWN durable identity, minted once by the server when the steer is
+    // accepted (the same `randomUUID()` pattern as a session/turn/action id). It exists
+    // because the two figures a display segment used to key off — `at` and the text
+    // length — are not unique: two guidance submits recorded in the same millisecond with
+    // the same length would otherwise collapse into ONE context-bar segment, and trimming
+    // the bounded `steers` ring could renumber a survivor. Optional and additive: a record
+    // written before this build simply has no id, and the fold falls back to the
+    // deterministic occurrence key for it (./turn-projector.ts `steerBlockKeysOf`).
+    id?: string;
     // Epoch milliseconds when the server accepted the guidance.
     at: number;
     // The user's raw (trimmed) text. The run prompt may also contain the composed
@@ -605,12 +658,19 @@ export type SessionStreamItem =
 //   GET  views/:sessionId/events         SSE `data: <SessionViewStreamItem>\n\n`
 //   POST views/:sessionId/tasks          202                          -> SubmitTaskViewResult
 //   GET  views/:sessionId/turns/:turnId/steps/:stepId                -> { detail: TurnStepDetail }
+//   GET  views/:sessionId/turns/:turnId/blocks/:blockId              -> { block: TurnBlockDetail }
 //   GET  views/:sessionId/turns/:turnId/raw                          -> { turn: SessionTurn }
 //
-// The last two are the ONLY places a raw event reaches a browser, and only on an
-// explicit user action (open a tool's details / copy a transcript). `:stepId` is the
+// The last three are the ONLY places recorded bytes reach a browser beyond the compact
+// row, and only on an explicit user action (open a tool's details / click one context
+// segment / copy a transcript). `:stepId` is the
 // opening event's index (see `DisplayStepDetailRef`), so the request resolves the
-// recorded request AND its recorded response together. The `/raw` route exists for
+// recorded request AND its recorded response together. `:blockId` addresses ONE segment
+// of the turn's context bar (`TurnSection.context`, shared/turn-display.ts); it answers
+// with that block's exact recorded TEXT for ANY kind — prompt, instructions, reasoning,
+// an earlier answer, or a tool call — which is how "click a segment, get the exact
+// detail" (R8) works without ever putting that text on the default wire (R1/R3). The
+// `/raw` route exists for
 // the transcript copy/export surface, which quotes whole recorded turns
 // (src/frontend/ui/thread-transcript.ts:296); nothing in the normal render path uses it.
 
@@ -640,12 +700,29 @@ export type SessionView = {
     // `TurnSummary.blocks` — but they stay so the raw and display surfaces agree.
     labelSeeds?: Record<string, Record<string, number>>;
     labelHighWater?: Record<string, number>;
+    // T9 (wire rule, no shape change): a `/views` response STILL types this as
+    // `HarnessDescriptor`, but the server OMITS `agentInstructions` from the copy it
+    // sends. That map is per-agent instruction TEXT (see
+    // `HarnessDescriptor.agentInstructions`, lines 236-243), and forwarding it would
+    // leak the system prompt of every member into every view frame — exactly the
+    // payload class R1/R3 removes. A browser that wants the effective instruction text asks
+    // for one block: `GET views/:id/turns/:tid/blocks/:blockId` of kind `system`. Nothing
+    // else about the descriptor changes, so the model/member/promotion reads keep working.
     harnessDefinition?: HarnessDescriptor;
     discoveredTools?: string[];
     // Compact rows, in recorded order (the raw `turns` list is absent by contract).
     turns: TurnSummary[];
     // Display trees keyed by turn id. Present ONLY for turns named in `turns`; a
     // turn with no live work still has an entry (its sections are the transcript).
+    //
+    // T9: this is where the ONE context bar lives — `TurnSection.context` per section,
+    // metadata only, so the frame stays bounded however long the conversation is. Text
+    // in these trees is bounded too, except the two designated full payloads (the row's
+    // `prompt`, and each section's current answer named by `answerNodeId`); a superseded
+    // answer and every reasoning node arrive as a preview plus the exact `chars`
+    // (`DisplayTextNode`/`DisplayReasoningNode`). `SessionViewSummary` (below) omits the
+    // whole map, so a session LIST carries rows without bars — fetch the view of the
+    // session whose bar you are looking at.
     displays: Record<string, TurnDisplay>;
 };
 
@@ -667,6 +744,22 @@ export type SessionViewResponse = {
 // Body of GET /api/views/:id/turns/:turnId/steps/:stepId.
 export type SessionStepDetailResponse = {
     detail: TurnStepDetail;
+};
+
+// Body of GET /api/views/:id/turns/:turnId/blocks/:blockId (T9, R8).
+//
+// One segment of the context bar answered EXACTLY: the block's own metadata plus its
+// recorded text (`TurnBlockDetail`). Served from the durable record — the turn's
+// recorded events for the block's `eventFrom..eventTo` range, its `prompt`/`steers`, or
+// the turn's persisted instruction sources — so it answers identically live, after a
+// restart, and for a session folded from a legacy checkpoint that has no journal.
+//
+// 404 for an unknown session/turn/blockId (a block the bar never minted, or one dropped
+// with a discarded attempt), and 400 for a blank id. The turn and the block identity are
+// echoed inside `block`, so a late answer can be matched to the segment that asked for
+// it.
+export type SessionBlockDetailResponse = {
+    block: TurnBlockDetail;
 };
 
 // Body of GET /api/views/:id/turns/:turnId/raw — the verbatim recorded turn

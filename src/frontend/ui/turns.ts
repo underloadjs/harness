@@ -165,14 +165,30 @@ import type {
     DisplayStep,
     DisplayTextNode,
     SectionDisplayState,
+    TurnBlockDetail,
     TurnDisplay,
     TurnDisplayOp,
     TurnSection,
     TurnStepDetail,
     TurnSummary
 } from '../../shared/turn-display';
-import { displayOf as displayOfView, sectionsOf, summariesOf } from '../view-state';
+import { displayOf as displayOfView, isNewerSummary, sectionsOf, summariesOf } from '../view-state';
 import { stepDetailPayloadOf } from '../view-detail';
+// T11 (R7/R8): the ONE context bar. The model/geometry lives in ../view-context.ts (pure),
+// the surface in ./context-bar.ts (canvas or lightweight buttons), and the click-time
+// payload dialog in ./context-detail.ts. Nothing in this trio reads an event.
+import {
+    contextBarOf,
+    contextBarReplacesChips,
+    contextTailCaptionOf,
+    contextTailOf,
+    contextTailShowsProse
+} from '../view-context';
+import type { ContextBarModel, ContextTail } from '../view-context';
+import { mountContextBar } from './context-bar';
+import type { ContextBar, ContextBarActivateInput } from './context-bar';
+import { blockDetailFingerprintOf, openBlockDetail } from './context-detail';
+import type { BlockDetailDialog } from './context-detail';
 import { applyAttachmentChips } from './attachments';
 import { enhanceFileLinks } from './file-links';
 import { openFilePreview } from './file-preview';
@@ -226,7 +242,13 @@ import type { AgentBlockDescriptor } from './references';
 // insecure-origin clipboard fallback that keeps an open dialog's focus trap alive).
 // It lives in ui/dialog.ts because the transcript, a tool dialog and a file preview
 // all copy text the same way; the tile only supplies the payload provider.
-import { createTextCopyButton } from './dialog';
+//
+// T6/R5: the SAME module now also supplies the modal shell the mobile thread Delete
+// confirmation runs in, so that surface gets the dialog's proven focus trap, Escape /
+// backdrop dismissal, stacking and focus restoration instead of a second hand-rolled
+// overlay. The transcript (ui/thread-transcript.ts) opened that layer first.
+import { createTextCopyButton, openDialog } from './dialog';
+import type { DialogHandle } from './dialog';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -537,6 +559,16 @@ export type TurnBoardOptions = {
         stepId: string;
         sessionId?: string;
     }) => Promise<TurnStepDetail>;
+    // T11 R8 lazy block detail. The context bar calls this ONLY when the reader activates
+    // ONE segment, and only for that segment (`blockId` is `ContextBlock.id`). The shell
+    // owns the route (./view-api.ts `getBlockDetail`); the renderer owns no network code.
+    // Omitted in a standalone embedding: the segment still opens, and the dialog says the
+    // route is not wired rather than inventing a payload.
+    loadBlockDetail?: (input: {
+        turnId: string;
+        blockId: string;
+        sessionId?: string;
+    }) => Promise<TurnBlockDetail>;
 };
 
 export type TurnBoard = {
@@ -1221,10 +1253,68 @@ type AgentSection = {
 // parent's tool_result names its spawning `callId` (the authoritative outcome).
 type ThreadState = 'queued' | 'streaming' | 'done' | 'error' | 'cancelled';
 
+// T19 (R17): ONE context bar per SECTION, mounted in the surface that block owns.
+//
+// Before T19 a tile built a single bar from EVERY section of the tree and painted it in
+// the tile body, so a delegated conversation showed its caller's strip and none of its
+// own. The model layer (`../view-context.ts` `contextBarOf`) already takes a tree, so a
+// per-section bar is the same function over `{turnId, sections: [section]}` — no second
+// compiler, no local pairing of a step with a segment.
+//
+// A surface is the host element plus the two owned resources that must never be
+// shared across sections: the bar itself (a `ResizeObserver` + pointer/keyboard
+// listeners) and the segment dialog opened from it. Tracking the dialog per host is what
+// makes a metadata refresh, a block removal and a section discard answer to the card that
+// owns them; the reader still sees ONE segment at a time, because opening a segment closes
+// whichever strip in this tile had one open (T11's no-stacked-modals rule).
+type ContextBarSurface = {
+    /** The `.context-bar-host` this surface paints (hidden while it has nothing). */
+    host: HTMLElement;
+    /**
+     * Point this surface at ONE section of `turnId`.
+     *
+     * `undefined` is the server saying nothing about this section's context (a pre-T9
+     * record, or a reconcile that dropped the metadata): the strip is destroyed, the host
+     * hidden, and `driven()` goes false so the section's steps render as cards again.
+     * Returns true when the surface CHANGED the chip/card decision, which is the only
+     * moment the flow already on screen is known to be the wrong shape.
+     */
+    sync: (section: TurnSection | undefined, turnId: string) => boolean;
+    /** True when this section's segments, not step cards, are its tool surface. */
+    driven: () => boolean;
+    /**
+     * Paint — or hide — the section's ONE current content body, mounted inside this host
+     * directly after the strip (T22/T23, R23).
+     *
+     * A `reasoning` tail and a `tool` tail paint here: the thinking window because the chip
+     * that used to hold it is gone, and the call because R23 makes a recorded call a block
+     * like any other — its complete recorded request, plus its complete recorded result once
+     * the call settles. An `assistant` tail paints NOTHING: its full text is the section's
+     * designated answer node, and the flow already renders that in the `.agent-text` block
+     * that sits immediately below this host, so printing it twice would duplicate the answer.
+     * Every body carries the SERVER's figures (`data-chars`, `data-truncated`, and for a call
+     * `data-state`/`data-duration`/`data-args-chars`/`data-result-chars`), so a bounded
+     * payload says so instead of letting a prefix read as the whole block.
+     */
+    setTail: (tail: ContextTail | undefined) => void;
+    /** Repaint the dialog this surface owns from the section's current metadata. */
+    refresh: () => void;
+    /** Close the dialog this surface owns WITHOUT destroying the strip (a sibling section's
+     *  click replaces the reader's segment, exactly as a second click on this strip does). */
+    closeDetail: () => void;
+    /** Close the dialog, destroy the bar, empty the host. Idempotent. */
+    destroy: () => void;
+};
+
 // One invocation rendered as a thread entry. The ROOT invocation has a section
 // but no row: its content is the tile body itself (depth 0). Every non-root
-// invocation gets `.thread-row` → `.thread-tile` (header + collapsible body) and
-// a `.thread-children` host for its own descendants.
+// invocation gets `.thread-row` → `.thread-tile` (header + collapsible body).
+//
+// T19 (R18): a row is a FLAT sibling in the owning turn's one `.thread-children` host,
+// never inside its parent's `.thread-tile`/`.tile`. Ordering is depth-first and
+// indentation is the `data-depth` figure the board stamps (`--thread-depth`), so a
+// delegated conversation is an independent card a reader can point at, reference and
+// collapse on its own, while `parentKey` keeps the logical parentage the wire recorded.
 //
 // `key` is the canonical identity inside this turn: the runtime's explicit
 // `thread.id` once known, otherwise a synthesized placeholder key
@@ -1276,7 +1366,16 @@ type ThreadEntry = {
     preview: HTMLElement | undefined;
     prompt: HTMLElement | undefined;
     outcome: HTMLElement | undefined;
-    childrenHost: HTMLElement | undefined;
+    // T19 (R17): this block's OWN context bar. Every kind of entry owns one — the turn's
+    // root section is painted by the tile's surface (assigned in `compiledEntryOf`, which
+    // also covers the defensive flat-section fallback), and a delegated section by a
+    // surface inside its own `.thread-body`. Undefined for a row-less inline section that
+    // no compiled frame has claimed, whose steps then keep rendering as cards.
+    contextBar: ContextBarSurface | undefined;
+    // Closes this entry's segment dialog and destroys its bar (observers + listeners)
+    // when its projection is discarded. The root/inline literals no-op, because the TILE
+    // owns that surface and destroys it with the tile.
+    disposeContextBar: () => void;
     // R7/R8: transcript + delete toolbar of an expanded child CONVERSATION.
     // Undefined for a row-less root/inline section.
     transcriptAction: HTMLElement | undefined;
@@ -1287,6 +1386,14 @@ type ThreadEntry = {
     syncActionBar: () => void;
     disposeActionBar: () => void;
     expanded: boolean;
+    /**
+     * T22 (R23): the WIRE section this entry was last painted from. The state reducer
+     * mutates that object in place, so holding the reference is what lets an ops frame
+     * that names no document still re-derive the section's ONE displayed content block
+     * from the server's own order — no second copy of the tree, no event compilation.
+     * Undefined only for a row-less legacy entry that no compiled frame has claimed.
+     */
+    compiledSection?: TurnSection;
 };
 
 // Root invocation key. It never collides with a runtime id because it is not a
@@ -1399,6 +1506,60 @@ export const threadDeleteProtectionOf = (
     return undefined;
 };
 
+// --- T6/R5: which Delete press is immediate, and which one owes a confirmation -----
+//
+// The request: desktop deletes on ONE press; a phone confirms through a dialog, because
+// a thumb resting next to a destructive control must never destroy a conversation (plus
+// its whole subtree of turns) on the press that only meant to look at the row.
+//
+// Two independent axes decide it, and BOTH have to positively say "desktop" before the
+// request goes out unasked:
+//   - layout width: `(max-width: 860px)` — the SAME breakpoint the shell's rails
+//     (main.ts `phoneMedia`) and the composer's cap (ui/composer.ts
+//     `COMPOSER_MOBILE_WIDTH`) switch at, so the app never grows a second, drifting
+//     "is this a phone" threshold;
+//   - primary input device: `(pointer: fine)` — also main.ts's own axis (`finePointerMedia`),
+//     and asked in the POSITIVE direction on purpose: a query that only names coarse
+//     input would classify `(pointer: none)` (keyboard-only, assistive tech) and any
+//     undetected device as a desktop.
+//
+// Anything the engine cannot vouch for (no `matchMedia` at all — jsdom, old webviews,
+// some embedded shells — a throwing implementation, or a list without a boolean
+// `matches`) reads as UNKNOWN, and unknown keeps the confirmation. A mistaken extra
+// dialog costs one press; a mistaken delete costs the conversation.
+//
+// Both queries are sampled at CLICK time rather than captured at module init.
+// `MediaQueryList.matches` is live, but the list object itself is not always available
+// at import time, and the reader may resize or rotate the window between presses — the
+// answer must describe the device as it is when the finger lands.
+const PHONE_LAYOUT_QUERY = '(max-width: 860px)';
+const FINE_POINTER_QUERY = '(pointer: fine)';
+
+// One media feature, three-valued: `true` / `false` only when the engine answered,
+// `undefined` when it could not.
+const mediaMatches = (query: string): boolean | undefined => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
+
+    try {
+        const list = window.matchMedia(query);
+        return typeof list.matches === 'boolean' ? list.matches : undefined;
+    } catch {
+        // A hostile/stubbed implementation that throws is still "unknown", never a
+        // licence to delete without asking.
+        return undefined;
+    }
+};
+
+// Exported because it is the whole policy, it is pure, and a caller (or a test) can pin
+// the matrix without mounting a board.
+export const requiresDeleteConfirmation = (): boolean =>
+    mediaMatches(PHONE_LAYOUT_QUERY) !== false || mediaMatches(FINE_POINTER_QUERY) !== true;
+
+// The one warning sentence, shared by the confirmation dialog so the wording does not
+// drift per surface. `<name>` is the conversation code (`RR1`), never a raw id.
+const threadDeleteWarningOf = (name: string): string =>
+    `Delete thread ${name} permanently? Its turns and transcript are removed.`;
+
 export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');
 
@@ -1452,10 +1613,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // refresh it; another view with a coincidentally equal thread id cannot.
     const transcriptScope = {};
 
-    // R9 destructive-action state. Confirmation is board state (not per tile) so a
-    // rebuilt tile cannot resurrect a stale confirm; in-flight ids dedupe a double
+    // R9 destructive-action state. T6/R5: the armed inline confirmation is GONE — a
+    // mobile/narrow press opens the shared confirmation DIALOG instead, and a proven
+    // desktop press sends the request on its own. The dialog reference is still BOARD
+    // state (not per bar) because the expanded tile, a nested child card and the
+    // roster-only panel can all name the SAME thread: one pending confirmation and one
+    // layer no matter which one was pressed. In-flight keys keep deduping a double
     // pointer/confirm into exactly one request.
-    let confirmingThread: string | undefined;
+    let deleteConfirmation: { handle: DialogHandle; threadId: string } | undefined;
     // In-flight deletes are keyed by SESSION + THREAD. Thread ids are only unique
     // per session, and a session switch may show the same id in the new roster; a
     // late resolution of the old request must not clear the new session's dedupe.
@@ -1607,20 +1772,124 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return undefined;
     };
 
-    // First click: open/close the inline confirmation. No request is sent.
-    const requestThreadDelete = (threadId: string): void => {
+    // T6/R5: dismiss the confirmation layer this board holds. `close()` is idempotent
+    // and its `onClose` (fired exactly once, after the overlay is removed and focus is
+    // restored) owns the state clear plus the toolbar repaint, so the dialog's own
+    // header close, Escape, the backdrop, Cancel, the Delete action and every
+    // programmatic teardown below all share ONE dismissal path.
+    const closeThreadDeleteConfirmation = (): void => {
+        deleteConfirmation?.handle.close();
+    };
+
+    // The mobile/tablet confirmation: the SAME shared dialog shell the transcript and the
+    // previews use (ui/dialog.ts), so the focus trap, Escape/backdrop dismissal, stacking
+    // under an open transcript and focus restoration are the proven implementation
+    // instead of a second hand-rolled overlay. `trigger` is the Delete control that was
+    // pressed, which is where closing puts focus back.
+    const openThreadDeleteConfirmation = (threadId: string, trigger?: HTMLElement): void => {
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (entry === undefined) return;
+
+        if (deleteConfirmation !== undefined) {
+            // Second press for the SAME conversation: keep the layer already open rather
+            // than stack an identical one — the request must stay exactly one, and a
+            // reader double-tapping a disabled-looking control gets nothing new.
+            if (deleteConfirmation.threadId === threadId) return;
+
+            // A DIFFERENT conversation replaces the layer instead of stacking it, so the
+            // dialog on screen always names the thread the reader pressed last.
+            closeThreadDeleteConfirmation();
+        }
+
+        const name = threadNameOf(entry);
+        // The class names are the ones styles.css already ships for the destructive
+        // confirmation (`.thread-delete-confirm*`), so the dialog body is styled by the
+        // rules that styled the old inline row — this worker does not own styles.css, and
+        // reusing the vocabulary keeps one look. Inside `.dialog-body` the container's
+        // `flex: 1 0 100%` basis is inert, so it lays out as a wrapping row either way.
+        const content = el('div', 'thread-delete-confirm');
+        content.setAttribute('role', 'group');
+        content.setAttribute('aria-label', `Confirm deleting thread ${name}`);
+
+        const text = el('p', 'thread-delete-confirm-text');
+        text.append(el('span', 'thread-delete-confirm-body', threadDeleteWarningOf(name)));
+
+        const confirmButton = el('button', 'thread-delete-confirm-delete', 'Delete thread');
+        confirmButton.type = 'button';
+        const cancelButton = el('button', 'thread-delete-confirm-cancel', 'Cancel');
+        cancelButton.type = 'button';
+        content.append(text, confirmButton, cancelButton);
+
+        confirmButton.addEventListener('click', () => {
+            // Ownership guard: only the layer that still OWNS the pending confirmation may
+            // act. A body left over from a replaced or cleared dialog (a detached node a
+            // synthetic click can still reach) must never fire a second request.
+            if (deleteConfirmation === undefined || deleteConfirmation.handle !== handle) return;
+
+            // Dismiss FIRST, then request: the confirmation is spent either way, and the
+            // answer (including the transcript/focus teardown on success) must never queue
+            // behind a modal layer. `confirmThreadDelete` re-checks protection, session
+            // identity, in-flight dedupe and its own errors.
+            closeThreadDeleteConfirmation();
+            void confirmThreadDelete(threadId);
+        });
+
+        cancelButton.addEventListener('click', () => {
+            // "No": the layer closes, nothing is sent, focus returns to the trigger.
+            if (deleteConfirmation === undefined || deleteConfirmation.handle !== handle) return;
+
+            closeThreadDeleteConfirmation();
+        });
+
+        let handle: DialogHandle | undefined;
+        handle = openDialog({
+            title: 'Delete thread',
+            content,
+            // Focus goes back to the control the reader actually pressed — Escape, the
+            // backdrop and the header close all land on the same rule. `undefined` keeps
+            // the dialog's own capture of what was focused at open time.
+            returnFocus: trigger,
+            onClose: () => {
+                // Identity guard: a replaced layer's late cleanup must not clear the
+                // confirmation that took its place.
+                if (deleteConfirmation?.handle === handle) deleteConfirmation = undefined;
+                refreshActionBars();
+            }
+        });
+
+        deleteConfirmation = { handle, threadId };
+    };
+
+    // First click. A PROVEN desktop (wide viewport + fine pointer, see
+    // `requiresDeleteConfirmation`) deletes on this press: one callback, no layer. Every
+    // other surface — narrow, coarse, `none`, or an engine that cannot answer either
+    // query — opens the confirmation dialog and sends nothing yet.
+    const requestThreadDelete = (threadId: string, trigger?: HTMLElement): void => {
         if (isDeleting(threadId)) return;
 
         const entry = roster.find((candidate) => candidate.id === threadId);
-        if (entry === undefined || deleteProtectionFor(threadId) !== undefined) return;
+        if (
+            entry === undefined ||
+            // Nothing to confirm when there is no transport: an unwired host keeps its
+            // honest disabled control (see `sync`) and must not grow a dead-end dialog.
+            options.deleteThread === undefined ||
+            deleteProtectionFor(threadId) !== undefined
+        ) {
+            return;
+        }
 
-        confirmingThread = confirmingThread === threadId ? undefined : threadId;
-        refreshActionBars();
+        if (!requiresDeleteConfirmation()) {
+            void confirmThreadDelete(threadId);
+            return;
+        }
+
+        openThreadDeleteConfirmation(threadId, trigger);
     };
 
-    // Second click: exactly one DELETE. The shell callback owns the existing API
-    // and reconciles its returned snapshot/tombstones; this board only closes the
-    // surfaces that are provably gone and reports failure without dropping data.
+    // The confirmed click (mobile dialog) or the single desktop click: exactly one
+    // DELETE. The shell callback owns the existing API and reconciles its returned
+    // snapshot/tombstones; this board only closes the surfaces that are provably gone
+    // and reports failure without dropping data.
     const confirmThreadDelete = async (threadId: string): Promise<void> => {
         const sessionId = currentSessionId();
         if (sessionId !== undefined && isDeleting(threadId)) return;
@@ -1633,7 +1902,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             options.deleteThread === undefined ||
             sessionId === undefined
         ) {
-            confirmingThread = undefined;
+            // A protected/vanished conversation cannot answer. Repaint the toolbar (the
+            // confirmation layer already dismissed itself) and send nothing.
             refreshActionBars();
             return;
         }
@@ -1648,7 +1918,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         const suppressionToken = (deleteRequestSequence += 1);
 
-        confirmingThread = undefined;
         deletingRequests.add(requestKey);
         activeDeleteSuppressions.add(suppressionToken);
         refreshActionBars();
@@ -1690,8 +1959,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // one right. Labels are desktop text, mobile glyphs; `aria-label` always carries the
     // full accessible name.
     //
-    // The two-step confirmation still lives in THIS bar: it needs the full width, and
-    // moving it into the header would reflow the identity line on every click.
+    // T6/R5: the confirmation no longer lives in THIS bar. A proven desktop press deletes
+    // on the click itself, and every other surface opens the shared confirmation DIALOG
+    // (`openThreadDeleteConfirmation`). The bar is therefore exactly its two actions: no
+    // inline row that a stray second tap could confirm, and nothing left to reflow the
+    // identity line on a click.
     type ThreadActionBar = {
         element: HTMLElement;
         transcriptButton: HTMLButtonElement;
@@ -1727,34 +1999,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         deleteButton.append(deleteLabel, deleteGlyph);
         deleteButton.addEventListener('click', () => {
             const threadId = input.target();
-            if (threadId !== undefined) requestThreadDelete(threadId);
-        });
-
-        const confirm = el('div', 'thread-delete-confirm');
-        confirm.hidden = true;
-        confirm.setAttribute('role', 'group');
-        const confirmText = el('p', 'thread-delete-confirm-text');
-        const confirmTextBody = el('span', 'thread-delete-confirm-body');
-        confirmText.append(confirmTextBody);
-        const confirmDelete = el('button', 'thread-delete-confirm-delete');
-        confirmDelete.type = 'button';
-        const confirmCancel = el('button', 'thread-delete-confirm-cancel', 'Cancel');
-        confirmCancel.type = 'button';
-        confirm.append(confirmText, confirmDelete, confirmCancel);
-        confirmCancel.addEventListener('click', () => {
-            confirmingThread = undefined;
-            refreshActionBars();
-        });
-        confirmDelete.addEventListener('click', () => {
-            const threadId = input.target();
-            if (threadId !== undefined) void confirmThreadDelete(threadId);
+            // The pressed control travels with the request so a confirmation dialog can
+            // hand focus back to it on dismissal (desktop presses never open one).
+            if (threadId !== undefined) requestThreadDelete(threadId, deleteButton);
         });
 
         // T26: Delete leads the bar and Transcript closes it (the two swapped places, and
         // the measurement line took the header's right-edge slot). DOM order is the visual
         // order; `margin-left: auto` on `.transcript-open` (styles.css) is what pins the
         // transcript button to the right even when Delete is hidden.
-        bar.append(deleteButton, transcriptButton, confirm);
+        bar.append(deleteButton, transcriptButton);
 
         const sync = (): void => {
             const threadId = input.target();
@@ -1785,8 +2039,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             transcriptButton.disabled = transcriptBusy;
 
             const protection = deleteProtectionFor(threadId);
-            const confirmationOpen =
-                confirmingThread === threadId && protection === undefined && !transcriptBusy;
 
             // The agent's default conversation is never deletable (Reset session
             // clears it); a live/queued thread is temporarily protected. Both keep
@@ -1807,15 +2059,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         : options.deleteThread === undefined
                           ? 'Thread deletion is not wired in this host.'
                           : 'Delete this thread permanently';
-
-            confirm.hidden = !confirmationOpen;
-            if (confirmationOpen) {
-                const description = `Delete thread ${name} permanently? Its turns and transcript are removed.`;
-                confirm.setAttribute('aria-label', `Confirm deleting thread ${name}`);
-                confirmTextBody.textContent = description;
-                confirmDelete.textContent = 'Delete thread';
-                confirmDelete.disabled = transcriptBusy;
-            }
         };
 
         actionBarSyncs.add(sync);
@@ -2211,6 +2454,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // user preference. `remember=false` is that distinction.
     const threadRowSync = new WeakMap<HTMLElement, (expanded: boolean, remember?: boolean) => void>();
 
+    // T22 (R22): the rows the READER collapsed on purpose.
+    //
+    // `openEnclosingCards` exists so an expanded exchange is never hidden inside a
+    // collapsed ancestor card (T6), but an implicit reveal is not a request to undo a
+    // choice the reader just made: without this set, collapsing a delegated card and then
+    // expanding the parent tile re-opened it, so a loaded conversation could never be
+    // read as the reader arranged it. Membership is per row element and deliberately not
+    // remembered across a projection rebuild — a rebuild already starts every card
+    // collapsed, and `expandedThreads` is what carries a reader's EXPANSION across one.
+    // Only an explicit user transition (remember=true) writes here; the board's implicit
+    // open/close passes remember=false and therefore never forges an intent.
+    const userCollapsedRows = new WeakSet<HTMLElement>();
+
     // Open every NESTED card that contains this turn's row. A continuation routed
     // into a child card (see `placeTurn`) is only visible while that card is open, so
     // focusing a resumed child would otherwise show an "expanded" turn nobody can see.
@@ -2220,6 +2476,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         let host = turn.element.parentElement?.closest<HTMLElement>('.thread-row') ?? null;
 
         while (host !== null) {
+            // T22 (R22): a card the READER collapsed stays collapsed. The walk still climbs
+            // to the next ancestor, because their collapse covered this card and not the
+            // chain above it — and an implicit reveal must never look like an expansion the
+            // reader asked for, so nothing is pushed onto `openedCards` here either.
+            if (userCollapsedRows.has(host)) {
+                host = host.parentElement?.closest<HTMLElement>('.thread-row') ?? null;
+                continue;
+            }
+
             if (!host.classList.contains('is-expanded') && !openedCards.includes(host)) openedCards.push(host);
 
             // T6: drive the card's MODEL, not just its DOM. A directly-added class
@@ -2754,13 +3019,24 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         setAttachments(initialAttachments);
 
         const flow = el('div', 'tile-flow');
-        body.append(promptBlock, flow);
+
+        // T11 (R7): this turn's ONE context bar, between the prompt and the flow. It is
+        // per TURN, not per section or per call: it aggregates every section's
+        // `TurnSection.context` in the document's section order, which is exactly what the
+        // wall of tool chips used to spell out one card at a time. Empty and hidden until a
+        // compiled frame actually carries context metadata, so a legacy turn costs nothing.
+        const contextBarHost = el('div', 'context-bar-host');
+        contextBarHost.hidden = true;
+
+        body.append(promptBlock, contextBarHost, flow);
 
         // R7/R8/T26: the expanded tile's toolbar. Delete leads (left), Transcript closes
-        // it (right); the two-step Delete confirmation still lives here because it needs
-        // the full width. Both live between the header and body so they are visible
-        // without scrolling and disappear with expansion. The header's right edge is no
-        // longer a control slot — it now carries the measurement line (styles.css).
+        // it (right), and those are its ONLY children: T6/R5 moved the Delete confirmation
+        // out of the bar and into the shared dialog (`openThreadDeleteConfirmation`), where
+        // a stray tap cannot confirm it. Both actions live between the header and body so
+        // they are visible without scrolling and disappear with expansion. The header's
+        // right edge is no longer a control slot — it now carries the measurement line
+        // (styles.css).
         const actionBar = createThreadActionBar({
             className: 'tile-transcript-action',
             visible: () => expandedTurn?.element === card && card.classList.contains('is-expanded'),
@@ -3304,8 +3580,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // temporary reveal of the focused exchange, closed by `detachTileExpansion`
             // and never re-opened as if the reader had chosen it.
             if (!remember) return;
+
             if (expanded) expandedThreads.add(entry.key);
             else expandedThreads.delete(entry.key);
+
+            // T22 (R22): a collapse the reader chose is a choice, not a transient. The row
+            // is recorded so `openEnclosingCards` — the board's implicit reveal, which fires
+            // whenever a tile inside this card is expanded — does not undo it on the next
+            // frame, and an EXPANSION clears the marker again. The two sets are the whole
+            // of "user controls expansion": hydration and streaming never write to either.
+            if (expanded) userCollapsedRows.delete(entry.row);
+            else userCollapsedRows.add(entry.row);
         };
 
         // --- persistent child conversations (S2) ---------------------------
@@ -3431,8 +3716,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         };
 
         const paintPersistentMarkers = (): void => {
-            // T5-DEBUG (remove before commit)
-            console.warn('[markers]', [...threads.values()].map((entry) => ({ key: entry.key, row: entry.row !== undefined, explicit: entry.explicitId, persistent: persistentIdOf(entry) })), [...learnedThreads], roster.map((row) => ({ id: row.id, invocationId: row.invocationId, invocationIds: row.invocationIds })));
             for (const entry of threads.values()) {
                 // The ROOT invocation has no row (its surface is the tile body), so
                 // it has nothing to mark; its label is painted separately.
@@ -3500,34 +3783,92 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return false;
         };
 
-        // Where a child row belongs. A parent with a row has a children host AFTER
-        // its body, so grandchildren are visible even when the parent entry is
-        // collapsed. The turn root (and an inline legacy section) has no row: its
-        // children attach to the turn-level host at depth 1.
+        // R18: where a child row belongs — FLAT. The host is wherever the parent's row already
+        // lives, never the parent's own card, so a grandchild is a sibling of its parent's card
+        // rather than another element inside it. The hierarchy is the returned `depth`, which
+        // `orderThreadRows` stamps on the row; the DOM structure carries none of it.
+        //
+        // A turn root (and an inline legacy section) has no row: its children attach to the
+        // turn-level host at depth 1, exactly as before. An unknown parent id degrades to the
+        // same top-level slot instead of throwing, because a recorded payload is untrusted.
         const threadRowOf = (parentKey: string | undefined): { host: HTMLElement; depth: number } => {
             const parent = parentKey === undefined ? undefined : threads.get(parentKey);
-            if (parent?.childrenHost !== undefined) {
-                return { host: parent.childrenHost, depth: parent.depth + 1 };
-            }
+            const parentHost = parent?.row?.parentElement;
+
+            if (parent !== undefined && parent.row !== undefined && parentHost instanceof HTMLElement)
+                return { host: parentHost, depth: parent.depth + 1 };
 
             return { host: threadHost, depth: 1 };
         };
 
-        // Recompute depth for an entry and its descendants. Needed when explicit
-        // metadata re-parents an adopted placeholder; DOM nesting does the visual
-        // indentation, `data-depth` keeps the accessible/test-visible level true.
-        // `seen` makes a corrupt/cyclic parent chain terminate instead of recursing.
-        const setThreadDepth = (entry: ThreadEntry, depth: number, seen = new Set<string>()): void => {
-            if (seen.has(entry.key)) return;
-            seen.add(entry.key);
+        // R18: the ONE ordering pass for the flat hierarchy. Every invocation row this tile owns
+        // is re-appended into the turn's single `.thread-children` host in DEPTH-FIRST order and
+        // stamped with its level, which is what replaces the nesting that used to give that
+        // order (and that indentation) for free:
+        //   - a delegated conversation reads as an independent card BESIDE the block it came
+        //     from — the bug being fixed was a delegate rendering inside its caller's frame;
+        //   - the reading order is still [root, child, grandchild, next child], the order the
+        //     roster join, the `#` result blocks and the labels were allocated in, so flattening
+        //     renumbers nothing;
+        //   - indentation is DATA: `data-depth` for assistive tech and the tests, and
+        //     `--thread-depth` (the stylesheet's single indent step multiplied) for the visual
+        //     cue, so an arbitrary metadata depth still indents without another element.
+        // Map insertion order is creation order, and the projector/`entryForMeta` always open a
+        // parent before its children, so a pre-order walk of that map is the server's order.
+        const orderThreadRows = (): void => {
+            const children = new Map<string, ThreadEntry[]>();
+            const roots: ThreadEntry[] = [];
 
-            entry.depth = depth;
-            entry.row?.setAttribute('data-depth', String(depth));
+            for (const entry of threads.values()) {
+                if (entry.row === undefined) continue;
 
-            for (const child of threads.values()) {
-                if (child.parentKey !== entry.key) continue;
-                setThreadDepth(child, depth + 1, seen);
+                const parent =
+                    entry.parentKey === undefined ? undefined : threads.get(entry.parentKey);
+
+                // No parent, an unknown parent (a corrupt record), or a parent whose surface is
+                // the tile body (the turn root / a flat legacy section): a top-level card here.
+                if (parent === undefined || parent.row === undefined) {
+                    roots.push(entry);
+                    continue;
+                }
+
+                const list = children.get(parent.key);
+                if (list === undefined) children.set(parent.key, [entry]);
+                else list.push(entry);
             }
+
+            // A corrupt/cyclic parent chain terminates: the second visit is a no-op rather than
+            // infinite recursion, and the row keeps the position it already had.
+            const seen = new Set<string>();
+
+            const visit = (entry: ThreadEntry, depth: number, parentKey: string | undefined): void => {
+                if (seen.has(entry.key)) return;
+                seen.add(entry.key);
+
+                entry.depth = depth;
+                entry.row?.setAttribute('data-depth', String(depth));
+                // R18: the hierarchy the DOM no longer carries lives in the row's own ids.
+                // `data-parent-thread` names the invocation this card hangs off, so a reader, a
+                // test and a `#` reference can all resolve parentage after flattening. The turn
+                // root's internal 'root' key is deliberately NOT written — it is not an
+                // addressable identity — but the root SECTION's wire id is, and a compiled
+                // child's `parentKey` is exactly that, which is how a direct child of the turn's
+                // own flow still says whose delegate it is.
+                if (entry.row !== undefined) {
+                    if (parentKey === undefined || parentKey === ROOT_KEY) delete entry.row.dataset.parentThread;
+                    else entry.row.dataset.parentThread = parentKey;
+                }
+                // The host's own `padding-left` is the FIRST step, so a row adds `depth - 1`.
+                entry.row?.style.setProperty('--thread-depth', String(Math.max(0, depth - 1)));
+                if (entry.row !== undefined) threadHost.append(entry.row);
+
+                for (const child of children.get(entry.key) ?? []) visit(child, depth + 1, entry.key);
+            };
+
+            // A root row still carries its recorded `parentKey` (the turn's own section id, or
+            // 'root' for the raw path's root flow), so the attribute is decided from the entry,
+            // not from the walk.
+            for (const root of roots) visit(root, 1, root.parentKey);
         };
 
         // Would making `parentKey` this entry's parent create a cycle? A recorded
@@ -3807,8 +4148,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const body = el('div', 'thread-body');
             body.id = bodyId;
 
+            // T19 (R17): this conversation's OWN context strip, in the same slot the main tile
+            // uses — between the identity/prompt half and the flow. It stays hidden until a
+            // compiled frame carries `TurnSection.context` for THIS section, so a raw stream or
+            // a legacy record costs nothing, and a delegated card can never read its caller's
+            // distribution by accident.
+            const entryContextBarHost = el('div', 'context-bar-host');
+            entryContextBarHost.hidden = true;
+
             const threadFlow = el('div', 'thread-flow');
-            body.append(threadFlow);
+            body.append(entryContextBarHost, threadFlow);
 
             const outcome = el('div', 'thread-outcome');
             outcome.hidden = true;
@@ -3830,10 +4179,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             tile.append(select, transcriptAction, body);
 
-            // Children live outside the body so collapsing THIS entry never hides
-            // its descendants (R2).
-            const childrenHost = el('div', 'thread-children');
-            threadRow.append(tile, childrenHost);
+            // R18: the row holds ONLY its own card now. The descendant rows that used to be
+            // appended after the tile inside a per-entry `.thread-children` host are flat
+            // siblings in the turn's one host, so `.thread-row > .thread-tile` is the whole
+            // structure of a delegated card.
+            threadRow.append(tile);
+
+            // T19 (R17): one bar surface per delegated conversation, owned by THIS card. It is
+            // created empty and stays `driven() === false` until a section points it at itself,
+            // so a raw-path row (which has no `TurnSection` to read) simply never shows one.
+            const entryContextBar = createContextBarSurface(entryContextBarHost);
+
+            // R18: the row lands in its parent's host; `orderThreadRows` (called once the entry
+            // is registered, below) then puts it at its depth-first position among its siblings.
             place.host.append(threadRow);
 
             const entry: ThreadEntry = {
@@ -3876,7 +4234,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 preview,
                 prompt: undefined,
                 outcome,
-                childrenHost,
+                // T19 (R17): this card's own strip + the teardown that closes its dialog and
+                // destroys its observers. `destroy` is safe to call at any point: the surface
+                // was created with nothing mounted on it.
+                //
+                // T22 (R23): the SAME surface owns this card's one tail body, so a delegated
+                // conversation's thinking prints at the tail of ITS strip and never inside the
+                // caller's block — the scoping rule that made the aggregate bar wrong.
+                contextBar: entryContextBar,
+                disposeContextBar: () => entryContextBar.destroy(),
                 transcriptAction,
                 transcriptButton,
                 syncActionBar: actionBar.sync,
@@ -3908,6 +4274,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (options.input !== undefined) renderThreadPrompt(entry, options.input);
 
             threads.set(options.key, entry);
+            // R18: order ONLY after the entry is registered — `orderThreadRows` walks the
+            // `threads` map, and calling it before this line would rank the brand-new row below
+            // every row the map already holds (a later sibling would then sort ahead of the
+            // earlier one). Appending it first and ordering here keeps creation order for
+            // siblings and puts a descendant directly after its parent's subtree.
+            orderThreadRows();
             // R1: restore the reader's expansion across a rebuilt projection.
             if (expandedThreads.has(options.key)) setThreadExpanded(entry, true);
             // The roster may already know this invocation (a snapshot delivered the
@@ -4005,7 +4377,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 preview: undefined,
                 prompt: undefined,
                 outcome: undefined,
-                childrenHost: undefined,
+                contextBar: undefined,
+                // The tile owns the root/inline strip and destroys it with the tile, so a
+                // row-less entry has nothing of its own to tear down here.
+                disposeContextBar: () => undefined,
                 transcriptAction: undefined,
                 transcriptButton: undefined,
                 expanded: false
@@ -4063,7 +4438,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 preview: undefined,
                 prompt: undefined,
                 outcome: undefined,
-                childrenHost: undefined,
+                contextBar: undefined,
+                // The tile owns the root/inline strip and destroys it with the tile, so a
+                // row-less entry has nothing of its own to tear down here.
+                disposeContextBar: () => undefined,
                 transcriptAction: undefined,
                 transcriptButton: undefined,
                 expanded: false
@@ -4073,17 +4451,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return section;
         };
 
-        // Move one entry (and its subtree) under a new parent host. A parent that is
+        // Move one entry (and its whole subtree) under a new parent. A parent that is
         // this entry or one of its descendants is rejected: the metadata would be
         // corrupt, and the DOM cannot nest a node inside itself.
         const reparentThread = (entry: ThreadEntry, parentKey: string | undefined): void => {
             if (entry.row === undefined) return;
             if (!canReparent(entry, parentKey)) return;
 
-            const place = threadRowOf(parentKey);
             entry.parentKey = parentKey;
-            place.host.append(entry.row);
-            setThreadDepth(entry, place.depth);
+            // R18: the row no longer needs to be carried between hosts (there is one flat host
+            // per turn); what changes is its POSITION in that host and its DEPTH, and
+            // `orderThreadRows` recomputes both for the re-parented branch AND its descendants
+            // in one pass — the replacement for the old per-subtree `setThreadDepth` walk.
+            orderThreadRows();
         };
 
         // Adopt a placeholder when the runtime's explicit identity for the SAME
@@ -4251,12 +4631,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return entryForLegacy(event);
         };
 
-        const renderText = (block: TextBlock): void => {
-            block.node.replaceChildren(markdownFragment(block.buffer));
+        // Paint ONE prose surface from ONE string. `renderText` (the streaming writer's
+        // flush) and a `node:set {text}` replacement (the server swapping in a bounded
+        // preview) go through here, so the two can never disagree about Markdown, file
+        // links or image enhancement (T13: the patch is server state being rendered, not
+        // the client re-compiling events).
+        const paintProse = (node: HTMLElement, text: string): void => {
+            node.replaceChildren(markdownFragment(text));
             // R11: file mentions in the assistant's answer are clickable too. The
             // transform runs after sanitizing and only creates buttons from text.
-            enhanceFileLinks(block.node, { open: openTranscriptFile });
-            enhanceImages(block.node, { open: openTranscriptImage });
+            enhanceFileLinks(node, { open: openTranscriptFile });
+            enhanceImages(node, { open: openTranscriptImage });
+        };
+
+        const renderText = (block: TextBlock): void => {
+            paintProse(block.node, block.buffer);
         };
 
         const flushText = (section: AgentSection): void => {
@@ -4688,6 +5077,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 const entry = threads.get(key);
                 if (entry === undefined) continue;
                 threads.delete(key);
+                // T19 (R17): the row's strip goes with the row (a placeholder never has an open
+                // dialog, but the destroy is the honest teardown of everything the card owned).
+                entry.disposeContextBar();
                 entry.row?.remove();
             }
 
@@ -4779,30 +5171,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             promoteAnswer(section, completed);
         };
 
-        // One retry notice. Concise by design: the count, the backoff and the failed
-        // attempt's error, in the same quiet mono register as a wakeup marker.
-        const appendRetry = (
-            section: AgentSection,
-            attempt: number,
-            maxAttempts: number,
-            delayMs: number,
-            message: string
-        ): void => {
-            closeText(section);
-            closeToolGroup(section);
-
-            const node = el('div', 'agent-retry');
-            node.dataset.attempt = String(attempt);
-            node.append(el('span', 'agent-retry-label', 'retry'));
-            node.append(
-                el(
-                    'span',
-                    'agent-retry-text',
-                    `attempt ${attempt} of ${maxAttempts} failed · retrying in ${formatDuration(delayMs)} · ${message}`
-                )
-            );
-            section.flow.append(node);
-        };
+        // T19 (R19): the one-line retry notice this file used to append is GONE, and with it the
+        // `appendRetry` helper and its `.agent-retry` nodes. A `retry` frame's job in the browser
+        // is now exactly one thing — discard the abandoned attempt — which `case 'retry'` below
+        // does through `discardAttempt`. Nothing else about an attempt boundary changes:
+        // `closeText`/`closeToolGroup` were only needed to PLACE the notice line, and
+        // `discardAttempt` already cancels the text writer and drops the tool-group pointer. No
+        // browser renderer mints `.agent-retry` any more (the compiled path suppresses a
+        // `retry`-tone notice node in `paintCompiledNotice`), so the stylesheet rule is a legacy
+        // hook for a DOM that already carries one, not a live surface.
 
         const appendText = (section: AgentSection, delta: string): void => {
             beginAttempt(section);
@@ -5076,6 +5453,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // board-wide sync callback with it instead of refreshing detached
                 // controls after every later roster/snapshot change.
                 entry.disposeActionBar();
+                // T19 (R17): the same rule for a delegated card's context strip — its bar owns a
+                // `ResizeObserver` and possibly an open segment dialog, and both belong to the
+                // projection being discarded here.
+                entry.disposeContextBar();
                 if (entry.section.text !== undefined) cancel(entry.section.text);
                 for (const tool of entry.section.tools) tool.destroy();
                 // A think chip is the same kind of owned surface as a tool chip: its
@@ -5148,7 +5529,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         //     `node:append`/`node:set`/`node:remove`/`step:set` reach the exact
         //     surface without searching.
         type CompiledHandle =
-            | { kind: 'text'; sectionId: string; entry: ThreadEntry; node: HTMLElement }
+            | {
+                  kind: 'text';
+                  sectionId: string;
+                  entry: ThreadEntry;
+                  node: HTMLElement;
+                  // T22 (R23): the node id beside the element, so "is THIS the block the
+                  // section is allowed to print?" is an id comparison against the server's
+                  // tail — never a DOM position or a text match.
+                  nodeId: string;
+              }
             | { kind: 'reasoning'; sectionId: string; entry: ThreadEntry; card: ReasoningCard }
             | {
                   kind: 'step';
@@ -5157,6 +5547,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                   card: ToolCallCard;
                   step: DisplayStep;
               }
+            // T11 (R7): a recorded call that the CONTEXT BAR owns instead of a card. The
+            // handle still exists, because the ops path addresses steps by id and must be
+            // able to find this one (`step:set`, `attempt:discard`, a section rebuild); it
+            // simply owns no DOM. `syncCompiledNode` keeps it pointed at the server's latest
+            // `DisplayStep`, and the bar segment it stands for is repainted from
+            // `TurnSection.context`, which the same frame updates.
+            | { kind: 'implicit'; sectionId: string; entry: ThreadEntry; step: DisplayStep }
+            // T22 (R23): a thinking window the BAR owns outright. The strip carries the
+            // segment and the section's ONE tail body carries the text while this node is
+            // the newest content block, so no chip is minted in the flow at all — which is
+            // precisely what stops a long run printing a stale chip per window. It is NOT
+            // an `implicit` step: dropping it must never move the tool tally, and it never
+            // resolves a card. The handle exists so `node:append`, `node:set`, `node:remove`
+            // and `attempt:discard` resolve to the section that owns the tail rather than
+            // falling through as an unknown node.
+            | { kind: 'tail'; sectionId: string; entry: ThreadEntry; nodeId: string }
             | {
                   kind: 'action';
                   sectionId: string;
@@ -5175,6 +5581,477 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // True once anything was painted from the display wire. The raw event fold
         // and this renderer never share a tile: a view-driven tile has no events.
         let compiledMode = false;
+
+        // --- one context bar per SECTION (T11 R7/R8, per-section since T19 R17) ---------
+        //
+        // What it replaces: one `.tool` card per recorded call, each with its own timer,
+        // its own expansion and its own Markdown work. A long turn printed hundreds of
+        // them, and that is the wall this bar stands in front of. The bar carries the SAME
+        // information per call — name, kind, whether it failed, how long it took, how many
+        // characters it contributed — as one strip of segments whose widths are the exact
+        // character distribution, and it opens the recorded bytes of ANY segment (prompt,
+        // instructions, thinking, an earlier answer, a tool call) on one click.
+        //
+        // It is driven ONLY by `TurnSection.context`, never by the node tree: pairing a step
+        // with a segment locally is the compilation this wire removed.
+        //
+        // T19 (R17) moves the ownership boundary from the tile to the SECTION. The tile's
+        // strip describes the turn's OWN (root) section, and every delegated section carries
+        // a surface inside its own card. Aggregating the delegates into the caller's strip was
+        // the defect this closes: a delegated conversation had no bar of its own to read, and
+        // clicking one of its calls opened a segment owned by a different block.
+        //
+        // The last tree this tile painted from. The ops path needs it to recompute the bars
+        // (a frame carries ops, not the whole document) and to rebuild the flows when a bar
+        // takes over from the chips mid-run.
+        let compiledDisplay: TurnDisplay | undefined;
+
+        // The model for ONE section, built by the SAME function the tree-level strip uses:
+        // `contextBarOf` reads only `turnId` and `sections`, so a one-section tree IS a
+        // one-section bar. No second compiler, and the recorded order inside the section is
+        // still the server's (../view-context.ts rule 1).
+        const sectionContextModel = (
+            turnId: string,
+            section: TurnSection | undefined
+        ): ContextBarModel =>
+            contextBarOf(section === undefined ? undefined : { turnId, sections: [section] });
+
+        // Every surface this tile owns, in creation order. T11's rule that one activation
+        // REPLACES the reader's segment rather than stacking a second modal over the same turn
+        // was enforced by a single tile-wide dialog pointer; with one strip per section the same
+        // guarantee needs the list, because the dialog to replace may belong to a sibling card.
+        const contextBarSurfaces: ContextBarSurface[] = [];
+
+        /**
+         * Mount one bar surface over one `.context-bar-host`.
+         *
+         * A surface owns three things, and keeping them per section is the whole point: the
+         * model (which decides cards-vs-segments for THAT section), the bar (its
+         * `ResizeObserver` and pointer/keyboard listeners), and the segment dialog opened from
+         * that strip. Per-section tracking is what makes a metadata change refresh, and a
+         * section discard close, the RIGHT dialog; a click still shows one segment at a time,
+         * because `openSegment` replaces whichever strip in this tile the reader had open.
+         *
+         * T22 (R23) adds a fourth owned surface inside the SAME host: this section's ONE
+         * current tail body, mounted directly after the strip. It is owned per section for
+         * exactly the reason the strip is — a delegated conversation's thinking must never
+         * print inside its caller's block, and one host can only ever hold one body, so a
+         * long run cannot accumulate the pile of stale think chips the strip replaced.
+         */
+        const createContextBarSurface = (host: HTMLElement): ContextBarSurface => {
+            let model: ContextBarModel | undefined;
+            let bar: ContextBar | undefined;
+            // The one segment dialog THIS surface opened. Kept so a metadata change can
+            // refresh it and a teardown can close it — never so that a second one can stack.
+            let detail: { dialog: BlockDetailDialog; fingerprint: string } | undefined;
+
+             // --- the current tail body (T22, R23; widened by T23) ----------------------
+            // Minted once per surface and re-appended after the strip, so the element that
+            // prints the newest block is ALWAYS the element right after the graph.
+            const tail = document.createElement('div');
+            tail.className = 'context-bar-tail';
+            tail.hidden = true;
+
+            const tailCaption = document.createElement('p');
+            tailCaption.className = 'context-bar-tail-caption';
+            tailCaption.textContent = '';
+
+            const tailBody = document.createElement('div');
+            tailBody.className = 'context-bar-tail-body';
+
+            tail.append(tailCaption, tailBody);
+
+            // Which body this element currently prints. Streaming calls `paintTail` on every
+            // frame of the round, so this key is what makes a repaint of unchanged state cost
+            // no DOM work at all.
+            let tailKey: string | undefined;
+
+            const clearTail = (): void => {
+                tailKey = undefined;
+                tail.hidden = true;
+                delete tail.dataset.kind;
+                delete tail.dataset.nodeId;
+                delete tail.dataset.blockId;
+                delete tail.dataset.chars;
+                delete tail.dataset.truncated;
+                delete tail.dataset.state;
+                delete tail.dataset.duration;
+                delete tail.dataset.argsChars;
+                delete tail.dataset.resultChars;
+                delete tail.dataset.panels;
+                delete tail.dataset.media;
+                tailCaption.textContent = '';
+                tailBody.replaceChildren();
+            };
+
+            // One labelled pane of the current call's body, and its stated absence. The
+            // record holds no arguments for a result-only frame and no result while the call
+            // is running, and each of those is an ANSWER the reader deserves to see spelled
+            // out rather than a blank box (the rule `ui/context-detail.ts` applies to the
+            // same two fields in the dialog).
+            const createTailPane = (label: string, pane: string, value: string | undefined, absence: string): HTMLElement => {
+                const section = document.createElement('div');
+                section.className = 'context-bar-tail-pane';
+                section.dataset.pane = pane;
+
+                const heading = document.createElement('p');
+                heading.className = 'context-bar-tail-pane-label';
+                heading.textContent = label;
+                section.append(heading);
+
+                if (value === undefined) {
+                    const note = document.createElement('p');
+                    note.className = 'context-bar-tail-pane-note';
+                    note.dataset.note = absence;
+                    note.textContent = absence === 'no-result'
+                        ? 'no result recorded for this call yet'
+                        : absence === 'empty-result'
+                          ? 'this call recorded an empty result'
+                          : 'no arguments recorded for this call';
+                    section.append(note);
+
+                    return section;
+                }
+
+                // Plain text, never Markdown and never a highlighter: these are recorded
+                // bytes, and this path parses no model-written markup (the think chip's rule
+                // verbatim). `textContent` also keeps the pane byte-identical to the payload.
+                const body = document.createElement('pre');
+                body.className = 'context-bar-tail-pane-body';
+                body.dataset.field = pane;
+                body.textContent = value;
+                section.append(body);
+
+                return section;
+            };
+
+            /**
+             * Print the section's current block in full, or hide the body.
+             *
+             * An `assistant` tail deliberately prints NOTHING here: its full text is the
+             * section's designated answer node, and the flow already renders that in the
+             * `.agent-text` block immediately below this host — the existing full-answer
+             * surface R23 points at. A thinking window and a recorded call DO need a body
+             * minted at the tail of the strip, because the think chip and the tool card that
+             * used to hold them are the wall this bar replaced.
+             */
+            const paintTail = (next: ContextTail | undefined): void => {
+                if (next === undefined || next.kind === 'assistant') {
+                    clearTail();
+
+                    return;
+                }
+
+                const kind = next.kind === 'tool' ? next.tool : undefined;
+
+                // A designation whose payload vanished (a legacy producer, a malformed frame)
+                // has no body to print; hiding the element is honest, inventing one is not.
+                if (next.kind === 'tool' && kind === undefined) {
+                    clearTail();
+
+                    return;
+                }
+
+                // Prose compares its text (the body IS the text); a call compares the
+                // payload sizes and the server's figures, because its bytes are minted once
+                // per recorded event and can only move by one arriving.
+                const key =
+                    next.kind === 'tool'
+                        ? `tool|${next.nodeId}|${next.blockId ?? ''}|${next.chars}|${next.truncated}|${kind?.state ?? ''}|${kind?.durationMs ?? -1}|${kind?.args?.length ?? -1}|${kind?.result?.length ?? -1}|${kind?.panelCount ?? 0}|${kind?.mediaCount ?? 0}`
+                        : `${next.kind}|${next.nodeId}|${next.blockId ?? ''}|${next.chars}|${next.truncated}|${next.text}`;
+
+                if (key === tailKey) return;
+
+                tailKey = key;
+                tail.hidden = false;
+                tail.dataset.kind = next.kind;
+                tail.dataset.nodeId = next.nodeId;
+                if (next.blockId === undefined) delete tail.dataset.blockId;
+                else tail.dataset.blockId = next.blockId;
+                // The EXACT recorded length and the honest truncation state, both from the
+                // server's figures: a bounded body says so instead of letting a prefix read
+                // as the whole block.
+                tail.dataset.chars = String(next.chars);
+                tail.dataset.truncated = next.truncated ? 'true' : 'false';
+                tailCaption.textContent = contextTailCaptionOf(next);
+
+                if (next.kind === 'reasoning') {
+                    delete tail.dataset.state;
+                    delete tail.dataset.duration;
+                    delete tail.dataset.argsChars;
+                    delete tail.dataset.resultChars;
+                    delete tail.dataset.panels;
+                    delete tail.dataset.media;
+                    // Plain text, never Markdown — the think chip's rule verbatim: scratch
+                    // space can contain anything the model wrote, and this path parses no HTML.
+                    tailBody.textContent = next.text;
+
+                    return;
+                }
+
+                // The current call: its own status, then its complete recorded request and
+                // response, one pane each. R23 — a call IS a block, so it gets the same full
+                // body at the tail a thinking window or an answer gets.
+                tail.dataset.state = kind?.state ?? 'running';
+                if (kind?.durationMs === undefined) delete tail.dataset.duration;
+                else tail.dataset.duration = String(kind.durationMs);
+                tail.dataset.argsChars = String(kind?.argsChars ?? 0);
+                if (kind?.resultChars === undefined) delete tail.dataset.resultChars;
+                else tail.dataset.resultChars = String(kind.resultChars);
+                tail.dataset.panels = String(kind?.panelCount ?? 0);
+                tail.dataset.media = String(kind?.mediaCount ?? 0);
+                tailBody.replaceChildren(
+                    createTailPane('arguments', 'args', kind?.args, 'no-args'),
+                    createTailPane(
+                        'result',
+                        'result',
+                        kind?.result,
+                        kind?.hasResult === true ? 'empty-result' : 'no-result'
+                    )
+                );
+            };
+
+            /** True when the bar, not the chip wall, is this section's tool surface. */
+            const driven = (): boolean => model !== undefined && contextBarReplacesChips(model);
+
+            // Opens one segment's full detail: the ONLY place the block route is called.
+            const openSegment = (input: ContextBarActivateInput): void => {
+                const loader = options.loadBlockDetail;
+                // The block names its own turn (the route's key), and an optimistic tile has
+                // no `serverId` yet, so the block's value is the primary and the tile's is the
+                // fallback — never a guess from stream position. A delegated segment carries
+                // the SAME turn id as its caller's, because one `TurnDisplay` is one turn; the
+                // block id is what makes the answer this section's and not the tile's.
+                const turnId = input.block.turnId.length > 0 ? input.block.turnId : (serverId ?? '');
+
+                // A second activation replaces the reader's segment instead of stacking a
+                // second modal over the same turn (ui/dialog.ts would happily stack them). T19
+                // keeps that promise across sections: the strip the reader just clicked is the
+                // one they are asking about, so this surface's dialog AND any sibling section's
+                // dialog close first, while each surface still tracks its own for refresh and
+                // teardown.
+                for (const other of contextBarSurfaces) other.closeDetail();
+
+                const dialog = openBlockDetail({
+                    block: input.block,
+                    turnId,
+                    ...(boundSession === undefined ? {} : { sessionId: boundSession }),
+                    ...(loader === undefined ? {} : { load: loader })
+                });
+
+                detail = { dialog, fingerprint: blockDetailFingerprintOf(input.block) };
+                host.dataset.open = dialog.blockId;
+            };
+
+            // Repaint the open segment from this section's CURRENT metadata, and only when that
+            // metadata actually moved. A running call's `context:set` frames arrive with every
+            // argument byte, so an unconditional refresh would re-issue the detail request on
+            // every frame; the fingerprint is what makes "refresh when the answer could have
+            // changed" both honest and cheap. A block the section dropped CLOSES its dialog,
+            // because the bytes on screen are no longer part of this block.
+            const refresh = (): void => {
+                const open = detail;
+
+                if (open === undefined || !open.dialog.isOpen()) {
+                    detail = undefined;
+
+                    return;
+                }
+
+                const next = model?.blocks.find((block) => block.id === open.dialog.blockId);
+
+                if (next === undefined) {
+                    open.dialog.close();
+                    detail = undefined;
+                    delete host.dataset.open;
+
+                    return;
+                }
+
+                const fingerprint = blockDetailFingerprintOf(next);
+                if (fingerprint === open.fingerprint) return;
+
+                detail = { dialog: open.dialog, fingerprint };
+                open.dialog.refresh(next);
+            };
+
+            const sync = (section: TurnSection | undefined, turnId: string): boolean => {
+                const wasDriven = driven();
+                const next = sectionContextModel(turnId, section);
+
+                model = next;
+
+                if (!next.available) {
+                    // A pre-T9 record, or a frame that says nothing about THIS section: destroy
+                    // the strip and let this section's step cards render the way they always did.
+                    // The tail body goes with it: a section with no strip has no tail end to
+                    // print a block at, and its chip/prose flow keeps rendering as it always did.
+                    if (bar !== undefined) {
+                        bar.destroy();
+                        bar = undefined;
+                    }
+
+                    clearTail();
+                    host.replaceChildren();
+                    host.hidden = true;
+                    delete host.dataset.turnId;
+                    delete host.dataset.sectionId;
+                    delete host.dataset.segments;
+
+                    return wasDriven;
+                }
+
+                if (bar === undefined) {
+                    bar = mountContextBar({ onActivate: openSegment });
+                    host.append(bar.element);
+                }
+
+                // The tail body is ALWAYS the host's last child, so the newest block reads as
+                // the tail of the strip instead of a chip left under older content (R23).
+                if (host.lastElementChild !== tail) host.append(tail);
+
+                bar.setModel(next);
+                host.hidden = false;
+                host.dataset.turnId = turnId;
+                // Provenance, readable without a second lookup: WHICH section this strip
+                // describes, and how many segments it carries.
+                if (section !== undefined) host.dataset.sectionId = section.id;
+                host.dataset.segments = String(next.blocks.length);
+                // R23: the ONE body this section prints, taken straight from the server's
+                // order. Doing it HERE is what makes a hydration render, an ops frame and a
+                // reconnect land on the same single block with no second code path.
+                paintTail(driven() ? contextTailOf(section) : undefined);
+                refresh();
+
+                return wasDriven !== driven();
+            };
+
+            // Closes ONLY this surface's dialog and leaves the strip mounted. `openSegment`
+            // calls it on every surface this tile owns, so one click replaces whichever segment
+            // the reader had open, whichever section's strip held it.
+            const closeDetail = (): void => {
+                detail?.dialog.close();
+                detail = undefined;
+                delete host.dataset.open;
+            };
+
+            const destroy = (): void => {
+                // The dialog is the user-visible half: a discarded section must not leave its
+                // modal behind with an already-detached strip (a focus trap and the counted
+                // body scroll lock would survive the card that owned it).
+                closeDetail();
+
+                if (bar !== undefined) {
+                    bar.destroy();
+                    bar = undefined;
+                }
+
+                // The tail body is the user-visible half of the surface: its text must go
+                // with the host, or a rebuilt card could read the previous section's block.
+                clearTail();
+                host.replaceChildren();
+                host.hidden = true;
+                delete host.dataset.turnId;
+                delete host.dataset.sectionId;
+                delete host.dataset.segments;
+                model = undefined;
+
+                // Out of the tile's list too: a rebuilt projection mints fresh surfaces, and a
+                // dead one left behind would be asked to close a dialog it no longer owns.
+                const index = contextBarSurfaces.indexOf(surface);
+                if (index >= 0) contextBarSurfaces.splice(index, 1);
+            };
+
+            const surface: ContextBarSurface = {
+                host,
+                sync,
+                driven,
+                // R23: the ops path repaints the body straight from an addressed node when a
+                // frame arrives without a tree, so `paintTail` is part of the surface contract.
+                setTail: paintTail,
+                refresh,
+                closeDetail,
+                destroy
+            };
+            contextBarSurfaces.push(surface);
+
+            return surface;
+        };
+
+        // The tile's own surface: the turn's ROOT section strip, in `.tile-body` between the
+        // prompt and the flow (exactly where T11 mounted it; only its CONTENT narrowed).
+        // No tile-wide "is the bar driving?" accessor survives: T19 made that answer per
+        // section, and `paintCompiledStep` asks the surface that owns the step.
+        const tileContextBar = createContextBarSurface(contextBarHost);
+
+        // Which section of a tree the TILE's strip describes. The two server figures that say
+        // this are the same ones `compiledEntryOf` uses to decide which surface a section's
+        // nodes land in, and they are checked in the same order, so a section can never be
+        // "root" to the bar and "nested" to the flow:
+        //   - `role === 'primary'` (turn-display.ts:199, the entry agent's own flow);
+        //   - otherwise the FIRST section when it has no `parentSectionId` — the projector
+        //     allocates the turn's own flow before anything nested (turn-display.ts:445).
+        // A tree with neither (an empty or legacy document) has no root strip to paint.
+        const rootSectionOf = (display: TurnDisplay | undefined): TurnSection | undefined => {
+            const sections = sectionsOf(display);
+            const primary = sections.find((section) => section.role === 'primary');
+            if (primary !== undefined) return primary;
+
+            const first = sections[0];
+
+            return first !== undefined && first.parentSectionId === undefined ? first : undefined;
+        };
+
+        /**
+         * Re-derive EVERY strip this tile owns from the tree it is painting (T19, R17).
+         *
+         * `undefined` (an ops frame with no document to read) leaves every bar exactly as it
+         * was: the terminal `view` frame is the documented reconciler, so keeping the last
+         * authoritative strip beats redrawing it from a guess.
+         *
+         * Returns true when ANY section took over from (or handed back) its chip wall — the
+         * one moment in which the flows already on screen are known to be the wrong shape.
+         */
+        const syncContextBar = (display: TurnDisplay | undefined): boolean => {
+            if (display === undefined) return false;
+
+            compiledDisplay = display;
+
+            let flipped = tileContextBar.sync(rootSectionOf(display), display.turnId);
+
+            // A delegated strip lives on ITS card, so the same tree repaints it through the
+            // entry that owns it. `compiledSections` is the only join, and a section seen for
+            // the FIRST time is not in it yet — `compiledEntryOf` syncs a brand-new surface
+            // itself at creation, which is what keeps the first paint already in the right
+            // mode instead of rebuilding twice.
+            for (const entry of compiledSections.values()) {
+                const surface = entry.contextBar;
+                if (surface === undefined || surface === tileContextBar) continue;
+
+                const section = sectionsOf(display).find((candidate) => candidate.id === entry.key);
+                flipped = surface.sync(section, display.turnId) || flipped;
+            }
+
+            return flipped;
+        };
+
+        // Rebuild every painted section's flow from the tree. Needed exactly once per turn:
+        // the FIRST context frame converts a tile that had already painted step cards into a
+        // bar-driven one (and the reverse when a reconcile drops the metadata). It reuses the
+        // documented whole-section repaint, so handles, attempt ownership and the pending
+        // snapshot stay consistent with the tree rather than with what was on screen.
+        const rebuildCompiledFlow = (): void => {
+            if (compiledDisplay === undefined) return;
+
+            for (const [sectionId, entry] of [...compiledSections]) {
+                const section = sectionsOf(compiledDisplay).find((candidate) => candidate.id === sectionId);
+                if (section === undefined) continue;
+
+                renderCompiledSection(entry, section);
+            }
+
+            updateMeta();
+        };
 
         const compiledKeyOf = (sectionId: string, nodeId: string): string =>
             `${sectionId}\u0000${nodeId}`;
@@ -5199,18 +6076,42 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             (step.state === 'ok' ? 'completed' : step.state === 'cancelled' ? 'cancelled' : 'failed');
 
         // The entry that owns one server section, creating it on first sight.
-        const compiledEntryOf = (section: TurnSection): ThreadEntry => {
+        //
+        // `display` is the compiled tree this tile is painting (the whole-tree paths have
+        // it; an ops frame carries the store's post-state tree). It is what separates the
+        // turn's own flow from a nested one whose parent the runtime never named.
+        const compiledEntryOf = (section: TurnSection, display?: TurnDisplay): ThreadEntry => {
             const known = compiledSections.get(section.id);
             if (known !== undefined) return known;
 
             compiledMode = true;
 
-            // The ROOT flow is the turn's own primary section; every other section is a nested
-            // invocation with its own row. `parentSectionId` cannot decide this alone: a direct
-            // child of the root omits it by contract (`HarnessThread.parentId` is "omitted for a
-            // direct child of the root", types/index.ts:1664), so the server's `role` is the
-            // authority for "is this the turn's own flow" (turn-display.ts:161,199).
-            const root = section.role === 'primary';
+            // The ROOT flow is the turn's own section; every other section is a nested
+            // invocation with its own row. Two server figures say this, and either wins:
+            //   - `role === 'primary'` (turn-display.ts:199, the entry agent's own flow);
+            //   - NO `parentSectionId` (turn-display.ts:397) ON THE SECTION THE TREE ORDERS
+            //     FIRST — the projector allocates the turn's own flow before anything nested
+            //     (turn-display.ts:445), so "first and parentless" IS the root.
+            //
+            // `role` alone is not enough: a PERSISTENT CHILD conversation owns turns of its
+            // own whose root run is that CHILD's agent, and the projector stamps that section
+            // `role: 'subagent'` (`agent === context.primary` compares against the ENTRY
+            // agent, turn-projector.ts:450). The tile is still that turn's exchange, so its
+            // flow belongs in `.tile-flow`, never in an indented `.thread-row` — the same
+            // discrimination the raw fold makes with `isConversationRoot` (turns.ts:4043) and
+            // the rule thread-conversation-shell.test.ts pins.
+            //
+            // The position test matters the other way too: a branch/fork of the root ALSO has
+            // no `parentSectionId` (`HarnessThread.parentId` is "omitted for a direct child of
+            // the root", types/index.ts:1664), and only its place after the root keeps it a
+            // nested row. With no tree to order against (an ops frame that arrived without
+            // one), the honest equivalent is "this tile has no root flow yet".
+            const root =
+                section.role === 'primary' ||
+                (section.parentSectionId === undefined &&
+                    (display !== undefined
+                        ? sectionsOf(display)[0]?.id === section.id
+                        : threads.get(ROOT_KEY) === undefined));
             let entry: ThreadEntry;
 
             if (root) {
@@ -5232,6 +6133,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     tileAgent.hidden = false;
                     syncRootAgentVisibility();
                 }
+
+                // T19 (R17): this entry's steps are owned by the TILE's strip. Assigned here
+                // rather than in `rootSection`, because the defensive `inlineEntry` fallback
+                // takes the same branch — whichever entry ends up owning the root flow is the
+                // one whose steps the root strip replaces. `disposeContextBar` stays the
+                // literal's no-op: the tile owns that surface and destroys it with the tile.
+                entry.contextBar = tileContextBar;
             } else {
                 entry = createThread({
                     // The server's section id is the card's identity: stable across a
@@ -5259,6 +6167,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             compiledSections.set(section.id, entry);
+
+            // T19 (R17): point this section's OWN strip at itself BEFORE its steps are painted,
+            // so the very first pass already knows whether this section draws segments or
+            // cards. `display` can be absent (an ops frame that arrived without a tree); the
+            // strip's turn figure then falls back to the id this tile is bound to, and the next
+            // tree repaint corrects it. A section carrying no `context` array leaves the host
+            // hidden and keeps its step cards, exactly as a legacy turn always did.
+            entry.contextBar?.sync(section, display?.turnId ?? serverId ?? '');
+
             paintCompiledSection(entry, section);
 
             return entry;
@@ -5269,6 +6186,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // allocator and the roster invocation join are the raw path's fallbacks and
         // are deliberately not consulted first.
         const paintCompiledSection = (entry: ThreadEntry, section: TurnSection): void => {
+            // T22 (R23): the reducer mutates THIS object in place, so holding the reference
+            // is what lets a later ops frame — including one that arrives with no document —
+            // re-derive this section's single displayed content block from server state
+            // rather than from what happens to be on screen.
+            entry.compiledSection = section;
+
             if (entry.key !== ROOT_KEY && section.agentLabel.length > 0)
                 paintEntryLabel(entry, section.agentLabel);
 
@@ -5323,13 +6246,24 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             updateMeta();
         };
 
-        // One notice line. The tone selects the existing surface so a retry, a wake
-        // and an error keep the DOM vocabulary the styles and the tests already pin;
-        // the quieter tones share one new `.agent-notice` line.
+        // One notice line. The tone selects the existing surface so a wake, an error and the
+        // quieter notes keep the DOM vocabulary the styles and the tests already pin.
+        //
+        // T19 (R19): a `retry` tone renders NOTHING. A transient model-request retry is
+        // internal — the runtime re-sent one request and the run went on — so a line per
+        // attempt is chatter the reader never acts on, and T16 already stopped the server
+        // minting one (turn-display.ts `DisplayNoticeTone`). The tone still arrives from an
+        // OLDER imported/compiled document that recorded the notice as a node, and the browser
+        // has to be silent about it too: "no retry line" is a rendering rule for every render
+        // path, not only for the projector. The distinction is the tone, never the words — a
+        // budget actually running out is an `error`-tone notice (../core/agent.ts:604) and that
+        // one is the outcome the reader acts on, so it still prints.
         const paintCompiledNotice = (
             entry: ThreadEntry,
             node: DisplayNoticeNode
-        ): CompiledHandle => {
+        ): CompiledHandle | undefined => {
+            if (node.tone === 'retry') return undefined;
+
             const section = entry.section;
 
             // A notice is readable prose between chips, so it breaks the chip run —
@@ -5365,6 +6299,32 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // `DisplayActionSummary` the server sends inline (answering must not cost
             // a round trip).
             if (step.kind === 'action') return paintCompiledAction(entry, step);
+
+            // T11 (R7) / T19 (R17): when THIS section's context is server-described, a recorded
+            // call is ONE SEGMENT of that section's bar, not a card. Everything that is not the
+            // card still happens: the block's tool tally, the authoritative pending snapshot and
+            // the settled-call prune feed the meta line and the status row, which the bar does
+            // not replace. What goes is the card itself — its DOM, its live timer, its preview
+            // Markdown and its own lazy step-detail source, because the bar segment's click buys
+            // the same exact recorded bytes through the block route.
+            //
+            // The check is per section on purpose: a caller that described its context and a
+            // callee that did not are two different surfaces, and swallowing the second one's
+            // cards on the first one's evidence would hide real information.
+            if (entry.contextBar?.driven() === true) {
+                toolCount += 1;
+
+                // Read from `entry.section` directly: the card path below declares its own
+                // `section` binding, and this branch runs before it.
+                const owner = entry.section;
+                if (Array.isArray(step.pending)) paintPending(owner, step.pending);
+                if (step.state !== 'running' && step.callId !== undefined) noteSettled(owner, step.callId);
+
+                const implicit: CompiledHandle = { kind: 'implicit', sectionId: entry.key, entry, step };
+                compiledHandles.set(compiledKeyOf(entry.key, step.id), implicit);
+
+                return implicit;
+            }
 
             const section = entry.section;
             const startedAt = step.startedAt;
@@ -5506,6 +6466,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // One prose/reasoning node. Both reuse the fold's incremental writers, so
         // Markdown scheduling, attempt ownership and the chip-row layout are the
         // same code the live path already proved — only the bytes' origin differs.
+        //
+        // T22 (R23) narrows what the reader SEES of that flow when the section is
+        // bar-described: `applyEntryContent` runs after the paint and leaves exactly one
+        // prose block printed — the section's current answer — because every earlier
+        // window is a segment of the strip that answers a click with its exact bytes.
         const paintCompiledText = (entry: ThreadEntry, node: DisplayTextNode): CompiledHandle | undefined => {
             const section = entry.section;
 
@@ -5519,9 +6484,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 kind: 'text',
                 sectionId: entry.key,
                 entry,
-                node: block.node
+                node: block.node,
+                nodeId: node.id
             };
             compiledHandles.set(compiledKeyOf(entry.key, node.id), handle);
+            // Provenance on the surface itself, so a reader (or a test) can tell which
+            // recorded node a printed block came from without re-walking the tree.
+            block.node.dataset.contextNode = node.id;
 
             // A committed node is a closed window: the next node must stream into a
             // block of its own (the raw path closes at `attempt_commit`/`done`).
@@ -5538,6 +6507,28 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry: ThreadEntry,
             node: DisplayReasoningNode
         ): CompiledHandle | undefined => {
+            // T22 (R23): a bar-described section prints its thinking at the TAIL of the
+            // strip, one window at a time — not as a chip per round. The tail body is owned
+            // by the section's bar surface and is repainted from the server's order by
+            // `applyEntryContent`, which runs after this paint, so a hydration render, an
+            // ops frame and a reconnect all land on the same single body.
+            if (entry.contextBar?.driven() === true) {
+                const tailHandle: CompiledHandle = {
+                    kind: 'tail',
+                    sectionId: entry.key,
+                    entry,
+                    nodeId: node.id
+                };
+                compiledHandles.set(compiledKeyOf(entry.key, node.id), tailHandle);
+
+                // A newly painted window IS the newest block (the projector just opened it),
+                // so paint it now rather than waiting for a frame that carries a document —
+                // an ops-only stream still shows the round growing, live.
+                entry.contextBar?.setTail(contextTailOf(entry.compiledSection));
+
+                return tailHandle;
+            }
+
             const section = entry.section;
 
             appendReasoning(section, node.text);
@@ -5547,9 +6538,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             // The server owns the token arithmetic, so the chip prints the share it
             // was handed; the local character estimate stays the fallback for a
-            // frame that reports no share.
+            // frame that reports no share. Same rule for the character figure: `chars`
+            // is the round's EXACT recorded length, which is the only honest number
+            // once the wire text is a bounded preview (T13).
             chip.card.setContext((entry.meta ?? blockMeta).context());
             chip.card.setShare(node.share);
+            chip.card.setChars(node.chars);
 
             const handle: CompiledHandle = {
                 kind: 'reasoning',
@@ -5592,12 +6586,31 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 return;
             }
 
+            if (handle.kind === 'implicit') {
+                // T11: no DOM of its own. The tile's tool tally moves, and the bar's strip is
+                // repainted from the tree by `syncContextBar` — never per handle, which is
+                // what keeps a 300-call turn at one repaint instead of 300.
+                toolCount = Math.max(0, toolCount - 1);
+
+                return;
+            }
+
             if (handle.kind === 'reasoning') {
                 handle.entry.section.thinking = handle.entry.section.thinking.filter(
                     (card) => card !== handle.card
                 );
                 handle.card.destroy();
                 handle.card.element.remove();
+
+                return;
+            }
+
+            if (handle.kind === 'tail') {
+                // T22 (R23): the window leaves the flow the moment its node does, and the
+                // section's tail is re-derived from the tree the discard just updated. No
+                // card, no tally: a think window was never a tool call, and dropping it must
+                // not move the tile's call count (the `implicit` branch above would).
+                applyEntryContent(handle.entry, handle.entry.compiledSection);
 
                 return;
             }
@@ -5618,6 +6631,63 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const compiledSectionKeys = (sectionId: string): string[] =>
             [...compiledHandles.keys()].filter((key) => key.startsWith(`${sectionId}\u0000`));
 
+        /**
+         * T22/T23 (R23): re-derive the ONE content body this section is allowed to print.
+         *
+         * Everything about the decision is server-authored (`contextTailOf` applies the
+         * section's own `tail` designation and reads the node/block it names), and this
+         * single pass is the only thing that turns it into DOM state. It therefore runs
+         * after EVERY paint that can move the tail: a hydration render, a whole-tree
+         * reconcile, one addressed ops frame (a new round, a settled call, a redaction), a
+         * discard. Live streaming and a cold reload end on the same body because they end
+         * in the same function.
+         *
+         * Two surfaces are narrowed, and only while the section is bar-described
+         * (`driven()`), so a pre-T9 record keeps the historical flow untouched:
+         *   - the strip's OWN tail body (this section's current thinking window or current
+         *     call, printed in full directly after the graph — `surface.setTail`), and
+         *   - the flow's prose blocks: the current answer prints, every earlier window is
+         *     hidden because the segment plus its lazy detail is how it is represented now.
+         */
+        const applyEntryContent = (entry: ThreadEntry, section: TurnSection | undefined): void => {
+            const surface = entry.contextBar;
+            if (surface === undefined) return;
+
+            if (section !== undefined) entry.compiledSection = section;
+
+            const source = section ?? entry.compiledSection;
+            const driven = surface.driven();
+            const tail = driven ? contextTailOf(source) : undefined;
+
+            surface.setTail(tail);
+
+            for (const key of compiledSectionKeys(entry.key)) {
+                const handle = compiledHandles.get(key);
+                if (handle === undefined || handle.kind !== 'text') continue;
+
+                // The tail IS the answer the reader is looking at, so its block prints; any
+                // other prose node of this section is history and prints nothing (its segment
+                // plus the lazy block detail is how it is represented now).
+                const visible = driven ? contextTailShowsProse(tail, handle.nodeId) : true;
+
+                handle.node.dataset.tailState = visible ? 'current' : 'superseded';
+                // `hidden` is the base rule (`[hidden] { display: none !important }`), and
+                // `data-superseded` states the same decision in its own vocabulary so the
+                // stylesheet contract survives a change to that base rule. The element and
+                // its writer stay in the DOM: only the rendering is withdrawn.
+                if (visible) delete handle.node.dataset.superseded;
+                else handle.node.dataset.superseded = 'true';
+                handle.node.hidden = !visible;
+            }
+        };
+
+        /** The same pass for every section this tile owns, from the tree it is painting. */
+        const applyCompiledContent = (display: TurnDisplay | undefined): void => {
+            for (const [sectionId, entry] of compiledSections) {
+                applyEntryContent(entry, sectionsOf(display).find((candidate) => candidate.id === sectionId));
+            }
+        };
+
         // Repaint one section's flow from its compiled node array. Used for a full
         // hydration and for the rare `node:insert` with an explicit `index` (an
         // out-of-order recovery), where appending would put the node in the wrong
@@ -5635,25 +6705,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.section.pendingCalls.clear();
             entry.section.pending = undefined;
 
+            // Set BEFORE the node loop: `paintCompiledReasoning` paints the tail body from
+            // this reference, and a rebuild must land on the same block a stream would.
+            entry.compiledSection = section;
+
             for (const node of section.nodes) paintCompiledNode(entry, node);
 
-            // TEMP PROBE (T5): did the compiled paint actually reach the surface?
-            console.warn(
-                '[paint]',
-                'mode',
-                compiledMode,
-                'entry',
-                entry.key,
-                'section',
-                section.id,
-                section.role,
-                'nodes',
-                section.nodes.length,
-                'kinds',
-                section.nodes.map((n) => n.kind).join(','),
-                'flow children',
-                entry.section.flow.children.length
-            );
+            // R23: the flow was just rebuilt, so the ONE body this section prints is
+            // re-derived here rather than left to whatever node painted last.
+            applyEntryContent(entry, section);
 
             updateMeta();
         };
@@ -5665,16 +6725,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const renderCompiledDisplay = (display: TurnDisplay): void => {
             resetCompiled();
             compiledMode = true;
-            // TEMP PROBE (T5): which whole-tree path ran, and with what.
-            console.warn('[full paint]', display.turnId, sectionsOf(display).length);
+
+            // T11: the bar is decided BEFORE the flow is painted, because whether this tile
+            // draws step cards or segments is a property of the whole turn, and a node loop
+            // that ran first would have already minted the cards this mode replaces.
+            syncContextBar(display);
 
             // Sections in the server's allocation order: root first, then nested.
             // `paintCompiledSection` re-applies identity, so an already-created entry
             // (an optimistic tile's root) is refreshed rather than duplicated.
             for (const section of sectionsOf(display)) {
-                const entry = compiledEntryOf(section);
+                const entry = compiledEntryOf(section, display);
                 renderCompiledSection(entry, section);
             }
+
+            // T22 (R23): one pass over every section this tile just painted, deciding which
+            // single content block prints. `renderCompiledSection` does it per section; this
+            // also covers a section whose entry was refreshed without a rebuild (an
+            // optimistic tile), which is what keeps a hydration and a live stream identical.
+            applyCompiledContent(display);
 
             // The persistent-conversation join (the row's `data-persistent-thread`, its title and
             // the child header's conversation name) is painted from the roster claim or the join
@@ -5697,34 +6766,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const syncCompiledDisplay = (display: TurnDisplay): void => {
             compiledMode = true;
 
-            for (const section of sectionsOf(display)) {
-                const entry = compiledEntryOf(section);
-                paintCompiledSection(entry, section);
+            // T11: an authoritative frame can be the one that FINALLY carries context (or a
+            // legacy reconcile that stopped carrying it). When the mode flips, the flow on
+            // screen is known to be the wrong shape, so it is rebuilt from this tree rather
+            // than patched node by node.
+            if (syncContextBar(display)) {
+                renderCompiledDisplay(display);
 
-                // TEMP PROBE (T5): the incremental whole-tree path's per-section work.
-                console.warn(
-                    '[sync paint]',
-                    display.turnId,
-                    'sections',
-                    sectionsOf(display).length,
-                    'section',
-                    section.id,
-                    section.role,
-                    'nodes',
-                    section.nodes.length,
-                    'flow children',
-                    entry.section.flow.children.length,
-                    'flow',
-                    entry.section.flow.tagName + '.' + String(entry.section.flow.className),
-                    'flow parent',
-                    entry.section.flow.parentElement?.className ?? '(detached)',
-                    'connected',
-                    entry.section.flow.isConnected,
-                    'card connected',
-                    card.isConnected,
-                    'card flow',
-                    card.querySelector('.tile-flow')?.children.length ?? -1
-                );
+                return;
+            }
+
+            for (const section of sectionsOf(display)) {
+                const entry = compiledEntryOf(section, display);
+                paintCompiledSection(entry, section);
 
                 const painted = new Set<string>();
 
@@ -5747,6 +6801,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                     dropCompiledHandle(key);
                 }
+
+                // R23: this section's flow just advanced node by node, so its single
+                // displayed body is re-derived from the same tree the reconcile read.
+                applyEntryContent(entry, section);
             }
 
             // A whole section the document dropped (a deleted invocation) takes its
@@ -5757,6 +6815,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 for (const key of compiledSectionKeys(sectionId)) dropCompiledHandle(key);
                 compiledSections.delete(sectionId);
                 entry.disposeActionBar();
+                // T19 (R17): a section the document dropped loses its OWN strip too, including
+                // any segment dialog the reader still has open on it.
+                entry.disposeContextBar();
                 entry.row?.remove();
                 threads.delete(sectionId);
             }
@@ -5815,12 +6876,31 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 return;
             }
 
+            // T22 (R23): a bar-described thinking window owns no DOM, so an already-painted
+            // one has nothing to advance here — the caller's `applyEntryContent` pass re-reads
+            // the same node and repaints the ONE tail body, which is what keeps a reconcile
+            // frame identical to the stream that produced it.
+            if (handle.kind === 'tail') return;
+
             if (handle.kind === 'notice' && node.kind === 'notice') {
                 handle.node.dataset.tone = node.tone;
                 const label = handle.node.querySelector('.agent-notice-label');
                 const text = handle.node.querySelector('.agent-notice-text');
                 if (label !== null) label.textContent = node.tone;
                 if (text !== null) text.textContent = node.text;
+
+                return;
+            }
+
+            if (handle.kind === 'implicit' && node.kind === 'tool') {
+                // A bar-owned call: the step object is the only state, so the same exact
+                // comparison decides whether anything moved. Repainting is a handle swap
+                // (no DOM), and the segment's colour/width come from the `context:set` the
+                // same frame carries, which `syncContextBar` already applied.
+                if (JSON.stringify(handle.step) === JSON.stringify(node)) return;
+
+                dropCompiledHandle(key);
+                paintCompiledStep(handle.entry, node);
 
                 return;
             }
@@ -5879,6 +6959,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             ops: readonly TurnDisplayOp[],
             display?: TurnDisplay
         ): void => {
+            // One flag per frame, so the bar is repainted at most once per frame however many
+            // `context:*` ops it carried (a settled tool round sends several).
+            let contextTouched = false;
+
             for (const op of ops) {
                 switch (op.op) {
                     case 'turn':
@@ -5888,7 +6972,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                     case 'section:open': {
                         compiledMode = true;
-                        const entry = compiledEntryOf(op.section);
+                        // A section the server opens CAN carry its whole context list on the
+                        // object, so this frame is a bar frame whether or not a `context:*` op
+                        // follows it.
+                        contextTouched = true;
+                        // `display` is the store's post-state tree for this turn: it is what
+                        // tells a parentless FIRST section (the turn's own flow) apart from a
+                        // parentless later one (a branch of the root).
+                        const entry = compiledEntryOf(op.section, display);
                         paintCompiledSection(entry, op.section);
                         break;
                     }
@@ -5958,6 +7049,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                             }
                         } else if (handle.kind === 'reasoning') {
                             handle.card.setText(`${handle.card.text()}${op.delta}`);
+                        } else if (handle.kind === 'tail') {
+                            // T22 (R23): a bar-described thinking window has no chip to
+                            // append into — its body is the section's single tail, and the
+                            // reducer has ALREADY grown `entry.compiledSection`'s node text,
+                            // so re-deriving the tail is the whole update. No local buffer,
+                            // and therefore nothing that could drift from a cold reload.
+                            applyEntryContent(handle.entry, undefined);
                         }
 
                         break;
@@ -5969,6 +7067,55 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                         if (handle.kind === 'reasoning' && op.patch.share !== undefined)
                             handle.card.setShare(op.patch.share);
+
+                        // T13: the exact recorded length the chip prints. A think window's
+                        // wire TEXT is bounded once it passes the cap, but its `chars` keeps
+                        // arriving with every delta, so the figure stays the round's real one
+                        // (../shared/turn-display.ts:684). `undefined` is "not reported", and
+                        // the card falls back to measuring its own text.
+                        if (handle.kind === 'reasoning' && op.patch.chars !== undefined)
+                            handle.card.setChars(op.patch.chars);
+
+                        // `text` rewrites a NOTICE line in place (turn-display.ts:380). The
+                        // per-section pending status line is the node this reaches most: a
+                        // remove+insert pair would flicker the row, so the patch updates the
+                        // existing line's text verbatim.
+                        if (handle.kind === 'notice' && op.patch.text !== undefined) {
+                            const line = handle.node.querySelector('.agent-notice-text');
+                            if (line !== null) line.textContent = op.patch.text;
+                        }
+
+                        // T13 (contract decision): a prose `text` patch is the SERVER
+                        // replacing what this node displays, and the row must show it. Two
+                        // producers, both decided by the fold: the bounded preview of a think
+                        // window whose wire bytes stopped at the cap, and the preview of an
+                        // answer a newer one superseded (`redactSuperseded`). The cold tree a
+                        // reload receives carries the SAME string, so ignoring it here left a
+                        // live chip with an empty body and a live answer expanded past what
+                        // the document says. This renders addressed server state; it parses
+                        // no events and restores no history.
+                        if (handle.kind === 'reasoning' && op.patch.text !== undefined)
+                            handle.card.setText(op.patch.text);
+
+                        if (handle.kind === 'text' && op.patch.text !== undefined) {
+                            const section = handle.entry.section;
+                            const writer = section.text;
+
+                            // The open writer owns the buffer the next scheduled flush
+                            // paints, so the replacement moves the buffer too — otherwise a
+                            // later frame would repaint the pre-redaction bytes over the
+                            // server's text. A closed block (the normal case: a committed
+                            // answer that has just been superseded) is repainted in place.
+                            if (writer !== undefined && writer.node === handle.node) {
+                                cancel(writer);
+                                writer.buffer = op.patch.text;
+                            }
+
+                            paintProse(handle.node, op.patch.text);
+                            // Prose that just moved stays before the status line, exactly as
+                            // an appended delta does (turns.ts `node:append`).
+                            if (section.pending !== undefined) section.flow.append(section.pending);
+                        }
 
                         // `committed` is a styling/lifecycle marker: the server sends
                         // explicit removes for a discard, so a commit only closes the
@@ -5982,6 +7129,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                             if (text !== undefined && text.length > 0) promoteAnswer(section, text);
                         }
 
+                        // T22 (R23): a tail-owned thinking window. Every patch here — the
+                        // bounded preview swapped in at the cap, the exact `chars` that keeps
+                        // arriving after the wire stopped carrying bytes, the `redacted`
+                        // marker that says which one it was — has already been applied to
+                        // `entry.compiledSection` by the reducer, so the tail body is
+                        // re-derived from the same server state a reload would read.
+                        if (handle.kind === 'tail') applyEntryContent(handle.entry, undefined);
+
                         break;
                     }
 
@@ -5989,6 +7144,38 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         dropCompiledHandleOf(op.sectionId, op.nodeId);
                         updateMeta();
                         break;
+
+                    case 'section:remove': {
+                        // The mirror of `section:open`: the server discarded a section that
+                        // never produced a node (a delegation placeholder whose attempt
+                        // failed, turn-projector.ts:1567). Its handles and its row go with
+                        // it — the document no longer names it, so nothing may keep painting
+                        // into it. A section this tile never adopted is a no-op.
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        // T11: the dropped section's SEGMENTS go with it. They live on the
+                        // section object, so the strip is rebuilt from the post-state tree
+                        // after the loop rather than spliced here.
+                        contextTouched = true;
+
+                        // Handles are keyed by the ENTRY key (`ROOT_KEY` for the turn's own
+                        // flow, the wire section id for every nested invocation), so the
+                        // cleanup resolves through the entry rather than the wire id.
+                        for (const key of compiledSectionKeys(entry.key)) dropCompiledHandle(key);
+                        compiledSections.delete(op.sectionId);
+                        entry.disposeActionBar();
+                        // T19 (R17): the dropped section's OWN strip goes with its row — the bar
+                        // (observers + listeners) and any segment dialog opened from it. A root
+                        // flow has no strip of its own to destroy: the tile owns that one.
+                        entry.disposeContextBar();
+                        // A root flow has no row of its own (its surfaces live in the tile),
+                        // so `row?.remove()` is the honest no-op for that case.
+                        entry.row?.remove();
+                        threads.delete(entry.key);
+                        updateMeta();
+                        break;
+                    }
 
                     case 'step:set': {
                         const entry = compiledSections.get(op.sectionId);
@@ -6059,8 +7246,53 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         updateMeta();
                         break;
                     }
+
+                    // T11 (R7/R8): the bar's OWN ops. The state half already ran before this
+                    // frame was routed here (`view-state.applyOpToDisplay` mutated the document
+                    // the caller hands back), so all three cases do is mark the frame as one
+                    // that touched the strip: the single repaint happens after the loop, from
+                    // the post-state tree, which is also what re-colors a segment a
+                    // `context:set` just settled.
+                    case 'context:add':
+                    case 'context:set':
+                    case 'context:remove': {
+                        contextTouched = true;
+                        break;
+                    }
+
+                    // T23 (R23): the tail designation. The state half already ran (the reducer
+                    // replaced `section.tail` on the post-state document this frame is routed
+                    // with), and the DOM half is the single frame-end `applyCompiledContent`
+                    // pass below — which is also what hides the body the designation left
+                    // behind. No strip repaint is needed for a designation on its own: the
+                    // segments and their counts did not move, only which body prints.
+                    case 'tail:set':
+                    case 'tail:clear': {
+                        break;
+                    }
                 }
             }
+
+            // T11: one strip repaint per frame that named the bar. When that frame changed
+            // whether this tile is bar-driven — the FIRST `context:add` of a run, or a
+            // reconcile that stopped carrying the metadata — the flow already on screen is the
+            // wrong shape, so it is rebuilt. Without the rebuild a tile that had painted step
+            // cards would show cards AND segments for the same calls, which is the duplication
+            // this bar exists to remove.
+            if (contextTouched) {
+                const compiled = display ?? compiledDisplay;
+
+                if (syncContextBar(compiled) && compiled !== undefined) rebuildCompiledFlow();
+            }
+
+            // T22 (R23): the frame is done, so every section this tile owns re-derives its
+            // ONE displayed content block. This runs for a node frame as well as a context
+            // frame — the tail moves on a `node:insert` (a new round, a final answer) and on
+            // a `step:set` (a call superseding the thinking), and neither carries a
+            // `context:*` op of its own. One pass per frame, driven by the post-state tree
+            // the reducer already advanced, so a live stream, a drain and a reconnect that
+            // missed frames all end on the same single body.
+            applyCompiledContent(display ?? compiledDisplay);
 
             // One pass per frame, after the ops it names: a `section:open` records the roster join
             // (or adopts the conversation id the server put on the section), and the row's
@@ -6073,8 +7305,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // thread badge, the attachment chips and the copy target all come from the
         // server's figures; `state` is printed verbatim because the projector already
         // applied the `running -> streaming` mapping the fold used to do.
+        //
+        // MONOTONIC per id (the same N2 rule the shell applies to its record cache,
+        // main.ts:6789): a row stamped strictly BEFORE the row this tile already painted
+        // is a late answer — the 202 body of a submit captured before the observer
+        // delivered a newer revision — and it is authoritative for nothing. Without this
+        // guard a queued row repaints a tile the stream already moved to `streaming`.
         const setCompiledSummary = (summary: TurnSummary): void => {
             compiledMode = true;
+            if (isNewerSummary(compiledSummary, summary)) return;
+
             compiledSummary = summary;
 
             if (serverId === undefined || serverId !== summary.id) {
@@ -6188,7 +7428,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             compiledSections.clear();
             compiledHandles.clear();
 
-            for (const entry of threads.values()) entry.disposeActionBar();
+            for (const entry of threads.values()) {
+                entry.disposeActionBar();
+                // T19 (R17): every delegated strip is destroyed with the projection it was
+                // painted from; the rebuilt pass mints a fresh surface inside each new card.
+                entry.disposeContextBar();
+            }
 
             threads.clear();
             pendingTools.length = 0;
@@ -6319,25 +7564,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     appendText(route().section, event.delta);
                     break;
 
-                // R1/R3/R4: a failed model attempt was abandoned and the same
-                // request is re-sent. The failed attempt's partial output is removed
-                // (the agent never committed it), then a one-line notice records the
-                // retry count, the backoff and the original error. The NEXT attempt
-                // gets a fresh boundary, so its output survives normally.
+                // R1/R3/R4 + T19 (R19): a failed model attempt was abandoned and the same
+                // request is re-sent. The failed attempt's partial output is still removed —
+                // the agent never committed it, and leaving it on screen would show an answer
+                // that was thrown away — but NOTHING replaces it. The line this case used to
+                // append ("attempt 1 of 11 failed · retrying in 1.0s · …") was transient
+                // machinery chatter: the next attempt overwrites the same output, the run keeps
+                // its `streaming` state through the backoff, and a reader who cannot act on it
+                // should not have to scroll past it. The evidence stays where it was recorded:
+                // the raw `retry` event in the journal and the CLI raw watcher. A budget that
+                // actually RUNS OUT still prints, because that arrives as the turn's own
+                // `error`/`done` terminal frame, not as this notice.
                 case 'retry': {
                     const frame = retryOf(event);
                     if (frame === undefined) break;
 
-                    const entry = route();
-                    const section = entry.section;
-                    discardAttempt(section);
-                    appendRetry(
-                        section,
-                        frame.attempt,
-                        frame.maxAttempts,
-                        frame.delayMs,
-                        frame.error.message
-                    );
+                    discardAttempt(route().section);
                     break;
                 }
 
@@ -6782,6 +8024,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 forgetAnswerCard(requestId);
             }
             actionCards.clear();
+
+            // T11 (R7/R8) / T19 (R17): every context bar this tile owns goes here — the turn's
+            // OWN strip in the tile body, plus one strip per delegated card that still exists.
+            // A bar owns a `ResizeObserver` and pointer/keyboard listeners, and its segment
+            // dialog owns a modal layer (a focus trap and the counted body scroll lock). A
+            // destroyed tile that left any of them behind would keep repainting a dead element
+            // and keep the page locked, so they go exactly like a tool card's dialog does.
+            for (const entry of threads.values()) entry.disposeContextBar();
+            tileContextBar.destroy();
         };
 
         // Shared descriptor status: the tile's transport-facing states collapse to
@@ -6957,8 +8208,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         expandedTurn = undefined;
         hideFocusPanel();
         focusedThreadId = undefined;
-        // A confirm/in-flight delete belongs to the projection being torn down.
-        confirmingThread = undefined;
+        // A confirmation/in-flight delete belongs to the projection being torn down.
+        // T6/R5: the confirmation is a live modal layer now, so it is dismissed (no
+        // stale dialog left naming a thread this board no longer shows) rather than
+        // un-armed.
+        closeThreadDeleteConfirmation();
         deletingRequests.clear();
         activeDeleteSuppressions.clear();
         // A cleared board is a NEW conversation surface: the next content may be
@@ -7461,7 +8715,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         if (boundSession !== undefined) {
             closeThreadTranscript(transcriptScope);
             sessionSnapshot = undefined;
-            confirmingThread = undefined;
+            // T6/R5: the confirmation layer names a thread of the conversation being
+            // left; confirming it here could only ever target the wrong roster.
+            closeThreadDeleteConfirmation();
             // In-flight deletes belong to the session being left. A late resolution
             // removes only its own composite key/token, so the new binding's state
             // cannot be cleared by the old request.

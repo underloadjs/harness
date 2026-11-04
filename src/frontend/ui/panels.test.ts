@@ -9,20 +9,23 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
 import type { SessionTurn } from '../../server/protocol';
+import type { DisplayPanelSummary } from '../../shared/turn-display';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
     PANEL_LIMITS,
     applyPanels,
     createPanelHost,
     isPanelSlot,
+    mediaOfSummaries,
     mediaOfTurns,
     panelKeyOf,
+    panelOfSummary,
     resolveSlot,
     sanitizeBlock,
     sanitizePanel,
     sanitizePanels
 } from './panels';
-import type { PanelMedia } from './panels';
+import type { PanelMedia, PanelSummarySource } from './panels';
 
 beforeEach(() => {
     document.body.innerHTML = '';
@@ -349,6 +352,144 @@ describe('mediaOfTurns', () => {
         expect([...media.keys()]).toEqual([panelKeyOf('statusTool', { id: 'status' })]);
         expect([...media.values()].map((entry) => entry.panel.title)).toEqual(['Status 2']);
         expect(mediaOfTurns([]).size).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// The COMPACT wire's panel summaries (R1/R2): the board ships SHAPES, and one click
+// buys the content.
+// ---------------------------------------------------------------------------
+
+describe('panelOfSummary / mediaOfSummaries', () => {
+    const summary = (overrides: Partial<DisplayPanelSummary> = {}): DisplayPanelSummary => ({
+        id: 'status',
+        slot: 'scratch',
+        title: 'Status',
+        blocks: [
+            { type: 'text', length: 240 },
+            { type: 'table', rows: 12, columns: 4 },
+            { type: 'keyValue', items: 30 }
+        ],
+        preview: 'queue: 2 running, 5 waiting',
+        truncated: true,
+        totalPanels: 3,
+        ...overrides
+    });
+
+    const entry = (tool: string, panel: DisplayPanelSummary): PanelSummarySource => ({
+        turnId: 't1',
+        sectionId: 't1:0',
+        stepId: '7',
+        tool,
+        panel
+    });
+
+    it('draws a card from counts only, and says what it trimmed', () => {
+        // `toEqual` on the WHOLE panel: the compact wire never carries block content, so
+        // anything beyond the bounded preview and the shape lines would be invented.
+        expect(panelOfSummary(summary())).toEqual({
+            id: 'status',
+            slot: 'scratch',
+            title: 'Status',
+            blocks: [
+                { type: 'text', text: 'queue: 2 running, 5 waiting' },
+                {
+                    type: 'keyValue',
+                    items: [
+                        { label: 'text', value: '240 characters' },
+                        { label: 'table', value: '12 rows \u00b7 4 columns' },
+                        { label: 'keyValue', value: '30 items' }
+                    ]
+                }
+            ],
+            note: 'compact view \u00b7 content trimmed \u00b7 3 panels in this result'
+        });
+    });
+
+    it('drops an unmounted slot and an empty id, and keeps the note honest', () => {
+        // A tool cannot invent a location: the same rule that drops unknown slots on the
+        // raw surface (resolveSlot) applies here.
+        expect(panelOfSummary(summary({ slot: 'sidebar' }))).toBeUndefined();
+        expect(panelOfSummary(summary({ id: '' }))).toBeUndefined();
+
+        // No preview means no text block at all — the card shows shapes, not a blank line.
+        expect(panelOfSummary(summary({ preview: undefined }))).toEqual({
+            id: 'status',
+            slot: 'scratch',
+            title: 'Status',
+            blocks: [
+                {
+                    type: 'keyValue',
+                    items: [
+                        { label: 'text', value: '240 characters' },
+                        { label: 'table', value: '12 rows \u00b7 4 columns' },
+                        { label: 'keyValue', value: '30 items' }
+                    ]
+                }
+            ],
+            note: 'compact view \u00b7 content trimmed \u00b7 3 panels in this result'
+        });
+
+        // A summary the server did NOT truncate says so, and a single-panel result never
+        // claims extra panels.
+        expect(
+            panelOfSummary(summary({ truncated: false, totalPanels: 1 }))?.note
+        ).toBe('compact view \u00b7 preview only');
+    });
+
+    it('upserts under the raw aggregation key and wires exactly one expand action', () => {
+        const opened: string[] = [];
+        const media = mediaOfSummaries(
+            [entry('statusTool', summary()), entry('filesTool', summary({ id: 'files', title: 'Files' }))],
+            (item) => opened.push(`${item.turnId}/${item.sectionId}/${item.stepId}/${item.tool}`)
+        );
+
+        // The SAME scoped key `applyPanels` uses, so a full panel that arrives later (or a
+        // manual tool result) replaces its summary instead of sitting beside it.
+        expect([...media.keys()]).toEqual([
+            panelKeyOf('statusTool', { id: 'status' }),
+            panelKeyOf('filesTool', { id: 'files' })
+        ]);
+        expect([...media.values()].map((item) => item.panel.title)).toEqual(['Status', 'Files']);
+
+        const card = media.get(panelKeyOf('statusTool', { id: 'status' }))!;
+        expect(card.detail?.label).toBe('Open the full panel');
+        expect(opened).toEqual([]);
+
+        card.detail?.open();
+        expect(opened).toEqual(['t1/t1:0/7/statusTool']);
+
+        // One entry per key, and an unmountable summary never enters the map at all.
+        expect(
+            mediaOfSummaries([entry('statusTool', summary({ slot: 'sidebar' }))]).size
+        ).toBe(0);
+
+        // No action wired (a standalone embed): the card is a plain full card, and the host
+        // draws no expand button for it.
+        const plain = mediaOfSummaries([entry('statusTool', summary())]);
+        expect(plain.get(panelKeyOf('statusTool', { id: 'status' }))?.detail).toBeUndefined();
+
+        const host = createPanelHost('scratch');
+        document.body.append(host.element);
+
+        expect(host.apply([...plain.values()])).toBe(1);
+        expect(host.element.querySelector('[data-panel-id="status"]')?.dataset.panelState).toBe('full');
+        expect(host.element.querySelector('button.panel-expand')).toBeNull();
+
+        // With the action wired, the card is stamped 'summary' (it is one) and carries a
+        // real button the reader can reach from the keyboard.
+        expect(host.apply([...media.values()])).toBe(2);
+        const statusCard = host.element.querySelector<HTMLElement>('[data-panel-id="status"]');
+        expect(statusCard?.dataset.panelState).toBe('summary');
+        expect(statusCard?.querySelector('.panel-note')?.textContent).toBe(
+            'compact view \u00b7 content trimmed \u00b7 3 panels in this result'
+        );
+
+        const button = statusCard?.querySelector<HTMLButtonElement>('button.panel-expand');
+        expect(button?.textContent).toBe('Open the full panel');
+        opened.length = 0;
+        button?.click();
+        expect(opened).toEqual(['t1/t1:0/7/statusTool']);
     });
 });
 

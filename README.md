@@ -2456,6 +2456,7 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `POST /api/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agentModels?, agentInstructions? }` → `201 { harness }` |
 | `PATCH /api/harnesses/:name` | Change any harness — body `{ title?, description?, primary?, subagents?, agentModels?, agentInstructions? }` → `{ harness }` |
 | `DELETE /api/harnesses/:name` | Remove one harness — `200 { deleted: true }`; `404` for an unknown name or a repeat delete. Any harness is removable, including a shipped built-in (its name is remembered in the database's `deleted` list so a restart does not re-ship it). Existing and saved sessions are untouched: each runs and restores from the definition it captured |
+| `GET /api/harnesses/:name` | Read ONE harness definition — `200 { harness }`, the same projection the index lists, including `agentInstructions` when the card overrides any (the compiled `/views` document omits that map, so the configuration dialog reads the one card it is about to show). A legacy alias resolves to the card it redirects to; `404` for an unknown name |
 | `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
 | `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `search` always appears with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
@@ -3069,6 +3070,7 @@ GET    /v1/harness/health                 liveness + session count
 GET    /v1/harness/harnesses              harness descriptors + defaults + agents
 GET    /v1/harness/presets                alias of /harnesses
 POST   /v1/harness/harnesses              create a harness → 201 { harness }
+GET    /v1/harness/harnesses/:name        read one harness -> { harness }
 PATCH  /v1/harness/harnesses/:name        change any harness
 DELETE /v1/harness/harnesses/:name        remove any harness → 200 { deleted: true }
 GET    /v1/harness/agents                 trusted agent registry

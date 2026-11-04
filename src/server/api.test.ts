@@ -2989,6 +2989,67 @@ describe('harness registry over HTTP', () => {
         expect(after.messages).toEqual([{ role: 'system', content: WORKSPACE_PROMPT }]);
     });
 
+    // T12: the read the browser's configuration dialog depends on. A compiled `/views`
+    // frame deliberately OMITS `agentInstructions` (../server/sessions.ts
+    // `viewDescriptorOf`, ./protocol.ts:655-663), so `GET /harnesses/:name` is the only
+    // place the stored per-agent instruction text is answerable, and it must agree with
+    // the index and with PATCH byte for byte.
+    it('reads one harness definition, including the instruction map the views omit', async () => {
+        const runtime = createRuntime();
+
+        const patched = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/instruct', {
+                body: { agentInstructions: { instruct: 'Stored override the dialog edits.' } }
+            })
+        );
+        expect(patched.status).toBe(200);
+
+        const read = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'GET', '/v1/harness/harnesses/instruct')
+        );
+
+        // Same `{ harness }` envelope as PATCH/DELETE, and the identical projection the
+        // index lists for this card.
+        expect(read.status).toBe(200);
+        expect(read.body.harness).toEqual(patched.body.harness);
+
+        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
+        expect(read.body.harness).toEqual(index.body.harnesses.find((entry) => entry.name === 'instruct'));
+
+        // The field the route exists for, plus the rest of the card unchanged.
+        expect(read.body.harness.agentInstructions).toEqual({ instruct: 'Stored override the dialog edits.' });
+        expect(read.body.harness).toMatchObject({ name: 'instruct', primary: 'instruct', builtin: true });
+
+        // A card that overrides nothing omits the key, exactly like `agentModels` does,
+        // so every pre-T3 response shape survives.
+        const plain = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'GET', '/v1/harness/harnesses/demo')
+        );
+        expect(plain.status).toBe(200);
+        expect(Object.hasOwn(plain.body.harness, 'agentInstructions')).toBe(false);
+
+        // An unknown name is the registry's own 404 wording, like PATCH's.
+        expect(await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/harnesses/ghost'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "ghost".' } }
+        });
+
+        // Reads resolve a LEGACY ALIAS to the card it redirects to (the same read
+        // semantics as session creation), and the answer names the canonical card.
+        const alias = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'GET', '/v1/harness/harnesses/writer')
+        );
+        expect(alias.status).toBe(200);
+        expect(alias.body.harness.name).toBe('instruct');
+
+        // `/presets` stays an INDEX alias: the one-card read is mounted on the canonical
+        // name only, so there is no second surface with different rules.
+        expect(await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/presets/instruct'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown API route: GET /v1/harness/presets/instruct' } }
+        });
+    });
+
     it('patches every template (no read-only category) and keeps invalid patches rejected', async () => {
         const runtime = createRuntime();
 
@@ -3354,21 +3415,18 @@ describe('deleting a harness over HTTP', () => {
         expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
     });
 
-    it('answers 405 naming both accepted methods, and keeps the alias mount read-only', async () => {
+    it('answers 405 naming every accepted method, and keeps the alias mount read-only', async () => {
         const runtime = createRuntime();
 
+        // GET is a mounted read now (T12), so only an unsupported verb is refused, and
+        // the message names all three accepted methods (GET/PATCH/DELETE).
         expect(
             await jsonBody(await callHandler(runtime, 'PUT', '/v1/harness/harnesses/instruct'))
         ).toEqual({
             status: 405,
-            body: { error: { message: 'Use PATCH or DELETE for /v1/harness/harnesses/:name.' } }
+            body: { error: { message: 'Use GET, PATCH or DELETE for /v1/harness/harnesses/:name.' } }
         });
-        expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/harnesses/instruct'))
-        ).toEqual({
-            status: 405,
-            body: { error: { message: 'Use PATCH or DELETE for /v1/harness/harnesses/:name.' } }
-        });
+        expect((await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/harnesses/instruct'))).status).toBe(200);
 
         // `/presets` stays a read-only alias: only the canonical mount mutates, so
         // there is no second surface that could delete a harness.

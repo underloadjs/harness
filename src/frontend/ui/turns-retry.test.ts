@@ -1,17 +1,22 @@
-// Turn-tile retry rendering (R1/R3/R4).
+// Turn-tile retry handling (R1/R3/R4, and R19/T19: the notice is GONE).
 //
-// The agent retries ONE model request after a failed attempt. Its streamed output
-// from that attempt was already forwarded, so the tile must DISCARD it when the
-// `retry` frame arrives and show a concise retry notice instead; the successful
-// attempt's output must then render normally.
+// The agent retries ONE model request after a failed attempt. Its streamed output from
+// that attempt was already forwarded, so the tile must DISCARD it when the `retry` frame
+// arrives. What it must NOT do is print a line about it: a transient retry is internal
+// machinery the reader never acts on, so every browser render path — the raw event fold
+// here, and a compiled document that still carries a `retry`-tone notice node from an
+// OLDER recording — stays silent about it. Everything below therefore asserts the
+// DISCARD (the part with real state behind it) and the SILENCE (the part R19 removed).
 //
 // Pinned contract:
 //   - the failed attempt's prose, its think chip and its tool chips are removed;
 //   - a discarded think chip's DIALOG is closed with it (`card.destroy()`), and the
 //     committed chip's text is never touched by the discard;
-//   - the notice names the attempt, the budget, the backoff and the failed error;
+//   - NO retry line appears anywhere (`.agent-retry`, `.agent-notice`, or the words
+//     "retry"/"attempt N of M" in the tile's text) — while a terminal `error` still
+//     prints, because that one is the outcome the reader acts on;
 //   - output from an EARLIER successful turn of the same run is never discarded;
-//   - a malformed retry frame renders nothing (no fabricated "retry 0 in 0ms").
+//   - a malformed retry frame discards NOTHING (it is not evidence of a failed attempt).
 //
 // REASONING is an inline CHIP, not a block: one `details.tool.think` per model request,
 // appended INTO the agent's `.tool-group` row (ui/turns.ts `appendReasoning` +
@@ -22,7 +27,10 @@
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
-import type { HarnessEvent } from '../../server/protocol';
+import type { HarnessEvent, SessionView } from '../../server/protocol';
+import type { HarnessPendingTool } from '../../types';
+import type { TurnDisplay, TurnDisplayOp, TurnSummary } from '../../shared/turn-display';
+import { applyOpsToDisplay } from '../view-state';
 import { createTurnBoard } from './turns';
 
 const mount = () => {
@@ -56,6 +64,17 @@ const rowsOf = (turn: { element: HTMLElement }): string[][] =>
 
 const start = (agent = 'writer'): HarnessEvent => ({ type: 'start', agent, model: 'm1' });
 
+// R19 (T19): the ONE assertion every retry case makes. A discarded attempt leaves no
+// surface behind at all — no dedicated `.agent-retry` line, no `.agent-notice` line, and
+// not one word of the old wording anywhere in the tile's text (a screen reader hears this
+// element too, so "the line is gone" has to be true of its text, not only of its class).
+const expectNoRetryChatter = (turn: { element: HTMLElement }): void => {
+    expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(0);
+    expect(turn.element.querySelectorAll('.agent-notice')).toHaveLength(0);
+    expect(turn.element.textContent ?? '').not.toMatch(/retry/i);
+    expect(turn.element.textContent ?? '').not.toMatch(/attempt \d+ of \d+/);
+};
+
 const text = (delta: string, agent = 'writer'): HarnessEvent => ({ type: 'text', agent, delta });
 
 const retry = (fields: Record<string, unknown> = {}): HarnessEvent =>
@@ -69,8 +88,8 @@ const retry = (fields: Record<string, unknown> = {}): HarnessEvent =>
         ...fields
     }) as unknown as HarnessEvent;
 
-describe('model-request retries (R1)', () => {
-    it('discards the failed attempt output and shows a concise retry notice', () => {
+describe('model-request retries (R1 + R19)', () => {
+    it('discards the failed attempt output and prints no retry line', () => {
         const board = mount();
         const turn = board.begin('ask');
 
@@ -107,13 +126,10 @@ describe('model-request retries (R1)', () => {
         expect(turn.element.textContent).not.toContain('partial draft');
         expect(turn.element.textContent).not.toContain('thinking');
 
-        // One concise notice, with the attempt, the budget, the wait and the error.
-        const notices = turn.element.querySelectorAll('.agent-retry');
-        expect(notices).toHaveLength(1);
-        expect(notices[0].querySelector('.agent-retry-label')?.textContent).toBe('retry');
-        expect(notices[0].querySelector('.agent-retry-text')?.textContent).toBe(
-            'attempt 1 of 11 failed · retrying in 1.0s · HTTP 500: overloaded'
-        );
+        // R19: the discard happened, and NOTHING replaced it — no line, no words. The
+        // attempt, the budget, the backoff and the error are still on the wire (the raw
+        // journal and the CLI watcher read them); they are simply not transcript content.
+        expectNoRetryChatter(turn);
     });
 
     it('renders the successful attempt normally after a discarded one', () => {
@@ -128,7 +144,8 @@ describe('model-request retries (R1)', () => {
 
         expect(turn.element.textContent).not.toContain('failed draft');
         expect(turn.element.querySelector('.agent-text')?.innerHTML).toBe('<p>clean answer</p>\n');
-        expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
+        // R19: the surviving answer is the only thing the block shows.
+        expectNoRetryChatter(turn);
         expect(turn.state()).toBe('streaming');
     });
 
@@ -278,7 +295,7 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
         // Only the failed attempt's own prose is gone.
         expect(turn.element.textContent).not.toContain('partial');
         expect(turn.element.textContent).toContain('final');
-        expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
+        expectNoRetryChatter(turn);
     });
 
     // R1: `attempt_commit` no longer closes the chip ROW, so one row can hold calls
@@ -326,10 +343,12 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
 
         expect(turn.element.querySelectorAll('.agent-flow > .tool-group')).toHaveLength(0);
         expect(turn.element.querySelectorAll('details.tool')).toHaveLength(0);
-        // Only the retry notice is left in the block.
+        // R19: and the block is EMPTY, not "empty except for a retry line". A failed first
+        // attempt leaves no blank strip and no notice behind.
         expect([...(turn.element.querySelector('.agent-flow')?.children ?? [])].map((child) => child.className)).toEqual(
-            ['agent-retry']
+            []
         );
+        expectNoRetryChatter(turn);
     });
 
     // F1, HYDRATE/REPLAY path: a recorded turn applies with the `replay` origin and
@@ -358,7 +377,7 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
         expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
         expect(turn.element.textContent).not.toContain('partial');
         expect(turn.element.textContent).toContain('final');
-        expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
+        expectNoRetryChatter(turn);
     });
 
     // F2: the tile-wide pending list is shared by every invocation. Discarding one
@@ -478,7 +497,7 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
 
         // The window stayed open, so the retry discarded the prose as usual.
         expect(turn.element.textContent).not.toContain('kept');
-        expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
+        expectNoRetryChatter(turn);
     });
 });
 
@@ -523,7 +542,7 @@ describe('per-request reasoning ownership (T8)', () => {
         expect(turn.element.textContent).toContain('final');
         // The committed call chip is untouched by the discard (reasoning is not a call).
         expect(callChips(turn)).toBe(1);
-        expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
+        expectNoRetryChatter(turn);
     });
 
     // The chip is INLINE, so a discard removes it from the row the committed calls share
@@ -636,5 +655,149 @@ describe('per-request reasoning ownership (T8)', () => {
             [...turn.element.querySelectorAll('.agent-text')].map((node) => node.textContent)
         ).toEqual(['superseded prose\n', 'final answer\n']);
         expect(turn.element.textContent).not.toContain('failed draft');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T19 (R19) — the OTHER browser render path.
+//
+// The raw fold above never mints a retry line any more. A COMPILED document can still
+// carry one: a session recorded by an older build stored the per-attempt notice as a
+// `notice` node with tone `retry`, and an import/replay feeds that tree straight to the
+// tile. Suppressing it is a rendering rule for every path, not only for the projector
+// that stopped producing it — while the `error` tone that means "the budget ran out"
+// keeps printing, because that one is the outcome the reader acts on.
+//
+// Driven with hand-written fixtures (`TurnSummary` + `TurnDisplay`), so the evidence is
+// about the renderer, not about a test-side compiler.
+// ---------------------------------------------------------------------------
+
+const T0 = 1_700_000_000_000;
+
+const row = (overrides: Partial<TurnSummary> = {}): TurnSummary =>
+    ({
+        id: 't1',
+        index: 0,
+        prompt: 'ask',
+        status: 'running',
+        state: 'streaming',
+        updatedAt: T0,
+        sectionCount: 1,
+        stepCount: 0,
+        activeAgents: ['instruct'],
+        blocks: [],
+        ...overrides
+    }) as TurnSummary;
+
+const tree = (nodes: unknown[]): TurnDisplay =>
+    ({
+        turnId: 't1',
+        sections: [
+            {
+                id: 't1:0',
+                role: 'primary',
+                agent: 'instruct',
+                agentLabel: 'RR1',
+                state: 'streaming',
+                nodes
+            }
+        ]
+    }) as TurnDisplay;
+
+const viewOf = (display: TurnDisplay): SessionView =>
+    ({
+        id: 's1',
+        harness: 'instruct',
+        status: 'running',
+        model: 'm1',
+        createdAt: 1,
+        updatedAt: T0,
+        turns: [row()],
+        displays: { t1: display }
+    }) as unknown as SessionView;
+
+// The per-turn pending-tool map the shell threads through the reducer (main.ts keeps one per
+// session view); an empty map is the honest stand-in for a document with no live calls.
+const pending = new Map<string, HarnessPendingTool[]>();
+
+const mountCompiled = (): { board: ReturnType<typeof createTurnBoard>; tile: () => HTMLElement } => {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    const board = createTurnBoard({ empty });
+    board.bindSession('s1');
+    document.body.replaceChildren(board.element);
+
+    return { board, tile: () => document.querySelector<HTMLElement>('.tile') as HTMLElement };
+};
+
+describe('a retry the browser never prints, compiled path included (T19, R19)', () => {
+    it('renders an imported retry-tone notice as nothing at all', () => {
+        // The tree an OLDER recording hands the tile: a committed first block plus the notice
+        // line that build wrote for it, and the answer that followed. `committed` on the first
+        // node is what the projector stamps for a settled round, and it is also what makes the
+        // two prose blocks render as two elements — so a vanished notice is visible as a
+        // MISSING element between them, not as fused text.
+        const display = tree([
+            { kind: 'text', id: 'n0', text: 'a half sentence', committed: true },
+            { kind: 'notice', id: 'n1', tone: 'retry', text: 'attempt 1 of 11 failed · retrying in 1.0s · HTTP 500', at: T0 },
+            { kind: 'text', id: 'n2', text: 'the answer', committed: true }
+        ]);
+        const { board, tile } = mountCompiled();
+        const handle = board.upsertView(row(), viewOf(display));
+        handle.renderDisplay(display);
+        handle.flush();
+
+        // The real content survives untouched…
+        expect([...tile().querySelectorAll('.agent-text')].map((node) => node.textContent)).toEqual([
+            'a half sentence\n',
+            'the answer\n'
+        ]);
+        // …and the notice is simply not there: no line, and no trace of its words.
+        expect(tile().querySelectorAll('.agent-notice')).toHaveLength(0);
+        expect(tile().textContent ?? '').not.toMatch(/retry/i);
+        expect(tile().textContent ?? '').not.toContain('HTTP 500');
+    });
+
+    it('keeps the terminal error-tone notice that a retry budget exhausting sends', () => {
+        // The distinction is the TONE, never the words: this one is the outcome, so dropping
+        // the chatter must not drop it.
+        const display = tree([
+            { kind: 'notice', id: 'n1', tone: 'retry', text: 'attempt 3 of 11 failed · retrying in 8.0s · HTTP 503', at: T0 },
+            { kind: 'notice', id: 'n2', tone: 'error', text: 'Request failed: HTTP 503', at: T0 + 100 }
+        ]);
+        const { board, tile } = mountCompiled();
+        const handle = board.upsertView(row(), viewOf(display));
+        handle.renderDisplay(display);
+        handle.flush();
+
+        const lines = tile().querySelectorAll<HTMLElement>('.agent-notice');
+
+        expect(lines).toHaveLength(1);
+        expect(lines[0].dataset.tone).toBe('error');
+        expect(lines[0].querySelector('.agent-notice-text')?.textContent).toBe('Request failed: HTTP 503');
+    });
+
+    it('stays silent when a live ops frame inserts a retry notice', () => {
+        // The other way the same node arrives: an `node:insert` op, applied through the REAL
+        // document reducer the shell runs before routing a frame.
+        const display = tree([]);
+        const view = viewOf(display);
+        const { board, tile } = mountCompiled();
+        const handle = board.upsertView(row(), view);
+        handle.renderDisplay(display);
+
+        const insert = {
+            op: 'node:insert',
+            turnId: 't1',
+            sectionId: 't1:0',
+            node: { kind: 'notice', id: 'n9', tone: 'retry', text: 'attempt 1 of 11 failed · retrying in 1.0s' }
+        } as unknown as TurnDisplayOp;
+
+        applyOpsToDisplay(view, 't1', [insert], pending);
+        board.applyViewOps('t1', [insert], view);
+        handle.flush();
+
+        expect(tile().querySelectorAll('.agent-notice')).toHaveLength(0);
+        expect(tile().textContent ?? '').not.toMatch(/retry/i);
     });
 });

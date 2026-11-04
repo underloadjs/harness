@@ -245,6 +245,15 @@ const mount = async (): Promise<void> => {
     await flush();
 };
 
+// T21 R22: loading a conversation leaves EVERY thread collapsed — the routing target is
+// whatever the reader opens, never whatever the load happened to render last. Tests that
+// need a focused thread open it here, the same gesture a person makes, so the routing
+// contract below is stated on top of the collapse-on-load rule rather than around it.
+const openThread = async (turnId: string): Promise<void> => {
+    selectOf(turnId).click();
+    await flush();
+};
+
 beforeEach(() => {
     vi.resetModules();
     localStorage.clear();
@@ -256,7 +265,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('renders the roster, focuses the newest turn thread and continues it with threadId', async () => {
+it('renders the roster, and continues the thread the reader focused with threadId', async () => {
     const stub = stubServer(
         snapshot({
             turns: [
@@ -278,16 +287,19 @@ it('renders the roster, focuses the newest turn thread and continues it with thr
         'thread-1'
     ]);
 
-    // The newest turn (turn-2) is expanded on first content, and it carries the
-    // roster's label for thread-1 plus the opaque id in `data-thread-id`.
-    const expanded = [...document.querySelectorAll<HTMLElement>('.tile.is-expanded')];
-    expect(expanded.map((tile) => tile.dataset.turnId)).toEqual(['turn-2']);
+    // T21 R22: the load opens NOTHING. The identity facts below (thread id, the roster's
+    // label, the badge tooltip) are painted on the collapsed cards, and the newest turn
+    // is no more expanded than the oldest one.
+    expect([...document.querySelectorAll<HTMLElement>('.tile.is-expanded')]).toEqual([]);
     expect(tileOf('turn-2').dataset.threadId).toBe('thread-1');
     expect(badgeOf('turn-2').textContent).toBe('Writing');
     expect(badgeOf('turn-2').title).toBe('Thread Writing · instruct · stopped');
     expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(false);
 
-    // The routing line names the target before anything is typed.
+    // The reader opens the newest conversation, and THAT is the steering target the
+    // routing line names before anything is typed.
+    await openThread('turn-2');
+    expect(tileOf('turn-2').classList.contains('is-expanded')).toBe(true);
     expect(byClass('.composer-target', 'p').textContent).toBe('Continuing Writing');
 
     const input = byClass('.composer-input', 'div');
@@ -311,10 +323,18 @@ it('submits without a threadId when nothing is focused (new thread)', async () =
     );
     await mount();
 
-    // The newest turn is expanded (focused) on first content.
+    // T21 R22: a load focuses NOTHING, so this conversation starts on the very promise
+    // the test is about. The reader's expand-then-collapse round trip lands in the same
+    // place, which is what the rest of the walk pins.
+    expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(false);
+    expect(byClass('.composer-target', 'p').textContent).toBe('New thread');
+
+    // Opening the conversation makes it the steering target…
+    await openThread('turn-1');
+    expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(true);
     expect(byClass('.composer-target', 'p').textContent).toBe('Continuing Writing');
 
-    // Clicking the header of the ALREADY-expanded tile collapses it: that is the
+    // …and clicking the header of the ALREADY-expanded tile collapses it: that is the
     // explicit unfocus (ui/turns.ts `collapse` sets `explicitUnfocus`).
     selectOf('turn-1').click();
     await flush();
@@ -353,6 +373,10 @@ it('never resurrects a deleted thread from a late snapshot, turn or event (S3)',
     });
     const stub = stubServer(initial);
     await mount();
+
+    // T21 R22: the reader opens the conversation whose thread is about to disappear, so
+    // the learned deletion has a focus to drop.
+    await openThread('turn-1');
 
     // Focus is thread-1 (the expanded turn) before the deletion. The roster's only
     // visible effect is the tile's conversation badge: the strip that used to list
@@ -473,6 +497,8 @@ it('steers a running focused thread and keeps exactly one conversation row', asy
     );
     await mount();
 
+    // T21 R22: the running conversation is open because the reader opened it.
+    await openThread('turn-1');
     expect(byClass('.composer-target', 'p').textContent).toBe('Steering Running');
 
     const input = byClass('.composer-input', 'div');
@@ -511,10 +537,10 @@ it('labels a running focus with an unfinished reference as queued, keeping the s
     );
     await mount();
 
-    // The newest turn (thread-2) is expanded/focused on first content; focus
-    // thread-1 explicitly by clicking turn-1's header, so the draft addresses a
+    // The newest turn (thread-2) is COLLAPSED like every other card on a load (T21 R22);
+    // focus thread-1 explicitly by clicking turn-1's header, so the draft addresses a
     // running conversation while its reference is unfinished.
-    expect(tileOf('turn-2').classList.contains('is-expanded')).toBe(true);
+    expect(tileOf('turn-2').classList.contains('is-expanded')).toBe(false);
     selectOf('turn-1').click();
     await flush();
     expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(true);

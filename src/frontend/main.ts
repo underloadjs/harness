@@ -14,6 +14,12 @@
 // local: which tile is expanded, which session id was last viewed, the request
 // spinner.
 //
+// A FIRST load is not local state (T21): the app opens the most recently used
+// conversation of the harness it lands on (`initialSession`, ranked by the
+// server's `updatedAt`/`createdAt` and then by directory order), and it opens it
+// with EVERY thread collapsed — nothing expands until the reader clicks a card
+// (`View.collapseForLoad`, ui/turns.ts).
+//
 // Shell (three columns, R21):
 //   - left rail  — harnesses (built-ins and user-created) plus the create form and
 //                  the `left` tool-panel host. The endpoint/model settings are NOT
@@ -102,7 +108,7 @@ import type {
     ToolDescriptor
 } from '../server/protocol';
 import type { HarnessUsage } from '../types';
-import type { TurnDisplayOp, TurnSummary, TurnStepDetail } from '../shared/turn-display';
+import type { TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlockDetail } from '../shared/turn-display';
 // The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
 // and every submit below speaks `/views`, so no round trip on this path can carry a
 // recorded event. The raw client (./api.ts) stays imported for the catalogue routes
@@ -118,6 +124,7 @@ import {
     deleteViewThread,
     getRawSession,
     getStepDetail,
+    getBlockDetail,
     getView,
     listViews,
     observeView,
@@ -128,6 +135,7 @@ import {
 } from './view-api';
 import {
     activeAgentsOf,
+    applyOpsToActivity,
     createViewStateStore,
     displayOf as viewDisplayOf,
     isPendingView,
@@ -161,6 +169,7 @@ import {
     loadBootstrap,
     observeSession,
     updateHarness,
+    getHarness,
     updateSession,
     updateThreadTranscript
 } from './api';
@@ -238,7 +247,12 @@ import {
 } from './ui/references';
 import type { AgentBlockDescriptor, MentionTrigger } from './ui/references';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
-import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
+import { looksLikeJson, prettyJson } from './ui/markdown';
+// The one payload viewer every dialog surface uses (ui/tools.ts). The runner's response
+// box used to hand-roll `highlightCode` into a bare `pre.card-body`, which lost its wrap
+// to `ui/dialog.css .dialog-body pre { white-space: pre }`. `paintCodeBlock` is the
+// matching repaint: a persistent box keeps its ONE node and only its rows change.
+import { createPayloadViewer, paintCodeBlock } from './ui/tools';
 import { applyPanels, createPanelHost, mediaOfTurns, panelKeyOf, mediaOfSummaries } from './ui/panels';
 import type { PanelMedia, PanelSummarySource } from './ui/panels';
 import type { FilePreviewReader, FilePreviewResult, FilePreviewResolver } from './ui/file-preview';
@@ -467,6 +481,15 @@ type View = {
     // a tile toggle this is never a user intent to open a new thread, but it must
     // still stop the next submit from targeting the removed id (S3).
     clearFocus: () => void;
+    // T21 R22: land on a LOADED conversation with EVERY thread collapsed. The board's
+    // first-content rule opens the newest surface once (ui/turns.ts `reconcileView`
+    // `!hadTurns`, and `pendingFirstFocus` after a session switch); a load is not the
+    // reader asking to read a thread, so the shell drops that expansion immediately.
+    // It routes through the board's own `collapse`, which also marks the unfocus
+    // deliberate (`explicitUnfocus`), and that is what keeps every later stream,
+    // snapshot and poll frame from re-opening anything — only an explicit click on a
+    // `.tile-select`/`.thread-row` expands again.
+    collapseForLoad: () => void;
     // Hand the authoritative persistent-thread roster to the board. Repeated turns
     // of one thread share a badge in the transcript, so a conversation is never
     // presented as several independent threads. (The former strip also rendered
@@ -565,7 +588,15 @@ const createView = (
         turnId: string;
         stepId: string;
         sessionId?: string;
-    }) => Promise<TurnStepDetail>
+    }) => Promise<TurnStepDetail>,
+    // T11 R8: the same lazy rule for ONE context-bar segment. The bar calls it ONLY from
+    // the segment the reader clicked, and only for that segment, so a turn with five
+    // hundred recorded calls still costs zero requests until one of them is opened.
+    loadBlock?: (input: {
+        turnId: string;
+        blockId: string;
+        sessionId?: string;
+    }) => Promise<TurnBlockDetail>
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -601,6 +632,7 @@ const createView = (
         ...(removeThread === undefined ? {} : { deleteThread: removeThread }),
         ...(saveTranscript === undefined ? {} : { saveThreadTranscript: saveTranscript }),
         ...(loadDetail === undefined ? {} : { loadStepDetail: loadDetail }),
+        ...(loadBlock === undefined ? {} : { loadBlockDetail: loadBlock }),
         // Focus follows the single expanded tile. Only the composer's routing line
         // has to repaint from here now that the thread strip is gone, so the
         // steering target stays visible in the same tick the reader
@@ -665,6 +697,9 @@ const createView = (
         focusedThread: () => board.focusedThread(),
         focusThread: (threadId) => board.focusThread(threadId),
         clearFocus: () => board.collapse(),
+        // T21 R22: same transition as the reader's own collapse press, used by the
+        // shell when a conversation is LOADED (see the `View.collapseForLoad` note).
+        collapseForLoad: () => board.collapse(),
         setThreads: (threads) => {
             // The BOARD owns canonical labels (S6), the persistent-id mapping for
             // child focus (S2) and the roster-only transcript. It may CLEAR a focus
@@ -1272,6 +1307,16 @@ type ToolRunner = {
 // truncation: the UI never slices the result itself.
 const REQUEST_TOOLS_LIMIT = 5;
 
+// The class hook of the runner's response box. styles.css sizes and frames it through
+// `.card-body` (and the `.tool-runner-slot … > .tool-output > .card-body` flex chain), and
+// every consumer reads the result through it; `createPayloadViewer` adds the `tool-code`
+// wrap class beside it. A named constant so the viewer call sites cannot drift apart.
+const RUNNER_RESPONSE_VIEWER_CLASS = 'card-body';
+
+// The same pairing for the runner's parameter-schema disclosure (styles.css
+// `.transcript-body`).
+const TRANSCRIPT_BODY_VIEWER_CLASS = 'transcript-body';
+
 // Turn a toolRequest result into one actionable sentence. The structured result
 // is still rendered verbatim above; this line exists because a truncated list is
 // useless unless it says how much is missing and what to do next.
@@ -1327,7 +1372,12 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
 
     const schema = el('details', 'transcript');
     schema.append(el('summary', 'transcript-summary', 'Parameter schema'));
-    const schemaBody = el('pre', 'transcript-body', '{}');
+    // R1 (payload views): the parameter schema is a JSON payload inside the runner
+    // dialog, so it renders through the same line-numbered, soft-wrapped viewer as the
+    // result box below. `.transcript-body`'s own `pre-wrap` in styles.css (0,1,0) loses to
+    // `ui/dialog.css .dialog-body pre` (0,1,1), which is why this box used to scroll
+    // sideways; `createPayloadViewer` carries the host class plus `tool-code`.
+    const schemaBody = createPayloadViewer('{}', 'json', TRANSCRIPT_BODY_VIEWER_CLASS);
     schema.append(schemaBody);
 
     // R8: the preset buttons. Pressing one FILLS the editable box and sends nothing;
@@ -1384,7 +1434,29 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             className: 'tool-copy'
         })
     );
-    const outputBody = el('pre', 'card-body', '');
+    // R1 (payload views): the response box is a PAYLOAD surface, so it is the same
+    // line-numbered, soft-wrapped viewer a tool pane uses. It used to hand-roll
+    // `highlightCode` into a bare `pre.card-body`, and `ui/dialog.css`
+    // `.dialog-body pre { white-space: pre }` (0,1,1) beat `.card-body`'s `pre-wrap`
+    // (0,1,0) in styles.css — the long single-line results the runner is full of scrolled
+    // sideways instead of wrapping. `card-body` stays the host class (the runner's flex
+    // chain, its cap and `.card` framing all address it, and the consumer tests read the
+    // box through it); `createPayloadViewer` adds `tool-code`, which is what wins.
+    //
+    // `code.textContent` is byte-identical to the pretty-printed payload, so
+    // `JSON.parse(document.querySelector('.tool-output .card-body').textContent)` and the
+    // pane's Copy (which reads `responseText`, not the DOM) are unchanged.
+    //
+    // The box is ONE node for the life of the runner (R2): `setResponse` repaints its
+    // `<code>` column in place through `paintCodeBlock`. It used to hand-roll
+    // `highlightCode` into this same `<pre>`, and the payload viewer must keep that
+    // property — the runner pane is persistent (it outlives the dialog it was opened
+    // from), so consumers hold the box they rendered: a test that captures
+    // `.tool-output .card-body` before a call, then reads it after the answer lands
+    // (scratch-board.test.ts, playground-context.test.ts), is the same reader who looks
+    // at the box. Swapping the host would leave that reference on a detached node still
+    // showing the previous prompt.
+    const outputBody = createPayloadViewer('', undefined, RUNNER_RESPONSE_VIEWER_CLASS);
     output.append(outputHead, outputBody);
 
     // The raw text behind the rendered response box. Copy uses this instead of the
@@ -1418,9 +1490,10 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     let active: ToolDescriptor | undefined;
 
     // Direct-call responses get the same treatment as tool results inside a turn:
-    // pretty-printed JSON when it parses, escaped+highlighted otherwise. The
-    // markup comes from `highlightCode`, which escapes its input, so assigning it
-    // to `innerHTML` cannot execute anything.
+    // pretty-printed JSON when it parses, escaped (and highlighted) otherwise. The
+    // viewer builds that from `highlightCode` output through createElement/createTextNode
+    // only, so model-written markup stays inert text and the box is re-rendered rather
+    // than patched — the row set is derived from the payload's own newlines.
     const setResponse = (text: string, isError: boolean): void => {
         responseText = text;
         responseLabel = isError ? 'error' : 'response';
@@ -1428,8 +1501,17 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         output.className = isError
             ? 'card tool-output tool-section is-error'
             : 'card tool-output tool-section';
-        outputBody.innerHTML = highlightCode(prettyJson(text), looksLikeJson(text) ? 'json' : undefined);
-        outputBody.dataset.language = looksLikeJson(text) ? 'json' : 'text';
+
+        const shown = prettyJson(text);
+        const language = looksLikeJson(text) ? 'json' : undefined;
+
+        // IN PLACE (see `outputBody` above): the same `<pre class="card-body …">` keeps
+        // being the response box, and only its rows are rebuilt from the new payload.
+        paintCodeBlock(outputBody, shown, language);
+        // The format the box is actually showing, kept as data for a reader who inspects
+        // the node (nothing paints it: the `[data-language]` caption is Markdown-fence
+        // only, styles.css).
+        outputBody.dataset.language = language ?? 'text';
     };
 
     // One writer for every failure the runner can produce (R8). The box is a JSON view,
@@ -1697,7 +1779,12 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 ? 'Core tool — it runs in the playground’s own temporary session (a harness session this view created for tool testing, deleted when the tools view closes), so its result never changes the conversation you are reading.'
                 : 'Direct call — no harness, no agent, no tool loop. This is the same implementation a session registers, invoked as a function.';
 
-            schemaBody.textContent = JSON.stringify(entry.parameters, null, 2);
+            // The schema keeps its ONE `<pre>` (see the response box above): the rows are
+            // re-laid-out in place because the row set is derived from the payload's own
+            // newlines, and swapping the host would orphan a box a consumer already holds.
+            // `.transcript` keeps its own disclosure behaviour.
+            const schemaJson = JSON.stringify(entry.parameters, null, 2);
+            paintCodeBlock(schemaBody, schemaJson, 'json');
 
             // R8: the preset buttons are painted first and the first one fills the box,
             // so the runner always starts from a named, schema-valid payload (curated
@@ -2334,8 +2421,9 @@ sessionNew.setAttribute('aria-label', 'New session');
 sessionNew.addEventListener('click', () => newSession());
 
 // R2 (T9): one painter for the title trigger's state. The button is ALWAYS a real dialog
-// trigger now: the chat head opens the harness details (whose first section is the Sessions
-// dashboard), and the tools view opens that dashboard directly. T9 removed the header pill
+// trigger now: the chat head opens the harness details (whose Sessions dashboard is the
+// LAST section, under the details divider — R3), and the tools view opens that dashboard
+// directly. T9 removed the header pill
 // strip that used to stay reachable while Tools owned the centre, so disabling this button
 // in the tools view would have left the reader with no way to a saved conversation from
 // there — the entry point stays, only its scope and tooltip change.
@@ -2368,10 +2456,12 @@ const closeHarnessDialog = (): void => {
 // A bar is registered while it is in the page and dropped when its root is disconnected
 // (a closed dialog adopts its body, then removes it), so the painter never touches a
 // detached node.
+//
+// R3: no create control any more — the dashboard lists conversations (select / delete) and
+// the header owns "start a new one", so the bar is its list element alone.
 type SessionPillBar = {
     element: HTMLElement;
     list: HTMLElement;
-    newButton: HTMLButtonElement;
 };
 
 const sessionBars = new Set<SessionPillBar>();
@@ -2388,32 +2478,24 @@ const liveSessionBars = (): SessionPillBar[] => [...sessionBars].filter((bar) =>
 // the class hook is fixed rather than chosen per call site; the behaviour and the markup
 // are identical wherever it is rendered, which is what keeps the dashboard the one
 // authoritative directory view.
+//
+// R3: the dashboard's `+` is GONE. A session cannot be CREATED from inside this dialog —
+// only opened and deleted — because the create action belongs to the header, where the
+// harness the new conversation would inherit is the thing on screen. The one remaining
+// `.new-session` in the page is therefore the header's (`sessionNew` above), and
+// `paintSessionActions` has exactly one control to arm.
 const createSessionPillBar = (): SessionPillBar => {
     const element = el('div', 'session-pills-bar session-pills-bar-dialog');
     const list = el('div', 'session-pills');
     list.setAttribute('role', 'list');
 
-    // R4 (T9): the dashboard's create control is the SAME compact `+` the header carries —
-    // same classes, same glyph, same name — and it keeps the historical `.new-session`
-    // selector and the busy/disabled contract in `paintSessionActions`.
-    const newButton = el('button', 'new-session session-new', '+');
-    newButton.type = 'button';
-    newButton.disabled = true;
-    newButton.title = 'New session';
-    newButton.setAttribute('aria-label', 'New session');
-    // The listener is wrapped (not passed by reference) because `newSession` is a
-    // module-level `const` declared far below: reading the binding during this factory's
-    // first call would hit the temporal-dead-zone error. The arrow defers the read to
-    // click time.
-    newButton.addEventListener('click', () => newSession());
-
     // R4 (T9): the manual Refresh control is GONE. Nothing about the refresh BEHAVIOUR
     // changes — `refreshSessions()` still re-reads the directory on boot, after a stale
     // remembered id, and on the other automatic paths, and every mutation repaints through
     // `renderSessions()` — so a hand-held ↻ button was the only thing left to remove.
-    element.append(list, newButton);
+    element.append(list);
 
-    const bar: SessionPillBar = { element, list, newButton };
+    const bar: SessionPillBar = { element, list };
     sessionBars.add(bar);
 
     return bar;
@@ -2520,13 +2602,20 @@ const paintHarnessDialogStats = (): void => {
     row.replaceChildren(...harnessStatFigures(summary));
 };
 
-// The dialog's body. R3 (T9): the Sessions dashboard is here at EVERY width — the header
-// no longer carries a directory, so this is the one place a conversation is chosen or
-// deleted, and the strip is the same factory on a phone and on a desktop. It goes FIRST,
-// because choosing a conversation is the action the reader came for.
+// The dialog's body. R3 (T9) put the Sessions dashboard at the TOP because choosing a
+// conversation was the action the reader came for; R3 (this pass) moves the SAME section to
+// the BOTTOM, under a semantic `<hr>` that separates "what this harness is" from "the
+// conversations it holds". The details/stats/meta/note block is the answer to "what am I
+// looking at", and the directory is the list you scroll to when you want to go somewhere
+// else — a divider, not a reorder into a second heading, is what makes that readable.
 //
-// T6's breakpoint-shaped body is gone with it: the body no longer depends on the width it
-// was built at, so a dialog that survives a resize needs no rebuild.
+// The dashboard is still here at EVERY width (the header carries no directory), it keeps
+// the same factory, and selection plus deletion keep working exactly as before. Only the
+// CREATE affordance is gone from this layer (see `createSessionPillBar`), because a session
+// cannot be created here.
+//
+// T6's breakpoint-shaped body stays gone: the body does not depend on the width it was
+// built at, so a dialog that survives a resize needs no rebuild.
 const harnessDetailsBody = (display: HarnessDescriptor | undefined): HTMLElement => {
     // The strip this call replaces leaves the document with the old body, so the painter's
     // work list drops it first: `renderSessions()` paints registered bars.
@@ -2541,16 +2630,30 @@ const harnessDetailsBody = (display: HarnessDescriptor | undefined): HTMLElement
 
     const body = el('div', 'harness-details');
 
-    dialogSessionBar = createSessionPillBar();
-    body.append(el('h3', 'harness-details-section', 'Sessions'), dialogSessionBar.element);
+    // Registered as soon as it exists (the painter walks `sessionBars`, not the DOM
+    // order), and appended LAST by `appendSessions` below — registration and position are
+    // independent here, which is what lets R3 reorder without touching the paint path.
+    const bar = createSessionPillBar();
+    dialogSessionBar = bar;
+
+    // One place builds the section (caption + strip) so both shapes of this body — the
+    // harness dialog and the tools-view Sessions-only dialog — render the same nodes.
+    const appendSessions = (): void => {
+        body.append(el('h3', 'harness-details-section', 'Sessions'), bar.element);
+    };
 
     // T9: with no harness selected (the last one was deleted, or the server has none) or
     // while the tools view owns the head, the saved conversations are the only thing this
     // layer can honestly offer: an archived record has no rail row and no chat card, and a
     // tools head names a tool rather than a harness. The body then stops after the
-    // dashboard, because every section below it describes a harness the reader is not
-    // looking at.
-    if (display === undefined) return body;
+    // dashboard, because every section above it would describe a harness the reader is not
+    // looking at — and a divider with nothing ABOVE it would be decoration, so there is
+    // none in this shape either.
+    if (display === undefined) {
+        appendSessions();
+
+        return body;
+    }
 
     if (display.description.length > 0) {
         body.append(el('p', 'harness-details-description', display.description));
@@ -2575,6 +2678,12 @@ const harnessDetailsBody = (display: HarnessDescriptor | undefined): HTMLElement
     if (headNote.textContent.length > 0) {
         body.append(el('p', 'harness-details-note', headNote.textContent));
     }
+
+    // R3: the rule that closes the details block, then the directory under it. A real
+    // `<hr>` (not a border on the caption) because the break is in the CONTENT: styling is
+    // one rule in ui/dialog.css, `.dialog-body > .harness-details > .harness-details-divider`.
+    body.append(el('hr', 'harness-details-divider'));
+    appendSessions();
 
     return body;
 };
@@ -4169,6 +4278,13 @@ type Instance = {
     // The session's settings model: the effective fallback for the no-override
     // choice and the tile label a saved chat shows (R18 never renders "inherit").
     sessionModel?: string;
+    // T11: the harness's per-agent INSTRUCTION overrides, read on the ONE explicit action
+    // that needs them (opening the configuration dialog). A `/views` document OMITS
+    // `harnessDefinition.agentInstructions` (../server/protocol.ts:655-663) because that
+    // map is instruction text, so the dialog must not assume the textarea it seeds is the
+    // stored text. Undefined = never read; a harness whose read failed or answered nothing
+    // keeps the document-derived map, which is the pre-T11 behaviour rather than a blank.
+    harnessInstructions?: Record<string, string>;
     // Tools toolRequest enabled for this session (SessionSnapshot.discoveredTools),
     // shown on the tools view's session note (R21.2 — there is no core dropdown any
     // more). Refreshed by the snapshot a core call triggers.
@@ -4554,6 +4670,13 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
                     input.sessionId ?? instance.sessionId ?? '',
                     input.turnId,
                     input.stepId
+                ),
+            // T11 R8: the ONE request a context-bar segment costs, and only on the click.
+            (input) =>
+                getBlockDetail(
+                    input.sessionId ?? instance.sessionId ?? '',
+                    input.turnId,
+                    input.blockId
                 )
         ),
         activity: new Set<string>(),
@@ -4582,7 +4705,15 @@ const replaceDescriptor = (updated: HarnessDescriptor): void => {
         : [...presetDescriptors, updated];
 
     const existing = instances.get(updated.name);
-    if (existing !== undefined) existing.descriptor = updated;
+    if (existing !== undefined) {
+        existing.descriptor = updated;
+
+        // T11: the dialog-open read caches the SAME map, so an authoritative descriptor
+        // replaces that cache too — otherwise a deleted override would resurrect itself from
+        // the cached copy (the merge in `agentViewOf` prefers the document per key, and a key
+        // the document no longer names would still be readable from a stale cache).
+        existing.harnessInstructions = agentInstructionsOf(updated);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -4657,7 +4788,15 @@ const harnessMeta = (descriptor: HarnessDescriptor): string => {
 // `fallback` is the definition to select when the registry no longer holds this name
 // (R6: opening a saved session of a DELETED harness). It never writes to the roster, so
 // selecting an archived conversation cannot resurrect its harness.
-const selectHarness = (name: string, fallback?: HarnessDescriptor): void => {
+//
+// `keepStatus` is for the AUTOMATIC switch of an automatic conversation open (T24): the
+// reader did not gesture, so the app must not erase the confirmation they were told to
+// read (e.g. "deleted alpha") the moment the record arrives.
+const selectHarness = (
+    name: string,
+    fallback?: HarnessDescriptor,
+    options?: { keepStatus?: boolean }
+): void => {
     const descriptor = descriptorFor(name) ?? fallback;
     if (descriptor === undefined) return;
     // Picking a harness (or a session, which lands here through openSession) is the
@@ -4713,10 +4852,17 @@ const selectHarness = (name: string, fallback?: HarnessDescriptor): void => {
     // state into it (R1 — that text went stale the moment another session was
     // opened). Work the reader selected is visible on its turn tiles, and a failure
     // detail lives in the pane's session note.
-    setStatus('idle');
+    if (options?.keepStatus !== true) setStatus('idle');
     // Re-derive controls for THIS instance: pending work belongs to its session,
     // and leaving a running conversation simply unsubscribes (work continues).
     setBusy(current.pending);
+
+    // T24: entering a harness resolves its conversation the way the first load does —
+    // its most recently used row (T21 R21) — when this harness has nothing selected yet.
+    // Everything that only REDRAWS the current harness (a session open, which arrives
+    // here with `sessionId` already bound) is a no-op inside the helper, and so is every
+    // later entry, because the reader's own selection wins from then on.
+    openLatestOfEnteredHarness(descriptor.name);
 };
 
 // ---------------------------------------------------------------------------
@@ -5058,6 +5204,20 @@ const renderHarnessChrome = (): void => {
 // One derived description of the agent UI for the selected instance. Both the
 // composer button and the dialog read from it, so the two can never disagree about
 // the team, the primary, the lock reason or the effective model map.
+
+// The per-agent INSTRUCTION map this browser believes is STORED, in precedence order:
+// whatever the document states wins per key (an unredacted server, or a frozen definition
+// that carries its own map), and the copy read on the configuration dialog's explicit open
+// (`instance.harnessInstructions`, ./api.ts `getHarness`) fills the keys a compiled view
+// omits (../server/protocol.ts:655-663).
+//
+// Both the dialog's seed and every harness PATCH restate THIS map, and that is the whole
+// point of keeping it in one place: the server REPLACES `agentInstructions`, so restating
+// only the fields one frame happened to carry would silently wipe another member's override.
+const storedInstructionsOf = (display: HarnessDescriptor, instance: Instance): Record<string, string> => ({
+    ...(instance.harnessInstructions ?? {}),
+    ...agentInstructionsOf(display)
+});
 type AgentView = {
     display: HarnessDescriptor;
     members: string[];
@@ -5117,7 +5277,12 @@ const agentViewOf = (instance: Instance): AgentView => {
     // actually runs — and editing it is refused, because a system message already
     // seeded into a running transcript cannot be rewritten without rebuilding the
     // conversation (see the `hint` below and the dialog's locked instruction note).
-    const instructions = agentInstructionsOf(display);
+    // T11: a COMPILED view no longer carries that map at all (instruction text does not
+    // belong in every view frame, ../server/protocol.ts:655-663). Whatever the explicit
+    // dialog-open read produced (`instance.harnessInstructions`, ./api.ts `getHarness`)
+    // fills the gap, and a field the DOCUMENT does state still wins — an older server that
+    // ships the map, or a frozen definition that carries it, needs no round trip at all.
+    const instructions = storedInstructionsOf(display, instance);
 
     // The actual model the no-override choice resolves to. For a new session it
     // is the typed model, else the server default (what mergeSettings applies to a
@@ -5235,6 +5400,47 @@ const agentDialogSignatureOf = (view: AgentView): string =>
         agents: agentLibrary.map((agent) => agent.name)
     });
 
+// T11: the configuration dialog's instruction text is NOT part of the compiled view. A
+// `/views` frame types `harnessDefinition` as a `HarnessDescriptor` but OMITS
+// `agentInstructions` (../server/protocol.ts:655-663), because that map is per-agent
+// instruction TEXT and the default wire exists to stop carrying text. Opening the dialog is
+// therefore the ONE explicit action that needs it, and this is the only place the read
+// happens — never during a render, a hydrate, a poll or a stream frame.
+//
+// Every failure mode keeps the text this browser already had instead of blanking the
+// editor: a gateway that has not mounted the GET answers 405 and ./api.ts reports
+// `undefined`; a network failure rejects. Both leave the document-derived overrides on
+// screen, which is the pre-T11 behaviour rather than a lost edit. And the answer is applied
+// only while this instance is STILL the one whose dialog was opened, so a late response
+// cannot paint another conversation's configuration.
+const loadHarnessInstructions = (instance: Instance): void => {
+    const name = instance.descriptor.name;
+
+    void getHarness(name)
+        .then((fetched) => {
+            // No such route (or an answer that names a different harness): keep what we have.
+            if (fetched === undefined || fetched.name !== name) return;
+
+            const stored = agentInstructionsOf(fetched);
+
+            // A harness with no stored override needs no repaint at all: every member
+            // already renders the trusted preset text, which is the correct answer.
+            if (Object.keys(stored).length === 0 && instance.harnessInstructions === undefined) return;
+
+            instance.harnessInstructions = stored;
+            if (current !== instance) return;
+
+            // `refreshAgentDialog` is signature-guarded: an unchanged map repaints nothing,
+            // and a changed one rebuilds the body the reader has not typed into yet (a draft
+            // they ARE typing survives, because the dialog owns drafts separately).
+            refreshAgentDialog(agentViewOf(instance), instance);
+        })
+        .catch(() => {
+            // Stated, not swallowed: the dialog is still usable with the definition this
+            // browser was given, and the next open asks again.
+        });
+};
+
 // Open the dialog for the SELECTED instance. The click handler resolves `current`
 // at press time, so a rebuilt button can never target a conversation left behind.
 const openAgentDialogForCurrent = (): void => {
@@ -5269,6 +5475,11 @@ const openAgentDialogForCurrent = (): void => {
             }
         }
     });
+
+    // T11: the dialog opened, so the instruction text it edits is now the thing worth one
+    // request. The dialog itself is already painted from the definition in hand, so this
+    // read only ever refines it — a slow or missing route cannot delay or blank the modal.
+    loadHarnessInstructions(instance);
 };
 
 // Close the app-scoped agent dialog (lifecycle changes, Tools view). Idempotent.
@@ -5446,7 +5657,12 @@ const applyAgentConfiguration = async (
         else models[name] = value;
     }
 
-    const instructions = { ...agentInstructionsOf(display) };
+    // T11: the base map is the one the DIALOG renders from (`view.instructions`), not the raw
+    // document field. A compiled view omits `agentInstructions` entirely, and the copy this
+    // shell read when the dialog was opened (`instance.harnessInstructions`) is the only
+    // other source there is. Since the server REPLACES the whole map, restating only what the
+    // document happened to carry would silently wipe a member's stored override.
+    const instructions = { ...view.instructions };
 
     for (const [name, instruction] of Object.entries(changes.instructions)) {
         const value = instruction.trim();
@@ -5465,7 +5681,7 @@ const applyAgentConfiguration = async (
         JSON.stringify(nextMembers) === JSON.stringify(members) &&
         JSON.stringify(nextModels) === JSON.stringify(modelsForMembers(agentModelsOf(display), members)) &&
         JSON.stringify(nextInstructions) ===
-            JSON.stringify(agentInstructionsOf(display)) &&
+            JSON.stringify(view.instructions) &&
         !busy
     ) {
         return { applied: false, message: 'Nothing changed.' };
@@ -5525,7 +5741,7 @@ const patchAgents = async (
             ...(includeModels ? { agentModels: models } : {}),
             // T3: `{}` is meaningful and must still be sent — it clears every stored
             // override so every member runs its trusted preset instruction again.
-            ...(includeInstructions || Object.keys(agentInstructionsOf(display)).length > 0
+            ...(includeInstructions || Object.keys(storedInstructionsOf(display, instance)).length > 0
                 ? { agentInstructions: instructions }
                 : {})
         });
@@ -6029,8 +6245,13 @@ const archivedSessions = (): SessionRecord[] =>
 // R6: the one extra match is an ARCHIVED harness that is currently open. A deleted
 // harness has no registry entry to resolve through, so its still-readable conversations
 // are matched by the harness name the record itself carries.
-const visibleSessions = (): SessionRecord[] => {
-    if (selectedName === undefined) return [];
+//
+// T24: the projection is parameterised by harness, because ENTERING a harness has to
+// answer "which conversation is this harness's newest?" for a harness that is not the
+// selected one yet (the reader just clicked its row). Same rows, same exclusions — the
+// rail and the pick can therefore never disagree about what belongs to a harness.
+const sessionsOfHarness = (name: string | undefined): SessionRecord[] => {
+    if (name === undefined) return [];
 
     return sessions.filter(
         (session) =>
@@ -6039,10 +6260,12 @@ const visibleSessions = (): SessionRecord[] => {
             // filter above is authoritative; this is the last line of defence so a
             // temporary context can never show up as a row the reader might open.
             !playgroundSessions.has(session.id) &&
-            (canonicalHarnessName(session.harness, presetDescriptors) === selectedName ||
-                archivedHarnessOf(session) === selectedName)
+            (canonicalHarnessName(session.harness, presetDescriptors) === name ||
+                archivedHarnessOf(session) === name)
     );
 };
+
+const visibleSessions = (): SessionRecord[] => sessionsOfHarness(selectedName);
 
 // T7: THE one session directory projection, shared by every surface that lists the
 // reader's conversations. `renderSessions()` paints it as pills and the header cycler
@@ -6070,6 +6293,145 @@ const sessionDirectory = (): SessionDirectoryEntry[] => {
     }
 
     return entries;
+};
+
+// ---------------------------------------------------------------------------
+// Initial selection (T21 R21 + T24)
+// ---------------------------------------------------------------------------
+//
+// The app chooses a conversation on the reader's behalf when a harness is FIRST entered:
+// on boot (the harness it lands on) and on every later rail entry into a harness that has
+// nothing selected yet (T24). Both go through the same ranking below and the same
+// `openSession`, and nothing in it runs on a directory poll, a refresh or a frame — an
+// ongoing selection is never moved underneath the reader (the "don't churn" rule).
+
+// The recency figure a directory row is ranked by, from the server's own stamps.
+// `updatedAt` is authoritative (the session store bumps it on every turn, and the
+// display wire carries it on every row), so "latest session" means "most recently
+// used". `createdAt` is the fallback for a conversation that has never run a task or
+// for a server that sends no update stamp; a record with NEITHER sorts first (0),
+// which keeps an un-stamped legacy row behind every stamped one instead of inventing
+// a date for it.
+const recencyOf = (session: SessionRecord): number => {
+    const updated = session.updatedAt;
+    if (typeof updated === 'number' && Number.isFinite(updated)) return updated;
+
+    const created = session.createdAt;
+    if (typeof created === 'number' && Number.isFinite(created)) return created;
+
+    return 0;
+};
+
+// The most recently used row of one directory list. Deterministic for a given server
+// answer: `recencyOf` decides first, and an exact tie falls to the DIRECTORY order,
+// which is the server's insertion order (oldest first — see `archivedSessions`), so
+// "later row" is the newer conversation. The strict `>=` walk therefore keeps the
+// newest tie rather than whichever row the list happened to put first, and a list
+// whose order is shuffled but whose stamps differ still yields the same row.
+const latestSession = (list: readonly SessionRecord[]): SessionRecord | undefined => {
+    let newest: SessionRecord | undefined;
+    let newestAt = 0;
+
+    for (const session of list) {
+        const at = recencyOf(session);
+        if (at >= newestAt) {
+            newest = session;
+            newestAt = at;
+        }
+    }
+
+    return newest;
+};
+
+// The conversation to open on a first load: the latest one belonging to the harness
+// on screen. `visibleSessions()` is the right scope (the selected harness only, with
+// deleted and playground rows filtered out) and deliberately EXCLUDES the archived
+// group — an archived harness's conversation must not steal the first load of the
+// harness the reader actually opened. Called only after `selectHarness`, which is what
+// sets `selectedName`; with no harness selected it is empty, exactly like the rail.
+const initialSession = (): SessionRecord | undefined => latestSession(visibleSessions());
+
+// ---------------------------------------------------------------------------
+// Entering a harness (T24)
+// ---------------------------------------------------------------------------
+//
+// The user rule ("when first loaded a harness, it should select the latest session")
+// applies to EVERY first entry into a harness, not only to the app's boot: clicking a
+// rail row that has never been opened in this visit resolves to that harness's most
+// recently used conversation, through the same `latestSession` authority and the same
+// `openSession` path (so T21 R22's collapse-on-load still renders nothing expanded).
+
+// A harness resolves its own conversation exactly ONCE per page visit. After that the
+// reader is in charge: a directory poll, a refresh, or another trip through the rail
+// never replaces the conversation they chose. The mark is set when an open ACTUALLY binds
+// a conversation (see `openLatestOfEnteredHarness`), and `+ New session` sets it too: an
+// empty composer is a choice, not something to take back on the next entry.
+const enteredHarnesses = new Set<string>();
+
+// Is the automatic open of `name`'s newest conversation still wanted? Every fact is read
+// AFTER the record arrives, because each can change while the request is in flight:
+//   - `selectedName !== name` — the reader entered another harness (rapid rail switching:
+//     the slow answer from the harness they LEFT must not yank the screen back);
+//   - `sessionId !== undefined` — a conversation is bound already, either the reader's own
+//     open that won the race or a submit whose answer just created one;
+//   - `enteredHarnesses.has(name)` — the reader resolved this harness themselves mid-flight
+//     (`+ New session`) or an earlier automatic open already landed.
+const entryIsStale = (name: string): boolean =>
+    enteredHarnesses.has(name) ||
+    selectedName !== name ||
+    instances.get(name)?.sessionId !== undefined;
+
+// One automatic open per harness in flight. Without it, entering A, leaving, and coming
+// back before the first read lands would queue a second GET of the same record (the first
+// one still wins the bind, and the second drops itself as stale — correct, but wasteful).
+const entryInFlight = new Set<string>();
+
+// Enter a harness: open its latest conversation when the harness is not already showing
+// one. `selectHarness` is the ONE entry point (rail row, the reselect after a harness
+// delete, the app's first load), so this rule lives in exactly one place.
+const openLatestOfEnteredHarness = (name: string): void => {
+    // Already resolved in this visit — the reader's own selection stands.
+    if (enteredHarnesses.has(name) || entryInFlight.has(name)) return;
+
+    const instance = instances.get(name);
+    if (instance === undefined) return;
+    // A conversation is bound to this harness already (the selection survives switching),
+    // so there is nothing to pick.
+    if (instance.sessionId !== undefined) return;
+    // A submit may be creating the very conversation this harness should show; picking one
+    // now would race its answer. The harness stays UNMARKED, so the next entry resolves.
+    if (submitting || creatingSessions > 0) return;
+
+    const latest = latestSession(sessionsOfHarness(name));
+    if (latest === undefined) {
+        // No conversation to open (a fresh harness, or rows that have not arrived yet).
+        // Deliberately unmarked: a conversation that appears later is still picked up the
+        // next time the harness is entered.
+        return;
+    }
+
+    entryInFlight.add(name);
+
+    // `openSession` swallows its own read failures, so the continuation only has to
+    // un-in-flight the harness and record what actually bound.
+    void openSession(latest.id, { stale: () => entryIsStale(name), automatic: true }).then(
+        () => {
+            entryInFlight.delete(name);
+            // Mark only once a conversation is REALLY bound. A dropped (stale) or failed
+            // open leaves the harness eligible, so re-entering it — the reader's next
+            // deliberate gesture — gets another chance to resolve instead of staying
+            // silently empty.
+            const opened = instances.get(name);
+            if (opened !== undefined && opened.sessionId !== undefined) {
+                enteredHarnesses.add(name);
+            }
+        },
+        // `openSession` swallows its own read errors, so this is defensive: a rejection
+        // must never leave the harness permanently in flight.
+        () => {
+            entryInFlight.delete(name);
+        }
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -6433,9 +6795,10 @@ const renderSessions = (): void => {
     }
 };
 
-// One painter for EVERY create-session control the page owns: the compact `+` in the header
-// row and the `+` inside an open dashboard strip. Painting them from one place means the two
-// copies can never disagree about what is clickable.
+// One painter for the create-session control the page owns: the compact `+` in the header
+// row. R3 took the dashboard's copy away (a conversation is not created from inside the
+// details dialog), so there is one control again and this painter still has one rule for
+// its busy contract (submit / run / pending create / un-booted / archived harness).
 //
 // R6: a NEW session needs a harness the registry still has. An archived conversation
 // (its harness deleted) is readable and can keep queuing tasks into its own record, but
@@ -6448,7 +6811,6 @@ const paintSessionActions = (): void => {
     const disabled = submitting || pending || !booted || archivedSelection;
 
     sessionNew.disabled = disabled;
-    for (const bar of liveSessionBars()) bar.newButton.disabled = disabled;
 };
 
 // Re-read the directory. A failure is reported in the status pill; the list on
@@ -7210,14 +7572,10 @@ const onViewItem = (
         // The tombstone — not arrival order — decides.
         if (instance.turnTombstones.has(item.turnId)) return;
 
-        // TEMP PROBE (T5): client-side routing of one ops frame.
-        console.warn(
-            '[route ops]',
-            item.turnId,
-            JSON.stringify((item.ops ?? []).map((op) => op.op)),
-            'displays:',
-            JSON.stringify(Object.keys(instance.store.view()?.displays ?? {}))
-        );
+        // The document as it stood WHEN this frame arrived. The activity reducer resolves
+        // an agent by section id against it, because `section:remove` names a section the
+        // post-state no longer holds.
+        const before = instance.store.view();
 
         // 1. state first: the store applies every addressed mutation to the one
         //    document this instance renders.
@@ -7247,10 +7605,23 @@ const onViewItem = (
             // Panels: the compact trees changed, so the scratch board follows — the
             // same derivation the document path uses, never an event scan.
             derivePanels(instance);
-            refreshActivity(instance);
+
+            // Activity: the raw stream mutated the live ring set from every event
+            // (ui/activity.ts); the display wire mutates the SAME set from the addressed
+            // ops this frame names. A frame that ENDS a turn instead recomputes from the
+            // document, because the row it just upserted is now the authority for what is
+            // still running (and a `view` frame does the same in `applyView`).
+            const settlesTurn = (item.ops ?? []).some(
+                (op) => op.op === 'turn' && op.summary.status !== 'running'
+            );
+
+            if (settlesTurn) refreshActivity(instance);
+            else {
+                applyOpsToActivity(instance.activity, before, item.turnId, item.ops ?? []);
+                if (current === instance) paintAgentRings(instance.activity);
+            }
 
             if (current === instance) {
-                paintAgentRings(instance.activity);
                 paintPanels();
                 setBusy(instance.pending);
             }
@@ -7431,7 +7802,19 @@ const releaseSessionState = (instance: Instance): void => {
 // Select and render an existing session. Everything drawn here comes from the
 // server's COMPILED document; nothing is reconstructed from browser memory, and no
 // recorded event is fetched (T5 R1/R3).
-const openSession = async (id: string): Promise<void> => {
+//
+// `stale` is the T24 opt-in guard for the AUTOMATIC opens (entering a harness): the read
+// is async, and the reader may have moved to another harness, picked their own
+// conversation, or asked for an empty composer while it was in flight. An explicit open
+// (a pill, the cycler) passes nothing, because the reader's click always wins.
+// `automatic: true` marks the same calls so the switch they perform keeps the app status
+// the reader was just told about (see `selectHarness`).
+const openSession = async (
+    id: string,
+    options?: { stale?: () => boolean; automatic?: boolean }
+): Promise<void> => {
+    const stale = options?.stale;
+
     stopWatching();
     stopPolling();
 
@@ -7439,6 +7822,9 @@ const openSession = async (id: string): Promise<void> => {
     try {
         session = await getView(id);
     } catch (error) {
+        // A superseded automatic open is not an event the reader should feel: the view it
+        // belonged to is already gone, so no pointer change, no header error, no refresh.
+        if (stale !== undefined && stale()) return;
         // A remembered id from a previous server process is not an error state
         // the user must fix: forget it and show what the server does have. A
         // stale id in a *row* (someone else's process) must not clear a valid
@@ -7448,6 +7834,10 @@ const openSession = async (id: string): Promise<void> => {
         void refreshSessions();
         return;
     }
+
+    // T24: an automatic open whose answer arrived after the reader moved on is dropped
+    // BEFORE it can select a harness, bind a conversation or repaint anything.
+    if (stale !== undefined && stale()) return;
 
     // R8: this read may have been in flight when the row was deleted (a DELETE is
     // allowed while a session is being opened). The record is gone server-side, so
@@ -7508,6 +7898,13 @@ const openSession = async (id: string): Promise<void> => {
         releaseSessionState(target);
     }
 
+    // T21 R22: is this a LOAD of a conversation, as opposed to the same conversation
+    // being re-opened while it is already on screen? Captured BEFORE the assignment
+    // below, which is what makes the answer impossible to derive afterwards. Clicking
+    // the pill of the ACTIVE session is not a load, so an expansion the reader chose
+    // there is never reset by the click.
+    const loadsFresh = target.sessionId !== id;
+
     target.sessionId = id;
     // N3: an answer card from the conversation being left cannot follow the
     // reader here; binding expires it before the new transcript is drawn.
@@ -7517,8 +7914,21 @@ const openSession = async (id: string): Promise<void> => {
     // R6: for an archived harness this passes the frozen definition, because the registry
     // has no entry to look up. The instance key is the record's own harness name, so the
     // conversation is scoped to itself and no harness row appears in the rail.
-    selectHarness(descriptor.name, descriptor);
+    selectHarness(descriptor.name, descriptor,
+        // T24: an open the reader did not gesture (the harness-entry pick) keeps whatever
+        // status line the action before it painted.
+        options?.automatic === true ? { keepStatus: true } : undefined
+    );
     applyView(target, session);
+    // T21 R22: a loaded conversation starts with EVERY thread collapsed. `applyView`
+    // just reconciled the document, and the board's first-content rule opened the
+    // newest surface while doing so (`reconcileView`'s `!hadTurns` branch, and its
+    // `pendingFirstFocus` branch after a session switch — ui/turns.ts). Reading that as
+    // an expansion request is wrong — only a click is — so the shell drops it here,
+    // before the observer below or any composer paint can see a focus the reader never
+    // chose. `collapse` also marks the unfocus deliberate (`explicitUnfocus`), which is
+    // what stops every later stream/snapshot/poll frame from re-opening anything.
+    if (loadsFresh) target.view.collapseForLoad();
     rememberSession(id);
 
     if (pendingOf(session)) {
@@ -7586,6 +7996,11 @@ const newSession = (): void => {
     // no outcome to report.
     instance.view.setNotice(undefined);
     if (instance === current) forgetRememberedSession();
+    // T24: `+ New session` is an EXPLICIT choice of an empty conversation, so this
+    // harness stops resolving one on entry for the rest of the visit — switching away and
+    // back returns the reader to the draft they were writing, not to a saved chat. It also
+    // drops an automatic entry-open that is still mid-read (`entryIsStale`).
+    enteredHarnesses.add(instance.descriptor.name);
     // Lifecycle: the agent dialog belongs to the conversation being left. Closing it
     // here also releases its focus trap/scroll lock before the chrome repaints.
     closeAgentDialog();
@@ -7625,9 +8040,10 @@ const paintControls = (): void => {
     // other control. It is the only submit/stop control in the shell.
     paintComposer();
 
-    // R1 (T3) / R4 (T9): every create-session control is painted from one place
-    // (`paintSessionActions`): the compact `+` in this header row plus the `+` inside an
-    // open dashboard strip. The rules are the ones the rail buttons carried before.
+    // R1 (T3) / R4 (T9) / R3 (this pass): the create-session control is painted from one
+    // place (`paintSessionActions`) and there is now exactly ONE of them — the compact `+`
+    // in this header row. R3 removed the dashboard's copy (no creating inside the details
+    // dialog), so the two-copies rule that used to live here is gone with it.
     paintSessionActions();
     createHarnessButton.disabled = submitting || pending || !booted;
 
@@ -8311,9 +8727,10 @@ createHarnessButton.addEventListener('click', () => {
     createHarnessButton.setAttribute('aria-expanded', 'true');
 });
 
-// R1 (T3) / R4 (T9): each New-session control is wired where it is built — the header `+`
-// in the head above, the dashboard `+` inside `createSessionPillBar` — so a single
-// module-level listener could not reach both copies.
+// R1 (T3) / R4 (T9) / R3 (this pass): the only New-session control is the header `+`, wired
+// where it is built (`sessionNew`). The dashboard's copy that used to be built inside
+// `createSessionPillBar` is gone — a conversation is not created from the details dialog —
+// so there is one listener again.
 
 // A polling loop or a live tick must never outlive the page; a reload re-reads
 // the snapshot and every elapsed label from the server.
@@ -8500,27 +8917,57 @@ const boot = async (): Promise<void> => {
         }
 
         booted = true;
-        // R1 (T3) / R4 (T9): the New-session controls live in the header row and in the
-        // dashboard strip, and their enabled state is derived from `booted`, so this runs
+        // R1 (T3) / R4 (T9) / R3 (this pass): the header's New-session button is the only
+        // create control, and its enabled state is derived from `booted`, so this runs
         // AFTER the flag flips (the rail used to force the buttons on directly). With no
-        // harness at all they stay disabled, which is the truth: `newSession` has nothing
+        // harness at all it stays disabled, which is the truth: `newSession` has nothing
         // to start a conversation from.
         paintSessionActions();
         // R9/R10: paint the single composer action now that submitting is allowed
         // (it stays hidden while the field is empty and nothing is pending).
         paintComposer();
-        selectHarness(presetDescriptors[0].name);
+        // T24: `selectHarness` now resolves the harness on screen by itself, and boot must
+        // not stack a second automatic open on top of it. Marking the first harness as
+        // already entered hands that ONE decision to the awaited block below, which is the
+        // version that also honours the saved-pointer fallback and finishes before the
+        // reader sees a half-resolved view.
+        const firstHarness = presetDescriptors[0].name;
+        enteredHarnesses.add(firstHarness);
+        selectHarness(firstHarness);
 
-        // Resume the last conversation this browser looked at, but only if this
-        // server still holds it (sessions are in memory, so a restart loses
-        // them). An unknown id is forgotten, not treated as an error.
+        // T21 R21: a first load opens the LATEST conversation of the harness on
+        // screen, ranked by the server's own stamps (see `initialSession`). This runs
+        // BEFORE the remembered pointer is consulted on purpose: a pointer from an
+        // earlier visit must not beat the newest conversation, so the saved id only
+        // decides when it IS the newest, or when the selected harness has no
+        // conversation at all and the pointer names one under another harness (the
+        // resume this app has always offered on a reload).
         const remembered = loadRememberedSession();
+        const rememberedLive =
+            remembered !== undefined && sessions.some((session) => session.id === remembered);
 
-        if (remembered !== undefined && sessions.some((session) => session.id === remembered)) {
-            await openSession(remembered);
-        } else {
-            if (remembered !== undefined) forgetRememberedSession();
+        // Sessions are in memory, so a server restart loses them; an unknown id is
+        // forgotten, not treated as an error.
+        if (remembered !== undefined && !rememberedLive) forgetRememberedSession();
+
+        const newest = initialSession();
+        const initial = newest === undefined ? (rememberedLive ? remembered : undefined) : newest.id;
+
+        if (newest === undefined) {
+            // Boot had nothing to resolve FOR this harness (an empty one, or only the
+            // saved pointer of another harness matched). Release the claim above, so the
+            // next time the reader enters it the shared entry rule picks the newest
+            // conversation the server reports by then — the same "empty stays eligible"
+            // rule `openLatestOfEnteredHarness` applies everywhere else.
+            enteredHarnesses.delete(firstHarness);
+        }
+
+        if (initial === undefined) {
+            // Nothing to open: an empty harness view, which is what `+ New session`
+            // and the composer are for.
             setStatus('idle');
+        } else {
+            await openSession(initial);
         }
 
         // R8: initial load never focuses the composer. The page opens with focus

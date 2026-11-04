@@ -216,10 +216,33 @@ const opened = (calls: Call[]): string[] =>
 // Three conversations of the selected harness, in directory order. Every test that cycles
 // starts from s1 (the remembered pointer), so the expected walk is fully known: s1 → s2 → s3
 // → s1.
+//
+// T21 R21 makes that start deterministic from BOTH sides: a first load opens the most
+// recently used conversation, so s1 also carries the newest `updatedAt` (the server's
+// own stamp). The remembered pointer and the newest row are the same conversation on
+// purpose, and the cycler's walk then never depends on which row the fixture listed
+// last.
 const directory = (): SessionSnapshot[] => [
-    snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('first in', 't-s1')] }),
-    snapshot({ id: 's2', harnessDefinition: descriptor(), turns: [doneTurn('second in', 't-s2')] }),
-    snapshot({ id: 's3', harnessDefinition: descriptor(), turns: [doneTurn('third in', 't-s3')] })
+    snapshot({
+        createdAt: T,
+        updatedAt: T + 5_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('first in', 't-s1')]
+    }),
+    snapshot({
+        id: 's2',
+        createdAt: T - 10_000,
+        updatedAt: T - 5_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('second in', 't-s2')]
+    }),
+    snapshot({
+        id: 's3',
+        createdAt: T - 20_000,
+        updatedAt: T - 15_000,
+        harnessDefinition: descriptor(),
+        turns: [doneTurn('third in', 't-s3')]
+    })
 ];
 
 const recordOf = (url: string): SessionSnapshot | undefined =>
@@ -334,10 +357,16 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
     });
 
     it('is hidden while no conversation is open, and paints itself the moment one is', async () => {
-        const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello', 't-hello')] });
+        const first = snapshot({
+            createdAt: T,
+            updatedAt: T + 5_000,
+            harnessDefinition: descriptor(),
+            turns: [doneTurn('hello', 't-hello')]
+        });
 
-        // Nothing remembered: boot selects the harness and lists its conversation, but opens
-        // none of it.
+        // Nothing remembered. T21 R21: a first load opens the newest conversation of
+        // the harness on screen, so the pill starts out naming it — and the header `+`
+        // below is what produces the "nothing open" state this control hides in.
         stubFetch((url) => {
             if (url === '/api') return json(bootstrap({ sessions: [first] }));
             if (url === '/api/models') return json({ models: ['m1'] });
@@ -350,6 +379,14 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
         await flush();
 
         const pill = cycle();
+        expect(pill.hidden).toBe(false);
+        expect(cycleId()).toBe('s1');
+
+        // The header `+` — the compact create control R2 (T9) put beside the cycler —
+        // forgets the conversation without deleting anything.
+        headerNew().click();
+        await flush();
+
         // Nothing to name, so nothing to read, tab to, or click — and no stale id, name or
         // tooltip left behind for a screen reader to trip over.
         expect(pill.hidden).toBe(true);
@@ -374,9 +411,8 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
         expect(pill.dataset.sessionId).toBe('s1');
         expect(pill.getAttribute('aria-label')).toBe('Current session s1. Switch to the next session.');
 
-        // The header `+` — the compact create control R2 (T9) put beside the cycler — forgets
-        // the conversation without deleting anything and hides the pill again, WITHOUT
-        // opening the dashboard. The pill can only ever name a conversation on screen.
+        // And the `+` returns the pill to hidden again WITHOUT opening the dashboard. The pill
+        // can only ever name a conversation on screen.
         expect(document.querySelector('.dialog')).toBeNull();
         headerNew().click();
         await flush();
@@ -530,8 +566,21 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
     });
 
     it('hides itself when the conversation in view is deleted', async () => {
-        const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello', 't-hello')] });
-        const second = snapshot({ id: 's2', harnessDefinition: descriptor(), turns: [doneTurn('other', 't-other')] });
+        const first = snapshot({
+            // T21 R21: a first load opens the newest conversation, and this test walks
+            // the delete of the conversation ON screen (s1) — so s1 is the newer row.
+            createdAt: T,
+            updatedAt: T + 5_000,
+            harnessDefinition: descriptor(),
+            turns: [doneTurn('hello', 't-hello')]
+        });
+        const second = snapshot({
+            id: 's2',
+            createdAt: T - 10_000,
+            updatedAt: T - 5_000,
+            harnessDefinition: descriptor(),
+            turns: [doneTurn('other', 't-other')]
+        });
 
         localStorage.setItem(SESSION_KEY, 's1');
         const calls = stubFetch((url, method) => {
@@ -690,7 +739,10 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
         // R3 (T9): deletion is still where the user asked for it — three pills, each with its
         // `×`, plus the dashboard's own `+`. And R4: no refresh control anywhere.
         expect(after.querySelectorAll('.session-pill-delete')).toHaveLength(3);
-        expect(after.querySelector('.new-session')?.textContent).toBe('+');
+        // R3 (this pass): the dashboard has NO create control any more, so the only
+        // `.new-session` left in the page is the header's compact `+`.
+        expect(after.querySelector('.new-session')).toBeNull();
+        expect(document.querySelectorAll('.new-session')).toHaveLength(1);
         expect(after.querySelector('.refresh-sessions')).toBeNull();
     });
 });

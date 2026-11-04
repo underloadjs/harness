@@ -410,8 +410,21 @@ describe('fork / autoanswer branch rows', () => {
         const branchRow = turn.element.parentElement?.querySelector<HTMLElement>(
             '.thread-row[data-thread-id="branch-3"]'
         ) as HTMLElement;
+        // R18: the branch card is a FLAT sibling that directly follows its source row, and its
+        // parentage is carried by the row's OWN ids — `data-depth` and `data-parent-thread` —
+        // not by an ancestor element. Both live in the turn's one `.thread-children` host.
+        const host = branchRow.parentElement as HTMLElement;
+        expect(host.className).toBe('thread-children');
         expect(branchRow.dataset.depth).toBe('2');
-        expect(branchRow.parentElement?.className).toBe('thread-children');
-        expect(branchRow.closest('.thread-row[data-thread-id="child-thread"]')).not.toBeNull();
+        expect(branchRow.dataset.parentThread).toBe('child-thread');
+        expect([...host.children].map((child) => (child as HTMLElement).dataset.threadId)).toEqual([
+            'child-thread',
+            'branch-3'
+        ]);
+        // A flattened row is still no such thing as a wrapper: the row contains its card and
+        // nothing else, exactly like every other nested block (no second block shape).
+        expect([...branchRow.children].map((child) => (child as HTMLElement).className)).toEqual([
+            'thread-tile'
+        ]);
     });
 });

@@ -6,9 +6,9 @@
 //   - BASENAME RESOLUTION: a bare `descriptors.ts` is looked up through the injected
 //     resolver (one match -> read it, several -> list them, none -> say so), and a
 //     page with no resolver keeps the historical ENOENT rendering;
-//   - the EDITOR CODE VIEW: one numbered row per logical line, no soft wrap, a
-//     sideways scroller and a STICKY gutter, with `code.textContent` still
-//     byte-identical to the window (the Copy contract depends on it).
+//   - the PAYLOAD CODE VIEW: one numbered row per logical line, SOFT WRAP (like every
+//     other dialog payload), with `code.textContent` still byte-identical to the window
+//     (the Copy contract depends on it) and numbering that starts at the window's line.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/file-preview.test.ts
 
@@ -231,8 +231,9 @@ describe('preview code view', () => {
         await mounted();
 
         const pre = previewFrame();
-        // The shared `createCodeBlock` builder, scoped with `preview-code` instead of
-        // the tool pane's `tool-code` (which is what soft-wraps).
+        // The shared `createCodeBlock` builder, scoped with `preview-code`: the same
+        // soft-wrapped payload layout as a tool pane, plus the window-relative counter
+        // start that only the preview needs (ui/dialog.css).
         expect(pre.className).toBe('code-block preview-code');
         // 4 logical lines: `a`, the blank line, `b`, and the empty line the trailing
         // '\n' leaves — exactly what `code.split('\n')` means.
@@ -298,41 +299,49 @@ describe('preview code view', () => {
         handle.close();
     });
 
-    it('declares the no-wrap, sideways-scroll, sticky-gutter rules in its own stylesheet', () => {
-        // The frame scrolls sideways and keeps the source's own whitespace: the old
-        // `white-space: pre-wrap` prose look is gone.
+    it('declares the wrapped payload rules in its own stylesheet', () => {
+        // R1: the preview wraps like every other dialog payload — the block stops
+        // preserving whitespace, the rows do, and there is nothing left to scroll
+        // sideways into. The old `white-space: pre` + sideways scrollbar is gone.
         const frame = blockOf('.preview-file .preview-code.code-block {');
         expect(frame).toContain('max-height: 68vh');
-        expect(frame).toContain('overflow-x: auto');
+        expect(frame).toContain('overflow-x: hidden');
         expect(frame).toContain('overflow-y: auto');
-        expect(frame).toContain('white-space: pre');
-        expect(frame).not.toContain('overflow-x: hidden');
-        expect(frame).not.toContain('pre-wrap');
+        expect(frame).toContain('white-space: normal');
+        expect(frame).not.toContain('overflow-x: auto');
+        expect(frame).not.toMatch(/white-space:\s*pre(?!-wrap)/);
 
-        // The text column is as wide as the widest line, which is what gives the
-        // sticky gutter room to stay pinned during a sideways scroll.
+        // The text column is the scrollport's width, NOT `max-content`: a max-content
+        // box would size itself to the longest source line and re-open the horizontal
+        // scroll the row wrap just removed. The counter still resets once per pane, and
+        // `ui/file-preview.ts` overrides it inline for a paged window.
         const text = blockOf('.preview-file .preview-code.code-block code {');
-        expect(text).toContain('width: max-content');
-        expect(text).toContain('overflow-wrap: normal');
-        expect(text).toContain('white-space: pre');
+        expect(text).toContain('counter-reset: code-line');
         expect(text).toContain('font-variant-numeric: tabular-nums');
+        expect(text).toContain('white-space: normal');
+        expect(text).not.toContain('width: max-content');
 
+        // One row per LOGICAL line, wrapped: `pre-wrap` keeps the source's own
+        // indentation and `anywhere` breaks a token that has no break opportunity at
+        // all, which is the 200-column path/URL case the pane used to scroll through.
         const row = blockOf('.preview-file .preview-code .code-line {');
-        expect(row).toContain('white-space: pre');
-        expect(row).toContain('overflow-wrap: normal');
-        expect(row).not.toContain('pre-wrap');
+        expect(row).toContain('white-space: pre-wrap');
+        expect(row).toContain('overflow-wrap: anywhere');
+        expect(row).toContain('var(--code-gutter');
 
         // The number is generated content (never in `textContent`, never selectable,
-        // never copied) and it is STICKY, with an opaque background so the text that
-        // scrolls sideways passes under it.
+        // never copied) and it sits in the ROW'S PADDING against its own first visual
+        // line, so a wrapped continuation line flows in the text column. Absolute, not
+        // sticky: with the wrap there is no sideways scroll to stay pinned to.
         const gutter = blockOf('.preview-file .preview-code .code-line::before {');
         expect(gutter).toContain('content: counter(code-line)');
-        expect(gutter).toContain('position: sticky');
-        expect(gutter).toContain('left: 0');
+        expect(gutter).toContain('position: absolute');
+        expect(gutter).toContain('top: 0');
+        expect(gutter).toContain('left: 1px');
         expect(gutter).toContain('width: var(--code-gutter, 2ch)');
-        expect(gutter).toContain('background: var(--bg-deep)');
+        expect(gutter).toContain('text-align: right');
         expect(gutter).toContain('user-select: none');
-        expect(gutter).not.toContain('position: absolute');
+        expect(gutter).not.toContain('position: sticky');
     });
 });
 

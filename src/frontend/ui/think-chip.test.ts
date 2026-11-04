@@ -182,9 +182,13 @@ describe('createReasoningCard', () => {
         expect([...card.body.children].map((node) => node.className)).toEqual(['tool-section']);
         const section = card.body.querySelector<HTMLElement>('.tool-section');
         if (section === null) throw new Error('missing .tool-section');
+        // R1 (payload views): the payload node is the shared viewer carrying the
+        // `.reasoning` hook — `code-block reasoning tool-code` — so the pane is
+        // line-numbered and soft-wrapped like a tool pane while every consumer that
+        // reads `.reasoning` (this file, ui/turns*.test.ts, styles.css) is unchanged.
         expect([...section.children].map((node) => node.className)).toEqual([
             'tool-heading',
-            'reasoning'
+            'code-block reasoning tool-code'
         ]);
         const heading = section.querySelector<HTMLElement>('.tool-heading');
         if (heading === null) throw new Error('missing .tool-heading');

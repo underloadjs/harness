@@ -403,6 +403,11 @@ it('labels a running focused thread as queued once a ready attachment exists', a
     const calls = stubServer(restored);
     await mount();
 
+    // T21 R22: loading a conversation leaves EVERY thread collapsed, so the steering
+    // target exists only once the reader opens the running conversation. The rest of
+    // this test is about what that target then promises.
+    byClass('.tile .tile-select', 'button').click();
+
     const target = byClass('.composer-target', 'p');
     expect(target.textContent).toBe('Steering Running');
 

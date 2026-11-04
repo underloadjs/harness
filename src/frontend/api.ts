@@ -446,6 +446,29 @@ export const updateHarness = async (
     return body.harness;
 };
 
+// GET /harnesses/:name (T11) — ONE definition, read on an EXPLICIT action.
+//
+// Why the browser needs it: a `/views` response types `harnessDefinition` as a
+// `HarnessDescriptor` but OMITS `agentInstructions` (../server/protocol.ts:655-663),
+// because that map is per-agent instruction TEXT and forwarding it would put every
+// member's system prompt into every view frame. The configuration dialog therefore
+// cannot assume the text it edits is present in the document it was handed: it asks for
+// the one definition it is about to show, exactly once, when the reader opens it.
+//
+// The route answers `{ harness }`, the same envelope PATCH and DELETE use. An older
+// server that has not mounted the GET (a 405/404) is NOT an error the reader sees: the
+// caller keeps the instruction text it already has, so a dialog opened against an
+// un-upgraded gateway degrades to the previous behaviour instead of going blank.
+export const getHarness = async (name: string): Promise<HarnessDescriptor | undefined> => {
+    const body = await request<{ harness?: HarnessDescriptor } | undefined>(
+        `/harnesses/${encodeURIComponent(name)}`,
+        {},
+        [404, 405]
+    );
+
+    return body?.harness;
+};
+
 // DELETE /harnesses/:name (R6) — permanently remove ONE harness definition.
 //
 // The server (src/server/api.ts -> harness registry) removes the entry durably,

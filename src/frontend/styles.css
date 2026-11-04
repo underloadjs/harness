@@ -51,11 +51,16 @@
        of drifting from it as two hand-tuned magic numbers. */
     --scratch-fab-size: 32px;
 
-    /* Agent identity (R3). Every agent-owned block (`.tile`, `.thread-tile`,
-       `.agent`) is painted from ui/agent-color.ts, which overrides these two on the
-       element. The values here are the UNKNOWN-AGENT fallback — identical to
-       `UNKNOWN_AGENT_COLOR` — so a block that exists before any event names a
-       primary agent reads neutral instead of borrowing a palette identity. */
+    /* Agent identity (R3, recoloured by T5/R4). Every agent-owned block is painted from
+       ui/agent-color.ts, which overrides these two on the element: `.tile` and `.agent`
+       plus the `IT1`/`RR2` labels (`.thread-tile`/`.thread-select`, ui/turns.ts),
+       `.agent-control` (the composer button, ui/agent-control.ts) and
+       `.agent-dialog-agent` / `.agent-dialog-add-option` (ui/agent-dialog.ts). The values
+       here are the UNKNOWN-AGENT fallback — identical to `UNKNOWN_AGENT_COLOR` — so a
+       block that exists before any event names a primary agent reads neutral instead of
+       borrowing one of the (now randomly handed out) palette slots.
+       R4 changed only HOW a slot is chosen: a shuffled palette permutation per page,
+       stable for that page's lifetime. What the two properties MEAN is unchanged. */
     --agent-color: #8b94a7;
     --agent-line: rgba(139, 148, 167, 0.55);
 }
@@ -1461,9 +1466,13 @@ summary::-webkit-details-marker {
    deliberately SEAMLESS: no standalone border/background box, so it reads as part of
    the input surface (`--bg-input` comes from `.composer-field`) instead of a second
    widget next to it. The transparent border keeps the 32px box and the hover/focus
-   ring geometry identical to the previous outlined button, and the muted label keeps
-   it secondary to the text the reader is writing. Activity ownership is unchanged
-   (`--accent` via `[data-activity='active']` below). */
+   ring geometry identical to the previous outlined button; the label stays small and
+   mono so it never competes with the text the reader is writing.
+   T5/R4: the label colour is the agent's IDENTITY tone, painted on the `.agent-control`
+   wrapper by ui/agent-color.ts `paintAgentColor` and inherited from there. Activity
+   ownership is unchanged (`--accent` via `[data-activity='active']` below) — the accent
+   stays the STATE channel (border/ring) and the hue stays the IDENTITY channel (text),
+   so a running agent is still recognisable as itself while it works. */
 .agent-control-button {
     display: inline-flex;
     align-items: center;
@@ -1475,18 +1484,21 @@ summary::-webkit-details-marker {
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
     background: transparent;
-    /* `--muted` is the palette's real secondary text token (there is no
-       `--text-muted` variable in :root). */
-    color: var(--muted);
+    /* The `:root` fallback for `--agent-color` is `#8b94a7`, i.e. exactly the old
+       `--muted` value, so a control with no attributable agent still reads secondary
+       and a real agent is the only thing that introduces a hue. */
+    color: var(--agent-color);
     font-family: var(--mono);
     font-size: 11.5px;
     white-space: nowrap;
     cursor: pointer;
 }
 
+/* Hover is the border appearing (the box has no border at idle), so the press target is
+   announced without repainting the agent's name in `--accent` and briefly erasing the
+   identity the reader is aiming at. */
 .agent-control-button:hover {
     border-color: var(--accent);
-    color: var(--accent);
 }
 
 .agent-control-button:focus-visible {
@@ -1501,7 +1513,8 @@ summary::-webkit-details-marker {
 
 /* The threading code is the small-width label; it stays in the DOM at every width
    so a resize needs no re-render. `aria-hidden` keeps it out of the accessible name
-   (the button's aria-label carries the full title). */
+   (the button's aria-label carries the full title). It inherits the identity tone, so
+   the compact `IT`/`RR` label is the SAME colour as the transcript's thread labels. */
 .agent-control-code {
     display: none;
     font-weight: 600;
@@ -1510,10 +1523,12 @@ summary::-webkit-details-marker {
 
 /* Activity: the compact button carries the same `data-activity`/`aria-busy` pair as
    a deck tile (ui/activity.ts). A visible border/colour change is enough here; the
-   animated ring stays on the full card inside the dialog. */
+   animated ring stays on the full card inside the dialog.
+   R4: the accent is deliberately confined to the BORDER. Overriding `color` too (the
+   previous behaviour) hid the agent's hue exactly while that agent was working, which
+   is when the reader most wants to know which one it is. */
 .agent-control[data-activity='active'] .agent-control-button {
     border-color: var(--accent);
-    color: var(--accent);
 }
 
 .agent-row-wrap {
@@ -2768,19 +2783,24 @@ summary::-webkit-details-marker {
    the SAME object as a main block — same radius, surface, header layout and state
    treatment — and is distinguished ONLY by indentation. There is no role badge and
    no left "hierarchy stripe"; the agent's colour (outline + name, ui/agent-color.ts)
-   says WHO owns the block and the nesting says WHERE it belongs. Structure:
-     .thread-row          ← data-depth (1 = direct child of the turn root), state
-       .thread-tile       ← agent-coloured outline (same surface as `.tile`)
-         .thread-select   ← button: ONE row = code [kind] · preview · [elapsed | tokens (state = colour)]
-         .thread-body     ← input prompt, agent flow, outcome (hidden collapsed)
-       .thread-children   ← this entry's own descendants, in spawn order
-   The children host is OUTSIDE the body and BELOW the tile, so collapsing a parent
-   never hides descendants and collapsing the turn tile never hides its child rows.
-   The nesting also gives depth-first sibling layout for free. */
+   says WHO owns the block and the indentation says WHERE it belongs. Structure
+   (R18/T19 — FLAT, and that is the point):
+     .thread-children             ← the ONE host of a turn's invocation rows
+       .thread-row                ← data-depth, data-parent-thread, state, --thread-depth
+         .thread-tile             ← agent-coloured outline (same surface as `.tile`)
+           .thread-select         ← button: ONE row = code [kind] · preview · [elapsed | tokens]
+           .thread-body           ← context strip, input prompt, agent flow, outcome (collapsed = hidden)
+   Every descendant row is a SIBLING in that one host, ordered depth-first, so a delegated
+   conversation is an independent card BESIDE the block it came from rather than another
+   element inside it. The nesting used to carry both the order and the indent; the order now
+   comes from the board's ordering pass and the indent from `--thread-depth` (stamped by
+   ui/turns.ts `orderThreadRows`), which keeps arbitrary depth working without another
+   wrapper element. Parentage stays addressable: `data-parent-thread` names the invocation
+   this card hangs off. */
 .thread-children {
-    /* ONE indent step per nesting level: depth 2 is two `.thread-children`
-       containers deep, so arbitrary metadata depth indents correctly without
-       enumerating selectors. Indentation is the ONLY hierarchy cue (R3). */
+    /* ONE indent step. The host supplies the FIRST step (a direct child of the turn root is
+       one step in, exactly as the old nested host rendered it); a deeper row adds its own
+       `depth - 1` steps, so the pixels are identical to the nested model at every level. */
     --thread-indent: 18px;
     display: flex;
     flex-direction: column;
@@ -2800,13 +2820,17 @@ summary::-webkit-details-marker {
     display: none;
 }
 
-/* No stripe, no extra left padding: the host above already indents the entry, and
-   a coloured rule beside the tile would be a second hierarchy language (R3).
-   `data-depth` is still mirrored on the row for styling/assistive context, but no
-   rule paints it — the indentation IS the depth. */
+/* No stripe, no extra left padding: a coloured rule beside the tile would be a second
+   hierarchy language (R3). `data-depth` is mirrored on the row for styling/assistive
+   context, but the rule that PAINTS the indent reads `--thread-depth`, which is why an
+   arbitrary depth needs no enumerated `[data-depth='N']` selector set. */
 .thread-row {
+    --thread-depth: 0;
     display: flex;
     flex-direction: column;
+    /* R18/T19: the row's own depth is its indentation. The host already paid for level 1,
+       so the board stamps `depth - 1` here (ui/turns.ts `orderThreadRows`). */
+    margin-left: calc(var(--thread-indent) * var(--thread-depth));
     /* R6: shrink with the host (min-width) and never exceed it (max-width). */
     min-width: 0;
     max-width: 100%;
@@ -3051,8 +3075,18 @@ summary::-webkit-details-marker {
     line-height: 1;
 }
 
-/* R9: inline two-step confirmation. It occupies the full toolbar width below the
-   two actions; Cancel sends no request (ui/turns.ts). */
+/* R9/T26: the two-step confirmation's anatomy. It occupies the full toolbar width below
+   the two actions; Cancel sends no request (ui/turns.ts).
+   R5 (T6) moved the confirmation itself into the SHARED dialog (ui/turns.ts
+   `openThreadDeleteConfirmation`): a proven desktop deletes on one press, so no host
+   paints this row inline any more. The class names stay — the dialog re-uses them, which
+   is what keeps the warning and the two controls looking exactly like the row they
+   replaced — and the toolbar geometry below still describes a row inside a WRAPPING ROW
+   container (`flex: 1 0 100%` is what forces it onto its own line, the top border what
+   separates it from the actions above). Inside `.dialog-body`, a flex COLUMN, that basis
+   would hand the group the panel's whole height and the border would draw a second rule
+   under the dialog header, so `ui/dialog.css` carries the one dialog-scoped override that
+   cancels exactly those three declarations. */
 .thread-delete-confirm {
     display: flex;
     flex: 1 0 100%;
@@ -3708,8 +3742,12 @@ summary::-webkit-details-marker {
 }
 
 .agent-name {
-    /* R3: the agent's own deterministic tone, not one global accent — the same
-       colour as the outline of the block that owns this section. */
+    /* R3 (re-pointed by T5/R4): the agent's OWN tone, not one global accent — the same
+       colour as the outline of the block that owns this section, and the same colour the
+       composer button and the roster badge carry. `ui/agent-color.ts` hands that tone out
+       at random ONCE PER PAGE and caches it by canonical agent id, so it is stable for
+       every surface of this page load (it may differ after a reload, which is the
+       behaviour R4 asked for). */
     color: var(--agent-color);
     font-family: var(--mono);
     font-size: 10.5px;
@@ -6585,7 +6623,18 @@ summary::-webkit-details-marker {
     padding: 0 5px;
     border: 1px solid var(--border-strong);
     border-radius: 999px;
-    color: var(--text-dim);
+    /* T5/R4: the `IT1`/`RR2` badge is an agent IDENTITY, so it carries the agent's hue.
+       It used to read `var(--text-dim)` — a token that is not defined in `:root` at all,
+       which makes the declaration invalid at computed-value time and silently falls back
+       to INHERIT. The badge therefore already picked up whatever colour its owning tile
+       happened to carry, and the tile is painted by ui/agent-color.ts (`paintAgentColor`
+       in ui/turns.ts). Naming `--agent-color` explicitly is what makes that a documented
+       contract instead of an accident of an undefined token, and it puts this badge on
+       the SAME rule family as `.thread-name` / `.tile-agent` (`:is(.tile-agent,
+       .thread-name)` above), which already read it.
+       The 1px `--border-strong` frame stays neutral: it is the shared pill vocabulary
+       (`.tool-duration`, `.thread-kind`), not an identity channel. */
+    color: var(--agent-color);
     font-size: 10px;
     line-height: 1.5;
     letter-spacing: 0.04em;
@@ -6593,10 +6642,11 @@ summary::-webkit-details-marker {
 }
 
 /* Expanded tiles stack the header as a column, so the pill must not stretch across
-   the full width like the identity line does. */
+   the full width like the identity line does. The old `var(--text-muted)` colour was a
+   second undefined token (same silent-inherit outcome); dropping it keeps the badge in
+   the agent's colour in BOTH header shapes, which is the point of R4. */
 .tile.is-expanded .tile-thread {
     align-self: flex-start;
-    color: var(--text-muted);
 }
 
 /* Separate STOP-ALL control (R5/R7). It sits LEFT of the inline action so the
@@ -6702,4 +6752,420 @@ summary::-webkit-details-marker {
     .composer-stop {
         border-color: CanvasText;
     }
+}
+/* ===========================================================================
+   T11: the ONE context bar per turn (ui/context-bar.ts, model in view-context.ts)
+
+   One strip replaces the wall of tool chips a long turn used to print. Two rules
+   in this file are LOAD-BEARING against the model, and `context-bar-style.test.ts`
+   pins both numbers:
+     - the visible gap between segments is `CONTEXT_BAR_GAP_PX` (2px) in DOM mode, so
+       the segments read as separate blocks instead of one merged band;
+     - the track height is `CONTEXT_BAR_TRACK_HEIGHT_PX` (18px) for BOTH modes, so the
+       canvas pixels and the flex row describe the same box.
+
+   Colours come from `data-tone`, which ./view-context.ts `contextBarToneOf` decided
+   from the SERVER's `kind`/`state`: settled tool green, failed/cancelled tool red,
+   running tool faded green, reasoning amber, prompt/instructions/answer neutral. The
+   tone is never the only signal: every segment carries its state in words through
+   `aria-label` and `title`, which is what forced-colors mode falls back to below.
+   ========================================================================= */
+
+.context-bar-host {
+    display: block;
+    margin: 0 0 10px;
+}
+
+.context-bar-host[hidden] {
+    display: none;
+}
+
+.context-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    /* The strip is a control the reader aims at, so it reads as one: a frame around
+       the track and the caption that explains it. */
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-deep);
+}
+
+.context-bar:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* Canvas mode: one element, sized by the model's own geometry. `height` also arrives as
+   an inline style from the painter (jsdom has no layout, so the stylesheet is the
+   contract here and the inline value is the one that survives a missing rule). */
+.context-bar-canvas {
+    display: block;
+    width: 100%;
+    height: 18px;
+}
+
+/* DOM mode: the same box, built from flex weights instead of pixels. */
+.context-bar-segments {
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 2px;
+    height: 18px;
+    overflow: hidden;
+    border-radius: 3px;
+}
+
+.context-bar-segment {
+    display: block;
+    min-width: 1px;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    border-radius: 2px;
+    background: var(--text);
+    cursor: pointer;
+}
+
+.context-bar-segment[data-tone='ok'] {
+    background: var(--ok);
+}
+
+.context-bar-segment[data-tone='error'] {
+    background: var(--danger);
+}
+
+/* A running call is the same green at 45% (CONTEXT_BAR_TONE_STYLES.running.alpha), so
+   "not settled yet" is visible without being a fourth colour. */
+.context-bar-segment[data-tone='running'] {
+    background: var(--ok);
+    opacity: 0.45;
+}
+
+.context-bar-segment[data-tone='reasoning'] {
+    background: var(--warn);
+}
+
+.context-bar-segment[data-tone='neutral'] {
+    background: var(--text);
+}
+
+.context-bar-segment:hover {
+    outline: 1px solid var(--text);
+    outline-offset: -1px;
+}
+
+/* Focus and hover paint one highlight in canvas mode too, so the keyboard and the
+   pointer cannot disagree about which segment is current. */
+.context-bar-segment[data-focused='true'] {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+/* In-segment name: only minted for a uncrowded bar (CONTEXT_BAR_DOM_LABEL_LIMIT), and
+   clipped rather than wrapped so one long tool name cannot resize the track. */
+.context-bar-segment-name {
+    display: block;
+    padding: 0 4px;
+    overflow: hidden;
+    color: var(--bg);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 18px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Canvas mode keeps its accessible text off-screen: the option list is what a screen
+   reader browses segment by segment, and the live region states the current one as the
+   keyboard moves. Same visually-hidden recipe as the tile's status word. */
+.context-bar-options,
+.context-bar-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+/* The figures line (T16/R16b): the segment count and the exact character total, printed
+   RIGHT-ALIGNED under the track, where the reader's eye already is after scanning the
+   strip left to right. The sentence "context character distribution" is gone from the
+   visible surface — it repeated above every turn — but the UNIT stays in this text,
+   because naming it is the anti-mislabelling rule (a character strip must never read as
+   a context-window gauge). The phrase still exists where it costs nothing and helps:
+   `aria-label`, from `contextBarSummaryOf`. */
+.context-bar-caption {
+    margin: 0;
+    /* Right-aligned on purpose: the stats belong at the end of the bar, not mixed into a
+       label at its start. `text-align` (not `margin-left: auto`) so the line wraps
+       against the right edge when the unprompted-chars note is long. */
+    text-align: right;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    overflow-wrap: anywhere;
+}
+
+/* An authoritative empty bar (every section answered `context: []`) says so, rather than
+   showing a blank track that could be read as "nothing ran". */
+.context-bar[data-empty='true'] .context-bar-segments {
+    min-height: 18px;
+    border: 1px dashed var(--border-strong);
+}
+
+.context-bar[data-empty='true'] .context-bar-caption {
+    color: var(--text);
+}
+
+/* ===========================================================================
+   T22: the ONE current tail block (R23) — ui/turns.ts `createContextBarSurface`
+
+   The strip says what a turn was made of; the block the reader is actually reading
+   still has to appear, exactly once, at the TAIL of that strip. `ui/turns.ts` mounts
+   one `.context-bar-tail` inside each section's own `.context-bar-host` (so a
+   delegated conversation's thinking can never print inside its caller's block).
+
+   T23 widened WHAT may print there: the server's designation (`TurnSection.tail`) names
+   the newest block of ANY kind — a thinking window, an answer, or a recorded CALL — and a
+   call's body is its complete recorded request plus, once it settles, its complete recorded
+   response, one labelled pane each. The exceptions stay `user` and `system`: the prompt
+   already rides the tile's own row and the instructions have no board surface.
+
+   Two rules below are load-bearing for that contract and are pinned by
+   `ui/context-bar-style.test.ts`:
+     - the attribute selector `[data-superseded='true']` sets `display: none` — every OLDER prose window is a
+       segment the reader clicks (its exact bytes come from the block route), so it
+       must not stay printed as a stale preview. `[hidden]` already covers the common
+       case; this states the SAME rule in the vocabulary of the decision, so a change
+       to the base `[hidden]` rule cannot silently bring the wall of previews back.
+     - the tail body is `white-space: pre-wrap` in the mono face: reasoning is scratch
+       space and renders as plain text, and a long round scrolls inside its own box
+       instead of pushing the rest of the transcript off the page.
+
+   `data-truncated` is the honest label, not decoration: the display wire bounds
+   reasoning text at `DISPLAY_NODE_PREVIEW_CHARS` (src/shared/turn-display.ts:134), so
+   until the server designates the tail block as a full-text carrier the body IS a
+   preview, and the caption line states the exact recorded length beside it.
+   ======================================================================== */
+
+.context-bar-tail {
+    display: block;
+    margin-top: 4px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    /* Amber on the left edge is the strip's own reasoning tone (`--warn`, the same
+       value `CONTEXT_BAR_TONE_STYLES.reasoning` paints a segment), so the body reads
+       as the block that segment stands for. */
+    border-left: 2px solid var(--warn);
+    border-radius: var(--radius-sm);
+    background: var(--bg-deep);
+}
+
+.context-bar-tail[data-kind='assistant'] {
+    border-left-color: var(--text);
+}
+
+/* T23 (R23): a recorded call IS a block, so it gets the tail too — with the strip's own
+   tool tones, verbatim: `--ok` settled, `--danger` failed or cancelled. The state is also
+   printed as a WORD in the caption (`contextTailCaptionOf`), so the colour is never the
+   only signal; in a `forced-colors` mode that collapses the tone, the word and each pane's own
+   boundary are what the reader is left with, and both stay. */
+.context-bar-tail[data-kind='tool'] {
+    border-left-color: var(--ok);
+}
+
+.context-bar-tail[data-kind='tool'][data-state='error'],
+.context-bar-tail[data-kind='tool'][data-state='cancelled'] {
+    border-left-color: var(--danger);
+}
+
+/* A running call is unfinished: the same green, visibly not settled — the tone
+   `CONTEXT_BAR_TONE_STYLES.running` paints its segment with. */
+.context-bar-tail[data-kind='tool'][data-state='running'] {
+    opacity: 0.72;
+}
+
+.context-bar-tail[hidden] {
+    display: none;
+}
+
+.context-bar-tail-caption {
+    margin: 0 0 6px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    overflow-wrap: anywhere;
+}
+
+.context-bar-tail-body {
+    margin: 0;
+    max-height: 22rem;
+    overflow: auto;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* T23 (R23): one pane of the current call's body. Stacked rather than side-by-side — the
+   request and the response are both long, and every other payload surface in this app
+   gives a field its own labelled block (`ui/context-detail.ts` panes, the tool dialog).
+   Each pane scrolls on its own, so a huge result can never push the request the reader
+   aimed at off screen. */
+.context-bar-tail-pane + .context-bar-tail-pane {
+    margin-top: 8px;
+}
+
+.context-bar-tail-pane-label {
+    margin: 0 0 3px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+/* Byte-identical to the recorded payload: the pane's text is written with `textContent`
+   and nothing here adds generated content, so `pre[data-field]` reads back exactly the
+   bytes the server sent (the rule `ui/tools.ts` states for its own viewer). */
+.context-bar-tail-pane-body {
+    margin: 0;
+    max-height: 14rem;
+    overflow: auto;
+    padding: 6px 8px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+
+/* A stated absence is an ANSWER, not a blank: no arguments were recorded for this call, or
+   no result has been recorded for it yet. Same vocabulary as the segment dialog
+   (`ui/context-detail.ts` `.block-detail-note`). */
+.context-bar-tail-pane-note {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-style: italic;
+    overflow-wrap: anywhere;
+}
+
+/* R23: a superseded block prints NO body. The element stays in the DOM (its writer and
+   Markdown work are still owned by the node's handle, and the segment's click still
+   answers with the exact recorded bytes); only its rendering is withdrawn. */
+[data-superseded='true'] {
+    display: none;
+}
+
+/* Forced colors: the tones collapse, so every segment keeps its own boundary and the
+   focused one keeps a visible ring. The words (aria-label/title) already carry state. */
+@media (forced-colors: active) {
+    .context-bar-segment {
+        forced-color-adjust: none;
+        outline: 1px solid CanvasText;
+        outline-offset: -1px;
+    }
+
+    .context-bar-segment[data-focused='true'] {
+        outline: 2px solid Highlight;
+    }
+}
+
+/* --- the segment detail dialog (ui/context-detail.ts) -------------------
+   The full recorded bytes of ONE segment, loaded on the click and never before. The
+   panes reuse the tool dialog's heading/label/copy vocabulary (`.tool-heading`,
+   `.tool-label`, `.tool-copy`, `.tool-code`, `.reasoning`) so a reader meets one
+   convention across every payload surface in this app. */
+
+.block-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+/* The fact line renders from metadata ALONE, so it answers "what is this segment"
+   before (and even when) the route fails. */
+.block-detail-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 6px;
+    margin: 0;
+}
+
+.block-detail-fact {
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.block-detail-fact[data-fact='kind'] {
+    border-color: var(--border-strong);
+    color: var(--text);
+}
+
+.block-detail-panes {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.block-detail-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+/* Prose keeps the reasoning box (plain text, its own scroller, no Markdown parse of
+   model bytes) so a 200k-character answer cannot grow the modal without bound. */
+.block-detail-text {
+    max-height: min(58vh, 620px);
+}
+
+.block-detail-note {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    padding: 8px 10px;
+    border-left: 2px solid var(--border-strong);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.block-detail-note[data-detail='loading'] {
+    border-left-color: var(--warn);
+}
+
+.block-detail-note[data-detail='error'] {
+    border-left-color: var(--danger);
+    color: var(--text);
+}
+
+.block-detail-retry {
+    flex: 0 0 auto;
 }

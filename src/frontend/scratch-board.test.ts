@@ -240,6 +240,10 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
 it('derives recorded panels per session and keeps the hosts session-scoped', async () => {
     const first = snapshot({
         id: 's1',
+        // T21 R21: a first load opens the newest conversation, and this test reads the
+        // board of s1 before switching to s2 — so s1 carries the newer stamp.
+        createdAt: T,
+        updatedAt: T + 5_000,
         turns: [
             turn({
                 events: [
@@ -309,7 +313,9 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
 
     localStorage.setItem(SESSION_KEY, 's1');
 
-    stubFetch((url, method) => {
+    // `calls` is the request log: the assertions below prove the recorded panel values arrive
+    // ONLY through the lazy step-detail route (one request, on the reader's click).
+    const calls = stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap({ sessions: [first, second] }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1' && method === undefined) return json({ session: first });

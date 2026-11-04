@@ -12,7 +12,10 @@
  * dark UI without redefining the palette.
  *
  * All selectors are scoped to `.dialog-*`, except the file-preview section at the
- * end, which is scoped to `.preview*` (the dialog content classes in styles.css).
+ * end, which is scoped to `.preview*` (the dialog content classes in styles.css),
+ * and the two dialog-content rules named in the section above (the `.harness-details`
+ * divider for R3 and the thread-delete confirmation copy for R5 — both are content
+ * classes styles.css owns for OTHER hosts, adjusted only inside a dialog).
  * Nothing here touches shell classes. */
 
 /* Full-viewport dismiss layer. Fixed + inset keeps it out of the shell grid, and
@@ -279,113 +282,144 @@
     }
 }
 
-/* --- file preview: editor-style code view (ui/file-preview.ts) --------------
+/* --- file preview: wrapped payload view (ui/file-preview.ts) --------------
  *
  * The preview's `<pre>` is the shared line-view builder `createCodeBlock`
  * (ui/tools.ts) scoped with `preview-code` instead of the tool pane's `tool-code`:
  * one `.code-line` row per LOGICAL line, joined by `.code-break` separators that
  * carry the payload's own '\n', with the numbers as CSS counters. That row
- * machinery is styled in styles.css (`.code-block` / `.code-line`), and the tool
- * pane uses it SOFT-WRAPPED (`.tool-code` opts out of sideways scroll).
+ * machinery is styled in styles.css (`.code-block` / `.code-line`).
  *
- * A source file is a different job from a tool payload: an editor never reflows
- * a line, so the preview keeps `white-space: pre`, takes the horizontal
- * scrollbar, and keeps the number column pinned while the text scrolls under it.
+ * SOFT WRAP, like every other payload surface in a dialog (R1). The preview used to
+ * be the one exception — `white-space: pre` plus a sideways scrollbar and a sticky
+ * number column — and a reader comparing a tool result with a file saw two different
+ * products. A wrapped line whose continuation starts under the text column is what
+ * the tool pane already does, and it is what this section now does too; the ONLY
+ * thing still preview-specific is that numbering starts at the window's first line
+ * (`ui/file-preview.ts` writes `counter-reset: code-line <startLine - 1>` inline on
+ * the `<code>`), which the tool pane's plain `counter-reset: code-line` cannot carry.
  *
- * THE SPECIFICITY IS LOAD-BEARING, not decoration. styles.css `@import`s this
- * file as its FIRST line, so every ruleset in styles.css is LATER and wins a tie
- * (see the matching note on styles.css `.tool-code.code-block`). Each rule below
- * therefore carries one class more than the rules it overrides:
+ * THE SPECIFICITY IS LOAD-BEARING, not decoration. styles.css `@import`s this file as
+ * its FIRST line, so every ruleset in styles.css is LATER and wins a tie (see the
+ * matching note on styles.css `.tool-code.code-block`). Each rule below therefore
+ * carries more classes than the rules it overrides:
  *   `.preview-file .preview-code.code-block`  >  `.code-block`  /  `.preview-code`  /  `.dialog-body pre`
+ *   `.preview-file .preview-code.code-block code`  >  `.code-block code`
  *   `.preview-file .preview-code .code-line`  >  `.code-line`
  * and nothing here reaches outside `.preview*`, so no other dialog changes. */
 
 /* The scroll container. `max-height: 68vh` is the pre-existing preview cap (the
- * image preview uses the same), and `overflow-x` is what replaces the old soft
- * wrap: a long line scrolls sideways instead of reflowing into prose. `padding`
- * drops the frame's inner gutter so the number column can sit flush against the
- * border and stay pinned there (`.dialog-body pre` would otherwise add 12px). */
+ * image preview uses the same). `overflow-x: hidden` is the wrap half of the
+ * contract: with the rows wrapping there is nothing to scroll sideways, and the
+ * belt stops a pathological token opening a scrollbar (`ui/tools.ts` keeps the
+ * payload's unbroken 200-character strings exactly that way). `padding` drops the
+ * frame's inner gutter so the number column reads as the edge of the text column,
+ * exactly like a tool pane; `.dialog-body pre` would otherwise add 12px. */
 .preview-file .preview-code.code-block {
     max-height: 68vh;
     padding: 6px 0 8px;
-    overflow-x: auto;
+    overflow-x: hidden;
     overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-deep);
     color: var(--text);
     font: 12px/1.6 var(--mono);
-    /* The preview is a code surface: preserved whitespace, no reflow, and the
-     * payload's own tabs stay 4 columns wide. */
     tab-size: 4;
-    white-space: pre;
+    /* The block itself does not preserve whitespace: each ROW does (`pre-wrap`
+     * below), which is what lets a long line reflow without swallowing the
+     * source's own indentation. */
+    white-space: normal;
 }
 
-/* The text column has to be as wide as the WIDEST line for a sticky gutter to
- * have anywhere to travel: a plain block box would stop at the scrollport width
- * and the numbers would scroll out with it (the original complaint). `min-width`
- * keeps a short file filling the frame so rows still read as a column.
- * `tabular-nums` keeps 9 -> 10 from shifting the right-aligned column. */
+/* The text column. `width: auto` (the default, so simply NOT the old
+ * `max-content`): a wrapped column is the scrollport's width, and a `max-content`
+ * box would size itself to the longest line and re-open the sideways scroll the row
+ * wrap just removed. `tabular-nums` keeps 9 -> 10 from shifting the column. */
 .preview-file .preview-code.code-block code {
     display: block;
-    width: max-content;
-    min-width: 100%;
     padding: 0;
     /* One increment per row = per logical line. ui/file-preview.ts overrides this
      * inline with `counter-reset: code-line <startLine - 1>` for a paged window. */
     counter-reset: code-line;
     font-variant-numeric: tabular-nums;
-    /* `normal` is the no-wrap half of the contract: without it a 200-column line
-     * would still break at a space (`anywhere`/`break-word` come from elsewhere). */
+    /* `normal` breaks NOTHING at the block level; `anywhere` on the rows below is
+     * what carries a token with no break opportunity at all. */
     overflow-wrap: normal;
-    white-space: pre;
+    white-space: normal;
 }
 
-/* A row is exactly one source line: no wrap, no reflow, and no left indent — the
- * gutter below is IN FLOW, so the old `padding-left: calc(gutter + 12px)` that
- * reserves room for an absolutely positioned number is dropped. The base rule's
- * `border-left` was the column divider; it belongs to the sticky gutter now. A
- * BLANK source line still gets a line box from styles.css
- * `.code-line:empty::after { content: '\00a0' }`, so its number never collapses
- * onto the next row. */
+/* A row is exactly one source line: it wraps into as many visual lines as it needs,
+ * keeps its own leading whitespace, and starts clear of the number column —
+ * `--code-gutter` is set per pane by `createCodeBlock` from the row count, so the
+ * column and the indent always agree in this font. A BLANK source line still gets a
+ * line box from styles.css `.code-line:empty::after { content: '\00a0' }`, so its
+ * number never collapses onto the next row. */
 .preview-file .preview-code .code-line {
-    padding: 0 12px 0 0;
-    border-left: 0;
-    overflow-wrap: normal;
-    white-space: pre;
+    padding: 0 12px 0 calc(var(--code-gutter, 2ch) + 12px);
+    border-left: 1px solid var(--border);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
 
-/* The STICKY number. Generated content still, so it stays out of
-   `code.textContent`, out of a mouse selection and out of the Copy payload
-   (ui/file-preview-copy.test.ts). Unlike the tool pane's `position: absolute`,
-   `left: 0` pins it to the scrollport while the text scrolls beneath it, and the
-   opaque `background` is what makes that read as an overlay rather than a
-   collision. `top: auto` is deliberate: the number belongs to its own row and
-   must not float while the panel scrolls vertically. */
+/* The number. Generated content still, so it stays out of `code.textContent`, out of
+ * a mouse selection and out of the Copy payload (ui/file-preview-copy.test.ts). With
+ * the wrap in place it is ABSOLUTE against its own row (styles.css `.code-line` is
+ * `position: relative`) and lives in that row's padding, so a wrapped continuation
+ * line flows in the text column rather than under the number — and there is no
+ * sideways scroll left for a sticky column to stay pinned to. */
 .preview-file .preview-code .code-line::before {
     content: counter(code-line);
-    position: sticky;
-    top: auto;
-    left: 0;
+    position: absolute;
+    top: 0;
+    left: 1px;
     display: inline-block;
     width: var(--code-gutter, 2ch);
-    /* Set by `createCodeBlock` from the row count (`--code-gutter: 3ch` for a
-     * 3-digit file); `margin-right` is the text gutter and reserves the space the
-     * number floats over. */
-    margin-right: 12px;
-    padding: 0 8px 0 1px;
+    padding-right: 8px;
     box-sizing: content-box;
-    border-right: 1px solid var(--border);
-    background: var(--bg-deep);
     color: var(--muted);
     text-align: right;
     user-select: none;
-    white-space: pre;
 }
 
 /* A blank source line still needs a line box (styles.css `.code-line:empty::after`
  * supplies the nbsp); without one, a trailing empty row would collapse to zero
  * height and its number would print on top of the next one. */
+
+/* --- the harness details dialog: section divider (src/frontend/main.ts) -----
+ * R3: the Sessions dashboard moved to the BOTTOM of that dialog, under a real
+ * semantic `<hr>` that separates "what this harness is" from "the conversations it
+ * has". The section's own copy/metadata rules live in styles.css; only the divider
+ * is scoped here, in the dialog sheet that owns the panel's vertical rhythm, and it
+ * is one rule so the divider cannot drift into another dialog (`.harness-details`
+ * is that body's own class and appears nowhere else). */
+.dialog-body > .harness-details > .harness-details-divider {
+    margin: 14px 0 10px;
+    border: 0;
+    border-top: 1px solid var(--border);
+}
+
+/* --- the thread-delete confirmation copy (ui/turns.ts `openThreadDeleteConfirmation`) --
+ * R5: a phone/tablet Delete press opens THIS shell rather than a second hand-rolled
+ * overlay, and the body re-uses the class names styles.css already ships for the old
+ * two-step toolbar row, so the warning and its two buttons keep one look. Three of that
+ * rule's declarations are toolbar-only and wrong in a dialog:
+ *   - `flex: 1 0 100%` — the toolbar is a WRAPPING ROW, where a 100% basis is what puts the
+ *     confirmation on its own line. `.dialog-body` is a flex COLUMN, so the same 100% is a
+ *     height basis and `flex-grow` then hands this group the panel's whole height, leaving
+ *     the two actions floating in empty space below the warning.
+ *   - `padding-top` + `border-top` — the toolbar needed a divider to separate the row from
+ *     the actions above it; `.dialog-head` already draws one, so this would be a second
+ *     rule two pixels apart.
+ * Only those three are cancelled: the wrapping row of warning + actions and its 8px gaps
+ * come straight through. Two classes beat the sheet's one (0,2,0 > 0,1,0), so the override
+ * holds regardless of `@import` order, and a DESCENDANT combinator keeps it out of the
+ * `> .thread-delete*` shape styles.css deliberately no longer has. */
+.dialog-body .thread-delete-confirm {
+    flex: 0 1 auto;
+    padding-top: 0;
+    border-top: 0;
+}
 
 /* --- ambiguous basename: the candidate list (ui/file-preview.ts) -----------
  * A bare `descriptors.ts` that exists in three directories is a QUESTION, not a

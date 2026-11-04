@@ -80,6 +80,10 @@
 //   - src/frontend/main.ts             open/refresh/close lifecycle + onApply PATCH
 //   - src/frontend/ui/agent-control.ts the composer button that opens this dialog
 //   - src/frontend/ui/agents.ts        createAgentModelSelect/createAgentPresetDetail
+//   - src/frontend/ui/agent-color.ts   paintAgentColor — R4 paints every roster badge
+//                                      and every `[+]` option with that agent's tone, so
+//                                      a badge, the composer button and the transcript
+//                                      blocks of one agent always share one colour
 //   - src/frontend/ui/activity.ts      paintActivity (the dialog's tabs keep the
 //                                      `.agent-dialog-agent[data-agent]` host it paints)
 //   - src/frontend/ui/dialog.ts        modal stack/focus/scroll lock
@@ -95,6 +99,7 @@ import {
 } from './agents';
 import type { AgentModelSelect } from './agents';
 import { paintActivity as paintAgentActivity } from './activity';
+import { paintAgentColor } from './agent-color';
 import { openDialog } from './dialog';
 import type { DialogHandle } from './dialog';
 
@@ -461,7 +466,11 @@ const createAddPicker = (options: AgentDialogOptions, state: DialogState): HTMLE
         const label = displayTitleOf(agentDetailsOf(options.agents, name));
         const option = el('button', 'agent-dialog-add-option', label);
         option.type = 'button';
-        option.dataset.agent = name;
+        // R4 (T5): a picker option is an agent the roster is about to gain, so it is
+        // painted with the tone that badge will keep — the colour is already the reader's
+        // pointer to "who am I about to add". Same canonical id, same page-lifetime slot,
+        // so the option and the badge it produces cannot disagree.
+        paintAgentColor(option, name);
         option.title = `Add ${label} to the team and configure it.`;
         option.addEventListener('click', () => {
             editDraft(state, name, (draft) => {
@@ -604,10 +613,21 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         tab.setAttribute('aria-controls', 'agent-dialog-config');
         // Roving tabindex: one tab stop for the whole strip, arrows move inside it.
         tab.tabIndex = active ? 0 : -1;
+        // R4 (T5): the badge is painted with its agent's tone, so the roster answers
+        // "which badge is which agent" with the SAME colour the transcript tiles and the
+        // composer button already use. Painting the badge (not the inner name span) is
+        // what makes that possible in one call: `--agent-color` inherits down to
+        // `.agent-dialog-agent-name`, and the rebuild in `paint()` re-reads the same
+        // page-lifetime assignment, so switching tabs or a live refresh never recolours
+        // a badge. The badge's own border stays `--border`/`--accent` because that is the
+        // channel for selection and ACTIVITY — identity colour and state colour must stay
+        // readable as two different facts.
+        //
         // `data-agent`/`data-role` are the same team facts the deck and the old rows
-        // exposed, so a test/inspector reads the roster the same way from any host,
-        // and ui/activity.ts keeps painting these nodes.
-        tab.dataset.agent = member;
+        // exposed, so a test/inspector reads the roster the same way from any host, and
+        // ui/activity.ts keeps painting these nodes (`paintAgentColor` writes the same
+        // canonical id).
+        paintAgentColor(tab, member);
         tab.dataset.role = member === options.primary ? 'primary' : 'secondary';
         if (isDraftedAddition(options, state, member)) tab.dataset.added = 'true';
         tab.setAttribute('aria-label', `Configure ${title} · ${member === options.primary ? 'primary agent' : 'subagent'}`);

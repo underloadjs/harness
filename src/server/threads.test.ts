@@ -29,9 +29,9 @@ import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
-import { HarnessPersistence, readHarnessDatabase } from './persistence';
+import { HARNESS_DATABASE_VERSION, HarnessPersistence, readHarnessDatabase } from './persistence';
 import { SessionError, SessionStore } from './sessions';
-import type { SessionSnapshot, SessionThread } from './protocol';
+import type { SessionSnapshot, SessionThread, SessionView } from './protocol';
 import { listAgentResultBlocks, REFERENCED_RESULTS_FOOTER, REFERENCED_RESULTS_HEADER } from '../shared/agent-results';
 
 const SETTINGS: RunnerSettings = {
@@ -490,6 +490,275 @@ describe('SessionStore persistent threads', () => {
                 .filter((event) => event.type === 'text')
                 .map((event) => (event as { delta: string }).delta)
         ).toEqual(['answer:start', 'answer:more']);
+    });
+
+    it('gives two submits recorded in one millisecond one bar segment each, and its own bytes', async () => {
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = store.create('probe');
+
+        fixture.gate('start');
+        const running = store.enqueue(created.id, 'start');
+        await fixture.started('start').promise;
+
+        // Two guidance submits the AUDIT RECORD cannot tell apart: the store stamps each
+        // one with `Date.now()`, and both texts are 4 characters. Mocking the clock is what
+        // makes that collision reproducible instead of a race.
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        const first = store.enqueue(created.id, 'aaaa', undefined, undefined, 'thread-1');
+        const second = store.enqueue(created.id, 'bbbb', undefined, undefined, 'thread-1');
+        clock.mockRestore();
+
+        expect(first.steered).toBe(true);
+        expect(second.steered).toBe(true);
+        await first.settled;
+        await second.settled;
+
+        fixture.gate('start').resolve();
+        await running.settled;
+        await store.waitForIdle(created.id);
+
+        const turnId = store.get(created.id).turns[0].id;
+        const records = store.get(created.id).turns[0].steers ?? [];
+        const view = store.getView(created.id);
+        const steered = (view.displays[turnId].sections[0].context ?? []).filter((block) => block.name === 'steer');
+
+        // T13: the record now carries the identity the segment keys off. These two submits are
+        // indistinguishable by `(at, length)` — the mock proves it — so ONLY a per-submit id
+        // can keep them apart, and the id must be minted once (never re-derived).
+        expect(records).toHaveLength(2);
+        expect(records[0].id).toEqual(expect.any(String));
+        expect(records[1].id).toEqual(expect.any(String));
+        expect(records[0].id).not.toBe(records[1].id);
+        expect([records[0].at, records[0].prompt.length]).toEqual([records[1].at, records[1].prompt.length]);
+
+        const firstKey = `0-user-i${records[0].id}`;
+        const secondKey = `0-user-i${records[1].id}`;
+
+        // R6: every recorded submit is its own segment, counted exactly once. One merged
+        // segment here would silently drop a submit from the bar and from its totals.
+        expect(steered.map((block) => [block.id, block.chars])).toEqual([
+            [firstKey, 4],
+            [secondKey, 4]
+        ]);
+
+        // R8: and each segment answers with ITS OWN recorded text, not the first match.
+        expect(store.blockDetail(created.id, turnId, firstKey).text).toBe('aaaa');
+        expect(store.blockDetail(created.id, turnId, secondKey).text).toBe('bbbb');
+
+        // The row carries the same identity, so a client can address a submit without
+        // re-deriving anything from a timestamp.
+        expect(view.turns[0].steers?.map((steer) => [steer.id, steer.prompt])).toEqual([
+            [records[0].id, 'aaaa'],
+            [records[1].id, 'bbbb']
+        ]);
+    });
+
+    // T13/T14/T15 regression: 520 indistinguishable submits (one mocked millisecond, all the
+    // same length) overflow the 64-entry AUDIT ring on purpose — and pass far beyond any
+    // smaller archive bound. The ring keeps its bounded semantics, but EVERY submit the server
+    // accepted is archived durably by its own id and never discarded, so the FIRST segment
+    // (trimmed from the ring at submit 65) and the LAST one are both drawn and resolvable
+    // while the run is active, after it completes, and after a restart.
+    it('keeps every submit distinct across the steer audit ring and a restart', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't15-steer-archive-'));
+        const fixture = createFixture();
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([fixture.preset], persistence);
+        const created = store.create('probe');
+
+        fixture.gate('start');
+        const running = store.enqueue(created.id, 'start');
+        await fixture.started('start').promise;
+
+        // 520 prompts, all 5 characters, all recorded in the same mocked millisecond: the
+        // audit record cannot tell any two of them apart on `(at, length)`. Mocking the clock
+        // is what makes that reproducible instead of a race.
+        const SUBMITS = 520;
+        const RING = 64;
+        const prompts = Array.from({ length: SUBMITS }, (_entry, index) => `s${String(index).padStart(4, '0')}`);
+        const trimmed = prompts.slice(0, SUBMITS - RING);
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+        const receipts = prompts.map((prompt) => store.enqueue(created.id, prompt, undefined, undefined, 'thread-1'));
+        clock.mockRestore();
+
+        expect(receipts.every((receipt) => receipt.steered === true)).toBe(true);
+        await Promise.all(receipts.map((receipt) => receipt.settled));
+
+        const turnId = store.get(created.id).turns[0].id;
+        const recordsOf = () => {
+            const turn = store.get(created.id).turns[0];
+
+            return { ring: turn.steers ?? [], archive: turn.steerTexts ?? [] };
+        };
+        const segmentIds = (view: ReturnType<SessionStore['getView']>) =>
+            (view.displays[turnId].sections[0].context ?? []).filter((block) => block.name === 'steer');
+        // A ring-trimmed prompt must never reach the compact wire. Checked as one pass over
+        // the serialised view (520 substrings would otherwise each rescan a large document).
+        const wirePrompts = (view: ReturnType<SessionStore['getView']>, expected: readonly string[]): string[] => {
+            const wire = JSON.stringify(view);
+
+            return expected.filter((prompt) => wire.includes(prompt));
+        };
+
+        // The bounded audit ring kept the LAST 64, in acceptance order (its contract, and the
+        // compact row's), while the durable archive kept ALL 520 with their exact text: an
+        // accepted submit is user data, so nothing is truncated away (T15).
+        const { ring, archive } = recordsOf();
+
+        expect(ring).toHaveLength(RING);
+        expect(ring.map((steer) => steer.prompt)).toEqual(prompts.slice(SUBMITS - RING));
+        expect(archive).toHaveLength(SUBMITS);
+        expect(archive.map((entry) => entry.prompt)).toEqual(prompts);
+        expect(new Set(archive.map((entry) => entry.id)).size).toBe(SUBMITS);
+        // The archive is addressed by the ring's OWN ids: an archived entry and the audit
+        // record it came from are the same submit, one identity.
+        expect(ring.map((steer) => steer.id)).toEqual(archive.slice(SUBMITS - RING).map((entry) => entry.id));
+
+        // The two ends of the list, held by id: the FIRST submit is the oldest one the ring
+        // threw away, the LAST is the newest. Both must survive every phase below.
+        const firstSubmit = archive[0];
+        const lastSubmit = archive[SUBMITS - 1];
+        const firstKey = `0-user-i${firstSubmit.id}`;
+        const lastKey = `0-user-i${lastSubmit.id}`;
+
+        // WHILE THE RUN IS ACTIVE: the bar drew every accepted submit — the 456 the ring has
+        // already dropped included — and each end answers with its own text.
+        const liveView = store.getView(created.id);
+        const liveSegments = segmentIds(liveView);
+
+        expect(liveSegments).toHaveLength(SUBMITS);
+        expect(liveSegments.map((block) => block.id)).toEqual(archive.map((entry) => `0-user-i${entry.id}`));
+
+        const liveEnds = (key: string, prompt: string): void => {
+            const [segment] = liveSegments.filter((block) => block.id === key);
+
+            expect(segment).toEqual({
+                kind: 'user',
+                id: key,
+                turnId,
+                sectionId: `${turnId}:0`,
+                name: 'steer',
+                at: 1_700_000_000_000,
+                chars: 5,
+                inPrompt: true
+            });
+            expect(store.blockDetail(created.id, turnId, key)).toEqual({
+                ...segment,
+                sessionId: created.id,
+                text: prompt
+            });
+        };
+
+        liveEnds(firstKey, prompts[0]);
+        liveEnds(lastKey, prompts[SUBMITS - 1]);
+
+        // A ring-trimmed submit is NOT on the compact wire: the row publishes the bounded audit
+        // ring, and the archived text is only ever answered by the lazy block route. (No
+        // trimmed prompt can hide inside a uuid either — every prompt starts with `s`, which is
+        // not a hex digit.)
+        expect(wirePrompts(liveView, trimmed)).toEqual([]);
+        expect(liveView.turns[0].steers).toHaveLength(RING);
+
+        fixture.gate('start').resolve();
+        await running.settled;
+        await store.waitForIdle(created.id);
+
+        const view = store.getView(created.id);
+        const segments = segmentIds(view);
+
+        // The completed bar is unchanged by the ring: 520 id-keyed segments, one per accepted
+        // submit, each counting its own 5 characters.
+        expect(segments).toHaveLength(SUBMITS);
+        expect(segments.map((block) => block.id)).toEqual(archive.map((entry) => `0-user-i${entry.id}`));
+        expect(segments.every((block) => block.chars === 5 && block.inPrompt === true)).toBe(true);
+        expect(recordsOf().ring).toHaveLength(RING);
+
+        // EVERY visible segment resolves its own recorded text — the R8 rule the ring used to
+        // break at submit 65 and an archive bound would have broken at 521.
+        expect(segments.map((block) => store.blockDetail(created.id, turnId, block.id).text)).toEqual(prompts);
+        expect(store.blockDetail(created.id, turnId, firstKey).text).toBe(prompts[0]);
+        expect(store.blockDetail(created.id, turnId, lastKey).text).toBe(prompts[SUBMITS - 1]);
+        expect(JSON.stringify(view.turns[0])).toContain(prompts[SUBMITS - RING]);
+        expect(wirePrompts(view, trimmed)).toEqual([]);
+
+        // AND THE SAME ANSWERS COME BACK FROM A FRESH STORE OVER THE SAME ROOT: the ids and
+        // the archived bytes are durable, the re-projected bar reproduces the archived
+        // segments (not merely the last 64), and a segment captured before the restart still
+        // resolves after it.
+        const written = persistence.load();
+
+        if (written === undefined) throw new Error('the steer checkpoint did not persist');
+
+        // The whole archive is IN THE DOCUMENT (not only in memory), and it cost no schema
+        // bump — `HARNESS_DATABASE_VERSION` is still 1, so an older server reads this file too.
+        expect(written.version).toBe(HARNESS_DATABASE_VERSION);
+        expect(written.sessions[0].turns[0].steerTexts?.map((entry) => entry.prompt)).toEqual(prompts);
+        expect(written.sessions[0].turns[0].steers?.map((steer) => steer.prompt)).toEqual(
+            prompts.slice(SUBMITS - RING)
+        );
+
+        const reloaded = createStore([fixture.preset], persistence, persistence.load());
+
+        expect(reloaded.get(created.id).turns[0].steers ?? []).toHaveLength(RING);
+        expect(reloaded.get(created.id).turns[0].steerTexts ?? []).toHaveLength(SUBMITS);
+
+        const reloadedView = reloaded.getView(created.id);
+        const reloadedSegments = segmentIds(reloadedView);
+
+        expect(reloadedSegments.map((block) => block.id)).toEqual(segments.map((block) => block.id));
+        expect(reloadedSegments.map((block) => [block.id, block.chars])).toEqual(
+            segments.map((block) => [block.id, block.chars])
+        );
+        expect(reloadedSegments.map((block) => reloaded.blockDetail(created.id, turnId, block.id).text)).toEqual(
+            prompts
+        );
+        expect(reloaded.blockDetail(created.id, turnId, firstKey).text).toBe(prompts[0]);
+        expect(reloaded.blockDetail(created.id, turnId, lastKey).text).toBe(prompts[SUBMITS - 1]);
+
+        // LEGACY COMPATIBILITY: a document written before the archive existed carries only
+        // the bounded audit ring. Rewriting the checkpoint that way (the shape an older
+        // build leaves behind) must still load, still draw a bar whose every segment
+        // resolves, and answer the dropped submits with an honest 404 — never a successful
+        // detail with no text in it.
+        reloaded.dispose();
+
+        // Rewrite the checkpoint the way a build BEFORE the archive wrote it.
+        delete written.sessions[0].turns[0].steerTexts;
+        persistence.save(written);
+
+        const legacy = createStore([fixture.preset], persistence, persistence.load());
+
+        expect(legacy.get(created.id).turns[0].steerTexts).toBeUndefined();
+
+        const legacySegments = segmentIds(legacy.getView(created.id));
+
+        // The legacy bar draws the 64 submits the ring still names, and each one answers.
+        expect(legacySegments.map((block) => block.id)).toEqual(
+            recordsOf().ring.map((steer) => `0-user-i${steer.id}`)
+        );
+        expect(legacySegments.map((block) => legacy.blockDetail(created.id, turnId, block.id).text)).toEqual(
+            prompts.slice(SUBMITS - RING)
+        );
+        // The first submit is not drawn at all, and a client still holding its segment id
+        // gets a 404 instead of an empty panel.
+        expect(legacySegments.some((block) => block.id === firstKey)).toBe(false);
+        expect(() => legacy.blockDetail(created.id, turnId, firstKey)).toThrow(/Unknown context block/);
+        // A turn that carries no steer at all keeps its existing 404 wording.
+        expect(() => legacy.blockDetail(created.id, 'no-such-turn', firstKey)).toThrow(/Unknown turn/);
+
+        // CLEANUP: the archive rides the TURN record, so removing the conversation that owns
+        // the steered run takes the archived bytes with it — no orphaned steer text is left in
+        // the document behind a deleted conversation (reset and session removal work the same
+        // way, because they drop the same turn records).
+        const deleted = store.deleteThread(created.id, threadOf(store.get(created.id), turnId));
+
+        expect(deleted.turns).toHaveLength(0);
+        expect(persistence.load()?.sessions[0].turns.some((turn) => turn.steerTexts !== undefined)).toBe(false);
+
+        store.dispose();
+        legacy.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
     });
 
     it('rejects a blank or unknown thread id and steers/continues only real threads', async () => {
@@ -1765,14 +2034,17 @@ describe('focused steering input', () => {
         expect(steered.steered).toBe(true);
         expect(steered.steeredThreadId).toBe('thread-1');
         expect(steered.turn.id).toBe(running.turn.id);
-        // Audit: the user's prompt and the bound block, no duplicated events.
+        // Audit: the user's prompt, the bound block, and the submit's own durable identity
+        // (T13) — a uuid this server minted once, which the context bar keys its segment from.
         expect(steered.turn.steers).toEqual([
             {
+                id: expect.any(String),
                 at: expect.any(Number),
                 prompt: 'focused',
                 references: [{ turnId: base.turn.id, label: 'PE1' }]
             }
         ]);
+        expect((steered.turn.steers![0].id as string).length).toBeGreaterThan(8);
         await steered.settled;
 
         fixture.gate('start').resolve();
@@ -2131,5 +2403,271 @@ describe('cascaded thread stop', () => {
         expect(statusOf(child.turn.id)).toBe('cancelled');
         // The sibling conversation is untouched.
         expect(statusOf(sibling.turn.id)).toBe('done');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R18/T18: the compiled view carries the PERSISTENT conversation identity of EVERY
+// section, so a delegated conversation is separately referenceable inside a turn
+// ---------------------------------------------------------------------------
+//
+// Before this the delegated rows carried `invocationId` (a per-run id that changes on
+// every resume) and nothing else, so a client could not tell that two rows belong to ONE
+// conversation, could not focus/steer/delete it, and had no per-conversation bar to
+// draw. These tests run the REAL runtime (scripted transport, persistent threads on) and
+// read the SERVER's own compiled view, which is the wire the UI consumes.
+
+describe('delegated conversation identity in the compiled view (R18)', () => {
+    // `lead → helper`: the parent's FIRST request issues one `delegate` call, the helper
+    // answers, and the parent answers once the result lands. Every later request (and
+    // every later turn) answers directly, so the delegation tree is deterministic.
+    const identityPreset = (): HarnessPreset => {
+        let delegated = false;
+
+        return {
+            name: 'lead',
+            title: 'lead',
+            description: 'lead + helper',
+            requiresEndpoint: false,
+            primary: 'lead',
+            subagents: ['helper'],
+            agents: ['lead', 'helper'],
+            tools: [],
+            builtin: true,
+            editable: true,
+            create: (settings, progress) =>
+                harness({
+                    agents: {
+                        lead: agent({
+                            model: settings.model,
+                            instruction: 'lead',
+                            stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                                const prompt = lastUser(request.messages);
+
+                                if (prompt === 'delegate please' && !delegated) {
+                                    delegated = true;
+
+                                    yield {
+                                        type: 'done',
+                                        stopReason: 'tool_calls',
+                                        toolCalls: [
+                                            {
+                                                id: 'delegate-1',
+                                                name: 'delegate',
+                                                arguments: JSON.stringify({ agent: 'helper', input: 'child work' })
+                                            }
+                                        ]
+                                    };
+                                    return;
+                                }
+
+                                yield { type: 'text', delta: `lead answer: ${prompt}` };
+                                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                            }
+                        }),
+                        helper: agent({
+                            model: settings.model,
+                            instruction: 'helper',
+                            stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                                yield { type: 'text', delta: `helper answer: ${lastUser(request.messages)}` };
+                                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                            }
+                        })
+                    },
+                    primary: 'lead',
+                    subagents: ['helper'],
+                    presets: false,
+                    report: { progress }
+                })
+        };
+    };
+
+    // One turn's compiled rows as identity tuples: `[section ordinal, conversation,
+    // conversation label, invocation, parent section ordinal]`. Section ids are
+    // `${turnId}:${ordinal}`, so the ordinal is the part that is stable across turns and
+    // worth asserting; the label is the conversation's own display name (R8/T14).
+    const rowsOf = (view: SessionView, turnId: string) =>
+        view.displays[turnId].sections.map((section) => [
+            section.id.slice(turnId.length + 1),
+            section.threadId,
+            section.threadLabel ?? section.agentLabel,
+            section.invocationId,
+            section.parentSectionId === undefined ? undefined : section.parentSectionId.slice(turnId.length + 1)
+        ]);
+
+    // Which row owns each context-bar segment: the per-conversation bar the UI needs.
+    const barsOf = (view: SessionView, turnId: string) =>
+        view.displays[turnId].sections.map((section) =>
+            (section.context ?? []).map((block) => [section.id.slice(turnId.length + 1), block.kind, block.name])
+        );
+
+    // The identity half of the tuples above (conversation, run, parent), i.e. everything
+    // EXCEPT the display label. The label is a separate store-owned allocation (R8/T14), so
+    // each path pins its own exact value AND the label-inclusive rows compare live vs cold
+    // (T20); this narrower projection is what lets a test state parity on identity without
+    // re-listing every name.
+    const identityOnly = (rows: (string | undefined)[][]) =>
+        rows.map(([ordinal, threadId, , invocationId, parent]) => [ordinal, threadId, invocationId, parent]);
+
+    it('gives a delegated conversation its own address in the view, live and after a restart', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't18-view-'));
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([identityPreset()], persistence);
+        const created = store.create('lead');
+
+        const task = store.enqueue(created.id, 'delegate please');
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        const live = store.getView(created.id);
+
+        // R18: the delegated row names the CONVERSATION ('thread-2'), not merely the run,
+        // and stays indented under the row that spawned it (`parentSectionId`). T20: it is
+        // born with its conversation's DISPLAY NAME ('HR1') on the live frame too — the
+        // label join the fold reads is live, exactly like the id join, so a watcher sees the
+        // same name the durable record will carry (see the parity assertions below).
+        expect(rowsOf(live, task.turn.id)).toEqual([
+            ['0', 'thread-1', 'LD1', '1', undefined],
+            ['1', 'thread-2', 'HR1', '2', '0']
+        ]);
+
+        // R18/R9: one bar per conversation, and no segment crosses a row boundary. The
+        // parent owns its submit, the delegation call and its own answer; the child owns
+        // its system instructions and its answer. That is the server data a per-thread bar
+        // needs — the client never has to guess which bytes belong to which conversation.
+        expect(barsOf(live, task.turn.id)).toEqual([
+            [
+                ['0', 'system', 'instructions'],
+                ['0', 'user', 'prompt'],
+                ['0', 'tool', 'delegate'],
+                ['0', 'assistant', 'answer']
+            ],
+            [
+                ['1', 'system', 'instructions'],
+                ['1', 'assistant', 'answer']
+            ]
+        ]);
+
+        // A restart folds the persisted document cold, from the persisted invocation→
+        // conversation map, and reaches the SAME identity tree (live ≡ replay, R18).
+        const reloaded = createStore([identityPreset()], persistence, persistence.load());
+        const restored = reloaded.getView(created.id);
+
+        expect(rowsOf(restored, task.turn.id)).toEqual([
+            ['0', 'thread-1', 'LD1', '1', undefined],
+            ['1', 'thread-2', 'HR1', '2', '0']
+        ]);
+        expect(identityOnly(rowsOf(live, task.turn.id))).toEqual(identityOnly(rowsOf(restored, task.turn.id)));
+        expect(barsOf(restored, task.turn.id)).toEqual(barsOf(live, task.turn.id));
+
+        // T20 (closes the one live/cold difference T18 left open): the delegated row's OWN
+        // display name is identical on the live frame and after a restart. The store
+        // allocates it through its single canonical conversation allocator in the same step
+        // it records the invocation → conversation join
+        // (`noteInvocationThread` → `ensureThreadLabel`), and `displayContext` hands the fold
+        // a LIVE resolving label map, so the section is born labelled and the persisted
+        // document replays the exact same value. This is what makes a `#HR1` reference typed
+        // while the run is still live mean the same conversation after a restart (R18).
+        expect(rowsOf(live, task.turn.id)[1]).toEqual(rowsOf(restored, task.turn.id)[1]);
+
+        // And it is the name the ROSTER publishes for that conversation, i.e. the name the
+        // composer's `#` popup offers — one label sequence, one authority (R8/T14).
+        expect(store.get(created.id).threads!.map((thread) => [thread.id, thread.label])).toEqual([
+            ['thread-1', 'LD1'],
+            ['thread-2', 'HR1']
+        ]);
+
+        store.dispose();
+        reloaded.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it('keeps one conversation identity across a delegated run, its focused continuation, and the next main submit', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't18-view-'));
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([identityPreset()], persistence);
+        const created = store.create('lead');
+
+        // [Main]: the parent conversation delegates → its child conversation.
+        const first = store.enqueue(created.id, 'delegate please');
+        await first.settled;
+
+        // A focused submit INTO the delegated conversation: same conversation, new run.
+        const second = store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
+        await second.settled;
+
+        // A second submit on the MAIN conversation: the SAME main conversation, therefore
+        // the same id and label, and a run id of its own ([Main] again, later).
+        const third = store.enqueue(created.id, 'main again', undefined, undefined, 'thread-1');
+        await third.settled;
+        await store.waitForIdle(created.id);
+
+        const view = store.getView(created.id);
+
+        expect(rowsOf(view, first.turn.id)).toEqual([
+            ['0', 'thread-1', 'LD1', '1', undefined],
+            ['1', 'thread-2', 'HR1', '2', '0']
+        ]);
+        // THREAD REUSE: the continuation's root row addresses the SAME conversation
+        // ('thread-2'), while `invocationId` advances — a run id is never a name.
+        expect(rowsOf(view, second.turn.id)).toEqual([['0', 'thread-2', 'HR1', '3', undefined]]);
+        expect(rowsOf(view, third.turn.id)).toEqual([['0', 'thread-1', 'LD1', '4', undefined]]);
+
+        // The conversation labels the composer types (`#HR1`) survive every turn in order,
+        // and the historical invocation roster covers each conversation's runs.
+        expect(
+            store
+                .get(created.id)
+                .threads!.map((thread) => [thread.id, thread.label, thread.invocationIds])
+        ).toEqual([
+            ['thread-1', 'LD1', ['1', '4']],
+            ['thread-2', 'HR1', ['2', '3']]
+        ]);
+
+        // Restart: the compiled identity of all three turns is reproduced from disk, row
+        // for row (R18 live ≡ replay; the first turn's live label gap is pinned above).
+        const reloaded = createStore([identityPreset()], persistence, persistence.load());
+        const restored = reloaded.getView(created.id);
+
+        // Restart: the compiled identity of all three turns is reproduced from disk, row
+        // for row, LABELS INCLUDED (R18 live ≡ replay; T20 closed the delegated label, so
+        // the first turn compares as a WHOLE row now, not only as its id half).
+        expect(rowsOf(restored, first.turn.id)).toEqual(rowsOf(view, first.turn.id));
+        expect(rowsOf(restored, second.turn.id)).toEqual(rowsOf(view, second.turn.id));
+        expect(rowsOf(restored, third.turn.id)).toEqual(rowsOf(view, third.turn.id));
+        expect(rowsOf(restored, first.turn.id)[1][2]).toBe('HR1');
+
+        store.dispose();
+        reloaded.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it('never invents a conversation for a legacy run the roster does not name', async () => {
+        // The legacy `/messages` path runs one fresh block with NO persistent conversation
+        // record, so no invocation is ever mapped and the join is empty.
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't18-legacy-'));
+        const store = createStore([identityPreset()], new HarnessPersistence(root));
+        const created = store.create('lead');
+
+        await store.run(created.id, 'legacy please', () => undefined);
+        await store.waitForIdle(created.id);
+
+        const snapshot = store.get(created.id);
+        const turnId = snapshot.turns[0].id;
+
+        expect(snapshot.turns[0].threadId).toBeUndefined();
+
+        // Nothing is minted: `threadId` is only ever ADOPTED from the store's join, so a
+        // record that names no conversation keeps naming none (R18e, and the byte-compat
+        // half of R20).
+        expect(
+            store.getView(created.id).displays[turnId].sections.map((section) => [
+                section.id.slice(turnId.length + 1),
+                Object.prototype.hasOwnProperty.call(section, 'threadId')
+            ])
+        ).toEqual([['0', false]]);
+
+        store.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
     });
 });

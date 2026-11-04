@@ -1,11 +1,13 @@
-// Invocation thread entries (R1–R5).
+// Invocation thread entries (R1–R5, flattened by R18/T19).
 //
 // A delegated agent is its own entry, not another flat section inside the turn:
-//   - the row lives in the spawning invocation's children host, INSIDE the turn
-//     row but OUTSIDE every `.tile-body`/`.thread-body`, so collapsing either
-//     parent never hides its descendants;
-//   - entries are per INVOCATION (two same-agent delegates are two rows) and are
-//     nested by `thread.parentId`, giving depth-first sibling order for free;
+//   - the row is a FLAT sibling in the turn's single `.thread-children` host — INSIDE the
+//     turn row but OUTSIDE every `.tile-body`/`.thread-body` and outside every other
+//     entry's `.thread-row`, so collapsing any parent never hides its descendants and no
+//     delegated card renders inside the block that delegated to it;
+//   - entries are per INVOCATION (two same-agent delegates are two rows); the hierarchy the
+//     nesting used to express is the row's own `data-depth`/`data-parent-thread`, and the
+//     ordering pass emits the same depth-first sequence the nested DOM gave for free;
 //   - status/outcome come from the child's own events and from the parent's
 //     `tool_result` for the spawning `callId` (the authoritative completion);
 //   - saved sessions predating the metadata still render rows inferred from
@@ -16,6 +18,7 @@
 
 import type { HarnessAssistantMessage, HarnessEvent, SessionTurn } from '../../server/protocol';
 import { findLatestAgentResultBlock, listAgentResultBlocks } from '../../shared/agent-results';
+import { UNKNOWN_AGENT_COLOR, agentColorOf } from './agent-color';
 import { createTurnBoard } from './turns';
 import type { TurnHandle } from './turns';
 
@@ -101,6 +104,27 @@ const mount = () => {
     document.body.replaceChildren(board.element);
     return board;
 };
+
+// T5/R4: an agent's tone is DRAWN BY THE UI for the current page (randomly, once), so a
+// transcript test can no longer hardcode "writer is violet". What these tests own is that
+// every block is painted with the tone the SHARED mapping reports for THAT block's agent;
+// the assignment itself is pinned in ui/agent-color.test.ts and the cross-surface parity
+// in ui/agent-color-surfaces.test.ts. Both properties are compared as one pair so a
+// component painting only one of them still fails.
+const toneOf = (agent: string): [string, string] => {
+    const tone = agentColorOf(agent);
+    return [tone.color, tone.line];
+};
+
+const paintedTone = (node: Element): [string, string] => {
+    const element = node as HTMLElement;
+    return [element.style.getPropertyValue('--agent-color'), element.style.getPropertyValue('--agent-line')];
+};
+
+// The one tone that is NOT drawn: an unattributable block is neutral on every surface,
+// and its exact values are pinned in ui/agent-color.test.ts (and mirrored as the `:root`
+// defaults in styles.css, asserted in ui/turn-tile-style.test.ts).
+const NEUTRAL_TONE: [string, string] = [UNKNOWN_AGENT_COLOR.color, UNKNOWN_AGENT_COLOR.line];
 
 describe('invocation thread entries', () => {
     it('shows a queued delegate entry outside the parent body and expands it independently', () => {
@@ -283,10 +307,24 @@ describe('invocation thread entries', () => {
         turn.flush();
 
         const host = turn.element.nextElementSibling as HTMLElement;
-        // Root host: only direct children (t1, t5). The grandchild lives inside t1.
-        expect([...host.children].map((child) => (child as HTMLElement).dataset.threadId)).toEqual(['t1', 't5']);
+        // R18 (T19): FLAT. Every invocation row of this turn is a DIRECT child of the turn's
+        // one `.thread-children` host, ordered depth-first, so the reading order is still the
+        // recorded hierarchy — t1's whole subtree comes before its later sibling t5 — while no
+        // card sits inside another card.
+        expect([...host.children].map((child) => (child as HTMLElement).dataset.threadId)).toEqual([
+            't1',
+            't3',
+            't5'
+        ]);
         expect(threadRows(turn).map((row) => row.dataset.threadId)).toEqual(['t1', 't3', 't5']);
         expect(threadRows(turn).map((row) => row.dataset.depth)).toEqual(['1', '2', '1']);
+        // The hierarchy the nesting used to carry is now the row's own identity: a grandchild
+        // names its parent, and a top-level card names none.
+        expect(threadRows(turn).map((row) => row.dataset.parentThread)).toEqual([
+            undefined,
+            't1',
+            undefined
+        ]);
         // R2: the code is per INVOCATION and ordered by spawn, at any depth:
         // helper → HR1, deeper → DR1, the second helper → HR2.
         expect(threadRows(turn).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
@@ -296,13 +334,25 @@ describe('invocation thread entries', () => {
         ]);
 
         const t1 = host.children[0] as HTMLElement;
-        const nestedHost = t1.lastElementChild as HTMLElement;
-        expect(nestedHost.className).toBe('thread-children');
-        const t3 = nestedHost.firstElementChild as HTMLElement;
+        const t3 = host.children[1] as HTMLElement;
+        // The grandchild is its own INDEPENDENT card: outside its parent's tile, outside its
+        // parent's row, and never inside any `.thread-body`/`.thread-flow`.
         expect(t3.dataset.threadId).toBe('t3');
-        // Descendants are outside t1's body, so collapsing t1 keeps them visible.
+        expect(t1.contains(t3)).toBe(false);
+        expect(t1.querySelector('.thread-tile')?.contains(t3)).toBe(false);
+        // Its own card is its only tile: the row never sits inside another block's surface.
+        expect(t3.closest('.thread-tile')).toBeNull();
+        // No OTHER `.thread-row` encloses it (`closest` starts at the element itself, so the
+        // guard has to exclude its own row).
+        expect(t3.closest('.thread-row:not([data-thread-id="t3"])')).toBeNull();
+        expect(t3.closest('.thread-body')).toBeNull();
+        // Descendants are still outside t1's body, so collapsing t1 keeps them visible.
         expect(t1.querySelector('.thread-body')?.contains(t3)).toBe(false);
         expect(t1.querySelector('.thread-flow')?.contains(t3)).toBe(false);
+        // A row's own structure is exactly one card — the per-entry children host is gone.
+        expect([...t1.children].map((child) => (child as HTMLElement).className)).toEqual([
+            'thread-tile'
+        ]);
 
         // Per-invocation content and tools: t1 owns its own delegate card, the root
         // tile owns the two root-level calls.
@@ -906,28 +956,19 @@ describe('invocation thread entries', () => {
         turn.apply(withThread({ type: 'start', agent: '', model: 'u1' }, { id: 't3', input: 'anon' }));
         turn.flush();
 
-        // Main block: the primary agent's tone (`writer` is a hashed, non-profile id
-        // → violet, slot 2).
+        // Main block: the primary agent's own tone. R4 draws the tone per page, so the
+        // expectation reads back the same mapping the tile was painted from — the failure
+        // this pins is a tile painted from an identity other than its own label's.
         expect(turn.element.dataset.agent).toBe('writer');
-        expect(turn.element.style.getPropertyValue('--agent-color')).toBe('#a78bfa');
-        expect(turn.element.style.getPropertyValue('--agent-line')).toBe('rgba(167, 139, 250, 0.6)');
+        expect(paintedTone(turn.element)).toEqual(toneOf('writer'));
 
-        // Nested blocks: each tile is painted; the same agent is the same tone, twice.
-        // `helper` hashes to teal (slot 5).
+        // Nested blocks: every tile is painted, and TWO invocations of one agent keep the
+        // SAME tone (the no-flicker rule R4 depends on). An unnamed invocation keeps the
+        // neutral fallback, and `data-agent` stays absent (cleared) rather than becoming an
+        // empty identity.
         const tiles = [...turn.element.nextElementSibling!.querySelectorAll<HTMLElement>('.thread-tile')];
         expect(tiles.map((tile) => tile.dataset.agent)).toEqual(['helper', 'helper', undefined]);
-        expect(tiles.map((tile) => tile.style.getPropertyValue('--agent-line'))).toEqual([
-            'rgba(45, 212, 191, 0.6)',
-            'rgba(45, 212, 191, 0.6)',
-            // Unknown/unnamed agent keeps the neutral fallback, and `data-agent` is
-            // absent (cleared) rather than an empty identity.
-            'rgba(139, 148, 167, 0.55)'
-        ]);
-        expect(tiles.map((tile) => tile.style.getPropertyValue('--agent-color'))).toEqual([
-            '#2dd4bf',
-            '#2dd4bf',
-            '#8b94a7'
-        ]);
+        expect(tiles.map(paintedTone)).toEqual([toneOf('helper'), toneOf('helper'), NEUTRAL_TONE]);
         expect(tiles[2].hasAttribute('data-agent')).toBe(false);
         // The ROW uses the same neutral semantics (no `data-agent=""` raw value).
         expect(tiles[2].parentElement?.hasAttribute('data-agent')).toBe(false);
@@ -987,10 +1028,9 @@ describe('invocation thread entries', () => {
         expect(flat.map((node) => node.getAttribute('data-role'))).toEqual(['primary', 'subagent']);
         expect(flat[0].matches(".tile-flow > .agent[data-role='subagent']")).toBe(false);
         expect(flat[1].matches(".tile-flow > .agent[data-role='subagent']")).toBe(true);
-        // It keeps the agent's own colour, which the outline reads.
-        expect((flat[1] as HTMLElement).style.getPropertyValue('--agent-line')).toBe(
-            'rgba(45, 212, 191, 0.6)'
-        );
+        // R4: it keeps its own agent's colour (name + outline together), which the outline
+        // rule reads — the tone itself is drawn per page, see `toneOf` above.
+        expect(paintedTone(flat[1] as HTMLElement)).toEqual(toneOf('helper'));
     });
 
     // R4/R1: a collapsed entry is ONE row with the same anatomy as a compact turn

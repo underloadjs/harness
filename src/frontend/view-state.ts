@@ -29,6 +29,8 @@
 //   - ui/activity.ts               — `applyActivity` (raw path, kept for compatibility)
 
 import type {
+    ContextBlock,
+    ContextBlockPatch,
     DisplayBlockSummary,
     DisplayNode,
     DisplayPanelSummary,
@@ -314,15 +316,30 @@ const findSection = (display: TurnDisplay | undefined, sectionId: string): TurnS
     sectionsOf(display).find((candidate) => candidate.id === sectionId);
 
 // Insert a fresh node, honoring an explicit `index` (out-of-order recovery only).
+// The document OWNS its own copy of an inserted node.
+//
+// Two consumers read one ops frame: this reducer mutates the cached display, and the tile
+// renderer replays the SAME array (`view-api.ts` -> `applyOpsToDisplay` then
+// `TurnBoard.applyViewOps`, with the identical `ops`). Storing the caller's node object means a
+// later op in that array rewrites an earlier one: `node:append` does `node.text += delta` on the
+// node the `node:insert` op carries, so by the time the tile reaches the insert its `text` is
+// already advanced, and the insert paint plus the append paint print the delta twice. That is
+// the shape an R23 tail frame always has — a streamed answer arrives as
+// `node:insert {text:''}` + `node:append {delta}` — so the alias is not hypothetical.
+//
+// A shallow copy is the whole fix. Every field a later op writes on a stored node is a scalar
+// (`text`, `chars`, `committed`, `redacted`, `unredacted`, `share`), and a step's or action's
+// payload is REPLACED whole by `step:set` rather than mutated in place.
 const insertNode = (section: TurnSection, node: DisplayNode, index: number | undefined): void => {
     const nodes = nodesOf(section);
+    const owned = { ...node };
 
     if (index === undefined || index < 0 || index >= nodes.length) {
-        nodes.push(node);
+        nodes.push(owned);
         return;
     }
 
-    nodes.splice(index, 0, node);
+    nodes.splice(index, 0, owned);
 };
 
 // Detach a node by id. An emptied `.tool-group` equivalent (nothing to do here —
@@ -336,6 +353,15 @@ const removeNode = (section: TurnSection, nodeId: string): boolean => {
     return true;
 };
 
+// The section's own share of the turn's ONE context bar. `context:add` on a section whose
+// `context` is ABSENT (a pre-T9 tree the projector started appending to) defines the array:
+// from that frame on the server IS authoritative for this bar.
+const ensureContext = (section: TurnSection): ContextBlock[] => {
+    if (!Array.isArray(section.context)) section.context = [];
+
+    return section.context;
+};
+
 // Apply ONE op to one turn's display tree, in place. Returns true when the op found
 // its target (a false return means the frame named a turn/section this client does
 // not hold, i.e. the terminal `view` frame must reconcile it).
@@ -343,7 +369,10 @@ const removeNode = (section: TurnSection, nodeId: string): boolean => {
 // Rules come straight from turn-display.ts:521 and are NOT re-derived here:
 //   - `step:set` REPLACES the step object (no field merge);
 //   - `section:set` patches only the fields it names;
-//   - text content moves only through `node:append`;
+//   - `section:remove` detaches a section the server discards (a never-adopted
+//     delegation placeholder, turn-projector.ts:503);
+//   - text content moves only through `node:append`, except a notice's line, which
+//     `node:set {text}` rewrites in place (turn-display.ts:380);
 //   - `attempt:discard` names the exact nodes to drop;
 //   - `attempt:commit` closes the window, so every uncommitted prose/reasoning node
 //     of that section becomes committed (the flag is display-only — the server sends
@@ -412,6 +441,17 @@ export const applyOpToDisplay = (
             if (node === undefined || (node.kind !== 'text' && node.kind !== 'reasoning')) return false;
 
             node.text += op.delta;
+
+            // T13 (contract decision): the exact length must converge on BOTH paths, so
+            // an UNREDACTED prose node keeps `chars` equal to the bytes the server sent.
+            // This is not a measurement of a bounded preview: `DisplayTextNode.chars` /
+            // `DisplayReasoningNode.chars` (../shared/turn-display.ts:659, 684) state that
+            // an un-redacted node's `text` IS its complete recorded text, so the delta
+            // stream is the authoritative source for the figure. The moment a `node:set`
+            // patch marks the node `redacted`, that equality ends and only the SERVER's
+            // `chars` figure is kept (see `node:set` below).
+            if (node.redacted !== true) node.chars = node.text.length;
+
             return true;
         }
 
@@ -421,6 +461,53 @@ export const applyOpToDisplay = (
 
             if (op.patch.committed !== undefined && node.kind === 'text') node.committed = op.patch.committed;
             if (op.patch.share !== undefined && node.kind === 'reasoning') node.share = op.patch.share;
+            // T13 (contract decision): `text` is an ADDRESSED, SERVER-STATED replacement for
+            // the node it names, and it applies to every text-carrying kind — not only the
+            // T4 notice line. The projector sends it three ways: a per-section status line
+            // rewritten in place (turn-display.ts:712-725), a think window's bounded preview
+            // at the moment the wire stops carrying its bytes (../server/turn-projector.ts
+            // `case 'reasoning'`), and a superseded answer's preview at redaction
+            // (`redactSuperseded`). The cold `display()` carries the SAME value, so applying
+            // it here is what makes a live tree equal a reloaded one; skipping it left the
+            // live think chip EMPTY and kept a superseded answer expanded. This is still no
+            // client-side compilation: the server named the node, the field and the bytes.
+            if (
+                op.patch.text !== undefined &&
+                (node.kind === 'notice' || node.kind === 'text' || node.kind === 'reasoning')
+            )
+                node.text = op.patch.text;
+
+            // T9 additions, applied verbatim (turn-display.ts:692-698). `chars` keeps
+            // arriving while a bounded node's TEXT has stopped moving (the wire caps it at
+            // `DISPLAY_NODE_PREVIEW_CHARS`), so the think chip's figure stays exact after
+            // the stream stopped carrying bytes. `redacted` arrives in the SAME patch that
+            // swaps a superseded answer for its preview, which is how redaction is STATED
+            // rather than inferred from a length comparison.
+            //
+            // T23 (R23) adds the mirror image: `unredacted` states that the node the
+            // projector just re-designated as its section's tail carries its WHOLE text
+            // again (a discarded attempt removed the block that superseded it). Dropping
+            // the marker here is what keeps a live tree byte-equal to the cold document,
+            // which carries the same node with no marker at all.
+            if (node.kind === 'text' || node.kind === 'reasoning') {
+                if (op.patch.chars !== undefined) node.chars = op.patch.chars;
+                if (op.patch.redacted === true) node.redacted = true;
+                if (op.patch.unredacted === true) delete node.redacted;
+            }
+
+            return true;
+        }
+
+        case 'section:remove': {
+            // Exactly the mirror of `section:open` (turn-display.ts:530): a delegation
+            // placeholder row that never ran is dropped by id. The pending snapshot the
+            // `pending:set` ops parked beside the document goes with it, because it is
+            // addressed by turn + section and would otherwise be unreachable.
+            const index = sectionsOf(display).findIndex((section) => section.id === op.sectionId);
+            if (index < 0) return false;
+
+            display.sections.splice(index, 1);
+            pending.delete(pendingKeyOf(turnId, op.sectionId));
 
             return true;
         }
@@ -494,6 +581,112 @@ export const applyOpToDisplay = (
             return true;
         }
 
+        // --- context bar (T9 wire, T11 renderer) --------------------------
+        //
+        // A context block is addressed by `blockId` inside one section, exactly like a
+        // node inside a section. Same three rules as the node ops, no new machinery:
+        //   - `context:add` is IDEMPOTENT by id (a reconnect replaying a frame must not
+        //     mint a second segment and double the bar's characters);
+        //   - `context:set` patches ONLY the fields it names, and every count is a full
+        //     replacement, never a delta (turn-display.ts:478);
+        //   - identity (`id`/`kind`/`turnId`/`sectionId`/`eventFrom`) never changes in
+        //     place, so there is nothing to reconcile here when they differ.
+        case 'context:add': {
+            const section = findSection(display, op.sectionId);
+            if (section === undefined) return false;
+
+            const blocks = ensureContext(section);
+            const index = blocks.findIndex((block) => block.id === op.block.id);
+
+            if (index >= 0) {
+                // A re-delivered add replaces the segment in place rather than appending
+                // a duplicate: the id is the identity (see `node:insert` above).
+                blocks[index] = op.block;
+
+                return true;
+            }
+
+            if (op.index === undefined || op.index < 0 || op.index > blocks.length) blocks.push(op.block);
+            else blocks.splice(op.index, 0, op.block);
+
+            return true;
+        }
+
+        case 'context:set': {
+            const section = findSection(display, op.sectionId);
+            if (section === undefined) return false;
+
+            const block = ensureContext(section).find((candidate) => candidate.id === op.blockId);
+            if (block === undefined) return false;
+
+            const patch = op.patch;
+            if (patch.name !== undefined) block.name = patch.name;
+            if (patch.state !== undefined) block.state = patch.state;
+            if (patch.chars !== undefined) block.chars = patch.chars;
+            if (patch.argsChars !== undefined) block.argsChars = patch.argsChars;
+            if (patch.resultChars !== undefined) block.resultChars = patch.resultChars;
+            if (patch.inPrompt !== undefined) block.inPrompt = patch.inPrompt;
+            if (patch.at !== undefined) block.at = patch.at;
+            if (patch.endedAt !== undefined) block.endedAt = patch.endedAt;
+            if (patch.eventTo !== undefined) block.eventTo = patch.eventTo;
+
+            // `durationMs` is the measured span the projector stamps beside `at`/`endedAt`.
+            // Read structurally so this reducer is correct before AND after the shared
+            // type carries the field, and never re-derives a span the server did not send.
+            const measured = (patch as ContextBlockPatch & { durationMs?: number }).durationMs;
+            if (measured !== undefined) (block as ContextBlock & { durationMs?: number }).durationMs = measured;
+
+            return true;
+        }
+
+        case 'context:remove': {
+            const section = findSection(display, op.sectionId);
+            if (section === undefined) return false;
+
+            // ABSENT context means this client never received a bar for the section, which
+            // is not the same as an empty one: the frame names a block that cannot be
+            // there, so the honest answer is "not found" and the terminal `view` frame
+            // reconciles.
+            const blocks = Array.isArray(section.context) ? section.context : undefined;
+            if (blocks === undefined) return false;
+
+            const index = blocks.findIndex((block) => block.id === op.blockId);
+            if (index < 0) return false;
+
+            blocks.splice(index, 1);
+
+            return true;
+        }
+
+        // --- the ONE current tail block (T23 wire, R23) -------------------
+        //
+        // The descriptor is a whole replacement, never a merge (turn-display.ts:1096): the
+        // pointer, the exact figure and the tool payload move together, so a section can
+        // never hold the designation of one block and the payload of another. `tail:clear`
+        // is the server stating "this section displays no block" — deliberately different
+        // from a document in which the field is absent, which means a producer that said
+        // nothing at all (the same absent-vs-empty rule `section.context` follows).
+        case 'tail:set': {
+            const section = findSection(display, op.sectionId);
+            if (section === undefined) return false;
+
+            section.tail = op.tail;
+
+            return true;
+        }
+
+        case 'tail:clear': {
+            const section = findSection(display, op.sectionId);
+            if (section === undefined) return false;
+
+            // Clearing a designation this client never received is still the server's
+            // answer for the section (it has nothing to display), so the state is applied
+            // and reported — unlike a `context:remove` for a segment that cannot exist.
+            if (section.tail !== undefined) delete section.tail;
+
+            return true;
+        }
+
         // Unreachable while the union stays exhaustive; a server that gains an op
         // kind must not make this renderer claim it applied something.
         default:
@@ -517,9 +710,19 @@ export const applyOpsToDisplay = (
 
 // Upsert one summary into the view's row list: replace in place by id (order is the
 // server's recorded order, never re-sorted locally), append when new.
+//
+// MONOTONIC per id (the same N2 rule `applyView` implements for `instance.records`,
+// main.ts:6789): a row stamped strictly BEFORE the row this document already holds is
+// a late answer — the 202 body of a submit captured before the observer delivered a
+// newer revision — and it is authoritative for NOTHING. Applying it would regress the
+// tile (a `queued` row painted over a `streaming` one), so it is dropped. An EQUAL
+// stamp still applies: the server bumps `updatedAt` on every state change, so equal is
+// the same moment, not an older one.
 export const upsertSummary = (view: SessionView | SessionViewSummary, summary: TurnSummary): void => {
     const rows = summariesOf(view as SessionView);
     const index = rows.findIndex((row) => row.id === summary.id);
+
+    if (index >= 0 && isNewerSummary(rows[index] as TurnSummary, summary)) return;
 
     if (index < 0) rows.push(summary);
     else rows[index] = summary;
@@ -535,6 +738,24 @@ export const upsertSummary = (view: SessionView | SessionViewSummary, summary: T
     }
 };
 
+// True when `known` was stamped strictly after `incoming`, i.e. `incoming` is a late
+// revision of the same turn. A row without a usable stamp on either side is applied
+// (never blocked), because the server always stamps and an absent figure means this
+// client cannot compare, not that the row is old.
+export const isNewerSummary = (known: TurnSummary | undefined, incoming: TurnSummary): boolean => {
+    if (known === undefined) return false;
+
+    const knownAt = known.updatedAt;
+
+    return (
+        typeof knownAt === 'number' &&
+        Number.isFinite(knownAt) &&
+        typeof incoming.updatedAt === 'number' &&
+        Number.isFinite(incoming.updatedAt) &&
+        knownAt > incoming.updatedAt
+    );
+};
+
 // Apply one `turn` upsert op to the view document (the row half; the tree half is a
 // no-op, see `applyOpToDisplay`).
 export const applyOpToView = (view: SessionView, op: TurnDisplayOp, pending: PendingSections): void => {
@@ -547,6 +768,156 @@ export const applyOpToView = (view: SessionView, op: TurnDisplayOp, pending: Pen
         if (op.latestInput !== undefined) summary.latestInput = op.latestInput;
         if (op.cachedInput !== undefined) summary.cachedInput = op.cachedInput;
     } else applyOpsToDisplay(view, op.turnId, [op], pending);
+};
+
+// ---------------------------------------------------------------------------
+// Live activity from an ops frame (the display-wire replacement for
+// `ui/activity.ts`'s event reducer)
+// ---------------------------------------------------------------------------
+
+// Which agents are working BETWEEN row upserts.
+//
+// `activeAgentsOf` answers that from the DOCUMENT (a hydration, a poll, a drain frame). A
+// live connection only receives ops, and the projector's ops carry exactly the same
+// transitions the raw reducer reads off events:
+//   - `section:open` / a `section:set` to `open|streaming`  ← a `start` (ui/activity.ts:60);
+//   - a `section:set` to `done|error|cancelled`             ← a child's `done`/`error` (l:78-118);
+//   - an `error`-tone notice node                            ← the root's `error` event, which
+//     closes THAT agent without closing the turn (the root section's state belongs to the
+//     turn, turn-projector.ts:1330);
+//   - a `retry`/`wake` notice                                ← `retry`/`wakeup` (l:73, l:53);
+//   - `node:insert`/`node:append`/`step:set`/`pending:set`/`usage`/`attempt:commit`
+//                                                            ← text, reasoning, tool frames,
+//      a usage report and a committed request (l:61-75).
+//
+// Nothing here re-derives a meaning from content: every rule is triggered by an ADDRESSED
+// mutation the server already decided. The set is the caller's live set (mutated in
+// place, one per instance) and the caller replaces it wholesale on a whole-document
+// frame, because the document is then authoritative.
+//
+// Additions are gated on the turn still RUNNING (the same status guard
+// `activityOfTurns` applies): a settled turn must never animate old work. Removals are
+// unconditional — a `done` for one agent of a turn this client stopped tracking still
+// has to take its ring off.
+const TERMINAL_SECTION_STATES: readonly string[] = ['done', 'error', 'cancelled'];
+
+export const applyOpsToActivity = (
+    active: Set<string>,
+    view: SessionView | undefined,
+    turnId: string,
+    ops: readonly TurnDisplayOp[]
+): void => {
+    if (view === undefined) return;
+
+    const display = displayOf(view, turnId);
+    const row = summariesOf(view).find((summary) => summary.id === turnId);
+
+    // `running` tracks THIS frame's knowledge: the pre-state row, advanced by any `turn`
+    // op the frame carries, so a frame that settles the turn removes the rings it names
+    // instead of adding them back from its own section ops.
+    let running = row !== undefined && row.status === 'running';
+
+    // The agent a section id names, from the tree as it stands BEFORE the frame (which is
+    // what the caller passes): the only case that needs it after the mutation is
+    // `section:remove`, where the tree no longer holds the section.
+    const agentOf = (sectionId: string): string | undefined =>
+        sectionsOf(display).find((section) => section.id === sectionId)?.agent;
+
+    for (const op of ops) {
+        switch (op.op) {
+            case 'turn': {
+                if (op.summary.status === 'running') {
+                    running = true;
+                    for (const name of op.summary.activeAgents) {
+                        if (typeof name === 'string' && name.length > 0) active.add(name);
+                    }
+                    break;
+                }
+
+                // The turn ended: every agent it was holding is idle, and a row that
+                // settled reports `activeAgents: []` (turn-projector.ts:1717), so the
+                // removal below is the server's own figure, not an inference.
+                for (const name of row?.activeAgents ?? []) active.delete(name);
+                for (const section of sectionsOf(display)) active.delete(section.agent);
+                running = false;
+                break;
+            }
+
+            case 'section:open': {
+                if (TERMINAL_SECTION_STATES.includes(op.section.state)) {
+                    active.delete(op.section.agent);
+                    break;
+                }
+                if (running) active.add(op.section.agent);
+                break;
+            }
+
+            case 'section:set': {
+                const agent = agentOf(op.sectionId);
+                if (agent === undefined) break;
+
+                if (op.patch.state === undefined) break;
+                if (TERMINAL_SECTION_STATES.includes(op.patch.state)) active.delete(agent);
+                else if (running) active.add(agent);
+                break;
+            }
+
+            case 'section:remove': {
+                const agent = agentOf(op.sectionId);
+                if (agent !== undefined) active.delete(agent);
+                break;
+            }
+
+            case 'node:insert': {
+                const agent = agentOf(op.sectionId);
+
+                // A notice is the server's own wording of a lifecycle line: only the
+                // `error` tone closes an agent, and a `retry`/`wake` line re-opens it (the
+                // exact pair the raw reducer forms from `error`/`retry`/`wakeup` events).
+                // T16 (R16a): the fold no longer MINTS a `retry` notice — a retried request
+                // keeps this agent lit through `section:open`/`node:*`/`step:set` alone, and
+                // `attempt:discard` is deliberately neutral below. The branch stays so a
+                // document from an older fold still resolves the same way.
+                if (op.node.kind === 'notice') {
+                    if (op.node.tone === 'error') {
+                        if (agent !== undefined) active.delete(agent);
+                        break;
+                    }
+
+                    if (agent !== undefined && running) active.add(agent);
+                    break;
+                }
+
+                // Prose, a think chip, a tool row and an owner question are all mid-run
+                // work of the invocation that produced them.
+                if (agent !== undefined && running) active.add(agent);
+                break;
+            }
+
+            case 'node:append':
+            case 'step:set':
+            case 'pending:set':
+            case 'attempt:commit': {
+                const agent = agentOf(op.sectionId);
+                if (agent !== undefined && running) active.add(agent);
+                break;
+            }
+
+            case 'usage': {
+                if (op.sectionId === 'turn') break;
+                const agent = agentOf(op.sectionId);
+                if (agent !== undefined && running) active.add(agent);
+                break;
+            }
+
+            // `node:set`, `node:remove` and `attempt:discard` change content, not who is
+            // working; the raw reducer ignores their events for the same reason. So do the
+            // `context:*` ops (T11): a bar segment is metadata about text that already
+            // moved activity through its own `node:insert`/`step:set`/`turn` frame.
+            default:
+                break;
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------

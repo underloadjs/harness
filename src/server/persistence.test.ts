@@ -1691,3 +1691,375 @@ describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
         expect(invalid['__proto__'].messages).toBe('broken');
     });
 });
+
+// ---------------------------------------------------------------------------
+// T10: the per-turn instruction snapshot. It is the ONLY durable evidence for the
+// context bar's `system` segment, so the loader validates it STRUCTURALLY (a
+// non-string entry would silently produce a wrong character count instead of failing)
+// and an absent field must stay absent, so a pre-T10 document keeps its exact shape.
+// ---------------------------------------------------------------------------
+
+describe('durable per-turn instruction snapshots (T10)', () => {
+    it('records the instruction text the run actually used', async () => {
+        const root = tempRoot('instructions');
+        const runtime = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+        const created = runtime.store.create('one');
+
+        await runtime.store.run(created.id, 'remember this', async () => {});
+
+        const loaded = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
+        const record = loaded.sessions.find((session) => session.id === created.id);
+        const turnId = record?.turns[0]?.id ?? '';
+
+        // The exact seeded instruction entries, per agent, with the capture time. This
+        // is what `SessionStore.blockDetail` returns as `entries`, and what the fold
+        // counted into the segment's `chars`.
+        expect(record?.turnInstructionSources?.[turnId]).toEqual([
+            { agent: 'one', instructions: ['You are the one scripted agent.'], at: expect.any(Number) }
+        ]);
+    });
+
+    it('keeps a legacy document exact, and refuses a malformed snapshot instead of mis-counting it', async () => {
+        const root = tempRoot('instructions-shape');
+        const runtime = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+        const created = runtime.store.create('one');
+
+        await runtime.store.run(created.id, 'remember this', async () => {});
+
+        const written = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as { sessions: Record<string, unknown>[] };
+
+        // Rewrite the file the way a build BEFORE this feature wrote it.
+        for (const session of written.sessions) delete session.turnInstructionSources;
+
+        fs.writeFileSync(stateFile(root), JSON.stringify(written));
+
+        const reopened = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+
+        expect(reopened.store.get(created.id).turns[0].prompt).toBe('remember this');
+
+        // Any structural mutation persists the whole document, so this proves the
+        // absent key is not re-invented on the way back out.
+        reopened.store.setAgentModels(created.id, { one: 'next/model' });
+
+        const rewritten = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as { sessions: Record<string, unknown>[] };
+
+        expect('turnInstructionSources' in rewritten.sessions[0]).toBe(false);
+
+        const good = JSON.parse(fs.readFileSync(stateFile(root), 'utf8'));
+        const refusing = (mutate: (session: Record<string, unknown>) => void, message: string): void => {
+            const broken = structuredClone(good);
+
+            mutate(broken.sessions[0]);
+
+            expect(() => readHarnessDatabase(broken)).toThrow(message);
+        };
+
+        refusing(
+            (session) => {
+                session.turnInstructionSources = { t: 'not a list' };
+            },
+            /must be an array of instruction sources/
+        );
+        refusing(
+            (session) => {
+                session.turnInstructionSources = { t: [{ agent: 'one', instructions: 'not a list' }] };
+            },
+            /instructions must be an array/
+        );
+        refusing(
+            (session) => {
+                session.turnInstructionSources = { t: [{ agent: 'one', instructions: ['ok', 7] }] };
+            },
+            /instructions\[1\]/
+        );
+        refusing(
+            (session) => {
+                session.turnInstructionSources = { t: [{ agent: 'one', instructions: ['ok'], at: 'soon' }] };
+            },
+            /\.at/
+        );
+
+        // An EMPTY instruction list is a legitimate recorded value ("this agent ran with
+        // no system message") and must survive untouched.
+        const empty = structuredClone(good);
+
+        empty.sessions[0].turnInstructionSources = { t: [{ agent: 'one', instructions: [] }] };
+
+        expect(readHarnessDatabase(empty).sessions[0].turnInstructionSources).toEqual({
+            t: [{ agent: 'one', instructions: [] }]
+        });
+    });
+
+    it('freezes the snapshot at the turn start, so an interrupted turn still rebuilds its system segment', async () => {
+        const root = tempRoot('instructions-interrupted');
+        const fixture = gatedPreset();
+        const first = runtimeOf(root, [fixture.preset]);
+        const created = first.store.create('gated');
+
+        const running = first.store.run(created.id, 'hold the turn', async () => {});
+
+        await fixture.started;
+
+        // The turn-START write already carries the snapshot, before the run produced a
+        // terminal record and before any later instruction edit could happen.
+        const duringRun = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+            sessions: {
+                turns: { id: string; status: string }[];
+                turnInstructionSources?: Record<string, { agent: string; instructions: string[] }[]>;
+            }[];
+        };
+        const stored = duringRun.sessions[0];
+        const turnId = stored.turns[0].id;
+
+        expect(stored.turns[0].status).toBe('running');
+        expect(stored.turnInstructionSources?.[turnId]).toEqual([
+            { agent: 'gated', instructions: ['You are the gated scripted agent.'], at: expect.any(Number) }
+        ]);
+
+        // A fresh process over the same root while the first is still alive (the crash
+        // case): the interrupted turn is restored as error, and its bar is rebuilt from
+        // the durable record — the instruction it ACTUALLY ran with, not a live agent
+        // that no longer exists (R4/R6).
+        const second = runtimeOf(root, [fixture.preset]);
+        const view = second.store.getView(created.id);
+        const bar = view.displays[turnId].sections[0].context ?? [];
+
+        expect(bar.map((block) => block.kind)).toEqual(['system', 'user', 'assistant']);
+        expect(bar[0]).toMatchObject({
+            id: '0-system-instructions',
+            chars: 'You are the gated scripted agent.'.length,
+            inPrompt: true
+        });
+        expect(second.store.blockDetail(created.id, turnId, '0-system-instructions').entries).toEqual([
+            'You are the gated scripted agent.'
+        ]);
+
+        fixture.release();
+        await running;
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T14/T15: the per-turn steered-submit TEXT archive (`SessionTurn.steerTexts`).
+//
+// The 64-entry `steers` list is the operational AUDIT record (and the compact row);
+// the archive is the durable evidence that lets a context-bar segment answer a click
+// with its exact text AFTER the ring has moved past that submit. It is ADDITIVE, so the
+// reader rules are the same ones every other per-turn field follows: validate the shape
+// entry by entry (a corrupt entry would surface as a segment that opens with nothing in
+// it), keep an absent key absent (a pre-T14 document keeps its exact shape and loads on
+// an older server), and never bump `HARNESS_DATABASE_VERSION`. It is deliberately NOT
+// length-capped (T15): every entry is a submit the user made and the server ACCEPTED, so
+// the reader refuses no count — only a malformed entry, wherever it sits.
+// ---------------------------------------------------------------------------
+
+describe('durable steered-submit text archive (T14)', () => {
+    // One gated run with three steered submits, exactly the way a live session produces
+    // them: the first `enqueue` starts the turn, the next three land while it runs.
+    const steeredDocument = async (label: string): Promise<{ root: string; sessionId: string; turnId: string }> => {
+        const root = tempRoot(label);
+        const fixture = gatedPreset();
+        const runtime = runtimeOf(root, [fixture.preset]);
+        const created = runtime.store.create('gated');
+
+        const running = runtime.store.enqueue(created.id, 'hold the turn');
+
+        await fixture.started;
+
+        // Steer into the conversation the run ACTUALLY owns (the same join the audit record
+        // and the context bar attribute the submit by).
+        const threadId = running.turn.threadId;
+
+        if (threadId === undefined) throw new Error('the gated run owns no conversation');
+
+        const steered = ['steer one', 'steer two', 'steer three'].map((input) =>
+            runtime.store.enqueue(created.id, input, undefined, undefined, threadId)
+        );
+
+        expect(steered.every((receipt) => receipt.steered === true)).toBe(true);
+        await Promise.all(steered.map((receipt) => receipt.settled));
+
+        fixture.release();
+        await running.settled;
+        await runtime.store.waitForIdle(created.id);
+
+        return { root, sessionId: created.id, turnId: running.turn.id };
+    };
+
+    const documentOf = (root: string): Record<string, any> =>
+        JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+
+    const writeDocument = (root: string, document: Record<string, any>): void => {
+        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+    };
+
+    it('archives every accepted submit durably, beside the unchanged audit ring', async () => {
+        const { root, sessionId, turnId } = await steeredDocument('archive-write');
+        const written = documentOf(root);
+
+        // The archive is IN the checkpoint document: the live record is not the only copy.
+        const turn = written.sessions[0].turns.find((entry: Record<string, any>) => entry.id === turnId);
+
+        expect(turn.steerTexts.map((entry: Record<string, unknown>) => entry.prompt)).toEqual([
+            'steer one',
+            'steer two',
+            'steer three'
+        ]);
+        expect(written.version).toBe(HARNESS_DATABASE_VERSION);
+
+        // The identity is the archive's address, and it is the SAME id the audit ring (and
+        // therefore the context-bar segment) carries.
+        const loaded = new HarnessPersistence(root).load()?.sessions[0];
+        const restored = loaded?.turns.find((entry) => entry.id === turnId);
+        const ring = restored?.steers ?? [];
+        const archive = restored?.steerTexts ?? [];
+
+        expect(archive.map((entry) => entry.prompt)).toEqual(['steer one', 'steer two', 'steer three']);
+        expect(archive.map((entry) => entry.id)).toEqual(ring.map((steer) => steer.id));
+        expect(new Set(archive.map((entry) => entry.id)).size).toBe(3);
+        // Exact bytes, exact times, no invented fields: a root-thread submit records no
+        // destination, and the archive never carries the ring's `references`.
+        expect(archive[0]).toEqual({ id: archive[0].id, at: archive[0].at, prompt: 'steer one' });
+        expect(archive.every((entry) => entry.threadId === undefined)).toBe(true);
+
+        // A FRESH process over the same root reproduces the archived bar and answers each
+        // segment with its own text: the archive is what makes the click resolvable after a
+        // restart, not only while the run is alive.
+        const reopened = runtimeOf(root, [gatedPreset().preset]);
+        const view = reopened.store.getView(sessionId);
+        const segments = (view.displays[turnId].sections[0].context ?? []).filter(
+            (block) => block.name === 'steer'
+        );
+
+        expect(segments.map((block) => block.id)).toEqual(archive.map((entry) => `0-user-i${entry.id}`));
+        expect(segments.map((block) => block.chars)).toEqual([9, 9, 11]);
+        expect(segments.map((block) => reopened.store.blockDetail(sessionId, turnId, block.id).text)).toEqual([
+            'steer one',
+            'steer two',
+            'steer three'
+        ]);
+
+        // And the archive is NOT part of the default wire: the compact row publishes the
+        // bounded audit ring only, so a turn's archived text — however many submits it holds —
+        // cannot grow a normal frame.
+        expect(view.turns[0].steers ?? []).toHaveLength(3);
+        expect(view.turns[0]).not.toHaveProperty('steerTexts');
+        // A bar segment is METADATA: the archived bytes reach a client only through the one
+        // lazy block route above, never inside the compiled tree.
+        expect(segments.every((block) => !('text' in block))).toBe(true);
+
+        reopened.store.dispose();
+    });
+
+    it('keeps a pre-archive document exact and refuses to invent the key back', async () => {
+        const { root, sessionId, turnId } = await steeredDocument('archive-legacy');
+        const written = documentOf(root);
+
+        // Rewrite the file the way a build BEFORE this feature wrote it.
+        for (const session of written.sessions) {
+            for (const turn of session.turns) delete turn.steerTexts;
+        }
+
+        writeDocument(root, written);
+
+        const reopened = runtimeOf(root, [gatedPreset().preset]);
+
+        expect(reopened.store.get(sessionId).turns.find((turn) => turn.id === turnId)?.steerTexts).toBeUndefined();
+
+        // The archive-less record still projects a bar whose every segment resolves: the
+        // audit ring is the complete submit list when there is no archive.
+        const view = reopened.store.getView(sessionId);
+        const segments = (view.displays[turnId].sections[0].context ?? []).filter((block) => block.name === 'steer');
+
+        expect(segments).toHaveLength(3);
+        expect(segments.map((block) => reopened.store.blockDetail(sessionId, turnId, block.id).text)).toEqual([
+            'steer one',
+            'steer two',
+            'steer three'
+        ]);
+
+        // Any structural mutation rewrites the WHOLE document, so this proves the absent key
+        // is not re-invented on the way back out (the same rule the T10 snapshots follow).
+        reopened.store.setAgentModels(sessionId, { gated: 'next/model' });
+
+        const rewritten = documentOf(root);
+
+        expect(
+            rewritten.sessions[0].turns.some((turn: Record<string, unknown>) => 'steerTexts' in turn)
+        ).toBe(false);
+
+        reopened.store.dispose();
+    });
+
+    it('refuses a malformed archive instead of storing an unresolvable segment', async () => {
+        const { root, turnId } = await steeredDocument('archive-shape');
+        const good = documentOf(root);
+        const refusing = (mutate: (turn: Record<string, unknown>) => void, message: RegExp): void => {
+            const broken = structuredClone(good);
+
+            mutate(broken.sessions[0].turns.find((entry: Record<string, unknown>) => entry.id === turnId));
+
+            expect(() => readHarnessDatabase(broken)).toThrow(message);
+        };
+
+        refusing((turn) => {
+            turn.steerTexts = 'not a list';
+        }, /must be an array/);
+        refusing((turn) => {
+            turn.steerTexts = ['steer one'];
+        }, /steerTexts\[0\] must be an object/);
+        // The id is MANDATORY here (unlike the audit ring, where a pre-T13 record may lack
+        // one): the archive is addressed by it, so a blank or missing key would make the
+        // entry unreachable by the very route that reads it.
+        refusing((turn) => {
+            turn.steerTexts = [{ at: 1, prompt: 'steer one' }];
+        }, /\.id must be a string/);
+        refusing((turn) => {
+            turn.steerTexts = [{ id: '  ', at: 1, prompt: 'steer one' }];
+        }, /\.id must not be blank/);
+        refusing((turn) => {
+            turn.steerTexts = [{ id: 'a', at: 'soon', prompt: 'steer one' }];
+        }, /\.at must be a finite number/);
+        refusing((turn) => {
+            turn.steerTexts = [{ id: 'a', at: 1, prompt: 7 }];
+        }, /\.prompt must be a string/);
+        refusing((turn) => {
+            turn.steerTexts = [{ id: 'a', at: 1, prompt: 'steer one', threadId: ' ' }];
+        }, /\.threadId must not be blank/);
+        // T15: there is NO length cap. The archive holds accepted user data, so a document
+        // with more entries than any earlier artificial bound must load verbatim rather than
+        // be refused (a refused load would strand the whole session). The per-ENTRY rules
+        // above are unchanged, and one bad entry among many still fails the load.
+        const large = structuredClone(good);
+
+        large.sessions[0].turns.find((entry: Record<string, unknown>) => entry.id === turnId).steerTexts = [
+            ...Array.from({ length: 999 }, (_entry, index) => ({
+                id: `id-${index}`,
+                at: 1,
+                prompt: `steer ${index}`
+            })),
+            { id: 'id-last', at: 2, prompt: 'steer last', threadId: 'thread-2' }
+        ];
+
+        const restored = readHarnessDatabase(large).sessions[0].turns.find((entry) => entry.id === turnId);
+
+        expect(restored?.steerTexts).toHaveLength(1_000);
+        expect(restored?.steerTexts?.[0]).toEqual({ id: 'id-0', at: 1, prompt: 'steer 0' });
+        expect(restored?.steerTexts?.[998]).toEqual({ id: 'id-998', at: 1, prompt: 'steer 998' });
+        // Exact bytes in acceptance order, and a destination thread survives.
+        expect(restored?.steerTexts?.[999]).toEqual({
+            id: 'id-last',
+            at: 2,
+            prompt: 'steer last',
+            threadId: 'thread-2'
+        });
+
+        // Entry validation is not dropped with the cap: one malformed entry deep in a large
+        // archive is still corruption, and it fails the load by name.
+        const rotted = structuredClone(large);
+
+        rotted.sessions[0].turns.find((entry: Record<string, unknown>) => entry.id === turnId).steerTexts[640].prompt = 42;
+
+        expect(() => readHarnessDatabase(rotted)).toThrow(/steerTexts\[640\]\.prompt must be a string/);
+    });
+});
