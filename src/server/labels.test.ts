@@ -164,7 +164,7 @@ const submit = async (
     prompt: string,
     threadId?: string
 ): Promise<{ label: string | undefined; threadId: string | undefined; turnId: string }> => {
-    const task = store.enqueue(id, prompt, undefined, undefined, threadId);
+    const task = await store.enqueue(id, prompt, undefined, undefined, threadId);
     await task.settled;
     await store.waitForIdle(id);
 
@@ -194,7 +194,7 @@ const rosterLabels = (snapshot: SessionSnapshot): string[] =>
 describe('one canonical conversation/legacy label sequence', () => {
     it('numbers three legacy turns RR1-RR3 and the next conversation RR4', async () => {
         const store = createStore(researcherPreset());
-        const id = store.create('researcher').id;
+        const id = (await store.create('researcher')).id;
 
         // A legacy turn is a fresh one-block conversation: it consumes one ordinal
         // of the primary agent's code even though no thread record exists.
@@ -218,7 +218,7 @@ describe('one canonical conversation/legacy label sequence', () => {
 
     it('continues the sequence after a task so a legacy run cannot duplicate #RR1', async () => {
         const store = createStore(researcherPreset());
-        const id = store.create('researcher').id;
+        const id = (await store.create('researcher')).id;
 
         const first = await submit(store, id, 'thread-first');
         await runLegacy(store, id, 'legacy-after');
@@ -230,7 +230,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         const after = store.get(id);
         expect(blockLabels(after)).toEqual(['RR1', 'RR2']);
 
-        const referenced = store.enqueue(id, 'use #RR1');
+        const referenced = await store.enqueue(id, 'use #RR1');
         expect(referenced.turn.references).toEqual([{ turnId: first.turnId, label: 'RR1' }]);
         await referenced.settled;
         await store.waitForIdle(id);
@@ -242,7 +242,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't14-labels-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore(researcherPreset(), persistence);
-        const id = store.create('researcher').id;
+        const id = (await store.create('researcher')).id;
 
         const one = await submit(store, id, 'one');
         const two = await submit(store, id, 'two');
@@ -251,8 +251,8 @@ describe('one canonical conversation/legacy label sequence', () => {
         expect([one.label, two.label, three.label]).toEqual(['RR1', 'RR2', 'RR3']);
 
         // Retire RR1/RR2 so only RR3 survives.
-        store.deleteThread(id, one.threadId as string);
-        store.deleteThread(id, two.threadId as string);
+        await store.deleteThread(id, one.threadId as string);
+        await store.deleteThread(id, two.threadId as string);
         store.dispose();
 
         // Simulate a partial write: the per-thread label map AND its high-water are
@@ -291,7 +291,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't14-rollback-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore(researcherPreset(), persistence);
-        const id = store.create('researcher').id;
+        const id = (await store.create('researcher')).id;
 
         const kept = await submit(store, id, 'kept');
         expect(kept.label).toBe('RR1');
@@ -302,7 +302,7 @@ describe('one canonical conversation/legacy label sequence', () => {
             throw new Error('boom');
         });
 
-        expect(() => store.enqueue(id, 'lost')).toThrow(SessionError);
+        await expect(store.enqueue(id, 'lost')).rejects.toThrow(SessionError);
 
         const afterFailure = store.get(id);
         expect(afterFailure.turns.map((turn) => turn.prompt)).toEqual(['kept']);
@@ -324,13 +324,13 @@ describe('one canonical conversation/legacy label sequence', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't14-restart-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore(researcherPreset(), persistence);
-        const id = store.create('researcher').id;
+        const id = (await store.create('researcher')).id;
 
         const first = await submit(store, id, 'e1');
         const second = await submit(store, id, 'e2');
         expect([first.label, second.label]).toEqual(['RR1', 'RR2']);
 
-        store.deleteThread(id, first.threadId as string);
+        await store.deleteThread(id, first.threadId as string);
         store.dispose();
 
         const restored = createStore(researcherPreset(), persistence, persistence.load());
@@ -346,7 +346,7 @@ describe('one canonical conversation/legacy label sequence', () => {
 
     it('re-uses a conversation label and burns no ordinal on a continuation', async () => {
         const store = createStore(researcherPreset());
-        const id = store.create('researcher').id;
+        const id = (await store.create('researcher')).id;
 
         const first = await submit(store, id, 'f1');
         const again = await submit(store, id, 'f2', first.threadId);
@@ -365,7 +365,7 @@ describe('one canonical conversation/legacy label sequence', () => {
 
     it('numbers a nested child conversation from the root conversation sequence', async () => {
         const store = createStore(teamPreset());
-        const id = store.create('team').id;
+        const id = (await store.create('team')).id;
 
         await submit(store, id, 'delegate please');
         const snapshot = store.get(id);

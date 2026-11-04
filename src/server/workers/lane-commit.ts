@@ -86,10 +86,48 @@ export type CanonicalStore = { items: CanonicalRecord[]; nextId: number };
 
 export type CanonicalTool = { name: string; source: string; revision: string; replaced: boolean };
 
+// The digest of an archived invocation, over ONLY the fields a writer owns.
+//
+// Why not `digestMemoryValue(record)`: the authority reassigns `completedOrder` when it
+// applies an archive (ordering is decided where the ordering counter lives), so a lane
+// comparing its own record against a canonical digest would never match and would
+// re-archive forever. Both sides therefore digest the SAME projection.
+export const archiveDigestOf = (record: {
+    invocationId: string;
+    sequence: number;
+    agent: string;
+    role: string;
+    kind: string;
+    status: string;
+    content?: string;
+    error?: string;
+}): string =>
+    digestMemoryValue({
+        invocationId: record.invocationId,
+        sequence: record.sequence,
+        agent: record.agent,
+        role: record.role,
+        kind: record.kind,
+        status: record.status,
+        content: record.content ?? '',
+        ...(record.error === undefined ? {} : { error: record.error })
+    });
+
 export type CanonicalView = {
     threads: Record<string, CanonicalThread>;
     stores: Record<RecordStoreName, CanonicalStore>;
     results: Record<string, HarnessAgentResultSnapshot>;
+    // T10 finding M3: which lane epoch wrote each archived invocation. The core's own
+    // identity rule makes a HOST thread's invocation id its THREAD id (harness.ts
+    // `invocationIdOf`), and the same is true of an agent default conversation
+    // (`agent:<name>`), so one conversation legitimately archives the SAME id again on
+    // every later turn. Ownership is what distinguishes that writer updating its own slot
+    // from a second lane colliding into it - the id alone cannot, because it is shared by
+    // design. No entry means "no live lane owns it": the session archived it through its own
+    // run, this authority was rebuilt, or the owning lane was reclaimed. An id-keyed archive
+    // is a REPLACE by core contract, so the next writer of that conversation adopts the slot;
+    // only a DIFFERENT live epoch is a collision.
+    resultOwners: Record<string, number>;
     tools: Record<string, CanonicalTool>;
     createdToolCount: number;
     memory: Record<string, unknown>;
@@ -125,6 +163,7 @@ export const emptyCanonicalView = (): CanonicalView => ({
         locations: { items: [], nextId: 1 }
     },
     results: {},
+    resultOwners: {},
     tools: {},
     createdToolCount: 0,
     memory: {},
@@ -167,6 +206,11 @@ export type SharedMutation =
 
 export type MutationRejectionCode =
     | 'epoch-superseded'
+    // The journal said no to this seq for a reason the lane can act on. Mapped from
+    // CommitJournal.accepts (T10 finding S5), so a duplicate send and a frame behind the
+    // lane's own watermark are no longer both reported as "epoch superseded".
+    | 'seq-duplicate'
+    | 'seq-behind'
     | 'not-writer'
     | 'unknown-thread'
     | 'unknown-record'
@@ -177,6 +221,12 @@ export type MutationRejectionCode =
     | 'stale-tool'
     | 'prefix-moved'
     | 'unowned-mutation'
+    // T10 finding M2: the fold refused a LATER op in the same group, so nothing in the
+    // group moved at all. Every op the fold would have applied is reported with this code
+    // and NO effect, because a lane adopts committed facts from receipts only.
+    | 'group-rolled-back'
+    // T10 finding S6: the lane wrote a memory key outside the window it was given.
+    | 'memory-undeclared'
     | 'capacity-threads'
     | 'capacity-records'
     | 'capacity-results'
@@ -192,8 +242,11 @@ export type MutationReceipt = {
     laneEpoch: number;
     status: 'applied' | 'rejected';
     rejection?: { code: MutationRejectionCode; message: string };
-    // The canonical facts the lane must adopt. A lane advances its committed base
-    // ONLY from these values (F7), and adopts nothing at all from a rejection.
+    // The canonical facts the lane must adopt. A lane advances its committed base from
+    // THESE, per receipt (T10 finding M2): an applied op's facts are adopted even when the
+    // GROUP around them did not land, and a rejected op adopts only the canonical digest
+    // or length this effect carries - never its own guess. That rebase is what lets the
+    // next boundary succeed instead of replaying the same refusal forever.
     effect?: {
         mintedId?: string;
         length?: number;
@@ -219,8 +272,14 @@ export type GroupOutcome = {
     seq: number;
     status: 'applied' | 'rejected' | 'partial';
     receipts: MutationReceipt[];
-    // True only when EVERY op applied: a partial group rolled the view back, so the
+    // True only when EVERY op applied. A partial group rolled the staged view back, so the
     // lane must not report progress for it (F8: no success on a rejected mutation).
+    //
+    // T10 finding M2: `complete: false` also means NOTHING moved on the live canonical
+    // object. The applier must not replay the individually-applied receipts of an
+    // incomplete group - the retired behaviour left half a group in a live store while the
+    // lane, which adopts nothing from an incomplete group, kept a base that no longer
+    // matched canonical, i.e. permanent divergence plus a turn that can never publish.
     complete: boolean;
 };
 
@@ -378,6 +437,12 @@ export type ApplyContext = {
     // `observe` folds back an id the AUTHORITY minted, keeping the ledger ahead of
     // anything a lane may be handed next.
     identity: IdentityLedger;
+    // T10 finding S6: the memory keys this lane was actually given. A write to a key
+    // outside this window is REFUSED with the canonical digest, because the lane's own
+    // base never covered that key - accepting it would be a blind overwrite of a sibling
+    // or of an operator edit. `undefined` means "this session declares no window", which is
+    // the unrestricted case ./lane-authority.ts already uses for `memory:window`.
+    declaredKeys?: readonly string[];
 };
 
 const boundsOf = (partial?: Partial<CanonicalBounds>): CanonicalBounds => ({ ...DEFAULT_BOUNDS, ...(partial ?? {}) });
@@ -591,6 +656,22 @@ export const applySharedMutation = (
         }
 
         case 'memory:set': {
+            // S6: the declared window is enforced HERE, authority-side, not only by the
+            // lane's own derivation. A write to a key this lane was never given carries a
+            // digest it invented (it could not have read the canonical value), so it is
+            // refused with the canonical digest and the lane re-bases.
+            if (context.declaredKeys !== undefined && !context.declaredKeys.includes(mutation.key)) {
+                return {
+                    ...base,
+                    status: 'rejected',
+                    rejection: {
+                        code: 'memory-undeclared',
+                        message: `harness.memory["${mutation.key}"] is outside the memory window this lane was given; it cannot write a key it never read.`
+                    },
+                    effect: { digest: expectsDigestOf(view.memory[mutation.key]) }
+                };
+            }
+
             const outcome = applyMemoryWrite(view.memory, { key: mutation.key, expected: mutation.expects, value: mutation.value });
 
             if (!outcome.applied) {
@@ -608,6 +689,20 @@ export const applySharedMutation = (
         }
 
         case 'memory:delete': {
+            // S6: same window rule as `memory:set`. This is exactly the write that lost a
+            // sibling's key in the retired merge (F4): a lane deleting what it never read.
+            if (context.declaredKeys !== undefined && !context.declaredKeys.includes(mutation.key)) {
+                return {
+                    ...base,
+                    status: 'rejected',
+                    rejection: {
+                        code: 'memory-undeclared',
+                        message: `harness.memory["${mutation.key}"] is outside the memory window this lane was given; it cannot delete a key it never read.`
+                    },
+                    effect: { digest: expectsDigestOf(view.memory[mutation.key]) }
+                };
+            }
+
             const outcome = applyMemoryWrite(view.memory, { key: mutation.key, expected: mutation.expects, remove: true });
 
             if (!outcome.applied) {
@@ -623,23 +718,66 @@ export const applySharedMutation = (
         }
 
         case 'result:archive': {
-            if (view.results[mutation.invocationId] !== undefined) {
-                const digest = digestMemoryValue(view.results[mutation.invocationId]);
+            const existing = view.results[mutation.invocationId];
 
-                return {
-                    ...base,
-                    status: 'rejected',
-                    rejection: { code: 'stale-record', message: `Invocation "${mutation.invocationId}" is already archived; identity ids must come from the authority.` },
-                    effect: { digest }
+            if (existing !== undefined) {
+                // The digest of the slot AS IT IS, so a refusal still hands the lane the
+                // canonical fact it needs to stop re-sending.
+                const digest = archiveDigestOf(existing);
+                const owner = view.resultOwners[mutation.invocationId];
+
+                // A DIFFERENT lane epoch owns this id: a real cross-epoch collision, refused.
+                // `undefined` means "no live lane owns it" - the session archived it through
+                // its own run, this authority was rebuilt, or the owning lane was reclaimed -
+                // and in every one of those cases the writer of the conversation may update the
+                // slot, exactly as the core's id-keyed `archiveInvocation` does inline.
+                if (owner !== undefined && owner !== context.laneEpoch) {
+                    return {
+                        ...base,
+                        status: 'rejected',
+                        rejection: {
+                            code: 'not-writer',
+                            message: `Invocation "${mutation.invocationId}" is archived by lane ${owner}; this lane (${context.laneEpoch}) does not own that identity.`
+                        },
+                        effect: { digest }
+                    };
+                }
+
+                // M3: this lane is re-archiving the id IT owns. That is the normal second
+                // turn of one conversation, because a host thread's invocation id IS the
+                // thread id and an agent default conversation's is `agent:<name>` - the
+                // core rule `invocationIdOf` implements inline, where the archive simply
+                // replaces the slot (`archiveInvocation` returns `replaced: true`). The
+                // retired behaviour here refused the repeat, so the canonical archive kept
+                // the FIRST answer for the whole life of the conversation.
+                const replacedRecord: HarnessAgentResultSnapshot = {
+                    invocationId: mutation.invocationId,
+                    sequence: mutation.sequence,
+                    completedOrder: mutation.completedOrder,
+                    agent: mutation.agent,
+                    role: mutation.role,
+                    kind: mutation.runKind,
+                    status: mutation.status,
+                    content: mutation.content,
+                    ...(mutation.error === undefined ? {} : { error: mutation.error })
                 };
+
+                view.results[replacedRecord.invocationId] = replacedRecord;
+                context.identity.observe('completedOrder', replacedRecord.completedOrder);
+
+                return { ...base, status: 'applied', effect: { digest: archiveDigestOf(replacedRecord) } };
             }
 
             if (Object.keys(view.results).length >= bounds.maxResults) {
                 // Retention drops the OLDEST completed entry, exactly like the core
-                // archive; the new result is still recorded.
+                // archive; the new result is still recorded. The owner bookkeeping goes
+                // with it, so the slot is free again if the id ever returns.
                 const oldest = Object.values(view.results).sort((left, right) => left.completedOrder - right.completedOrder)[0];
 
-                if (oldest !== undefined) delete view.results[oldest.invocationId];
+                if (oldest !== undefined) {
+                    delete view.results[oldest.invocationId];
+                    delete view.resultOwners[oldest.invocationId];
+                }
             }
 
             const record: HarnessAgentResultSnapshot = {
@@ -655,6 +793,7 @@ export const applySharedMutation = (
             };
 
             view.results[record.invocationId] = record;
+            view.resultOwners[record.invocationId] = context.laneEpoch;
 
             // Fold the leased ids back so the ledger stays ahead of everything issued,
             // including anything the authority itself mints between lane commits.
@@ -663,7 +802,7 @@ export const applySharedMutation = (
             if (Number.isInteger(minted)) context.identity.observe('invocation', minted);
             context.identity.observe('completedOrder', record.completedOrder);
 
-            return { ...base, status: 'applied', effect: { digest: digestMemoryValue(record) } };
+            return { ...base, status: 'applied', effect: { digest: archiveDigestOf(record) } };
         }
 
         case 'tool:create': {
@@ -760,6 +899,12 @@ export const applySharedMutation = (
 // is replaced only when every one of them applies. A rejection mid-group therefore
 // cannot leave half a mutation in the live canonical state (F10), and the receipt
 // list names the first op that failed.
+//
+// THE CALLER MUST HONOUR THE ROLLBACK (T10 finding M2): when `complete` is false the
+// staged view was thrown away, so the LIVE applier must apply none of the individually
+// `applied` receipts and must report them through `rolledBackReceipts`. Replaying a
+// per-op `applied` receipt of a rolled-back group is what made the live object and the
+// lane's base diverge for the rest of the lane's life.
 export const applyMutationGroup = (
     view: CanonicalView,
     group: MutationGroup,
@@ -795,6 +940,38 @@ export const applyMutationGroup = (
 
     return { view: staged, outcome: { seq: group.seq, status: 'applied', receipts, complete: true } };
 };
+
+// Roll every receipt of a group that did NOT land back to a refusal (T10 finding M2).
+//
+// The staged fold answered each op on its own, so an incomplete group contains ops whose
+// receipt says `applied` even though the rollback means the canonical object never saw
+// them. Rewriting those to `group-rolled-back`, with their effects dropped, is what makes
+// the lane's base correct: it adopts canonical facts from a receipt only when the receipt
+// describes something that really happened, and the refusals that CAUSED the rollback keep
+// their canonical digest/length so the next boundary can re-base instead of repeating.
+export const rolledBackReceipts = (
+    receipts: MutationReceipt[],
+    ops: readonly SharedMutation[],
+    laneEpoch: number,
+    seq: number
+): MutationReceipt[] =>
+    receipts.map((receipt) =>
+        receipt.status === 'rejected'
+            ? receipt
+            : {
+                  opId: receipt.opId,
+                  seq,
+                  laneEpoch,
+                  status: 'rejected' as const,
+                  rejection: {
+                      code: 'group-rolled-back' as MutationRejectionCode,
+                      // The op KIND is named (never its payload: a transcript append can be
+                      // 64 KiB) so the lane's operator can see which part of the boundary
+                      // the refusal dragged down.
+                      message: `Commit ${seq} was not applied as a unit, so operation ${receipt.opId} (${String(ops[receipt.opId]?.kind ?? 'unknown')}) moved nothing.`
+                  }
+              }
+    );
 
 // Digest used by a lane when it declares "this is the value I read".
 export const expectsDigestOf = (value: unknown): string =>

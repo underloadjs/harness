@@ -13,6 +13,7 @@ import { readTaskStoreState } from '../../core/task';
 import {
     ID_SPACES,
     ID_SPACE_CAPS,
+    LIVE_RECORD_BOUNDS,
     counterSemanticsOf,
     createIdentityLedger,
     idOf,
@@ -41,11 +42,16 @@ describe('counter units', () => {
         expect(seedFromCounter('record:todos', 1)).toBe(0);
     });
 
-    it('caps each space at the bound the core already enforces', () => {
-        expect(ID_SPACE_CAPS.thread).toBe(256);
-        expect(ID_SPACE_CAPS.completedOrder).toBe(64);
-        expect(ID_SPACE_CAPS.resultSequence).toBe(64);
-        expect(ID_SPACE_CAPS.createdToolCount).toBe(32);
+    it('mints only the created-tool budget, and bounds the live records elsewhere (T10 M1)', () => {
+        // A mint cap on `thread`/`completedOrder`/`resultSequence` bounded the WRONG quantity:
+        // those core numbers are LIVE RECORD counts (roster size, retained results), while a
+        // lane burns ids on every spawn lease and ids are never reused. Only the created-tool
+        // budget is a count of spends, so only it is a mint bound.
+        expect(ID_SPACE_CAPS).toEqual({ createdToolCount: 32 });
+
+        // Where the other three bounds actually live: the fold, against the live counts
+        // (./lane-commit.ts CanonicalBounds.maxThreads / maxResults / maxCreatedTools).
+        expect(LIVE_RECORD_BOUNDS).toEqual({ thread: 256, completedOrder: 64, resultSequence: 64, createdToolCount: 32 });
     });
 
     it('names exactly the spaces a replica would otherwise mint itself', () => {
@@ -176,24 +182,45 @@ describe('createIdentityLedger', () => {
         expect(next.lease.start).toBe(3);
     });
 
-    it('stops at the core bounds instead of minting past what the runtime keeps', () => {
-        const ledger = createIdentityLedger({ thread: 255 });
+    it('lets a session respawn its lanes far past the roster bound without burning out identity (T10 M1)', () => {
+        // The exact arithmetic of ./lane-host.ts `spawn`: 512 invocation ids plus 32 thread ids
+        // reserved per lane start. Idle reclaim (`workerIdleMs`) is the NORMAL lifecycle, so one
+        // session re-spawns its lanes many times over a working day.
+        const LANE_RUN_ID_LEASE = 512;
+        const LANE_THREAD_ID_LEASE = 32;
+        const ledger = createIdentityLedger({ thread: 4, invocation: 0 });
+        const outcomes: boolean[] = [];
 
-        expect(ledger.capOf('thread')).toBe(256);
-        expect(ledger.allocate('thread', 2, 1)).toEqual({
+        for (let attempt = 1; attempt <= 40; attempt += 1) {
+            outcomes.push(ledger.allocate('invocation', LANE_RUN_ID_LEASE, attempt).ok);
+            outcomes.push(ledger.allocate('thread', LANE_THREAD_ID_LEASE, attempt).ok);
+        }
+
+        // 40 spawns mint 1280 thread ids - five times MAX_THREAD_RECORDS - while the roster
+        // still holds its 4 records. The retired cap refused the EIGHTH spawn ("The thread
+        // identity space holds at most 256 ids; 228 are already used and 32 were requested")
+        // without creating a single thread, and every turn of that conversation has thrown a
+        // ServerRuntimeError ever since.
+        expect(outcomes.every((ok) => ok)).toBe(true);
+        expect(ledger.watermarkOf('thread')).toBe(4 + 40 * LANE_THREAD_ID_LEASE);
+        expect(ledger.publishedOf('thread')).toBe(4 + 40 * LANE_THREAD_ID_LEASE);
+        // A lease that mints is still a lease: each spawn received its own contiguous range.
+        expect(ledger.watermarkOf('invocation')).toBe(40 * LANE_RUN_ID_LEASE);
+
+        // The bound that matters did not disappear - it lives where the LIVE count is visible
+        // (./lane-commit.ts `capacity-threads`, read from the core constant).
+        expect(LIVE_RECORD_BOUNDS.thread).toBe(256);
+    });
+
+    it('refuses to mint past the created-tool lifetime budget, because that count IS the spend', () => {
+        const ledger = createIdentityLedger({ createdToolCount: 31 });
+
+        expect(ledger.allocate('createdToolCount', 1, 1).ok).toBe(true);
+        expect(ledger.allocate('createdToolCount', 1, 1)).toEqual({
             ok: false,
             fault: {
                 code: 'exhausted',
-                message: 'The thread identity space holds at most 256 ids; 255 are already used and 2 were requested.'
-            }
-        });
-        // Exactly to the bound is fine, and one past it is not.
-        expect((ledger.allocate('thread', 1, 1) as { ok: boolean }).ok).toBe(true);
-        expect(ledger.allocate('thread', 1, 1)).toEqual({
-            ok: false,
-            fault: {
-                code: 'exhausted',
-                message: 'The thread identity space holds at most 256 ids; 256 are already used and 1 were requested.'
+                message: 'The createdToolCount identity space holds at most 32 ids; 32 are already used and 1 were requested.'
             }
         });
     });

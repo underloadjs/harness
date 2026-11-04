@@ -194,19 +194,19 @@ describe('T13 shutdown safety (P1-B)', () => {
         const first = runtimeOf(root, [fixture.preset]);
 
         // Two idle sessions that must survive the shutdown untouched.
-        const idleA = first.store.create('gated');
-        const idleB = first.store.create('gated');
+        const idleA = await first.store.create('gated');
+        const idleB = await first.store.create('gated');
 
         // One session with a turn genuinely in flight (LEGACY path: run()'s promise
         // resolves only after the whole executeTurn continuation, which is exactly
         // the window that used to overwrite the file).
-        const running = first.store.create('gated');
+        const running = await first.store.create('gated');
         const runSettled = first.store.run(running.id, 'hold the turn', async () => {});
         await fixture.started;
 
         // A prompt accepted while that turn runs: dispose() must persist it before
         // dropping the accepted backlog.
-        const queued = first.store.enqueue(running.id, 'do this next');
+        const queued = await first.store.enqueue(running.id, 'do this next');
 
         // Count every save from here on, so "dispose writes exactly once and never
         // again" is an exact number rather than an inference.
@@ -281,11 +281,11 @@ describe('T13 shutdown safety (P1-B)', () => {
         second.store.dispose();
     });
 
-    it('commits an idle store exactly once and stays idempotent', () => {
+    it('commits an idle store exactly once and stays idempotent', async () => {
         const root = tempRoot('dispose-idle');
         const first = runtimeOf(root, [idlePreset()]);
 
-        const created = first.store.create('idle');
+        const created = await first.store.create('idle');
 
         const saves: number[] = [];
         const persistence = first.persistence;
@@ -310,17 +310,17 @@ describe('T13 shutdown safety (P1-B)', () => {
         expect(readState(root)).toBe(committed);
     });
 
-    it('refuses structural writes after dispose() instead of writing an empty document', () => {
+    it('refuses structural writes after dispose() instead of writing an empty document', async () => {
         const root = tempRoot('dispose-refuse');
         const first = runtimeOf(root, [idlePreset()]);
 
-        const created = first.store.create('idle');
+        const created = await first.store.create('idle');
         first.store.dispose();
         const committed = readState(root);
 
         // A request that raced the shutdown is answered honestly (503) and rolls its
         // in-memory mutation back; the good document is untouched.
-        expect(() => first.store.create('idle')).toThrowError(
+        await expect(first.store.create('idle')).rejects.toThrowError(
             'The harness database is closed; nothing was saved.'
         );
         expect(first.store.size).toBe(0);
@@ -330,7 +330,7 @@ describe('T13 shutdown safety (P1-B)', () => {
         ).toEqual([created.id]);
 
         // The registry write-through path refuses for the same reason.
-        expect(() => first.store.persistRegistry()).toThrowError(
+        await expect(first.store.persistRegistry()).rejects.toThrowError(
             'The harness database is closed; nothing was saved.'
         );
         expect(readState(root)).toBe(committed);
@@ -380,7 +380,7 @@ describe('T13 legacy stream ordering (P3)', () => {
         const store = new SessionStore(SETTINGS, createHarnessRegistry([preset]), (entry) =>
             describeHarness(entry, CATALOGUE)
         );
-        const session = store.create('concurrent');
+        const session = await store.create('concurrent');
 
         // Deliberately inverted write delays: frame 2 settles instantly while frame 1
         // is held. A serial chain still starts 2 only after 1 ended; an unserialized

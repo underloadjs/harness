@@ -226,9 +226,9 @@ describe('SessionStore persistent threads', () => {
         pinClock(1_000);
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const task = store.enqueue(created.id, '  hello  ');
+        const task = await store.enqueue(created.id, '  hello  ');
         // The 202 record names the thread it will run in and stays queued.
         expect(task.turn).toEqual({
             id: task.turn.id,
@@ -319,13 +319,13 @@ describe('SessionStore persistent threads', () => {
         pinClock(1_500);
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const first = store.enqueue(created.id, 'one');
+        const first = await store.enqueue(created.id, 'one');
         await first.settled;
-        const second = store.enqueue(created.id, 'two');
+        const second = await store.enqueue(created.id, 'two');
         await second.settled;
-        const third = store.enqueue(created.id, 'three');
+        const third = await store.enqueue(created.id, 'three');
         await third.settled;
 
         // Three DISTINCT conversations: PE1, PE2, PE3 (not T1/T2/T3 and not one
@@ -337,7 +337,7 @@ describe('SessionStore persistent threads', () => {
         ]);
 
         // A continuation of PE2 repeats its label and consumes NO new ordinal.
-        const continuation = store.enqueue(created.id, 'again', undefined, undefined, second.turn.threadId);
+        const continuation = await store.enqueue(created.id, 'again', undefined, undefined, second.turn.threadId);
         expect(continuation.turn.threadId).toBe(second.turn.threadId);
         expect(continuation.turn.threadLabel).toBe('PE2');
         await continuation.settled;
@@ -348,8 +348,8 @@ describe('SessionStore persistent threads', () => {
         ]);
 
         // Deleting PE1 retires its name: the next standalone conversation is PE4.
-        store.deleteThread(created.id, first.turn.threadId as string);
-        const fourth = store.enqueue(created.id, 'four');
+        await store.deleteThread(created.id, first.turn.threadId as string);
+        const fourth = await store.enqueue(created.id, 'four');
         expect(fourth.turn.threadLabel).toBe('PE4');
         await fourth.settled;
 
@@ -365,12 +365,12 @@ describe('SessionStore persistent threads', () => {
         pinClock(2_000);
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const first = store.enqueue(created.id, 'one');
+        const first = await store.enqueue(created.id, 'one');
         await first.settled;
 
-        const second = store.enqueue(created.id, 'two', undefined, undefined, 'thread-1');
+        const second = await store.enqueue(created.id, 'two', undefined, undefined, 'thread-1');
         expect(second.turn.threadId).toBe('thread-1');
         expect(second.turn.index).toBe(1);
         await second.settled;
@@ -405,20 +405,20 @@ describe('SessionStore persistent threads', () => {
     it('runs two thread lanes concurrently with isolated event records', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         // Two standalone threads (each unfocused submit is serialized and completes).
-        const seedOne = store.enqueue(created.id, 'seed-one');
+        const seedOne = await store.enqueue(created.id, 'seed-one');
         await seedOne.settled;
-        const seedTwo = store.enqueue(created.id, 'seed-two');
+        const seedTwo = await store.enqueue(created.id, 'seed-two');
         await seedTwo.settled;
 
         fixture.gate('left');
         fixture.gate('right');
 
-        const left = store.enqueue(created.id, 'left', undefined, undefined, 'thread-1');
+        const left = await store.enqueue(created.id, 'left', undefined, undefined, 'thread-1');
         await fixture.started('left').promise;
-        const right = store.enqueue(created.id, 'right', undefined, undefined, 'thread-2');
+        const right = await store.enqueue(created.id, 'right', undefined, undefined, 'thread-2');
         await fixture.started('right').promise;
 
         // BOTH requests are in flight: the lanes do not share the legacy gate.
@@ -451,13 +451,13 @@ describe('SessionStore persistent threads', () => {
     it('steers a running thread without recording a duplicate turn', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         fixture.gate('start');
-        const running = store.enqueue(created.id, 'start');
+        const running = await store.enqueue(created.id, 'start');
         await fixture.started('start').promise;
 
-        const steered = store.enqueue(created.id, 'more', undefined, undefined, 'thread-1');
+        const steered = await store.enqueue(created.id, 'more', undefined, undefined, 'thread-1');
         // Explicit steering marker; `turn` is the turn that owns the run.
         expect(steered.steered).toBe(true);
         expect(steered.turn.id).toBe(running.turn.id);
@@ -495,18 +495,18 @@ describe('SessionStore persistent threads', () => {
     it('gives two submits recorded in one millisecond one bar segment each, and its own bytes', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         fixture.gate('start');
-        const running = store.enqueue(created.id, 'start');
+        const running = await store.enqueue(created.id, 'start');
         await fixture.started('start').promise;
 
         // Two guidance submits the AUDIT RECORD cannot tell apart: the store stamps each
         // one with `Date.now()`, and both texts are 4 characters. Mocking the clock is what
         // makes that collision reproducible instead of a race.
         const clock = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-        const first = store.enqueue(created.id, 'aaaa', undefined, undefined, 'thread-1');
-        const second = store.enqueue(created.id, 'bbbb', undefined, undefined, 'thread-1');
+        const first = await store.enqueue(created.id, 'aaaa', undefined, undefined, 'thread-1');
+        const second = await store.enqueue(created.id, 'bbbb', undefined, undefined, 'thread-1');
         clock.mockRestore();
 
         expect(first.steered).toBe(true);
@@ -565,10 +565,10 @@ describe('SessionStore persistent threads', () => {
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
         const store = createStore([fixture.preset], persistence);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         fixture.gate('start');
-        const running = store.enqueue(created.id, 'start');
+        const running = await store.enqueue(created.id, 'start');
         await fixture.started('start').promise;
 
         // 520 prompts, all 5 characters, all recorded in the same mocked millisecond: the
@@ -579,8 +579,16 @@ describe('SessionStore persistent threads', () => {
         const prompts = Array.from({ length: SUBMITS }, (_entry, index) => `s${String(index).padStart(4, '0')}`);
         const trimmed = prompts.slice(0, SUBMITS - RING);
         const clock = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
-        const receipts = prompts.map((prompt) => store.enqueue(created.id, prompt, undefined, undefined, 'thread-1'));
+        // D4: every submit must be DISPATCHED in one synchronous batch - that is what makes them
+        // steer into the conversation the run owns instead of queueing behind it - so the map
+        // callback stays non-async and the now-async durability is collected with `Promise.all`
+        // AFTER the clock is restored. Same interleaving and the same frozen `at` values; each
+        // accepted submit is now durable before its receipt is inspected.
+        const pending = prompts.map(async (prompt) => await store.enqueue(created.id, prompt, undefined, undefined, 'thread-1'));
+
         clock.mockRestore();
+
+        const receipts = await Promise.all(pending);
 
         expect(receipts.every((receipt) => receipt.steered === true)).toBe(true);
         await Promise.all(receipts.map((receipt) => receipt.settled));
@@ -751,7 +759,7 @@ describe('SessionStore persistent threads', () => {
         // the steered run takes the archived bytes with it — no orphaned steer text is left in
         // the document behind a deleted conversation (reset and session removal work the same
         // way, because they drop the same turn records).
-        const deleted = store.deleteThread(created.id, threadOf(store.get(created.id), turnId));
+        const deleted = await store.deleteThread(created.id, threadOf(store.get(created.id), turnId));
 
         expect(deleted.turns).toHaveLength(0);
         expect(persistence.load()?.sessions[0].turns.some((turn) => turn.steerTexts !== undefined)).toBe(false);
@@ -759,29 +767,35 @@ describe('SessionStore persistent threads', () => {
         store.dispose();
         legacy.dispose();
         fs.rmSync(root, { recursive: true, force: true });
-    });
+        // D4: this case performs 520 ACCEPTED submits, and every accepted submit is now durable
+        // before its receipt (`await persistOrThrow`), so the test does 520 awaited
+        // whole-document commits on a growing record. Alone it lands near the suite's global
+        // 15 s budget and under full-suite load it crosses it, so the budget is raised HERE
+        // rather than by loosening `testTimeout` for every spec. No assertion was changed or
+        // removed - the work simply takes longer than 15 s when the whole suite runs at once.
+    }, 60_000);
 
     it('rejects a blank or unknown thread id and steers/continues only real threads', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        expect(() => store.enqueue(created.id, 'x', undefined, undefined, '   ')).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, undefined, '   ')).rejects.toThrow(
             '`threadId` must be a non-empty string when present.'
         );
-        expect(() => store.enqueue(created.id, 'x', undefined, undefined, 7)).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, undefined, 7)).rejects.toThrow(
             '`threadId` must be a non-empty string when present.'
         );
 
         // The thread must EXIST before it can be addressed.
-        const seed = store.enqueue(created.id, 'seed');
+        const seed = await store.enqueue(created.id, 'seed');
         await seed.settled;
 
-        const task = store.enqueue(created.id, 'known', undefined, undefined, 'thread-1');
+        const task = await store.enqueue(created.id, 'known', undefined, undefined, 'thread-1');
         expect(task.turn.threadId).toBe('thread-1');
         await task.settled;
 
-        expect(() => store.enqueue(created.id, 'x', undefined, undefined, 'thread-404')).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, undefined, 'thread-404')).rejects.toThrow(
             'Unknown thread "thread-404".'
         );
     });
@@ -790,9 +804,9 @@ describe('SessionStore persistent threads', () => {
         pinClock(3_000);
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const seed = store.enqueue(created.id, 'seed');
+        const seed = await store.enqueue(created.id, 'seed');
         await seed.settled;
 
         // Hold the exclusive gate with a legacy run, so the lane submit QUEUES.
@@ -800,10 +814,10 @@ describe('SessionStore persistent threads', () => {
         const legacy = store.run(created.id, 'legacy', async () => {});
         await fixture.started('legacy').promise;
 
-        const queued = store.enqueue(created.id, 'waiting', undefined, undefined, 'thread-1');
+        const queued = await store.enqueue(created.id, 'waiting', undefined, undefined, 'thread-1');
         expect(queued.turn.status).toBe('queued');
 
-        const stopped = store.cancelThread(created.id, 'thread-1');
+        const stopped = await store.cancelThread(created.id, 'thread-1');
         expect(stopped.cancelled).toBe(true);
         expect(stopped.session.threads).toEqual([
             expect.objectContaining({ id: 'thread-1', status: 'stopped' }) as unknown as SessionThread
@@ -824,13 +838,13 @@ describe('SessionStore persistent threads', () => {
     it('aborts a running thread and reports it cancelled and stopped', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         fixture.gate('long');
-        const running = store.enqueue(created.id, 'long');
+        const running = await store.enqueue(created.id, 'long');
         await fixture.started('long').promise;
 
-        const stopped = store.cancelThread(created.id, 'thread-1', 'owner stopped it');
+        const stopped = await store.cancelThread(created.id, 'thread-1', 'owner stopped it');
         expect(stopped.cancelled).toBe(true);
         expect(stopped.session.threads![0]).toEqual(
             expect.objectContaining({ id: 'thread-1', status: 'stopped' })
@@ -845,26 +859,26 @@ describe('SessionStore persistent threads', () => {
         expect(final.status).toBe('error');
         expect(final.lastError).toBe('The run was cancelled.');
 
-        expect(() => store.cancelThread(created.id, 'thread-404')).toThrow('Unknown thread "thread-404".');
-        expect(() => store.cancelThread('missing', 'thread-1')).toThrow('Unknown session "missing".');
+        await expect(store.cancelThread(created.id, 'thread-404')).rejects.toThrow('Unknown thread "thread-404".');
+        await expect(store.cancelThread('missing', 'thread-1')).rejects.toThrow('Unknown session "missing".');
     });
 
     it('stops every host thread and backlog on cancel { all: true }', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         // F1: two plain submits run CONCURRENTLY in their own lanes; stop-all must
         // stop both conversations and abort both runs.
         fixture.gate('active');
         fixture.gate('sibling');
-        const active = store.enqueue(created.id, 'active');
+        const active = await store.enqueue(created.id, 'active');
         await fixture.started('active').promise;
-        const sibling = store.enqueue(created.id, 'sibling');
+        const sibling = await store.enqueue(created.id, 'sibling');
         await fixture.started('sibling').promise;
         expect(fixture.peak()).toBe(2);
 
-        expect(store.cancel(created.id, { all: true })).toBe(true);
+        expect(await store.cancel(created.id, { all: true })).toBe(true);
 
         fixture.gate('active').resolve();
         fixture.gate('sibling').resolve();
@@ -900,34 +914,34 @@ describe('SessionStore thread deletion', () => {
     it('rejects running work (409), the default conversation (400), and unknown ids (404)', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const seed = store.enqueue(created.id, 'seed');
+        const seed = await store.enqueue(created.id, 'seed');
         await seed.settled;
 
         // Hold a LANE run in thread-1 so its record is live.
         fixture.gate('hold');
-        const held = store.enqueue(created.id, 'hold', undefined, undefined, 'thread-1');
+        const held = await store.enqueue(created.id, 'hold', undefined, undefined, 'thread-1');
         await fixture.started('hold').promise;
 
-        expect(() => store.deleteThread(created.id, 'thread-1')).toThrow(SessionError);
-        expect(() => store.deleteThread(created.id, 'thread-1')).toThrow(
+        await expect(store.deleteThread(created.id, 'thread-1')).rejects.toThrow(SessionError);
+        await expect(store.deleteThread(created.id, 'thread-1')).rejects.toThrow(
             'Thread "thread-1" still has live work; wait for it to stop before deleting it.'
         );
-        expect(() => store.deleteThread(created.id, 'thread-404')).toThrow(
+        await expect(store.deleteThread(created.id, 'thread-404')).rejects.toThrow(
             'Unknown thread "thread-404".'
         );
-        expect(() => store.deleteThread(created.id, 'agent:probe')).toThrow(
+        await expect(store.deleteThread(created.id, 'agent:probe')).rejects.toThrow(
             'Thread "agent:probe" is the agent\'s own conversation and cannot be deleted; use reset to clear the session.'
         );
 
-        store.cancel(created.id, { all: true });
+        await store.cancel(created.id, { all: true });
         fixture.gate('hold').resolve();
         await held.settled;
         await store.waitForIdle(created.id);
 
         // A stopped, idle thread deletes cleanly and its turns/transcript go with it.
-        const deleted = store.deleteThread(created.id, 'thread-1');
+        const deleted = await store.deleteThread(created.id, 'thread-1');
         expect(deleted.threads).toBeUndefined();
         expect(deleted.turns).toEqual([]);
     });
@@ -935,13 +949,13 @@ describe('SessionStore thread deletion', () => {
     it('keeps indices monotonic and surviving labels stable across a deletion', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const one = store.enqueue(created.id, 'one');
+        const one = await store.enqueue(created.id, 'one');
         await one.settled;
-        const two = store.enqueue(created.id, 'two');
+        const two = await store.enqueue(created.id, 'two');
         await two.settled;
-        const three = store.enqueue(created.id, 'three');
+        const three = await store.enqueue(created.id, 'three');
         await three.settled;
         await store.waitForIdle(created.id);
 
@@ -958,7 +972,7 @@ describe('SessionStore thread deletion', () => {
             ).map((block) => block.label)
         ).toEqual(['PE1', 'PE2', 'PE3']);
 
-        store.deleteThread(created.id, threadOf(before, one.turn.id));
+        await store.deleteThread(created.id, threadOf(before, one.turn.id));
 
         const after = store.get(created.id);
         expect(after.turns.map((turn) => `${turn.index}:${turn.prompt}`)).toEqual([
@@ -978,7 +992,7 @@ describe('SessionStore thread deletion', () => {
         ).toEqual(['PE2', 'PE3']);
 
         // A typed reference to the surviving #PE2 still resolves to that turn.
-        const reuse = store.enqueue(created.id, 'reuse #PE2');
+        const reuse = await store.enqueue(created.id, 'reuse #PE2');
         await reuse.settled;
         await store.waitForIdle(created.id);
 
@@ -999,12 +1013,10 @@ describe('SessionStore thread deletion', () => {
         );
 
         // A reference to the deleted turn is refused before anything mutates.
-        expect(() =>
-            store.enqueue(created.id, 'gone', undefined, [{ turnId: one.turn.id, label: 'PE1' }])
-        ).toThrow(`Referenced turn "${one.turn.id}" does not exist in this session.`);
+        await expect(store.enqueue(created.id, 'gone', undefined, [{ turnId: one.turn.id, label: 'PE1' }])).rejects.toThrow(`Referenced turn "${one.turn.id}" does not exist in this session.`);
 
         // The index high-water mark never reuses a deleted turn's index.
-        const next = store.enqueue(created.id, 'next');
+        const next = await store.enqueue(created.id, 'next');
         expect(next.turn.index).toBe(4);
         await next.settled;
     });
@@ -1014,15 +1026,15 @@ describe('SessionStore thread deletion', () => {
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
         const store = createStore([fixture.preset], persistence);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const one = store.enqueue(created.id, 'one');
+        const one = await store.enqueue(created.id, 'one');
         await one.settled;
-        const two = store.enqueue(created.id, 'two');
+        const two = await store.enqueue(created.id, 'two');
         await two.settled;
         await store.waitForIdle(created.id);
 
-        const deleted = store.deleteThread(created.id, threadOf(store.get(created.id), one.turn.id));
+        const deleted = await store.deleteThread(created.id, threadOf(store.get(created.id), one.turn.id));
         expect(deleted.threads!.map((thread) => thread.id)).toEqual([threadOf(deleted, two.turn.id)]);
 
         const reloaded = createStore([fixture.preset], persistence, persistence.load()).get(created.id);
@@ -1045,16 +1057,16 @@ describe('SessionStore thread persistence', () => {
         const persistence = new HarnessPersistence(root);
 
         const first = createStore([fixture.preset], persistence);
-        const created = first.create('probe');
+        const created = await first.create('probe');
 
-        const done = first.enqueue(created.id, 'kept');
+        const done = await first.enqueue(created.id, 'kept');
         await done.settled;
 
         // Hold a LEGACY run so a lane submit stays queued at "crash" time.
         fixture.gate('legacy');
         void first.run(created.id, 'legacy', async () => {});
         await fixture.started('legacy').promise;
-        const queued = first.enqueue(created.id, 'pending-lane', undefined, undefined, 'thread-1');
+        const queued = await first.enqueue(created.id, 'pending-lane', undefined, undefined, 'thread-1');
         expect(queued.turn.status).toBe('queued');
 
         // Simulate a crash: a FRESH store over the same root, no dispose.
@@ -1101,7 +1113,7 @@ describe('SessionStore thread persistence', () => {
 
         // An explicit submit to that SAME thread drains the paused turn FIRST (FIFO),
         // with its persisted prompt, then runs the new input as a continuation.
-        const kick = second.enqueue(created.id, 'after restart', undefined, undefined, 'thread-1');
+        const kick = await second.enqueue(created.id, 'after restart', undefined, undefined, 'thread-1');
         await kick.settled;
         await second.waitForIdle(created.id);
 
@@ -1135,13 +1147,13 @@ describe('SessionStore thread persistence', () => {
         fs.rmSync(root, { recursive: true, force: true });
     });
 
-    it('reads a pre-thread document (no thread fields) without failing', () => {
+    it('reads a pre-thread document (no thread fields) without failing', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
         const store = createStore([fixture.preset], persistence);
-        const created = store.create('probe');
-        const task = store.enqueue(created.id, 'one');
+        const created = await store.create('probe');
+        const task = await store.enqueue(created.id, 'one');
         expect(task.turn.threadId).toBe('thread-1');
         store.dispose();
 
@@ -1391,9 +1403,9 @@ describe('delegated child threads', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegationPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -1459,7 +1471,7 @@ describe('delegated child threads', () => {
         ]);
 
         // Deleting the owner removes the linked child with it.
-        const deleted = store.deleteThread(created.id, 'thread-1');
+        const deleted = await store.deleteThread(created.id, 'thread-1');
         expect(deleted.threads).toBeUndefined();
         expect(deleted.turns).toEqual([]);
 
@@ -1471,9 +1483,9 @@ describe('delegated child threads', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegationPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -1490,7 +1502,7 @@ describe('delegated child threads', () => {
         // Both the root ('1') and the delegated child ('2') results are durable.
         expect(persistedIds()).toEqual(['1', '2']);
 
-        store.deleteThread(created.id, 'thread-2');
+        await store.deleteThread(created.id, 'thread-2');
 
         // The saved registry loses EXACTLY the child's result; the root survives.
         expect(persistedIds()).toEqual(['1']);
@@ -1524,11 +1536,11 @@ describe('delegated child threads', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegationPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
         // Parent submit opens thread-1; its delegation opens the owned child
         // thread-2 (invocations: parent 1, child 2).
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -1550,7 +1562,7 @@ describe('delegated child threads', () => {
         ]);
 
         // A focused submit addresses the CHILD conversation by its persistent id.
-        const continuation = store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
+        const continuation = await store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
         expect(continuation.turn.threadId).toBe('thread-2');
         // The conversation keeps its own display name (it is the same thread).
         expect(continuation.turn.threadLabel).toBe('HR1');
@@ -1627,7 +1639,7 @@ describe('delegated child threads', () => {
             transcript(after.threads![1].messages)
         );
 
-        const resumed = reloaded.enqueue(created.id, 'after restart', undefined, undefined, 'thread-2');
+        const resumed = await reloaded.enqueue(created.id, 'after restart', undefined, undefined, 'thread-2');
         await resumed.settled;
         await reloaded.waitForIdle(created.id);
 
@@ -1665,14 +1677,14 @@ describe('delegated child threads', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegationPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 
         // The child resumes, so its single slot advances past the original run ('2').
-        const continuation = store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
+        const continuation = await store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
         await continuation.settled;
         await store.waitForIdle(created.id);
         expect(store.get(created.id).threads!.map((thread) => thread.invocationIds)).toEqual([
@@ -1782,9 +1794,9 @@ describe('delegated child threads', () => {
         };
 
         const store = createStore([twinPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate twice');
+        const task = await store.enqueue(created.id, 'delegate twice');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -1825,7 +1837,7 @@ describe('delegated child threads', () => {
         const restored = reloaded.get(created.id);
         expect(restored.threads!.map((thread) => thread.invocationIds)).toEqual([['1'], ['2'], ['3']]);
 
-        const resumed = reloaded.enqueue(created.id, 'resume b', undefined, undefined, 'thread-3');
+        const resumed = await reloaded.enqueue(created.id, 'resume b', undefined, undefined, 'thread-3');
         await resumed.settled;
         await reloaded.waitForIdle(created.id);
 
@@ -1865,7 +1877,7 @@ describe('thread persistence rollback', () => {
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
         const store = createStore([fixture.preset], persistence);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         const save = vi.spyOn(persistence, 'save').mockImplementation(() => {
             throw new Error('disk full');
@@ -1874,7 +1886,7 @@ describe('thread persistence rollback', () => {
         // `enqueue` validates/persists synchronously, so the failure is a throw.
         let submitFailure: unknown;
         try {
-            store.enqueue(created.id, 'lost');
+            await store.enqueue(created.id, 'lost');
         } catch (error) {
             submitFailure = error;
         }
@@ -1890,7 +1902,7 @@ describe('thread persistence rollback', () => {
         // RETIRED: the runtime never reuses a minted thread id, so the next accepted
         // submit is thread-2.
         save.mockRestore();
-        const next = store.enqueue(created.id, 'kept');
+        const next = await store.enqueue(created.id, 'kept');
         expect(next.turn.threadId).toBe('thread-2');
         await next.settled;
         await store.waitForIdle(created.id);
@@ -1904,9 +1916,9 @@ describe('thread persistence rollback', () => {
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
         const store = createStore([fixture.preset], persistence);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const task = store.enqueue(created.id, 'one');
+        const task = await store.enqueue(created.id, 'one');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -1916,7 +1928,7 @@ describe('thread persistence rollback', () => {
 
         let deleteFailure: unknown;
         try {
-            store.deleteThread(created.id, 'thread-1');
+            await store.deleteThread(created.id, 'thread-1');
         } catch (error) {
             deleteFailure = error;
         }
@@ -1929,7 +1941,7 @@ describe('thread persistence rollback', () => {
 
         // Once writes work again the same delete succeeds and is durable.
         save.mockRestore();
-        expect(store.deleteThread(created.id, 'thread-1').turns).toEqual([]);
+        expect((await store.deleteThread(created.id, 'thread-1')).turns).toEqual([]);
         const reloaded = createStore([fixture.preset], persistence, persistence.load()).get(created.id);
         expect(reloaded.turns).toEqual([]);
         expect(reloaded.threads).toBeUndefined();
@@ -1947,12 +1959,12 @@ describe('thread reference edges', () => {
     it('links without owning: stopping or deleting the source keeps the connected conversation', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const source = store.enqueue(created.id, 'source');
+        const source = await store.enqueue(created.id, 'source');
         await source.settled;
 
-        const linked = store.enqueue(created.id, 'connected', undefined, [
+        const linked = await store.enqueue(created.id, 'connected', undefined, [
             { turnId: source.turn.id, label: 'PE1' }
         ]);
         await linked.settled;
@@ -1967,7 +1979,7 @@ describe('thread reference edges', () => {
         expect(linkedThread.references).toEqual([{ turnId: source.turn.id, label: 'PE1' }]);
 
         // Stopping the SOURCE conversation never aborts the connected one.
-        expect(store.cancelThread(created.id, source.turn.threadId!)).toEqual({
+        expect(await store.cancelThread(created.id, source.turn.threadId!)).toEqual({
             cancelled: false,
             session: expect.anything()
         });
@@ -1985,7 +1997,7 @@ describe('thread reference edges', () => {
 
         // Deleting the source strips the dangling LINK but keeps the conversation,
         // its turn, and its transcript.
-        const deleted = store.deleteThread(created.id, source.turn.threadId!);
+        const deleted = await store.deleteThread(created.id, source.turn.threadId!);
         expect(deleted.turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual(['connected:done']);
         const survivor = deleted.threads!.find((thread) => thread.id === linked.turn.threadId)!;
         expect(survivor.status).toBe('idle');
@@ -2018,16 +2030,16 @@ describe('focused steering input', () => {
     it('steers reference context with an audit record and never drops attachments', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        const base = store.enqueue(created.id, 'base');
+        const base = await store.enqueue(created.id, 'base');
         await base.settled;
 
         fixture.gate('start');
-        const running = store.enqueue(created.id, 'start', undefined, undefined, 'thread-1');
+        const running = await store.enqueue(created.id, 'start', undefined, undefined, 'thread-1');
         await fixture.started('start').promise;
 
-        const steered = store.enqueue(created.id, 'focused', undefined, [
+        const steered = await store.enqueue(created.id, 'focused', undefined, [
             { turnId: base.turn.id, label: 'PE1' }
         ], 'thread-1');
 
@@ -2070,7 +2082,7 @@ describe('focused steering input', () => {
         // An ATTACHMENT-bearing focused submit is not steered (the runtime's steer
         // API is text-only): it becomes a queued continuation that keeps its bytes.
         fixture.gate('long');
-        const long = store.enqueue(created.id, 'long', undefined, undefined, 'thread-1');
+        const long = await store.enqueue(created.id, 'long', undefined, undefined, 'thread-1');
         await fixture.started('long').promise;
 
         const attachment = {
@@ -2082,7 +2094,7 @@ describe('focused steering input', () => {
             size: 8,
             data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64')
         };
-        const deferred = store.enqueue(created.id, '', [attachment], undefined, 'thread-1');
+        const deferred = await store.enqueue(created.id, '', [attachment], undefined, 'thread-1');
         expect(deferred.steered).toBeUndefined();
         expect(deferred.turn.status).toBe('queued');
         expect(deferred.turn.attachments).toEqual([attachment]);
@@ -2140,12 +2152,12 @@ describe('thread deletion atomicity', () => {
         const fixture = stubbornPreset();
         const persistence = new HarnessPersistence(root);
         const store = createStore([fixture.preset], persistence);
-        const created = store.create('stubborn');
+        const created = await store.create('stubborn');
 
-        const task = store.enqueue(created.id, 'work');
+        const task = await store.enqueue(created.id, 'work');
         await fixture.started.promise;
 
-        expect(store.cancelThread(created.id, 'thread-1').cancelled).toBe(true);
+        expect((await store.cancelThread(created.id, 'thread-1')).cancelled).toBe(true);
         // The run ignores the abort: the turn is still live.
         expect(store.get(created.id).turns[0].status).toBe('running');
 
@@ -2154,7 +2166,7 @@ describe('thread deletion atomicity', () => {
 
         let refusal: unknown;
         try {
-            store.deleteThread(created.id, 'thread-1');
+            await store.deleteThread(created.id, 'thread-1');
         } catch (error) {
             refusal = error;
         }
@@ -2172,7 +2184,7 @@ describe('thread deletion atomicity', () => {
         await task.settled;
         await store.waitForIdle(created.id);
 
-        const deleted = store.deleteThread(created.id, 'thread-1');
+        const deleted = await store.deleteThread(created.id, 'thread-1');
         expect(deleted.turns).toEqual([]);
         expect(deleted.threads).toBeUndefined();
 
@@ -2186,23 +2198,23 @@ describe('thread deletion atomicity', () => {
 // ---------------------------------------------------------------------------
 
 describe('thread deletion persistence', () => {
-    it('never reuses a deleted thread id after a restart, even with no host threads left', () => {
+    it('never reuses a deleted thread id after a restart, even with no host threads left', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
         const first = createStore([fixture.preset], persistence);
-        const created = first.create('probe');
+        const created = await first.create('probe');
 
-        const task = first.enqueue(created.id, 'one');
+        const task = await first.enqueue(created.id, 'one');
         expect(task.turn.threadId).toBe('thread-1');
         return task.settled.then(async () => {
             await first.waitForIdle(created.id);
-            expect(first.deleteThread(created.id, 'thread-1').threads).toBeUndefined();
+            expect((await first.deleteThread(created.id, 'thread-1')).threads).toBeUndefined();
             first.dispose();
 
             // F5: the id high-water survives an empty roster.
             const second = createStore([fixture.preset], persistence, persistence.load());
-            const next = second.enqueue(created.id, 'two');
+            const next = await second.enqueue(created.id, 'two');
             expect(next.turn.threadId).toBe('thread-2');
             await next.settled;
             await second.waitForIdle(created.id);
@@ -2218,7 +2230,7 @@ describe('thread deletion persistence', () => {
 // ---------------------------------------------------------------------------
 
 describe('thread capacity errors', () => {
-    it('maps the host-thread bound to an actionable 429 before mutating', () => {
+    it('maps the host-thread bound to an actionable 429 before mutating', async () => {
         const fixture = createFixture();
         const capacity = 'This session already has 256 independent threads; delete a terminal one before creating another (maximum 256).';
 
@@ -2244,11 +2256,11 @@ describe('thread capacity errors', () => {
         };
 
         const store = createStore([preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         let failure: unknown;
         try {
-            store.enqueue(created.id, 'overflow');
+            await store.enqueue(created.id, 'overflow');
         } catch (error) {
             failure = error;
         }
@@ -2362,10 +2374,10 @@ describe('cascaded thread stop', () => {
         };
 
         const store = createStore([preset]);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
         // The runtime opens the child conversation for the delegation.
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
         expect(store.get(created.id).threads!.find((thread) => thread.id === 'thread-2')!.ownerThreadId).toBe(
@@ -2377,14 +2389,14 @@ describe('cascaded thread stop', () => {
         gateOf('parent hold');
         gateOf('child hold');
         gateOf('sibling');
-        const parent = store.enqueue(created.id, 'parent hold', undefined, undefined, 'thread-1');
+        const parent = await store.enqueue(created.id, 'parent hold', undefined, undefined, 'thread-1');
         await startedOf('parent hold').promise;
-        const child = store.enqueue(created.id, 'child hold', undefined, undefined, 'thread-2');
+        const child = await store.enqueue(created.id, 'child hold', undefined, undefined, 'thread-2');
         await startedOf('child hold').promise;
-        const sibling = store.enqueue(created.id, 'sibling');
+        const sibling = await store.enqueue(created.id, 'sibling');
         await startedOf('sibling').promise;
 
-        expect(store.cancelThread(created.id, 'thread-1').cancelled).toBe(true);
+        expect((await store.cancelThread(created.id, 'thread-1')).cancelled).toBe(true);
 
         gateOf('parent hold').resolve();
         gateOf('child hold').resolve();
@@ -2513,9 +2525,9 @@ describe('delegated conversation identity in the compiled view (R18)', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't18-view-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([identityPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -2586,19 +2598,19 @@ describe('delegated conversation identity in the compiled view (R18)', () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't18-view-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([identityPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
         // [Main]: the parent conversation delegates → its child conversation.
-        const first = store.enqueue(created.id, 'delegate please');
+        const first = await store.enqueue(created.id, 'delegate please');
         await first.settled;
 
         // A focused submit INTO the delegated conversation: same conversation, new run.
-        const second = store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
+        const second = await store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
         await second.settled;
 
         // A second submit on the MAIN conversation: the SAME main conversation, therefore
         // the same id and label, and a run id of its own ([Main] again, later).
-        const third = store.enqueue(created.id, 'main again', undefined, undefined, 'thread-1');
+        const third = await store.enqueue(created.id, 'main again', undefined, undefined, 'thread-1');
         await third.settled;
         await store.waitForIdle(created.id);
 
@@ -2647,7 +2659,7 @@ describe('delegated conversation identity in the compiled view (R18)', () => {
         // record, so no invocation is ever mapped and the join is empty.
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't18-legacy-'));
         const store = createStore([identityPreset()], new HarnessPersistence(root));
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
         await store.run(created.id, 'legacy please', () => undefined);
         await store.waitForIdle(created.id);

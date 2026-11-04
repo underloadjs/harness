@@ -287,6 +287,17 @@ export type {
     MaterializedBranchHistory,
     NormalizedForkAgentOptions
 } from './branch';
+// T14: the worker-mode NESTED-RUN policy. One leaf owns the limitation code, the refusal
+// sentence, and the validated arm, so the core doors (../harness.ts), the lane worker
+// (../server/workers/lane-worker-loop.ts), the capability report and the docs cannot state
+// three different guarantees for the same rule. See ./nested-runs.ts.
+export {
+    NESTED_RUN_LIMITATION_CODE,
+    NESTED_RUN_POLICIES,
+    assertNestedRunPolicy,
+    nestedRunRefusalMessage,
+    nestedRunUnsupportedError
+} from './nested-runs';
 // R2 persistent threads. The factory registry is internal plumbing (the harness
 // runtime and focused tests are the only callers); the harness's public thread
 // API lives on the handle. See ./thread.ts.

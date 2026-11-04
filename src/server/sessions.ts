@@ -210,9 +210,19 @@ import {
     createLaneHost,
     laneWorkerEnvironment,
     laneWorkerUnsupportedMessage,
-    planWorkerToolSurfaces
+    planWorkerToolSurfaces,
+    // T12: the field-correct scan text (`moduleText` + captured helpers), so the SESSION window
+    // is computed from the same bytes the worker report and the authority's created-tool check
+    // scan. Without it `memoryKeysFor` saw `undefined` for every shipped core tool.
+    toolScanTextOf
 } from './workers';
 import type { LaneAuthority, LaneBlueprintSource, LaneHost, LaneTarget, LaneTurnResult } from './workers';
+// D4 (R1/R2/R4): the IO worker client, through the same subsystem barrel. `openHarnessIoClient`
+// is the SYNCHRONOUS opener: the store constructor cannot await, and the client registers
+// every operation issued before the handshake and releases it in call order once the worker
+// answers (`./workers/io-client.ts`, "THE INTEGRATION CONTRACT").
+import { openHarnessIoClient } from './workers';
+import type { HarnessIoClient, IoCloseSummary } from './workers';
 import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
 import type { HarnessDatabase, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
@@ -600,6 +610,13 @@ export type SessionStoreOptions = {
     // execution model is a deployment property, and a session cannot opt into a promise the
     // process did not make.
     runtime?: ServerRuntimeConfiguration;
+    // D4: the IO worker client that owns this store's durable writes. Normally LEFT OUT and
+    // created by the constructor when `runtime.ioExecution === 'worker'` (one client per
+    // database root). Supplying one is the explicit override: a host that owns the thread's
+    // lifecycle injects it, and `inline` + an injected client still means worker semantics,
+    // because an injected client IS the write path. In-memory stores (no `persistence`)
+    // refuse one: there is nothing off-loop to write.
+    io?: HarnessIoClient;
 };
 
 // Recovery wording used when a turn was running at save time. The policy is
@@ -1285,13 +1302,29 @@ export class SessionStore {
 
     private host?: LaneHost;
 
+    // D4 (R1/R2/R4): the IO worker client that performs this store's checkpoint and journal
+    // WRITES when `runtime.ioExecution === 'worker'`. One client per database root, opened in
+    // the constructor. `undefined` means inline writes - the historical path, byte-identical
+    // and still the default.
+    //
+    // The authority does NOT move with it: the store still decides what the next document and
+    // the next journal line are, and in what order (./workers/io-client.ts). What moves off
+    // this thread is the serialization and the syscalls.
+    private readonly io: HarnessIoClient | undefined;
+
+    // Cached so `drainIo()` is idempotent: `dispose()` fires the close and a host that also
+    // awaits it (start.ts / the service shutdown) gets the SAME summary, never a second close.
+    private ioClosing: Promise<IoCloseSummary> | undefined;
+
     // One authority per session id. Rebuilt whenever the session's harness object is replaced
     // (a restore, a reset), because the authority's ledgers are counters over THAT harness.
     private readonly authorities = new Map<string, LaneAuthority>();
 
-    // The memory keys each session's tools may reach, computed once per harness from the
-    // captured tool sources (./workers/capability.ts). Absent means "not computed yet".
-    private readonly memoryKeys = new Map<string, string[]>();
+    // The memory keys each session's tools may reach, computed from the captured tool sources
+    // (./workers/capability.ts) and keyed on the registry's CONTENT FINGERPRINT, so a replaced
+    // or created tool revision refreshes it instead of keeping the window captured at session
+    // build. Absent means "not computed yet"; a stale fingerprint means "recompute".
+    private readonly memoryKeys = new Map<string, { fingerprint: string; keys: string[] }>();
 
     private loading = false;
     // Shutdown guards (T13 / P1-B). `closing` is set by dispose() AFTER the one
@@ -1332,6 +1365,40 @@ export class SessionStore {
         // ./runtime.ts asserted readiness BEFORE constructing this store. A missing option is
         // inline: the historical behaviour, never a downgrade of an explicit request.
         this.runtime = options.runtime ?? DEFAULT_RUNTIME_CONFIGURATION;
+
+        // D4: open the IO worker when the deployment asked for off-loop durability. This is
+        // SYNCHRONOUS on purpose - `new SessionStore(...)` and `createHarnessRuntime` are sync
+        // (./runtime.ts:107) - and the client therefore holds every write issued before the
+        // handshake instead of dropping it. Whoever may block awaits `ioReady()` before it
+        // serves (./start.ts, ./service.ts).
+        //
+        // Rules this constructor enforces, all of them LOUD:
+        //   - `persistence === undefined` (an in-memory store) never opens a thread;
+        //   - `ioExecution: 'inline'` never opens one either, unless a client was injected;
+        //   - a missing entry, a host without `node:worker_threads`, or a protocol mismatch
+        //     THROWS `HarnessIoError` out of the constructor and aborts startup. There is no
+        //     inline fallback here, because a store that quietly went back to blocking the
+        //     event loop would make the deployment's promise a lie.
+        this.io =
+            options.io ??
+            (this.persistence === undefined || this.runtime.ioExecution !== 'worker'
+                ? undefined
+                : openHarnessIoClient({
+                      // The client commits exactly the file `HarnessPersistence` reads, so a
+                      // worker-written database is loadable by the inline reader (and vice
+                      // versa) - ./workers/io-worker-loop.ts calls the same primitives.
+                      persistence: this.persistence,
+                      ...(this.runtime.ioEntry === undefined ? {} : { entry: this.runtime.ioEntry }),
+                      // Worker-mode twin of `persistence.lastWriteError` -> the store's sticky
+                      // error and reporter. It fires only for a QUEUED save: a strict save
+                      // rejects, and `persistOrThrow` reports that itself (one failure, once).
+                      onCheckpointError: (error) => this.notePersistenceError(error),
+                      // Worker-mode twin of `journal.error`. It arrives with only a session id,
+                      // because the reply lands after the call returned - the kinds the store
+                      // CAN name (open/append/rewrite) are reported synchronously from
+                      // `journalError(id)` at their own call sites, with the inline prefixes.
+                      onJournalError: (sessionId, message) => this.noteWorkerJournalError(sessionId, message)
+                  }));
 
         if (options.database !== undefined) {
             this.loading = true;
@@ -1381,6 +1448,59 @@ export class SessionStore {
         return this.journalFailures;
     }
 
+    // D4: the IO client this store opened (`undefined` = inline writes). A host reads its
+    // `stats()`/`lastError()` the way it reads `persistenceError`: the off-loop cost and the
+    // last failed commit are deployment facts, not internals.
+    get ioWorker(): HarnessIoClient | undefined {
+        return this.io;
+    }
+
+    // True when THIS store's writes go through the IO worker. Reported rather than inferred,
+    // so a health payload can state where durability actually runs.
+    get workerIoExecution(): boolean {
+        return this.io !== undefined;
+    }
+
+    // D4: readiness of the IO worker, or `undefined` when there is nothing to wait for
+    // (inline durability / in-memory store). A worker-mode host awaits this BEFORE its first
+    // response: it rejects - the thread already terminated - on no worker support, a missing
+    // entry, a thread that failed to start, a handshake timeout, or a protocol mismatch.
+    //
+    // It is the memoized handshake promise, so awaiting it per request (the service host has
+    // no separate startup) costs one microtask after the first resolution.
+    ioReady(): Promise<void> | undefined {
+        return this.io?.ready();
+    }
+
+    // D4: graceful durability shutdown (integration contract 7).
+    //
+    // `dispose()` has already queued the final document; the client's `close()` flushes the
+    // coalesced slot, drains everything posted before its `shutdown` frame, and reports the
+    // append handles the worker fenced. Idempotent: `dispose()` fires this and a host that
+    // also awaits it receives the SAME summary.
+    //
+    // A non-empty `summary.failures` means those writes are NOT known durable. They are
+    // reported through `notePersistenceError` (never thrown: a dispose path cannot act on a
+    // failed write, but it must be able to SAY so), and the caller keeps the summary.
+    async drainIo(reason = 'store shutdown'): Promise<IoCloseSummary | undefined> {
+        if (this.io === undefined) return undefined;
+
+        if (this.ioClosing === undefined) {
+            this.ioClosing = this.io.close(reason).then((summary) => {
+                for (const failure of summary.failures) {
+                    // The sticky error ends up naming the LAST failure, the same way
+                    // `persistence.lastWriteError` reports one raw failure. Every failure is
+                    // still visible because each line is its own reported error.
+                    this.notePersistenceError(new Error(`An IO worker write did not complete: ${failure.kind}: ${failure.message}`));
+                }
+
+                return summary;
+            });
+        }
+
+        return this.ioClosing;
+    }
+
     // Sessions this load dropped, document order, each as the exact diagnostic
     // that was reported (see noteRestoreError). Empty for an in-memory store and
     // for a document whose every session rebuilt successfully.
@@ -1392,7 +1512,11 @@ export class SessionStore {
         return this.sessions.size;
     }
 
-    create(presetName: string, input?: Partial<RunnerSettings>): SessionSnapshot {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    async create(presetName: string, input?: Partial<RunnerSettings>): Promise<SessionSnapshot> {
         // Alias-aware: `writer`/`assistant` resolve to `instruct` and
         // `researcher` to `research`, so an older client keeps working. The
         // snapshot reports the canonical preset name below. Resolution consults
@@ -1487,7 +1611,7 @@ export class SessionStore {
         // forgotten. A failed write rolls the in-memory entry back so a retry
         // cannot observe a session that was never durable.
         try {
-            this.persistOrThrow();
+            await this.persistOrThrow();
         } catch (error) {
             this.sessions.delete(session.id);
             throw error;
@@ -1598,18 +1722,43 @@ export class SessionStore {
     // The memory keys this session's tools may touch, derived from the CAPTURED tool sources
     // (./workers/capability.ts). A tool that reaches the map dynamically is refused at hello
     // rather than given the whole map, so the window stays bounded.
+    //
+    // T12 hook (from the T11 report): two defects, both of which made the window smaller than
+    // the toolbox rather than wider, which is the direction that loses a lane's write:
+    //   1. The scan read `source.source` - the LEGACY `format: 'function-body'` field. Every
+    //      shipped core tool is registered as `format: 'module'` with its text in `moduleText`
+    //      plus captured helper modules in `dependencies`, so all of them scanned as
+    //      `undefined` and named no keys. That is T10 finding M5 again, one level up: the
+    //      session-level plan now uses `toolScanTextOf`, the same field-correct reader the
+    //      worker report (./lane-worker-loop.ts) and the authority's created-tool check
+    //      (./lane-authority.ts) use, so the three windows cannot drift.
+    //   2. The result was cached per session id FOREVER. `toolCreate`/`toolManage` install a
+    //      revision without replacing the harness OBJECT, so neither this cache nor the
+    //      authority cache below (keyed by object identity) noticed, and a lane created after
+    //      that install got the window from session build - a tool naming a literal key the
+    //      window never had would then have no base digest to commit against. The cache key is
+    //      now the registry's content fingerprint, built from `ToolSourceRecord.revision`
+    //      (../core/tool-source.ts:141, content-addressed over the entry, its helpers, and the
+    //      installed metadata), so any revision change recomputes the window on the next call.
     private memoryKeysFor(session: Session): string[] {
+        const sources = session.harness.toolSources();
+
+        // Sorted so the fingerprint is stable regardless of registration order; `revision`
+        // already covers the content, so no second hash is needed here.
+        const fingerprint = sources
+            .map((source) => `${source.name}\u0000${source.revision}`)
+            .sort()
+            .join('\u0001');
         const cached = this.memoryKeys.get(session.id);
 
-        if (cached !== undefined) return cached;
+        if (cached !== undefined && cached.fingerprint === fingerprint) return cached.keys;
 
-        const sources = session.harness.toolSources();
-        const installed = new Map(sources.map((source) => [source.name, source.source]));
+        const texts = new Map(sources.map((source) => [source.name, toolScanTextOf(source)]));
         const plan = planWorkerToolSurfaces(
-            Object.keys(session.harness.tools).map((name) => ({ name, source: installed.get(name) }))
+            Object.keys(session.harness.tools).map((name) => ({ name, source: texts.get(name) }))
         );
 
-        this.memoryKeys.set(session.id, plan.memoryKeys);
+        this.memoryKeys.set(session.id, { fingerprint, keys: plan.memoryKeys });
 
         return plan.memoryKeys;
     }
@@ -1681,14 +1830,25 @@ export class SessionStore {
     // Guidance for a live run goes to the lane that OWNS the run: the authority's copy of this
     // conversation is never executing, so steering it would steer nothing (T3 finding F9).
     //
-    // With no live lane the canonical answer is the honest one - the run already ended, and
-    // `steerThread` reports `queued: false` with its own reason, exactly as inline.
-    private steerOnLane(session: Session, threadId: string, input: string): HarnessThreadSteerReceipt {
-        if (this.host !== undefined && this.host.steer(session.id, { kind: 'thread', threadId }, input)) {
-            return { threadId, queued: true };
-        }
+    // T12: the lane's answer is AWAITED, and the store reports THAT - the retired version
+    // returned `queued: true` from the POST alone, which told a client its guidance was accepted
+    // by a run that had already refused it (T10 finding M6). Three honest outcomes:
+    //   - `undefined` from the host: no live lane owns this conversation, so the run already
+    //     ended and the canonical harness gives the answer - `queued: false` with its own
+    //     reason, exactly as the inline path does;
+    //   - `queued: true`: the worker's `steer.result` receipt says the guidance was taken;
+    //   - `queued: false`: the lane refused it, and the lane's reason IS the answer. Falling
+    //     back to `steerThread` here would have replaced "the run is not at a steerable point"
+    //     with "Thread is idle", a state that is not true while the lane is running.
+    private async steerOnLane(session: Session, threadId: string, input: string): Promise<HarnessThreadSteerReceipt> {
+        const host = this.host;
+        const receipt = host === undefined ? undefined : await host.steer(session.id, { kind: 'thread', threadId }, input);
 
-        return session.harness.steerThread(threadId, input);
+        if (receipt === undefined) return session.harness.steerThread(threadId, input);
+
+        if (receipt.queued) return { threadId, queued: true };
+
+        return { threadId, queued: false, ...(receipt.reason === undefined ? {} : { reason: receipt.reason }) };
     }
 
     // Register one unanswered question from the runtime. Rejections are the
@@ -1967,8 +2127,12 @@ export class SessionStore {
     // A caller that needs "the mutation is real only if it is durable" uses
     // `mutateRegistry` below instead; this stays for a host that mutates the
     // registry itself and commits afterwards.
-    persistRegistry(): void {
-        this.persistOrThrow();
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    async persistRegistry(): Promise<void> {
+        await this.persistOrThrow();
     }
 
     // T5: run a registry mutation (create / patch / DELETE) and commit it as ONE
@@ -1985,7 +2149,15 @@ export class SessionStore {
     // Failure is honest: the caller's mutation result is never returned. A write
     // failure throws the 500 from `persistOrThrow` (and a post-shutdown write throws
     // its 503), after the registry is back exactly as it was.
-    mutateRegistry<T>(mutate: () => T): T {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    //
+    // The rollback still compensates exactly once: `mutate()` is synchronous and ONLY the
+    // commit is awaited, so a failed write restores the captured snapshot before the
+    // rejection reaches the caller.
+    async mutateRegistry<T>(mutate: () => T): Promise<T> {
         // In-memory store: nothing to commit, nothing to roll back.
         if (this.persistence === undefined) return mutate();
 
@@ -1995,7 +2167,7 @@ export class SessionStore {
 
         try {
             result = mutate();
-            this.persistOrThrow();
+            await this.persistOrThrow();
         } catch (error) {
             // A HarnessRegistryError from `mutate` itself lands here too; that
             // mutation never touched the registry, so restoring the snapshot is a
@@ -2132,17 +2304,43 @@ export class SessionStore {
     // store, and saving it would destroy the graceful shutdown document. A 503 is
     // the honest answer to a request that raced the shutdown (the caller's rollback
     // then leaves in-memory state exactly as it found it).
-    private persistOrThrow(overrides?: ReadonlyMap<string, HarnessSessionRecord>): void {
+    // D4: this method is ASYNC, and that is the whole cost of "durable before the response"
+    // in worker mode. Inline it still writes synchronously (the syscall is the commit, exactly
+    // as it always was); with an IO client the document is cloned to the thread and the
+    // promise resolves only after the worker's own `rename` receipt. A caller that cannot
+    // await may NOT claim durability - which is why every strict call site awaits and the
+    // synchronous observers use `persistBestEffort`/`checkpoint` instead.
+    //
+    // `commit.fenceSessions` is the TERMINAL commit shape: the journal tail of those sessions
+    // is fsynced ahead of the document that lists those events (`io.commitCheckpoint`, whose
+    // queue order is what makes the fence precede the rename). Inline ignores it - the inline
+    // path never fsynced here, and a worker-mode fence is strictly stronger than inline, never
+    // weaker. Omitting it is byte-for-byte parity in both modes.
+    private async persistOrThrow(
+        overrides?: ReadonlyMap<string, HarnessSessionRecord>,
+        commit?: { fenceSessions?: readonly string[] }
+    ): Promise<void> {
         if (this.persistence === undefined) return;
 
         if (this.shuttingDown) {
             throw new SessionError(503, 'The harness database is closed; nothing was saved.');
         }
 
+        // Built on THIS thread either way: the coordinator owns the state, so it owns the
+        // record. What moves off-thread is the stringify and the syscalls.
+        const record = this.databaseRecord(overrides);
+        const fences = commit?.fenceSessions;
+
         try {
-            this.persistence.save(this.databaseRecord(overrides));
+            if (this.io === undefined) this.persistence.save(record);
+            else if (fences === undefined || fences.length === 0) await this.io.saveCheckpoint(record);
+            else await this.io.commitCheckpoint({ document: record, fenceSessions: fences });
+
             this.lastPersistenceError = undefined;
         } catch (error) {
+            // The message parity is deliberate: `io.saveCheckpoint` rejects with the exact
+            // text `persistence.save` throws (./workers/io-protocol.ts `ioErrorReportOf`), so
+            // a 500 body reads identically in both modes.
             this.notePersistenceError(error);
             throw new SessionError(500, `Could not save the harness database: ${messageOf(error)}`);
         }
@@ -2157,10 +2355,29 @@ export class SessionStore {
     // rewrite the file with `sessions: []` and lose every session it just
     // committed. Background work may legitimately race a shutdown; it may never
     // overwrite the shutdown document.
+    //
+    // It STAYS SYNCHRONOUS, in both modes: this is the body of a synchronous core
+    // observer (noteStateChange) and of the interval checkpoint, and neither may block.
+    // In worker mode the call therefore claims ORDER, not durability - the newest document
+    // replaces the pending slot (one commit per burst), and the rename happens later on the
+    // worker. Anything that must be durable before a response uses `persistOrThrow`.
     private persistBestEffort(): void {
         if (this.persistence === undefined) return;
 
         if (this.shuttingDown) return;
+
+        if (this.io !== undefined) {
+            this.io.queueCheckpointSave(this.databaseRecord());
+
+            // The worker-mode twin of `persistence.lastWriteError`: what the LAST SETTLED
+            // commit says. It can lag this just-queued document by one commit - the honest
+            // difference from inline, and the reason a queued failure is reported rather than
+            // thrown (`onCheckpointError` covers the case where it settles while nobody is
+            // looking).
+            this.lastPersistenceError = this.io.lastError();
+
+            return;
+        }
 
         try {
             this.persistence.save(this.databaseRecord());
@@ -2732,7 +2949,7 @@ export class SessionStore {
             // created-tool registry. Persist that before the caller sees success:
             // an acknowledged manual mutation must survive a restart.
             session.core = session.harness.snapshot();
-            this.persistOrThrow();
+            await this.persistOrThrow();
 
             return result;
         } finally {
@@ -3520,6 +3737,23 @@ export class SessionStore {
         if (this.persistence === undefined) return undefined;
         if (session.journal !== undefined) return session.journal;
 
+        // D4: in worker mode the coordinator builds a READER only. `open()` is a write (it
+        // creates the directory and appends the header line), and `append`/`flush`/`rewrite`
+        // need the held fd - which the worker owns. Two append handles on one file are two
+        // writers, so the store keeps this instance for `read()`/`exists()` (restore-side
+        // merges, which stay synchronous by design) and asks the worker to open the log
+        // through the queue.
+        if (this.io !== undefined) {
+            session.journal = new HarnessJournal(this.persistence.directory, session.id);
+            this.io.queueJournalOpen(session.id);
+
+            const queuedError = this.io.journalError(session.id);
+
+            if (queuedError !== undefined) this.noteJournalError(session, `could not open the event journal: ${queuedError}`);
+
+            return session.journal;
+        }
+
         const journal = new HarnessJournal(this.persistence.directory, session.id);
 
         journal.open();
@@ -3544,6 +3778,20 @@ export class SessionStore {
         // suppresses its publishes).
         if (session.disposed) return;
 
+        // D4: the event recorder runs on EVERY progress frame, so this stays synchronous in
+        // both modes. The append is posted in call order - the recorder's order IS the file's
+        // order - and the receipt ('written', not 'durable') arrives later. Durability of the
+        // tail is the terminal commit's fence or a `journal.flush`, never this call.
+        if (this.io !== undefined) {
+            this.io.queueJournalAppend(session.id, { turnId, index, at, event });
+
+            const queuedError = this.io.journalError(session.id);
+
+            if (queuedError !== undefined) this.noteJournalError(session, `could not append to the event journal: ${queuedError}`);
+
+            return;
+        }
+
         const journal = session.journal ?? this.attachJournal(session);
 
         if (journal === undefined) return;
@@ -3562,8 +3810,33 @@ export class SessionStore {
 
         session.journalProblems.push(message);
 
-        const report = `Session ${session.id}: ${message}`;
+        this.reportJournalFailure(`Session ${session.id}: ${message}`);
+    }
 
+    // D4: a worker-mode journal failure can also arrive on the client's reporter, from the
+    // reply to an operation the store already forgot about (a queued rewrite or remove whose
+    // failure lands a tick later). The store then knows only the session id, so the prefix is
+    // the neutral one; the kind-specific prefixes inline uses ("could not append...", "could
+    // not rewrite...") are still produced synchronously at each call site from
+    // `io.journalError(id)`, and the raw message is identical in both modes.
+    private noteWorkerJournalError(sessionId: string, message: string): void {
+        const label = `could not write the event journal: ${message}`;
+        const session = this.sessions.get(sessionId);
+
+        // A session that is already gone still keeps its failure visible: inline, the last
+        // error lives on the `HarnessJournal` instance, which outlives `remove()` the same way.
+        if (session === undefined) {
+            this.reportJournalFailure(`Session ${sessionId}: ${label}`);
+
+            return;
+        }
+
+        this.noteJournalError(session, label);
+    }
+
+    // The shared tail of both journal-report paths: the aggregate list (what
+    // `journalErrors` exposes) and the host reporter, neither of which may throw.
+    private reportJournalFailure(report: string): void {
         if (!this.journalFailures.includes(report)) this.journalFailures.push(report);
 
         if (this.onPersistenceError === undefined) return;
@@ -3738,9 +4011,14 @@ export class SessionStore {
     // deletion or a reset). Without this, a deleted turn's events could be replayed
     // onto a restart as ghost steps.
     private compactJournal(session: Session, turnIds?: Iterable<string>): void {
-        const journal = session.journal;
+        // D4: which thread holds the handle decides who writes. Inline needs the session's own
+        // `HarnessJournal` (and does nothing without one); worker mode has no writer handle on
+        // this thread at all, so the rewrite is QUEUED for the thread that owns the fd. The
+        // queue keeps it ordered against the checkpoint that follows it, and a rewrite is
+        // atomic there (tmp + fsync + rename), so the durability claim is the same.
+        const inline = this.io === undefined ? session.journal : undefined;
 
-        if (journal === undefined) return;
+        if (this.io === undefined && inline === undefined) return;
 
         const wanted = turnIds === undefined ? undefined : new Set(turnIds);
         const records: JournalEventRecord[] = [];
@@ -3760,11 +4038,24 @@ export class SessionStore {
             }
         }
 
-        journal.rewrite(records);
+        if (this.io === undefined && inline !== undefined) {
+            inline.rewrite(records);
 
-        const error = journal.error;
+            const error = inline.error;
 
-        if (error !== undefined) this.noteJournalError(session, `could not rewrite the event journal: ${error}`);
+            if (error !== undefined) this.noteJournalError(session, `could not rewrite the event journal: ${error}`);
+
+            return;
+        }
+
+        this.io?.queueJournalRewrite(session.id, records);
+
+        // The mirror of `journal.error` for the session, read the same instant the inline path
+        // would read its own handle: a rewrite that already failed is reported here, and a
+        // later one arrives through `onJournalError`.
+        const queuedError = this.io?.journalError(session.id);
+
+        if (queuedError !== undefined) this.noteJournalError(session, `could not rewrite the event journal: ${queuedError}`);
     }
 
     // PATCH /sessions/:id — retarget the model of one or more agents in THIS live
@@ -3794,7 +4085,11 @@ export class SessionStore {
     //   - `definition` stays FROZEN: it records what the session was created with.
     //     `model`/`agentModels` in a snapshot are derived from the live brains, so
     //     they report what the session runs NOW.
-    setAgentModels(id: string, agentModels: unknown): SessionSnapshot {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    async setAgentModels(id: string, agentModels: unknown): Promise<SessionSnapshot> {
         const session = this.require(id);
 
         // Members are exactly the agents a snapshot reports, so a key the client
@@ -3838,7 +4133,7 @@ export class SessionStore {
             // mid-run PATCH is still durable because the record carries the live
             // model map separately from the snapshot.
             if (!session.busy) session.core = session.harness.snapshot();
-            this.persistOrThrow();
+            await this.persistOrThrow();
         } catch (error) {
             for (const [name, model] of Object.entries(previous)) {
                 session.harness.agents[name].model(model);
@@ -4618,13 +4913,20 @@ export class SessionStore {
     // `threadId` is the FINAL trailing parameter (R1-R6). Absent opens a new
     // standalone host thread (this submit's block); a running thread is STEERED; an
     // idle/stopped thread gets a continuation turn. See SubmitTaskRequest.
-    enqueue(
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    //
+    // The 202 still does not wait for EXECUTION (see `settled`); it waits only for the
+    // accepted backlog to be durable, which is what a restart needs to keep the prompt.
+    async enqueue(
         id: string,
         rawInput: string,
         attachments?: unknown,
         references?: unknown,
         threadId?: unknown
-    ): EnqueuedTask {
+    ): Promise<EnqueuedTask> {
         const session = this.require(id);
         const validated = validateAttachmentsForSubmit(attachments);
         const input = validateInput(rawInput, validated.length);
@@ -4661,7 +4963,10 @@ export class SessionStore {
         // runtime's steer API is text-only), so such a submit falls through to a
         // queued continuation that keeps its bytes.
         if (wantedThread !== undefined) {
-            const steered = this.steerIntoThread(
+            // Awaited because the lane's steering answer is a frame round-trip (T12): the
+            // receipt, not the POST, decides whether this submit steered or became a
+            // continuation.
+            const steered = await this.steerIntoThread(
                 session,
                 wantedThread,
                 input,
@@ -4756,7 +5061,7 @@ export class SessionStore {
         // that a restart must preserve. Roll back the in-memory entry on failure so
         // a retry cannot duplicate it (including the host thread this submit opened).
         try {
-            this.persistOrThrow();
+            await this.persistOrThrow();
         } catch (error) {
             const at = session.turns.indexOf(turn);
             if (at !== -1) session.turns.splice(at, 1);
@@ -4928,7 +5233,7 @@ export class SessionStore {
         // means the command simply did not happen, and the record rolls back the same
         // way a failed enqueue does. The 500 from persistOrThrow propagates.
         try {
-            this.persistOrThrow();
+            await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
         } catch (error) {
             const at = session.turns.indexOf(turn);
             if (at !== -1) session.turns.splice(at, 1);
@@ -5090,7 +5395,7 @@ export class SessionStore {
         // kept `done`, because "done" would claim a transcript the disk refused.
         if (!session.disposed && !this.shuttingDown) {
             try {
-                this.persistOrThrow();
+                await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
             } catch (error) {
                 turn.status = 'error';
                 turn.updatedAt = Date.now();
@@ -5142,13 +5447,17 @@ export class SessionStore {
     // STEER a running thread, or return undefined when it is not running (the
     // caller then enqueues a continuation). The owning turn is returned rather
     // than a duplicate record: its event log is where the steered text lands.
-    private steerIntoThread(
+    //
+    // ASYNC because of worker mode: in line the runtime answers `steerThread` synchronously,
+    // while a lane answers its `steer.result` frame (./workers/lane-host.ts), and the store may
+    // only claim the guidance landed once one of those two says so (T12).
+    private async steerIntoThread(
         session: Session,
         threadId: string,
         input: string,
         attachments: readonly HarnessAttachment[],
         references: readonly AgentResultReference[]
-    ): EnqueuedTask | undefined {
+    ): Promise<EnqueuedTask | undefined> {
         if (!this.threadsSupported(session)) {
             throw new SessionError(400, 'This session does not support persistent threads.');
         }
@@ -5180,7 +5489,7 @@ export class SessionStore {
         let receipt;
         try {
             receipt = this.workerExecution
-                ? this.steerOnLane(session, threadId, steeredText)
+                ? await this.steerOnLane(session, threadId, steeredText)
                 : session.harness.steerThread(threadId, steeredText);
         } catch (error) {
             // A runtime refusal is a client/lifecycle error (400/429), never a 500.
@@ -5757,7 +6066,7 @@ export class SessionStore {
             // it ran with — and a preset/instruction edit made later cannot silently
             // move a number a client has already been shown (R4/R6).
             this.noteInstructionSource(session, turn.id, runAgentOf(session, turn));
-            this.persistOrThrow();
+            await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
 
             // Legacy disconnect → cancel THIS run only. Registered after the
             // controller is published and removed in the finally, so it can never
@@ -6160,7 +6469,14 @@ export class SessionStore {
     //
     // Returns true when anything was cancelled (an active run or at least one
     // queued turn). An unknown id is false; the API looks the session up first.
-    cancel(id: string, options: { all?: boolean } = {}): boolean {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    //
+    // A cancel is TERMINAL: the document names the journal tail this call just recorded, so
+    // it commits through the fenced path (`fenceSessions`), not a bare save.
+    async cancel(id: string, options: { all?: boolean } = {}): Promise<boolean> {
         const session = this.sessions.get(id);
         if (!session) return false;
 
@@ -6195,7 +6511,7 @@ export class SessionStore {
         if (options.all !== true) {
             // Write-through: an accepted cancel survives a restart (the turn is
             // restored as cancelled, not as a phantom running turn).
-            if (cancelled) this.persistOrThrow();
+            if (cancelled) await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
             return cancelled;
         }
 
@@ -6257,7 +6573,7 @@ export class SessionStore {
 
         // The dropped turns are terminal records: make that durable before the
         // response claims they were cancelled.
-        if (cancelled) this.persistOrThrow();
+        if (cancelled) await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
 
         return cancelled;
     }
@@ -6268,7 +6584,11 @@ export class SessionStore {
     // now), marks it stopped, and cascades to any thread it owns. A sibling lane is
     // untouched. `cancelled` reports whether live work was aborted or a queued turn
     // dropped; an idle thread is still marked stopped and answers false.
-    cancelThread(id: string, threadId: string, reason?: string): CancelThreadResult {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    async cancelThread(id: string, threadId: string, reason?: string): Promise<CancelThreadResult> {
         const session = this.require(id);
 
         if (!this.threadsSupported(session)) {
@@ -6372,7 +6692,7 @@ export class SessionStore {
         // waiters and any waitForIdle() caller here too.
         this.releaseTurnWaiters(session);
         this.releaseDrain(session);
-        this.persistOrThrow();
+        await this.persistOrThrow(undefined, { fenceSessions: [session.id] });
         this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
 
         return { cancelled, session: this.snapshot(session) };
@@ -6549,11 +6869,15 @@ export class SessionStore {
     //     being replaced, and a lost mid-run edit is worse than a refusal;
     //   - the write is DURABLE before the response (`persistOrThrow`), and watchers
     //     get one `snapshot` frame so a focused conversation repaints.
-    updateThreadTranscript(
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    async updateThreadTranscript(
         id: string,
         threadId: string,
         messages: unknown
-    ): UpdateThreadTranscriptResult {
+    ): Promise<UpdateThreadTranscriptResult> {
         const session = this.require(id);
 
         if (!this.transcriptSupported(session)) {
@@ -6621,7 +6945,7 @@ export class SessionStore {
         session.core = session.harness.snapshot();
         session.updatedAt = Date.now();
 
-        this.persistOrThrow();
+        await this.persistOrThrow();
         this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
 
         return {
@@ -6640,7 +6964,11 @@ export class SessionStore {
     // ORDERING: the new document is written BEFORE the live harness is touched, so
     // a failed write rolls back cleanly with nothing lost (the in-memory state and
     // the disk still describe the same session).
-    deleteThread(id: string, threadId: string): SessionSnapshot {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    async deleteThread(id: string, threadId: string): Promise<SessionSnapshot> {
         const session = this.require(id);
 
         if (!this.threadsSupported(session)) {
@@ -6907,7 +7235,7 @@ export class SessionStore {
         if (threadLabelHighWaterEntries.length === 0) delete projected.threadLabelHighWater;
         if (invalidEntries.length === 0) delete projected.invalidThreads;
 
-        this.persistOrThrow(new Map([[session.id, projected]]));
+        await this.persistOrThrow(new Map([[session.id, projected]]));
 
         // Durable: now change the runtime. Preflight above rejects every live or
         // queued conversation, so this call has nothing left to refuse. If the
@@ -6918,7 +7246,7 @@ export class SessionStore {
             session.harness.deleteThread(threadId);
         } catch (error) {
             try {
-                this.persistOrThrow(new Map([[session.id, previous]]));
+                await this.persistOrThrow(new Map([[session.id, previous]]));
             } catch {
                 // The rollback write failed; report the original refusal.
             }
@@ -7002,7 +7330,15 @@ export class SessionStore {
         return this.snapshot(session);
     }
 
-    reset(id: string): SessionSnapshot {
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    //
+    // The truncate queued below is ordered AHEAD of this save by the queue, so the document
+    // that no longer lists the forgotten turns can never land before the log stopped
+    // replaying them.
+    async reset(id: string): Promise<SessionSnapshot> {
         const session = this.require(id);
 
         // `busy`, not `status`: a manual delegate/toolCreate call holds the
@@ -7071,7 +7407,12 @@ export class SessionStore {
         // without the cache clear a stale tree could be served until the next event.
         session.projections.clear();
         session.blockCache.clear();
-        session.journal?.truncate();
+        // D4: the log restarts on whichever thread owns the append handle. The strict save
+        // below is posted AFTER this queue op, so the FIFO order is what guarantees the
+        // truncated log reaches the disk before the document that no longer lists the dropped
+        // turns (the rule ./journal.ts has always relied on, enforced by the queue).
+        if (this.io === undefined) session.journal?.truncate();
+        else this.io.queueJournalTruncate(session.id);
         session.status = 'idle';
         session.cancelled = false;
         session.lastError = undefined;
@@ -7080,7 +7421,7 @@ export class SessionStore {
 
         // The cleared transcript/records are the new durable state: persist before
         // acknowledging the reset (the old file must not come back on restart).
-        this.persistOrThrow();
+        await this.persistOrThrow();
 
         // Watchers would otherwise keep rendering turns the server just forgot.
         // A snapshot is enough: a reset deletes rows, so no upsert can express it.
@@ -7095,7 +7436,7 @@ export class SessionStore {
     // removed harness (its result is simply no longer listed). `disposed` makes
     // the pump stop and suppresses every later publish, so a removed session can
     // never leak frames.
-    remove(id: string): boolean {
+    async remove(id: string): Promise<boolean> {
         const session = this.sessions.get(id);
         if (!session) return false;
 
@@ -7105,7 +7446,7 @@ export class SessionStore {
         this.sessions.delete(id);
 
         try {
-            this.persistOrThrow();
+            await this.persistOrThrow();
         } catch (error) {
             this.sessions.set(id, session);
             throw error;
@@ -7117,7 +7458,13 @@ export class SessionStore {
         const journal = session.journal;
 
         this.disposeSession(session);
-        journal?.remove();
+
+        // D4: same order as inline (close, then remove), because the worker's `remove` also
+        // drops its cached handle - and in worker mode the coordinator may never have held one
+        // at all, so the queue op is issued by session id, not by handle.
+        if (this.io === undefined) journal?.remove();
+        else this.io.queueJournalRemove(id);
+
         return true;
     }
 
@@ -7154,6 +7501,18 @@ export class SessionStore {
         // every lane's epoch was already retired by disposeSession above, which is what makes
         // a late frame from a dying worker harmless rather than merely unlikely.
         void this.host?.close('store disposed').catch(() => undefined);
+
+        // D4: the IO queue goes last as well, after the graceful document has been queued.
+        // `close()` flushes the coalesced slot and drains every frame posted before its
+        // `shutdown`, so the document dispose() just wrote is on disk before the thread stops,
+        // and `drainIo` reports any write that did not make it.
+        //
+        // It is fire-and-forget HERE for the same reason the lane close is: `dispose()` is
+        // synchronous by contract. It is still safe - a live Worker keeps the process alive
+        // until it is terminated, so the drain cannot be truncated by an exit - and a host that
+        // must not proceed before the disk is settled awaits `drainIo()` itself (./start.ts's
+        // close path, and the worker-mode tests). Same cached promise either way.
+        void this.drainIo('store disposed').catch(() => undefined);
     }
 
     // Shared teardown for remove()/dispose(): stop execution, drop accepted work,
@@ -7243,8 +7602,16 @@ export class SessionStore {
         // R4: flush and release the append handle. The LOG ITSELF stays on disk — a
         // store shutdown must never discard durable steps — and only an explicit
         // session removal deletes it (see `remove`).
+        //
+        // D4: in worker mode the handle is the worker's, so this queues a `journal.close`
+        // (fsync + release) instead of touching the fd from here. It is ordered ahead of every
+        // later frame for this session, and `drainIo()`/`close()` fences the whole queue on the
+        // way out, so nothing recorded before a dispose can be lost silently.
         const journal = session.journal;
-        journal?.close();
+
+        if (this.io === undefined) journal?.close();
+        else this.io.queueJournalClose(session.id);
+
         session.journal = undefined;
         session.projections.clear();
         session.blockCache.clear();

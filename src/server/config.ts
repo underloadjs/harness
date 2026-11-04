@@ -35,11 +35,31 @@ import type { HarnessIndex } from './protocol';
 // quietly executed inline.
 export type ThreadExecutionMode = 'inline' | 'worker';
 
+// How the DURABLE writes get their CPU (D4). Independent of `threadExecution`: one lane
+// worker isolates a turn's CPU, this one isolates the checkpoint/journal syscalls, and a
+// deployment may want either, both, or neither.
+//
+//   - 'inline' (default) - the coordinator performs `persistence.save()` /
+//     `journal.append()` itself: whole-document stringify + mkdir/open/write/fsync/rename
+//     on the event loop that serves every other session. The historical behaviour.
+//   - 'worker'           - ONE IO worker thread per database root owns the write side
+//     (./workers/io-client.ts + ./workers/io-worker.ts). The coordinator still decides
+//     WHAT is written and in WHAT ORDER; a strict save then resolves after the worker's
+//     rename, so durability still precedes the response while the loop stays free.
+//     A queued (observer/checkpoint/journal-event) write claims ORDER, not durability.
+//
+// Like `threadExecution`, 'worker' is a promise, not a hint: a missing entry, a thread
+// that will not start, or a protocol mismatch FAILS startup. It never degrades to inline,
+// because that would leave the operator believing a blocking write is off the loop.
+export type IoExecutionMode = 'inline' | 'worker';
+
 // The server RUNTIME, kept beside (not inside) the provider settings: settings are
 // per-session and client-visible, the runtime is a deployment property and never
 // leaves the process.
 export type ServerRuntimeConfiguration = {
     threadExecution: ThreadExecutionMode;
+    // D4: where the checkpoint/journal writes run (see `IoExecutionMode`).
+    ioExecution: IoExecutionMode;
     // Reclaim a lane worker after this much idle time; 0 keeps it alive until the
     // session goes. Reclaim is always safe: the next turn rebuilds the replica from
     // the committed snapshot.
@@ -53,6 +73,11 @@ export type ServerRuntimeConfiguration = {
     // `dist/underload-harness.worker.mjs` through ./package-root.ts, which is the
     // same source-vs-bundle resolution the static UI root uses.
     workerEntry?: string;
+    // D4: explicit path to the built IO worker entry (`dist/underload-harness.io-worker
+    // .mjs`). Omitted means the resolver chain in ./workers/io-client.ts
+    // (`resolveIoWorkerEntry`), which prefers the built bundle and falls back to the
+    // source entry only when no build exists.
+    ioEntry?: string;
 };
 
 export type ServerConfiguration = {
@@ -81,6 +106,12 @@ const DEFAULT_MODEL = 'merge/ds4-flash';
 // implemented and verified: ./workers/lane-worker.test.ts measures it.
 export const DEFAULT_THREAD_EXECUTION: ThreadExecutionMode = 'inline';
 
+// D4: off-loop durability is opt-in for the same reason CPU isolation is - it changes
+// WHEN a strict write is acknowledged (an awaited round trip instead of a synchronous
+// syscall) and it needs a worker entry the build emits. `./workers/io-client.test.ts`
+// and `./io-worker-bridge.test.ts` verify the mode itself.
+export const DEFAULT_IO_EXECUTION: IoExecutionMode = 'inline';
+
 // Bounds exist so one typo cannot park every lane behind a 40-second handshake or
 // fork 400 harness replicas. They are limits, not tuning advice.
 export const WORKER_IDLE_MS_MAX = 3_600_000;
@@ -90,6 +121,7 @@ export const WORKER_HANDSHAKE_MS_MAX = 600_000;
 
 export const DEFAULT_RUNTIME_CONFIGURATION: ServerRuntimeConfiguration = {
     threadExecution: DEFAULT_THREAD_EXECUTION,
+    ioExecution: DEFAULT_IO_EXECUTION,
     workerIdleMs: 120_000,
     maxLaneWorkers: 16,
     workerHandshakeMs: 60_000
@@ -205,9 +237,19 @@ export const parseThreadExecutionMode = (raw: string | undefined, variable = 'HA
     );
 };
 
+// D4: `ioExecution` takes the same two spellings as `threadExecution`, and reuses its
+// validator so the message names the FIELD that is wrong (`HARNESS_IO_EXECUTION=workr`
+// aborts startup naming HARNESS_IO_EXECUTION, never silently becoming inline).
+export const parseIoExecutionMode = (raw: string | undefined, variable = 'HARNESS_IO_EXECUTION'): IoExecutionMode =>
+    parseThreadExecutionMode(raw, variable);
+
 // Read the runtime from the process environment. Idempotent and side-effect free.
 export const loadRuntimeConfiguration = (env: NodeJS.ProcessEnv = process.env): ServerRuntimeConfiguration => {
     const threadExecution = parseThreadExecutionMode(env.HARNESS_THREAD_EXECUTION);
+
+    // D4: the durability mode is read next to the CPU mode, because both are deployment
+    // promises and an operator sets them in one place.
+    const ioExecution = parseIoExecutionMode(env.HARNESS_IO_EXECUTION);
 
     const workerIdleMs =
         integerWithin(env.HARNESS_WORKER_IDLE_MS, 'HARNESS_WORKER_IDLE_MS', 0, WORKER_IDLE_MS_MAX) ??
@@ -229,12 +271,19 @@ export const loadRuntimeConfiguration = (env: NodeJS.ProcessEnv = process.env): 
     // then resolves the shipped bundle, which is the value that survives a rebuild.
     const entry = env.HARNESS_WORKER_ENTRY?.trim() ?? '';
 
+    // D4: `HARNESS_IO_WORKER_ENTRY` is the same variable ./workers/io-client.ts reads as
+    // an operator escape hatch; surfacing it here keeps the REPORTED runtime complete,
+    // so `startHarnessServer().runtime` says exactly which entry a worker-mode store uses.
+    const ioEntry = env.HARNESS_IO_WORKER_ENTRY?.trim() ?? '';
+
     return {
         threadExecution,
+        ioExecution,
         workerIdleMs,
         maxLaneWorkers,
         workerHandshakeMs,
-        ...(entry.length > 0 ? { workerEntry: entry } : {})
+        ...(entry.length > 0 ? { workerEntry: entry } : {}),
+        ...(ioEntry.length > 0 ? { ioEntry } : {})
     };
 };
 
@@ -251,6 +300,13 @@ export const resolveRuntimeConfiguration = (
         input.threadExecution === undefined
             ? loaded.threadExecution
             : parseThreadExecutionMode(input.threadExecution, 'threadExecution');
+
+    // D4: an explicit `ioExecution` is validated the same way, so a host option cannot
+    // smuggle in a mode the environment would have refused.
+    const ioExecution =
+        input.ioExecution === undefined
+            ? loaded.ioExecution
+            : parseIoExecutionMode(input.ioExecution, 'ioExecution');
 
     const workerIdleMs =
         input.workerIdleMs === undefined
@@ -280,12 +336,19 @@ export const resolveRuntimeConfiguration = (
 
     const entry = input.workerEntry?.trim() ?? '';
 
+    // D4: same precedence as `workerEntry` - explicit wins, a blank explicit value falls
+    // back to what the environment supplied, and an absent pair leaves the resolver in
+    // ./workers/io-client.ts free to choose (built bundle first, source entry last).
+    const ioEntry = input.ioEntry?.trim() ?? '';
+
     return {
         threadExecution,
+        ioExecution,
         workerIdleMs,
         maxLaneWorkers,
         workerHandshakeMs,
-        ...(entry.length > 0 ? { workerEntry: entry } : loaded.workerEntry === undefined ? {} : { workerEntry: loaded.workerEntry })
+        ...(entry.length > 0 ? { workerEntry: entry } : loaded.workerEntry === undefined ? {} : { workerEntry: loaded.workerEntry }),
+        ...(ioEntry.length > 0 ? { ioEntry } : loaded.ioEntry === undefined ? {} : { ioEntry: loaded.ioEntry })
     };
 };
 

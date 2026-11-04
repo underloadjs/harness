@@ -166,6 +166,18 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         }
     );
 
+    // D4: a worker-mode listener does not bind its port until the IO worker has answered the
+    // protocol handshake. `ioReady()` is `undefined` unless this store offloads durability, so
+    // an inline host is unchanged; when it is present, a rejection means the thread is already
+    // terminated and every write issued before the handshake failed with the same reason
+    // (./workers/io-client.ts, contract 8) - there is no inline fallback to fall back to.
+    //
+    // Awaiting BEFORE `http.createServer` also means a deployment with a missing worker entry
+    // never opens a socket it then has to close.
+    const readiness = store.ioReady();
+
+    if (readiness !== undefined) await readiness;
+
     const api: HarnessHandler = createHarnessHandler({
         store,
         defaults: options.defaults ?? configuration.defaults,
@@ -224,11 +236,21 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         store,
         runtime,
         ...(persistence === undefined ? {} : { persistence }),
-        close: () =>
-            new Promise<void>((resolve, reject) => {
-                store.dispose();
-                server.closeAllConnections?.();
+        close: async (): Promise<void> => {
+            // D4: `dispose()` queues the graceful document and FIRES the IO drain; awaiting
+            // `drainIo()` here - the same cached promise - is what turns "the process may exit
+            // now" into "the last document is on disk". A write that did not make it is reported
+            // through `notePersistenceError` and carried in the summary, never thrown, so the
+            // listener below is still closed.
+            store.dispose();
+
+            await store.drainIo('server close');
+
+            server.closeAllConnections?.();
+
+            await new Promise<void>((resolve, reject) => {
                 server.close((error) => (error ? reject(error) : resolve()));
-            })
+            });
+        }
     };
 };

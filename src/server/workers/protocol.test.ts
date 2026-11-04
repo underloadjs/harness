@@ -32,9 +32,13 @@ import {
 describe('lane protocol constants', () => {
     it('pins the contract a built worker bundle is checked against', () => {
         // Version 2 replaced the snapshot-sync frames with operation/receipt frames
-        // (T3 findings F7-F10). A version-1 bundle must not be accepted by a
-        // version-2 coordinator.
-        expect(LANE_PROTOCOL_VERSION).toBe(2);
+        // (T3 findings F7-F10). Version 3 is the T10 correctness round: a partial commit
+        // group now rolls EVERY operation back, `transcript:sync` / `thread:read` requests
+        // exist, a transcript delta may be pushed to a live lane, a steering refusal is its
+        // own non-terminal reply, and a registry broadcast carries the module revision in its
+        // own field. A v2 worker answers none of that correctly, so it must be refused here
+        // rather than run a turn on frames it half-understands.
+        expect(LANE_PROTOCOL_VERSION).toBe(3);
         expect(LANE_EVENT_WINDOW).toBe(32);
         expect(LANE_IDLE_MS).toBe(120_000);
         expect(LANE_MAX_WORKERS).toBe(16);
@@ -66,6 +70,9 @@ describe('frame vocabulary', () => {
             'event.ack',
             'broadcast.registry',
             'sync.memory',
+            // T10 finding M4: "canonical moved in the conversation you own - come and get the
+            // messages you are missing". A pointer, not a state document.
+            'sync.transcript',
             'dispose'
         ]) {
             expect(isLaneCommandKind(kind)).toBe(true);
@@ -84,7 +91,7 @@ describe('frame vocabulary', () => {
     });
 
     it('names the worker replies', () => {
-        for (const kind of ['event', 'mutation', 'request', 'turn-done', 'aborted', 'fault']) {
+        for (const kind of ['event', 'mutation', 'request', 'turn-done', 'aborted', 'steer.result', 'fault']) {
             expect(isLaneReplyKind(kind)).toBe(true);
             expect(isLaneCommandKind(kind)).toBe(false);
         }
@@ -92,6 +99,11 @@ describe('frame vocabulary', () => {
         // The worker never acks its own mutation: that is the coordinator's frame.
         expect(isLaneReplyKind('mutation.receipt')).toBe(false);
         expect(isLaneReplyKind('event.ack')).toBe(false);
+
+        // T10 finding M6: a steering refusal is a reply of its own, NOT a fault. A fault ends
+        // the live turn at the host, and guidance that arrived at an unsteerable moment must
+        // not destroy the run that is still executing.
+        expect(isLaneReplyKind('steer.result')).toBe(true);
     });
 });
 

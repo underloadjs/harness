@@ -269,9 +269,11 @@ const waitUntil = async (condition: () => boolean): Promise<void> => {
     throw new Error('condition was not met in time');
 };
 
-const sessionErrorOf = (run: () => unknown): { status: number; message: string } => {
+// D4: the strict store methods are async, so a refused write arrives as a REJECTION -
+// an async helper is the only way to observe its status and message. Same contract, awaited.
+const sessionErrorOf = async (run: () => unknown): Promise<{ status: number; message: string }> => {
     try {
-        run();
+        await run();
     } catch (error) {
         if (error instanceof SessionError) return { status: error.status, message: error.message };
         throw error;
@@ -280,9 +282,11 @@ const sessionErrorOf = (run: () => unknown): { status: number; message: string }
     throw new Error('expected the call to throw a SessionError.');
 };
 
-const persistenceErrorOf = (run: () => unknown): unknown => {
+// D4: the strict store methods are async, so a refused write arrives as a REJECTION -
+// an async helper is the only way to observe its status and message. Same contract, awaited.
+const persistenceErrorOf = async (run: () => unknown): Promise<unknown> => {
     try {
-        run();
+        await run();
     } catch (error) {
         return error;
     }
@@ -300,9 +304,9 @@ type Seeded = { root: string; runtime: HarnessRuntime; sessionId: string; reques
 const seeded = async (label: string, scripted: Scripted = scriptedPreset('one')): Promise<Seeded> => {
     const root = tempRoot(label);
     const runtime = runtimeOf(root, scripted.preset);
-    const created = runtime.store.create('one');
+    const created = await runtime.store.create('one');
 
-    const task = runtime.store.enqueue(created.id, 'hello');
+    const task = await runtime.store.enqueue(created.id, 'hello');
     await task.settled;
     await runtime.store.waitForIdle(created.id);
 
@@ -376,7 +380,7 @@ describe('thread transcript read/write (C4)', () => {
         // The next turn of the SAME conversation starts from the edited value: the
         // request the provider actually receives is the replacement plus the new
         // prompt, with no trace of the discarded history.
-        const continuation = runtime.store.enqueue(sessionId, 'again', undefined, undefined, 'thread-1');
+        const continuation = await runtime.store.enqueue(sessionId, 'again', undefined, undefined, 'thread-1');
         await continuation.settled;
         await runtime.store.waitForIdle(sessionId);
 
@@ -501,7 +505,7 @@ describe('thread transcript read/write (C4)', () => {
 
         // The thread is still addressable and still runnable after the restart: a
         // broken transcript never takes the conversation down with it.
-        const continuation = second.store.enqueue(sessionId, 'still here', undefined, undefined, 'thread-1');
+        const continuation = await second.store.enqueue(sessionId, 'still here', undefined, undefined, 'thread-1');
         await continuation.settled;
         await second.store.waitForIdle(sessionId);
 
@@ -864,10 +868,10 @@ describe('thread transcript route status contract (C4)', () => {
 
         const scripted = scriptedPreset('one', () => held);
         const runtime = runtimeOf(root, scripted.preset);
-        const created = runtime.store.create('one');
+        const created = await runtime.store.create('one');
 
         // Submit WITHOUT awaiting, then observe the run becoming live.
-        runtime.store.enqueue(created.id, 'hold');
+        await runtime.store.enqueue(created.id, 'hold');
         await waitUntil(() => threadOf(runtime.store.get(created.id)).status === 'running');
 
         const busy = await callApi(runtime, 'PUT', transcriptPath(created.id), {
@@ -900,22 +904,22 @@ describe('thread transcript route status contract (C4)', () => {
     it('throws the same statuses from the store methods the routes call', async () => {
         const { runtime, sessionId } = await seeded('store-contract');
 
-        expect(sessionErrorOf(() => runtime.store.updateThreadTranscript('none', 'thread-1', [])).status).toBe(
+        expect((await sessionErrorOf(async () => await runtime.store.updateThreadTranscript('none', 'thread-1', []))).status).toBe(
             404
         );
         expect(
-            sessionErrorOf(() => runtime.store.updateThreadTranscript(sessionId, 'thread-9', [])).status
+            (await sessionErrorOf(async () => await runtime.store.updateThreadTranscript(sessionId, 'thread-9', []))).status
         ).toBe(404);
-        expect(sessionErrorOf(() => runtime.store.threadTranscript('none', 'thread-1')).status).toBe(404);
-        expect(sessionErrorOf(() => runtime.store.threadTranscript(sessionId, 'thread-9')).message).toBe(
+        expect((await sessionErrorOf(() => runtime.store.threadTranscript('none', 'thread-1'))).status).toBe(404);
+        expect((await sessionErrorOf(() => runtime.store.threadTranscript(sessionId, 'thread-9'))).message).toBe(
             'Unknown thread "thread-9".'
         );
 
         // A stopped conversation is still editable — that IS the repair path.
-        runtime.store.cancelThread(sessionId, 'thread-1');
+        await runtime.store.cancelThread(sessionId, 'thread-1');
         expect(threadOf(runtime.store.get(sessionId)).status).toBe('stopped');
 
-        const stopped = runtime.store.updateThreadTranscript(sessionId, 'thread-1', [
+        const stopped = await runtime.store.updateThreadTranscript(sessionId, 'thread-1', [
             { role: 'user', content: 'repaired while stopped' }
         ]);
         expect(stopped.transcript.messages).toEqual([{ role: 'user', content: 'repaired while stopped' }]);
@@ -937,7 +941,7 @@ describe('document-level corruption stays fatal (C4 regression)', () => {
         documentSession(document, sessionId).core = 'not-a-snapshot';
         writeDocument(root, document);
 
-        const corrupted = persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
+        const corrupted = await persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
         expect(corrupted).toBeInstanceOf(HarnessPersistenceError);
         expect((corrupted as Error).message).toBe(
             `${stateFile(root)}: The harness database has an invalid shape or version: ` +
@@ -953,7 +957,7 @@ describe('document-level corruption stays fatal (C4 regression)', () => {
         documentSession(restored, sessionId).invalidThreads = { 'thread-1': { error: 7, messages: [] } };
         writeDocument(root, restored);
 
-        const malformed = persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
+        const malformed = await persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
         expect(malformed).toBeInstanceOf(HarnessPersistenceError);
         expect((malformed as Error).message).toBe(
             `${stateFile(root)}: The harness database has an invalid shape or version: ` +
@@ -966,7 +970,7 @@ describe('document-level corruption stays fatal (C4 regression)', () => {
         documentSession(notAMap, sessionId).invalidThreads = 'broken';
         writeDocument(root, notAMap);
 
-        const shaped = persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
+        const shaped = await persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
         expect(shaped).toBeInstanceOf(HarnessPersistenceError);
         expect((shaped as Error).message).toBe(
             `${stateFile(root)}: The harness database has an invalid shape or version: ` +

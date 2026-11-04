@@ -337,7 +337,12 @@ import {
     // below before any configured command. See core/command.ts.
     createBuiltinCommands,
     parseCommandLine,
-    validateCommandName
+    validateCommandName,
+    // T14: the worker-mode nested-run policy. The doors below raise the named refusal;
+    // `assertNestedRunPolicy` validates the arm written through `harness.nestedRuns(...)`.
+    // See core/nested-runs.ts.
+    assertNestedRunPolicy,
+    nestedRunUnsupportedError
 } from './core';
 import type { AgentBranchMetadata } from './core';
 import type { DiscoveredTool } from './core';
@@ -398,6 +403,7 @@ import type {
     HarnessToolSource,
     HarnessMemory,
     HarnessToolRuntime,
+    NestedRunPolicy,
     Tool,
     ToolContext,
     ToolCreation,
@@ -4074,6 +4080,167 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     let runSequence = 0;
     let activeRuns = 0;
 
+    // T14: how many TOOL BODIES are executing in THIS instance right now, as a BACKSTOP for the
+    // one path the guarded tool-context handle cannot cover: a tool defined by a HOST CLOSURE (a
+    // preset factory that re-ran inside this worker) can capture the RAW handle from its own
+    // scope, because a closure's source is never scanned (capability.ts `closure-definition`). The
+    // primary gate is the exposure itself — see `toolHandleView` below, which T15 added because a
+    // timing window cannot bind a reference the body keeps after it settles. This window is what
+    // still refuses the raw captured handle called DURING a body, while the lane's OWN root turn
+    // (no tool body in flight) stays legal.
+    let toolBodiesRunning = 0;
+
+    // T14: the nested-run policy of THIS instance (./core/nested-runs.ts owns the rule and the
+    // sentence). 'allow' is every inline harness and the library default, so an inline run is
+    // bit-for-bit what it was. A lane WORKER REPLICA arms 'refuse' once, at hello, through the
+    // `harness.nestedRuns(...)` accessor — see ./server/workers/lane-worker-loop.ts
+    // `refuseNestedRuns`, which arms EVERY lane it starts, whatever preset that lane rebuilt: the
+    // guarantee is a property of the execution mode, not of a preset opting in. Because a replica
+    // that cannot arm is a startup fault rather than a fallback, there is no worker lane running
+    // with the policy left at 'allow'.
+    //
+    // T15: under 'refuse' the refusal is a property of the EXECUTION SURFACES, not of a stack
+    // window. A tool context receives a guarded handle (`toolHandleView`), a guarded sibling view
+    // (`toolAgentsView`) and a guarded `run` closure, each of which throws the named limitation
+    // WHENEVER it is called — including from a callback that fires after the tool that captured it
+    // settled. The armed `runAgent` entry below still refuses a run nested inside another run (a
+    // child or a branch), and `toolBodiesRunning` stays only as the backstop for a RAW handle a
+    // host-defined closure captured outside the context (no source to scan).
+    //
+    // Read at CALL time (never captured), so the arm applies to every tool the registry holds —
+    // including a tool created or replaced after hello by the model or by another lane.
+    let nestedRunPolicy: NestedRunPolicy = 'allow';
+
+    const nestedRunsRefused = (): boolean => nestedRunPolicy === 'refuse';
+
+    // The ONE raise every armed door uses. `door` names what the caller holds
+    // (`context.run("summarizer")`, `harness.agents.writer.turn()`, `threadFork`, …), so the
+    // model reading a failed tool result, the hello report and a caught error all see the same
+    // named sentence.
+    const refuseNestedRun = (door: string): never => {
+        throw nestedRunUnsupportedError(door);
+    };
+
+    // The sibling registry AS A TOOL BODY SEES IT. A live brain's `turn()`/`stream()` performs a
+    // provider request and appends to THAT agent's own conversation — the same lane-private state
+    // a nested run would create, reached through a door that never passes `runAgent`. Only a
+    // REFUSING instance wraps anything: an inline harness keeps handing out the identical live
+    // registry, so nothing outside a lane changes identity or behaviour.
+    //
+    // `context.agent` (the brain running the caller) is deliberately NOT wrapped: its transcript
+    // is the conversation this lane commits, so writing it is weakened ordering, not lost state.
+    // Keyed by the BRAIN, not the registry name: a registry entry replaced after the first read
+    // must not keep serving a guard around the old instance.
+    const guardedBrains = new WeakMap<Agent, Agent>();
+
+    const guardedBrainOf = (name: string, brain: Agent): Agent => {
+        const cached = guardedBrains.get(brain);
+
+        if (cached !== undefined) return cached;
+
+        const guarded = new Proxy(brain, {
+            get: (target, property) => {
+                if (property === 'turn' || property === 'stream') {
+                    refuseNestedRun(`harness.agents.${name}.${String(property)}()`);
+                }
+
+                // Plain property reads, including the `messages` accessor: forwarding without a
+                // receiver keeps the agent's own closure state (this build's Agent never reads
+                // `this`, verified by core/agent.ts's closure-only implementation).
+                return Reflect.get(target, property);
+            }
+        });
+
+        guardedBrains.set(brain, guarded);
+
+        return guarded;
+    };
+
+    // T15: the handle a TOOL CONTEXT receives while the policy refuses, and WHY the raw one cannot
+    // be handed out. A tool body keeps whatever it is given: the T14 guard closed the nested-run
+    // doors only while a body was executing (`toolBodiesRunning`), so a body that STORED
+    // `context.harness` (or `context.agents.writer`) and called it after its own invocation had
+    // settled got the live child anyway - a lane-local conversation nobody publishes, which is the
+    // exact defect the policy exists to refuse, just later. Refusing at the EXPOSURE is permanent:
+    // the object the body holds is the guard, so WHEN it fires no longer matters.
+    //
+    // What is refused (only the members that START a conversation run on this instance):
+    //   - the callable itself — `context.harness(input)` / `ctx(...)`;
+    //   - `sendThreadInput` — runs a turn in another conversation;
+    //   - `agents` / `subagents` — the guarded brain view, so `.turn()` / `.stream()` are refused
+    //     at the read that would capture them (same rule as `context.agents`).
+    // Everything else passes through untouched, which is what the toolbox actually uses:
+    // `runtime.*` (the routed cross-thread and shared-state operations), `memory`, `tools`,
+    // `commands`, `agent`, `executeTool`, `callTool`, `registerTool`, `threads()` /
+    // `threadMessages()` reads, and `nestedRuns()` itself.
+    //
+    // Identity: an ARMED instance hands every invocation the SAME guarded view (built once, like
+    // the guarded agents view), so a tool that memoises `context.harness` still sees one object.
+    // A 'refuse' policy only ever exists on a lane replica, so an inline harness keeps receiving
+    // the strict-identical live handle exactly as before.
+    let guardedHandleView: Harness | undefined;
+
+    const toolHandleView = (): Harness => {
+        if (!nestedRunsRefused()) return handle;
+
+        if (guardedHandleView !== undefined) return guardedHandleView;
+
+        guardedHandleView = new Proxy(handle, {
+            // The callable form: a root run of THIS instance, whether fired during the body or
+            // from a callback the body left behind.
+            apply: () => refuseNestedRun('harness(...) called from a tool body'),
+            get: (target, property) => {
+                // `sendThreadInput` runs a whole turn in some other conversation. On a lane that
+                // transcript belongs to neither this lane's commit nor the authority, so the door
+                // is refused at the read - the same capture-proof rule as a brain's `turn`.
+                if (property === 'sendThreadInput') {
+                    refuseNestedRun('harness.sendThreadInput(...) called from a tool body');
+                }
+
+                // Sibling brains go through the guarded view, so `context.harness.agents.x.turn()`
+                // cannot reach an unguarded `turn` either, and `steerThread`/`stopThread`/reads on
+                // the same object keep working.
+                if (property === 'agents' || property === 'subagents') return toolAgentsView();
+
+                return Reflect.get(target, property);
+            }
+        }) as unknown as Harness;
+
+        return guardedHandleView;
+    };
+
+    let guardedAgentsView: Harness['agents'] | undefined;
+
+    // The guarded VIEW of the live registry. Built once per refusing instance and keyed through
+    // the live map, so an agent added or replaced after the view was built is still seen live
+    // (`context.agents` has always meant "resolved at call time").
+    const toolAgentsView = (): Harness['agents'] => {
+        if (!nestedRunsRefused()) return agents;
+
+        if (guardedAgentsView === undefined) {
+            guardedAgentsView = new Proxy(agents, {
+                get: (target, property) => {
+                    const value = Reflect.get(target, property);
+
+                    // Only a registry brain is wrapped; `Object.keys`, `hasOwnProperty` and the
+                    // rest of the record's own surface pass through untouched.
+                    if (
+                        typeof property === 'string' &&
+                        typeof value === 'object' &&
+                        value !== null &&
+                        Object.prototype.hasOwnProperty.call(target, property)
+                    ) {
+                        return guardedBrainOf(property, value as Agent);
+                    }
+
+                    return value;
+                }
+            }) as unknown as Harness['agents'];
+        }
+
+        return guardedAgentsView;
+    };
+
     // N6 branch state. Ephemeral, deliberately NOT part of snapshot v1. Records
     // are kept in creation order; active branch ids are the concurrency slots.
     let branchRecords: HarnessBranchRecord[] = [];
@@ -5051,11 +5218,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 const context: ToolContext = {
                     parameters,
                     agent: brain,
-                    agents,
-                    // THE live harness reference: strict identity is preserved across
-                    // replacement (the handle is created once, after startup, and is
-                    // never cloned for a tool invocation).
-                    harness: handle,
+                    // T14: the guarded sibling view — identical live registry while nested runs
+                    // are allowed, brains that refuse `turn`/`stream` on a refusing replica.
+                    agents: toolAgentsView(),
+                    // THE harness reference a tool body holds: the live handle on an inline
+                    // instance (strict identity preserved across replacement — the handle is
+                    // created once, after startup, and is never cloned for a tool invocation), and
+                    // the guarded view on a REFUSING lane replica, where every conversation-starting
+                    // member refuses whenever it is called (T15, `toolHandleView` above).
+                    harness: toolHandleView(),
                     // Nested calls resolve through the live registry at call time and
                     // inherit this invocation's cancellation/caller/thread/depth.
                     callTool: (name: string, nestedParameters: unknown) =>
@@ -5068,11 +5239,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // Always present now: a background call is always cancelable.
                     signal,
                     runDepth: run.depth,
+                    // T14: the live nested-run policy, so a tool with a real local path takes it
+                    // on a lane instead of failing on the refusal (src/harness.ts `refuseNestedRun`
+                    // is the door; ./core/nested-runs.ts is the sentence).
+                    nestedRuns: nestedRunPolicy,
                     // R2/R4: the persistent conversation this call belongs to. The
                     // runtime supplies it (never a tool argument), so threadSend can
                     // attribute the sender honestly.
                     ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
                     run: (agentName: string, input: string) => {
+                        // T14: refuse BEFORE anything is resolved, so no child thread state, no
+                        // transcript append and no provider request can exist behind the refusal.
+                        // The throw is inside THIS function, which is also why a body that
+                        // destructured or aliased `run`/`ctx.run` cannot dodge it: the alias still
+                        // calls the guarded closure. (A static scan of the same door lives in
+                        // ./server/workers/capability.ts and only names the tool in the report.)
+                        if (nestedRunsRefused()) {
+                            refuseNestedRun(`context.run("${agentName}")`);
+                        }
+
                         const target = agents[agentName];
                         if (!target) {
                             throw new HarnessError(`Agent "${agentName}" is not registered.`);
@@ -5105,12 +5290,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     }
                 };
 
-                // No local catch on purpose: core/scheduler.ts wraps this call in
-                // its own try/catch, so BOTH a synchronous throw from a raw
-                // compiled Tool-like export and an async rejection settle the task
-                // and reach deliverTask as a failed tool result. The run keeps
-                // going; only a cancellation is treated as non-failure.
-                return definition.execute(context);
+                // T14: the tool-body window. Held across the AWAIT, because a nested-run door
+                // is usually opened by an async body; the scheduler's own try/catch keeps the
+                // task settled exactly as before (no local CATCH is added here).
+                toolBodiesRunning += 1;
+
+                try {
+                    // No local catch on purpose: core/scheduler.ts wraps this call in
+                    // its own try/catch, so BOTH a synchronous throw from a raw
+                    // compiled Tool-like export and an async rejection settle the task
+                    // and reach deliverTask as a failed tool result. The run keeps
+                    // going; only a cancellation is treated as non-failure.
+                    return await definition.execute(context);
+                } finally {
+                    toolBodiesRunning -= 1;
+                }
             },
             onSettled: (task) => {
                 enqueueMailbox(run.actorKey, () =>
@@ -6592,6 +6786,48 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const ancestors = parent?.lineage ?? [];
         const branchRun = branchInternals?.branch;
 
+        // T14/T15: the CENTRAL nested-run guard. `runAgent` is the one entry point every path uses
+        // (the harness callable, ctx.run, delegate, and a branch launch), so an armed instance
+        // refuses the nesting HERE instead of trusting each call site:
+        //   - `parent !== undefined`    — a ctx.run/delegate child started inside another run;
+        //   - `branchRun !== undefined` — a threadFork/autoanswer branch, whose ephemeral branch
+        //     state a lane never publishes (the same refusal `refuseNestedRuns` applies to the
+        //     `threadFork` tool entry, so a replacement definition cannot slip a branch through);
+        //   - `toolBodiesRunning > 0 && threadState === undefined` — a ROOT run opened from inside
+        //     a tool body on the raw handle (the `harness.executeTool` / nested `callTool` paths
+        //     build a context whose `run` passes NO parent, and a host-defined closure can call the
+        //     raw callable it captured in its own scope). A body that reached the handle THROUGH ITS
+        //     CONTEXT was already refused at the exposure (`toolHandleView`), permanently; this
+        //     clause is the backstop for the raw capture. `threadState` is excluded on purpose: the
+        //     lane's own authorized turn enters here WITH a thread and no parent, and a direct tool
+        //     call running on the same replica must not make that legitimate run look like a child.
+        //
+        // T15: this window is NO LONGER the primary door-closer for a tool body. A refusing
+        // instance hands every tool context the GUARDED views (`toolHandleView` /
+        // `toolAgentsView` / the guarded `run` closure), which refuse whenever they are called — so
+        // a body that stores `context.harness` and fires it after its own call settled is refused
+        // too. The window stays as the backstop for the surface no context view can wrap: a
+        // HOST-CLOSED tool (no captured source, so ./server/workers/capability.ts reports
+        // `closure-definition`) whose factory closure kept the raw handle from its own scope.
+        //
+        // This throws before the first side effect below: no thread record, no transcript
+        // append, no actor slot and no provider request. The lane's OWN turn matches none of the
+        // three (a root/`sendThreadInput` run has no parent and no tool body in flight), so
+        // arming the policy never blocks the work a lane exists to do — only the child it must
+        // not keep to itself.
+        if (
+            nestedRunsRefused() &&
+            (parent !== undefined || branchRun !== undefined || (toolBodiesRunning > 0 && threadState === undefined))
+        ) {
+            refuseNestedRun(
+                branchRun !== undefined
+                    ? 'threadFork'
+                    : parent !== undefined
+                      ? `a nested run of agent "${brain.name}"`
+                      : 'harness(...) called from a tool body'
+            );
+        }
+
         if (ancestors.includes(brain)) {
             throw new HarnessError(
                 `Agent "${brain.name}" is already running; it cannot be re-entered (delegation cycle).`
@@ -7493,9 +7729,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         const result = await command.execute({
-            // The LIVE handle, so a command can read the registries and call tools
-            // like any other host (never a clone or a snapshot).
-            harness: handle,
+            // The handle a command holds: the LIVE handle inline, the guarded view on a REFUSING
+            // lane replica (src/harness.ts `toolHandleView`) - a slash command runs on a lane too
+            // (./server/workers/capability.ts WORKER_MODE_NOTES), and the built-ins only ever use
+            // `executeTool` plus registry reads, both of which the view passes straight through.
+            harness: toolHandleView(),
             name: parsed.name,
             args: parsed.args,
             rest: parsed.rest,
@@ -7616,15 +7854,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const context: ToolContext = {
             parameters: resolved,
-            agents,
-            harness: handle,
+            // T14: guarded sibling view (see the model path above for the rule).
+            agents: toolAgentsView(),
+            // T15: the same guarded handle view the model path gets — a nested `callTool` lands
+            // here with NO parent run, so this is the other door a retained reference used to
+            // reach after its own invocation settled.
+            harness: toolHandleView(),
             callTool: (nestedName: string, nestedParameters: unknown) =>
                 callToolInternal(nestedName, nestedParameters, options),
             ...(options.agent === undefined ? {} : { agent: options.agent }),
             ...(signal === undefined ? {} : { signal }),
             runDepth: options.runDepth ?? 1,
+            // T14: the live nested-run policy of THIS instance.
+            nestedRuns: nestedRunPolicy,
             ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
             run: (agentName: string, input: string) => {
+                // T14: this door carries NO parent run (a manual `executeTool` or a nested
+                // `callTool` is depth 1 by design), so `runAgent`'s lineage guard could not see
+                // it — the ToolContext guard is what closes it. Thrown before the agent is
+                // resolved: no child, no transcript, no provider request.
+                if (nestedRunsRefused()) {
+                    refuseNestedRun(`context.run("${agentName}")`);
+                }
+
                 const target = agents[agentName];
 
                 if (!target) {
@@ -7644,9 +7896,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
         };
 
+        // T14: hold the tool-body window across the call (see the model path).
+        toolBodiesRunning += 1;
+
         try {
             return await definition.execute(context);
         } finally {
+            toolBodiesRunning -= 1;
+
             // Same advisory boundary as executeTool: nested calls are real tool
             // executions and may have changed snapshot-managed state.
             notifyStateChange('tool_execute', {
@@ -7689,48 +7946,68 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const resolved = resolveToolParameters(definition.parameters, parameters, 'direct');
 
-        try {
-            return await definition.execute({
-                parameters: resolved,
-                // An explicit host call acts as the session's entry agent: delegate
-                // therefore stays primary-only, and ctx.run cycles and the depth rule are
-                // still enforced by runAgent.
-                agent: primary,
-                agents,
-                // Manual/nested calls receive the same LIVE harness reference. A tool
-                // must never be handed a clone or a state snapshot as a substitute.
-                harness: handle,
-                callTool: (nestedName: string, nestedParameters: unknown) =>
-                    callToolInternal(nestedName, nestedParameters, { agent: primary, runDepth: 1 }),
-                // A manual call is a top-level action (depth 1), exactly like a
-                // harness invocation; delegation and the depth rule see it that
-                // way.
-                runDepth: 1,
-                run: (agentName: string, input: string) => {
-                    const target = agents[agentName];
-                    if (!target) {
-                        throw new HarnessError(`Agent "${agentName}" is not registered.`);
-                    }
-                    // T2/R1: a MANUAL delegate call gets the same answer
-                    // extraction as the model path, so a host-triggered delegation
-                    // cannot return a blank terminal turn while the child already
-                    // answered substantively. Other manual ctx.run tools keep the
-                    // literal final-turn return.
-                    return observeToolRejection(
-                        runAgent(
-                            target,
-                            input,
-                            undefined,
-                            undefined,
-                            undefined,
-                            delegateAnswerDefinitions.has(definition)
-                                ? DELEGATE_ANSWER
-                                : undefined
-                        )
-                    );
+        // T14: the manual door gets the SAME guarded context as the model path — a
+        // session-bound `POST /tools/:name` runs its body on a lane, which is exactly how the
+        // shipped `textSummarize` reached its nested child in the T13 repro.
+        const context: ToolContext = {
+            parameters: resolved,
+            // An explicit host call acts as the session's entry agent: delegate
+            // therefore stays primary-only, and ctx.run cycles and the depth rule are
+            // still enforced by runAgent.
+            agent: primary,
+            // T14: guarded sibling view (see the model path above).
+            agents: toolAgentsView(),
+            // Manual/nested calls receive the same harness reference the model path does: the LIVE
+            // handle inline, the guarded view on a REFUSING lane replica (`toolHandleView`). A tool
+            // is never handed a clone or a state snapshot as a substitute.
+            harness: toolHandleView(),
+            callTool: (nestedName: string, nestedParameters: unknown) =>
+                callToolInternal(nestedName, nestedParameters, { agent: primary, runDepth: 1 }),
+            // A manual call is a top-level action (depth 1), exactly like a
+            // harness invocation; delegation and the depth rule see it that
+            // way.
+            runDepth: 1,
+            // T14: the live nested-run policy of THIS instance.
+            nestedRuns: nestedRunPolicy,
+            run: (agentName: string, input: string) => {
+                // T14: refuse this door before anything resolves (no parent run reaches
+                // `runAgent`'s lineage guard from here).
+                if (nestedRunsRefused()) {
+                    refuseNestedRun(`context.run("${agentName}")`);
                 }
-            });
+
+                const target = agents[agentName];
+                if (!target) {
+                    throw new HarnessError(`Agent "${agentName}" is not registered.`);
+                }
+                // T2/R1: a MANUAL delegate call gets the same answer
+                // extraction as the model path, so a host-triggered delegation
+                // cannot return a blank terminal turn while the child already
+                // answered substantively. Other manual ctx.run tools keep the
+                // literal final-turn return.
+                return observeToolRejection(
+                    runAgent(
+                        target,
+                        input,
+                        undefined,
+                        undefined,
+                        undefined,
+                        delegateAnswerDefinitions.has(definition)
+                            ? DELEGATE_ANSWER
+                            : undefined
+                    )
+                );
+            }
+        };
+
+        // T14: hold the tool-body window across the call (see the model path).
+        toolBodiesRunning += 1;
+
+        try {
+            return await definition.execute(context);
         } finally {
+            toolBodiesRunning -= 1;
+
             // Manual calls emit no progress events (they are not conversation
             // turns), so this is the ONLY notification a persistence layer gets
             // for a UI Tools-tab mutation. It fires on failure too, since a tool
@@ -7803,6 +8080,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         branch: (id: string) => {
             const record = retainedBranches().find((entry) => entry.branchId === id);
             return record === undefined ? undefined : cloneBranchRecord(record);
+        },
+        // T14 lane-worker seam: the NESTED-RUN policy of this instance, read or armed (see
+        // ./core/nested-runs.ts and `NestedRunPolicy`).
+        //
+        //   - read (`harness.nestedRuns()`) — the policy right now. A tool body reads it through
+        //     `context.nestedRuns`; the value is never a construction-time snapshot, so an arm
+        //     that lands after a tool was registered still counts;
+        //   - arm (`harness.nestedRuns('refuse')`) — what a lane WORKER REPLICA does once, at
+        //     hello, BEFORE its first turn (./server/workers/lane-worker-loop.ts
+        //     `refuseNestedRuns`). Every nested-run door then throws the named
+        //     `nested-run-unsupported` limitation instead of creating a child conversation this
+        //     replica would keep to itself.
+        //
+        // The arm is VALIDATED, never coerced: a policy the build does not recognise throws, so a
+        // worker can never believe it refused while the core still runs children privately. An
+        // inline harness never arms anything and stays exactly as it was.
+        nestedRuns: (policy?: NestedRunPolicy): NestedRunPolicy => {
+            if (policy === undefined) return nestedRunPolicy;
+
+            nestedRunPolicy = assertNestedRunPolicy(policy);
+
+            return nestedRunPolicy;
         },
         // R2 persistent threads. Reads are detached copies (a record or a
         // transcript), writes are the explicit lifecycle calls below. The default

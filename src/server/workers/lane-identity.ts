@@ -97,8 +97,34 @@ export const publishCounter = (space: IdSpace, watermark: number): number =>
 export const seedFromCounter = (space: IdSpace, counter: number): number =>
     COUNTER_SEMANTICS[space] === 'next-id' ? Math.max(0, counter - 1) : counter;
 
-// Bounds that exist in the core and must be refused BEFORE a lane mints past them.
+// The mint ceiling, i.e. the ids this ledger is allowed to hand out.
+//
+// T10 finding M1 (why `thread`/`completedOrder`/`resultSequence` are NOT here):
+// those core numbers bound LIVE RECORDS - MAX_THREAD_RECORDS is the size of the thread
+// roster, AGENT_RESULT_RETENTION is how many completed results the session keeps - while
+// this ledger counts MINTED ids, which are never reused (decision D5). A lane takes
+// LANE_THREAD_ID_LEASE (32) ids per spawn, so capping the mint at 256 made the EIGHTH
+// spawn of a session throw "The thread identity space holds at most 256 ids" with ZERO
+// threads created: eight reclaims had burned the whole id space without ever adding a
+// record. A mint cap on those spaces therefore bounds the wrong quantity twice, and the
+// first bound (the live record count) is already enforced where the live count is
+// visible: ./lane-commit.ts refuses `capacity-threads` at CanonicalBounds.maxThreads and
+// `capacity-results` at CanonicalBounds.maxResults, both read from the core constants
+// below. Reclaim-then-respawn is the normal lifecycle (workerIdleMs), so this is not a
+// theoretical leak - it is the default one.
+//
+// `createdToolCount` stays capped because it is the odd space out: the minted count IS
+// the spend (a lifetime budget of consumed creations, DEFAULT_CREATED_TOOLS_LIMIT), and
+// the fold re-checks the same number live (`capacity-tools`), so both bounds agree.
 export const ID_SPACE_CAPS: Partial<Record<IdSpace, number>> = {
+    createdToolCount: DEFAULT_CREATED_TOOLS_LIMIT
+};
+
+// Where each core bound is enforced, stated as data so a test pins the mapping instead of
+// trusting a comment: `ID_SPACE_CAPS` is what the LEDGER refuses to mint past, and
+// `LIVE_RECORD_BOUNDS` is what the FOLD refuses to grow the canonical state past. Every
+// space except the created-tool budget is bounded only in the second set.
+export const LIVE_RECORD_BOUNDS: Partial<Record<IdSpace, number>> = {
     thread: MAX_THREAD_RECORDS,
     completedOrder: AGENT_RESULT_RETENTION,
     resultSequence: AGENT_RESULT_RETENTION,

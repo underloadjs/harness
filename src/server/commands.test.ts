@@ -563,7 +563,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         pinClock();
         const fixture = scriptedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('instruct');
+        const created = await store.create('instruct');
 
         const before = store.get(created.id);
 
@@ -685,10 +685,10 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         pinClock();
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
         const id = created.id;
 
-        const running = store.enqueue(id, 'hold');
+        const running = await store.enqueue(id, 'hold');
         await fixture.started('hold').promise;
 
         const before = store.get(id);
@@ -742,7 +742,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         pinClock();
         const fixture = scriptedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('instruct');
+        const created = await store.create('instruct');
 
         // 200 001 characters: one past MAX_INPUT_LENGTH (sessions.ts line 218).
         const overLong = `/task add ${'x'.repeat(200_001)}`;
@@ -815,7 +815,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         await fixture.started('legacy').promise;
 
         for (let index = 0; index < 100; index += 1) {
-            store.enqueue(id, `queued-${index}`);
+            await store.enqueue(id, `queued-${index}`);
         }
 
         expect(store.get(id).queueDepth).toBe(100);
@@ -865,7 +865,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         expect(turnOf(store, id, accepted.body.turn.id).status).toBe('done');
 
         // Release the parked run so the fixture cannot leak a live gate.
-        store.cancel(id, { all: true });
+        await store.cancel(id, { all: true });
         fixture.gate('legacy').resolve();
         await store.waitForIdle(id);
     });
@@ -971,7 +971,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         const setClock = pinClock();
         const fixture = scriptedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('instruct');
+        const created = await store.create('instruct');
         const id = created.id;
 
         setClock(3_000);

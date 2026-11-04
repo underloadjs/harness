@@ -33,6 +33,16 @@
 //                             interception, operation derivation, commit boundaries
 //   - ./capability.ts       - what may run in worker mode at all, per harness and per tool,
 //                             with the reason and the fix
+//   - ./io-protocol.ts      - D4: the durability frames (checkpoint save, journal
+//                             open/append/flush/rewrite/truncate/remove/close) and the three
+//                             outcomes ('durable' / 'written' / 'superseded')
+//   - ./io-client.ts        - D4: the coordinator side of durability - one FIFO queue per
+//                             database root, the strict/queued split, and the handshake gate
+//   - ./io-worker.ts        - D4: the IO worker ENTRY (`@underload/harness/io-worker`), built
+//                             as the `io-worker` library entry of ../../../vite.config.ts
+//   - ./io-worker-loop.ts   - D4: the thread body: the operation table, the held journal
+//                             handles, and `startIoWorker` (called by the entry, because the
+//                             manifest says `sideEffects: false`)
 //   - ../config.ts          - the validated `threadExecution` runtime configuration (kept
 //                             with the other server settings, not here)
 //
@@ -61,6 +71,14 @@ export * from './lane-commit';
 export * from './lane-memory';
 export * from './lane-authority';
 export * from './lane-host';
+// D4 (R1/R2/R4): the IO subsystem's COORDINATOR surface - the frames and the client. The
+// ENTRY modules (./io-worker.ts and ./io-worker-loop.ts) are deliberately NOT re-exported:
+// a Worker is spawned with the FILE PATH (see `resolveIoWorkerEntry` below), never with an
+// imported symbol, and pulling the loop into every barrel importer would put `node:worker_
+// threads` and the fs-only writer loop behind unrelated imports. Same rule ./lane-worker.ts
+// follows, with the one documented exception of `startLaneWorker` for tests.
+export * from './io-protocol';
+export * from './io-client';
 export {
     assertWorkerRuntimeReady,
     assessLaneWorkerCapability,
@@ -75,11 +93,37 @@ export {
     AUTHORITY_RUNTIME_METHODS,
     LOCAL_RUNTIME_METHODS,
     LANE_FORBIDDEN_HANDLE_CALLS,
+    // T10 finding M5: the field-correct reader (moduleText, not source) that every scan must
+    // share, and T10 finding S1: the handle reads a lane replica routes to the authority. The
+    // session-level plan (../sessions.ts `memoryKeysFor`) has to use `toolScanTextOf` too -
+    // until it does, its window is computed from an unscanned toolbox.
+    LANE_ROUTED_HANDLE_READS,
+    toolScanTextOf,
     SHARED_STATE_TOOL_NAMES,
-    DELEGATION_TOOL_NAME
+    DELEGATION_TOOL_NAME,
+    // T12 (S7): the nested-run refusal. Named in the barrel because BOTH sides of the promise
+    // must quote one sentence: ../sessions.ts and ./lane-worker-loop.ts refuse the tools, the
+    // capability report discloses them, and the tests assert the disclosure.
+    NESTED_RUN_LIMITATION_CODE,
+    NESTED_RUN_TOOL_NAMES,
+    isNestedRunTool,
+    nestedRunLimitationMessage,
+    // T14: the SAME limitation on the doors a tool BODY holds. The core guard (src/harness.ts,
+    // armed by ./lane-worker-loop.ts) raises `nestedRunUnsupportedError`; the scan below names
+    // which doors a captured revision reaches, and the two wordings say honestly which of them
+    // the runtime refuses versus what must be refused before the tool runs.
+    NESTED_RUN_ARMED_DOORS,
+    LANE_NESTED_RUN_DOORS,
+    reachesNestedRunDoors,
+    nestedRunDoorReason,
+    nestedRunDoorWarning,
+    nestedRunRefusalMessage,
+    nestedRunUnsupportedError
 } from './capability';
-export type { AuthorityRuntimeMethod, LaneWorkerCapability, LocalRuntimeMethod, ToolPlacement, ToolSurface, WorkerToolPlan } from './capability';
+export type { AuthorityRuntimeMethod, LaneWorkerCapability, LocalRuntimeMethod, NestedRunDoor, ToolPlacement, ToolSurface, WorkerToolPlan } from './capability';
 // The worker-side helpers, exported for tests (the entry itself is only ever spawned).
 // `startLaneWorker` is the loop attach point; importing it has no side effects.
-export { deriveOperations, installAuthorityRuntime, startLaneWorker } from './lane-worker-loop';
+// `refuseNestedRuns` is the replica-shaping step (S7), exported so a test can prove the
+// registry entries and the `runtime.delegate` route are both gone.
+export { deriveOperations, installAuthorityRuntime, nestedRunHandshakeLimitations, refuseNestedRuns, startLaneWorker } from './lane-worker-loop';
 export type { LaneWorkerState } from './lane-worker-loop';

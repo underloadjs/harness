@@ -208,6 +208,7 @@ describe('configuration wiring', () => {
             // worker variable, and the isolation helper clears any inherited one.
             runtime: {
                 threadExecution: 'inline',
+                ioExecution: 'inline',
                 workerIdleMs: 120_000,
                 maxLaneWorkers: 16,
                 workerHandshakeMs: 60_000
@@ -241,6 +242,7 @@ describe('configuration wiring', () => {
             },
             runtime: {
                 threadExecution: 'inline',
+                ioExecution: 'inline',
                 workerIdleMs: 120_000,
                 maxLaneWorkers: 16,
                 workerHandshakeMs: 60_000

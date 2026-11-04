@@ -1317,6 +1317,37 @@ export type LocationStoreState = {
 // own: `read(['package.json'])` runs the same implementation with no agent, no
 // registry, and no run(). A tool that needs them must check, and the presets in
 // src/tools deliberately do not.
+// T14/T15: whether a nested agent run may start in THIS harness instance.
+//
+//   - 'allow'  — the default, and the only value an inline harness ever holds: `delegate`,
+//                `threadFork` and a tool's `context.run(...)` all start a child conversation
+//                whose record and transcript live in the same harness that publishes them, and a
+//                tool receives the strict-identical live `context.harness`;
+//   - 'refuse' — armed ONCE, before the first turn, on EVERY lane WORKER REPLICA by
+//                `src/server/workers/lane-worker-loop.ts` `refuseNestedRuns`. The arm is not a
+//                preset option: it follows from the execution mode, and a replica whose build has
+//                no nested-run seam FAULTS the handshake instead of quietly running children on a
+//                private copy. A child started inside a lane is invisible to the canonical session
+//                (its thread record and its transcript live only in that replica, and a lane
+//                commit publishes only the target conversation's tail, its declared memory window
+//                and its terminal result archives), so every nested-run door throws the named
+//                `nested-run-unsupported` limitation BEFORE the child, its transcript or its
+//                provider request exists. Explicit refusal, never a private child.
+//
+// The doors 'refuse' closes are refused at the SURFACES, not at a stack depth (T15): a refusing
+// instance builds every tool context from `toolHandleView` (the callable, `sendThreadInput` and
+// the sibling brains refuse whenever they are reached), `toolAgentsView`, and a guarded `run`
+// closure, so storing one of those references and calling it after the tool's own invocation
+// settled is refused exactly like calling it inside the body. `runAgent` still refuses a run
+// nested inside another run or a branch, and the tool-body window remains as the backstop for a
+// RAW handle a host-defined closure (no scanned source) captured in its own scope.
+//
+// The code and the refusal sentence live in src/core/nested-runs.ts; the doors live in
+// src/harness.ts. Cross-references: ToolContext.nestedRuns, ToolContext.harness,
+// Harness.nestedRuns, and src/server/workers/capability.ts (the hello report's door scan +
+// limitation entries).
+export type NestedRunPolicy = 'allow' | 'refuse';
+
 export type ToolContext<TParameters = any> = {
     // The parameter value. For a schema with several properties this is the
     // parsed arguments object; for a schema with exactly one property it is that
@@ -1355,12 +1386,23 @@ export type ToolContext<TParameters = any> = {
     // cross-thread message cannot be spoofed by the model. Absent for a manual
     // `executeTool` call, which runs as the primary agent outside any thread.
     threadId?: string;
-    // The LIVE harness instance this call belongs to. This is the ORIGINAL
-    // reference created at startup, never a clone, spread, serialized copy, or
-    // replacement harness. It is present for every harness invocation (model,
-    // manual executeTool, nested callTool) and absent for a standalone direct
-    // `tool()(args)` call. A replacement tool therefore receives strict-identical
-    // harness identity to the tool it replaced.
+    // The LIVE harness instance this call belongs to. On an INLINE harness this is the ORIGINAL
+    // reference created at startup, never a clone, spread, serialized copy, or replacement
+    // harness: a replacement tool therefore receives strict-identical harness identity to the tool
+    // it replaced.
+    //
+    // T15 EXCEPTION (nested runs refused): while the instance's policy is 'refuse' — which only
+    // ever happens on a lane worker replica (see `NestedRunPolicy`) — the reference is a stable
+    // GUARDED VIEW over that same live handle, created once per instance (so every invocation on
+    // the lane sees one identical object). Everything a lane toolbox actually needs passes through
+    // untouched — `runtime.*` (the routed cross-thread and shared-state operations), `memory`,
+    // `tools`, `commands`, `agent`, `executeTool`, `callTool`, `registerTool`, `threads()` /
+    // `threadMessages()` reads and `nestedRuns()` — and the members that would START a conversation
+    // on that replica (the callable itself, `sendThreadInput`, and the brains under `agents` /
+    // `subagents` with their `turn()` / `stream()`) throw the named `nested-run-unsupported`
+    // limitation WHENEVER they are reached, including from a callback the body kept after its own
+    // call settled. The view is not a stub and not a snapshot: it is the live handle with those
+    // doors closed, because a child conversation started on a lane is never published.
     harness?: Harness;
     // Invoke another REGISTERED tool through the live registry, preserving schema
     // validation, caller/thread identity, cancellation, and state-change
@@ -1368,6 +1410,19 @@ export type ToolContext<TParameters = any> = {
     // is observed rather than a fixed imported implementation. Available only
     // inside a harness invocation (it is bound to the current run/call context).
     callTool?: (name: string, parameters: unknown) => Promise<unknown>;
+    // T14: the live NESTED-RUN policy of the harness running this call (see
+    // `NestedRunPolicy`). Present whenever a harness runs the tool — a standalone
+    // `tool()(args)` call has no harness, and therefore no nested-run question to
+    // answer — and its value is this instance's policy at CALL time, never a
+    // snapshot from construction.
+    //
+    // WHY A TOOL NEEDS IT: a lane worker refuses a nested run, so `run(...)` throws
+    // rather than answering. A tool with a real LOCAL path (the shipped
+    // `textSummarize` condenses the notes itself) should take that path on a lane
+    // instead of turning an unsupported capability into a failed call. Check the
+    // policy, or catch the named refusal — never assume `run` exists just because
+    // this harness does.
+    nestedRuns?: NestedRunPolicy;
 };
 
 // WHEN a finished call of this tool is allowed to start the next agent turn
@@ -2665,6 +2720,20 @@ export type Harness = {
     // an id the coordinator has already leased to somebody else. Supplied values never lower
     // a counter; the returned object is the actual state afterwards.
     reserveIdentity: (input: HarnessIdentityReservation) => HarnessIdentityReservation;
+    // T14 lane-worker seam: read or arm this instance's NESTED-RUN policy (see
+    // `NestedRunPolicy`, whose own comment states the whole rule).
+    //
+    //   - `harness.nestedRuns()` — the current policy;
+    //   - `harness.nestedRuns('refuse')` — armed ONCE by a lane worker replica at hello,
+    //     before its first turn (`src/server/workers/lane-worker-loop.ts` `refuseNestedRuns`),
+    //     which is what makes every nested-run door throw the named `nested-run-unsupported`
+    //     limitation instead of creating a child conversation this replica would keep to itself;
+    //   - an unrecognised value THROWS (validated, never coerced), so a worker cannot believe it
+    //     armed while the core still runs children privately.
+    //
+    // An inline harness never arms anything, so every door behaves exactly as it always did.
+    // A tool body reads the same policy without touching the handle: `context.nestedRuns`.
+    nestedRuns: (policy?: NestedRunPolicy) => NestedRunPolicy;
     // Open an independent conversation owned by `agent`. Throws for an unknown
     // agent or an invalid/blank label, and when an `ownerThreadId` names no
     // thread in this harness.

@@ -8,6 +8,9 @@
 //   src/server/index.ts   -> dist/underload-harness.server.mjs  (@underload/harness/server)
 //   src/frontend/index.ts -> dist/underload-harness.frontend.mjs(@underload/harness/frontend)
 //   src/shared/index.ts   -> dist/underload-harness.shared.mjs  (@underload/harness/shared)
+//   src/server/workers/io-worker.ts -> dist/underload-harness.io-worker.mjs
+//                                     (@underload/harness/io-worker - D4, an EXECUTABLE entry:
+//                                     the IO worker ./workers/io-client.ts spawns)
 //
 // Why two builds: a browser cannot load the server tree (`node:http`, sessions,
 // presets) OR the Node-only source compiler (`node:fs`, TypeScript). A single
@@ -145,7 +148,15 @@ const nodeConfig: UserConfig = {
                 // HARNESS_WORKER_ENTRY). Keeping it in the same build as the server entry is
                 // deliberate - both evaluate the same session graph, and the bundler resolves
                 // the worker's dynamic import into a sibling chunk in dist/.
-                worker: entry('./src/server/workers/lane-worker.ts')
+                worker: entry('./src/server/workers/lane-worker.ts'),
+                // D4 (R1/R2/R4): the IO-worker ENTRY - the durability arm. Also an executable,
+                // never an API: ./src/server/workers/io-client.ts spawns a Worker with this
+                // file's path (`@underload/harness/io-worker`, `HARNESS_IO_WORKER_ENTRY`, or
+                // `runtime.ioEntry`). The chunk KEY is load-bearing: `entryFileNames` below turns
+                // it into `underload-harness.io-worker.mjs`, which is exactly the filename
+                // `IO_WORKER_DIST_FILE` / `ioWorkerEntryCandidates` look for. Rename this key and
+                // the resolver stops finding the bundle - src/structure.test.ts pins the pairing.
+                'io-worker': entry('./src/server/workers/io-worker.ts')
             },
             formats: ['es']
         },

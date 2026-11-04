@@ -189,9 +189,9 @@ describe('a live delegated run rendered by the real board (R17/R18/R19/R20)', ()
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't20-board-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegatingPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 
@@ -299,9 +299,9 @@ describe('a live delegated run rendered by the real board (R17/R18/R19/R20)', ()
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't20-board-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegatingPreset()], persistence);
-        const created = store.create('lead');
+        const created = await store.create('lead');
 
-        const task = store.enqueue(created.id, 'delegate please');
+        const task = await store.enqueue(created.id, 'delegate please');
         await task.settled;
         await store.waitForIdle(created.id);
 

@@ -368,7 +368,7 @@ describe('queued attachments dispatch and persist', () => {
     it('carries a valid image through the legacy run() trailing parameter', async () => {
         const seen: SeenTurn[] = [];
         const runtime = runtimeOf(recordingPreset('media', seen));
-        const created = runtime.store.create('media');
+        const created = await runtime.store.create('media');
         const attachment = imageAttachment();
 
         // Positional proof: the 4th argument is still the options object and the
@@ -383,10 +383,10 @@ describe('queued attachments dispatch and persist', () => {
         const root = tempRoot('queue');
         const seen: SeenTurn[] = [];
         const runtime = runtimeOf(recordingPreset('media', seen), root);
-        const created = runtime.store.create('media');
+        const created = await runtime.store.create('media');
         const attachment = imageAttachment();
 
-        const task = runtime.store.enqueue(created.id, '  Look at [Image 1]  ', [attachment]);
+        const task = await runtime.store.enqueue(created.id, '  Look at [Image 1]  ', [attachment]);
 
         // The accepted 202 copy is detached: mutating it cannot rewrite the turn.
         expect(task.turn).toEqual({
@@ -442,14 +442,14 @@ describe('queued attachments dispatch and persist', () => {
         const seen: SeenTurn[] = [];
         const fixture = gatedPreset('gated', seen);
         const first = runtimeOf(fixture.preset, root);
-        const created = first.store.create('gated');
+        const created = await first.store.create('gated');
         const attachment = imageAttachment();
 
         // Hold the legacy run so the attachment task stays queued on disk.
         void first.store.run(created.id, 'hold', async () => {});
         await fixture.started;
 
-        const queued = first.store.enqueue(created.id, '', [attachment]);
+        const queued = await first.store.enqueue(created.id, '', [attachment]);
         expect(queued.turn.status).toBe('queued');
         expect(queued.turn.prompt).toBe('');
         expect(queued.turn.attachments).toEqual([attachment]);
@@ -472,7 +472,7 @@ describe('queued attachments dispatch and persist', () => {
         // that SAME conversation; it executes the restored turn FIRST, with its
         // persisted bytes, then the new text turn.
         expect(restored.turns[1]!.threadId).toBe('thread-1');
-        const kick = second.store.enqueue(created.id, 'after restart', undefined, undefined, 'thread-1');
+        const kick = await second.store.enqueue(created.id, 'after restart', undefined, undefined, 'thread-1');
         await kick.settled;
 
         // R1-R6: the blank attachment task runs in its own persistent thread, and a
@@ -499,16 +499,16 @@ describe('attachment validation rejects before mutation', () => {
     it('accepts blank input only with a valid attachment and keeps the text cap', async () => {
         const seen: SeenTurn[] = [];
         const runtime = runtimeOf(recordingPreset('media', seen));
-        const created = runtime.store.create('media');
+        const created = await runtime.store.create('media');
 
-        expect(() => runtime.store.enqueue(created.id, '   ')).toThrow(SessionError);
-        expect(() => runtime.store.enqueue(created.id, '   ')).toThrow('A task cannot be empty.');
-        expect(() => runtime.store.enqueue(created.id, 'x'.repeat(200_001), [imageAttachment()])).toThrow(
+        await expect(runtime.store.enqueue(created.id, '   ')).rejects.toThrow(SessionError);
+        await expect(runtime.store.enqueue(created.id, '   ')).rejects.toThrow('A task cannot be empty.');
+        await expect(runtime.store.enqueue(created.id, 'x'.repeat(200_001), [imageAttachment()])).rejects.toThrow(
             'A task cannot exceed 200000 characters.'
         );
         expect(runtime.store.get(created.id).turns).toEqual([]);
 
-        const task = runtime.store.enqueue(created.id, '   ', [imageAttachment()]);
+        const task = await runtime.store.enqueue(created.id, '   ', [imageAttachment()]);
         // The user-facing record stays the raw blank prompt; only the RUN text a
         // persistent thread requires becomes the marker.
         expect(task.turn.prompt).toBe('');
@@ -518,7 +518,7 @@ describe('attachment validation rejects before mutation', () => {
 
     it('maps malformed, wrong-signature, and oversized media to 400/415/413 with nothing queued', async () => {
         const runtime = runtimeOf(recordingPreset('media', []));
-        const created = runtime.store.create('media');
+        const created = await runtime.store.create('media');
         const baseline = runtime.store.get(created.id).turns;
 
         const malformed = imageAttachment({ data: 'not-base64!' });
@@ -560,7 +560,7 @@ describe('attachment validation rejects before mutation', () => {
         for (const entry of cases) {
             let thrown: unknown;
             try {
-                runtime.store.enqueue(created.id, 'x', [entry.attachment]);
+                await runtime.store.enqueue(created.id, 'x', [entry.attachment]);
             } catch (error) {
                 thrown = error;
             }
@@ -571,15 +571,15 @@ describe('attachment validation rejects before mutation', () => {
             expect(runtime.store.get(created.id).turns).toEqual(baseline);
         }
 
-        expect(() => runtime.store.enqueue(created.id, 'x', tooMany)).toThrow(
+        await expect(runtime.store.enqueue(created.id, 'x', tooMany)).rejects.toThrow(
             'attachments may contain at most 4 entries; received 5.'
         );
         expect(runtime.store.get(created.id).turns).toEqual(baseline);
     });
 
-    it('rejects a turn whose attachments exceed the total byte budget', () => {
+    it('rejects a turn whose attachments exceed the total byte budget', async () => {
         const runtime = runtimeOf(recordingPreset('media', []));
-        const created = runtime.store.create('media');
+        const created = await runtime.store.create('media');
 
         // Three clips under the per-clip cap but together over the 8 MiB budget.
         const each = Math.ceil((8 * 1024 * 1024) / 3) + 1;
@@ -593,7 +593,7 @@ describe('attachment validation rejects before mutation', () => {
             })
         );
 
-        expect(() => runtime.store.enqueue(created.id, 'x', attachments)).toThrow(
+        await expect(runtime.store.enqueue(created.id, 'x', attachments)).rejects.toThrow(
             `attachments total ${each * 3} bytes, above the ${8 * 1024 * 1024}-byte per-turn limit.`
         );
         expect(runtime.store.get(created.id).turns).toEqual([]);

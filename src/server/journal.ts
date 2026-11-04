@@ -30,21 +30,29 @@
 //     (`persistOrThrow`, ./sessions.ts:1561), and `flush()`/`rewrite()`/`open()`
 //     record errors the same way instead of throwing at the run.
 //
-// Durability levels, stated exactly (R4):
+// Durability levels, stated exactly (R4/D4):
 //   - `append` is `writeSync` on a held fd: safe across a PROCESS crash, not fenced
 //     against a power loss. This is the level the store has always relied on, and the
-//     store does not call `flush()` except at dispose (./sessions.ts:6954), so worker
-//     mode changes nothing there.
+//     inline store still never calls `flush()` itself (only `close()` at dispose, which
+//     flushes first), so `ioExecution: 'inline'` changes nothing here.
 //   - `flush()` is the fsync fence. A caller that wants "every event of this turn is
 //     on stable storage before the response" awaits a flush (the IO client exposes it
 //     as an operation ordered ahead of the checkpoint that references those events).
+//     D4 ADOPTS IT: a terminal store commit (`persistOrThrow(undefined, { fenceSessions:
+//     [session.id] })` at a cancel / cancelThread / turn-start / command-terminal site)
+//     maps to `io.commitCheckpoint`, which fences that session's tail before the rename.
+//     That is STRICTER than inline, never weaker - inline keeps its existing levels.
 //   - `rewrite()` is now fsync-then-rename: a compaction publishes complete bytes.
 //
-// WORKER MODE (R1): who calls what
-// --------------------------------
-// `threadExecution: 'worker'` routes every WRITE below to one IO worker thread
+// WORKER MODE (R1/D4): who calls what
+// ------------------------------------
+// WHEN an io client owns a journal, writes go to one IO worker thread
 // (./workers/io-worker.ts), which instantiates THIS class verbatim and holds the append
-// fd there. Consequences a caller must respect:
+// fd there. That is no longer hypothetical: `SessionStore` opens a client whenever
+// `runtime.ioExecution === 'worker'` (./sessions.ts, D4), and in that mode the coordinator
+// keeps a journal instance ONLY as a reader - it never calls a write method on it. With the
+// default `ioExecution: 'inline'` nothing changes: one process, one thread, one writer.
+// Consequences a caller must respect either way:
 //   - Do not call `open`/`append`/`flush`/`rewrite`/`truncate`/`remove`/`close` on a
 //     coordinator-side instance while a worker owns the same session: two append
 //     handles on one file is a second writer, which is exactly what the FIFO queue

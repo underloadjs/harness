@@ -16,7 +16,10 @@
 //   2. `createHarnessRuntime({ root })` binds the durable database to that absolute
 //      root, and a session created through its API persists under it;
 //   3. `startHarnessServer({ databaseRoot, port: 0 })` serves the harness index and a
-//      session POST over real HTTP, persists under that root, and closes its listener.
+//      session POST over real HTTP, persists under that root, and closes its listener;
+//   4. D4: the `./io-worker` subpath is published, its bundle exists, and the shipped entry
+//      handshakes, commits a checkpoint, appends and fences a journal line IN A THREAD - after
+//      which the built server's own reader loads what that thread wrote.
 //
 // Safety: loopback + port 0 only (never a fixed or production port), no signal
 // handlers, no machine-environment changes, and no `.env` value is ever printed —
@@ -39,6 +42,9 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+// D4: the IO worker check spawns the SHIPPED entry in a real thread, exactly as
+// ./src/server/workers/io-client.ts does in the running server.
+import { Worker } from 'node:worker_threads';
 import {
     BUILD_ROOT,
     EDITABLE_SOURCE_ROOT,
@@ -220,6 +226,128 @@ try {
         });
     }
 }
+
+// 4. D4: the IO worker EXECUTABLE. A second shipped entry means a second artifact that must
+// actually RUN in a thread: importing cleanly proves nothing, and `sideEffects: false` makes a
+// tree-shaken entry that never answers `hello` a real failure mode (measured during T9). This
+// drives the built bundle the way ./src/server/workers/io-client.ts does - boot marker in
+// `workerData`, `hello`, one checkpoint, one journal append + fence - and then makes the built
+// SERVER read what the built WORKER wrote.
+const IO_WORKER_FILE = 'underload-harness.io-worker.mjs';
+
+// Mirrors ./src/server/workers/io-protocol.ts (`IO_PROTOCOL_VERSION`, `IO_WORKER_BOOT_KEY`).
+// ./src/structure.test.ts pins the manifest half of the pairing, so a rename on one side fails
+// a check rather than producing a server that silently persists on its own loop.
+const IO_PROTOCOL_VERSION = 1;
+const IO_BOOT_KEY = 'harnessIoWorker';
+
+await check('the io-worker entry is published as its own subpath', () => {
+    const manifest = readPackageManifest(PACKAGE_ROOT);
+    const entry = manifest.exports?.['./io-worker'];
+
+    assert(entry !== undefined, '`exports` has no "./io-worker" subpath');
+    assert(entry.import === `./${BUILD_ROOT}/${IO_WORKER_FILE}`, `./io-worker does not resolve to ${BUILD_ROOT}/${IO_WORKER_FILE}: ${JSON.stringify(entry)}`);
+    assert(typeof entry.types === 'string' && entry.types.endsWith('.d.ts'), './io-worker declares no .d.ts target');
+    assert(existsSync(path.join(DIST, IO_WORKER_FILE)), `dist/${IO_WORKER_FILE} is missing — vite.config.ts must keep the "io-worker" library entry`);
+    assert(existsSync(path.join(DIST, 'server', 'workers', 'io-worker.d.ts')), 'the io-worker declaration was not emitted');
+
+    return { runtime: entry.import, types: entry.types };
+});
+
+const ioRoot = path.join(work, 'io-root');
+const ioDirectory = path.join(ioRoot, 'harness');
+const ioState = path.join(ioDirectory, 'state.json');
+const ioSession = 'io-smoke-session';
+
+await check('the built io-worker commits, journals and fences off-thread', async () => {
+    // A `URL`, not a `file://` string: Node rejects the string form. This mirrors
+    // ./src/server/workers/io-client.ts, which spawns with `pathToFileURL(entry)`.
+    const worker = new Worker(pathToFileURL(path.join(DIST, IO_WORKER_FILE)), {
+        // The boot marker is what makes the entry self-start its message loop at all; without it
+        // the thread imports, answers nothing, and exits 0.
+        workerData: { [IO_BOOT_KEY]: IO_PROTOCOL_VERSION, maxFrameBytes: 4 * 1024 * 1024 }
+    });
+
+    try {
+        // One frame in, one reply out, matched by kind AND callId: the ordering contract, asserted
+        // against the shipped bundle rather than a source file.
+        const call = (frame) =>
+            new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error(`the io-worker never answered ${frame.kind}`));
+                }, 60_000);
+
+                worker.once('error', (error) => {
+                    clearTimeout(timer);
+                    reject(error);
+                });
+                worker.once('message', (reply) => {
+                    clearTimeout(timer);
+                    resolve(reply);
+                });
+                worker.postMessage(frame);
+            });
+
+        const hello = await call({ kind: 'hello', callId: 0 });
+
+        assert(hello.kind === 'hello' && hello.ok === true && hello.version === IO_PROTOCOL_VERSION, `handshake: ${JSON.stringify(hello)}`);
+
+        const saved = await call({
+            kind: 'checkpoint.save',
+            callId: 1,
+            target: { directory: ioDirectory, file: ioState },
+            document: { version: IO_PROTOCOL_VERSION, savedAt: 1_700_000_000_000, registry: [], sessions: [] },
+            savedAt: 1_700_000_000_000
+        });
+
+        // A checkpoint answers 'durable': fsynced staging plus atomic rename, never a partial
+        // write (./src/server/persistence.ts is the only writer of this format).
+        assert(saved.kind === 'result' && saved.ok === true && saved.outcome === 'durable', `checkpoint.save: ${JSON.stringify(saved)}`);
+
+        for (const frame of [
+            { kind: 'journal.open', callId: 2, target: { root: ioDirectory, sessionId: ioSession } },
+            {
+                kind: 'journal.append',
+                callId: 3,
+                target: { root: ioDirectory, sessionId: ioSession },
+                record: { turnId: 'turn-1', index: 0, at: 1_700_000_000_001, event: { type: 'text', agent: 'demo', delta: 'from the built bundle' } }
+            },
+            { kind: 'journal.flush', callId: 4, target: { root: ioDirectory, sessionId: ioSession } }
+        ]) {
+            const reply = await call(frame);
+
+            assert(reply.kind === 'result' && reply.ok === true, `${frame.kind}: ${JSON.stringify(reply)}`);
+        }
+
+        const bye = await call({ kind: 'shutdown', callId: 5 });
+
+        assert(bye.kind === 'bye' && bye.ok === true, `shutdown: ${JSON.stringify(bye)}`);
+
+        // RELOAD, by the built server's own readers: the checkpoint parses as a database, and the
+        // journal file holds the header line plus exactly the event the worker was told to write.
+        const runtime = server.createHarnessRuntime({ root: ioRoot, loadEnvironment: false });
+
+        assert(runtime.persistence !== undefined, 'the built runtime bound no persistence');
+
+        const loaded = runtime.persistence.load();
+
+        assert(loaded?.version === IO_PROTOCOL_VERSION, 'the worker-written document did not load');
+        assert(Array.isArray(loaded.sessions) && loaded.sessions.length === 0, 'the reloaded sessions array is wrong');
+        assert(runtime.persistence.lastWriteError === undefined, `lastWriteError: ${runtime.persistence.lastWriteError}`);
+
+        const lines = readFileSync(path.join(ioDirectory, 'sessions', ioSession, 'events.jsonl'), 'utf8')
+            .split('\n')
+            .filter((line) => line.length > 0)
+            .map((line) => JSON.parse(line));
+
+        assert(lines[0]?.type === 'header' && lines[0].sessionId === ioSession, `journal header: ${JSON.stringify(lines[0])}`);
+        assert(lines[1]?.type === 'event' && lines[1].event?.delta === 'from the built bundle', `journal event: ${JSON.stringify(lines[1])}`);
+
+        return { bytes: saved.bytes, journalLines: lines.length };
+    } finally {
+        await worker.terminate();
+    }
+});
 
 if (!keep) rmSync(work, { recursive: true, force: true });
 

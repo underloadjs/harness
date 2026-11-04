@@ -19,7 +19,8 @@
 //
 // Cross-references:
 //   - ../tsconfig.build.json — emits dist/<entry>.d.ts for these entries
-//   - ../vite.config.ts      — the five library entries
+//   - ../vite.config.ts       — the six library entries (browser root, then index/
+//     server/frontend/shared plus the `worker` lane-worker executable)
 //   - ../package.json        — "exports" asserted below
 //   - ./server/service-start.test.ts — the end-to-end proof that the real service
 //     gateway serves /v1/harness from the moved endpoint folder
@@ -119,6 +120,24 @@ describe('package layout', () => {
                 import: './dist/underload-harness.server.mjs',
                 default: './dist/underload-harness.server.mjs'
             },
+            // T5 (R1): the lane-worker EXECUTABLE. It is published as a subpath so an
+            // installed host can spawn `dist/underload-harness.worker.mjs` by specifier;
+            // ./../vite.config.ts emits it as a library entry named `worker`.
+            './worker': {
+                types: './dist/server/workers/lane-worker.d.ts',
+                import: './dist/underload-harness.worker.mjs',
+                default: './dist/underload-harness.worker.mjs'
+            },
+            // D4 (R1/R2/R4): the IO-worker EXECUTABLE, published as its own subpath for the
+            // same reason `./worker` is - an installed host spawns `dist/underload-harness
+            // .io-worker.mjs` by specifier (./workers/io-client.ts resolves exactly this pair:
+            // `IO_WORKER_PACKAGE_SPECIFIER` + `IO_WORKER_DIST_FILE`). ../vite.config.ts emits it
+            // as the library entry keyed `io-worker`; renaming either side breaks the resolver.
+            './io-worker': {
+                types: './dist/server/workers/io-worker.d.ts',
+                import: './dist/underload-harness.io-worker.mjs',
+                default: './dist/underload-harness.io-worker.mjs'
+            },
             './frontend': {
                 browser: {
                     types: './dist/frontend/index.d.ts',
@@ -176,7 +195,10 @@ describe('package layout', () => {
         for (const [subpath, value] of Object.entries(manifest.exports)) walk(subpath, subpath, value);
 
         const published = targets.filter(({ subpath }) => subpath !== './package.json');
-        expect(published.length).toBe(17);
+        // 23 = root 6 (browser.types/default, types, node, import, default) + ./server 3
+        // + ./worker 3 (T5 lane-worker executable) + ./io-worker 3 (D4 IO-worker executable)
+        // + ./frontend 5 + ./shared 3.
+        expect(published.length).toBe(23);
         for (const { condition, target } of published) {
             expect(target.startsWith('./dist/')).toBe(true);
             expect(target.endsWith(condition.endsWith('types') ? '.d.ts' : '.mjs')).toBe(true);

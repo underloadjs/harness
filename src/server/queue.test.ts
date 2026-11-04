@@ -285,7 +285,7 @@ describe('SessionStore task queue', () => {
         const setClock = pinClock(1_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         setClock(2_000);
 
@@ -300,7 +300,7 @@ describe('SessionStore task queue', () => {
         const firstStarted = fixture.started('first');
         const secondStarted = fixture.started('second');
 
-        const first = store.enqueue(created.id, '  first  ');
+        const first = await store.enqueue(created.id, '  first  ');
 
         // 202-shaped acceptance: stable id/index, trimmed prompt, queued, and NO
         // startedAt before execution. The queueDepth snapshot counts this turn.
@@ -328,7 +328,7 @@ describe('SessionStore task queue', () => {
         setClock(3_000);
 
         // B is accepted WHILE A runs: queued, index 1, nothing else started.
-        const second = store.enqueue(created.id, 'second');
+        const second = await store.enqueue(created.id, 'second');
         expect(second.turn).toEqual({
             id: second.turn.id,
             index: 1,
@@ -500,18 +500,18 @@ describe('SessionStore task queue', () => {
     it('records a failed task and keeps draining the rest of its thread', async () => {
         pinClock(2_000);
         const store = createStore([failingFixture()]);
-        const created = store.create('flaky');
+        const created = await store.create('flaky');
 
         // Same-thread FIFO: the failure must not stop the queued continuations, and
         // the serialized order keeps the banner rule deterministic.
-        const boom = store.enqueue(created.id, 'boom');
+        const boom = await store.enqueue(created.id, 'boom');
         expect(boom.turn.threadId).toBe('thread-1');
         await boom.settled;
 
-        const good = store.enqueue(created.id, 'good', undefined, undefined, 'thread-1');
+        const good = await store.enqueue(created.id, 'good', undefined, undefined, 'thread-1');
         await good.settled;
 
-        const tail = store.enqueue(created.id, 'tail', undefined, undefined, 'thread-1');
+        const tail = await store.enqueue(created.id, 'tail', undefined, undefined, 'thread-1');
         await tail.settled;
         await store.waitForIdle(created.id);
 
@@ -548,7 +548,7 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         // Park the exclusive gate with a legacy run: every thread lane's pump waits,
         // so accepted lane work genuinely stays PENDING (F1 keeps separate lanes, so
@@ -558,10 +558,10 @@ describe('SessionStore task queue', () => {
         await fixture.started('legacy').promise;
 
         // Validation order: unknown id (404), empty (400), over-long (413).
-        expect(() => store.enqueue('missing', 'x')).toThrow(SessionError);
-        expect(() => store.enqueue('missing', 'x')).toThrow('Unknown session "missing".');
-        expect(() => store.enqueue(created.id, '   ')).toThrow('A task cannot be empty.');
-        expect(() => store.enqueue(created.id, 'x'.repeat(200_001))).toThrow(
+        await expect(store.enqueue('missing', 'x')).rejects.toThrow(SessionError);
+        await expect(store.enqueue('missing', 'x')).rejects.toThrow('Unknown session "missing".');
+        await expect(store.enqueue(created.id, '   ')).rejects.toThrow('A task cannot be empty.');
+        await expect(store.enqueue(created.id, 'x'.repeat(200_001))).rejects.toThrow(
             'A task cannot exceed 200000 characters.'
         );
 
@@ -569,7 +569,7 @@ describe('SessionStore task queue', () => {
 
         // Fill the backlog to the cap (100 pending; the active turn is not pending).
         for (let index = 0; index < 100; index += 1) {
-            store.enqueue(created.id, `queued-${index}`);
+            await store.enqueue(created.id, `queued-${index}`);
         }
 
         expect(store.get(created.id).queueDepth).toBe(100);
@@ -578,7 +578,7 @@ describe('SessionStore task queue', () => {
         // The 101st pending submit is a 429 and adds no turn.
         let rejection: unknown;
         try {
-            store.enqueue(created.id, 'overflow');
+            await store.enqueue(created.id, 'overflow');
         } catch (error) {
             rejection = error;
         }
@@ -590,7 +590,7 @@ describe('SessionStore task queue', () => {
         expect(store.get(created.id).turns).toHaveLength(queuedBefore + 100);
 
         // Stop everything so the fixture cannot leak a parked run.
-        store.cancel(created.id, { all: true });
+        await store.cancel(created.id, { all: true });
         fixture.gate('legacy').resolve();
         await store.waitForIdle(created.id);
     });
@@ -599,7 +599,7 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         // A legacy run parks every lane pump, so the two later submits are genuinely
         // PENDING (F1: independent lanes would otherwise start them at once).
@@ -607,16 +607,16 @@ describe('SessionStore task queue', () => {
         const legacy = store.run(created.id, 'legacy', async () => {});
         await fixture.started('legacy').promise;
 
-        const queued = store.enqueue(created.id, 'queued');
-        const later = store.enqueue(created.id, 'later');
+        const queued = await store.enqueue(created.id, 'queued');
+        const later = await store.enqueue(created.id, 'later');
         expect(store.get(created.id).queueDepth).toBe(2);
 
         // Active-only cancel (legacy shape) leaves the backlog alone.
-        expect(store.cancel(created.id)).toBe(true);
+        expect(await store.cancel(created.id)).toBe(true);
         expect(store.get(created.id).queueDepth).toBe(2);
 
         // Stop-all drops the two pending turns; they stay as cancelled records.
-        expect(store.cancel(created.id, { all: true })).toBe(true);
+        expect(await store.cancel(created.id, { all: true })).toBe(true);
 
         fixture.gate('legacy').resolve();
         await legacy;
@@ -650,14 +650,14 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset, toolFixture()]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         // Two independent lanes, both live (F1): the exclusive paths must refuse.
         fixture.gate('first');
         fixture.gate('second');
-        store.enqueue(created.id, 'first');
+        await store.enqueue(created.id, 'first');
         await fixture.started('first').promise;
-        store.enqueue(created.id, 'second');
+        await store.enqueue(created.id, 'second');
         await fixture.started('second').promise;
 
         await expect(store.run(created.id, 'legacy', async () => {})).rejects.toMatchObject({
@@ -671,8 +671,8 @@ describe('SessionStore task queue', () => {
             status: 409,
             message: 'A task is running in this session; try again when it finishes.'
         });
-        expect(() => store.reset(created.id)).toThrow(SessionError);
-        expect(() => store.reset(created.id)).toThrow(
+        await expect(store.reset(created.id)).rejects.toThrow(SessionError);
+        await expect(store.reset(created.id)).rejects.toThrow(
             'Cancel the running task before resetting the session.'
         );
 
@@ -683,7 +683,7 @@ describe('SessionStore task queue', () => {
             'running'
         ]);
 
-        store.cancel(created.id, { all: true });
+        await store.cancel(created.id, { all: true });
         fixture.gate('first').resolve();
         fixture.gate('second').resolve();
         await store.waitForIdle(created.id);
@@ -693,7 +693,7 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         const legacyStarted = fixture.started('legacy');
         const frames: SessionStreamItem[] = [];
@@ -706,7 +706,7 @@ describe('SessionStore task queue', () => {
         // Accepted while the legacy run owns the harness: it queues, it does not
         // execute, and it does NOT abort or reshape the legacy stream.
         const queuedStarted = fixture.started('queued');
-        const queued = store.enqueue(created.id, 'queued');
+        const queued = await store.enqueue(created.id, 'queued');
         expect(queued.turn.status).toBe('queued');
         expect(fixture.log).toEqual(['start:legacy']);
 
@@ -742,20 +742,20 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         const firstStarted = fixture.started('first');
-        const first = store.enqueue(created.id, 'first');
+        const first = await store.enqueue(created.id, 'first');
         await firstStarted.promise;
 
         // PATCH while the first task runs: allowed, nothing aborted (T2 contract).
-        store.setAgentModels(created.id, { gated: 'live/next-model' });
+        await store.setAgentModels(created.id, { gated: 'live/next-model' });
 
         fixture.gate('first').resolve();
         await first.settled;
 
         const secondStarted = fixture.started('second');
-        const second = store.enqueue(created.id, 'second');
+        const second = await store.enqueue(created.id, 'second');
         await secondStarted.promise;
         fixture.gate('second').resolve();
         await second.settled;
@@ -780,7 +780,7 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         const frames: SessionStreamItem[] = [];
         let closes = 0;
@@ -795,13 +795,13 @@ describe('SessionStore task queue', () => {
         );
 
         const started = fixture.started('active');
-        const active = store.enqueue(created.id, 'active');
+        const active = await store.enqueue(created.id, 'active');
         await started.promise;
 
-        const queued = store.enqueue(created.id, 'queued');
+        const queued = await store.enqueue(created.id, 'queued');
 
         const frameCountAtRemove = frames.length;
-        expect(store.remove(created.id)).toBe(true);
+        expect(await store.remove(created.id)).toBe(true);
         expect(closes).toBe(1);
         expect(() => store.get(created.id)).toThrow('Unknown session');
 
@@ -820,13 +820,13 @@ describe('SessionStore task queue', () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('gated');
+        const created = await store.create('gated');
 
         // No work: idle is immediate.
         await expect(store.waitForIdle(created.id)).resolves.toBeUndefined();
 
         const started = fixture.started('one');
-        const task = store.enqueue(created.id, 'one');
+        const task = await store.enqueue(created.id, 'one');
         await started.promise;
 
         let idle = false;
@@ -976,7 +976,7 @@ describe('queue HTTP contract', () => {
             error: { message: 'A task is already running in this session.' }
         });
 
-        runtime.store.cancel(id, { all: true });
+        await runtime.store.cancel(id, { all: true });
         fixture.gate('third').resolve();
         await runtime.store.waitForIdle(id);
     });
@@ -1202,7 +1202,7 @@ describe('queue HTTP contract', () => {
 
         // Accepted behind the legacy run and parked until it releases the gate.
         const queuedStarted = fixture.started('queued');
-        const queued = runtime.store.enqueue(id, 'queued');
+        const queued = await runtime.store.enqueue(id, 'queued');
         expect(queued.turn.status).toBe('queued');
         expect(fixture.log).toEqual(['start:legacy']);
 
@@ -1274,7 +1274,7 @@ describe('queue HTTP contract', () => {
 
         // Accepted behind the legacy run; it must not be what the disconnect hits.
         const queuedStarted = fixture.started('queued');
-        const queued = runtime.store.enqueue(id, 'queued');
+        const queued = await runtime.store.enqueue(id, 'queued');
 
         // Disconnect while the legacy run is still streaming.
         controller.abort();
@@ -1363,7 +1363,7 @@ describe('queue HTTP contract', () => {
         expect(recorded[0].type).toBe('snapshot');
 
         const taskStarted = fixture.started('task');
-        const task = runtime.store.enqueue(id, 'task');
+        const task = await runtime.store.enqueue(id, 'task');
 
         // The task parks on its gate until this test releases it; the queue drain
         // only happens after that, so release before waiting for idle.

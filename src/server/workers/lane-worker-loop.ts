@@ -51,6 +51,7 @@ import type {
     Harness,
     HarnessActionChoice,
     HarnessActionRequestContext,
+    HarnessAgentResultSnapshot,
     HarnessEvent,
     HarnessIdentityReservation,
     HarnessMessage,
@@ -59,7 +60,7 @@ import type {
 import type { HarnessPreset } from '../harnesses/types';
 import { presetFromRecord } from '../harnesses';
 import type { LaneAuthorityRequest } from './lane-authority';
-import type { LaneBlueprint, LaneCommand, LaneReply, LaneRequestReplyValue } from './protocol';
+import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply, LaneRequestReplyValue } from './protocol';
 import {
     LANE_EVENT_WINDOW,
     LANE_MAX_FRAME_BYTES,
@@ -70,9 +71,22 @@ import {
     isLaneEnvelope,
     isTransferableFrame
 } from './protocol';
-import { LOCAL_RUNTIME_METHODS, ROUTED_RUNTIME_METHODS, planWorkerToolSurfaces } from './capability';
-import type { SharedMutation } from './lane-commit';
-import { expectsDigestOf } from './lane-commit';
+import {
+    DELEGATION_TOOL_NAME,
+    LOCAL_RUNTIME_METHODS,
+    NESTED_RUN_ARMED_DOORS,
+    NESTED_RUN_LIMITATION_CODE,
+    NESTED_RUN_TOOL_NAMES,
+    ROUTED_RUNTIME_METHODS,
+    assessWorkerToolSurface,
+    nestedRunLimitationMessage,
+    nestedRunRefusalMessage,
+    nestedRunUnsupportedError,
+    planWorkerToolSurfaces,
+    toolScanTextOf
+} from './capability';
+import type { SharedMutation, MutationReceipt } from './lane-commit';
+import { archiveDigestOf, expectsDigestOf } from './lane-commit';
 import type { IdSpace, IdentityLease } from './lane-identity';
 import { syncMemoryMap } from './lane-memory';
 import type { MemoryWindow } from './lane-memory';
@@ -115,17 +129,38 @@ export type LaneWorkerState = {
     // root run (whose transcript IS that registry agent's messages).
     targetId?: string;
     controller?: AbortController;
-    // Committed facts, adopted ONLY from an applied receipt (T3 finding F7).
+    // Committed facts, adopted per receipt (T3 finding F7, T10 finding M2).
+    //
+    // `committedLength` is the CANONICAL PREFIX this replica holds: the invariant is
+    // `replica.threadMessages(targetId)[0..committedLength] === canonical[0..committedLength]`
+    // (T10 finding M4). The lane's own unpublished work therefore lives at
+    // `slice(committedLength)`, and a delta a sibling wrote is inserted AT that index, which
+    // is what keeps a re-derivation from duplicating or dropping messages.
     committedLength: number;
     readDigests: Record<string, string>;
     declaredKeys: string[];
-    // Invocation ids already archived, so a boundary never re-sends one the authority has.
-    archived: Set<string>;
+    // Terminal invocations this lane has published, mapped to the CANONICAL digest the
+    // authority reported for each.
+    //
+    // T10 finding M3: this used to be a Set of invocation ids. A host thread's invocation id
+    // IS its thread id (and a default conversation's is `agent:<name>`) - the core reuses it
+    // for every turn of that conversation - so after turn 1 the Set suppressed turn 2 forever
+    // and the canonical archive kept the first answer for the life of the session. A digest
+    // per id instead says "this lane has published THIS result", so the next one is sent, and
+    // an unchanged one is still skipped.
+    archived: Map<string, string>;
     nextSeq: () => number;
     nextCallId: () => number;
     nextStreamSeq: () => number;
     pending: Map<number, { resolve: (value: LaneRequestReplyValue) => void; reject: (error: Error) => void }>;
-    pendingCommits: Map<number, (outcome: { complete: boolean; faults: string[] }) => void>;
+    pendingCommits: Map<number, (outcome: CommitOutcome) => void>;
+    // T10 finding S4: one commit at a time. `mutation` groups are ordered by `seq` and the
+    // journal refuses a group that arrives behind the watermark, so two overlapping commits
+    // (an interrupt landing while the turn's final commit is still awaiting its receipt)
+    // would settle out of order and strand the second receipt. Every commit - and every
+    // transcript rebase, which is the request the retry depends on - runs through
+    // `runExclusive`.
+    commitChain: Promise<unknown>;
     // Event credit: the coordinator acks each stream sequence, so a stalled SSE consumer
     // paces this run exactly like the inline `await progress(event)` contract.
     ackedThrough: number;
@@ -135,6 +170,13 @@ export type LaneWorkerState = {
     commitFaults: string[];
     // Identity high-water marks the authority shipped or leased.
     identities: Partial<Record<IdSpace, number>>;
+    // The invocation this turn published (T10 finding M3's roster half). A store-dispatched
+    // thread run gets a NEW numeric invocation id per turn (harness.ts `invocationIdOf` falls
+    // back to `String(run.id)` when the run carries no thread agent), inline and on a lane
+    // alike, so the roster's `invocationId` cannot be invented from the thread id - the host
+    // mirrors the id the lane actually archived, or the UI joins a turn to a result that does
+    // not exist.
+    turnInvocationId?: string;
 };
 
 const state: LaneWorkerState = {
@@ -142,12 +184,13 @@ const state: LaneWorkerState = {
     committedLength: 0,
     readDigests: {},
     declaredKeys: [],
-    archived: new Set(),
+    archived: new Map(),
     nextSeq: createSequence(),
     nextCallId: createSequence(),
     nextStreamSeq: createSequence(),
     pending: new Map(),
     pendingCommits: new Map(),
+    commitChain: Promise.resolve(),
     ackedThrough: 0,
     ackWaiters: [],
     commitFaults: [],
@@ -241,6 +284,20 @@ let localRuntime: {
     manageTool: () => undefined
 };
 
+// The replica's OWN thread reads, captured for the same reason (T10 finding S1): the handle
+// members are replaced with routed canonical reads, so everything inside this loop - the op
+// derivation, the fresh-block reset, and the transcript rebase - must go through the local
+// closures or it would receive a promise where it needs an array.
+type LocalThreadReads = {
+    messages: (threadId: string) => HarnessMessage[];
+    record: (threadId: string) => unknown;
+};
+
+let localThreads: LocalThreadReads = {
+    messages: () => [],
+    record: () => undefined
+};
+
 export const installAuthorityRuntime = (replica: Harness): void => {
     const runtime = replica.runtime as unknown as Record<string, unknown>;
 
@@ -289,7 +346,35 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     route('agentManage', () => ({ identity: identityOf(undefined) }));
     route('listTools', () => ({ identity: identityOf(undefined) }));
 
-    // Asserted, not assumed: a NEW runtime method must be classified as routed or local
+    // T10 finding S1: the two handle READS of session-shared conversation state.
+    //
+    // A replica is a hello snapshot plus what this lane itself has run, so a direct
+    // `harness.threadMessages(id)` / `harness.thread(id)` is a PRIVATE answer: stale for any
+    // conversation a sibling moved, and simply missing for a thread another lane created.
+    // `threadRead` is the model-facing feature that reads exactly those conversations, so the
+    // replica's own handle members are replaced with routed reads answered by the canonical
+    // harness, and the tool entry awaits them.
+    //
+    // The lane's OWN conversation stays local: this replica is the only place its uncommitted
+    // tail exists, so routing that read backwards would hide the run's own work.
+    const handle = replica as unknown as {
+        threadMessages: (threadId: string) => unknown;
+        thread: (threadId: string) => unknown;
+    };
+    const localMessages = replica.threadMessages.bind(replica);
+    const localRecord = replica.thread.bind(replica);
+
+    // Captured BEFORE the routed replacements: ./lane-worker-loop.ts's own derivation, reset
+    // handling and transcript rebase all need the synchronous local answer, and reading the
+    // member back at call time would get a promise.
+    localThreads = { messages: localMessages, record: localRecord };
+
+    handle.threadMessages = (threadId: string): unknown =>
+        threadId === state.targetId ? localMessages(threadId) : raise({ op: 'thread:read', threadId, identity: {} }).then((reply) => (reply.value as { messages: unknown[] }).messages);
+    handle.thread = (threadId: string): unknown =>
+        threadId === state.targetId ? localRecord(threadId) : raise({ op: 'thread:read', threadId, identity: {} }).then((reply) => (reply.value as { record: unknown }).record);
+
+    // Asserted, not assumed: a NEW runtime method must be classified as routed or local or local
     // before a lane may run it, and this is where that rule bites at hello time.
     for (const key of Object.keys(runtime)) {
         if ((LOCAL_RUNTIME_METHODS as readonly string[]).includes(key)) continue;
@@ -300,6 +385,83 @@ export const installAuthorityRuntime = (replica: Harness): void => {
         );
     }
 };
+
+// T12 (S7) + T14: close EVERY nested-run path on this replica before any turn can start a child
+// conversation inside it, and report the names actually removed so the hello frame carries the
+// limitation (a replica whose preset registered no subagents has no `delegate` to remove).
+//
+// Three levers, because three kinds of door can start a child (./capability.ts
+// NESTED_RUN_TOOL_NAMES + LANE_NESTED_RUN_DOORS explain why a refusal, not a private copy, is the
+// honest answer):
+//   1. the registry entries - the same mechanism a mirrored registry REMOVAL already uses in
+//      `applyRegistryChange` below: `tools` is the registry map the handle exposes, and the run
+//      resolves a call AND builds its model-facing declarations from it (src/harness.ts:1105
+//      and :2242 read `Object.values(tools)`), so dropping the entry takes the tool out of
+//      both. This is the only lane-side lever for `threadFork`, whose dispatch is a core
+//      CONTROL path keyed on a definition marker the replica handle does not expose
+//      (src/harness.ts:2111-2120).
+//   2. `harness.runtime.delegate` - the direct runtime route the tool entry itself calls
+//      (src/tools/runtime/delegate.tool.ts:120), plus any built-in delegation path. Replaced,
+//      NOT deleted: the loop above classifies every key the replica exposes, and `delegate`
+//      stays declared local (./capability.ts LOCAL_RUNTIME_METHODS) because nothing crosses
+//      for it - it refuses.
+//   3. THE CORE RUNTIME GUARD, armed by `replica.nestedRuns('refuse')` on EVERY lane, whatever
+//      preset this worker rebuilt: the arm is a property of the execution mode, not a preset option,
+//      and the read-back below makes an unarmable build a HELLO FAULT (the coordinator settles the
+//      turn with the named error) rather than a quiet inline fallback. Levers 1-2 close the doors
+//      that go THROUGH a tool or a runtime route; they do not close the doors a tool BODY holds,
+//      which is the `context.run` / `context.harness` / `context.agents` surface the core builds per
+//      invocation. T13 measured exactly that bypass: the shipped `textSummarize` reached a nested
+//      child through `ctx.run`, the child answered, and its transcript died in the lane. Arming the
+//      policy makes the core throw the named limitation instead — before the child, its transcript
+//      or its provider request exist — for every spelling of the same closure (a direct
+//      `context.run(...)`, `ctx.run(...)`, `const { run } = context`, or an alias), including a tool
+//      created or replaced after hello. T15: on a refusing replica those surfaces are the GUARDED
+//      views the core builds (`toolHandleView`, `toolAgentsView`, the guarded `run` closure), so a
+//      reference the body keeps and calls after its own call settled is refused as well; the armed
+//      doors are `context.run(name, input)`, `harness(...)`,
+//      `harness.sendThreadInput(...)` and `harness.agents.<name>.turn() / .stream()`, and every one
+//      of them is stated in the hello report (./capability.ts `NESTED_RUN_ARMED_DOORS`).
+export const refuseNestedRuns = (replica: Harness): string[] => {
+    // T14 lever 3, FIRST: arm the CORE nested-run policy on this replica, so every door the core
+    // can see (a tool-context `run`, a run nested inside another run, a `harness(...)` call made
+    // from a tool body, a sibling brain run through `context.agents`) throws the named
+    // `nested-run-unsupported` limitation before a child exists. The accessor is validated, so an
+    // unsupported value throws here rather than arming nothing; and the read-back below is what
+    // proves the seam is really present in THIS build — an unarmed replica would keep running
+    // children against a private copy of the session, which is the exact defect this closes.
+    replica.nestedRuns('refuse');
+
+    if (replica.nestedRuns() !== 'refuse') {
+        throw new Error(
+            'This harness build exposes no nested-run seam (harness.nestedRuns), so a lane replica cannot refuse the nested runs a tool body starts. Rebuild the worker entry (dist/underload-harness.worker.mjs) against this build, or run the session with threadExecution "inline".'
+        );
+    }
+
+    const tools = replica.tools as Record<string, unknown>;
+    const runtime = replica.runtime as unknown as Record<string, unknown>;
+    const removed: string[] = [];
+
+    for (const name of NESTED_RUN_TOOL_NAMES) {
+        if (tools[name] === undefined) continue;
+
+        delete tools[name];
+        removed.push(name);
+    }
+
+    // A rejected tool handler is turned into a readable tool result by the runtime, so a model
+    // (or an internal path) that still reaches delegation gets the named sentence rather than a
+    // crash it cannot act on.
+    runtime.delegate = (): never => {
+        throw nestedRunUnsupportedError(`Tool "${DELEGATION_TOOL_NAME}"`);
+    };
+
+    return removed;
+};
+
+// T14: the doors `refuseNestedRuns` ARMED on this replica are listed in ./capability.ts
+// (`NESTED_RUN_ARMED_DOORS`) and named in the hello report below, so the handshake states what
+// this lane refuses even when the preset registered no `delegate` to remove.
 
 // Adopt the canonical follow-up state the authority sent with an answer.
 const applySync = (sync: LaneRequestReplyValue['sync']): void => {
@@ -321,7 +483,12 @@ const applySync = (sync: LaneRequestReplyValue['sync']): void => {
         }
     }
 
-    for (const change of sync.registry ?? []) applyRegistryChange(change);
+    for (const change of sync.registry ?? []) void applyRegistryChange(change);
+
+    // T10 finding M5: the authority may have widened the SESSION window for this very reply
+    // (a tool revision naming new literal keys was just installed). Join them and pull the
+    // digests, or the tool's first memory write has no base to commit against.
+    if (sync.memoryKeys !== undefined) void declareMemoryKeys(sync.memoryKeys);
 
     if (sync.identities !== undefined) {
         for (const [space, value] of Object.entries(sync.identities)) {
@@ -338,18 +505,16 @@ const reserve = (identities: Partial<Record<IdSpace, number>>): HarnessIdentityR
 
 // Install a registry change the authority already applied, so this replica runs the same
 // revision the canonical harness runs (T3 finding F9: no stale definition behind a replace).
-const applyRegistryChange = (change: {
-    name: string;
-    description?: string;
-    tags?: string[];
-    parameters?: Record<string, unknown>;
-    source: string;
-    revision: string;
-    removed: boolean;
-}): void => {
+//
+// T10 finding M5: the revision is installed in the FORM the canonical harness compiled. The
+// shipped format is a MODULE (`format: 'module'`, text in `moduleText`); pushing that text
+// through `source` fed module code to the legacy function-body path, and left `source` empty
+// for every core-installed tool. Whichever one is present wins, and the captured helper
+// modules travel with it.
+const applyRegistryChange = (change: LaneRegistryChange): Promise<void> => {
     const replica = state.replica;
 
-    if (replica === undefined) return;
+    if (replica === undefined) return Promise.resolve();
 
     if (change.removed) {
         // The core has no "unregister" operation on the handle (toolManage offers
@@ -358,23 +523,77 @@ const applyRegistryChange = (change: {
         // handle exposes, so the next call cannot resolve it.
         delete (replica.tools as Record<string, unknown>)[change.name];
 
-        return;
+        return Promise.resolve();
     }
 
-    // A created tool's `source` is a function BODY, so the metadata has to travel with it:
-    // `registerTool` refuses a candidate without a description.
+    // T10 finding S2: scan a source that arrives from ELSEWHERE (an operator toolManage,
+    // another lane's create) before installing it, with the same lens the hello report uses.
+    // The common path - a model creating a tool from this very lane - is already refused
+    // authority-side before install, so a hit here means a revision entered the session
+    // through another door and this lane genuinely cannot run it.
+    const installedText = toolScanTextOf({ source: change.source, moduleText: change.moduleText, dependencies: change.dependencies });
+    const surface = assessWorkerToolSurface({ name: change.name, source: installedText });
+
+    if (surface.reasons.length > 0) {
+        // Not installed, and reported: running it against a private copy of the map would be
+        // the silent loss, and dropping it without a word would be the invisible one. The
+        // turn reports the reason instead of pretending the tool is available here.
+        state.commitFaults.push(`capability: ${surface.reasons.map((entry) => entry.message).join(' ')}`);
+
+        return Promise.resolve();
+    }
+
+    // A created tool's body needs the metadata as well as the text: `registerTool` refuses a
+    // candidate with no description.
     void replica.registerTool({
         name: change.name,
         ...(change.description === undefined ? {} : { description: change.description }),
         ...(change.tags === undefined ? {} : { tags: change.tags }),
         ...(change.parameters === undefined ? {} : { parameters: change.parameters }),
-        source: change.source
+        ...(change.moduleText === undefined
+            ? { source: change.source }
+            : { moduleText: change.moduleText, ...(change.dependencies === undefined ? {} : { dependencies: change.dependencies }) })
     });
+
+    // M5: the keys this revision added to the session window join this lane's declared set,
+    // and their canonical digests are pulled immediately - a memory write for a key with no
+    // read base would otherwise be refused as undeclared on the lane's very next boundary.
+    return declareMemoryKeys(change.memoryKeys);
+};
+
+// T10 finding M5: join keys the authority added to this session's memory window (because a
+// tool revision that names them was just installed) and fetch their canonical values.
+//
+// Without this the derivation loop never examines the key, so the tool's memory write is
+// invisible to the commit - the "silently dropped memory effect" the finding names. A key
+// the scan did not produce is never added, so the window still bounds what a lane may write
+// (./lane-authority.ts `memory:window`, enforced at the fold by ./lane-commit.ts).
+const declareMemoryKeys = (keys: readonly string[] | undefined): Promise<void> => {
+    if (keys === undefined || keys.length === 0 || state.replica === undefined) return Promise.resolve();
+
+    const fresh = keys.filter((key) => !state.declaredKeys.includes(key));
+
+    if (fresh.length === 0) return Promise.resolve();
+
+    state.declaredKeys.push(...fresh);
+
+    return raise({ op: 'memory:window', keys: fresh }).then(
+        (reply) => applyMemoryFrame(reply.value as MemoryWindow),
+        () => undefined
+    );
 };
 
 // ---------------------------------------------------------------------------
 // Progress events, with credit
 // ---------------------------------------------------------------------------
+
+// Release every run parked in the event-credit window. Two things end a wait legitimately:
+// the coordinator's `event.ack`, and the run ending (an abort or a dispose) - in the second
+// case no further ack is coming, and a promise nobody resolves would strand the turn's
+// terminal commit (T10 finding S3).
+const drainAckWaiters = (): void => {
+    for (const resolve of state.ackWaiters.splice(0, state.ackWaiters.length)) resolve();
+};
 
 const emitProgress = async (event: HarnessEvent): Promise<void> => {
     const turnId = state.turnId;
@@ -400,10 +619,20 @@ const emitProgress = async (event: HarnessEvent): Promise<void> => {
 // Commit boundaries
 // ---------------------------------------------------------------------------
 
+// The read surface the derivation needs. Stated structurally (not as `Harness`) because the
+// handle members are patched in worker mode (T10 finding S1: a routed read is a promise), so
+// this loop reads conversations through the replica's ORIGINAL closures. A test or probe can
+// hand over the same three members without a harness.
+export type ReplicaReadView = {
+    threadMessages: (threadId: string) => HarnessMessage[];
+    memory: { has: (key: string) => boolean; get: (key: string) => unknown };
+    snapshot: () => { agentResults?: HarnessAgentResultSnapshot[] };
+};
+
 // The operations this lane owes the authority, derived from what it actually did since the
-// last APPLIED receipt. Nothing here is a whole-state diff: each op names the prefix, the
-// digest, or the identity it depends on.
-export const deriveOperations = (lane: LaneWorkerState, replica: Harness): SharedMutation[] => {
+// facts its RECEIPTS reported. Nothing here is a whole-state diff: each op names the prefix,
+// the digest, or the identity it depends on.
+export const deriveOperations = (lane: LaneWorkerState, replica: ReplicaReadView): SharedMutation[] => {
     const ops: SharedMutation[] = [];
 
     // 1. The transcript this lane owns, appended at the length the AUTHORITY last reported.
@@ -435,10 +664,17 @@ export const deriveOperations = (lane: LaneWorkerState, replica: Harness): Share
     // 3. Terminal invocations this lane produced. Identity is this replica's own (leased at
     //    hello), so two lanes cannot archive the same id; completion ORDER is reassigned by
     //    the authority, which owns the ordering counter.
+    //
+    //    T10 finding M3: the skip test is the published DIGEST, not the id. A host thread's
+    //    invocation id is its thread id, so turn 2 of the same conversation legitimately
+    //    archives that id again - a Set keyed by id suppressed it forever and the canonical
+    //    archive kept the first answer. The digest projection excludes `completedOrder`
+    //    (./lane-commit.ts `archiveDigestOf`), which the authority reassigns, so an unchanged
+    //    result is still skipped and a new one is sent.
     const results = replica.snapshot().agentResults ?? [];
 
     for (const record of results) {
-        if (lane.archived.has(record.invocationId)) continue;
+        if (lane.archived.get(record.invocationId) === archiveDigestOf(record)) continue;
 
         ops.push({
             kind: 'result:archive',
@@ -447,6 +683,7 @@ export const deriveOperations = (lane: LaneWorkerState, replica: Harness): Share
             completedOrder: record.completedOrder,
             agent: record.agent,
             role: record.role,
+            // The run's origin (root / delegation / fork / autoanswer).
             runKind: record.kind,
             status: record.status,
             content: record.content,
@@ -457,18 +694,44 @@ export const deriveOperations = (lane: LaneWorkerState, replica: Harness): Share
     return ops;
 };
 
-// Send one commit group and await its receipt. Applied facts are adopted INSIDE, so a caller
-// cannot report progress the authority refused. The reason is always `agent_message`: it is
-// the core's own reason for "a conversation changed", which is all a lane commits.
-const commit = async (reason: 'agent_message', turnId?: string): Promise<void> => {
-    const replica = state.replica;
+// The receipt a lane waits for at a boundary. `complete` says every op landed; `receipts`
+// carries, per op, what actually happened and the canonical fact the lane must adopt
+// (T10 finding M2), which is also where a needed transcript rebase is detected.
+type CommitOutcome = { complete: boolean; receipts: MutationReceipt[] };
 
-    if (replica === undefined) return;
+// One boundary, at a time (T10 finding S4).
+//
+// A `mutation` group is ordered by `seq`, and the journal refuses a group that arrives out
+// order, so an interrupt that commits while a turn's final commit is still awaiting its
+// receipt used to settle two groups concurrently: the second receipt answered a seq the
+// authority had already passed, and the lane parked on a promise nobody resolves. Every
+// commit - and the transcript rebase its retry depends on - runs through here.
+const runExclusive = <T,>(work: () => Promise<T>): Promise<T> => {
+    const run = state.commitChain.then(work, work);
 
-    const ops = deriveOperations(state, replica);
+    state.commitChain = run.then(
+        () => undefined,
+        () => undefined
+    );
 
-    if (ops.length === 0) return;
+    return run;
+};
 
+// The read view the derivation uses: the replica's ORIGINAL closures, not the routed handle
+// members (T10 finding S1), because a committed tail must be a synchronous array.
+const readView = (): ReplicaReadView => {
+    const replica = state.replica as Harness;
+
+    return {
+        threadMessages: (threadId) => localThreads.messages(threadId),
+        memory: replica.memory,
+        snapshot: () => replica.snapshot() as { agentResults?: HarnessAgentResultSnapshot[] }
+    };
+};
+
+// One group, sent and answered. The seq is taken here so a caller cannot report progress for
+// a group that was never raised.
+const sendCommit = (ops: SharedMutation[], reason: 'agent_message', turnId?: string): Promise<CommitOutcome> => {
     const seq = state.nextSeq();
 
     send({
@@ -479,25 +742,162 @@ const commit = async (reason: 'agent_message', turnId?: string): Promise<void> =
         group: { laneEpoch: state.epoch, seq, ops }
     });
 
-    const outcome = await new Promise<{ complete: boolean; faults: string[] }>((resolve) => {
+    return new Promise<CommitOutcome>((resolve) => {
         state.pendingCommits.set(seq, resolve);
     });
-
-    if (!outcome.complete) {
-        // The base does NOT move: the next boundary re-derives the same intents against the
-        // canonical facts the receipt carried (T3 findings F7/F8).
-        state.commitFaults.push(...outcome.faults);
-
-        return;
-    }
-
-    for (const op of ops) {
-        if (op.kind === 'transcript:append') state.committedLength += op.messages.length;
-        if (op.kind === 'result:archive') state.archived.add(op.invocationId);
-        if (op.kind === 'memory:set') state.readDigests[op.key] = expectsDigestOf(op.value);
-        if (op.kind === 'memory:delete') state.readDigests[op.key] = expectsDigestOf(undefined);
-    }
 };
+
+// Adopt the canonical facts a receipt reported, per op (T10 findings M2 and M3).
+//
+// The retired rule was all-or-nothing: an incomplete group adopted NOTHING, so one contested
+// memory key left the lane re-deriving the same refusal forever, and the turn could never
+// publish. The correct rule splits by receipt:
+//   - `applied`  -> adopt what the AUTHORITY wrote (its length/digest, never our guess);
+//   - rejected memory -> adopt the canonical digest the receipt carries, so the next boundary
+//     writes against the real value (this is what makes the retry land);
+//   - rejected transcript append -> the length alone is not enough: the replica needs the
+//     canonical MESSAGES, which `needsRebase` asks for;
+//   - rejected archive of a slot another live lane owns -> remember the canonical digest so
+//     this lane stops re-sending an identity it does not hold;
+//   - `group-rolled-back` -> nothing landed, so nothing is adopted.
+const adoptReceipts = (ops: SharedMutation[], receipts: MutationReceipt[]): { needsRebase: boolean; faults: string[] } => {
+    const faults: string[] = [];
+    let needsRebase = false;
+
+    for (const receipt of receipts) {
+        const op = ops[receipt.opId];
+
+        if (op === undefined) continue;
+
+        const digest = receipt.effect?.digest;
+
+        if (receipt.status === 'applied') {
+            if (op.kind === 'transcript:append') state.committedLength = receipt.effect?.length ?? state.committedLength + op.messages.length;
+
+            if (op.kind === 'result:archive' && digest !== undefined) {
+                state.archived.set(op.invocationId, digest);
+
+                // The identity this turn's answer is addressable by (the last terminal result it
+                // published), reported on the terminal frame so the roster mirror names a real
+                // archived invocation.
+                state.turnInvocationId = op.invocationId;
+            }
+            if (op.kind === 'memory:set') state.readDigests[op.key] = digest ?? expectsDigestOf(op.value);
+            if (op.kind === 'memory:delete') state.readDigests[op.key] = digest ?? expectsDigestOf(undefined);
+
+            continue;
+        }
+
+        const code = receipt.rejection?.code ?? 'rejected';
+
+        faults.push(`${code}: ${receipt.rejection?.message ?? 'no reason given'}`);
+
+        if (code === 'group-rolled-back') continue;
+
+        if ((op.kind === 'memory:set' || op.kind === 'memory:delete') && digest !== undefined) state.readDigests[op.key] = digest;
+        if (op.kind === 'transcript:append' && code === 'prefix-moved') needsRebase = true;
+        if (op.kind === 'result:archive' && code === 'not-writer' && digest !== undefined) state.archived.set(op.invocationId, digest);
+    }
+
+    return { needsRebase, faults };
+};
+
+// T10 finding M4: pull the canonical transcript messages this replica has not adopted.
+//
+// `committedLength` is the canonical prefix this lane holds, so the answer is exactly what
+// moved - a sibling `threadSend`, another lane's append, a coordinator transcript edit. The
+// delta is inserted AT that prefix, which keeps the lane's own unpublished tail after it in
+// the order canonical state already has; appending it at the end instead would make the
+// replica's tail stop matching canonical, and the next append would publish the wrong
+// messages at the right length.
+//
+// Returns false when the replica refused the write (the core refuses a wholesale transcript
+// replacement while a run is attached, harness.ts ~3821). That is not a loss: the facts are
+// re-read at the next commit boundary, which is the safe point.
+const syncTranscript = async (): Promise<boolean> => {
+    const replica = state.replica;
+    const targetId = state.targetId;
+
+    if (replica === undefined || targetId === undefined) return false;
+
+    const reply = await raise({ op: 'transcript:sync', threadId: targetId, haveLength: state.committedLength });
+    const canonical = reply.value as { threadId: string; fromLength: number; length: number; messages: HarnessMessage[]; rebased?: boolean };
+
+    if (canonical.length === state.committedLength) return false;
+
+    const local = localThreads.messages(targetId);
+
+    // Nothing of ours is waiting to publish: a plain append is enough, and it is legal even
+    // while the run is live (the lane-worker seam deliberately skips the live-run guard).
+    if (local.length === state.committedLength) {
+        try {
+            replica.appendThreadMessages(targetId, canonical.messages, state.committedLength);
+        } catch {
+            return false;
+        }
+
+        state.committedLength = canonical.length;
+
+        return true;
+    }
+
+    // Own work is pending, so the delta has to go BETWEEN the adopted prefix and that tail.
+    // `rebased` means canonical got shorter than our base (a reset or an edit): then the whole
+    // canonical transcript is the prefix and our tail follows it.
+    const prefix = canonical.rebased === true ? canonical.messages : [...local.slice(0, canonical.fromLength), ...canonical.messages];
+
+    try {
+        replica.setThreadMessages(targetId, [...prefix, ...local.slice(state.committedLength)]);
+    } catch {
+        return false;
+    }
+
+    state.committedLength = prefix.length;
+
+    return true;
+};
+
+// Extra rebase-and-retry attempts per boundary. One is enough to beat a single concurrent
+// writer; more would let two lanes fighting over one key spin inside a turn.
+const COMMIT_RETRY_LIMIT = 1;
+
+// Send one commit group and await its receipt. Applied facts are adopted INSIDE, so a caller
+// cannot report progress the authority refused. The reason is always `agent_message`: it is
+// the core's own reason for "a conversation changed", which is all a lane commits.
+const commit = async (reason: 'agent_message', turnId?: string): Promise<void> =>
+    runExclusive(async () => {
+        if (state.replica === undefined) return;
+
+        let ops = deriveOperations(state, readView());
+
+        if (ops.length === 0) return;
+
+        let faults: string[] = [];
+
+        for (let attempt = 0; ; attempt += 1) {
+            const outcome = await sendCommit(ops, reason, turnId);
+            const adopted = adoptReceipts(ops, outcome.receipts);
+
+            if (outcome.complete) return;
+
+            faults = adopted.faults;
+
+            if (attempt >= COMMIT_RETRY_LIMIT) break;
+
+            // A transcript refusal needs the canonical messages before a re-derivation can
+            // mean anything; a memory refusal is already re-based by `adoptReceipts`.
+            if (adopted.needsRebase) await syncTranscript();
+
+            ops = deriveOperations(state, readView());
+
+            if (ops.length === 0) break;
+        }
+
+        // The base moved with every receipt that reported a canonical fact, so the next
+        // boundary re-derives against the AUTHORITY's state (T3 findings F7/F8) - and a turn
+        // whose state nobody accepted still reports its refusals instead of hiding them.
+        state.commitFaults.push(...faults);
+    });
 
 // ---------------------------------------------------------------------------
 // hello: rebuild the replica
@@ -505,14 +905,21 @@ const commit = async (reason: 'agent_message', turnId?: string): Promise<void> =
 
 // What this replica can really do. A non-empty refusal list fails the HELLO, so the operator
 // learns before a turn is spent rather than halfway through a lost write.
-const capabilityReport = (replica: Harness, preset: HarnessPreset): {
+const capabilityReport = (replica: Harness, preset: HarnessPreset, refusedNestedRuns: string[]): {
     ok: boolean;
     agents: string[];
     tools: string[];
     unsupported: { code: string; message: string }[];
+    // T12 (S7): the nested-run tools this replica removed. Named here so the operator reads
+    // the limitation in the hello handshake instead of discovering it as a missing feature.
+    limitations: { code: string; message: string }[];
 } => {
+    // T10 finding M5: `toolScanTextOf` reads `moduleText` (plus the captured helpers), which
+    // is where the text of a `format: 'module'` registration actually lives. Reading
+    // `.source` handed the planner `undefined` for every shipped core tool, so all 30 tools
+    // were reported lane-safe without a single line of them being scanned.
     const sources = replica.toolSources();
-    const installed = new Map(sources.map((source) => [source.name, source.source]));
+    const installed = new Map(sources.map((source) => [source.name, toolScanTextOf(source)]));
     const plan = planWorkerToolSurfaces(
         Object.keys(replica.tools).map((name) => ({
             name,
@@ -530,9 +937,25 @@ const capabilityReport = (replica: Harness, preset: HarnessPreset): {
         // The routed runtime interception protects every shared operation a CORE tool can
         // reach, so the only lane-unsafe thing left is an opaque body that walks the memory
         // map dynamically or touches a canonical-document member of the live handle.
-        unsupported: plan.unsupported.map((surface) => surface.reasons).flat()
+        unsupported: plan.unsupported.map((surface) => surface.reasons).flat(),
+        limitations: nestedRunHandshakeLimitations(refusedNestedRuns)
     };
 };
+
+// T14: the nested-run limitations the HELLO frame carries, built in ONE place so the handshake can
+// never state less than the core enforces. Two kinds of entry, both under the same code:
+//   - the tool entries THIS replica removed (`delegate`/`threadFork`, only when the preset really
+//     registered them), named as tools;
+//   - the doors `refuseNestedRuns` ARMED on the replica (./capability.ts NESTED_RUN_ARMED_DOORS),
+//     named as the call a tool body would write — so the limitation is still stated for a harness
+//     that has no subagents, where the only way to reach a child was always through the context.
+export const nestedRunHandshakeLimitations = (refusedTools: readonly string[]): { code: string; message: string }[] => [
+    ...refusedTools
+        .slice()
+        .sort()
+        .map((name) => ({ code: NESTED_RUN_LIMITATION_CODE, message: nestedRunLimitationMessage(name) })),
+    ...NESTED_RUN_ARMED_DOORS.map((door) => ({ code: NESTED_RUN_LIMITATION_CODE, message: nestedRunRefusalMessage(door) }))
+];
 
 const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise<void> => {
     const blueprint: LaneBlueprint = frame.blueprint;
@@ -590,11 +1013,29 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
 
     state.replica = replica;
     state.declaredKeys = [...blueprint.memoryKeys];
-    state.archived = new Set(((replica.snapshot().agentResults ?? []) as { invocationId: string }[]).map((record) => record.invocationId));
+
+    // T10 finding M3: keyed by the canonical DIGEST of each result the snapshot already
+    // carries, not by invocation id. Those results came from the canonical harness, so this
+    // lane does not owe them again - but the NEXT result for the same conversation id does
+    // have to be sent, which a Set of ids made impossible.
+    state.archived = new Map(
+        (((replica.snapshot() as { agentResults?: HarnessAgentResultSnapshot[] }).agentResults ?? []) as HarnessAgentResultSnapshot[]).map(
+            (record) => [record.invocationId, archiveDigestOf(record)]
+        )
+    );
 
     installAuthorityRuntime(replica);
 
-    const report = capabilityReport(replica, preset);
+    // T12 (S7) / T14 / T15: shape the replica BEFORE the report is built and before any turn or
+    // tool call can arrive. The call is UNCONDITIONAL — every lane arms the nested-run policy
+    // whatever preset it rebuilt, and an operation that beat the handshake is already refused above
+    // ('A turn arrived before hello completed') — and it is the LAST replica-shaping step before
+    // `capabilityReport`, so the hello frame states what this lane refuses rather than discovering
+    // it mid-turn. A replica that cannot arm throws HERE, which the message loop turns into a
+    // `fault` frame: the handshake is rejected, and the coordinator never falls back to inline.
+    const refusedNestedRuns = refuseNestedRuns(replica);
+
+    const report = capabilityReport(replica, preset, refusedNestedRuns);
 
     send({ kind: 'hello', laneEpoch: frame.laneEpoch, version: LANE_PROTOCOL_VERSION, capabilities: report });
 };
@@ -621,21 +1062,38 @@ const handle = async (frame: LaneCommand): Promise<void> => {
             state.turnId = frame.turnId;
             state.commitFaults = [];
             state.ackedThrough = 0;
-            state.targetId = frame.target.kind === 'thread' ? frame.target.threadId : `agent:${frame.target.agent}`;
+            state.turnInvocationId = undefined;
 
-            // The authority reports the canonical transcript length for THAT conversation at
-            // dispatch; the lane appends against it instead of guessing its own.
-            state.committedLength = frame.fromLength;
+            const targetId = frame.target.kind === 'thread' ? frame.target.threadId : `agent:${frame.target.agent}`;
+            const firstTurnForTarget = state.targetId !== targetId;
 
-            // The inline path resets conversations for a fresh legacy block before the run
-            // (../sessions.ts ~5399); the replica must do the same, or the two transcripts
-            // would disagree at the first append.
+            state.targetId = targetId;
+
+            // T10 finding M4: the base is the prefix THIS REPLICA holds, never the canonical
+            // length read off the authority. The retired code assigned `frame.fromLength`
+            // straight to the base, so whenever canonical had run ahead of the replica (a
+            // sibling `threadSend` landed while this lane was idle), the lane's own new
+            // messages sat BELOW that base and were skipped - the lane committed nothing and
+            // its work was dropped.
             if (frame.reset === true) {
+                // The inline path resets conversations for a fresh legacy block before the run
+                // (../sessions.ts ~5399); the replica must do the same, or the two transcripts
+                // would disagree at the first append.
                 for (const brain of Object.values(replica.agents)) brain.reset();
 
-                // A reset rewrites every conversation, so the committed prefix restarts from
-                // what the reset seeded (the instructions message).
-                state.committedLength = replica.threadMessages(state.targetId).length;
+                state.committedLength = localThreads.messages(targetId).length;
+            } else if (firstTurnForTarget) {
+                // A fresh replica was built from the canonical snapshot at hello, so its own
+                // copy IS the canonical prefix at that instant; adopt that length and pull only
+                // what has moved since.
+                state.committedLength = localThreads.messages(targetId).length;
+            }
+
+            // The turn-start delta sync. `frame.fromLength` is the cross-check that proves the
+            // two sides may disagree, and the pull closes the gap BEFORE the run starts, so the
+            // model context already contains a message another lane sent here.
+            if (state.committedLength !== frame.fromLength) {
+                await runExclusive(() => syncTranscript());
             }
 
             const controller = new AbortController();
@@ -680,6 +1138,9 @@ const handle = async (frame: LaneCommand): Promise<void> => {
                 ...(answer === undefined ? {} : { answer }),
                 ...(failure === undefined ? {} : { failure }),
                 ...(controller.signal.aborted ? { cancelled: true } : {}),
+                // The invocation this turn archived, so the coordinator's roster mirror names a
+                // result that really exists (T10 M3: it is NOT derivable from the thread id).
+                ...(state.turnInvocationId === undefined ? {} : { invocationId: state.turnInvocationId }),
                 terminalSeq: Math.max(terminalSeq, 0),
                 ...(state.commitFaults.length === 0 ? {} : { commitFaults: [...state.commitFaults] })
             });
@@ -694,20 +1155,30 @@ const handle = async (frame: LaneCommand): Promise<void> => {
             const replica = state.replica;
 
             if (replica === undefined || state.targetId === undefined) {
-                send({ kind: 'fault', laneEpoch: frame.laneEpoch, message: 'Steering arrived with no live run on this lane.' });
+                send({
+                    kind: 'steer.result',
+                    laneEpoch: frame.laneEpoch,
+                    turnId: frame.turnId,
+                    queued: false,
+                    reason: 'There is no live run on this lane to steer.'
+                });
+
                 return;
             }
 
             const receipt = replica.steerThread(state.targetId, frame.input);
 
-            if (!receipt.queued) {
-                send({
-                    kind: 'fault',
-                    laneEpoch: frame.laneEpoch,
-                    turnId: frame.turnId,
-                    message: receipt.reason ?? 'The run is not at a point where steering applies.'
-                });
-            }
+            // T10 finding M6: a steering refusal is its own NON-TERMINAL reply. It used to
+            // travel as a `fault`, and the host settles a turn on a fault - so guidance that
+            // arrived between two model steps ended a live conversation (and the terminal frame
+            // for the real turn then arrived for a lane whose turn record was already gone).
+            send({
+                kind: 'steer.result',
+                laneEpoch: frame.laneEpoch,
+                turnId: frame.turnId,
+                queued: receipt.queued,
+                ...(receipt.queued ? {} : { reason: receipt.reason ?? 'The run is not at a point where steering applies.' })
+            });
 
             return;
         }
@@ -755,9 +1226,18 @@ const handle = async (frame: LaneCommand): Promise<void> => {
             rejectPendingRequests('The run was cancelled.');
             state.controller?.abort();
 
+            // T10 finding S3: releasing the event credit waiters. A run parked in the credit
+            // window of `emitProgress` is waiting on a promise that only an `event.ack`
+            // resolves; after an abort that ack may never come (the coordinator stops draining
+            // the stream the moment the turn is over), and the aborted run would hang there
+            // instead of reaching the commit below.
+            drainAckWaiters();
+
             // Commit what the stopped run already produced. A burn cannot be pre-empted
             // mid-loop, but the transcript it wrote is canonical state, and the terminal
-            // frame below carries the cancellation.
+            // frame below carries the cancellation. Serialized with every other commit
+            // (T10 finding S4), so an interrupt landing mid-turn cannot settle a group out of
+            // order and strand this receipt.
             await commit('agent_message', frame.turnId).catch(() => undefined);
 
             send({ kind: 'aborted', laneEpoch: frame.laneEpoch, ...(frame.turnId === undefined ? {} : { turnId: frame.turnId }) });
@@ -785,11 +1265,10 @@ const handle = async (frame: LaneCommand): Promise<void> => {
 
             state.pendingCommits.delete(frame.seq);
 
-            const faults = frame.outcome.receipts
-                .filter((receipt) => receipt.status === 'rejected')
-                .map((receipt) => `${receipt.rejection?.code ?? 'rejected'}: ${receipt.rejection?.message ?? 'no reason given'}`);
-
-            resolve({ complete: frame.outcome.complete, faults });
+            // T10 findings M2/M4: the whole receipt list is what the boundary acts on - the
+            // per-op canonical facts, and whether a transcript refusal means canonical holds
+            // messages this replica has never seen (./lane-commit.ts `prefix-moved`).
+            resolve({ complete: frame.outcome.complete, receipts: frame.outcome.receipts });
 
             return;
         }
@@ -797,18 +1276,35 @@ const handle = async (frame: LaneCommand): Promise<void> => {
         case 'event.ack': {
             state.ackedThrough = Math.max(state.ackedThrough, frame.streamSeq);
 
-            for (const resolve of state.ackWaiters.splice(0, state.ackWaiters.length)) resolve();
+            drainAckWaiters();
 
             return;
         }
 
         case 'broadcast.registry': {
-            applyRegistryChange(frame.change);
+            // Awaited: the change may widen this lane's memory window (T10 finding M5), and a
+            // turn that calls the new tool next must already hold the canonical digests.
+            await applyRegistryChange(frame.change);
+
             return;
         }
 
         case 'sync.memory': {
             applyMemoryFrame(frame.window);
+            return;
+        }
+
+        // T10 finding M4: the coordinator says canonical conversation state moved. Try the
+        // delta immediately - that is what makes a foreign send visible to a RUNNING turn at
+        // its next safe point - and let the commit boundary retry if the replica cannot take a
+        // wholesale transcript write while its run is attached.
+        case 'sync.transcript': {
+            await runExclusive(async () => {
+                if (state.targetId !== frame.threadId) return;
+
+                await syncTranscript();
+            }).catch(() => undefined);
+
             return;
         }
 
@@ -820,6 +1316,7 @@ const handle = async (frame: LaneCommand): Promise<void> => {
 
         case 'dispose': {
             rejectPendingRequests('The lane was reclaimed.');
+            drainAckWaiters();
             send({ kind: 'aborted', laneEpoch: frame.laneEpoch });
             channel?.close();
             process.exit(0);

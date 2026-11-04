@@ -67,16 +67,22 @@ import {
     DEFAULT_BOUNDS,
     applyMutationGroup,
     applySharedMutation,
+    archiveDigestOf,
     createCommitJournal,
     createWriterLeaseLedger,
     expectsDigestOf,
-    replaceLaneEpoch
+    replaceLaneEpoch,
+    rolledBackReceipts
 } from './lane-commit';
-import type { CanonicalBounds, CanonicalView, GroupOutcome, MutationGroup } from './lane-commit';
+import type { CanonicalBounds, CanonicalView, GroupOutcome, MutationGroup, MutationReceipt, MutationRejectionCode } from './lane-commit';
 import { ID_SPACES, createIdentityLedger, seedFromCounter } from './lane-identity';
 import type { IdSpace, IdentityLease } from './lane-identity';
-import { ABSENT_DIGEST, applyMemoryWrite, captureMemoryWindow, digestMemoryValue } from './lane-memory';
+import { ABSENT_DIGEST, applyMemoryWrite, assessMemoryAccess, captureMemoryWindow, digestMemoryValue } from './lane-memory';
 import type { MemoryWindow } from './lane-memory';
+// T10 findings M5/S2: the created-tool revision is scanned with the SAME lens the hello
+// report uses, before the canonical harness installs it, so a lane never runs a body whose
+// shared reach the plan could not bound.
+import { assessWorkerToolSurface, toolScanTextOf } from './capability';
 
 // The record-store tool names the authority can execute. Matches the core's own union
 // (`HarnessToolRuntime['executeRecordTool']`), stated here so the wire type is explicit.
@@ -104,19 +110,34 @@ export type LaneRuntimeCall =
     | { op: 'runtime'; method: 'agentManage'; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'agentResult'; parameters: Record<string, unknown>; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'threadSend'; threadId?: string; parameters: Record<string, unknown>; identity: LaneCallIdentity }
-    | { op: 'runtime'; method: 'threadList'; identity: LaneCallIdentity };
+    | { op: 'runtime'; method: 'threadList'; identity: LaneCallIdentity }
+    // T10 finding S1: a cross-thread READ. The lane replica cannot answer it truthfully -
+    // its roster and transcripts are a hello snapshot plus its own work - so the canonical
+    // harness resolves the identity and returns the transcript. The pure paging/filtering
+    // half of `threadRead` still runs on the LANE (that is the CPU isolation), so only the
+    // state read crosses.
+    | { op: 'thread:read'; threadId: string; identity: LaneCallIdentity };
 
 // Everything else the authority answers for a lane.
 export type LaneAuthorityRequest =
     | LaneRuntimeCall
     | { op: 'lease'; space: IdSpace; count: number }
     | { op: 'memory:window'; keys: string[] }
+    // T10 finding M4: the lane asks for the canonical transcript tail it has not adopted.
+    // `haveLength` is the prefix THIS replica already holds (and has published), so the
+    // answer is exactly what moved - a sibling `threadSend`, or another lane's append.
+    | { op: 'transcript:sync'; threadId: string; haveLength: number }
     | { op: 'brain:claim'; agent: string }
     | { op: 'brain:release'; agent: string }
     | { op: 'action:request'; requestId: string; agent: string; threadId?: string; request: HarnessActionRequest }
     // A harness body that is NOT a conversation turn: the operator's direct tool call or
     // slash command (decision D1). It runs on the lane's CPU, and every shared operation it
     // performs comes back through `op:'runtime'` like any other lane work.
+    //
+    // T10 finding S8: these two are `invoke` FRAME payloads, never requests. The worker
+    // executes them on its own CPU (./lane-worker-loop.ts `case 'invoke'`); an `answer`
+    // branch for them would have run coordinator CPU for work the lane owns, so it is gone
+    // and a lane that raised one gets a named refusal instead.
     | { op: 'execute:tool'; name: string; parameters: unknown }
     | { op: 'execute:command'; line: string };
 
@@ -130,6 +151,11 @@ export type LaneAuthorityAnswer = {
         enabled?: string[];
         registry?: { name: string; source: string; revision: string; removed: boolean }[];
         identities?: Partial<Record<IdSpace, number>>;
+        // T10 finding M5: memory keys the SESSION gained because a tool revision was just
+        // installed (the authority scanned that text itself). Every live lane extends its
+        // declared window with these and pulls the digests, so a model-created tool's memory
+        // write is committed instead of silently dropped by the derivation.
+        memoryKeys?: string[];
     };
 };
 
@@ -145,7 +171,9 @@ export type LaneAuthorityOptions = {
     ask?: (request: { requestId: string; agent: string; threadId?: string; request: HarnessActionRequest }) => Promise<HarnessActionChoice>;
     // Called after a registry change is applied, so the host can broadcast it. The metadata
     // is included because a created tool's source is a function body, and a replica needs
-    // description/tags/parameters to install the same revision.
+    // description/tags/parameters to install the same revision. `memoryKeys` carries the keys
+    // the SESSION gained from that revision (T10 finding M5), so every live lane can widen its
+    // declared window and fetch the digests instead of dropping the tool's memory writes.
     onRegistryChange?: (change: {
         name: string;
         description?: string;
@@ -154,6 +182,7 @@ export type LaneAuthorityOptions = {
         source: string;
         revision: string;
         removed: boolean;
+        memoryKeys?: string[];
     }) => void;
     // Called when the identity ledger moved, so a NEW lane's blueprint inherits it.
     onIdentityChange?: (watermarks: Partial<Record<IdSpace, number>>) => void;
@@ -176,7 +205,14 @@ export type LaneAuthority = {
     answer: (laneEpoch: number, request: LaneAuthorityRequest) => Promise<LaneAuthorityAnswer>;
     commit: (laneEpoch: number, group: MutationGroup) => GroupOutcome;
     // The committed state the lane must adopt: canonical transcript length after an append.
+    // Defensive by design: a conversation deleted mid-turn reads as 0 here, and the append
+    // that follows is refused with a name rather than throwing inside the dispatch.
     canonicalLengthOf: (threadId: string) => number;
+    // T10 finding M4: the canonical transcript itself, in canonical order. Length alone is
+    // not a sync primitive - a replica can be behind by N messages it never saw, and the
+    // only honest fix is to ship those messages. Throws for an id this harness never had
+    // (the routed request surfaces that as a named refusal).
+    canonicalTranscriptOf: (threadId: string) => HarnessMessage[];
 };
 
 // ---------------------------------------------------------------------------
@@ -247,7 +283,16 @@ const threadsOf = (snapshot: HarnessSnapshot): CanonicalView['threads'] => {
 };
 
 // The fold view for one commit group.
-export const canonicalViewOf = (harness: Harness, memory: Record<string, unknown>): CanonicalView => {
+//
+// `resultOwners` (T10 finding M3) is the authority's live "which lane epoch archived this
+// invocation" map, copied into the view so the fold can tell a writer updating its own slot
+// from a lane colliding into somebody else's. It is authority-owned state: the view gets a
+// copy, and only a replayed-and-applied archive writes the live map (see `commit`).
+export const canonicalViewOf = (
+    harness: Harness,
+    memory: Record<string, unknown>,
+    resultOwners: ReadonlyMap<string, number> = new Map()
+): CanonicalView => {
     const snapshot = harness.snapshot();
     const results: CanonicalView['results'] = {};
 
@@ -272,6 +317,7 @@ export const canonicalViewOf = (harness: Harness, memory: Record<string, unknown
         threads: threadsOf(snapshot),
         stores: storesOf(snapshot),
         results,
+        resultOwners: Object.fromEntries(resultOwners.entries()),
         tools,
         createdToolCount: (snapshot as unknown as { createdToolCount?: number }).createdToolCount ?? 0,
         // LIVE map: memory is deliberately not part of a snapshot, so the authority's CAS
@@ -344,9 +390,17 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
     const { harness } = options;
     const bounds: CanonicalBounds = { ...DEFAULT_BOUNDS, ...(options.bounds ?? {}) };
     const memory = (harness.memory as unknown as { data: Record<string, unknown> }).data;
+    // Mutable, and deliberately so: installing a tool revision whose (authority-scanned)
+    // text names new memory keys WIDENS the session window, because the scan of the text is
+    // the authority's own decision, not a lane's claim. T10 finding M5.
     const declared = new Set(options.memoryKeys ?? []);
 
-    const view = () => canonicalViewOf(harness, memory);
+    // Which lane epoch archived each invocation id (T10 finding M3). Authority-owned: a
+    // fold view gets a copy, and only a replay that LANDED writes this map, so a rolled-
+    // back group can never make a lane the owner of a record canonical never received.
+    const archiveOwners = new Map<string, number>();
+
+    const view = () => canonicalViewOf(harness, memory, archiveOwners);
     const identities = seedsOf(view(), harness);
     const ledger = createIdentityLedger(identities);
     const leases = createWriterLeaseLedger();
@@ -369,6 +423,14 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
     const closeLane = (laneEpoch: number): void => {
         leases.dropLane(laneEpoch);
         journal.supersede(laneEpoch);
+
+        // T10 finding M3: a retired lane's archived slots become claimable again, so the
+        // reborn lane for the SAME conversation (a reclaim, or an authority replacement) may
+        // update its own invocation instead of being refused by an epoch that no longer
+        // exists. Nothing about the canonical record changes - only who may write it next.
+        for (const [invocationId, owner] of [...archiveOwners.entries()]) {
+            if (owner === laneEpoch) archiveOwners.delete(invocationId);
+        }
     };
 
     // Which identity space each record tool's store draws from. The mapping is explicit
@@ -423,6 +485,28 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
     // discovery or registry change so the lane and the authority agree without a re-hello.
     const enabledNow = (): string[] => [...((harness as unknown as { discoveredTools?: string[] }).discoveredTools ?? [])];
 
+    // The canonical transcript of one conversation, in canonical order. `threadMessages`
+    // resolves BOTH ids a lane uses - a host thread AND an agent's default conversation
+    // (`agent:<name>` is a real thread record with the registry agent attached) - so there is
+    // no second spelling of "the transcript" for a lane and the coordinator to disagree about.
+    const canonicalTranscriptOf = (threadId: string): HarnessMessage[] => harness.threadMessages(threadId);
+
+    // The defensive read the host uses at dispatch. A conversation deleted mid-turn reads 0
+    // here rather than throwing, and the append that follows is refused with a name.
+    const canonicalLengthOf = (threadId: string): number => {
+        try {
+            return canonicalTranscriptOf(threadId).length;
+        } catch {
+            return 0;
+        }
+    };
+
+    // T10 finding S6: the memory window handed to the fold. An EMPTY session window means
+    // "this session declares no keys at all" (the same unrestricted reading `memory:window`
+    // already uses), so `undefined` is passed and nothing is refused on that axis; a
+    // non-empty window is enforced op-by-op in ./lane-commit.ts.
+    const declaredKeysForFold = (): readonly string[] | undefined => (declared.size === 0 ? undefined : [...declared]);
+
     const answer = async (laneEpoch: number, request: LaneAuthorityRequest): Promise<LaneAuthorityAnswer> => {
         // A retired epoch gets NO answer: its work belongs to a lane that is gone, and an
         // answer would only invite the dead lane to keep writing (T3 finding F9).
@@ -458,30 +542,76 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         return { value, sync: { enabled: enabledNow() } };
                     }
                     case 'createToolForAgent': {
+                        // T10 findings M5/S2: scan the CANDIDATE text before the canonical
+                        // install, so a lane cannot put a body into the session that the plan
+                        // would have refused at hello. `toolScanTextOf` is the field-correct
+                        // reader: a shipped tool is `format: 'module'`, whose text lives in
+                        // `moduleText` (the retired code read `.source`, which that format
+                        // leaves empty, so every scan in the pipeline was vacuous).
+                        const creation = request.creation as ToolCreation;
+                        const creationText = toolScanTextOf(creation as unknown as Parameters<typeof toolScanTextOf>[0]);
+                        const candidate = assessWorkerToolSurface({
+                            name: creation?.name ?? 'created tool',
+                            source: creationText
+                        });
+
+                        if (candidate.reasons.length > 0) {
+                            // An explicit refusal, naming the code and the fix: a silent
+                            // install would leave the model's tool unable to run anywhere.
+                            throw new Error(
+                                `This session cannot create the tool "${String(creation?.name)}" while threadExecution is "worker": ${candidate.reasons
+                                    .map((surface) => surface.message)
+                                    .join(' ')}`
+                            );
+                        }
+
                         // `creation` crossed a boundary as data, so it is asserted against the
                         // core's own shape here; the canonical call validates it for real.
                         const value = (await runtime.createToolForAgent(
                             callerFor(request.identity),
-                            request.creation as ToolCreation
+                            creation
                         )) as unknown;
                         const created = value as { name?: string; revision?: string };
                         // The installed text comes from the canonical registry, which is the
                         // only place the compiled revision is known.
-                        const installed = created?.name === undefined ? undefined : harness.toolSource(created.name);
-                        const source = (installed as { source?: string } | undefined)?.source ?? '';
+                        const installed = created?.name === undefined ? undefined : (harness.toolSource(created.name) as unknown as Parameters<typeof toolScanTextOf>[0] | undefined);
+                        const installedText = toolScanTextOf(installed ?? {});
+                        // `source` stays the legacy function-body spelling, and `moduleText` is
+                        // only set for a module revision: the replica installs whichever one the
+                        // canonical harness compiled, never module text handed to the body path.
+                        const source = installed?.source ?? '';
 
                         if (created?.name !== undefined) {
                             // The canonical registry is the only place the installed revision
                             // is fully known: the compiled definition carries the description,
                             // tags and schema, and `toolSource` carries the text.
                             const definition = (harness.tools as Record<string, { description?: string; tags?: readonly string[]; parameters?: Record<string, unknown> } | undefined>)[created.name];
+                            // T10 finding M5: the window is recomputed from the revision that is
+                            // NOW installed, so a model-created tool's literal memory keys become
+                            // committable state instead of a write nobody derives. The candidate
+                            // text is the fallback for a registration that captures no revision
+                            // (a host-supplied definition), which is the unscannable case the
+                            // hello report already keeps as a warning.
+                            const scanned = assessMemoryAccess(installedText ?? creationText ?? '');
+                            const gained: string[] = [];
+
+                            for (const key of scanned?.keys ?? []) {
+                                if (declared.has(key)) continue;
+
+                                declared.add(key);
+                                gained.push(key);
+                            }
+
                             const change = {
                                 name: created.name,
                                 ...(definition?.description === undefined ? {} : { description: definition.description }),
                                 ...(definition?.tags === undefined ? {} : { tags: [...definition.tags] }),
                                 ...(definition?.parameters === undefined ? {} : { parameters: structuredClone(definition.parameters) }),
                                 source,
-                                revision: created.revision ?? digestMemoryValue(source),
+                                ...(installed?.moduleText === undefined ? {} : { moduleText: installed.moduleText }),
+                                ...(installed?.dependencies === undefined || installed.dependencies.length === 0 ? {} : { dependencies: structuredClone(installed.dependencies) }),
+                                ...(gained.length === 0 ? {} : { memoryKeys: gained }),
+                                revision: created.revision ?? digestMemoryValue(installedText ?? source),
                                 removed: false
                             };
 
@@ -491,7 +621,15 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                             ledger.observe('createdToolCount', view().createdToolCount);
                             options.onRegistryChange?.(change);
 
-                            return { value, sync: { registry: [change], enabled: enabledNow(), identities: ledger.watermarks() } };
+                            return {
+                                value,
+                                sync: {
+                                    registry: [change],
+                                    enabled: enabledNow(),
+                                    identities: ledger.watermarks(),
+                                    ...(gained.length === 0 ? {} : { memoryKeys: gained })
+                                }
+                            };
                         }
 
                         return { value, sync: { enabled: enabledNow() } };
@@ -541,6 +679,55 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
             case 'brain:release':
                 return { value: leases.release({ kind: 'agent', name: request.agent }, laneEpoch) };
 
+            // T10 finding S1: one canonical conversation, as data. The identity block and the
+            // transcript come from the CANONICAL harness, so a lane reading a sibling thread -
+            // or one another lane created - sees the session, not its private replica. The
+            // paging, regex filtering and byte budgeting stay on the lane (the CPU work
+            // isolation exists for), so the coordinator only answers the read.
+            case 'thread:read': {
+                const record = harness.thread(request.threadId);
+
+                if (record === undefined) {
+                    throw new Error(`Thread "${request.threadId}" has no record in this session; it was never created, or it was deleted.`);
+                }
+
+                const messages = harness.threadMessages(request.threadId);
+
+                return { value: { threadId: request.threadId, record, messages, length: messages.length } };
+            }
+
+            // T10 finding M4: the transcript delta a replica is missing. `haveLength` is the
+            // canonical prefix this lane already adopted (and published), so the answer is
+            // exactly what moved since: a sibling `threadSend`, another lane's append, or a
+            // coordinator transcript edit. When canonical got SHORTER than the lane's base
+            // (a rewrite/reset), the lane cannot append a delta honestly, so the answer carries
+            // the whole transcript plus `rebased` and the replica replaces itself.
+            case 'transcript:sync': {
+                const messages = canonicalTranscriptOf(request.threadId);
+                const have = Math.max(0, Math.trunc(request.haveLength));
+
+                if (have > messages.length) {
+                    return {
+                        value: {
+                            threadId: request.threadId,
+                            fromLength: 0,
+                            length: messages.length,
+                            rebased: true,
+                            messages
+                        }
+                    };
+                }
+
+                return {
+                    value: {
+                        threadId: request.threadId,
+                        fromLength: have,
+                        length: messages.length,
+                        messages: messages.slice(have)
+                    }
+                };
+            }
+
             case 'action:request': {
                 if (options.ask === undefined) {
                     throw new Error(
@@ -558,14 +745,15 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                 return { value: choice };
             }
 
+            // T10 finding S8: no answer branch. The worker executes an operator action on its
+            // OWN CPU (decision D1), so these two arrive as `invoke` frames, never as requests.
+            // Answering them here would have run a harness body on the coordinator - the exact
+            // work isolation the mode promises - so a lane that raises one gets a named refusal.
             case 'execute:tool':
-                return { value: await harness.executeTool(request.name, request.parameters), sync: { enabled: enabledNow() } };
-
-            case 'execute:command': {
-                const value = (await (harness as unknown as { executeCommand: (line: string) => unknown }).executeCommand(request.line)) as unknown;
-
-                return { value, sync: { enabled: enabledNow() } };
-            }
+            case 'execute:command':
+                throw new Error(
+                    `"${request.op}" is an operator invocation frame, not a request: a lane worker executes it on its own CPU, and the authority answers only the shared operation it raises.`
+                );
 
             default:
                 throw new Error(`Unknown lane authority request: ${JSON.stringify((request as { op?: string }).op)}.`);
@@ -617,7 +805,11 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         ...(mutation.error === undefined ? {} : { error: mutation.error })
                     });
 
-                    return { ok: true, digest: digestMemoryValue(archived.record) };
+                    // The digest the lane compares against is `archiveDigestOf`, the projection
+                    // over the fields a WRITER owns: the authority reassigned `completedOrder`
+                    // just above, and a digest of the whole stored record would never match the
+                    // lane's own view of its result (T10 finding M3).
+                    return { ok: true, digest: archiveDigestOf(archived.record) };
                 } catch (error) {
                     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
                 }
@@ -646,10 +838,32 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         }
     };
 
+    // The code a LIVE write refuses with, per op kind (T10 finding S5's sibling: a receipt
+    // whose code names the wrong conflict sends the lane to the wrong fix).
+    const liveRejectionCodeOf = (mutation: Parameters<typeof applySharedMutation>[1]): MutationRejectionCode => {
+        if (mutation.kind === 'memory:set' || mutation.kind === 'memory:delete') return 'stale-memory';
+        if (mutation.kind === 'transcript:append') return 'prefix-moved';
+        if (mutation.kind === 'thread:status' || mutation.kind === 'result:archive') return 'stale-record';
+
+        return 'invalid-mutation';
+    };
+
     const commit = (laneEpoch: number, group: MutationGroup): GroupOutcome => {
         const acceptance = journal.accepts(laneEpoch, group.seq);
 
         if (!acceptance.ok) {
+            // T10 finding S5: pass the journal's actual reason through. A duplicate send, a
+            // group behind this lane's own watermark, and a retired epoch are three different
+            // situations - the first two are recoverable by the lane, and the message the
+            // retired code produced told it its epoch was dead either way.
+            const code: MutationRejectionCode = acceptance.code ?? 'epoch-superseded';
+            const message =
+                code === 'seq-duplicate'
+                    ? `Commit ${group.seq} was already settled for lane ${laneEpoch}; the reply is the earlier receipt, and the base behind it already moved.`
+                    : code === 'seq-behind'
+                      ? `Commit ${group.seq} is behind lane ${laneEpoch}'s applied watermark at ${journal.appliedThrough(laneEpoch)}; a lane never rewinds canonical state, so advance the seq.`
+                      : `Lane ${laneEpoch} is retired; its commits are no longer applied.`;
+
             return {
                 seq: group.seq,
                 status: 'rejected',
@@ -659,48 +873,99 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                     seq: group.seq,
                     laneEpoch,
                     status: 'rejected',
-                    rejection: {
-                        code: 'epoch-superseded',
-                        message:
-                            acceptance.code === 'seq-duplicate'
-                                ? `Commit ${group.seq} was already settled for this lane; the reply is the earlier receipt.`
-                                : `Commit ${group.seq} is behind this lane's applied watermark; a lane never rewinds canonical state.`
-                    }
+                    rejection: { code, message }
                 }))
             };
         }
 
-        const folded = applyMutationGroup(view(), group, { laneEpoch, leases, identity: ledger, bounds });
+        const folded = applyMutationGroup(view(), group, {
+            laneEpoch,
+            leases,
+            identity: ledger,
+            bounds,
+            declaredKeys: declaredKeysForFold()
+        });
         const outcome = folded.outcome;
 
-        // Replay every op the fold accepted. The fold already guaranteed atomicity, so a
-        // refusal here means the LIVE object disagreed - report it on that op's receipt.
-        const receipts = outcome.receipts.map((receipt, index) => {
+        // T10 finding M2, step 1: a group the FOLD could not complete moves nothing live. The
+        // staged view was thrown away, so replaying the individually-applied receipts onto the
+        // canonical harness would half-apply a group whose lane has been told (by `complete:
+        // false`) to adopt nothing - the live object and every later base then disagree
+        // permanently, which is the divergence and the livelock the review measured.
+        if (!outcome.complete) {
+            const receipts = rolledBackReceipts(outcome.receipts, group.ops, laneEpoch, group.seq);
+
+            journal.settle(laneEpoch, group.seq, false);
+            notifyIdentity();
+
+            return { ...outcome, receipts, complete: false };
+        }
+
+        // T10 finding M2, step 2: the fold accepted everything, so replay in order and stop at
+        // the first op the LIVE object disagrees with. Nothing after that op is written, so the
+        // half-write is bounded to a prefix, and every receipt names what really happened:
+        //   - ops before the break landed -> `applied`, with the canonical digest/length, so the
+        //     lane adopts them and its base matches the live object;
+        //   - the breaking op -> refused with its real code and the canonical fact in `effect`;
+        //   - everything after it -> `group-rolled-back`, with no effect, because it never landed.
+        const receipts: MutationReceipt[] = [];
+        let brokeAt = -1;
+
+        outcome.receipts.forEach((receipt, index) => {
             const mutation = group.ops[index];
+
+            if (brokeAt >= 0) {
+                receipts.push({
+                    opId: receipt.opId,
+                    seq: group.seq,
+                    laneEpoch,
+                    status: 'rejected',
+                    rejection: {
+                        code: 'group-rolled-back',
+                        message: `Commit ${group.seq} stopped at operation ${brokeAt}; operation ${receipt.opId} was never written.`,
+                        }
+                });
+
+                return;
+            }
+
             const applied = replay(laneEpoch, mutation, receipt.status);
 
             if (applied.ok) {
-                return {
+                // The archive landed on the canonical harness, so THIS epoch owns that slot from
+                // now on - the rule the fold needs to allow its next turn to replace it (M3).
+                if (mutation.kind === 'result:archive') archiveOwners.set(mutation.invocationId, laneEpoch);
+
+                receipts.push({
                     ...receipt,
-                    effect: { ...receipt.effect, ...(applied.digest === undefined ? {} : { digest: applied.digest }), ...(applied.length === undefined ? {} : { length: applied.length }) }
-                };
+                    effect: {
+                        ...receipt.effect,
+                        ...(applied.digest === undefined ? {} : { digest: applied.digest }),
+                        ...(applied.length === undefined ? {} : { length: applied.length })
+                    }
+                });
+
+                return;
             }
 
-            return {
+            brokeAt = index;
+
+            receipts.push({
                 ...receipt,
                 status: 'rejected' as const,
                 rejection: {
-                    // A memory refusal is a digest collision; anything else is the canonical
-                    // object having moved under the append/status write.
-                    code: mutation.kind === 'memory:set' || mutation.kind === 'memory:delete' ? ('stale-memory' as const) : ('prefix-moved' as const),
+                    code: liveRejectionCodeOf(mutation),
                     message: applied.reason ?? 'the canonical state moved between the fold and the write'
                 },
                 effect: { ...receipt.effect, ...(applied.digest === undefined ? {} : { digest: applied.digest }) }
-            };
+            });
         });
 
-        const complete = outcome.complete && receipts.every((receipt) => receipt.status === 'applied');
+        const complete = brokeAt === -1;
 
+        // Only a wholly landed group moves the applied watermark, which is what the terminal
+        // gate (journal.mayPublishSuccess) reads; a partial group leaves it where it was (F7)
+        // and the lane re-derives against the canonical facts the receipts just carried.
         journal.settle(laneEpoch, group.seq, complete);
         notifyIdentity();
 
@@ -719,10 +984,8 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         memoryWindow: (laneEpoch, keys) => captureMemoryWindow(memory, keys ?? [...declared], laneEpoch),
         answer,
         commit,
-        canonicalLengthOf: (threadId) =>
-            threadId.startsWith('agent:')
-                ? ((harness as unknown as { agents?: Record<string, { messages: unknown[] }> }).agents?.[threadId.slice(6)]?.messages ?? []).length
-                : (harness.threadMessages(threadId).length || 0)
+        canonicalLengthOf,
+        canonicalTranscriptOf
     };
 };
 

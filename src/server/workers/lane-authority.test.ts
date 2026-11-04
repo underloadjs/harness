@@ -534,3 +534,258 @@ describe('canonical helpers the host drives', () => {
         expect(lowered.threadSequence).toBe(40);
     });
 });
+
+// ---------------------------------------------------------------------------
+// T10 findings, measured against the LIVE canonical harness (not the staged fold):
+//   M2 - a group that did not complete must move NOTHING on the live object, and the lane
+//        must be able to land the same boundary once it re-bases (no wedged lane, and no
+//        turn that can never publish);
+//   M3 - the same conversation may replace the result it owns, because a host thread's
+//        invocation id IS its thread id by core design;
+//   M4 - the delta a replica is missing is the messages, not a length;
+//   S1 - a conversation this lane never created is readable from the canonical harness;
+//   S5 - a refusal names the journal's actual reason;
+//   S8 - an operator action is never executed on the coordinator.
+// ---------------------------------------------------------------------------
+
+describe('commit: an incomplete group moves nothing on the canonical harness (T10 M2)', () => {
+    const dataOf = (core: Harness): Record<string, unknown> => (core.memory as unknown as { data: Record<string, unknown> }).data;
+
+    it('leaves live memory and live transcript untouched, then lands on the retry', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        const partial = authority.commit(EPOCH_A, group(1, [
+            { kind: 'memory:set', key: 'shared.cache', value: 'from the lane', expects: ABSENT_DIGEST },
+            { kind: 'transcript:append', threadId: thread.id, fromLength: 99, messages: [{ role: 'assistant', content: 'mine' }] }
+        ]));
+
+        expect(partial.status).toBe('partial');
+        expect(partial.complete).toBe(false);
+        // The probe measured the opposite: the staged fold rolled back while the applier
+        // replayed the individually-applied receipt, so canonical memory got the value and the
+        // lane's base said it never happened.
+        expect(partial.receipts.map((receipt) => receipt.rejection?.code)).toEqual(['group-rolled-back', 'prefix-moved']);
+        expect(partial.receipts[0].effect).toBeUndefined();
+        expect(dataOf(core)['shared.cache']).toBeUndefined();
+        expect(core.threadMessages(thread.id)).toHaveLength(0);
+        // The canonical fact the lane needs to re-base is in the refusal that caused this.
+        expect(partial.receipts[1].effect?.length).toBe(0);
+        expect(authority.journal.appliedThrough(EPOCH_A)).toBe(0);
+        expect(authority.journal.mayPublishSuccess(EPOCH_A, 1)).toBe(false);
+
+        // The next boundary, re-derived against the facts the receipts carried. One contested
+        // op used to wedge EVERY later commit of that lane; here the same lane simply lands.
+        const retried = authority.commit(EPOCH_A, group(2, [
+            { kind: 'memory:set', key: 'shared.cache', value: 'from the lane', expects: ABSENT_DIGEST },
+            { kind: 'transcript:append', threadId: thread.id, fromLength: 0, messages: [{ role: 'assistant', content: 'mine' }] }
+        ]));
+
+        expect(retried.complete).toBe(true);
+        expect(dataOf(core)['shared.cache']).toBe('from the lane');
+        expect(core.threadMessages(thread.id).map((message) => (message as { content: string }).content)).toEqual(['mine']);
+        expect(authority.journal.mayPublishSuccess(EPOCH_A, 2)).toBe(true);
+    });
+
+    it('refuses a memory write to a key outside the window the lane was given (S6)', () => {
+        const core = coreOf();
+        const authority = authorityFor(core, { memoryKeys: ['mine.key'] });
+
+        dataOf(core)['sibling.key'] = 'canonical value';
+
+        const outcome = authority.commit(EPOCH_A, group(1, [
+            { kind: 'memory:set', key: 'sibling.key', value: 'lane guess', expects: ABSENT_DIGEST }
+        ]));
+
+        expect(outcome.complete).toBe(false);
+        expect(outcome.receipts[0].rejection?.code).toBe('memory-undeclared');
+        expect(outcome.receipts[0].effect?.digest).toBe(expectsDigestOf('canonical value'));
+        expect(dataOf(core)['sibling.key']).toBe('canonical value');
+    });
+});
+
+describe('commit: one conversation owns the result it archives (T10 M3)', () => {
+    const archivedOf = (core: Harness, invocationId: string): { content: string; completedOrder: number }[] =>
+        ((core.snapshot() as unknown as { agentResults: { invocationId: string; content: string; completedOrder: number }[] }).agentResults ?? []).filter(
+            (record) => record.invocationId === invocationId
+        );
+
+    it('replaces its own slot on the next turn instead of keeping the first answer forever', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        const archiveOp = (content: string, sequence: number, completedOrder: number): MutationGroup['ops'][number] => ({
+            kind: 'result:archive',
+            invocationId: thread.id,
+            sequence,
+            completedOrder,
+            agent: 'primary',
+            role: 'primary',
+            runKind: 'root',
+            status: 'completed',
+            content
+        });
+
+        const first = authority.commit(EPOCH_A, group(1, [archiveOp('answer one', 1, 1)]));
+        // The retired fold refused this second commit outright ('already archived'), so the
+        // canonical archive kept 'answer one' for the whole life of the conversation.
+        const second = authority.commit(EPOCH_A, group(2, [archiveOp('answer two', 2, 2)]));
+
+        expect(first.receipts[0].status).toBe('applied');
+        expect(second.complete).toBe(true);
+        expect(archivedOf(core, thread.id).map((record) => record.content)).toEqual(['answer two']);
+        // The ORDER stays the authority's, even though the lane proposed one.
+        expect(archivedOf(core, thread.id)[0].completedOrder).toBeGreaterThanOrEqual(2);
+        // A repeat of an unchanged result digests the same, which is what lets a lane skip it
+        // instead of re-archiving every boundary: the authority-assigned order is not in it.
+        const unchanged = authority.commit(EPOCH_A, group(3, [archiveOp('answer two', 2, 40)]));
+
+        expect(unchanged.receipts[0].effect?.digest).toBe(second.receipts[0].effect?.digest);
+    });
+
+    it('refuses a foreign live epoch, and frees the slot when the owner is retired', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        const archiveOp = (content: string, sequence: number): MutationGroup['ops'][number] => ({
+            kind: 'result:archive',
+            invocationId: thread.id,
+            sequence,
+            completedOrder: sequence,
+            agent: 'primary',
+            role: 'primary',
+            runKind: 'root',
+            status: 'completed',
+            content
+        });
+
+        authority.commit(EPOCH_A, group(1, [archiveOp('lane A answer', 1)]));
+
+        const collision = authority.commit(EPOCH_B, group(1, [archiveOp('lane B invented it', 2)]));
+
+        expect(collision.receipts[0].rejection?.code).toBe('not-writer');
+        expect(archivedOf(core, thread.id).map((record) => record.content)).toEqual(['lane A answer']);
+
+        // A reclaim: the lane that owned that conversation is gone, so the one that runs it now
+        // may update its own invocation instead of being refused by a dead epoch.
+        authority.closeLane(EPOCH_A);
+
+        const adopted = authority.commit(EPOCH_B, group(2, [archiveOp('lane B second turn', 3)]));
+
+        expect(adopted.receipts[0].status).toBe('applied');
+        expect(archivedOf(core, thread.id).map((record) => record.content)).toEqual(['lane B second turn']);
+    });
+});
+
+describe('answer: the canonical transcript delta and the routed thread read (T10 M4/S1)', () => {
+    it('answers exactly the messages the replica has not adopted', async () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // The lane publishes its own turn...
+        const committed = authority.commit(EPOCH_A, group(1, [
+            { kind: 'transcript:append', threadId: thread.id, fromLength: 0, messages: [{ role: 'user', content: 'mine' }] }
+        ]));
+
+        expect(committed.receipts[0].effect?.length).toBe(1);
+
+        // ...and a sibling's send lands canonically, which the replica never saw. The retired
+        // host shipped only the LENGTH, so the lane skipped its own messages at that base.
+        core.appendThreadMessages(thread.id, [{ role: 'user', content: 'from a sibling lane' }], 1);
+
+        const synced = await authority.answer(EPOCH_A, { op: 'transcript:sync', threadId: thread.id, haveLength: 1 });
+        const delta = synced.value as { threadId: string; fromLength: number; length: number; messages: { content: string }[] };
+
+        expect(delta.threadId).toBe(thread.id);
+        expect(delta.fromLength).toBe(1);
+        expect(delta.length).toBe(2);
+        expect(delta.messages.map((message) => message.content)).toEqual(['from a sibling lane']);
+
+        // Already level: nothing to insert, so a lane cannot duplicate what it has.
+        const level = await authority.answer(EPOCH_A, { op: 'transcript:sync', threadId: thread.id, haveLength: 2 });
+
+        expect((level.value as { messages: unknown[] }).messages).toEqual([]);
+
+        // Canonical got shorter than the lane's base (a rewrite or a reset): the whole
+        // transcript is the new prefix, and the answer says so instead of lying about a delta.
+        const behind = await authority.answer(EPOCH_A, { op: 'transcript:sync', threadId: thread.id, haveLength: 9 });
+
+        expect(behind.value).toMatchObject({ fromLength: 0, length: 2, rebased: true });
+    });
+
+    it('reads a conversation this lane never created from the canonical harness (S1)', async () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const sibling = core.createThread('primary', { label: 'sibling' });
+
+        core.appendThreadMessages(sibling.id, [{ role: 'user', content: 'canonical text' }], 0);
+
+        const read = await authority.answer(EPOCH_A, { op: 'thread:read', threadId: sibling.id, identity: {} });
+        const value = read.value as { record: { id: string; label?: string }; messages: { content: string }[]; length: number };
+
+        expect(value.record).toMatchObject({ id: sibling.id, label: 'sibling' });
+        expect(value.messages.map((message) => message.content)).toEqual(['canonical text']);
+        expect(value.length).toBe(1);
+
+        // An id that never existed is the harness's own honest error, not an empty answer.
+        await expect(authority.answer(EPOCH_A, { op: 'thread:read', threadId: 'thread-999', identity: {} })).rejects.toThrow(
+            /has no record in this session/
+        );
+    });
+});
+
+describe('refusals a lane can act on (T10 S5/S8)', () => {
+    it('names the journal reason instead of always "epoch superseded"', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        const append = (fromLength: number): MutationGroup['ops'] => [
+            { kind: 'transcript:append', threadId: thread.id, fromLength, messages: [{ role: 'user', content: 'x' }] }
+        ];
+
+        expect(authority.commit(EPOCH_A, group(1, append(0))).complete).toBe(true);
+
+        // A re-send of a settled seq: recoverable, and the message says what to do with it.
+        const duplicate = authority.commit(EPOCH_A, group(1, append(1)));
+
+        expect(duplicate.receipts[0].rejection?.code).toBe('seq-duplicate');
+        expect(duplicate.receipts[0].rejection?.message).toBe('Commit 1 was already settled for lane 1; the reply is the earlier receipt, and the base behind it already moved.');
+
+        // A group behind this lane's own watermark: also recoverable, also its own code.
+        const behind = authority.commit(EPOCH_A, group(0, append(1)));
+
+        expect(behind.receipts[0].rejection?.code).toBe('seq-behind');
+        expect(behind.receipts[0].rejection?.message).toContain("behind lane 1's applied watermark at 1");
+
+        // The one case the retired code described.
+        authority.closeLane(EPOCH_A);
+
+        const dead = authority.commit(EPOCH_A, group(3, append(1)));
+
+        expect(dead.receipts[0].rejection?.code).toBe('epoch-superseded');
+        expect(dead.receipts[0].rejection?.message).toBe('Lane 1 is retired; its commits are no longer applied.');
+    });
+
+    it('refuses an operator invocation raised as a request instead of running it on the coordinator (S8)', async () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+
+        await expect(authority.answer(EPOCH_A, { op: 'execute:tool', name: 'task', parameters: {} })).rejects.toThrow(/operator invocation frame/);
+        await expect(authority.answer(EPOCH_A, { op: 'execute:command', line: '/reset' })).rejects.toThrow(/executes it on its own CPU/);
+    });
+});

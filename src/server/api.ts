@@ -1202,7 +1202,7 @@ export const createHarnessApi = ({
                     // R3b + T5: the entry is durable BEFORE the 201, and a failed
                     // write rolls the registry back (no phantom card). This is a
                     // no-op commit when the host runs in memory.
-                    const preset = store.mutateRegistry(() =>
+                    const preset = await store.mutateRegistry(() =>
                         registry.create({
                             name: body.name,
                             ...(body.title === undefined ? {} : { title: body.title }),
@@ -1292,7 +1292,7 @@ export const createHarnessApi = ({
                     // `{ deleted: true }` is never an answer the next restart
                     // contradicts. Unknown or already-deleted name: 404 from
                     // HarnessRegistryError, mapped by the outer catch.
-                    store.mutateRegistry(() => registry.remove(first));
+                    await store.mutateRegistry(() => registry.remove(first));
 
                     const result: DeleteHarnessResult = { deleted: true };
 
@@ -1319,7 +1319,7 @@ export const createHarnessApi = ({
                 // R3b + T5: persist the patched registry before answering, and roll
                 // the entry back if that write fails. An existing session keeps its
                 // frozen preset, so this only affects future ones.
-                const preset = store.mutateRegistry(() =>
+                const preset = await store.mutateRegistry(() =>
                     registry.update(first, {
                         ...(body.title === undefined ? {} : { title: body.title }),
                         ...(body.description === undefined ? {} : { description: body.description }),
@@ -1410,7 +1410,7 @@ export const createHarnessApi = ({
 
                         // mergeSettings enforces the credential rule: a foreign
                         // baseURL with no explicit key gets no server key.
-                        const session = store.create(body.harness, body.settings);
+                        const session = await store.create(body.harness, body.settings);
                         return { kind: 'json', status: 201, body: { session } };
                     }
 
@@ -1450,12 +1450,12 @@ export const createHarnessApi = ({
                         return {
                             kind: 'json',
                             status: 200,
-                            body: { session: store.setAgentModels(first, body.agentModels) }
+                            body: { session: await store.setAgentModels(first, body.agentModels) }
                         };
                     }
 
                     if (method === 'DELETE') {
-                        if (!store.remove(first)) throw new HttpError(404, `Unknown session "${first}".`);
+                        if (!await store.remove(first)) throw new HttpError(404, `Unknown session "${first}".`);
                         return { kind: 'json', status: 200, body: { deleted: true } };
                     }
 
@@ -1579,7 +1579,7 @@ export const createHarnessApi = ({
 
                     if (second === 'reset') {
                         if (method !== 'POST') throw new HttpError(405, 'Use POST to reset a session.');
-                        return { kind: 'json', status: 200, body: { session: store.reset(first) } };
+                        return { kind: 'json', status: 200, body: { session: await store.reset(first) } };
                     }
 
                     if (second === 'cancel') {
@@ -1605,7 +1605,7 @@ export const createHarnessApi = ({
                         return {
                             kind: 'json',
                             status: 200,
-                            body: { cancelled: store.cancel(first, { all: body.all === true }) }
+                            body: { cancelled: await store.cancel(first, { all: body.all === true }) }
                         };
                     }
                 }
@@ -1619,7 +1619,7 @@ export const createHarnessApi = ({
                         throw new HttpError(405, `Use DELETE for ${mount}/sessions/:id/threads/:threadId.`);
                     }
 
-                    const session = store.deleteThread(first, segments[3]);
+                    const session = await store.deleteThread(first, segments[3]);
                     return {
                         kind: 'json',
                         status: 200,
@@ -1641,7 +1641,7 @@ export const createHarnessApi = ({
                     return {
                         kind: 'json',
                         status: 200,
-                        body: store.cancelThread(first, segments[3])
+                        body: await store.cancelThread(first, segments[3])
                     };
                 }
 
@@ -1686,7 +1686,7 @@ export const createHarnessApi = ({
                     return {
                         kind: 'json',
                         status: 200,
-                        body: store.updateThreadTranscript(first, threadId, body.messages)
+                        body: await store.updateThreadTranscript(first, threadId, body.messages)
                     };
                 }
 
@@ -1762,7 +1762,7 @@ export const createHarnessApi = ({
                             throw new HttpError(400, 'A session requires a harness name.');
                         }
 
-                        const created = store.create(body.harness, body.settings);
+                        const created = await store.create(body.harness, body.settings);
                         const response: SessionViewResponse = { view: store.getView(created.id) };
 
                         return { kind: 'json', status: 201, body: response };
@@ -1795,7 +1795,7 @@ export const createHarnessApi = ({
                             );
                         }
 
-                        store.setAgentModels(first, body.agentModels);
+                        await store.setAgentModels(first, body.agentModels);
 
                         return {
                             kind: 'json',
@@ -1807,7 +1807,7 @@ export const createHarnessApi = ({
                     // DELETE /views/:id — identical to DELETE /sessions/:id (its payload
                     // was already free of raw state; the journal goes with the session).
                     if (method === 'DELETE') {
-                        if (!store.remove(first)) throw new HttpError(404, `Unknown session "${first}".`);
+                        if (!await store.remove(first)) throw new HttpError(404, `Unknown session "${first}".`);
 
                         return { kind: 'json', status: 200, body: { deleted: true } };
                     }
@@ -1843,7 +1843,7 @@ export const createHarnessApi = ({
                     if (second === 'reset') {
                         if (method !== 'POST') throw new HttpError(405, 'Use POST to reset a session.');
 
-                        store.reset(first);
+                        await store.reset(first);
 
                         return {
                             kind: 'json',
@@ -1872,7 +1872,7 @@ export const createHarnessApi = ({
                         return {
                             kind: 'json',
                             status: 200,
-                            body: { cancelled: store.cancel(first, { all: body.all === true }) }
+                            body: { cancelled: await store.cancel(first, { all: body.all === true }) }
                         };
                     }
                 }
@@ -1933,7 +1933,7 @@ export const createHarnessApi = ({
                         throw new HttpError(405, `Use DELETE for ${mount}/views/:id/threads/:threadId.`);
                     }
 
-                    store.deleteThread(first, segments[3]);
+                    await store.deleteThread(first, segments[3]);
 
                     return {
                         kind: 'json',
@@ -1948,7 +1948,7 @@ export const createHarnessApi = ({
                         throw new HttpError(405, `Use POST for ${mount}/views/:id/threads/:threadId/cancel.`);
                     }
 
-                    const stopped = store.cancelThread(first, segments[3]);
+                    const stopped = await store.cancelThread(first, segments[3]);
 
                     return {
                         kind: 'json',
@@ -1980,7 +1980,7 @@ export const createHarnessApi = ({
                             throw new HttpError(400, 'A transcript update requires a `messages` value.');
                         }
 
-                        const updated = store.updateThreadTranscript(first, threadId, body.messages);
+                        const updated = await store.updateThreadTranscript(first, threadId, body.messages);
 
                         return {
                             kind: 'json',

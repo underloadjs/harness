@@ -34,13 +34,31 @@
 // also makes them serialized: there is no second writer in this process and no
 // cross-process multi-writer support (one server process per database root).
 //
-// R1 (worker IO mode): the identical commit is also executed on the IO worker thread,
+// R1 (worker IO mode): the identical commit is ALSO executable on the IO worker thread,
 // through the exported primitives below (`serializeHarnessDatabase` +
-// `writeHarnessDatabaseFile`), so a checkpoint's stringify and its syscalls no longer
-// block the coordinator's event loop. One writer of record per root still
-// holds: the session store routes EVERY write through one FIFO queue, and the staging
-// name carries the writer's thread identity so a worker staging file can never collide
-// with a coordinator one. There is still no second PROCESS and no parallel writer.
+// `writeHarnessDatabaseFile`), so a checkpoint's stringify and its syscalls need not block
+// the coordinator's event loop. One writer of record per root still holds: an io client
+// (./workers/io-client.ts) funnels EVERY write through one FIFO queue, and the staging name
+// carries the writer's identity (`<pid>` on the coordinator, `<pid>.io<threadId>` on the
+// worker — see `HarnessDatabaseWriteOptions.owner`) so a worker staging file can never
+// collide with a coordinator one. There is still no second PROCESS and no parallel writer.
+//
+// WIRING STATUS (honest, updated 2026-11-04): the store now opens an io client whenever the
+// resolved runtime says `ioExecution: 'worker'` (./sessions.ts constructor, D4), and the build
+// emits the entry - `vite.config.ts` has an `io-worker` library entry, so
+// `dist/underload-harness.io-worker.mjs` and the `@underload/harness/io-worker` subpath exist in
+// a build (./src/structure.test.ts pins the pairing, ./../../scripts/check-package-runtime.mjs
+// spawns the shipped bundle and reads its bytes back). In that mode the primitives below run on
+// the worker thread and the coordinator never blocks on them: a strict save resolves after the
+// worker's rename receipt, a best-effort/observer checkpoint claims queue ORDER only, and journal
+// events are appended by the thread that holds the fd.
+//
+// With the default `ioExecution: 'inline'` nothing above applies: this class remains the only
+// writer, exactly as before. `threadExecution: 'worker'` (../config.ts) is the SEPARATE promise
+// that isolates each logical THREAD'S CPU (./workers/lane-host.ts); the two flags are
+// independent, and each fails loudly when the platform cannot honour it: an io client that
+// cannot find an entry throws a named `HarnessIoError` (`worker-entry-missing`) with the exact
+// fix, and a store that throws at construction aborts startup rather than serving inline.
 //
 // FAILURE POLICY
 // --------------

@@ -179,7 +179,7 @@ describe('R3b durable harness database', () => {
         const preset = liveScriptedPreset('one', 'persisted answer');
 
         const first = runtimeOf(root, [preset]);
-        const created = first.store.create('one');
+        const created = await first.store.create('one');
         const id = created.id;
 
         // One completed turn: the transcript and the turn record must survive.
@@ -207,7 +207,7 @@ describe('R3b durable harness database', () => {
 
         // A live model retarget: recorded beside the snapshot so it survives even
         // when the snapshot is stale.
-        const patched = first.store.setAgentModels(id, { one: 'next/model' });
+        const patched = await first.store.setAgentModels(id, { one: 'next/model' });
         expect(patched.agentModels).toEqual({ one: 'next/model' });
 
         // A user-created registry entry that must come back after restart.
@@ -217,7 +217,7 @@ describe('R3b durable harness database', () => {
             description: 'created through the API',
             primary: 'instruct'
         });
-        first.store.persistRegistry();
+        await first.store.persistRegistry();
 
         const before = first.store.get(id);
         expect(before.discoveredTools).toEqual(['echoed']);
@@ -290,7 +290,7 @@ describe('R3b durable harness database', () => {
             subagents: ['summarizer'],
             agentInstructions: { summarizer: 'Condense to one line.' }
         });
-        first.store.persistRegistry();
+        await first.store.persistRegistry();
 
         // It is in the durable document (not only in memory).
         const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
@@ -319,14 +319,14 @@ describe('R3b durable harness database', () => {
         const fixture = gatedPreset();
         const first = runtimeOf(root, [fixture.preset]);
 
-        const created = first.store.create('gated');
+        const created = await first.store.create('gated');
         const id = created.id;
 
         const running = first.store.run(id, 'hold the turn', async () => {});
         await fixture.started;
 
         // A queued prompt accepted while the first turn is still running.
-        const queued = first.store.enqueue(id, 'do this next');
+        const queued = await first.store.enqueue(id, 'do this next');
         expect(queued.turn.status).toBe('queued');
 
         // The start transition was written through BEFORE provider work, and the
@@ -383,7 +383,7 @@ describe('R3b durable harness database', () => {
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
-        const created = first.store.create('demo');
+        const created = await first.store.create('demo');
         const frozenDefinition = first.store.get(created.id).harnessDefinition;
 
         expect(frozenDefinition?.title).toBe('Scripted demo');
@@ -391,7 +391,7 @@ describe('R3b durable harness database', () => {
         // Metadata-only patch of the shipped demo: the registry entry changes, the
         // session keeps its captured factory and descriptor.
         first.registry.update('demo', { title: 'Renamed demo', description: 'patched' });
-        first.store.persistRegistry();
+        await first.store.persistRegistry();
 
         first.store.dispose();
 
@@ -421,7 +421,7 @@ describe('R3b durable harness database', () => {
         ]);
     });
 
-    it('rebuilds a live session from its frozen record after an executable registry patch', () => {
+    it('rebuilds a live session from its frozen record after an executable registry patch', async () => {
         const root = tempRoot('frozen-live');
 
         const first = createHarnessRuntime({
@@ -431,13 +431,13 @@ describe('R3b durable harness database', () => {
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
-        const created = first.store.create('instruct');
+        const created = await first.store.create('instruct');
         const frozen = first.store.get(created.id).harnessDefinition;
         expect(frozen?.primary).toBe('instruct');
 
         // Executable patch: the registry entry now routes to a different agent.
         first.registry.update('instruct', { primary: 'workspace', subagents: [] });
-        first.store.persistRegistry();
+        await first.store.persistRegistry();
         first.store.dispose();
 
         const second = createHarnessRuntime({
@@ -496,8 +496,8 @@ describe('R3b durable harness database', () => {
             loadEnvironment: false
         });
 
-        const a = runtimeA.store.create('one');
-        const b = runtimeB.store.create('one');
+        const a = await runtimeA.store.create('one');
+        const b = await runtimeB.store.create('one');
 
         expect(runtimeA.root).not.toBe(runtimeB.root);
         expect(runtimeA.store.list().map((session) => session.id)).toEqual([a.id]);
@@ -597,17 +597,17 @@ describe('R3b durable harness database', () => {
         ).toThrow(HarnessPersistenceError);
     });
 
-    it('writes atomically (canonical file only, no staging leftovers) and recreates nothing on load failure', () => {
+    it('writes atomically (canonical file only, no staging leftovers) and recreates nothing on load failure', async () => {
         const root = tempRoot('atomic');
         const runtime = runtimeOf(root, [liveScriptedPreset('one')]);
-        runtime.store.create('one');
+        await runtime.store.create('one');
 
         const directory = path.join(root, 'harness');
         expect(fs.readdirSync(directory)).toEqual(['state.json']);
 
         // A second save replaces the same file atomically; staging names are
         // unique and removed before the call returns.
-        runtime.store.persistRegistry();
+        await runtime.store.persistRegistry();
         expect(fs.readdirSync(directory)).toEqual(['state.json']);
 
         runtime.store.dispose();
@@ -700,7 +700,7 @@ describe('R3b durable harness database', () => {
         );
 
         const first = runtimeOf(root, [preset]);
-        const created = first.store.create('mutator');
+        const created = await first.store.create('mutator');
         const running = first.store.run(created.id, 'mutate then hold', async () => {});
         await secondRequest;
 
@@ -893,7 +893,7 @@ describe('R3b durable harness database', () => {
         );
 
         const first = runtimeOf(root, [preset]);
-        const created = first.store.create('probe');
+        const created = await first.store.create('probe');
         await first.store.callTool(created.id, 'task', { tasks: [{ text: 'kept record' }] });
         first.store.dispose();
 
@@ -1004,7 +1004,7 @@ describe('R3b durable harness database', () => {
         );
 
         const first = runtimeOf(root, [preset]);
-        const created = first.store.create('blocking');
+        const created = await first.store.create('blocking');
         const running = first.store.run(created.id, 'call it', async () => {});
         await started;
 
@@ -1034,12 +1034,12 @@ describe('R3b durable harness database', () => {
         await running;
     });
 
-    it('resumes a session whose base URL is foreign without a persisted credential', () => {
+    it('resumes a session whose base URL is foreign without a persisted credential', async () => {
         const root = tempRoot('foreign');
         const preset = liveScriptedPreset('one');
 
         const first = runtimeOf(root, [preset]);
-        const created = first.store.create('one', { baseURL: 'http://elsewhere.invalid/v1' });
+        const created = await first.store.create('one', { baseURL: 'http://elsewhere.invalid/v1' });
         first.store.dispose();
 
         const second = runtimeOf(root, [preset]);
@@ -1061,8 +1061,8 @@ describe('R3b durable harness database', () => {
         const doomedPreset = liveScriptedPreset('two', 'deleted answer');
 
         const first = runtimeOf(root, [keepPreset, doomedPreset]);
-        const keep = first.store.create('one');
-        const doomed = first.store.create('two');
+        const keep = await first.store.create('one');
+        const doomed = await first.store.create('two');
 
         // Both sessions get real content: deleting one must leave the other's
         // transcript/turns untouched.
@@ -1076,7 +1076,7 @@ describe('R3b durable harness database', () => {
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
-        expect(first.store.setAgentModels(doomed.id, { two: 'next/model' }).agentModels).toEqual({
+        expect((await first.store.setAgentModels(doomed.id, { two: 'next/model' })).agentModels).toEqual({
             two: 'next/model'
         });
 
@@ -1090,8 +1090,8 @@ describe('R3b durable harness database', () => {
         expect(before.sessions.map((session) => session.id)).toEqual([keep.id, doomed.id]);
 
         // The delete itself persists before returning.
-        expect(first.store.remove(doomed.id)).toBe(true);
-        expect(first.store.remove(doomed.id)).toBe(false);
+        expect(await first.store.remove(doomed.id)).toBe(true);
+        expect(await first.store.remove(doomed.id)).toBe(false);
         expect(first.store.list().map((session) => session.id)).toEqual([keep.id]);
 
         const raw = fs.readFileSync(stateFile(root), 'utf8');
@@ -1157,9 +1157,11 @@ describe('T5 durable harness deletion', () => {
         return { store, registry };
     };
 
-    const failureOf = (run: () => unknown): { status: number; message: string } => {
+    // D4: the strict store methods are async, so a refused write arrives as a REJECTION -
+    // an async helper is the only way to observe its status and message. Same contract, awaited.
+    const failureOf = async (run: () => unknown): Promise<{ status: number; message: string }> => {
         try {
-            run();
+            await run();
         } catch (error) {
             const failure = error as { status?: number; message: string };
             return { status: failure.status ?? 0, message: failure.message };
@@ -1168,12 +1170,12 @@ describe('T5 durable harness deletion', () => {
         throw new Error('expected the mutation to fail');
     };
 
-    it('keeps a deleted user harness gone across a restart without a tombstone', () => {
+    it('keeps a deleted user harness gone across a restart without a tombstone', async () => {
         const root = tempRoot('delete-custom');
         const first = runtimeOf(root, [liveScriptedPreset('one')]);
 
         first.registry.create({ name: 'mine', title: 'Mine', primary: 'workspace' });
-        expect(first.store.mutateRegistry(() => first.registry.remove('mine')).name).toBe('mine');
+        expect((await first.store.mutateRegistry(() => first.registry.remove('mine'))).name).toBe('mine');
 
         // A user harness is absent from the document as soon as it is absent from
         // `list()`; only a built-in needs the extra record.
@@ -1189,7 +1191,7 @@ describe('T5 durable harness deletion', () => {
         expect(second.registry.deletedBuiltins()).toEqual([]);
     });
 
-    it('keeps a deleted built-in gone across a restart and records the tombstone', () => {
+    it('keeps a deleted built-in gone across a restart and records the tombstone', async () => {
         const root = tempRoot('delete-builtin');
 
         const first = createHarnessRuntime({
@@ -1201,14 +1203,14 @@ describe('T5 durable harness deletion', () => {
         });
 
         // A live session on the shipped default, created before the deletion.
-        const id = first.store.create('instruct').id;
+        const id = (await first.store.create('instruct')).id;
         const frozen = first.store.get(id).harnessDefinition;
         expect(frozen?.title).toBe('Instruct');
 
-        first.store.mutateRegistry(() => first.registry.remove('instruct'));
+        await first.store.mutateRegistry(() => first.registry.remove('instruct'));
 
         // The card is gone for good, so a NEW session on it is a 404.
-        expect(failureOf(() => first.store.create('instruct'))).toEqual({
+        expect(await failureOf(async () => await first.store.create('instruct'))).toEqual({
             status: 404,
             message: 'Unknown harness "instruct".'
         });
@@ -1270,12 +1272,12 @@ describe('T5 durable harness deletion', () => {
             loadEnvironment: false
         });
 
-        const id = first.store.create('demo').id;
+        const id = (await first.store.create('demo')).id;
         await first.store.run(id, 'first question', async () => {});
         const frozen = first.store.get(id).harnessDefinition;
         expect(frozen?.title).toBe('Scripted demo');
 
-        expect(first.store.mutateRegistry(() => first.registry.remove('demo')).name).toBe('demo');
+        expect((await first.store.mutateRegistry(() => first.registry.remove('demo'))).name).toBe('demo');
         expect(readState(root).deleted).toEqual(['demo']);
 
         first.store.dispose();
@@ -1317,7 +1319,7 @@ describe('T5 durable harness deletion', () => {
         ]);
     });
 
-    it('re-creating a deleted built-in name clears the tombstone durably', () => {
+    it('re-creating a deleted built-in name clears the tombstone durably', async () => {
         const root = tempRoot('recreate-deleted');
 
         const first = createHarnessRuntime({
@@ -1328,7 +1330,7 @@ describe('T5 durable harness deletion', () => {
             loadEnvironment: false
         });
 
-        first.store.mutateRegistry(() => {
+        await first.store.mutateRegistry(() => {
             first.registry.remove('workspace');
 
             return first.registry.create({ name: 'workspace', title: 'My coder', primary: 'reviewer' });
@@ -1369,10 +1371,10 @@ describe('T5 durable harness deletion', () => {
         expect(second.registry.find('workspace')?.builtin).toBe(true);
     });
 
-    it('answers failure, not success, when the durable write fails — and rolls the registry back', () => {
+    it('answers failure, not success, when the durable write fails — and rolls the registry back', async () => {
         const { store, registry } = failingStore('delete-write-failure');
 
-        const failure = failureOf(() => store.mutateRegistry(() => registry.remove('research')));
+        const failure = await failureOf(async () => await store.mutateRegistry(() => registry.remove('research')));
         expect(failure.status).toBe(500);
         expect(failure.message).toContain('Could not save the harness database');
 
@@ -1389,7 +1391,7 @@ describe('T5 durable harness deletion', () => {
         ]);
 
         // The same guarantee for a create: no phantom card.
-        expect(failureOf(() => store.mutateRegistry(() => registry.create({ name: 'ghost', primary: 'instruct' })))).toEqual(
+        expect(await failureOf(async () => await store.mutateRegistry(() => registry.create({ name: 'ghost', primary: 'instruct' })))).toEqual(
             {
                 status: 500,
                 message: expect.stringContaining('Could not save the harness database')
@@ -1400,19 +1402,19 @@ describe('T5 durable harness deletion', () => {
         // A failed PATCH rolls back too, so the client never sees an edit the file
         // does not carry.
         expect(
-            failureOf(() => store.mutateRegistry(() => registry.update('planner', { title: 'Renamed' }))).status
+            (await failureOf(async () => await store.mutateRegistry(() => registry.update('planner', { title: 'Renamed' })))).status
         ).toBe(500);
         expect(registry.find('planner')?.title).toBe('Planner');
     });
 
-    it('keeps an earlier tombstone when a later mutation fails', () => {
+    it('keeps an earlier tombstone when a later mutation fails', async () => {
         const { store, registry } = failingStore('tombstone-rollback');
 
         // One committed deletion (in-memory), then a failure that must not undo it.
         registry.restoreDeletedBuiltins(['workspace']);
         expect(registry.deletedBuiltins()).toEqual(['workspace']);
 
-        expect(failureOf(() => store.mutateRegistry(() => registry.remove('reviewer'))).status).toBe(500);
+        expect((await failureOf(async () => await store.mutateRegistry(() => registry.remove('reviewer')))).status).toBe(500);
 
         // The snapshot is taken per mutation, so the rolled-back state is exactly the
         // state at the start of THAT mutation: workspace still deleted, reviewer back.
@@ -1420,10 +1422,10 @@ describe('T5 durable harness deletion', () => {
         expect(registry.find('reviewer')?.title).toBe('Reviewer');
     });
 
-    it('reads a document without the additive field and validates it when present', () => {
+    it('reads a document without the additive field and validates it when present', async () => {
         const root = tempRoot('deleted-shape');
         const first = runtimeOf(root, [liveScriptedPreset('one')]);
-        first.store.create('one');
+        await first.store.create('one');
         first.store.dispose();
 
         // A pre-T5 document has no `deleted` key, loads, and is reported as absent
@@ -1457,7 +1459,7 @@ describe('T5 durable harness deletion', () => {
         expect(() => new HarnessPersistence(root).load()).toThrow('deleted[0] must be a string.');
     });
 
-    it('does not resurrect a built-in the document never recorded as deleted', () => {
+    it('does not resurrect a built-in the document never recorded as deleted', async () => {
         // The additive field must not change behaviour for an untouched document:
         // every shipped default is still there, and the rows replay exactly as before.
         const root = tempRoot('no-tombstone');
@@ -1469,7 +1471,7 @@ describe('T5 durable harness deletion', () => {
             loadEnvironment: false
         });
         first.registry.update('instruct', { title: 'Edited default' });
-        first.store.persistRegistry();
+        await first.store.persistRegistry();
         first.store.dispose();
 
         const second = createHarnessRuntime({
@@ -1520,8 +1522,8 @@ describe('durable conversation labels (T14)', () => {
     }> => {
         const root = tempRoot(label);
         const runtime = runtimeOf(root, [liveScriptedPreset('researcher')]);
-        const id = runtime.store.create('researcher').id;
-        const task = runtime.store.enqueue(id, 'one');
+        const id = (await runtime.store.create('researcher')).id;
+        const task = await runtime.store.enqueue(id, 'one');
         await task.settled;
         await runtime.store.waitForIdle(id);
         runtime.store.dispose();
@@ -1624,10 +1626,10 @@ describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
     // One persisted session, tampered with the way a foreign writer (or an older
     // build) would leave the document: an `invalidThreads` map holding a `__proto__`
     // key next to a normal thread id.
-    const documentWithProtoKey = (label: string): { root: string; sessionId: string } => {
+    const documentWithProtoKey = async (label: string): Promise<{ root: string; sessionId: string }> => {
         const root = tempRoot(label);
         const runtime = runtimeOf(root, [liveScriptedPreset('one')]);
-        const sessionId = runtime.store.create('one').id;
+        const sessionId = (await runtime.store.create('one')).id;
 
         runtime.store.dispose();
 
@@ -1647,8 +1649,8 @@ describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
         return { root, sessionId };
     };
 
-    it('keeps a `__proto__` thread id as a stored entry through the reader', () => {
-        const { root, sessionId } = documentWithProtoKey('invalid-proto-key');
+    it('keeps a `__proto__` thread id as a stored entry through the reader', async () => {
+        const { root, sessionId } = await documentWithProtoKey('invalid-proto-key');
 
         const database = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
         const record = database.sessions.find((entry) => entry.id === sessionId);
@@ -1677,8 +1679,8 @@ describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
         expect(Object.values(invalid)).toHaveLength(2);
     });
 
-    it('loads the same document through the persistence owner', () => {
-        const { root, sessionId } = documentWithProtoKey('invalid-proto-load');
+    it('loads the same document through the persistence owner', async () => {
+        const { root, sessionId } = await documentWithProtoKey('invalid-proto-load');
 
         const loaded = new HarnessPersistence(root).load()?.sessions.find(
             (entry) => entry.id === sessionId
@@ -1703,7 +1705,7 @@ describe('durable per-turn instruction snapshots (T10)', () => {
     it('records the instruction text the run actually used', async () => {
         const root = tempRoot('instructions');
         const runtime = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
-        const created = runtime.store.create('one');
+        const created = await runtime.store.create('one');
 
         await runtime.store.run(created.id, 'remember this', async () => {});
 
@@ -1722,7 +1724,7 @@ describe('durable per-turn instruction snapshots (T10)', () => {
     it('keeps a legacy document exact, and refuses a malformed snapshot instead of mis-counting it', async () => {
         const root = tempRoot('instructions-shape');
         const runtime = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
-        const created = runtime.store.create('one');
+        const created = await runtime.store.create('one');
 
         await runtime.store.run(created.id, 'remember this', async () => {});
 
@@ -1739,7 +1741,7 @@ describe('durable per-turn instruction snapshots (T10)', () => {
 
         // Any structural mutation persists the whole document, so this proves the
         // absent key is not re-invented on the way back out.
-        reopened.store.setAgentModels(created.id, { one: 'next/model' });
+        await reopened.store.setAgentModels(created.id, { one: 'next/model' });
 
         const rewritten = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as { sessions: Record<string, unknown>[] };
 
@@ -1794,7 +1796,7 @@ describe('durable per-turn instruction snapshots (T10)', () => {
         const root = tempRoot('instructions-interrupted');
         const fixture = gatedPreset();
         const first = runtimeOf(root, [fixture.preset]);
-        const created = first.store.create('gated');
+        const created = await first.store.create('gated');
 
         const running = first.store.run(created.id, 'hold the turn', async () => {});
 
@@ -1860,9 +1862,9 @@ describe('durable steered-submit text archive (T14)', () => {
         const root = tempRoot(label);
         const fixture = gatedPreset();
         const runtime = runtimeOf(root, [fixture.preset]);
-        const created = runtime.store.create('gated');
+        const created = await runtime.store.create('gated');
 
-        const running = runtime.store.enqueue(created.id, 'hold the turn');
+        const running = await runtime.store.enqueue(created.id, 'hold the turn');
 
         await fixture.started;
 
@@ -1872,8 +1874,13 @@ describe('durable steered-submit text archive (T14)', () => {
 
         if (threadId === undefined) throw new Error('the gated run owns no conversation');
 
-        const steered = ['steer one', 'steer two', 'steer three'].map((input) =>
-            runtime.store.enqueue(created.id, input, undefined, undefined, threadId)
+        // D4: the three submits are DISPATCHED in one synchronous batch (that is what makes them
+        // steer into the running conversation rather than queue after it), so the map callback
+        // stays non-async and the awaited durability is collected with `Promise.all`.
+        const steered = await Promise.all(
+            ['steer one', 'steer two', 'steer three'].map(async (input) =>
+                await runtime.store.enqueue(created.id, input, undefined, undefined, threadId)
+            )
         );
 
         expect(steered.every((receipt) => receipt.steered === true)).toBe(true);
@@ -1980,7 +1987,7 @@ describe('durable steered-submit text archive (T14)', () => {
 
         // Any structural mutation rewrites the WHOLE document, so this proves the absent key
         // is not re-invented on the way back out (the same rule the T10 snapshots follow).
-        reopened.store.setAgentModels(sessionId, { gated: 'next/model' });
+        await reopened.store.setAgentModels(sessionId, { gated: 'next/model' });
 
         const rewritten = documentOf(root);
 

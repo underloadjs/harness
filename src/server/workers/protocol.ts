@@ -38,9 +38,10 @@
 //   - No live handles: an AbortSignal or a command `context` object cannot cross, so
 //     `action:request` carries the DATA (`requestId`, `request`, the owning ids) and
 //     the cancellation is an `interrupt`/epoch event instead (T3 finding F9).
-//   - No wholesale state frames: there is no `sync{snapshot}`. A lane receives
-//     targeted registry broadcasts, bounded memory windows, and id grants, and it
-//     reads other threads from the authority. `hello` is the ONLY place a full
+//   - No wholesale state frames: there is no `sync{snapshot}`. A lane receives targeted
+//     registry broadcasts, bounded memory windows, id grants, and the DELTA of one
+//     conversation's canonical transcript (`sync.transcript` -> a `transcript:sync` request
+//     answered with the messages it has not adopted). `hello` is still the ONLY place a full
 //     snapshot is shipped, because that is the one moment a rebuild is legitimate.
 //   - No leniency for unknown frames: `describeEnvelope` names the offender, since a
 //     silently ignored frame shows up later as a mysteriously stuck turn.
@@ -66,7 +67,14 @@ import type { GroupOutcome, MutationGroup, MutationReceipt, SharedMutation } fro
 // Bumped whenever a frame changes incompatibly. A worker refuses a `hello` whose
 // version differs, so a stale `dist/` bundle against a fresh coordinator fails at
 // startup with a readable reason instead of mis-parsing frames.
-export const LANE_PROTOCOL_VERSION = 2;
+//
+// v3 (T10): the receipt contract changed shape (a partial group now rolls EVERY op back),
+// `transcript:sync` / `thread:read` requests were added, a transcript delta may be pushed
+// to a live lane, a steering refusal is its own non-terminal reply, and a registry
+// broadcast carries the installed revision in its own format (`moduleText`) instead of
+// pretending every tool is a legacy function body. A v2 worker cannot answer for any of
+// that, so it must fail here rather than run a turn whose frames it half-understands.
+export const LANE_PROTOCOL_VERSION = 3;
 
 // Un-acked `event` frames a worker may have in flight. Small on purpose: one model
 // request's worth of deltas, so a stalled client is felt as backpressure (the inline
@@ -125,6 +133,11 @@ export type LaneCapabilityReport = {
     agents: string[];
     tools: string[];
     unsupported: { code: string; message: string }[];
+    // T12 (S7): a feature this replica REFUSES rather than running privately (the nested-run
+    // tools). Non-blocking by definition - `ok` stays true - because the refusal is the
+    // supported behaviour: the tool is absent from the replica instead of producing a child
+    // conversation only that lane could see.
+    limitations?: { code: string; message: string }[];
 };
 
 // The requests a worker may raise are the authority's own request union
@@ -141,6 +154,34 @@ export type LaneCapabilityReport = {
 export type LaneRequestReplyValue = {
     value?: unknown;
     sync?: LaneAuthorityAnswer['sync'];
+};
+
+// One registry revision, as the authority installed it. The metadata travels with the text
+// because a created tool's source is a compiled body: `registerTool` needs
+// name/description/tags/parameters to install the same revision at all.
+//
+// T10 finding M5: `moduleText` and `dependencies` are here because the shipped registration
+// format is a MODULE (`HarnessToolSource.format === 'module'`), whose text lives in
+// `moduleText`. Broadcasting that text through `source` alone pushed module code into the
+// legacy function-body path, and left `source` empty for everything the core itself installed.
+// A replica installs whichever form the canonical harness actually compiled.
+export type LaneRegistryChange = {
+    name: string;
+    description?: string;
+    tags?: string[];
+    parameters?: Record<string, unknown>;
+    // The legacy async function-body revision (empty when the tool is a module).
+    source: string;
+    // The module revision, when the installed tool is one.
+    moduleText?: string;
+    // Local helper modules captured with the module revision.
+    dependencies?: { path: string; text: string }[];
+    // Memory keys this revision added to the session window (T10 finding M5): every live
+    // lane joins them to its declared set and pulls the digests, so the new tool's memory
+    // writes are committable state rather than a silent no-op.
+    memoryKeys?: string[];
+    revision: string;
+    removed: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -166,8 +207,10 @@ export type LaneCommand =
           attachments?: HarnessAttachment[];
           reset?: boolean;
           // The canonical transcript length for THIS conversation at dispatch. The lane
-          // appends against this value rather than assuming its own copy still matches
-          // (./lane-authority.ts refuses an append whose prefix moved).
+          // appends against the prefix IT has adopted and pulls whatever moved with a
+          // `transcript:sync` request; this value is the cross-check that proves the two
+          // sides may disagree (a sibling `threadSend` landed between hello and here), which
+          // is exactly why length alone was never a sync primitive (T10 finding M4).
           fromLength: number;
       }
     // One operator action, executed on this lane's CPU (decision D1): a session-bound
@@ -192,23 +235,19 @@ export type LaneCommand =
     | { kind: 'event.ack'; laneEpoch: number; streamSeq: number }
     // A tool registered/replaced/removed ANYWHERE in the session (another lane, the
     // operator, a model). Installed in this replica so the next call sees the same
-    // definition the authority runs. The metadata travels with the source because a created
-    // tool's source is a function body: `registerTool` needs name/description/tags/parameters.
-    | {
-          kind: 'broadcast.registry';
-          laneEpoch: number;
-          change: {
-              name: string;
-              description?: string;
-              tags?: string[];
-              parameters?: Record<string, unknown>;
-              source: string;
-              revision: string;
-              removed: boolean;
-          };
-      }
+    // definition the authority runs.
+    | { kind: 'broadcast.registry'; laneEpoch: number; change: LaneRegistryChange }
     // Refresh of this lane's declared memory window, with digests.
     | { kind: 'sync.memory'; laneEpoch: number; window: MemoryWindow }
+    // T10 finding M4: canonical conversation state moved under this lane - a sibling
+    // `threadSend` landed in the conversation this lane owns, or another lane appended to it.
+    // The frame carries NO payload: the replica's adopted prefix is its own knowledge, so it
+    // pulls exactly the delta it is missing with a `transcript:sync` request. A lane that is
+    // mid-run may not be able to insert the delta yet (its harness refuses a wholesale
+    // transcript write while a run is attached); it then retries at the next commit boundary,
+    // which is the safe point. This push is the responsiveness half; the boundary retry is the
+    // correctness half.
+    | { kind: 'sync.transcript'; laneEpoch: number; threadId: string }
     // Final frame.
     | { kind: 'dispose'; laneEpoch: number; reason?: string };
 
@@ -268,6 +307,11 @@ export type LaneReply =
       }
     // Confirmation that an interrupt landed.
     | { kind: 'aborted'; laneEpoch: number; turnId?: string }
+    // T10 finding M6: the answer to a `steer` frame, and deliberately NOT a fault. A run
+    // that is not at a steerable point refused the guidance while the turn itself keeps
+    // executing; the retired path sent a `fault`, which the host consumed as the turn's
+    // terminal frame, killing a live turn over a piece of advice that did not fit.
+    | { kind: 'steer.result'; laneEpoch: number; turnId: string; queued: boolean; reason?: string }
     // A worker-side fault that is not a turn failure (a bad frame, a lost realm).
     | { kind: 'fault'; laneEpoch: number; turnId?: string; message: string };
 
@@ -287,6 +331,7 @@ const COMMAND_KINDS = new Set([
     'event.ack',
     'broadcast.registry',
     'sync.memory',
+    'sync.transcript',
     'dispose'
 ]);
 
@@ -298,6 +343,7 @@ const REPLY_KINDS = new Set([
     'invoke.done',
     'turn-done',
     'aborted',
+    'steer.result',
     'fault'
 ]);
 

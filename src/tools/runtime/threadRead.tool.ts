@@ -127,7 +127,7 @@ export const registration = {
     listed: false
 } as const;
 
-export const execute = (context: ToolContext) => {
+export const execute = async (context: ToolContext) => {
     if (context.harness === undefined) {
         throw new Error('threadRead requires the live harness reference.');
     }
@@ -148,11 +148,19 @@ export const execute = (context: ToolContext) => {
         );
     }
 
-    // `threadMessages` is the canonical read: it throws the harness's own
-    // "not available in this harness" error for an id that never existed or was
-    // deleted, and returns a DETACHED copy, so a page cannot mutate live state.
-    const messages = context.harness.threadMessages(threadId);
-    const record = context.harness.thread(threadId);
+    // `threadMessages` is the canonical read: it throws the harness's own "not available in
+    // this harness" error for an id that never existed or was deleted, and returns a DETACHED
+    // copy, so a page cannot mutate live state.
+    //
+    // T10 finding S1 (why this is awaited): in worker mode a replica's copy of a conversation
+    // is a hello snapshot plus this lane's own work, so a synchronous handle read would answer
+    // from a PRIVATE projection - stale for a thread a sibling moved, and missing for a thread
+    // another lane created. ./workers/lane-worker-loop.ts replaces these two members on a
+    // replica with routed reads answered by the canonical harness, which are promises. Inline
+    // the same calls stay synchronous, and awaiting a non-promise is the identical value, so
+    // one source serves both modes and neither one gets an answer from the wrong side.
+    const messages = await context.harness.threadMessages(threadId);
+    const record = await context.harness.thread(threadId);
 
     if (record === undefined) {
         throw new Error(

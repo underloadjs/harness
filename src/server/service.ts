@@ -80,6 +80,10 @@ import { getHarnessRuntime } from './runtime';
 // instead of being limited to the HARNESS_* environment.
 import type { ServerRuntimeConfiguration } from './config';
 import { HarnessPersistenceError, normalizeHarnessDatabaseRoot } from './persistence';
+// D4: opening a worker-mode IO client can fail at runtime CREATION (no built entry, no worker
+// threads, a protocol mismatch). The adapter maps that to a 500 naming the reason, exactly like
+// a corrupt database, rather than serving a store whose durability never left the loop.
+import { HarnessIoError } from './workers';
 
 // The subset of Hono's Context this adapter reads. Typed structurally so the
 // harness package needs no compile-time dependency on hono or @underload/service.
@@ -379,11 +383,38 @@ export const createHarnessServiceHandler = (
                     ...(options.execution === undefined ? {} : { runtime: options.execution })
                 });
         } catch (error) {
-            if (error instanceof HarnessPersistenceError) {
+            // D4: `HarnessIoError` joins the persistence mapping because a worker-mode store
+            // that cannot OPEN its IO client (no built entry, no `node:worker_threads`, a
+            // protocol mismatch - ./workers/io-client.ts contract 8) fails here, at runtime
+            // creation. Both are surfaced with their real reason instead of being swallowed into
+            // an inline store that claims otherwise.
+            if (error instanceof HarnessPersistenceError || error instanceof HarnessIoError) {
                 return { status: 500, response: { error: { message: error.message } } };
             }
 
             throw error;
+        }
+
+        // D4: a worker-mode store has to have answered its IO handshake BEFORE it answers a
+        // request (`./workers/io-client.ts`, integration contract). `ioReady()` is `undefined`
+        // for an inline or in-memory store, and the memoized handshake promise otherwise, so
+        // after the first resolution this costs one microtask.
+        //
+        // A rejection is a deployment failure, not a retry: the thread is already terminated and
+        // every operation issued before the handshake failed with the same reason. Reporting 500
+        // with that message is the honest answer - the alternative would be serving from a store
+        // whose durability was quietly never off-loop.
+        const readiness = runtime.store.ioReady();
+
+        if (readiness !== undefined) {
+            try {
+                await readiness;
+            } catch (error) {
+                return {
+                    status: 500,
+                    response: { error: { message: error instanceof Error ? error.message : String(error) } }
+                };
+            }
         }
 
         const result = await runtime.api({

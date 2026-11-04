@@ -130,9 +130,11 @@ const deferred = (): { promise: Promise<void>; resolve: () => void } => {
 
 // Small helper: run one store operation and return the thrown SessionError so the
 // test can pin both its status and its exact message.
-const sessionErrorOf = (run: () => unknown): SessionError => {
+// D4: the strict store methods are async, so a refused write arrives as a REJECTION -
+// an async helper is the only way to observe its status and message. Same contract, awaited.
+const sessionErrorOf = async (run: () => unknown): Promise<SessionError> => {
     try {
-        run();
+        await run();
     } catch (error) {
         if (error instanceof SessionError) return error;
         throw error;
@@ -236,7 +238,7 @@ describe('SessionStore owner interaction', () => {
             })
         );
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         let announce!: (requestId: string) => void;
         const announced = new Promise<string>((resolve) => {
@@ -291,7 +293,7 @@ describe('SessionStore owner interaction', () => {
         });
 
         // A repeated answer is now a conflict, not a second resolution.
-        const late = sessionErrorOf(() =>
+        const late = await sessionErrorOf(() =>
             store.answerAction(created.id, requestId, { kind: 'option', optionId: 'no' })
         );
         expect(late.status).toBe(409);
@@ -343,7 +345,7 @@ describe('SessionStore owner interaction', () => {
             })
         );
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         let announce!: (requestId: string) => void;
         const announced = new Promise<string>((resolve) => {
@@ -359,7 +361,7 @@ describe('SessionStore owner interaction', () => {
         const requestId = await announced;
         await new Promise<void>((resolve) => setImmediate(resolve));
 
-        expect(store.cancel(created.id)).toBe(true);
+        expect(await store.cancel(created.id)).toBe(true);
         await running;
 
         const turn = store.get(created.id).turns[0];
@@ -367,7 +369,7 @@ describe('SessionStore owner interaction', () => {
         expect(turn.events.some((event) => event.type === 'action_answer')).toBe(false);
 
         // Cancellation expired the pending entry; no default/recommended answer exists.
-        const late = sessionErrorOf(() =>
+        const late = await sessionErrorOf(() =>
             store.answerAction(created.id, requestId, { kind: 'option', optionId: 'yes' })
         );
         expect(late.status).toBe(409);
@@ -376,7 +378,7 @@ describe('SessionStore owner interaction', () => {
     it('registers the host answerer on every created session and resolves an option answer', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         expect(typeof preset.captured.handler).toBe('function');
 
@@ -388,7 +390,7 @@ describe('SessionStore owner interaction', () => {
 
         // Exactly once: the entry left the pending map, and the id is now recorded
         // as no-longer-answerable rather than unknown.
-        const repeated = sessionErrorOf(() =>
+        const repeated = await sessionErrorOf(() =>
             store.answerAction(created.id, 'req-1', { kind: 'option', optionId: 'a' })
         );
         expect(repeated.status).toBe(409);
@@ -398,7 +400,7 @@ describe('SessionStore owner interaction', () => {
     it('trims and accepts a custom answer', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const awaiting = preset.captured.handler!(contextOf('req-custom'), new AbortController().signal);
 
@@ -410,11 +412,11 @@ describe('SessionStore owner interaction', () => {
     it('rejects an option id the model never offered with 400 and keeps the request answerable', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const awaiting = preset.captured.handler!(contextOf('req-2'), new AbortController().signal);
 
-        const malformed = sessionErrorOf(() =>
+        const malformed = await sessionErrorOf(() =>
             store.answerAction(created.id, 'req-2', { kind: 'option', optionId: 'zzz' })
         );
         expect(malformed.status).toBe(400);
@@ -427,30 +429,30 @@ describe('SessionStore owner interaction', () => {
         await expect(awaiting).resolves.toEqual({ kind: 'option', optionId: 'a' });
     });
 
-    it('rejects a non-object choice with 400', () => {
+    it('rejects a non-object choice with 400', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         void preset.captured.handler!(contextOf('req-3'), new AbortController().signal);
 
-        const malformed = sessionErrorOf(() => store.answerAction(created.id, 'req-3', null));
+        const malformed = await sessionErrorOf(() => store.answerAction(created.id, 'req-3', null));
         expect(malformed.status).toBe(400);
         expect(malformed.message).toBe('actionRequest choice must be an object.');
     });
 
-    it('answers 404 for an unknown request and unknown session', () => {
+    it('answers 404 for an unknown request and unknown session', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
-        const unknownRequest = sessionErrorOf(() =>
+        const unknownRequest = await sessionErrorOf(() =>
             store.answerAction(created.id, 'never-seen', { kind: 'custom', text: 'x' })
         );
         expect(unknownRequest.status).toBe(404);
         expect(unknownRequest.message).toBe('Unknown action request "never-seen".');
 
-        const unknownSession = sessionErrorOf(() =>
+        const unknownSession = await sessionErrorOf(() =>
             store.answerAction('missing-session', 'never-seen', { kind: 'custom', text: 'x' })
         );
         expect(unknownSession.status).toBe(404);
@@ -460,7 +462,7 @@ describe('SessionStore owner interaction', () => {
     it('bounds a session at four unanswered questions and settles all four', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const first = preset.captured.handler!(contextOf('req-a'), new AbortController().signal);
         const second = preset.captured.handler!(contextOf('req-b'), new AbortController().signal);
@@ -474,7 +476,7 @@ describe('SessionStore owner interaction', () => {
 
         // The refused request was still announced by the runtime, so its card is
         // expired (409), not unknown (404).
-        const refused = sessionErrorOf(() =>
+        const refused = await sessionErrorOf(() =>
             store.answerAction(created.id, 'req-e', { kind: 'option', optionId: 'a' })
         );
         expect(refused.status).toBe(409);
@@ -496,7 +498,7 @@ describe('SessionStore owner interaction', () => {
     it('expires the pending answer when the run signal aborts, settling once', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const controller = new AbortController();
         const awaiting = preset.captured.handler!(contextOf('req-abort'), controller.signal);
@@ -507,7 +509,7 @@ describe('SessionStore owner interaction', () => {
             'The action request was cancelled before the owner answered. Ask again only if the question is still required.'
         );
 
-        const late = sessionErrorOf(() =>
+        const late = await sessionErrorOf(() =>
             store.answerAction(created.id, 'req-abort', { kind: 'option', optionId: 'a' })
         );
         expect(late.status).toBe(409);
@@ -524,7 +526,7 @@ describe('SessionStore owner interaction', () => {
             }
         });
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const running = store.run(created.id, 'hold the run open', () => undefined);
         await Promise.resolve();
@@ -544,15 +546,15 @@ describe('SessionStore owner interaction', () => {
     it('rejects pending answers when the session is removed', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const awaiting = preset.captured.handler!(contextOf('req-remove'), new AbortController().signal);
 
-        expect(store.remove(created.id)).toBe(true);
+        expect(await store.remove(created.id)).toBe(true);
 
         await expect(awaiting).rejects.toThrow('The session was removed before the action request was answered.');
 
-        const gone = sessionErrorOf(() =>
+        const gone = await sessionErrorOf(() =>
             store.answerAction(created.id, 'req-remove', { kind: 'option', optionId: 'a' })
         );
         expect(gone.status).toBe(404);
@@ -562,7 +564,7 @@ describe('SessionStore owner interaction', () => {
     it('rejects pending answers when the store is disposed', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        store.create('worker');
+        await store.create('worker');
 
         const awaiting = preset.captured.handler!(contextOf('req-dispose'), new AbortController().signal);
 
@@ -572,7 +574,7 @@ describe('SessionStore owner interaction', () => {
         expect(store.size).toBe(0);
     });
 
-    it('restores a session with every recorded question already expired', () => {
+    it('restores a session with every recorded question already expired', async () => {
         const preset = capturePreset();
         const built = preset.create(DEFAULTS, () => undefined);
 
@@ -629,7 +631,7 @@ describe('SessionStore owner interaction', () => {
 
         // The runtime that was awaiting this request did not survive the restart,
         // so the question is expired (409) instead of answerable or unknown.
-        const expired = sessionErrorOf(() =>
+        const expired = await sessionErrorOf(() =>
             store.answerAction('restored-session', 'req-restored', {
                 kind: 'option',
                 optionId: 'a'
@@ -668,7 +670,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
     it('answers { ok: true } for a valid option choice', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const awaiting = preset.captured.handler!(contextOf('req-api'), new AbortController().signal);
 
@@ -686,7 +688,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
     it('maps unknown request 404, repeated answer 409, malformed 400, unknown session 404', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         void preset.captured.handler!(contextOf('req-api-2'), new AbortController().signal);
 
@@ -745,7 +747,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
     it('rejects a body without a choice and a body with an unknown field', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
 
         const missing = jsonOf(await call(store, preset, created.id, 'req-api-3', {}));
         expect(missing.status).toBe(400);
@@ -768,7 +770,7 @@ describe('POST /sessions/:id/actions/:requestId/answer', () => {
     it('rejects the GET method with 405', async () => {
         const preset = capturePreset();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const api = createHarnessApi({
             store,
             defaults: API_DEFAULTS,

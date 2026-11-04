@@ -214,9 +214,11 @@ const callApi = async (
 const sessionIdsOf = (body: unknown): string[] =>
     (body as { sessions: SessionSnapshot[] }).sessions.map((session) => session.id);
 
-const sessionErrorOf = (run: () => unknown): { status: number; message: string } => {
+// D4: the strict store methods are async, so a refused write arrives as a REJECTION -
+// an async helper is the only way to observe its status and message. Same contract, awaited.
+const sessionErrorOf = async (run: () => unknown): Promise<{ status: number; message: string }> => {
     try {
-        run();
+        await run();
     } catch (error) {
         if (error instanceof SessionError) return { status: error.status, message: error.message };
         throw error;
@@ -232,8 +234,8 @@ const persistTwoSessions = async (label: string): Promise<{ root: string; health
     const root = tempRoot(label);
     const first = runtimeOf(root);
 
-    const healthy = first.store.create('one');
-    const broken = first.store.create('two');
+    const healthy = await first.store.create('one');
+    const broken = await first.store.create('two');
 
     await first.store.run(healthy.id, 'keep this', async () => {});
     await first.store.run(broken.id, 'drop this', async () => {});
@@ -268,7 +270,7 @@ describe('per-session restore isolation (T5/R6)', () => {
         // R7: the broken session is not exposed as usable. It is absent, not a
         // half-restored row.
         expect(second.store.list().some((session) => session.id === broken.id)).toBe(false);
-        const missing = sessionErrorOf(() => second.store.get(broken.id));
+        const missing = await sessionErrorOf(() => second.store.get(broken.id));
         expect(missing.status).toBe(404);
         expect(missing.message).toBe(`Unknown session "${broken.id}".`);
 
@@ -322,7 +324,7 @@ describe('per-session restore isolation (T5/R6)', () => {
 
         // A brand-new session is creatable AND runnable on a store that loaded
         // nothing: this is exactly what "server unavailable" used to prevent.
-        const fresh = second.store.create('two');
+        const fresh = await second.store.create('two');
         expect(fresh.harness).toBe('two');
 
         await second.store.run(fresh.id, 'first after restart', async () => {});
@@ -352,14 +354,14 @@ describe('per-session restore isolation (T5/R6)', () => {
 
         expect(second.store.list().map((session) => session.id)).toEqual([healthy.id]);
         expect(second.store.get(healthy.id)).toEqual(healthy);
-        expect(sessionErrorOf(() => second.store.get(broken.id)).message).toBe(`Unknown session "${broken.id}".`);
+        expect((await sessionErrorOf(() => second.store.get(broken.id))).message).toBe(`Unknown session "${broken.id}".`);
         expect(second.store.restoreErrors).toEqual([
             `${stateFile(root)}: Session "${broken.id}" could not be restored: the saved agent model map names "ghost", which is not part of this harness.`
         ]);
 
         // Failure cleanup: the half-restored session is not in the document that
         // the next save writes, and it never leaks into the registry.
-        second.store.create('one');
+        await second.store.create('one');
         second.store.dispose();
 
         const raw = fs.readFileSync(stateFile(root), 'utf8');
@@ -379,7 +381,7 @@ describe('per-session restore isolation (T5/R6)', () => {
 
         // Any structural mutation commits the in-memory database, and the dropped
         // record is simply no longer part of it.
-        const added = second.store.create('two');
+        const added = await second.store.create('two');
         second.store.dispose();
 
         const raw = fs.readFileSync(stateFile(root), 'utf8');
@@ -477,11 +479,11 @@ describe('per-session restore isolation (T5/R6)', () => {
 // files instead of serving an empty database, and the file is never rewritten by
 // a failed load.
 describe('document-level failures stay fatal (T5 scope)', () => {
-    it('still aborts startup for malformed JSON, an unknown version and an invalid record shape', () => {
+    it('still aborts startup for malformed JSON, an unknown version and an invalid record shape', async () => {
         const root = tempRoot('document-fatal');
 
         const first = runtimeOf(root);
-        const created = first.store.create('one');
+        const created = await first.store.create('one');
         const written = fs.readFileSync(stateFile(root), 'utf8');
         first.store.dispose();
         expect(created.id).not.toBe('');

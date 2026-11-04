@@ -1370,6 +1370,7 @@ repeat the name inside the definition.
 | `writer.branches()` | Detached copies of retained branch audit records (`HarnessBranchRecord[]`), newest terminal records within `maxBranchRecords`; active records are never evicted. Ephemeral: not part of the snapshot. |
 | `writer.branch(id)` | One detached branch record by id, or `undefined`. |
 | `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `task`, `profileManage`, `chapterManage`, `locationManage`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
+| `writer.nestedRuns()` / `writer.nestedRuns('refuse')` | Read, or arm once, this instance's **nested-run policy** (`'allow'` by default; armed on EVERY lane worker replica at hello, whatever preset that lane rebuilt). Under `'refuse'` every door that could start a CHILD conversation throws the named `nested-run-unsupported` limitation before the child, its transcript or its provider request exists: a tool's `context.run(...)`, a `harness(...)` call made from inside a tool body, `harness.sendThreadInput(...)`, a sibling brain run through `context.agents`, `delegate`, and a `threadFork` branch. On a refusing instance those doors are refused at the SURFACES a tool is handed, not at a stack depth: `context.harness` is a guarded view of the live handle (`src/harness.ts` `toolHandleView`) whose callable, `sendThreadInput` and sibling-brain members throw whenever they are reached — a reference the body stores and fires after its own call settled is refused just the same, while every plain read and every routed `harness.runtime` operation passes through. An inline harness still receives the strict-identical live handle. A tool reads the same policy from its own context (`context.nestedRuns`) and takes its local path when it says `'refuse'`. Arming a value the build does not recognise throws, and only a lane worker arms it — an inline harness never changes, see [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker). |
 
 ### Runtime tool creation
 
@@ -1437,7 +1438,9 @@ re-enter an agent that is already running, so delegation is one level deep and
 cycles fail fast. `delegate` is not registered at all when there are no
 subagents. A tool can still call `ctx.run(name, input)` directly when it needs a
 sibling turn mid-tool, but that path is inside one agent's turn rather than
-model-visible delegation.
+model-visible delegation. Under `threadExecution: "worker"` a lane refuses it — the
+child a tool body starts would exist only inside that lane; see
+[Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker).
 
 What that means for the shipped roles:
 
@@ -1453,7 +1456,9 @@ What that means for the shipped roles:
 - **`textSummarize` is the tool-side exception.** It calls `ctx.run('summarizer', …)`
   when the harness has that agent and condenses the notes locally otherwise, so the
   tool works in every preset (the real teams include `summarizer`; the fixtures do
-  not).
+  not). A **worker lane** is the third case for the same local path: a replica arms
+  the nested-run refusal, `context.nestedRuns` reads `'refuse'`, and the tool
+  condenses instead of handing the notes to a child that nobody would publish.
 
 #### The loop
 
@@ -1506,6 +1511,10 @@ state after waking. This changes four things a caller must know:
   that limitation per deployment with `HARNESS_THREAD_EXECUTION=worker`, which runs
   each conversation (loop and tool bodies) on its own worker thread; see
   [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker).
+  The other blocking cost a server pays is its own durability — the whole-document
+  checkpoint and the per-event journal lines — and `HARNESS_IO_EXECUTION=worker` moves
+  that write side onto one IO worker thread per database root; see
+  [Off-loop durability](#off-loop-durability-ioexecution-worker).
 
 Cancellation follows the same model. A run's signal (and `toolCancel({ callId })`
 for one call) reaches every running tool; `shell` honours it and kills its
@@ -1906,6 +1915,8 @@ workspace root still finds it. In this workspace the file is
 | `LINKUP_API_KEY` | Third opt-in `search` provider, and the second optional hosted `fetch` provider |
 | `HARNESS_THREAD_EXECUTION` | Server only: `inline` (default) or `worker` — runs each conversation's turn on its own OS worker thread. See [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker) |
 | `HARNESS_WORKER_IDLE_MS`, `HARNESS_MAX_LANE_WORKERS`, `HARNESS_WORKER_HANDSHAKE_MS`, `HARNESS_WORKER_ENTRY` | Server only: the lane-worker bounds and entry file for `worker` execution (same section; every value is validated, and a bad one aborts startup) |
+| `HARNESS_IO_EXECUTION` | Server only: `inline` (default) or `worker` — runs the database checkpoint and the event journal on one IO worker thread instead of on the request loop. See [Off-loop durability](#off-loop-durability-ioexecution-worker) |
+| `HARNESS_IO_WORKER_ENTRY` | Server only: explicit IO worker entry file; otherwise `dist/underload-harness.io-worker.mjs`, else the source entry (dev/test) |
 
 `fetch` and `download` need **no** key: `webfetch: true` registers the native
 page GET on a keyless host and declares it core (R9-R11), and `download` is an
@@ -2626,7 +2637,8 @@ What moves to the lane worker, and what does not:
 | the agent loop, provider stream handling, and **every tool body** (sync, CPU-heavy, or created by `toolCreate`) | the **canonical** harness and session document |
 | a queued thread turn **and** the legacy root `POST .../messages` run | persistence, the event journal, the display view, and every SSE response |
 | a session-bound manual `POST .../tools/:name` call and a slash `/command` (both on the session's operator lane) | the single-flight gate, the queue pump, and cancellation classification |
-| a nested `delegate` loop and a `threadFork` branch (lane-local, under a one-writer lease on the shared conversation) | the identity ledger, the writer leases, and the commit journal |
+| the guidance text of a focused submit, taken into the lane's own running conversation | the identity ledger, the writer leases, and the commit journal |
+| a `nested` child conversation | **not in worker mode at all** — every door that can start one is refused (see the limitation below), because the child would exist only inside that lane |
 
 Shared state is not merged. A lane sends **operations** carrying the facts they
 depend on, and the coordinator's authority (`src/server/workers/lane-authority.ts`)
@@ -2672,8 +2684,55 @@ name and a fix — never a quiet inline fallback:
   refused at the lane handshake, naming the tool;
 - a tool that walks `harness.memory` dynamically (`memory.data`, `memory.keys()`, a
   computed key) is refused for the same reason;
+- **Nested runs are refused, not faked — at every door.** `delegate` and `threadFork` each
+  start a CHILD conversation, and in a lane that child's thread record and transcript would
+  exist only in that lane's replica: the archived result reaches the coordinator, but the
+  canonical roster cannot list the child and its transcript disappears when the lane is
+  reclaimed. Adopting a thread by an existing id needs a core seam this build does not have.
+  A lane therefore closes four kinds of door:
+  1. the two tool entries are removed from the replica at hello, so neither is declared to the
+     model nor resolvable by a call (`context.callTool("delegate")` answers an honest
+     "not registered");
+  2. `harness.runtime.delegate` on the replica is replaced with the same named thrower;
+  3. the replica **arms the core policy** (`writer.nestedRuns('refuse')`,
+     `src/core/nested-runs.ts` + the doors in `src/harness.ts`). The arm is not a preset option:
+     `refuseNestedRuns` runs for EVERY lane at hello, whatever preset that lane rebuilt, and a build
+     with no nested-run seam faults the handshake instead of quietly running children on a private
+     copy. It closes every door a tool BODY holds: `context.run(name, input)` in any spelling
+     (`ctx.run`, a destructured `{ run }`, an alias), `context.harness(...)` used as a runner,
+     `context.harness.sendThreadInput(...)`, and a sibling brain run straight from
+     `context.agents`. Every one of them throws `nested-run-unsupported` **before** the child, its
+     transcript or its provider request exists, and the lane handshake states the doors it armed;
+  4. those refusals live at the **surfaces**, not at a stack depth. A refusing replica does not hand
+     a body the raw live handle: `context.harness` is a guarded view of it (`src/harness.ts`
+     `toolHandleView`, built once per instance) whose callable, `sendThreadInput` and sibling-brain
+     members throw whenever they are reached — so a reference the body stores and fires from a
+     callback or a timer AFTER its own call settled is refused exactly like a call made inside the
+     body. Everything a lane toolbox needs passes through that view untouched (`runtime.*`,
+     `memory`, `tools`, `commands`, `threads()` / `threadMessages()`, `executeTool`, `nestedRuns()`),
+     and a write made through it lands on the live replica, so this is a set of closed doors rather
+     than a crippled handle. An inline harness still receives the strict-identical live handle, and
+     a reference it kept still works.
+  A tool that has a real local path takes it instead of failing: the shipped `textSummarize`
+  reads `context.nestedRuns` and condenses the notes on a lane, so worker mode does not lose
+  the toolbox over one summarizer call. A revision whose captured source reaches one of these doors
+  is refused before it runs, naming the tool — the source scan is TEXTUAL and says so on the surface
+  itself; it is the lens, and the armed core is the guarantee, which is why a spelling the pattern
+  misses (a computed member, a renamed context parameter) is still refused. Worker mode therefore
+  does **not** promise nested conversation state — and cross-thread work (`threadRead`,
+  `threadSend`, `threadList`) is unaffected, because it is routed to the canonical harness rather
+  than answered from a private copy.
 - no worker entry on disk is a `ServerRuntimeError` naming both candidate paths, and
   a handshake that times out fails the turn.
+
+Guidance for a live run is honest in the same way. A focused submit into a running lane is
+answered from the lane's own `steer.result` receipt, never from the frame the coordinator
+posted: `steered: true` means the executing conversation took the text (and it lands in that
+conversation's canonical transcript), while a refusal — a run that is not at a steerable point,
+or a lane that stopped — becomes an ordinary queued continuation. The declared memory window is
+recomputed the same way it is trusted: from the tool revision that is installed NOW, so a tool
+created or replaced after the session started widens the window instead of being scanned against
+a snapshot from session creation.
 
 Compatibility is unchanged: the default stays `inline`, no existing host changes
 shape on upgrade, and a worker session answers exactly the same HTTP surface.
@@ -2697,9 +2756,11 @@ source module. A cold lane measures ~1.6–2.4 s in source mode (it rebuilds the
 harness, recompiles created-tool sources and restores the snapshot) and less against
 `dist/`; reclaim is always safe because the next turn rebuilds from committed state.
 
-A lane's `harness.branch` listing and a `threadFork` audit are lane-local by core
-design (branch state is deliberately absent from snapshot v1), so a fork commits the
-summary it returns and the branch detail stays with the conversation that ran it.
+Branch state is deliberately absent from snapshot v1 (a `harness.branch` listing belongs
+to the run that created it), which is exactly why worker mode refuses `threadFork` rather
+than keeping a private branch the coordinator cannot list: a fork that ran on a lane would
+commit only its returned summary, and the branch detail would vanish with the lane. In
+`inline` sessions — the default — both nested tools behave exactly as documented above.
 
 Cross-references: `src/server/config.ts` (the validated runtime),
 `src/server/workers/` (protocol, lane host, worker entry + loop, authority,
@@ -2708,6 +2769,85 @@ worker branches — search for `workerExecution`), and
 `src/server/workers/lane-worker.test.ts` (the behavioral proofs: a CPU burn on one
 lane while a sibling and the event loop keep moving, a task written on one lane read
 back by a rebuilt lane, and cancel/crash leaving no late effects).
+
+### Off-loop durability (`ioExecution: 'worker'`)
+
+A durable server writes two things: the whole `harness/state.json` document (a
+two-space `JSON.stringify` of every session's every event) and one JSON line per
+harness event under `harness/sessions/<id>/events.jsonl`. Inline, both happen on the
+request loop, so a big checkpoint is a synchronous block that every other session and
+every open SSE stream pays for. `ioExecution: 'worker'` moves **the write side of
+durability** onto one IO worker thread per database root:
+
+    HARNESS_IO_EXECUTION=worker yarn dev:server    # or runtime: { ioExecution: 'worker' }
+
+What does NOT move is the authority. The coordinator still decides what the next
+document and the next journal line are, and in what order: it builds the record
+exactly as before (`databaseRecord`), then hands it to
+`src/server/workers/io-client.ts` instead of calling `persistence.save()`. The thread
+serializes and performs the syscalls (`fs.*Sync`, one operation at a time, so the
+atomic rename stays one-writer) and answers with a receipt. Three consequences,
+stated rather than smoothed over:
+
+- **Strict saves become awaited.** `persistOrThrow`, and the store methods that
+  contain it (`create`, `enqueue`, `reset`, `remove`, `cancel`, `cancelThread`,
+  `deleteThread`, `updateThreadTranscript`, `setAgentModels`, `persistRegistry`,
+  `mutateRegistry`), resolve only after the worker's rename receipt — so a 201/200
+  still means "durable before the response". A failed commit rejects with the exact
+  message the inline writer throws, and the caller's rollback still runs.
+- **Best-effort saves claim order, not durability.** The core state-change observer,
+  the interval `checkpoint()`, and every journal event append stay SYNCHRONOUS and
+  enqueue the work (a burst of observer fires coalesces into ONE commit of the newest
+  document). They are never presented as durable; a crash in that window can lose what
+  was queued, never what the strict path already acknowledged.
+- **Terminal commits are fenced, which inline never was.** A transition whose document
+  lists journaled events (`cancel`, `cancelThread`, the turn-start write, a command
+  turn's terminal write) commits through `io.commitCheckpoint({ document,
+  fenceSessions: [session.id] })`: that session's journal tail is fsynced and
+  acknowledged BEFORE the document referencing those events is renamed. Strictly
+  stronger than inline, which never fsynced there.
+
+Reads stay on the coordinator (`persistence.load()`, `journal.read()`): a restore runs
+before the server answers anything, and queueing it would serialize a cold start behind
+a pending compaction for no gain. In worker mode the coordinator keeps a journal
+instance ONLY as a reader, so there is still exactly one writer per file.
+
+Ordering is load-bearing and comes from the queue: frames are posted in call order and
+answered one at a time, so a journal append is on disk before the checkpoint that lists
+it, and a reset's truncate precedes the document that forgets those turns. There is no
+inline fallback anywhere — a missing entry, a host without `node:worker_threads`, a
+thread that dies, or a protocol-version mismatch throws a named `HarnessIoError`, fails
+every outstanding operation, and aborts startup: a listener never binds its port until
+`store.ioReady()` settles. Shutdown is awaited too: `startHarnessServer().close()`
+awaits `store.drainIo()`, which flushes the coalesced slot, fences the held journal
+handles, and reports every operation that never received a durability receipt.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HARNESS_IO_EXECUTION` | `inline` | `inline` or `worker`; any other value aborts startup |
+| `HARNESS_IO_WORKER_ENTRY` | unset | explicit IO worker entry file; otherwise the built `dist/underload-harness.io-worker.mjs`, else the source entry (dev/test) |
+
+The cost that stays on the main thread, honestly: building the record (the authority
+owns the state) and the structured clone `postMessage` performs on each frame — one
+document per checkpoint. A checkpoint frame is therefore bounded by `maxFrameBytes`
+(64 MiB): the worker measures the serialized length before touching the disk and feeds
+that number back, so a permanently oversized database fails loudly and stops paying the
+clone. Off-loading is a bounded cost moved off the loop, not a zero-cost win.
+
+The IO worker is a published entry point — `@underload/harness/io-worker`, built as
+`dist/underload-harness.io-worker.mjs` (`vite.config.ts`, `package.json` `exports`).
+Because the manifest says `"sideEffects": false`, the entry calls `startIoWorker()`
+explicitly: an entry that merely imported its loop compiled to a bundle that answered
+no frames at all.
+
+Cross-references: `src/server/workers/io-protocol.ts` (the frames and the three
+outcomes `durable` / `written` / `superseded`), `src/server/workers/io-client.ts` (the
+FIFO queue, the handshake gate, and the numbered integration contract at the bottom of
+the file), `src/server/workers/io-worker.ts` and `io-worker-loop.ts` (the thread),
+`src/server/sessions.ts` (the worker branches — search for `this.io`),
+`src/server/io-worker-bridge.test.ts` (store + standalone-server proofs, including the
+built bundle), and `src/server/workers/io-client.test.ts` (ordering, barriers, error
+close, and byte identity with the inline writer).
 
 ### Threads in the browser UI (R5/R6/R7)
 

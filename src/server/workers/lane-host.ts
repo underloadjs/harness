@@ -50,12 +50,12 @@ import { existsSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import type { HarnessAttachment, HarnessEvent, HarnessThreadStatus } from '../../types';
 import type { ServerRuntimeConfiguration } from '../config';
-import { ServerRuntimeError } from '../config';
+import { MAX_LANE_WORKERS_LIMIT, ServerRuntimeError } from '../config';
 import { packagePath } from '../package-root';
 import type { LaneAuthority, LaneAuthorityRequest } from './lane-authority';
 import type { IdSpace } from './lane-identity';
 import type { IdentityLease } from './lane-identity';
-import type { LaneBlueprint, LaneCommand, LaneReply } from './protocol';
+import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply } from './protocol';
 import { LANE_PROTOCOL_VERSION, createSequence, describeEnvelope, isLaneEnvelope, isLaneReplyKind } from './protocol';
 import { laneWorkerEnvironment } from './capability';
 
@@ -96,27 +96,40 @@ export type LaneTurnResult = {
     failure?: string;
     cancelled?: boolean;
     commitFaults?: string[];
+    // The invocation id this turn's result was archived under, as the LANE reports it. A
+    // store-dispatched host thread gets a fresh numeric invocation per turn (harness.ts
+    // `invocationIdOf` falls back to `String(run.id)`), so the coordinator cannot name the
+    // roster's invocation from the thread id and must take the lane's word for it.
+    invocationId?: string;
 };
 
 // A registry change the authority already applied and pushes to every live replica. It
-// carries the METADATA as well as the source, because a created tool's source is a function
-// BODY (not a self-describing module): a replica cannot install the revision from text alone,
-// and `registerTool` refuses a candidate with no description.
-export type RegistryChange = {
-    name: string;
-    description?: string;
-    tags?: string[];
-    parameters?: Record<string, unknown>;
-    source: string;
-    revision: string;
-    removed: boolean;
-};
+// carries the METADATA as well as the text, because a created tool's source is a compiled
+// body (not a self-describing module): a replica cannot install the revision from text alone,
+// and `registerTool` refuses a candidate with no description. The single definition lives in
+// ./protocol.ts so the frame and this API cannot drift (T10 finding M5).
+export type RegistryChange = LaneRegistryChange;
+
+// T12: the lane's own answer to a steering frame. `queued` is true ONLY once the worker's
+// `steer.result` receipt says so - the store used to report `queued: true` from the POST alone
+// (T10 finding M6 named this integration hook), which told the client its guidance landed on a
+// run that had refused it. `reason` is the worker's own sentence, so the client reads why.
+export type LaneSteerReceipt = { queued: boolean; reason?: string };
+
+// One waiter per posted `steer` frame, in the order posted. The frame pair carries no steer id
+// (./protocol.ts `steer` / `steer.result`), so FIFO order is the correlation, and it is sound:
+// a lane has exactly one live turn, and ./lane-worker-loop.ts answers EVERY steer frame with
+// its own receipt, accept or refuse.
+type SteerWaiter = { resolve: (receipt: LaneSteerReceipt) => void; active: boolean };
 
 export type LaneHost = {
     runTurn(request: LaneTurnRequest): Promise<LaneTurnResult>;
     // An operator action (direct tool call / slash command), on the session's operator lane.
     invoke<T = unknown>(input: { sessionKey: string; authority: LaneAuthority; request: LaneAuthorityRequest; blueprint: LaneBlueprintSource }): Promise<T>;
-    steer(sessionKey: string, target: LaneTarget, input: string): boolean;
+    // Awaited on purpose (see `LaneSteerReceipt`): `undefined` means there is no live lane for
+    // this conversation, so the caller answers from the canonical harness; a receipt is the
+    // owning lane's decision and must not be re-asked of the authority.
+    steer(sessionKey: string, target: LaneTarget, input: string): Promise<LaneSteerReceipt | undefined>;
     interrupt(sessionKey: string, target: LaneTarget, reason?: string): boolean;
     broadcastRegistry(sessionKey: string, change: RegistryChange): void;
     closeLane(sessionKey: string, target: LaneTarget, reason?: string): void;
@@ -130,6 +143,12 @@ export type LaneHost = {
 };
 
 // Resolve the worker entry once per host (it cannot move while the server runs).
+//
+// T10 finding S9: an explicit entry that NAMES a `.ts` file is the source-mode entry, whatever
+// `dist/` holds. That spelling is what lets a test (or a dev server) pin the CURRENT worker
+// code instead of a bundle built earlier - the integration suite was otherwise running the
+// worker from a stale `dist/`, where a source change is invisible until someone happens to
+// rebuild. A `.mjs` entry keeps the built-bundle contract, including its protocol check.
 const resolveEntry = (runtime: ServerRuntimeConfiguration): { path: string; mode: 'explicit' | 'built' | 'source' } => {
     if (runtime.workerEntry !== undefined) {
         if (!existsSync(runtime.workerEntry)) {
@@ -138,7 +157,7 @@ const resolveEntry = (runtime: ServerRuntimeConfiguration): { path: string; mode
             );
         }
 
-        return { path: runtime.workerEntry, mode: 'explicit' };
+        return { path: runtime.workerEntry, mode: runtime.workerEntry.endsWith('.ts') ? 'source' : 'explicit' };
     }
 
     const built = packagePath('dist', 'underload-harness.worker.mjs');
@@ -231,11 +250,16 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         targetId?: string;
         nextCallId: () => number;
         invokes: Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>;
+        // T12: the steering receipts still waiting for this lane's live turn, keyed by turnId.
+        steers: Map<string, SteerWaiter[]>;
         turn?: { turnId: string; resolve: (result: LaneTurnResult) => void; reject: (error: Error) => void };
         onEvent?: (event: HarnessEvent) => Promise<void>;
         mutationChain: Promise<void>;
         idleTimer?: ReturnType<typeof setTimeout>;
         closed: boolean;
+        // The shared terminate() promise, so every close path (idle reclaim, crash, host
+        // shutdown) can await the same teardown exactly once (T10 finding M8).
+        termination?: Promise<void>;
     };
 
     const lanes = new Map<string, LiveLane>();
@@ -260,6 +284,45 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         lane.idleTimer = undefined;
     };
 
+    // T12: settle ONE waiting steer with the worker's receipt (FIFO for this turn). A reply for
+    // a turn nobody waits on is dropped - the steer already timed out or the lane moved on.
+    const answerSteer = (lane: LiveLane, turnId: string, receipt: LaneSteerReceipt): void => {
+        const waiters = lane.steers.get(turnId);
+
+        if (waiters === undefined) return;
+
+        const next = waiters.find((waiter) => waiter.active);
+
+        if (next === undefined) {
+            lane.steers.delete(turnId);
+
+            return;
+        }
+
+        next.active = false;
+        next.resolve(receipt);
+
+        if (!waiters.some((waiter) => waiter.active)) lane.steers.delete(turnId);
+    };
+
+    // T12: settle EVERY steer still waiting, because the lane can no longer answer it - the
+    // turn ended, or the worker is gone. `queued: false` is the truth in both cases: the
+    // guidance never reached a steerable point of a live run.
+    const settleSteers = (lane: LiveLane, turnId: string | undefined, reason: string): void => {
+        for (const [key, waiters] of [...lane.steers.entries()]) {
+            if (turnId !== undefined && key !== turnId) continue;
+
+            for (const waiter of waiters) {
+                if (!waiter.active) continue;
+
+                waiter.active = false;
+                waiter.resolve({ queued: false, reason });
+            }
+
+            lane.steers.delete(key);
+        }
+    };
+
     // Reclaim is always safe: the next turn rebuilds the replica from the authority's
     // committed state, and the epoch is retired so nothing can arrive for the old worker.
     const armIdle = (lane: LiveLane): void => {
@@ -272,8 +335,14 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         lane.idleTimer.unref?.();
     };
 
-    const closeWorker = (lane: LiveLane, reason: string): void => {
-        if (lane.closed) return;
+    // Tears the lane down and returns the termination promise.
+    //
+    // T10 finding M8: the terminate() promise used to be fire-and-forget, so a caller that
+    // needed the worker REALLY gone (host.close) could not wait for it, and the exit handler
+    // of a lane whose turn was still open had nothing to settle the turn with. Returning it
+    // costs nothing on the idle path and makes shutdown provable.
+    const closeWorker = (lane: LiveLane, reason: string): Promise<void> => {
+        if (lane.closed) return lane.termination ?? Promise.resolve();
 
         lane.closed = true;
         clearIdle(lane);
@@ -288,7 +357,14 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
             // A dead channel is expected here; terminate() is the real teardown.
         }
 
-        void lane.worker.terminate().catch(() => undefined);
+        // Settles when the worker thread is actually gone; every close path shares it, so a
+        // turn or an invocation is never left hanging on a worker that will not answer.
+        const termination = lane.worker.terminate().then(
+            () => undefined,
+            () => undefined
+        );
+
+        lane.termination = termination;
         lanes.delete(lane.key);
 
         for (const [, invoke] of [...lane.invokes.entries()]) {
@@ -297,11 +373,16 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
 
         lane.invokes.clear();
 
+        // T12: a worker that is gone can never answer a `steer.result`, so every guidance still
+        // waiting on this lane is refused now rather than held until the turn's own end.
+        settleSteers(lane, undefined, `The lane stopped (${reason}).`);
+
         const turn = lane.turn;
 
         if (turn !== undefined) {
             lane.turn = undefined;
             lane.busy = false;
+            lane.onEvent = undefined;
             turn.resolve({ failure: `The lane stopped (${reason}).`, cancelled: false });
         }
 
@@ -310,6 +391,32 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         if (lane.targetId !== undefined) mirrorThreadStatus(lane.authority, lane.targetId, 'idle');
 
         lane.settleReady(new Error(`The lane closed before it was ready (${reason}).`));
+
+        return termination;
+    };
+
+    // T10 finding M4: tell the lane that OWNS a conversation that canonical state moved in
+    // it. The frame carries no payload on purpose: the replica's adopted prefix is its own
+    // knowledge, so it pulls exactly the delta it is missing (./lane-authority.ts
+    // `transcript:sync`). A lane that cannot insert the delta yet - a wholesale transcript
+    // write is refused while its run is attached - retries at its next commit boundary, which
+    // is the safe point; this push is the responsiveness half of the fix, that retry is the
+    // correctness half.
+    const notifyTranscriptMoved = (ownerSessionKey: string, threadId: string | undefined): void => {
+        if (threadId === undefined) return;
+
+        // `agent:<name>` is an agent's DEFAULT conversation, and in worker mode the session's
+        // root lane is the one that runs it (decision D1), so that is the lane to notify.
+        const owner = lanes.get(
+            laneKeyOf(
+                ownerSessionKey,
+                threadId.startsWith('agent:') ? { kind: 'root', agent: threadId.slice('agent:'.length) } : { kind: 'thread', threadId }
+            )
+        );
+
+        if (owner === undefined || owner.closed) return;
+
+        post(owner, { kind: 'sync.transcript', laneEpoch: owner.epoch, threadId });
     };
 
     const spawn = (
@@ -323,12 +430,41 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         const existing = lanes.get(key);
 
         if (existing !== undefined && !existing.closed) {
-            // A lane survives a turn: keep the worker, but always point it at the CURRENT
-            // authority object (a session restore rebuilds the harness).
-            existing.authority = authority;
-            clearIdle(existing);
+            if (existing.authority === authority) {
+                // A lane survives a turn: keep the worker, and point it at the CURRENT
+                // authority object (a session restore rebuilds the harness).
+                clearIdle(existing);
 
-            return existing;
+                return existing;
+            }
+
+            // T10 finding M7: the store replaced the AUTHORITY OBJECT (a restore or a reset
+            // re-creates the harness, and ../sessions.ts rebuilds the authority with it). The
+            // identity ledger, the writer leases and the commit journal the lane's frames were
+            // validated against are gone with it, so re-pointing the live worker is not enough:
+            // the retired path skipped openLane, the lease claim and the hello re-handshake, and
+            // every later commit from that lane was refused as `epoch-superseded` while its
+            // turn hung on a receipt that would never say `applied`. The lane is closed and
+            // rebuilt, which is the only path that re-opens an epoch, re-claims the writer lease
+            // and re-ships the snapshot on the new authority.
+            closeWorker(existing, 'authority-replaced');
+        }
+
+        // T10 finding M9: `maxLaneWorkers` is the deployment's memory guard - every live lane
+        // holds a harness replica - and it was never enforced, so the host spawned one worker
+        // per conversation without limit. An idle lane is evicted first (the next turn rebuilds
+        // it from committed state, which is what makes eviction safe); only when EVERY lane is
+        // executing a turn is the spawn a refusal the operator can act on.
+        if (lanes.size >= runtime.maxLaneWorkers) {
+            const evictable = [...lanes.values()].find((candidate) => candidate.key !== key && !candidate.busy);
+
+            if (evictable === undefined) {
+                throw new ServerRuntimeError(
+                    `This server runs at most ${runtime.maxLaneWorkers} lane workers at a time, and every one of them is executing a turn, so the lane for ${key} cannot start. Raise maxLaneWorkers (HARNESS_MAX_LANE_WORKERS, maximum ${MAX_LANE_WORKERS_LIMIT}) or wait for a lane to finish.`
+                );
+            }
+
+            closeWorker(evictable, `evicted to stay within the ${runtime.maxLaneWorkers}-lane worker limit`);
         }
 
         const epoch = nextEpoch();
@@ -405,6 +541,7 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
             ...(target === undefined ? {} : { targetId: canonicalTargetId(target) }),
             nextCallId: createSequence(),
             invokes: new Map(),
+            steers: new Map(),
             mutationChain: Promise.resolve(),
             closed: false
         };
@@ -514,6 +651,15 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
                                 value: value.value,
                                 ...(value.sync === undefined ? {} : { sync: value.sync })
                             });
+
+                            // T10 finding M4: a cross-thread send just grew a conversation
+                            // canonically. Whoever OWNS that conversation - this lane (sending
+                            // into its own thread) or a live sibling - is told to pull the
+                            // delta, so a running turn sees a message another lane sent it at
+                            // its next safe point instead of discovering it as a refusal.
+                            if (raw.request.op === 'runtime' && raw.request.method === 'threadSend') {
+                                notifyTranscriptMoved(sessionKey, raw.request.threadId ?? raw.request.identity.threadId);
+                            }
                         } catch (error) {
                             post(lane, {
                                 kind: 'request.reply',
@@ -550,11 +696,21 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
                 case 'turn-done': {
                     const turn = lane.turn;
 
+                    // T10 finding M6: compare BEFORE clearing anything. The retired handler
+                    // dropped lane.turn, busy and onEvent first and only then looked at the id,
+                    // so a turn-done that arrived late from an already-settled turn (a reclaimed
+                    // worker, or the fault path above) cleared the record of the turn that is
+                    // running NOW - and that next turn then had nothing to settle it.
+                    if (turn === undefined || turn.turnId !== raw.turnId) return;
+
                     lane.turn = undefined;
                     lane.busy = false;
                     lane.onEvent = undefined;
 
-                    if (turn === undefined || turn.turnId !== raw.turnId) return;
+                    // T12: the turn is over, so any guidance still waiting for it never reached
+                    // a steerable point. Refusing it here is what keeps `queued: true` honest -
+                    // without this drain the receipt would hang until the lane was reclaimed.
+                    settleSteers(lane, raw.turnId, 'The turn ended before the guidance reached a steerable point.');
 
                     // The terminal gate: the state that produced this answer must already be
                     // applied (T3 finding F8).
@@ -569,6 +725,7 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
                         ...(raw.answer === undefined ? {} : { answer: raw.answer }),
                         ...(failure === undefined ? {} : { failure }),
                         ...(raw.cancelled === undefined ? {} : { cancelled: raw.cancelled }),
+                        ...(raw.invocationId === undefined ? {} : { invocationId: raw.invocationId }),
                         ...(raw.commitFaults === undefined ? {} : { commitFaults: raw.commitFaults })
                     });
 
@@ -584,9 +741,29 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
                     const turn = lane.turn;
 
                     if (turn !== undefined) {
+                        // T10 finding M6: a fault ends a turn ONLY when it names that turn. A
+                        // mismatched id belongs to a turn that already settled (the retired path
+                        // cleared the live turn on arrival, so a late frame from an old worker
+                        // silently destroyed the next turn's record).
+                        if (raw.turnId !== undefined && raw.turnId !== turn.turnId) return;
+
+                        // An UNNAMED fault arrived while a turn is live, so it came from the
+                        // frame layer (a payload that cannot transfer, an unknown command). The
+                        // worker is not trustworthy after that: close it, which settles this turn
+                        // as a failure and retires the epoch, instead of reporting one failure and
+                        // leaving a broken worker to answer the next turn.
+                        if (raw.turnId === undefined) {
+                            closeWorker(lane, raw.message);
+
+                            return;
+                        }
+
                         lane.turn = undefined;
                         lane.busy = false;
                         lane.onEvent = undefined;
+                        // T12: the run ended in a fault, so a guidance still waiting on it is
+                        // refused with the same sentence rather than left hanging.
+                        settleSteers(lane, raw.turnId, `The turn failed before the guidance reached a steerable point (${raw.message}).`);
                         turn.resolve({ failure: raw.message, cancelled: false });
                         armIdle(lane);
 
@@ -595,6 +772,22 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
 
                     settleReady(new ServerRuntimeError(`The lane worker reported a fault: ${raw.message}`));
                     closeWorker(lane, raw.message);
+
+                    return;
+                }
+
+                // T10 finding M6: the answer to a `steer` frame, and explicitly NOT terminal.
+                // A run that is not at a steerable point refuses the guidance; the turn keeps
+                // executing, which is exactly what the client was told inline.
+                //
+                // T12 closed the integration hook this note listed: `steer()` below now awaits
+                // this frame, so ../sessions.ts reports the lane's own answer instead of the
+                // optimistic `queued: true` the POST alone used to produce.
+                case 'steer.result': {
+                    answerSteer(lane, raw.turnId, {
+                        queued: raw.queued,
+                        ...(raw.reason === undefined ? {} : { reason: raw.reason })
+                    });
 
                     return;
                 }
@@ -703,15 +896,17 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         lane.busy = false;
         lane.onEvent = undefined;
 
-        // Settle the mirror. A host thread's invocation identity is its own id (the core rule
-        // `invocationIdOf` implements inline), so the roster can join this turn to the result
-        // the lane archived.
+        // Settle the mirror. The roster's invocation id is the one the LANE archived its result
+        // under, reported on the terminal frame; the thread id is only the fallback for a run
+        // that published nothing (T10 finding M3: the core mints a fresh numeric invocation per
+        // thread turn, so inventing `thread-N` here joins the roster to a result that does not
+        // exist, and `agentResult` cannot find the turn the UI is pointing at).
         if (lane.targetId !== undefined) {
             mirrorThreadStatus(
                 request.authority,
                 lane.targetId,
                 'idle',
-                request.target.kind === 'thread' ? request.target.threadId : undefined
+                result.invocationId ?? (request.target.kind === 'thread' ? request.target.threadId : undefined)
             );
         }
 
@@ -745,14 +940,41 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         }
     };
 
-    const steer = (sessionKey: string, target: LaneTarget, input: string): boolean => {
+    // T12: AWAITED. The POST alone only proves the frame left this process, so the retired
+    // `return true` reported a guidance as queued on a run that had already refused it (T10
+    // finding M6's integration hook). `undefined` is a different answer from a refusal: there is
+    // no live lane, so the caller must answer from the canonical harness (the inline behaviour
+    // when a run has ended), and it must not be re-asked once the owning lane has spoken.
+    const steer = async (sessionKey: string, target: LaneTarget, input: string): Promise<LaneSteerReceipt | undefined> => {
         const lane = lanes.get(laneKeyOf(sessionKey, target));
 
-        if (lane === undefined || lane.closed || lane.turn === undefined) return false;
+        if (lane === undefined || lane.closed || lane.turn === undefined) return undefined;
 
-        post(lane, { kind: 'steer', laneEpoch: lane.epoch, turnId: lane.turn.turnId, input });
+        const turnId = lane.turn.turnId;
+        let resolveReceipt!: (receipt: LaneSteerReceipt) => void;
+        const receipt = new Promise<LaneSteerReceipt>((resolve) => {
+            resolveReceipt = resolve;
+        });
+        const waiter: SteerWaiter = { resolve: resolveReceipt, active: true };
 
-        return true;
+        // Registered BEFORE the frame is posted: the worker's answer is another message on this
+        // same port, and a reply processed before the waiter existed would find nobody.
+        const waiters = lane.steers.get(turnId) ?? [];
+
+        waiters.push(waiter);
+        lane.steers.set(turnId, waiters);
+
+        try {
+            post(lane, { kind: 'steer', laneEpoch: lane.epoch, turnId, input });
+        } catch (error) {
+            // The frame never left (a payload that cannot transfer, a channel that died between
+            // the check and the post). Nothing can answer, so refuse now with the reason.
+            waiter.active = false;
+            waiter.resolve({ queued: false, reason: `The lane could not accept the guidance (${(error as Error).message}).` });
+            if (!waiters.some((entry) => entry.active)) lane.steers.delete(turnId);
+        }
+
+        return receipt;
     };
 
     const interrupt = (sessionKey: string, target: LaneTarget, reason?: string): boolean => {
@@ -797,21 +1019,13 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
     const close = async (reason?: string): Promise<void> => {
         const live = [...lanes.values()];
 
-        for (const lane of live) {
-            lane.authority.closeLane(lane.epoch);
-            clearIdle(lane);
-            lane.closed = true;
+        // T10 finding M8: shutdown goes through `closeWorker`, the same teardown an idle reclaim
+        // or a crash uses. It settles the lane's open turn and every pending invocation, marks
+        // the epoch retired, and returns the terminate() promise; the retired path set
+        // `closed = true` by hand and awaited terminate() alone, so a turn that was in flight
+        // when the server stopped was never resolved and its caller hung.
+        await Promise.all(live.map((lane) => closeWorker(lane, reason ?? 'server shutdown')));
 
-            try {
-                lane.worker.postMessage({ kind: 'dispose', laneEpoch: lane.epoch, reason: reason ?? 'server shutdown' } satisfies LaneCommand);
-            } catch {
-                // A worker that already stopped cannot be disposed twice.
-            }
-
-            lane.settleReady(new Error(`The lane closed (${reason ?? 'server shutdown'}).`));
-        }
-
-        await Promise.all(live.map((lane) => lane.worker.terminate().catch(() => undefined)));
         lanes.clear();
     };
 

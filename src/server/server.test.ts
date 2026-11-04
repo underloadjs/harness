@@ -259,6 +259,7 @@ describe('server runtime configuration', () => {
     // degrading into an inline server the operator did not ask for.
     const RUNTIME_DEFAULTS = {
         threadExecution: 'inline',
+        ioExecution: 'inline',
         workerIdleMs: 120_000,
         maxLaneWorkers: 16,
         workerHandshakeMs: 60_000
@@ -360,6 +361,7 @@ describe('server runtime configuration', () => {
 
             expect(fromEnvironment.runtime).toEqual({
                 threadExecution: 'inline',
+                ioExecution: 'inline',
                 workerIdleMs: 1000,
                 maxLaneWorkers: 2,
                 workerHandshakeMs: 2000
@@ -376,6 +378,7 @@ describe('server runtime configuration', () => {
             try {
                 expect(overridden.runtime).toEqual({
                     threadExecution: 'inline',
+                    ioExecution: 'inline',
                     workerIdleMs: 1000,
                     maxLaneWorkers: 3,
                     workerHandshakeMs: 2000

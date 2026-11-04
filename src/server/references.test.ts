@@ -261,7 +261,7 @@ const submit = async (
     input: string,
     references?: unknown
 ): Promise<SessionTurn> => {
-    const task = store.enqueue(id, input, undefined, references);
+    const task = await store.enqueue(id, input, undefined, references);
     await task.settled;
     await store.waitForIdle(id);
     const turn = store.get(id).turns.find((candidate) => candidate.id === task.turn.id);
@@ -297,7 +297,7 @@ describe('fresh server blocks', () => {
     it('does not inherit the previous block user message and injects nothing without a reference', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         await submit(store, created.id, 'first block');
         await submit(store, created.id, 'second block');
@@ -333,7 +333,7 @@ describe('explicit result references', () => {
     it('binds a root reference at enqueue and injects the completed result', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         const first = await submit(store, created.id, 'produce a result');
 
@@ -367,7 +367,7 @@ describe('explicit result references', () => {
     it('resolves each typed #LABEL to the conversation-scoped block it names', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         const first = await submit(store, created.id, 'first block');
         const second = await submit(store, created.id, 'second block');
@@ -397,15 +397,15 @@ describe('explicit result references', () => {
     it('binds a still-streaming target and expands after it completes', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         const firstStarted = fixture.started('hold one');
-        const first = store.enqueue(created.id, 'hold one');
+        const first = await store.enqueue(created.id, 'hold one');
         await firstStarted.promise;
 
         // The target is RUNNING and has only a start event; binding must not read
         // partial content and must not reject the task.
-        const second = store.enqueue(created.id, 'use #PE1');
+        const second = await store.enqueue(created.id, 'use #PE1');
         expect(second.turn.references).toEqual([{ turnId: first.turn.id, label: 'PE1' }]);
         expect(second.session.turns[1].status).toBe('queued');
 
@@ -423,7 +423,7 @@ describe('explicit result references', () => {
     it('references a nested subagent block by thread id', async () => {
         const requests: RecordedRequest[] = [];
         const store = createStore([teamPreset(requests)]);
-        const created = store.create('team');
+        const created = await store.create('team');
 
         const first = await submit(store, created.id, 'delegate please');
 
@@ -470,16 +470,16 @@ describe('explicit result references', () => {
         const requests: RecordedRequest[] = [];
         const gate = deferred();
         const store = createStore([teamPreset(requests, gate)]);
-        const created = store.create('team');
+        const created = await store.create('team');
 
-        const first = store.enqueue(created.id, 'delegate please');
+        const first = await store.enqueue(created.id, 'delegate please');
 
         // Wait until the child request is inside its stream: the delegated block
         // has adopted thread id '2', so a reference using the STABLE call alias is
         // exactly the "bound before completion" case.
         await waitUntil(() => requests.some((request) => request.agent === 'helper'));
 
-        const second = store.enqueue(created.id, 'reuse child', undefined, [
+        const second = await store.enqueue(created.id, 'reuse child', undefined, [
             { turnId: first.turn.id, threadId: 'call:call_1', label: 'HR1' }
         ]);
 
@@ -524,17 +524,19 @@ describe('rejected references', () => {
     it('rejects a failed target at enqueue and creates no turn', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         const failed = await submit(store, created.id, 'BOOM now');
         expect(failed.status).toBe('error');
         const before = store.get(created.id).turns.length;
 
-        expect(() =>
+        // D4: `enqueue` is async, so a rejected submit is a REJECTION - `.rejects` takes the
+        // promise (awaiting inside `expect` would settle it before the assertion could see it).
+        await expect(
             store.enqueue(created.id, 'reuse failure', undefined, [
                 { turnId: failed.id, label: 'PE1' }
             ])
-        ).toThrow(
+        ).rejects.toThrow(
             new SessionError(400, 'Block "#PE1" cannot be referenced because it ended as error.')
         );
         expect(store.get(created.id).turns).toHaveLength(before);
@@ -543,21 +545,19 @@ describe('rejected references', () => {
     it('rejects a cancelled target at enqueue', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         const started = fixture.started('hold one');
-        const task = store.enqueue(created.id, 'hold one');
+        const task = await store.enqueue(created.id, 'hold one');
         await started.promise;
-        expect(store.cancel(created.id)).toBe(true);
+        expect(await store.cancel(created.id)).toBe(true);
         await task.settled;
         await store.waitForIdle(created.id);
 
         expect(store.get(created.id).turns[0].status).toBe('cancelled');
-        expect(() =>
-            store.enqueue(created.id, 'reuse cancelled', undefined, [
+        await expect(store.enqueue(created.id, 'reuse cancelled', undefined, [
                 { turnId: task.turn.id, label: 'PE1' }
-            ])
-        ).toThrow(
+            ])).rejects.toThrow(
             new SessionError(400, 'Block "#PE1" cannot be referenced because it ended as cancelled.')
         );
     });
@@ -565,30 +565,24 @@ describe('rejected references', () => {
     it('rejects unknown turns, unknown labels, and a label/thread mismatch', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
         const first = await submit(store, created.id, 'produce');
 
-        expect(() =>
-            store.enqueue(created.id, 'x', undefined, [{ turnId: 'missing', label: 'PE1' }])
-        ).toThrow(new SessionError(400, 'Referenced turn "missing" does not exist in this session.'));
+        await expect(store.enqueue(created.id, 'x', undefined, [{ turnId: 'missing', label: 'PE1' }])).rejects.toThrow(new SessionError(400, 'Referenced turn "missing" does not exist in this session.'));
 
-        expect(() =>
-            store.enqueue(created.id, 'x', undefined, [{ turnId: first.id, label: 'RH9' }])
-        ).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, [{ turnId: first.id, label: 'RH9' }])).rejects.toThrow(
             new SessionError(400, `Turn "${first.id}" has no block labelled "#RH9".`)
         );
 
         // A nested reference must name the thread; a bogus one cannot resolve.
-        expect(() =>
-            store.enqueue(created.id, 'x', undefined, [
+        await expect(store.enqueue(created.id, 'x', undefined, [
                 { turnId: first.id, threadId: 'ghost', label: 'PE1' }
-            ])
-        ).toThrow(
+            ])).rejects.toThrow(
             new SessionError(400, `Turn "${first.id}" has no block labelled "#PE1" (thread "ghost").`)
         );
 
         // Typed label with no matching prior block is rejected, never guessed.
-        expect(() => store.enqueue(created.id, 'use #ZZ9')).toThrow(
+        await expect(store.enqueue(created.id, 'use #ZZ9')).rejects.toThrow(
             new SessionError(400, 'No earlier block is labelled "#ZZ9". Type a label from a completed result.')
         );
     });
@@ -596,27 +590,27 @@ describe('rejected references', () => {
     it('rejects a malformed reference payload before creating a turn', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        expect(() => store.enqueue(created.id, 'x', undefined, { turnId: 'a', label: 'PE1' })).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, { turnId: 'a', label: 'PE1' })).rejects.toThrow(
             new SessionError(400, 'references must be an array.')
         );
-        expect(() => store.enqueue(created.id, 'x', undefined, [{ turnId: '', label: 'PE1' }])).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, [{ turnId: '', label: 'PE1' }])).rejects.toThrow(
             new SessionError(400, 'references[0].turnId must be a non-empty string.')
         );
-        expect(() => store.enqueue(created.id, 'x', undefined, [{ turnId: 'a', label: 'nope' }])).toThrow(
+        await expect(store.enqueue(created.id, 'x', undefined, [{ turnId: 'a', label: 'nope' }])).rejects.toThrow(
             new SessionError(400, 'references[0].label must be a block label such as "IT1".')
         );
 
         expect(store.get(created.id).turns).toEqual([]);
     });
 
-    it('keeps the 200k input ceiling and resolves nothing for an oversized prompt', () => {
+    it('keeps the 200k input ceiling and resolves nothing for an oversized prompt', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
-        expect(() => store.enqueue(created.id, 'x'.repeat(200_001))).toThrow(
+        await expect(store.enqueue(created.id, 'x'.repeat(200_001))).rejects.toThrow(
             new SessionError(413, 'A task cannot exceed 200000 characters.')
         );
         expect(store.get(created.id).turns).toEqual([]);
@@ -625,7 +619,7 @@ describe('rejected references', () => {
     it('fails a turn readably when prompt + referenced context exceed the combined budget', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create('probe');
+        const created = await store.create('probe');
         const first = await submit(store, created.id, 'produce');
 
         // Under the raw 200k ceiling, but there is no room left for the delimiters
@@ -647,7 +641,7 @@ describe('reference persistence', () => {
         const persistence = new HarnessPersistence(root);
 
         const firstStore = createStore([fixture.preset], persistence);
-        const created = firstStore.create('probe');
+        const created = await firstStore.create('probe');
         const first = await submit(firstStore, created.id, 'produce a result');
         const second = await submit(firstStore, created.id, 'reuse it', [
             { turnId: first.id, label: 'PE1' }
@@ -720,7 +714,7 @@ describe('POST /tasks references', () => {
         if (created.kind !== 'json' || created.status !== 201) throw new Error('expected a session');
         const id = (created.body as { session: SessionSnapshot }).session.id;
 
-        const first = runtime.store.enqueue(id, 'first');
+        const first = await runtime.store.enqueue(id, 'first');
         await first.settled;
         await runtime.store.waitForIdle(id);
 
@@ -755,7 +749,7 @@ describe('POST /tasks references', () => {
         if (created.kind !== 'json' || created.status !== 201) throw new Error('expected a session');
         const id = (created.body as { session: SessionSnapshot }).session.id;
 
-        const first = runtime.store.enqueue(id, 'first');
+        const first = await runtime.store.enqueue(id, 'first');
         await first.settled;
         await runtime.store.waitForIdle(id);
 

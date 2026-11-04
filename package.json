@@ -27,6 +27,11 @@
             "import": "./dist/underload-harness.worker.mjs",
             "default": "./dist/underload-harness.worker.mjs"
         },
+        "./io-worker": {
+            "types": "./dist/server/workers/io-worker.d.ts",
+            "import": "./dist/underload-harness.io-worker.mjs",
+            "default": "./dist/underload-harness.io-worker.mjs"
+        },
         "./frontend": {
             "browser": {
                 "types": "./dist/frontend/index.d.ts",

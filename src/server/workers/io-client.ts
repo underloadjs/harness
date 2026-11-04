@@ -193,6 +193,10 @@ export type IoQueueStats = {
     writtenBytes: number;
     lastCheckpointBytes: number;
     lastCheckpointDurationMs: number;
+    // Operations POSTED per kind, so "the worker performed my checkpoint and my journal fence"
+    // is a NUMBER an operator can read, not an inference from the total. It counts posts (the
+    // same basis as `posted`), including one that later failed or was refused by the worker.
+    postedByKind: Partial<Record<IoOperationKind, number>>;
     // Operations with a callId outstanding right now.
     outstanding: number;
 };
@@ -445,7 +449,8 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
         late: 0,
         writtenBytes: 0,
         lastCheckpointBytes: 0,
-        lastCheckpointDurationMs: 0
+        lastCheckpointDurationMs: 0,
+        postedByKind: {}
     };
 
     // The one deferred best-effort checkpoint, plus whether its release is scheduled.
@@ -660,6 +665,11 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
     // the caller called in (the gate is a FIFO array of already-numbered operations).
     const deliver = (pending: PendingOperation): void => {
         stats.posted += 1;
+
+        // Per-kind post counts, taken at the post (not at the reply): an operation that fails on
+        // the worker still cost a frame, and a caller proving "the fence was posted before the
+        // save" needs the count of what left this thread.
+        stats.postedByKind[pending.kind] = (stats.postedByKind[pending.kind] ?? 0) + 1;
 
         try {
             worker.postMessage(pending.frame);
@@ -1116,7 +1126,9 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
         // be confirmed; `operations` is everything outstanding, gated or posted.
         pending: () => ({ operations: outstanding.size, gated: gated.length, lastFrameBytes: stats.lastCheckpointBytes, coalescedCheckpoint: deferred !== undefined }),
 
-        stats: (): IoQueueStats => ({ ...stats, outstanding: outstanding.size }),
+        // `postedByKind` is copied so a reporter cannot mutate the live counters through the
+        // snapshot it was handed.
+        stats: (): IoQueueStats => ({ ...stats, postedByKind: { ...stats.postedByKind }, outstanding: outstanding.size }),
 
         // The worker-mode twin of `persistence.lastWriteError` (../persistence.ts:1143).
         lastError: () => lastCheckpointError,

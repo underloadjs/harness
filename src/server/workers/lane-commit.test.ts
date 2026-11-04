@@ -18,13 +18,15 @@ import {
     DEFAULT_BOUNDS,
     applyMutationGroup,
     applySharedMutation,
+    archiveDigestOf,
     createCommitJournal,
     createWriterLeaseLedger,
     emptyCanonicalView,
     expectsDigestOf,
     leaseKeyOf,
     leaseScopeOf,
-    replaceLaneEpoch
+    replaceLaneEpoch,
+    rolledBackReceipts
 } from './lane-commit';
 import type { CanonicalView, MutationGroup, SharedMutation } from './lane-commit';
 import { createIdentityLedger } from './lane-identity';
@@ -365,13 +367,29 @@ describe('thread creation and result archiving: identity comes from the authorit
             'answer from lane B'
         ]);
 
-        const duplicate = archiveFor(EPOCH_A, 'lane A minted locally again', String(idA.lease.start));
+        // T10 finding M3: a repeat of an id THIS lane already archived is not a collision, it
+        // is the same conversation's next turn (a host thread's invocation id IS its thread id).
+        // It replaces the slot, exactly as the core's id-keyed archive does inline.
+        const sameWriter = archiveFor(EPOCH_A, 'lane A second turn', String(idA.lease.start));
 
-        expect(duplicate.status).toBe('rejected');
-        expect(duplicate.rejection?.code).toBe('stale-record');
-        expect(duplicate.rejection?.message).toBe(
-            'Invocation "2" is already archived; identity ids must come from the authority.'
+        expect(sameWriter.status).toBe('applied');
+        expect(view.results[String(idA.lease.start)].content).toBe('lane A second turn');
+        expect(Object.keys(view.results)).toHaveLength(2);
+
+        // A DIFFERENT live epoch claiming that id is a real collision, and the canonical digest
+        // travels back so the losing lane stops re-sending an identity it does not hold.
+        const collision = archiveFor(EPOCH_B, 'lane B invented the same id', String(idA.lease.start));
+
+        expect(collision.status).toBe('rejected');
+        expect(collision.rejection?.code).toBe('not-writer');
+        expect(collision.rejection?.message).toBe(
+            `Invocation "${String(idA.lease.start)}" is archived by lane ${EPOCH_A}; this lane (${EPOCH_B}) does not own that identity.`
         );
+        expect(collision.effect?.digest).toBe(archiveDigestOf(view.results[String(idA.lease.start)]));
+        // The refusal moved nothing.
+        expect(view.results[String(idA.lease.start)].content).toBe('lane A second turn');
+        // Ownership is recorded where the write landed, so the fold can tell the two cases apart.
+        expect(view.resultOwners[String(idA.lease.start)]).toBe(EPOCH_A);
     });
 
     it('holds the core retention bound by evicting the oldest completed result', () => {
@@ -655,5 +673,116 @@ describe('mutation groups and the journal', () => {
         expect(journal.accepts(EPOCH_B, 0)).toEqual({ ok: false, code: 'seq-behind' });
         expect(journal.mayPublishSuccess(EPOCH_B, 0)).toBe(true);
         expect(journal.mayPublishSuccess(EPOCH_B, 1)).toBe(false);
+    });
+});
+
+// T10 findings M2, M3 and S6: what a boundary reports, and what a lane is therefore allowed
+// to believe. The retired behaviour was: the fold rolled back, the LIVE applier replayed the
+// individually-applied receipts anyway, and the lane adopted nothing from an incomplete group
+// - so canonical and the lane's base diverged permanently, one contested key wedged every
+// later commit of that lane, and the turn could never publish.
+describe('group rollback, canonical re-base, and the declared window (T10 M2/M3/S6)', () => {
+    const groupFor = (seq: number, ops: SharedMutation[], laneEpoch = EPOCH_A): MutationGroup => ({ laneEpoch, seq, ops });
+
+    const contested = () => {
+        const view = viewWith('thread-3', [{ role: 'user', content: 'q' }]);
+        const leases = createWriterLeaseLedger();
+
+        leases.claim({ kind: 'thread', id: 'thread-3' }, EPOCH_A);
+
+        const folded = applyMutationGroup(
+            view,
+            groupFor(1, [
+                // A key both lanes read as absent: this one wins, the other is refused.
+                { kind: 'memory:set', key: 'shared.cache', value: 'from-A', expects: expectsDigestOf(undefined) },
+                // A stale prefix: canonical holds 1 message, the lane appends at 0.
+                { kind: 'transcript:append', threadId: 'thread-3', fromLength: 0, messages: [{ role: 'assistant', content: 'a' }] }
+            ]),
+            { laneEpoch: EPOCH_A, leases, identity: createIdentityLedger({ thread: 3 }) }
+        );
+
+        return { view, folded };
+    };
+
+    it('rolls the staged view back and hands the caller the SAME view object', () => {
+        const { view, folded } = contested();
+
+        expect(folded.outcome.status).toBe('partial');
+        expect(folded.outcome.complete).toBe(false);
+        expect(folded.view).toBe(view);
+        expect(view.memory['shared.cache']).toBeUndefined();
+        expect(view.threads['thread-3'].messages).toHaveLength(1);
+    });
+
+    it('rewrites every would-have-applied receipt into a refusal with no effect (M2)', () => {
+        const { folded } = contested();
+        const rolled = rolledBackReceipts(folded.outcome.receipts, folded.outcome.receipts.map(() => ({ kind: 'memory:set', key: 'k', value: 1, expects: 'x' }) as SharedMutation), EPOCH_A, 1);
+
+        // Staged receipts say `applied` for op 0; the live applier must not treat them as such.
+        expect(folded.outcome.receipts.map((receipt) => receipt.status)).toEqual(['applied', 'rejected']);
+        expect(rolled.map((receipt) => receipt.status)).toEqual(['rejected', 'rejected']);
+        expect(rolled[0].rejection?.code).toBe('group-rolled-back');
+        expect(rolled[0].effect).toBeUndefined();
+        // The refusal that CAUSED the rollback keeps its canonical facts, which is what lets
+        // the lane re-base instead of repeating the same boundary forever.
+        expect(rolled[1].rejection?.code).toBe('prefix-moved');
+        expect(rolled[1].effect?.length).toBe(1);
+    });
+
+    it('digests an archived result over the writer-owned fields only (M3)', () => {
+        const record = {
+            invocationId: 'thread-3',
+            sequence: 7,
+            completedOrder: 1,
+            agent: 'instruct',
+            role: 'primary',
+            kind: 'root',
+            status: 'completed',
+            content: 'answer one'
+        };
+
+        // The authority reassigns `completedOrder` on every apply, so a digest that covered it
+        // would never match the lane's own view and the lane would re-archive forever.
+        expect(archiveDigestOf(record)).toBe(archiveDigestOf({ ...record, completedOrder: 99 }));
+        expect(archiveDigestOf(record)).not.toBe(archiveDigestOf({ ...record, content: 'answer two' }));
+        expect(archiveDigestOf(record)).not.toBe(archiveDigestOf({ ...record, sequence: 9 }));
+    });
+
+    it('refuses a memory write the lane was never given a window for (S6)', () => {
+        const view = emptyCanonicalView();
+
+        view.memory['sibling.key'] = 'canonical value';
+
+        const write = { kind: 'memory:set', key: 'sibling.key', value: 'lane value', expects: expectsDigestOf(undefined) } as SharedMutation;
+
+        const refused = applySharedMutation(view, write, {
+            ...context(view),
+            declaredKeys: ['mine.key']
+        });
+
+        expect(refused.status).toBe('rejected');
+        expect(refused.rejection?.code).toBe('memory-undeclared');
+        // The canonical digest comes back so the lane re-bases rather than guessing again.
+        expect(refused.effect?.digest).toBe(expectsDigestOf('canonical value'));
+        expect(view.memory['sibling.key']).toBe('canonical value');
+
+        const removed = applySharedMutation(view, { kind: 'memory:delete', key: 'sibling.key', expects: expectsDigestOf(undefined) }, {
+            ...context(view),
+            declaredKeys: ['mine.key']
+        });
+
+        expect(removed.rejection?.code).toBe('memory-undeclared');
+        expect(view.memory['sibling.key']).toBe('canonical value');
+
+        // A session that declares no window at all stays unrestricted - the same reading
+        // ./lane-authority.ts uses for a `memory:window` request. The CAS check still applies,
+        // which is the point: the window rule and the digest rule are separate guards.
+        const allowed = applySharedMutation(view, { kind: 'memory:set', key: 'sibling.key', value: 'lane value', expects: expectsDigestOf('canonical value') }, {
+            ...context(view),
+            declaredKeys: undefined
+        });
+
+        expect(allowed.status).toBe('applied');
+        expect(view.memory['sibling.key']).toBe('lane value');
     });
 });

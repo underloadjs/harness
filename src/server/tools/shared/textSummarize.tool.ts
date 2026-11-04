@@ -50,7 +50,7 @@ const condense = (notes: string): string => {
 export const metadata = {
     name: 'textSummarize',
     description:
-        'Summarise collected notes in at most two sentences. When the harness configures a summarizer subagent this hands the notes to it; otherwise it condenses them locally.',
+        'Summarise collected notes in at most two sentences. When the harness configures a summarizer subagent this hands the notes to it; otherwise — no such agent, or a worker lane, where a nested run is refused — it condenses them locally.',
     tags: ['summarize', 'text', 'condense'],
     parameters: {
         type: 'object',
@@ -77,12 +77,20 @@ export const registration = {
 // but has no such agent, so it condenses locally (see `condense` above). A direct
 // server call has neither `run` nor `agents`, and gets the same local fallback.
 //
+// T14: a WORKER LANE is the third case for the same local fallback. A lane replica
+// arms the nested-run refusal (`context.nestedRuns === 'refuse'`, src/harness.ts),
+// because a child conversation started there would live only in that lane — its
+// thread record and its transcript are never centralised. Rather than fail the call
+// (or, worse, run a child nobody publishes), this tool takes its documented local
+// path. An INLINE session, where nested runs are allowed, still hands the notes to
+// the `summarizer` model exactly as before.
+//
 // T3: the tags deliberately do NOT include "agents". Every real preset now has
 // subagents, so an "agents"-tagged condenser made `toolRequest({ tags: ["agents"] })`
 // look like a delegation discovery result even though the tool only summarises.
 const textSummarize = tool<string, string>({
     ...metadata,
-    execute: async ({ parameters: notes, run, agents }) => {
+    execute: async ({ parameters: notes, run, agents, nestedRuns }) => {
         // `agents` is the harness registry; a missing `summarizer` key is the
         // documented agent-configuration difference, not an error.
         const summarizer = agents?.summarizer;
@@ -94,8 +102,17 @@ const textSummarize = tool<string, string>({
         const boundedNotes = truncated ? notes.slice(0, MAX_SUMMARIZE_NOTES) : notes;
         const truncationNote = truncated ? `\n\n${NOTES_TRUNCATED}` : '';
 
+        // T14: a lane worker (`threadExecution: "worker"`) refuses every nested conversation
+        // run, so `run(...)` there throws `nested-run-unsupported` instead of answering: the
+        // child's thread record and transcript would live only in that lane's replica. This tool
+        // has a real LOCAL path, so it takes it — the SAME documented fallback as "no summarizer
+        // agent" — rather than failing the call or silently losing a child nobody publishes. The
+        // policy is read from the context (call-time, never a snapshot), so an inline session
+        // still hands the notes to the model.
+        const nestedRunAvailable = nestedRuns !== 'refuse';
+
         const summary =
-            !run || summarizer === undefined
+            !run || summarizer === undefined || !nestedRunAvailable
                 ? condense(boundedNotes)
                 : (
                       await run(

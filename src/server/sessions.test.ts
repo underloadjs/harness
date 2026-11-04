@@ -228,7 +228,7 @@ describe('SessionStore turns', () => {
     it('opens the stream with the running turn and records every event', async () => {
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const created = store.create('single');
+        const created = await store.create('single');
         expect(created.turns).toEqual([]);
 
         setClock(2_000);
@@ -327,7 +327,7 @@ describe('SessionStore turns', () => {
     it('carries the running tally on every frame from the first usage event on', async () => {
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const created = store.create('single');
+        const created = await store.create('single');
 
         setClock(2_000);
 
@@ -454,7 +454,7 @@ describe('SessionStore turns', () => {
         // also folded `done` would report {9,6,15} instead of {6,4,10}.
         const step = { input: 3, output: 2, total: 5 };
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([toolRoundPreset([step, step])]));
-        const created = store.create('rounds');
+        const created = await store.create('rounds');
         setClock(2_000);
 
         const items: SessionStreamItem[] = [];
@@ -552,7 +552,7 @@ describe('SessionStore turns', () => {
                 ])
             ])
         );
-        const created = store.create('rounds');
+        const created = await store.create('rounds');
         setClock(2_000);
 
         await store.run(created.id, 'cache me', async () => {});
@@ -571,7 +571,7 @@ describe('SessionStore turns', () => {
             DEFAULTS,
             createHarnessRegistry([usagePreset({ input: 5, output: 1, total: 6 })])
         );
-        const created = store.create('priced');
+        const created = await store.create('priced');
 
         await store.run(created.id, 'no cache', async () => {});
 
@@ -586,7 +586,7 @@ describe('SessionStore turns', () => {
             DEFAULTS,
             createHarnessRegistry([usagePreset({ input: 5, output: 1, total: 6, cached: 0 })])
         );
-        const created = store.create('priced');
+        const created = await store.create('priced');
 
         await store.run(created.id, 'zero cache', async () => {});
 
@@ -654,7 +654,7 @@ describe('SessionStore turns', () => {
 
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([partialPreset]));
-        const created = store.create('partial');
+        const created = await store.create('partial');
         setClock(2_000);
 
         const items: SessionStreamItem[] = [];
@@ -663,7 +663,7 @@ describe('SessionStore turns', () => {
         });
 
         await secondRequest.promise;
-        expect(store.cancel(created.id)).toBe(true);
+        expect(await store.cancel(created.id)).toBe(true);
         await running;
 
         const turn = store.get(created.id).turns[0];
@@ -678,7 +678,7 @@ describe('SessionStore turns', () => {
     it('records subagent events in the primary turn', async () => {
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([teamPreset()]));
-        const created = store.create('team');
+        const created = await store.create('team');
         setClock(2_000);
 
         const items: SessionStreamItem[] = [];
@@ -803,7 +803,7 @@ describe('SessionStore turns', () => {
     it('keeps sequential turns in order and leaves earlier turns untouched', async () => {
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const created = store.create('single');
+        const created = await store.create('single');
 
         setClock(2_000);
         const firstItems: SessionStreamItem[] = [];
@@ -882,7 +882,7 @@ describe('SessionStore turns', () => {
         );
 
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([gatedPreset]));
-        const created = store.create('gated');
+        const created = await store.create('gated');
         setClock(2_000);
 
         const items: SessionStreamItem[] = [];
@@ -960,7 +960,7 @@ describe('SessionStore turns', () => {
         );
 
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([hangingPreset]));
-        const created = store.create('hanging');
+        const created = await store.create('hanging');
         setClock(2_000);
 
         const items: SessionStreamItem[] = [];
@@ -972,7 +972,7 @@ describe('SessionStore turns', () => {
         });
 
         await partial.promise;
-        expect(store.cancel(created.id)).toBe(true);
+        expect(await store.cancel(created.id)).toBe(true);
         await running;
 
         const opening = items[0];
@@ -1019,7 +1019,7 @@ describe('SessionStore turns', () => {
 
         // Survives reload, and cancelling again is a no-op.
         expect(store.get(created.id).turns).toEqual(terminal.session.turns);
-        expect(store.cancel(created.id)).toBe(false);
+        expect(await store.cancel(created.id)).toBe(false);
         expect(store.assertRunnable(created.id)).toBeUndefined();
     });
 
@@ -1046,7 +1046,7 @@ describe('SessionStore turns', () => {
         );
 
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([brokenPreset]));
-        const created = store.create('broken');
+        const created = await store.create('broken');
         setClock(2_000);
 
         const items: SessionStreamItem[] = [];
@@ -1088,8 +1088,8 @@ describe('SessionStore turns', () => {
     it('clears turns on reset and isolates sessions from each other', async () => {
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const first = store.create('single');
-        const second = store.create('single');
+        const first = await store.create('single');
+        const second = await store.create('single');
 
         setClock(2_000);
         await store.run(first.id, 'first task', async () => {});
@@ -1099,7 +1099,7 @@ describe('SessionStore turns', () => {
         expect(store.get(second.id).turns.map((turn) => turn.prompt)).toEqual(['second task']);
         expect(store.get(first.id).turns[0].id).not.toBe(store.get(second.id).turns[0].id);
 
-        const reset = store.reset(first.id);
+        const reset = await store.reset(first.id);
         expect(reset.turns).toEqual([]);
         expect(reset.status).toBe('idle');
         // A reset returns the seeded transcript and nothing else: ONE system message
@@ -1111,7 +1111,7 @@ describe('SessionStore turns', () => {
         expect(store.get(second.id).turns.map((turn) => turn.prompt)).toEqual(['second task']);
 
         // remove() deletes the record and its turns with it.
-        expect(store.remove(first.id)).toBe(true);
+        expect(await store.remove(first.id)).toBe(true);
         expect(() => store.get(first.id)).toThrow(SessionError);
         expect(store.list().map((session) => session.id)).toEqual([second.id]);
     });
@@ -1119,7 +1119,7 @@ describe('SessionStore turns', () => {
     it('returns copies, so a client cannot mutate the stored session', async () => {
         pinClock(2_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const created = store.create('single');
+        const created = await store.create('single');
 
         const items: SessionStreamItem[] = [];
         await store.run(created.id, 'original', async (item) => {
@@ -1234,11 +1234,11 @@ describe('SessionStore turns', () => {
         });
     });
 
-    it('reports unknown harnesses and sessions with the existing statuses', () => {
+    it('reports unknown harnesses and sessions with the existing statuses', async () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
 
-        expect(() => store.create('missing')).toThrow('Unknown harness "missing".');
-        expect(() => store.create('missing')).toThrow(SessionError);
+        await expect(store.create('missing')).rejects.toThrow('Unknown harness "missing".');
+        await expect(store.create('missing')).rejects.toThrow(SessionError);
         expect(() => store.get('missing')).toThrow('Unknown session "missing".');
     });
 });
@@ -1256,11 +1256,11 @@ describe('SessionStore and the harness registry', () => {
         };
     };
 
-    it('freezes the harness definition at creation', () => {
+    it('freezes the harness definition at creation', async () => {
         pinClock(1_000);
         const registry = createHarnessRegistry();
         const store = new SessionStore(DEFAULTS, registry);
-        const before = store.create('instruct');
+        const before = await store.create('instruct');
 
         expect(before.harnessDefinition?.title).toBe('Instruct');
         // A profile-built agent starts with exactly ONE system message: the identity
@@ -1285,7 +1285,7 @@ describe('SessionStore and the harness registry', () => {
         });
 
         // A new session resolves the patched entry and is built from it.
-        const after = store.create('instruct');
+        const after = await store.create('instruct');
         expect(after.harnessDefinition?.title).toBe('Edited');
         expect(after.harnessDefinition?.primary).toBe('workspace');
         expect(after.harnessDefinition?.agents).toEqual(['workspace']);
@@ -1326,7 +1326,7 @@ describe('SessionStore and the harness registry', () => {
         );
 
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([discovering]));
-        const created = store.create('discovering');
+        const created = await store.create('discovering');
 
         setClock(2_000);
         await store.run(created.id, 'first', async () => {});
@@ -1346,7 +1346,7 @@ describe('SessionStore and the harness registry', () => {
         expect(store.get(created.id).discoveredTools).toEqual(['reader']);
 
         // reset() clears the discovery record with the conversation.
-        store.reset(created.id);
+        await store.reset(created.id);
         expect(store.get(created.id).discoveredTools).toEqual([]);
         expect(store.get(created.id).turns).toEqual([]);
     });
@@ -1407,11 +1407,11 @@ describe('SessionStore agent model retargeting', () => {
         return { preset: { ...preset, agentModels: { ...overrides } }, requests };
     };
 
-    it('changes one agent in place, reporting the live map over the frozen definition', () => {
+    it('changes one agent in place, reporting the live map over the frozen definition', async () => {
         const setClock = pinClock(1_000);
         const { preset, requests } = modelProbePreset({ helper: 'small/fast' });
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         // Baseline: the override applies to `helper` only; the entry agent keeps
         // the session model. The definition carries exactly the preset's map.
@@ -1422,7 +1422,7 @@ describe('SessionStore agent model retargeting', () => {
         setClock(2_000);
 
         // Merge semantics: only the named agent changes (values are trimmed).
-        const patched = store.setAgentModels(created.id, { helper: '  big/model  ' });
+        const patched = await store.setAgentModels(created.id, { helper: '  big/model  ' });
 
         expect(patched.model).toBe('scripted/test');
         expect(patched.agentModels).toEqual({ lead: 'scripted/test', helper: 'big/model' });
@@ -1442,7 +1442,7 @@ describe('SessionStore agent model retargeting', () => {
 
         // Retargeting the ENTRY agent moves the snapshot's top-level model too,
         // because that field is derived from the live entry brain.
-        expect(store.setAgentModels(created.id, { lead: 'entry/model' }).model).toBe('entry/model');
+        expect((await store.setAgentModels(created.id, { lead: 'entry/model' })).model).toBe('entry/model');
 
         // Nothing was sent to a provider by a patch.
         expect(requests).toEqual([]);
@@ -1459,7 +1459,7 @@ describe('SessionStore agent model retargeting', () => {
         });
 
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('probe');
+        const created = await store.create('probe');
 
         setClock(2_000);
 
@@ -1475,7 +1475,7 @@ describe('SessionStore agent model retargeting', () => {
 
         // A busy session accepts the patch: no 409, no cancellation, and the run
         // keeps streaming (the turn list still has its in-flight turn).
-        const patched = store.setAgentModels(created.id, { lead: 'next/model' });
+        const patched = await store.setAgentModels(created.id, { lead: 'next/model' });
         expect(patched.status).toBe('running');
         expect(patched.turns.map((turn) => turn.status)).toEqual(['running']);
         expect(patched.model).toBe('next/model');
@@ -1528,45 +1528,45 @@ describe('SessionStore agent model retargeting', () => {
         ]);
     });
 
-    it('rejects every invalid patch atomically, leaving the live map untouched', () => {
+    it('rejects every invalid patch atomically, leaving the live map untouched', async () => {
         pinClock(1_000);
         const { preset } = modelProbePreset({ helper: 'small/fast' });
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
-        const created = store.create('probe');
+        const created = await store.create('probe');
         const before = { lead: 'scripted/test', helper: 'small/fast' };
 
         // The valid entry in this map must NOT be applied: validation runs over the
         // whole map before any brain is touched.
-        expect(() => store.setAgentModels(created.id, { lead: 'new/model', ghost: 'x' })).toThrow(
+        await expect(store.setAgentModels(created.id, { lead: 'new/model', ghost: 'x' })).rejects.toThrow(
             new SessionError(
                 400,
                 '`agentModels` names "ghost", which is not a member of this harness. Members: lead, helper.'
             )
         );
 
-        expect(() => store.setAgentModels(created.id, { helper: '' })).toThrow(
+        await expect(store.setAgentModels(created.id, { helper: '' })).rejects.toThrow(
             new SessionError(400, '`agentModels.helper` cannot be empty.')
         );
-        expect(() => store.setAgentModels(created.id, { helper: '   ' })).toThrow(
+        await expect(store.setAgentModels(created.id, { helper: '   ' })).rejects.toThrow(
             new SessionError(400, '`agentModels.helper` cannot be empty.')
         );
-        expect(() => store.setAgentModels(created.id, { helper: 7 })).toThrow(
+        await expect(store.setAgentModels(created.id, { helper: 7 })).rejects.toThrow(
             new SessionError(400, '`agentModels.helper` must be a model id string.')
         );
-        expect(() => store.setAgentModels(created.id, { helper: 'x'.repeat(201) })).toThrow(
+        await expect(store.setAgentModels(created.id, { helper: 'x'.repeat(201) })).rejects.toThrow(
             new SessionError(400, '`agentModels.helper` cannot exceed 200 characters.')
         );
-        expect(() => store.setAgentModels(created.id, ['lead'])).toThrow(
+        await expect(store.setAgentModels(created.id, ['lead'])).rejects.toThrow(
             new SessionError(400, '`agentModels` must be an object mapping agent ids to model ids.')
         );
-        expect(() => store.setAgentModels(created.id, null)).toThrow(
+        await expect(store.setAgentModels(created.id, null)).rejects.toThrow(
             new SessionError(400, '`agentModels` must be an object mapping agent ids to model ids.')
         );
         // An empty map would change nothing, so it is not a silent success.
-        expect(() => store.setAgentModels(created.id, {})).toThrow(
+        await expect(store.setAgentModels(created.id, {})).rejects.toThrow(
             new SessionError(400, 'A patch must change at least one agent model.')
         );
-        expect(() => store.setAgentModels('nope', { lead: 'x' })).toThrow(
+        await expect(store.setAgentModels('nope', { lead: 'x' })).rejects.toThrow(
             new SessionError(404, 'Unknown session "nope".')
         );
 
@@ -1613,8 +1613,8 @@ describe('SessionStore manual tool calls', () => {
 
     it('runs a core tool in that session and isolates its state', async () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const mine = store.create('single');
-        const other = store.create('single');
+        const mine = await store.create('single');
+        const other = await store.create('single');
 
         expect(await store.callTool(mine.id, 'task', { tasks: [{ text: '  only mine ' }] })).toEqual({
             tasks: [{ id: '1', text: 'only mine', completed: false }],
@@ -1638,7 +1638,7 @@ describe('SessionStore manual tool calls', () => {
 
     it('runs a searchable tool without the model discovery gate, then records discovery', async () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([toolPreset()]));
-        const session = store.create('toolbox');
+        const session = await store.create('toolbox');
 
         // Discovery gates the MODEL. An explicit operator call may run any
         // registered tool even before toolRequest enabled it.
@@ -1658,7 +1658,7 @@ describe('SessionStore manual tool calls', () => {
 
     it('maps unknown sessions and unavailable tools to 404 and keeps tool errors intact', async () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
-        const session = store.create('single');
+        const session = await store.create('single');
 
         await expect(store.callTool('missing', 'task', {})).rejects.toMatchObject({
             status: 404,
@@ -1711,7 +1711,7 @@ describe('SessionStore manual tool calls', () => {
     it('rejects chat, reset, and a second manual call while a manual call is pending', async () => {
         const gate = deferred();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([slowPreset(gate)]));
-        const session = store.create('slow');
+        const session = await store.create('slow');
 
         const pending = store.callTool(session.id, 'slowTool', {});
 
@@ -1725,8 +1725,8 @@ describe('SessionStore manual tool calls', () => {
         });
 
         // reset is synchronous, so both the type and the status matter.
-        expect(() => store.reset(session.id)).toThrow(SessionError);
-        expect(() => store.reset(session.id)).toThrow(
+        await expect(store.reset(session.id)).rejects.toThrow(SessionError);
+        await expect(store.reset(session.id)).rejects.toThrow(
             'Cancel the running task before resetting the session.'
         );
 
@@ -1737,7 +1737,7 @@ describe('SessionStore manual tool calls', () => {
 
         // Cancelling a manual call is not supported (no turn/controller); it does
         // not silently release the gate either.
-        expect(store.cancel(session.id)).toBe(false);
+        expect(await store.cancel(session.id)).toBe(false);
 
         gate.resolve();
         expect(await pending).toBe('slow result');
@@ -1751,7 +1751,7 @@ describe('SessionStore manual tool calls', () => {
     it('releases the gate after a manual call fails', async () => {
         const gate = deferred();
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([slowPreset(gate, true)]));
-        const session = store.create('slow');
+        const session = await store.create('slow');
 
         const pending = store.callTool(session.id, 'slowTool', {});
         // Attach the rejection handler before the deliberate delay below, so the
@@ -1795,7 +1795,7 @@ describe('SessionStore manual tool calls', () => {
         );
 
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([gated]));
-        const session = store.create('gated');
+        const session = await store.create('gated');
 
         const started = deferred();
         const running = store.run(session.id, 'first', async (item) => {

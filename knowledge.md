@@ -1732,7 +1732,9 @@ await writer('tell me about new year');
   call order. Tools are async promises in ONE Node process: there are no OS worker
   threads and no CPU isolation, so CPU-bound JavaScript blocks the event loop. (A
   server-hosted session may opt out per deployment with
-  `threadExecution: 'worker'`; see [Lane workers](#lane-workers-threadexecution-worker).)
+  `threadExecution: 'worker'`; see [Lane workers](#lane-workers-threadexecution-worker),
+  and `ioExecution: 'worker'` for that deployment's durability writes — see
+  [IO workers](#io-workers-ioexecution-worker).)
 - **The entry agent is explicit or first.** `primary` names it; without one, the
   first `agents` key wins, so a single-agent config needs nothing. An unknown name
   throws at construction.
@@ -3082,8 +3084,71 @@ The three load-bearing decisions:
   reference `src/harness.ts` builds at ~2415 and the core tool sources call), not the
   `harness.runtime` property. That is what makes the interception total: harness
   internals call `runtime.*` locally, so a slash command or a manual tool body running
-  on a lane is routed too. `delegate`, `search` and `fetch` stay local — their loop and
-  IO are the work isolation protects.
+  on a lane is routed too. `search` and `fetch` stay local — their provider and network
+  waits are the work isolation protects. `delegate` is classified local as well (the
+  key exists on the replica and nothing crosses for it), but a replica REPLACES it with
+  the nested-run refusal below, so the classification describes the routing, not a
+  promise that it runs.
+- **Nested conversation state is refused, not weakened silently (S7 + T14).** `delegate` and
+  `threadFork` each start a CHILD conversation, and adopting a thread by an EXISTING id
+  needs a core seam the authority does not have (it can mint an id, mirror a status, and
+  archive a result — `appendThreadMessages`/`setThreadStatus`/`archiveInvocation` — but
+  not adopt a whole thread). Running them lane-locally produced a real answer behind
+  phantom state: the archived child result reached the coordinator while the canonical
+  roster could not list the child and its transcript died with the lane. So
+  `lane-worker-loop.ts` `refuseNestedRuns()` closes FOUR kinds of door at hello:
+  1. it deletes the two registry entries (the run builds its declarations AND resolves a call
+     from `Object.values(tools)`, `src/harness.ts:1105`/`:2242`, and `threadFork`'s dispatch is
+     a core CONTROL path keyed on a definition marker the replica handle does not expose,
+     `src/harness.ts:2111-2120`);
+  2. it replaces `harness.runtime.delegate` (the route
+     `src/tools/runtime/delegate.tool.ts:120` calls) with a thrower;
+  3. T14/T15 — it ARMS the core nested-run policy (`replica.nestedRuns('refuse')`) on EVERY lane it
+     starts, whatever preset that lane rebuilt: the arm follows the execution mode, there is no
+     per-preset flag to read, and it runs before the capability report and before any frame is
+     serviced, so no tool body can be reached unarmed. Steps 1-2 close the doors that go through a
+     tool or a runtime route; they never reached the doors a tool BODY holds. T13 measured the gap:
+     the shipped `textSummarize` called `ctx.run(...)`, the child answered, and its transcript died
+     inside the lane, while `refuseNestedRuns` reported a clean removal. The policy is core state
+     (`src/core/nested-runs.ts` owns the code, the sentence and the validated arm), and T15 keeps it
+     enforced at the SURFACES rather than at a stack depth: `ToolContext.run` refuses at all three
+     construction sites (the model dispatch, `invokeRegisteredTool` and `executeToolInternal` — the
+     last two pass NO parent run, which is why a `runAgent` lineage check alone was not enough),
+     `runAgent` still refuses anything that reaches it with a parent or as a branch, `context.agents`
+     is a guarded view whose `turn()`/`stream()` throw at the READ, and a refusing instance hands the
+     body `toolHandleView()` instead of the raw handle — its callable, `sendThreadInput` and the
+     brains under `agents`/`subagents` throw WHENEVER they are reached, so a body that stores
+     `context.harness` and fires it from a callback after its own call settled is refused exactly
+     like a call inside the body, which a timing window (`toolBodiesRunning`) could never bind. That
+     window stays only as the backstop for a RAW handle a host-defined closure (no scanned source,
+     reported as `closure-definition`) captured in its own scope, and it skips a run that arrives
+     with a `threadState`, so a direct tool call running alongside the lane's own authorized turn can
+     never refuse that turn. Plain reads and the routed `harness.runtime` operations pass through the
+     view untouched, an inline harness still receives the strict-identical live handle, and a write
+     made through the view lands on the live replica (it is a guard, not a copy). Every door throws
+     the named `nested-run-unsupported` error BEFORE a thread record, a transcript append or a
+     provider request exists, and the read-back in `refuseNestedRuns` turns an absent seam (a stale
+     `dist/` worker bundle) into a hello `fault`: the handshake is rejected, and there is no inline
+     fallback.
+  The refusal is one formatter, so no surface can paraphrase it: `capability.ts` re-exports the
+  code and words the tool-name spelling (`NESTED_RUN_TOOL_NAMES`,
+  `NESTED_RUN_LIMITATION_CODE`, `nestedRunLimitationMessage`), `NESTED_RUN_ARMED_DOORS` (four doors:
+  `context.run`, the callable, `sendThreadInput`, a sibling brain run) +
+  `nestedRunHandshakeLimitations()` state the armed doors in the hello `limitations`, and a
+  per-BODY textual scan (`LANE_NESTED_RUN_DOORS`, `reachesNestedRunDoors`) reports a
+  runtime-refused door (`context.run`, `callTool('delegate')`) as a warning while REFUSING, before
+  it is installed, the revisions whose OWN source starts the child (`context.harness(...)` used as a
+  runner, `agents.<name>.turn()/stream()`) — not because the runtime is blind to them (T15 refuses
+  those very doors at the handle a refusing tool is handed) but because such a body has no
+  worker-safe path left, and installing it would promise the model a call that can only fail. The
+  scan states its own limit on the surface: it is textual, a computed member or an uncaptured helper
+  can miss it, and the armed core — not the pattern — is the guarantee for every spelling, named or
+  missed.
+  A shipped tool with a real local path takes it instead of failing: `textSummarize` reads
+  `context.nestedRuns` and condenses the notes on a lane (its documented no-summarizer
+  fallback), so worker mode neither loses a child nor bans the toolbox over one call. Cross-thread
+  work is NOT in that set: `threadSend`/`threadList` route to the authority and `threadRead` reads
+  through it, so the roster feature survives worker mode intact.
 - **A commit is applied through targeted core seams, never `restore()` per commit.**
   `restore()` rebuilds every created tool and thread agent and zeroes each thread's
   generation, i.e. it spends coordinator CPU and disturbs live handles. The four seams
@@ -3107,17 +3172,109 @@ Node-24 facts this subsystem paid for (all still true, don't re-derive them):
   cancellation is a FRAME (`interrupt`), never a signal copy;
 - the global `Worker` is undefined in this Node build; `node:worker_threads` is used.
 
+Two more contracts are enforced at the coordinator boundary, because both used to be
+claimed before anyone knew:
+
+- **A steer is answered by the worker, not by the post.** `lane-host.ts` `steer()` returns
+  `Promise<LaneSteerReceipt | undefined>`: `undefined` when no live lane owns the
+  conversation (the store then answers from the canonical harness, exactly as inline does
+  once a run ended), otherwise the worker's own `steer.result` receipt — `{queued: true}`,
+  or `{queued: false, reason}` naming the refusal. Waiters are a per-turn FIFO (the frame
+  pair carries no steer id, and a lane has one live turn), and a turn that ends, faults, or
+  a lane that dies settles every outstanding waiter `false`. `sessions.ts` `steerOnLane`
+  forwards THAT, so `steered: true` on `POST /sessions/:id/tasks` is now evidence the
+  guidance reached the running conversation, not evidence a frame was posted.
+- **The declared memory window follows the installed revision.** `sessions.ts`
+  `memoryKeysFor` scans with `workers` `toolScanTextOf` (the `moduleText` + captured
+  helpers, the field a `format: 'module'` registration actually fills — T10 finding M5) and
+  caches per session keyed on the sorted `name + revision` fingerprint of
+  `harness.toolSources()`, so `toolCreate`/`toolManage` refreshing a revision recomputes the
+  window instead of keeping the one captured at session build.
+
 Tests: `src/server/workers/lane-authority.test.ts` (19 in-process cases against a
 REAL harness — prefix refusal, one-writer lease, central archive with reassigned
 order, memory CAS, routed `task`/`threadSend`/`threadList`, lease disjointness,
-retired epochs answering nothing), `lane-worker.test.ts` (7 live-worker cases: two
+retired epochs answering nothing), `lane-worker.test.ts` (10 live-worker cases: two
 lanes busy simultaneously, an 800 ms burn while a sibling's event stream grows, a task
 written on one lane read back by a REBUILT lane, cross-thread send/roster from a lane,
 a cancel with events frozen, a terminated worker failing the turn with canonical
-transcripts frozen, and an unrebuildable preset refused at create), plus
+transcripts frozen, an unrebuildable preset refused at create, the nested-run removal
+against a REAL preset harness, and the steering receipt from both angles),
+`lane-worker-correctness.test.ts` (T11: eight turns of one conversation with the lane
+reclaimed between each, a message another lane sent while this one was idle, a
+cross-thread read answered from canonical state the lane never created, the
+`maxLaneWorkers` cap with the evicted lane still usable, and an in-flight turn settled
+by `host.close()`), plus
 `lane-commit`/`lane-identity`/`lane-memory`/`protocol`/`capability` for the
-primitives, and `config.test.ts`/`environment.test.ts`/`server.test.ts` for the
-runtime surface.
+primitives, `io-worker-bridge.test.ts` for the durability path, and
+`config.test.ts`/`environment.test.ts`/`server.test.ts` for the runtime surface.
+
+### IO workers: `ioExecution: 'worker'`
+
+The lane workers isolate a turn's CPU; the IO worker isolates **durability**. One
+thread per database root owns the write side of `harness/state.json` and
+`harness/sessions/<id>/events.jsonl`, so the whole-document stringify plus
+mkdir/open/write/fsync/rename no longer block the loop that serves every other session
+and every SSE stream. The flag is independent of `threadExecution`: a deployment may
+want either, both, or neither, and the default for both is `inline` (today's behavior).
+
+Layout (`src/server/workers/`, same subsystem barrel as the lane workers):
+
+| File | Owns |
+|---|---|
+| `io-protocol.ts` | the data-only frames (`checkpoint.save`, `journal.open/append/flush/rewrite/truncate/remove/close`, `hello`, `shutdown`), the three outcomes (`durable` / `written` / `superseded`), the flattened `{message, code, path, cause}` error report, and the callId source |
+| `io-client.ts` | the coordinator side: one FIFO queue per root, the handshake gate, strict-vs-queued semantics, checkpoint coalescing, `barrier`, `close`, the `resolveIoWorkerEntry` chain, and the numbered integration contract at the bottom of the file |
+| `io-worker.ts` | the spawned **entry**: source vs built layout, resolve hooks for extension-less `.ts` specifiers, and the explicit `startIoWorker()` call the bundler needs to keep the loop |
+| `io-worker-loop.ts` | the thread body: the operation table, the cached per-session `HarnessJournal` (the append fd lives HERE), the staging owner `<pid>.io<threadId>`, and the frame bound re-check on the true serialized length |
+
+Invariants, in priority order:
+
+- **ORDER.** Frames are posted in call order and answered one at a time (every
+  operation inside the thread is synchronous), so a journal append reaches the file
+  before the checkpoint that lists it, a reset's truncate precedes the document that
+  forgets those turns, and a `journal.flush` ordered ahead of a save fences the tail.
+  The rule `src/server/journal.ts` always relied on becomes structural.
+- **NO FALSE SUCCESS.** An awaited operation resolves only on the worker's own success
+  receipt and rejects with the exact message the inline writer throws, so a 500 body is
+  identical in both modes. A QUEUED operation never claims durability at all — it
+  claims order — and its failure goes to the same channels the inline
+  `journal.error` / `persistence.lastWriteError` feed. A coalesced-away checkpoint is
+  counted `superseded`, never reported as written.
+- **ONE WRITER.** The store still owns the state and builds every record. In worker mode
+  it must not write through a coordinator-side `HarnessJournal` for a session the client
+  owns (two append handles is two writers), so `attachJournal` creates a READER only and
+  the open/append/rewrite/truncate/remove/close calls are queued. Reads
+  (`persistence.load`, `journal.read`) stay on the coordinator by design.
+- **NO INLINE FALLBACK.** A missing entry, no `node:worker_threads`, a thread that dies,
+  or a protocol-version mismatch throws a named `HarnessIoError`, fails every
+  outstanding operation, and aborts startup. `startHarnessServer` awaits
+  `store.ioReady()` before `listen`, and `close()` awaits `store.drainIo()` so the
+  graceful document is on disk before the process may exit — with `summary.failures`
+  listing what is NOT known durable.
+- **TERMINAL FENCES (new, strictly stronger than inline).** A cancel / cancelThread /
+  turn-start / command-terminal commit maps to `io.commitCheckpoint({ document,
+  fenceSessions: [session.id] })`. Inline never fsynced at those sites, so worker mode
+  is an upgrade, not a parity claim.
+- **BOUNDED, NOT FREE.** The record build and the structured clone of each frame stay on
+  the main thread (the authority owns the state); a checkpoint is bounded by
+  `maxFrameBytes`, measured by the worker and fed back so the client's guard is O(1).
+
+`SessionStore` opens the client in its constructor when the resolved runtime says
+`ioExecution: 'worker'` (or when a host injects `options.io`), and the strict path is
+`await`ed through 17 `persistOrThrow` call sites — which is why `create`, `enqueue`,
+`reset`, `remove`, `cancel`, `cancelThread`, `deleteThread`, `updateThreadTranscript`,
+`setAgentModels`, `persistRegistry` and `mutateRegistry` are async on the public store
+surface, and why the dispatcher awaits them before building a response.
+
+Tests: `src/server/workers/io-protocol.test.ts` (frame validation and the outcome
+table), `io-client.test.ts` (a REAL spawned worker: ordering, barriers, error close,
+source-mode entry, and byte identity with the inline writer), `io-worker.test.ts` (the
+operation table in-process), `src/server/io-worker-bridge.test.ts` (the store and the
+standalone listener: readiness, off-loop strict writes, a failed commit that rolls back
+with the inline message, journal ordering + reload, reset/delete/dispose queueing,
+shutdown drain, and the built bundle round-trip), and
+`scripts/check-package-runtime.mjs` (the SHIPPED `dist/underload-harness.io-worker.mjs`
+handshakes, commits, journals and is re-read by the built server).
 
 ### Agents and the harness registry
 
@@ -3381,4 +3538,7 @@ concurrently (see “The loop”). There is no ordered side-effect guarantee, an
 library itself still has no thread/CPU isolation; a server deployment can now move
 each conversation onto its own worker thread (`threadExecution: 'worker'`, see
 [Lane workers](#lane-workers-threadexecution-worker)), which is documented there
-with the boundaries that stay refused.
+with the boundaries that stay refused. The same deployment can also move the
+whole-document checkpoint and the per-event journal off the request loop
+(`ioExecution: 'worker'`, see [IO workers](#io-workers-ioexecution-worker)); the
+library-level statements above are about the library, and neither flag changes them.

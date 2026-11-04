@@ -121,7 +121,7 @@ const callTool = async (
     return result.body as ToolCallResult;
 };
 
-const createSession = (runtime: HarnessRuntime): SessionSnapshot => runtime.store.create('replaceable');
+const createSession = async (runtime: HarnessRuntime): SessionSnapshot => await runtime.store.create('replaceable');
 
 describe('session-aware tool execution (R4)', () => {
     it('executes a replacement of a known catalogue tool in the named session', async () => {
@@ -131,7 +131,7 @@ describe('session-aware tool execution (R4)', () => {
 
         const captured: Harness[] = [];
         const runtime = createRuntime(captured);
-        const session = createSession(runtime);
+        const session = await createSession(runtime);
         const live = captured[0];
         if (live === undefined) throw new Error('expected the preset factory to expose its harness');
 
@@ -184,7 +184,7 @@ describe('session-aware tool execution (R4)', () => {
     it('executes a session-only name and keeps it unknown without a session', async () => {
         const captured: Harness[] = [];
         const runtime = createRuntime(captured);
-        const session = createSession(runtime);
+        const session = await createSession(runtime);
         const live = captured[0];
         if (live === undefined) throw new Error('expected the preset factory to expose its harness');
 
@@ -217,7 +217,7 @@ describe('session-aware tool execution (R4)', () => {
     it('reports a hostile thrown Proxy as a normal tool error, not an escaped catch', async () => {
         const captured: Harness[] = [];
         const runtime = createRuntime(captured);
-        const session = createSession(runtime);
+        const session = await createSession(runtime);
         const live = captured[0];
         if (live === undefined) throw new Error('expected the preset factory to expose its harness');
 
@@ -261,7 +261,7 @@ export const execute = () => {
     it('reports a static tool absent from the named session as a 404 instead of falling back', async () => {
         const captured: Harness[] = [];
         const runtime = createRuntime(captured);
-        const session = createSession(runtime);
+        const session = await createSession(runtime);
         const live = captured[0];
         if (live === undefined) throw new Error('expected the preset factory to expose its harness');
 

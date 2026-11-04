@@ -204,6 +204,9 @@ describe('startup', () => {
             writtenBytes: 0,
             lastCheckpointBytes: 0,
             lastCheckpointDurationMs: 0,
+            // Per-kind posting starts empty for the same reason `posted` is 0: `hello` is a
+            // control frame, so nothing has left this thread yet.
+            postedByKind: {},
             outstanding: 0
         });
     });

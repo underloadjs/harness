@@ -523,7 +523,7 @@ describe('background run — the turn stays open while tools are pending', () =>
         const setClock = pinClock(1_000);
         const fixture = createLifecycleFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create(NAME);
+        const created = await store.create(NAME);
 
         setClock(2_000);
 
@@ -533,7 +533,7 @@ describe('background run — the turn stays open while tools are pending', () =>
         });
         expect(watched.snapshot.turns).toEqual([]);
 
-        const first = store.enqueue(created.id, 'bg');
+        const first = await store.enqueue(created.id, 'bg');
 
         // 202-shaped acceptance: stable id/index, trimmed prompt, queued, no
         // startedAt before execution.
@@ -586,7 +586,7 @@ describe('background run — the turn stays open while tools are pending', () =>
 
         // A second task is accepted as backlog and does NOT start.
         setClock(3_000);
-        const second = store.enqueue(created.id, 'after');
+        const second = await store.enqueue(created.id, 'after');
         expect(second.turn).toEqual({
             id: second.turn.id,
             index: 1,
@@ -624,7 +624,7 @@ describe('background run — the turn stays open while tools are pending', () =>
         // Leave no parked run behind: stop-all aborts the active turn and drops the
         // backlog; the pending gates are never resolved (an unresolved promise keeps
         // no handle open).
-        store.cancel(created.id, { all: true });
+        await store.cancel(created.id, { all: true });
         await store.waitForIdle(created.id);
         expect(store.get(created.id).turns.map((turn) => turn.status)).toEqual([
             'cancelled',
@@ -640,7 +640,7 @@ describe('background run — the turn stays open while tools are pending', () =>
         const setClock = pinClock(1_000);
         const fixture = createLifecycleFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create(NAME);
+        const created = await store.create(NAME);
 
         setClock(2_000);
 
@@ -649,7 +649,7 @@ describe('background run — the turn stays open while tools are pending', () =>
             frames.push(item);
         });
 
-        const task = store.enqueue(created.id, 'heartbeat');
+        const task = await store.enqueue(created.id, 'heartbeat');
         const turnId = task.turn.id;
         const calls = probeCalls('heartbeat', ['call-h']);
 
@@ -748,7 +748,7 @@ describe('background run — completion order and queue advance', () => {
         const setClock = pinClock(1_000);
         const fixture = createLifecycleFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create(NAME);
+        const created = await store.create(NAME);
 
         setClock(2_000);
 
@@ -757,14 +757,14 @@ describe('background run — completion order and queue advance', () => {
             frames.push(item);
         });
 
-        const first = store.enqueue(created.id, 'bg');
+        const first = await store.enqueue(created.id, 'bg');
         const calls = probeCalls('bg', ['call-1', 'call-2']);
 
         await waitUntil(() => store.get(created.id).turns[0].events.length === 4);
 
         // A second task arrives while the background run is still open.
         setClock(3_000);
-        const second = store.enqueue(created.id, 'next');
+        const second = await store.enqueue(created.id, 'next');
         expect(store.get(created.id).queueDepth).toBe(1);
 
         // First of two completions: recorded, with the remaining call still pending.
@@ -895,10 +895,10 @@ describe('background run — cancellation', () => {
         const setClock = pinClock(1_000);
         const fixture = createLifecycleFixture();
         const store = createStore([fixture.preset]);
-        const created = store.create(NAME);
+        const created = await store.create(NAME);
 
         setClock(2_000);
-        const task = store.enqueue(created.id, 'bg-cancel');
+        const task = await store.enqueue(created.id, 'bg-cancel');
         const turnId = task.turn.id;
         const calls = probeCalls('bg-cancel', ['call-1', 'call-2']);
 
@@ -906,7 +906,7 @@ describe('background run — cancellation', () => {
 
         // Root cancel: the active turn only (the legacy default shape).
         setClock(3_000);
-        expect(store.cancel(created.id)).toBe(true);
+        expect(await store.cancel(created.id)).toBe(true);
         await waitUntil(() => store.get(created.id).turns[0].status === 'cancelled');
 
         expect(store.get(created.id).status).toBe('error');
@@ -937,7 +937,7 @@ describe('background run — cancellation', () => {
 
         // A safe subsequent task: the cancelled background turn released the gate.
         setClock(4_000);
-        const next = store.enqueue(created.id, 'after');
+        const next = await store.enqueue(created.id, 'after');
         expect(next.turn.status).toBe('queued');
         await waitUntil(() => store.get(created.id).turns[1]?.events.length === 2);
 
@@ -1013,11 +1013,11 @@ describe('background run — restart and restore', () => {
         const first = createRuntime(root, [fixture.preset]);
 
         try {
-            const created = first.store.create(NAME);
+            const created = await first.store.create(NAME);
             const id = created.id;
 
             setClock(2_000);
-            first.store.enqueue(id, 'bg-restore');
+            await first.store.enqueue(id, 'bg-restore');
 
             await waitUntil(() => first.store.get(id).turns[0].events.length === 4);
 
@@ -1028,7 +1028,7 @@ describe('background run — restart and restore', () => {
             await waitUntil(() => first.store.get(id).turns[0].events.length === 5);
 
             setClock(4_000);
-            first.store.enqueue(id, 'next');
+            await first.store.enqueue(id, 'next');
             expect(first.store.get(id).queueDepth).toBe(1);
 
             // Crash: a FRESH runtime over the SAME root while call-2 is still running.
@@ -1086,7 +1086,7 @@ describe('background run — restart and restore', () => {
                 // The preserved backlog still drains FIFO on the repaired harness, in
                 // order, after one new submit starts the pump.
                 setClock(5_000);
-                second.store.enqueue(id, 'tail');
+                await second.store.enqueue(id, 'tail');
                 await second.store.waitForIdle(id);
 
                 const drained = second.store.get(id);

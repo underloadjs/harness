@@ -199,7 +199,7 @@ const runTurn = async (store: SessionStore, id: string, input: string): Promise<
 describe('the compiled view is compact and carries no raw internals', () => {
     it('ships bounded rows, and never a step payload, an events array, or a transcript roster', async () => {
         const store = storeOf([toolRoundPreset()]);
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const turn = await runTurn(store, created.id, 'do the work');
 
         const view = store.getView(created.id);
@@ -245,7 +245,7 @@ describe('the compiled view is compact and carries no raw internals', () => {
 
     it('the rail document omits the node trees entirely', async () => {
         const store = storeOf([singlePreset()]);
-        const created = store.create('one');
+        const created = await store.create('one');
 
         await runTurn(store, created.id, 'first');
 
@@ -262,7 +262,7 @@ describe('the compiled view is compact and carries no raw internals', () => {
 describe('lazy step detail (R2)', () => {
     it('returns the exact recorded request AND response together, with indexes and times', async () => {
         const store = storeOf([toolRoundPreset()]);
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const turn = await runTurn(store, created.id, 'do the work');
 
         const display = store.getView(created.id).displays[turn.id];
@@ -296,7 +296,7 @@ describe('lazy step detail (R2)', () => {
 
     it('refuses an unknown turn, an unknown step, and a malformed step id', async () => {
         const store = storeOf([singlePreset()]);
-        const created = store.create('one');
+        const created = await store.create('one');
         const turn = await runTurn(store, created.id, 'answer me');
 
         expect(() => store.stepDetail(created.id, 'nope', '0')).toThrow(SessionError);
@@ -323,7 +323,7 @@ describe('lazy step detail (R2)', () => {
 
     it('the raw turn route answers with the verbatim record', async () => {
         const store = storeOf([toolRoundPreset()]);
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const turn = await runTurn(store, created.id, 'do the work');
 
         const raw = store.rawTurn(created.id, turn.id);
@@ -337,7 +337,7 @@ describe('lazy step detail (R2)', () => {
 describe('the observer stream (R3/R4)', () => {
     it('opens with a view, streams display ops, and hands each watcher its own copy', async () => {
         const store = storeOf([singlePreset()]);
-        const created = store.create('one');
+        const created = await store.create('one');
         const frames: unknown[] = [];
 
         const watched = store.watchView(
@@ -387,7 +387,7 @@ describe('restart reconstruction (R4)', () => {
     it('rebuilds identical compiled state and identical detail after a restart', async () => {
         const root = tempRoot('restart');
         const first = storeOf([toolRoundPreset()], root);
-        const created = first.create('worker');
+        const created = await first.create('worker');
 
         await runTurn(first, created.id, 'persist me');
 
@@ -421,7 +421,7 @@ describe('restart reconstruction (R4)', () => {
     it('loads a legacy database that has no journal at all', async () => {
         const root = tempRoot('legacy');
         const first = storeOf([singlePreset()], root);
-        const created = first.create('one');
+        const created = await first.create('one');
 
         await runTurn(first, created.id, 'old server wrote this');
 
@@ -444,7 +444,7 @@ describe('restart reconstruction (R4)', () => {
     it('keeps checkpoint records the journal never saw, and recovers a turn only the journal saw', async () => {
         const root = tempRoot('merge');
         const first = storeOf([singlePreset()], root);
-        const created = first.create('one');
+        const created = await first.create('one');
 
         await runTurn(first, created.id, 'checkpointed');
 
@@ -482,7 +482,7 @@ describe('restart reconstruction (R4)', () => {
     it('surfaces mid-file journal corruption instead of swallowing it', async () => {
         const root = tempRoot('corrupt');
         const first = storeOf([singlePreset()], root);
-        const created = first.create('one');
+        const created = await first.create('one');
 
         await runTurn(first, created.id, 'before corruption');
 
@@ -506,10 +506,10 @@ describe('restart reconstruction (R4)', () => {
     it('a reset cannot replay stale steps, and a delete cannot resurrect them', async () => {
         const root = tempRoot('stale');
         const first = storeOf([singlePreset()], root);
-        const created = first.create('one');
+        const created = await first.create('one');
 
         await runTurn(first, created.id, 'remember once');
-        first.reset(created.id);
+        await first.reset(created.id);
 
         const journalPath = journalFileOf(root, created.id);
 
@@ -523,7 +523,7 @@ describe('restart reconstruction (R4)', () => {
 
         // A thread deletion compacts the log to the SURVIVING turns only.
         const threaded = storeOf([singlePreset()], root);
-        const made = threaded.create('one');
+        const made = await threaded.create('one');
         const firstSubmit = await threaded.dispatch(made.id, 'thread one');
         const threadId = firstSubmit.turn.threadId as string;
 
@@ -535,7 +535,7 @@ describe('restart reconstruction (R4)', () => {
 
         expect(kept.turns).toHaveLength(2);
 
-        threaded.deleteThread(made.id, threadId);
+        await threaded.deleteThread(made.id, threadId);
 
         const afterDelete = threaded.getView(made.id);
 
@@ -556,12 +556,12 @@ describe('restart reconstruction (R4)', () => {
     it('removing a session deletes its durable footprint', async () => {
         const root = tempRoot('remove');
         const store = storeOf([singlePreset()], root);
-        const created = store.create('one');
+        const created = await store.create('one');
 
         await runTurn(store, created.id, 'gone soon');
 
         expect(fs.existsSync(journalFileOf(root, created.id))).toBe(true);
-        expect(store.remove(created.id)).toBe(true);
+        expect(await store.remove(created.id)).toBe(true);
         expect(fs.existsSync(path.dirname(journalFileOf(root, created.id)))).toBe(false);
     });
 });
@@ -736,7 +736,7 @@ describe('the /views routes (R3)', () => {
 
     it('counts every bar segment from the record while the view ships none of that text', async () => {
         const store = storeOf([toolRoundPreset()]);
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const turn = await runTurn(store, created.id, 'do the work');
 
         const view = store.getView(created.id);
@@ -785,7 +785,7 @@ describe('the /views routes (R3)', () => {
         const preset = { ...toolRoundPreset(), agentInstructions: { worker: 'An override the run may or may not use.' } };
         const store = storeOf([preset]);
         const api = apiOf(store);
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const turn = await runTurn(store, created.id, 'do the work');
         const record = store.get(created.id).turns[0];
         const argsIndex = record.events.findIndex((event) => event.type === 'tool_call');
@@ -857,7 +857,7 @@ describe('the context bar survives a restart with the counts it recorded', () =>
     it('rebuilds the identical bar, freezes a historical instruction snapshot, and never invents one for a legacy turn', async () => {
         const root = tempRoot('bar-restart');
         const before = storeOf([toolRoundPreset()], root);
-        const created = before.create('worker');
+        const created = await before.create('worker');
 
         await runTurn(before, created.id, 'do the work');
 
@@ -901,7 +901,7 @@ describe('the context bar survives a restart with the counts it recorded', () =>
         // segment — an honest absence rather than a count reconstructed from today.
         const legacyRoot = tempRoot('bar-legacy');
         const seeded = storeOf([toolRoundPreset()], legacyRoot);
-        const legacySession = seeded.create('worker');
+        const legacySession = await seeded.create('worker');
 
         await runTurn(seeded, legacySession.id, 'do the work');
 
@@ -950,7 +950,7 @@ describe('the context bar survives a restart with the counts it recorded', () =>
                 })
             )
         ]);
-        const created = store.create('thinker');
+        const created = await store.create('thinker');
         const turn = await runTurn(store, created.id, 'ponder this');
         const view = store.getView(created.id);
         const display = view.displays[turn.id];
@@ -998,7 +998,7 @@ describe('the context bar survives a restart with the counts it recorded', () =>
     it('streams bounded context ops to an observer, and a reset drops the recorded snapshots', async () => {
         const root = tempRoot('bar-ops');
         const store = storeOf([toolRoundPreset()], root);
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const frames: unknown[] = [];
 
         store.watchView(
@@ -1055,7 +1055,7 @@ describe('the context bar survives a restart with the counts it recorded', () =>
 
         // A reset ends the conversation, so the recorded snapshots go with it; the next
         // turn freezes whatever its agents run with then.
-        store.reset(created.id);
+        await store.reset(created.id);
 
         const after = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { sessions: Record<string, unknown>[] };
 
@@ -1072,7 +1072,7 @@ describe('the raw surface is unchanged', () => {
             defaults: { baseURL: SETTINGS.baseURL, model: SETTINGS.model, hasApiKey: true },
             registry: createHarnessRegistry([toolRoundPreset()])
         });
-        const created = store.create('worker');
+        const created = await store.create('worker');
         const items: SessionStreamItem[] = [];
 
         await store.run(created.id, 'raw still works', (item) => {
