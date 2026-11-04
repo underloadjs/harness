@@ -1289,7 +1289,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "glob",
     metadata: {
         name: "glob",
-        description: "Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default [\"**/*\"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file's path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { \"paths\": [\"src\"], \"patterns\": [\"**/*.ts\"] } returns \"src/a.ts\" and \"src/nested/b.ts\" - so the same root with \"src/*.ts\" matches nothing. `paths` (default [\".\"]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. The result is { files, truncated }, with `truncated` true only when the cap was reached and more matches exist. Skips .git and symlinks, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is not listed - while a root you name explicitly is walked even when an enclosing .gitignore ignores it. Results are capped (100 by default) across all roots. Does not search text.",
+        description: "Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default [\"**/*\"]) supports *, ?, **, [abc] classes and {a,b} alternatives; a pattern with no slash also matches file names at any depth, and a leading ! excludes (a list of only ! patterns means \"everything except\"). Patterns match each file's path RELATIVE TO THE ROOT that found it, never an absolute path, and results are prefixed with that root: { \"paths\": [\"src\"], \"patterns\": [\"**/*.ts\"] } returns \"src/a.ts\" and \"src/nested/b.ts\" - so the same root with \"src/*.ts\" matches nothing. `paths` (default [\".\"]) lists roots in order and accepts a FILE meaning \"just that file\"; overlapping roots and patterns are deduplicated by real file identity (a symlink or case-alias root is walked once), so a file is reported once under the first root that reached it. The result is { files, truncated, offset, limit, nextOffset, bytes, contentBudget, stopReason, partial, searched, excluded, patterns, note }: `truncated` is true only when a path that exists was withheld by the entry cap (maxResults, default 100, clamped to 1-1000) or the 64 KiB path-text budget, `limit` echoes the cap actually applied, and `nextOffset` resumes the same deterministic sequence when passed back as `offset`. Nothing is silently dropped: `excluded` counts what the walk did not yield (ignored files, pruned and unreadable directories, name-skipped directories, symlinks, .gitignore cap), `searched` counts what it did, and `note` explains what is worth acting on - so an empty `files` array can be told from a withheld one. Skips .git and symlinks, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is not listed - while a root you name explicitly is walked even when an enclosing .gitignore ignores it. Matching is case-sensitive on every platform, so \"*.TS\" does not match a.ts. Does not search text.",
         tags: [
             "files",
             "glob",
@@ -1305,18 +1305,23 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     items: {
                         type: "string"
                     },
-                    description: "Glob patterns, OR-ed together and matched against each file path relative to its root, e.g. [\"**/*.test.ts\"] or [\"*.md\", \"*.txt\"]. Defaults to [\"**/*\"]."
+                    description: "Glob patterns, OR-ed together and matched against each file path relative to its root, e.g. [\"**/*.test.ts\"] or [\"*.md\", \"*.txt\"] or [\"**/*.{ts,tsx}\"]; a leading ! excludes, e.g. [\"**/*\", \"!**/*.test.ts\"]. Defaults to [\"**/*\"]."
                 },
                 paths: {
                     type: "array",
                     items: {
                         type: "string"
                     },
-                    description: "Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. A root you name explicitly is walked even when a .gitignore above it ignores that directory. Defaults to [\".\"]."
+                    description: "Roots to walk, absolute or relative to the working directory, in the order they are visited. A directory is walked recursively; a FILE is listed on its own. Results are prefixed with the root that found them. A root you name explicitly is walked even when a .gitignore above it ignores that directory. Defaults to [\".\"]."
                 },
                 maxResults: {
                     type: "number",
-                    description: "Maximum files to return across all roots. Defaults to 100 and is clamped to 1-100."
+                    description: "Maximum files to return across all roots. Defaults to 100 and is clamped to 1-1000; the effective cap is echoed as `limit`."
+                },
+                offset: {
+                    type: "integer",
+                    minimum: 0,
+                    description: "0-based index into the deterministic result sequence. Defaults to 0; pass nextOffset from the previous page to read the rest of a truncated listing."
                 }
             },
             additionalProperties: false
@@ -1337,7 +1342,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "grep",
     metadata: {
         name: "grep",
-        description: "Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE without delimiters or flags, e.g. \"TODO|FIXME\"; invalid source is an error naming the parser message, never \"no matches\". `patterns` (default [\"**/*\"]) is the glob filter for which files to read - same matcher as glob: *, ?, **, and [abc] classes, a pattern with no slash also matches file names at any depth, and patterns are matched against each path RELATIVE TO THE ROOT that found it. `paths` (default [\".\"]) lists the roots to walk in order; overlapping roots and patterns are deduplicated by real file identity, so a file is searched once, under the first root that reached it. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number in the file, `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when the line was cut), and the whole result shares a 64 KiB aggregate budget reported as `bytes` / `contentBudget`. { \"matches\": [...], \"truncated\": boolean, \"bytes\": number, \"contentBudget\": number } - `truncated` is true only when the 100-match cap or the byte budget stopped the search, so a narrow rerun is the way to see the rest. Matching is time-bounded: a pattern that backtracks past the 30-second budget is stopped with an error rather than allowed to hang. Skips .git, symlinks, binary files, and files larger than 1 MiB, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is never opened - while a root you name explicitly is searched even when an enclosing .gitignore ignores it. Does not list file names (use glob for that).",
+        description: "Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE with no delimiters and no inline flags - pass flags in `flags` (flag letters, \"i\" for case-insensitive), because `(?i)foo` is a JavaScript \"Invalid group\"; invalid source is an error naming the parser message, never \"no matches\". `patterns` (default [\"**/*\"]) filters which files to read - same matcher as glob: *, ?, **, [abc] classes, {a,b} alternatives, a leading ! to exclude, a slashless pattern also matching file names at any depth, and paths matched RELATIVE TO THE ROOT that found them. `paths` (default [\".\"]) lists roots in order and accepts a FILE to search just that file; overlapping roots are deduplicated by real file identity, so each file is searched once under the first root that reached it. `output` picks the verdict: \"content\" (default) one entry per matching line, \"files\" one entry per matching file, \"count\" the exact number of matching lines per file - the last two answer a survey question in one call. `context` (0-10) adds `before`/`after` neighbour lines so a hit needs no follow-up read. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number and `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when it was cut). The result is { \"matches\": [...], \"truncated\": boolean, \"bytes\": number, \"contentBudget\": number } plus output, offset, limit, nextOffset, partial, stopReason, searched, skipped, excluded, patterns, note. `truncated` is true only when a result that exists was withheld by the cap (maxResults, default 100, clamped to 1-1000) or the 64 KiB budget, and `nextOffset` resumes the same deterministic sequence as `offset`; `partial` means the SCOPE was not fully covered; `stopReason` says which bound closed the window (\"resultCap\", \"contentBudget\", \"searchBudget\", \"complete\"). Nothing is silently dropped: `skipped` counts files not searched (over 1 MiB, binary, unreadable), `excluded` counts what the walk did not yield (ignored files, pruned and unreadable directories, symlinks, .gitignore cap), `searched` reports { inScope, scanned, roots }, and `note` explains what is worth acting on. Time is bounded twice and never confused: 30s of regex execution throws (only a pattern can exhaust it), 30s of wall clock returns a partial result with stopReason \"searchBudget\" (only a big tree can). Matching is per line - a pattern cannot span lines, so use `context` for neighbours. Skips .git, symlinks, binary files, and files larger than 1 MiB, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is never opened - while a root you name explicitly is searched even when an enclosing .gitignore ignores it. Does not list file names (use glob for that).",
         tags: [
             "files",
             "grep",
@@ -1352,25 +1357,49 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                 pattern: {
                     type: "string",
                     minLength: 1,
-                    description: "JavaScript regular-expression source to match inside each file, e.g. \"TODO|FIXME\". No delimiters and no flags."
+                    description: "JavaScript regular-expression source to match inside each file, e.g. \"TODO|FIXME\". No delimiters and no flags - pass flags with `flags` instead."
                 },
                 patterns: {
                     type: "array",
                     items: {
                         type: "string"
                     },
-                    description: "Glob patterns selecting which files to read, OR-ed together and matched against each file path relative to its root, e.g. [\"**/*.test.ts\"]. Defaults to [\"**/*\"]."
+                    description: "Glob patterns selecting which files to read, OR-ed together and matched against each file path relative to its root, e.g. [\"**/*.test.ts\"] or [\"**/*.{ts,tsx}\"]; a leading ! excludes, e.g. [\"**/*.ts\", \"!**/*.test.ts\"]. Defaults to [\"**/*\"]."
                 },
                 paths: {
                     type: "array",
                     items: {
                         type: "string"
                     },
-                    description: "Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. A root you name explicitly is searched even when a .gitignore above it ignores that directory. Defaults to [\".\"]."
+                    description: "Roots to walk, absolute or relative to the working directory, in the order they are visited. A directory is searched recursively; a FILE is searched on its own. Results are prefixed with the root that found them. A root you name explicitly is searched even when a .gitignore above it ignores that directory. Defaults to [\".\"]."
                 },
                 maxResults: {
                     type: "number",
-                    description: "Maximum matching lines to return across all roots. Defaults to 100 and is clamped to 1-100."
+                    description: "Maximum result units to return across all roots (matching lines in \"content\" mode, files in \"files\"/\"count\" mode). Defaults to 100 and is clamped to 1-1000."
+                },
+                offset: {
+                    type: "integer",
+                    minimum: 0,
+                    description: "0-based index into the result sequence. Defaults to 0; pass nextOffset from the previous page to read the rest of a truncated search."
+                },
+                flags: {
+                    type: "string",
+                    description: "JavaScript regular-expression flag letters, e.g. \"i\" for case-insensitive or \"m\" for multiline anchors. Defaults to \"\" (no flags); the source itself must not carry (?i)-style flags."
+                },
+                output: {
+                    type: "string",
+                    enum: [
+                        "content",
+                        "files",
+                        "count"
+                    ],
+                    description: "\"content\" returns one entry per matching line (default). \"files\" returns one entry per matching file and stops scanning each file at its first match. \"count\" returns the exact number of matching lines per file."
+                },
+                context: {
+                    type: "integer",
+                    minimum: 0,
+                    maximum: 10,
+                    description: "Lines of context to include before and after each hit (content mode only), so a match can be understood without a follow-up read. 0-10, default 0."
                 }
             },
             required: [

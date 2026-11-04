@@ -40,8 +40,11 @@ const FILE_LIST_DEFAULT_LIMIT = 200;
 
 // Mirrors FILE_GREP_CONTENT_BUDGET in ./files/grep.tool for the same reason: grep is
 // the content half of the old fileGlob, and its aggregate budget is part of the
-// result shape a model reads.
+// result shape a model reads. glob now publishes the same size budget for its path
+// text, so both are mirrored here rather than imported (importing would evaluate the
+// implementation module eagerly and break laziness.test.ts).
 const FILE_GREP_CONTENT_BUDGET = 64 * 1024;
+const FILE_GLOB_CONTENT_BUDGET = 64 * 1024;
 
 // Repo-root Temp/, so fixtures never land in OS temp.
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../Temp', import.meta.url));
@@ -264,14 +267,36 @@ describe('file tools', () => {
             { path: 'search-split/notes.md', content: 'nothing here\n' }
         ]);
 
-        // glob answers with PATHS ONLY, root-prefixed.
+        // glob answers with PATHS ONLY, root-prefixed. The result carries the paging
+        // window and the coverage counters beside the list, so `toEqual` on the whole
+        // object pins that the DEFAULT call reports a complete, un-truncated page.
         await expect(glob({ paths: ['search-split'], patterns: ['*.ts'] })).resolves.toEqual({
             files: ['search-split/a.ts'],
-            truncated: false
+            truncated: false,
+            offset: 0,
+            limit: 100,
+            nextOffset: null,
+            bytes: 'search-split/a.ts'.length,
+            contentBudget: FILE_GLOB_CONTENT_BUDGET,
+            stopReason: 'complete',
+            partial: false,
+            searched: { inScope: 3, roots: 1 },
+            excluded: {
+                ignoredFiles: 0,
+                prunedDirectories: 0,
+                skippedDirectories: 0,
+                unreadableDirectories: 0,
+                symlinks: 0,
+                ignoreFilesParsed: 0,
+                ignoreRulesTruncated: false
+            },
+            patterns: ['*.ts']
         });
 
-        // grep answers with LINES, in the same walk order, with the byte accounting.
+        // grep answers with LINES, in the same walk order, with the byte accounting and
+        // the same coverage fields.
         await expect(grep({ pattern: 'TODO', paths: ['search-split'] })).resolves.toEqual({
+            output: 'content',
             matches: [
                 {
                     path: 'search-split/a.ts',
@@ -289,8 +314,28 @@ describe('file tools', () => {
                 }
             ],
             truncated: false,
+            offset: 0,
+            limit: 100,
+            nextOffset: null,
             bytes: 21,
-            contentBudget: FILE_GREP_CONTENT_BUDGET
+            contentBudget: FILE_GREP_CONTENT_BUDGET,
+            partial: false,
+            stopReason: 'complete',
+            // All three files in scope were opened and scanned; only two matched. The
+            // gap between `inScope` and `matches.length` is the pattern filter, and the
+            // gap between `inScope` and `scanned` would be a skip policy.
+            searched: { inScope: 3, scanned: 3, roots: 1 },
+            skipped: { tooLarge: 0, binary: 0, unreadable: 0 },
+            excluded: {
+                ignoredFiles: 0,
+                prunedDirectories: 0,
+                skippedDirectories: 0,
+                unreadableDirectories: 0,
+                symlinks: 0,
+                ignoreFilesParsed: 0,
+                ignoreRulesTruncated: false
+            },
+            patterns: ['**/*']
         });
 
         // There is no mode rule left to remember: glob has no `content` property, and

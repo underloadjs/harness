@@ -249,10 +249,13 @@ describe('preset catalogue', () => {
         // Both entries declare SEVERAL properties, so the single-property rule does
         // NOT apply and `execute` receives the whole object.
         expect(PRESET_TOOLS.glob.tags).toEqual(['files', 'glob', 'find', 'paths', 'filesystem']);
+        // `offset` joins the list because a capped search is now resumable, the way read
+        // and fileList already were.
         expect(Object.keys(PRESET_TOOLS.glob.parameters.properties)).toEqual([
             'patterns',
             'paths',
-            'maxResults'
+            'maxResults',
+            'offset'
         ]);
         // Every glob argument is optional: the documented defaults are ["**/*"] and ["."].
         expect('required' in PRESET_TOOLS.glob.parameters).toBe(false);
@@ -260,8 +263,13 @@ describe('preset catalogue', () => {
 
         // The description IS the contract the model reads: one shape for glob, and no
         // leftover `content` property that would resurrect the old mode switch.
-        expect(PRESET_TOOLS.glob.description).toContain('{ files, truncated }');
+        expect(PRESET_TOOLS.glob.description).toContain('{ files, truncated,');
         expect(PRESET_TOOLS.glob.description).toContain('names only, never file contents');
+        // The honesty fields are part of the published contract, not an implementation
+        // detail: a caller reads them to tell "nothing matched" from "something was
+        // withheld".
+        expect(PRESET_TOOLS.glob.description).toContain('excluded');
+        expect(PRESET_TOOLS.glob.description).toContain('nextOffset');
         expect(PRESET_TOOLS.glob.parameters.properties).not.toHaveProperty('content');
 
         expect(PRESET_TOOLS.grep.tags).toEqual([
@@ -272,11 +280,17 @@ describe('preset catalogue', () => {
             'regex',
             'filesystem'
         ]);
+        // `offset` pages the result, `flags` carries what the source cannot, `output`
+        // picks the verdict, and `context` makes a hit readable without a second call.
         expect(Object.keys(PRESET_TOOLS.grep.parameters.properties)).toEqual([
             'pattern',
             'patterns',
             'paths',
-            'maxResults'
+            'maxResults',
+            'offset',
+            'flags',
+            'output',
+            'context'
         ]);
         // `pattern` is the one property with no default; omitting it is an error
         // rather than a search that matches everything.

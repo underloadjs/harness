@@ -51,9 +51,12 @@
 // directory, scandir '…/glob.ts'` for the single most natural mistake in a search tool
 // (naming a FILE as a root), and `ENOENT … scandir` for a typo. Both are things a model
 // does by accident, both are inside a tool family where read/edit accept files, and
-// neither string says what to type instead. `openRoot` therefore classifies the root
-// once per root and either handles the file case (search just that file) or throws a
-// HarnessError naming the fix.
+// neither string says what to type instead. `collectCandidates` therefore stats each root
+// once: a FILE root becomes one candidate (search just that file), and anything the stat
+// cannot open becomes a HarnessError from `rootErrorMessage` naming the path and the fix.
+// A root whose own `readdir` still fails — the case a stat can miss, e.g. a path that is
+// a file for `stat` but not for `readdir` on this platform — is caught by the same
+// function around the walk, so there is one error surface for roots, not two.
 //
 // COVERAGE COUNTERS (why "no matches" is now explainable)
 // ------------------------------------------------------
@@ -182,12 +185,9 @@ export const matchesPatterns = (set: PatternSet, relativePath: string): boolean 
     return false;
 };
 
-// Kept as the inclusion-only spelling of the same test, so a caller that has no
-// exclusions reads the same way it always did.
-export const matchesAnyPattern = (
-    compiled: readonly CompiledPattern[],
-    relativePath: string
-): boolean => matchesPatterns({ include: [...compiled], exclude: [], effective: [], negated: false }, relativePath);
+// `matchesAnyPattern` is gone: with exclusions in the picture, "matches ANY pattern"
+// is no longer the question the tools ask, and keeping the older name beside the newer
+// one invites a caller to use the version that ignores `!`.
 
 // A candidate file: its dedupe identity, the path shown to the caller, and the
 // absolute path used to read it.
@@ -218,8 +218,13 @@ export type SearchStats = {
     unreadableDirectories: number;
     // Symlinked entries never followed.
     symlinks: number;
-    // `.gitignore` files parsed across all roots.
-    ignoreFiles: number;
+    // `.gitignore` files actually parsed across all roots. This is the number the
+    // MAX_GITIGNORE_FILES cap bounds, so it is the one that explains a verdict: "the
+    // rules came from these many files", not "these many directories were looked at".
+    // Counted by the WALKER (which knows whether the file exists) rather than by the
+    // loader's dedupe set, so a directory whose file was already loaded still counts once
+    // and a directory with no file never counts.
+    ignoreFilesParsed: number;
     // True when a per-walk gitignore cap (MAX_GITIGNORE_FILES or MAX_GITIGNORE_BYTES)
     // dropped rules, so the ignore verdicts below are a subset of the repository's.
     ignoreRulesTruncated: boolean;
@@ -236,22 +241,15 @@ export const createSearchStats = (): SearchStats => ({
     skippedDirectories: 0,
     unreadableDirectories: 0,
     symlinks: 0,
-    ignoreFiles: 0,
+    ignoreFilesParsed: 0,
     ignoreRulesTruncated: false,
     roots: 0
 });
 
-// Classify one root and return the absolute path to walk, or throw a HarnessError
-// naming the fix. A root that IS a file is reported through `isFile` so the caller can
-// search that one file instead of failing.
-export type OpenedRoot = {
-    requested: string;
-    absolute: string;
-    isFile: boolean;
-};
-
-// The message for a root that is not a directory. Two shapes, because the two causes
-// have different fixes and one string would send the caller the wrong way.
+// The message for a root that is not a directory. The shapes differ by cause, because the
+// causes have different fixes and one shared string would send the caller the wrong way:
+// "does not exist" for a typo, "is not a directory" for a file passed where a directory
+// was meant, "permission denied" for a root the process cannot open.
 const rootErrorMessage = (tool: string, root: string, code: string, cwd: string): string => {
     if (code === 'ENOENT') {
         return (
@@ -299,9 +297,13 @@ export async function* collectCandidates(
     options: { tool?: string; stats?: SearchStats } = {}
 ): AsyncGenerator<SearchCandidate> {
     const tool = options.tool ?? 'search';
-    const set: PatternSet = Array.isArray(patterns)
-        ? { include: [...patterns], exclude: [], effective: [], negated: false }
-        : patterns;
+
+    // Discriminated on a property rather than on `Array.isArray`: the guard does not
+    // narrow a `readonly T[]` member of a union (a readonly array is not assignable to
+    // `any[]`), which would leave the union in scope and force a cast.
+    const set: PatternSet = 'include' in patterns
+        ? patterns
+        : { include: [...patterns], exclude: [], effective: [], negated: false };
 
     const seenFiles = new Set<string>();
     const seenRoots = new Set<string>();
@@ -415,13 +417,15 @@ export async function* collectCandidates(
                 options.stats.skippedDirectories += walkStats.skippedDirectories;
                 options.stats.unreadableDirectories += walkStats.unreadableDirectories;
                 options.stats.symlinks += walkStats.symlinks;
+                options.stats.ignoreFilesParsed += walkStats.ignoreFilesParsed;
             }
 
             if (options.stats) {
-                const ignoreStats = ignores.stats();
-                options.stats.ignoreFiles += ignoreStats.files;
+                // Only the truncation verdict comes from the matcher: `files` there counts
+                // registered BASES, which is the cap's own bookkeeping, not the number of
+                // files this walk read.
                 options.stats.ignoreRulesTruncated =
-                    options.stats.ignoreRulesTruncated || ignoreStats.truncated;
+                    options.stats.ignoreRulesTruncated || ignores.stats().truncated;
             }
         }
     }
@@ -490,6 +494,13 @@ export async function* mapConcurrent<T, R>(
             await fill();
         }
     } finally {
+        // Whatever is still queued was abandoned by the consumer, so its verdict is never
+        // read. Detaching the rejections keeps an abandoned read from becoming an
+        // unhandledRejection (which Node treats as a fatal error by default) after the
+        // search already finished.
+        for (const pending of inFlight) pending.catch(() => undefined);
+        inFlight.length = 0;
+
         // Abandoning the generator must abandon the walk too, or a capped search still
         // enumerates every directory it could reach.
         await source.return(undefined).catch(() => undefined);

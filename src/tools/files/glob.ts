@@ -49,6 +49,7 @@
 
 import { open, readdir, stat } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
+import { GITIGNORE_FILE_NAME } from './gitignore';
 import type { GitignoreMatcher } from './gitignore';
 
 // Directories that are never useful search results and would dominate a walk.
@@ -136,10 +137,14 @@ export const MAX_GLOB_ALTERNATIVES = 256;
 // alternative count visible to the caller (it is what `patterns` in the result echoes).
 //
 // Rules, chosen to match what a caller expects from a shell/ripgrep pattern:
-//   - `\{` and `\}` are literal, and a `}` inside `[...]` does not close a group;
-//   - a group with no top-level comma (`{dist}`) is left literal, as git does;
+//   - a `}` inside `[...]` does not close a group;
+//   - a group with no top-level comma (`{dist}`) is left literal, as git does — which is
+//     also how a file actually NAMED `{solo}.ts` stays reachable;
 //   - groups nest: `a{b,{c,d}}e` -> abe, ace, ade;
-//   - an unterminated `{` is literal, so a typo costs matches, never a throw.
+//   - an unterminated `{` is literal, so a typo costs matches, never a throw;
+//   - a backslash is a PATH SEPARATOR, never an escape. `globToRegExp` normalizes `\` to
+//     `/`, so treating it as an escape here would make `src\{a,b}` mean something
+//     different from `src/{a,b}` for no reason a caller could predict.
 export const expandBraces = (pattern: string): string[] => {
     const expand = (value: string, depth: number): string[] => {
         if (depth > 8) return [value];
@@ -152,11 +157,6 @@ export const expandBraces = (pattern: string): string[] => {
 
         for (let index = 0; index < value.length; index++) {
             const character = value[index];
-
-            if (character === '\\') {
-                index++;
-                continue;
-            }
 
             if (character === '[' && inClass === false) {
                 inClass = true;
@@ -196,12 +196,6 @@ export const expandBraces = (pattern: string): string[] => {
 
         for (let index = 0; index < body.length; index++) {
             const character = body[index];
-
-            if (character === '\\') {
-                current += character + (body[index + 1] ?? '');
-                index++;
-                continue;
-            }
 
             if (character === '[' && !classInside) {
                 classInside = true;
@@ -361,6 +355,11 @@ export type WalkStats = {
     unreadableDirectories: number;
     // Symlinked entries of any kind, which are never followed.
     symlinks: number;
+    // `.gitignore` files actually read and parsed. The walker knows from its own entry
+    // list whether the file exists, so this counts real parses rather than the hundreds of
+    // "no such file" probes a repo-wide walk used to make — and it is the number the
+    // loader's MAX_GITIGNORE_FILES cap bounds.
+    ignoreFilesParsed: number;
 };
 
 // A zeroed counter set. Exported so a caller does not have to know the fields.
@@ -369,7 +368,8 @@ export const createWalkStats = (): WalkStats => ({
     ignoredDirectories: 0,
     skippedDirectories: 0,
     unreadableDirectories: 0,
-    symlinks: 0
+    symlinks: 0,
+    ignoreFilesParsed: 0
 });
 
 // What a walk may be told to care about. Both options are optional by design: a bare
@@ -445,7 +445,21 @@ export async function* walkFiles(
         // Rules are picked up per directory that is actually listed. That is what keeps
         // "an ignored directory is never inspected" true, and it is also why a
         // .gitignore ABOVE the root never applies: it is simply never loaded.
-        if (ignores) await ignores.load(directory, relativeDirectory);
+        //
+        // The walker already has the entry list, so it says whether the file is there
+        // instead of letting the loader discover it with a failed `open`. On a repo-wide
+        // walk that is one avoided syscall per directory — hundreds to thousands of them
+        // for information that was already paid for — and it keeps the loader's
+        // MAX_GITIGNORE_FILES cap charging FILES PARSED rather than directories visited.
+        let ignoreFilePresent = false;
+
+        if (ignores) {
+            ignoreFilePresent = entries.some(
+                (entry) => entry.name === GITIGNORE_FILE_NAME && entry.isFile()
+            );
+            await ignores.load(directory, relativeDirectory, { present: ignoreFilePresent });
+            if (stats && ignoreFilePresent) stats.ignoreFilesParsed += 1;
+        }
 
         entries.sort((left, right) => compareNames(left.name, right.name));
 
@@ -567,21 +581,8 @@ export const errorCode = (error: unknown): string => {
     }
 };
 
-// Whether a file is small enough for grep to read. A stat
-// failure is treated as "skip" for the same reason unreadable directories are
-// skipped.
-//
-// Kept for callers that only need the size verdict; grep itself uses
-// `readSearchableFile`, which decides size and readability in one open.
-export const isSearchableFileSize = async (path: string): Promise<boolean> => {
-    try {
-        const info = await stat(path);
-        return info.size <= MAX_SEARCH_FILE_BYTES;
-    } catch {
-        return false;
-    }
-};
-
-// A NUL byte in the first chunk means the file is binary (the same heuristic git
-// uses). Reading it would only produce noise matches in a model's context.
-export const looksBinary = (content: string): boolean => content.includes('\u0000');
+// `isSearchableFileSize` and `looksBinary` are gone rather than kept "for callers": the
+// one open in `readSearchableFile` decides both, so a caller that asked either question
+// separately would be paying for a second syscall to learn something the read already
+// answered. Dead exports in a helper module are a second opinion nobody has to agree
+// with, and the second opinion here was the slower one.

@@ -1,7 +1,7 @@
 // gitignore — the walk-scoped `.gitignore` subset ./gitignore.ts commits to.
 //
 // What has to stay true, pin by pin (the documented subset is the header comment of
-// ./gitignore.ts lines 25-51; every expectation below is derived from it, and every
+// ./gitignore.ts "MATCHING RULES"; every expectation below is derived from it, and every
 // compiled RegExp source is hardcoded from that derivation):
 //
 //   - compilation: `* ? [abc] [!abc] **/ /** **` and `\x` behave as documented, an
@@ -19,7 +19,11 @@
 //   - the matcher's caps and tolerances: a missing/unreadable `.gitignore` (including a
 //     DIRECTORY named `.gitignore`) is not an error, one oversized file is parsed up to
 //     `MAX_GITIGNORE_BYTES`, and after `MAX_GITIGNORE_FILES` load attempts further files
-//     are skipped — all of it observable through `stats()`.
+//     are skipped — all of it observable through `stats()`;
+//   - the walker's `present` hint: a directory the walk already knows has no `.gitignore`
+//     costs no open and no cap budget, so `MAX_GITIGNORE_FILES` bounds FILES PARSED rather
+//     than directories visited (the distinction that let the cap rise, and the reason
+//     `stats()` reports `files` and `directories` separately).
 //
 // `isIgnored` takes POSIX root-relative paths, so no cwd is needed here (unlike
 // ./glob.test.ts and ./grep.test.ts): the fixture tree only feeds `load`, which takes an
@@ -29,16 +33,16 @@
 // TWO KNOWN DEVIATIONS, each pinned by the test named after it (both assertions follow
 // the documented contract above, not the current output):
 //
-//   1. 'keeps a single * inside one path segment' — gitignore.ts line 154 routes a SINGLE
-//      star run through the `**` branch and emits `.*`, so `src/*.ts` also matches
-//      `src/nested/a.ts`. gitignore(5), and this module's own header (line 34), scope `*`
-//      to one segment. Every other expectation here avoids a bare single `*` in its
-//      expected RegExp source, so the fix flips exactly one test.
+//   1. 'keeps a single * inside one path segment' — gitignore.ts `compileGitignorePattern`
+//      routes a SINGLE star run through the `**` branch and emits `.*`, so `src/*.ts` also
+//      matches `src/nested/a.ts`. gitignore(5), and this module's own "MATCHING RULES"
+//      header, scope `*` to one segment. Every other expectation here avoids a bare single
+//      `*` in its expected RegExp source, so the fix flips exactly one test.
 //   2. 'keeps matching usable when one line fills the whole byte bound' — a bound-cut file
 //      that leaves one ~256 KiB literal pattern makes V8 refuse to EXECUTE the compiled
-//      rule: `new RegExp` succeeds, and the first `rule.source.test(candidate)` throws
-//      `SyntaxError: Invalid regular expression: …: Regular expression too large`
-//      (gitignore.ts:351). ./glob.ts:237 calls `isIgnored` outside its only try/catch, so
+//      rule: `new RegExp` succeeds and the first `rule.source.test(candidate)` inside
+//      `isIgnored` throws `SyntaxError: Invalid regular expression: …: Regular expression
+//      too large`. ./glob.ts `walkFiles` calls `isIgnored` outside its only try/catch, so
 //      the whole walk fails instead of merely costing rules.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -124,7 +128,9 @@ describe('gitignore pattern compilation', () => {
         // quietly widen them.
         expect(GITIGNORE_FILE_NAME).toBe('.gitignore');
         expect(MAX_GITIGNORE_BYTES).toBe(262144);
-        expect(MAX_GITIGNORE_FILES).toBe(512);
+        // 2048, not the 512 that fired on a repository with more than 512 DIRECTORIES:
+        // the cap bounds real parses, and a repo-wide walk of this package makes seven.
+        expect(MAX_GITIGNORE_FILES).toBe(2048);
     });
 
     it('compiles the documented pattern set to the exact expected sources', () => {
@@ -186,7 +192,7 @@ describe('gitignore pattern compilation', () => {
 
     it('compiles ** as zero-or-more directories, /** as everything inside, and bare ** as anything', () => {
         const tmp = compileGitignorePattern('**/tmp');
-        // The `**/` branch consumes its own '/' (gitignore.ts lines 143-150) so a
+        // The `**/` branch consumes its own '/' (gitignore.ts `compileGitignorePattern`) so a
         // leading `**/` does not anchor; the result is the any-depth prefix twice.
         expect(tmp.anchored).toBe(false);
         expect(tmp.source.source).toBe('^(?:[^/]*\\/)*(?:[^/]*\\/)*tmp$');
@@ -228,11 +234,11 @@ describe('gitignore pattern compilation', () => {
     });
 
     it('keeps a single * inside one path segment', () => {
-        // DOCUMENTED CONTRACT (gitignore.ts line 34, and gitignore(5)): `*` is "any run
+        // DOCUMENTED CONTRACT (gitignore.ts "MATCHING RULES", and gitignore(5)): `*` is "any run
         // of characters inside ONE path segment". The expected source and verdicts below
         // follow that sentence, not the current output.
         //
-        // RED against gitignore.ts lines 139-156, where a single-star run falls into the
+        // RED against gitignore.ts `compileGitignorePattern`, where a single-star run falls into the
         // trailing-`**` branch and emits `.*`: the real source is `^src\/.*\.ts$`, which
         // matches `src/nested/a.ts`. git does not ignore that path for `src/*.ts`.
         const compiled = compileGitignorePattern('src/*.ts');
@@ -512,7 +518,7 @@ describe('gitignore parsing', () => {
 describe('gitignore matcher', () => {
     it('has no rules and no load attempts before anything is read', () => {
         const matcher = createGitignoreMatcher();
-        expect(matcher.stats()).toEqual({ files: 0, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 0, directories: 0, truncated: false });
         expect(matcher.isIgnored('dist/app.js', false)).toBe(false);
         expect(matcher.isIgnored('dist', true)).toBe(false);
     });
@@ -532,7 +538,7 @@ describe('gitignore matcher', () => {
         // Only a whole segment counts.
         expect(matcher.isIgnored('adist', true)).toBe(false);
         expect(matcher.isIgnored('packages/adist/x.js', false)).toBe(false);
-        expect(matcher.stats()).toEqual({ files: 1, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: false });
     });
 
     it('does not match the directory itself for a /** rule, only what is inside it', async () => {
@@ -599,7 +605,7 @@ describe('gitignore matcher', () => {
         // A base is not inside itself: the owning directory is judged by its PARENT's
         // rules, never by its own file.
         expect(matcher.isIgnored('src', true)).toBe(false);
-        expect(matcher.stats()).toEqual({ files: 1, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: false });
     });
 
     it('lets a deeper .gitignore have the final say in its own subtree', async () => {
@@ -618,7 +624,7 @@ describe('gitignore matcher', () => {
         expect(matcher.isIgnored('other/cache', true)).toBe(true);
         expect(matcher.isIgnored('other/cache/file.txt', false)).toBe(true);
         expect(matcher.isIgnored('cache', true)).toBe(true);
-        expect(matcher.stats()).toEqual({ files: 2, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 2, directories: 2, truncated: false });
     });
 
     it('never lets one subtree rule reach into a sibling subtree', async () => {
@@ -635,7 +641,7 @@ describe('gitignore matcher', () => {
         // The shared prefix `packages` is shorter than either base, so neither applies.
         expect(matcher.isIgnored('packages/x.tmp', false)).toBe(false);
         expect(matcher.isIgnored('packages/app', true)).toBe(false);
-        expect(matcher.stats()).toEqual({ files: 2, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 2, directories: 2, truncated: false });
     });
 
     it('treats a missing .gitignore as no rules and counts the base once', async () => {
@@ -648,7 +654,7 @@ describe('gitignore matcher', () => {
         // second attempt is counted.
         await matcher.load(caseDirectory, '');
 
-        expect(matcher.stats()).toEqual({ files: 1, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: false });
         expect(matcher.isIgnored('anything.ts', false)).toBe(false);
         expect(matcher.isIgnored('anything', true)).toBe(false);
     });
@@ -660,7 +666,7 @@ describe('gitignore matcher', () => {
         const matcher = createGitignoreMatcher();
         await expect(matcher.load(caseDirectory, '')).resolves.toBeUndefined();
 
-        expect(matcher.stats()).toEqual({ files: 1, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: false });
         expect(matcher.isIgnored('x', true)).toBe(false);
     });
 
@@ -676,7 +682,7 @@ describe('gitignore matcher', () => {
 
         const quiet = createGitignoreMatcher();
         await quiet.load(caseDirectory, '');
-        expect(quiet.stats()).toEqual({ files: 1, truncated: false });
+        expect(quiet.stats()).toEqual({ files: 1, directories: 1, truncated: false });
         expect(quiet.isIgnored('ignored-name', false)).toBe(false);
     });
 
@@ -691,7 +697,7 @@ describe('gitignore matcher', () => {
         await writeAt(join(nested, GITIGNORE_FILE_NAME), 'late.tmp\n');
         await matcher.load(nested, 'nested');
 
-        expect(matcher.stats()).toEqual({ files: 1, truncated: false });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: false });
         expect(matcher.isIgnored('nested/early.tmp', false)).toBe(true);
         expect(matcher.isIgnored('nested/late.tmp', false)).toBe(false);
     });
@@ -706,7 +712,7 @@ describe('gitignore matcher', () => {
 
         const matcher = await loadMatcher([['', oversized]]);
 
-        expect(matcher.stats()).toEqual({ files: 1, truncated: true });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: true });
         // The rules before the bound still apply, and the line after it is gone.
         expect(matcher.isIgnored('before', false)).toBe(true);
         expect(matcher.isIgnored('before/deep/x.ts', false)).toBe(true);
@@ -714,24 +720,25 @@ describe('gitignore matcher', () => {
     });
 
     it('keeps matching usable when one line fills the whole byte bound', async () => {
-        // DOCUMENTED CONTRACT (gitignore.ts lines 316-321): the byte bound is "a bound,
-        // not a rejection ... the rules that matter (they come first in practice) still
-        // apply". A file with no newline at all is the worst case the bound allows: the
-        // slice leaves ONE literal pattern of 262137 characters.
+        // DOCUMENTED CONTRACT (gitignore.ts `load`): the byte bound is "a bound, not a
+        // rejection ... the rules that matter (they come first in practice) still apply".
+        // A file with no newline at all is the worst case the bound allows: the slice
+        // leaves ONE literal pattern of 262137 characters.
         //
         // RED against the implementation: `new RegExp` accepts that pattern, but V8
-        // refuses to EXECUTE it, so the first `rule.source.test(candidate)` throws
-        // `SyntaxError: Invalid regular expression: …: Regular expression too large` at
-        // gitignore.ts:351 and every later `isIgnored` of the walk dies with it — the
-        // opposite of "costs rules, not the walk" (line 195). ./glob.ts:237 calls
-        // `isIgnored` outside its only try/catch, so the whole search fails. Expected
-        // below is the documented verdict, not the throw.
+        // refuses to EXECUTE it, so the first `rule.source.test(candidate)` inside
+        // `isIgnored` throws `SyntaxError: Invalid regular expression: …: Regular
+        // expression too large`, and every later verdict of the walk dies with it — the
+        // opposite of "costs rules, not the walk" (the MAX_GITIGNORE_LINE_CHARS note in
+        // ./gitignore.ts). ./glob.ts `walkFiles` calls `isIgnored` outside its only
+        // try/catch, so the whole search fails. Expected below is the documented verdict,
+        // not the throw.
         const singleLine = `before\n${'z'.repeat(MAX_GITIGNORE_BYTES + 1)}\nafter\n`;
 
         const matcher = await loadMatcher([['', singleLine]]);
 
         // The cap accounting is unaffected: the file was read and truncated as documented.
-        expect(matcher.stats()).toEqual({ files: 1, truncated: true });
+        expect(matcher.stats()).toEqual({ files: 1, directories: 1, truncated: true });
 
         // `isIgnored` has to ANSWER. The verdict is captured as a string so a throw shows
         // up as this short diff, instead of a 256 KiB pattern dumped into the report; V8
@@ -748,28 +755,79 @@ describe('gitignore matcher', () => {
         expect(verdictOf('after')).toBe('false');
     });
 
+    it('skips the read entirely when the walker says the file is absent', async () => {
+        // THE EFFICIENCY FIX. A repo-wide walk used to pay one failed `open` per
+        // directory for a file the walker had already seen was not there — hundreds of
+        // syscalls, and worse, each one consumed the MAX_GITIGNORE_FILES budget, so a
+        // tree with more than 512 DIRECTORIES reported `truncated: true` while parsing
+        // only a handful of real files. The cap bounds files parsed, and that is what it
+        // now bounds.
+        const caseDirectory = join(workdir, `case-${caseIndex++}`);
+        await mkdir(caseDirectory, { recursive: true });
+
+        const matcher = createGitignoreMatcher();
+
+        for (let index = 0; index < MAX_GITIGNORE_FILES + 5; index++) {
+            // `present: false` is what ./glob.ts passes from its own readdir entries.
+            await matcher.load(caseDirectory, `d${index}`, { present: false });
+        }
+
+        // cap + 5 directories CHECKED, zero files registered, and the cap never fired —
+        // the two counters say exactly that, which is the point of keeping both.
+        expect(matcher.stats()).toEqual({
+            files: 0,
+            directories: MAX_GITIGNORE_FILES + 5,
+            truncated: false
+        });
+        expect(matcher.isIgnored('anything', false)).toBe(false);
+
+        // A directory the walker says DOES have the file still goes through the cap.
+        await writeAt(join(caseDirectory, GITIGNORE_FILE_NAME), 'early.tmp\n');
+        await matcher.load(caseDirectory, 'real', { present: true });
+
+        // `directories` keeps the 2053 no-file checks and adds this one, while `files`
+        // counts only the real parse — the two numbers answering different questions.
+        expect(matcher.stats()).toEqual({
+            files: 1,
+            directories: MAX_GITIGNORE_FILES + 6,
+            truncated: false
+        });
+        expect(matcher.isIgnored('real/early.tmp', false)).toBe(true);
+    });
+
     it('stops loading after MAX_GITIGNORE_FILES attempts and flags truncation', async () => {
         const capRoot = join(workdir, `case-${caseIndex++}`);
         const matcher = createGitignoreMatcher();
 
-        // Only three of the 515 directories need to exist: a directory with no
-        // .gitignore is still a load attempt, which is what the cap counts.
+        // Only three of the directories need to exist: a load attempt registers its base
+        // whether or not the read succeeds, which is what the cap counts.
+        const last = MAX_GITIGNORE_FILES - 1;
+
         await writeAt(join(capRoot, 'd0', GITIGNORE_FILE_NAME), 'early\n');
-        await writeAt(join(capRoot, 'd511', GITIGNORE_FILE_NAME), 'last\n');
-        await writeAt(join(capRoot, 'd512', GITIGNORE_FILE_NAME), 'late\n');
+        await writeAt(join(capRoot, `d${last}`, GITIGNORE_FILE_NAME), 'last\n');
+        await writeAt(join(capRoot, `d${last + 1}`, GITIGNORE_FILE_NAME), 'late\n');
 
         for (let index = 0; index <= MAX_GITIGNORE_FILES + 2; index++) {
             await matcher.load(join(capRoot, `d${index}`), `d${index}`);
         }
 
-        // 515 attempts, 512 registered (d0..d511): d512 is the first load the cap drops.
-        expect(matcher.stats()).toEqual({ files: 512, truncated: true });
+        // cap + 3 attempts, `cap` registered (d0..d{cap-1}): the next is the first load
+        // the cap drops.
+        expect(matcher.stats()).toEqual({
+            files: MAX_GITIGNORE_FILES,
+            directories: MAX_GITIGNORE_FILES,
+            truncated: true
+        });
         expect(matcher.isIgnored('d0/early', false)).toBe(true);
-        expect(matcher.isIgnored('d511/last', false)).toBe(true);
-        expect(matcher.isIgnored('d512/late', false)).toBe(false);
+        expect(matcher.isIgnored(`d${last}/last`, false)).toBe(true);
+        expect(matcher.isIgnored(`d${last + 1}/late`, false)).toBe(false);
 
         // Re-loading a registered base is a no-op, not another truncation.
         await matcher.load(join(capRoot, 'd0'), 'd0');
-        expect(matcher.stats()).toEqual({ files: 512, truncated: true });
+        expect(matcher.stats()).toEqual({
+            files: MAX_GITIGNORE_FILES,
+            directories: MAX_GITIGNORE_FILES,
+            truncated: true
+        });
     });
 });

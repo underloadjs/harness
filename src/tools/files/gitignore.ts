@@ -72,10 +72,17 @@ export const GITIGNORE_FILE_NAME = '.gitignore';
 // is a few hundred bytes; the bound keeps a pathological file from costing a read.
 export const MAX_GITIGNORE_BYTES = 256 * 1024;
 
-// How many `.gitignore` files one walk parses. Deep monorepos with a file per package
-// stay far below this; the cap exists so a generated tree of copied packages cannot turn
-// the walk into an unbounded read storm.
-export const MAX_GITIGNORE_FILES = 512;
+// How many `.gitignore` files one walk parses. The cap exists so a generated tree of
+// copied packages cannot turn the walk into an unbounded read storm.
+//
+// It bounds FILES PARSED, not directories visited: the walker already knows from its own
+// `readdir` entries whether the file exists, so a directory without one costs no open and
+// no budget (./glob.ts). That distinction is why the number could go up. At 512 the cap
+// fired on this very repository — a repo-wide walk visits well over 512 directories and
+// reported `truncated: true` while parsing only seven real files, which made the honest
+// "some rules were dropped" warning into noise. 2048 real parses is still a storm bound
+// and is above what any hand-maintained tree reaches.
+export const MAX_GITIGNORE_FILES = 2048;
 
 // One ignore line longer than this is not a hand-written pattern — it is a minified
 // one-liner, a corrupted file, or a `cat` of some other format. The line is skipped,
@@ -307,14 +314,29 @@ export type GitignoreMatcher = {
     // `relativeDirectory` (posix, relative to the search root; '' for the root itself).
     // Called once per directory the walker actually lists, so an ignored directory's
     // own .gitignore is never read — the same consequence git's pruning has.
-    load: (absoluteDirectory: string, relativeDirectory: string) => Promise<void>;
+    //
+    // `options.present` is the walker's answer to "does this directory contain the
+    // file?", taken from the `readdir` entries it already has. Passing `false` skips the
+    // open entirely — a repo-wide walk used to pay one failed `open` per directory, which
+    // is hundreds of syscalls for information the walk had already paid for — and the
+    // directory is then counted as CHECKED without consuming the MAX_GITIGNORE_FILES
+    // budget, which bounds FILES PARSED, not directories visited. Omitting the option
+    // keeps the original behaviour (attempt the read, register the base) for callers that
+    // have no entry list.
+    load: (
+        absoluteDirectory: string,
+        relativeDirectory: string,
+        options?: { present?: boolean }
+    ) => Promise<void>;
     // Whether `relativePath` (posix, relative to the search root) is excluded.
     // `isDirectory` decides whether a "directory only" rule may match it.
     isIgnored: (relativePath: string, isDirectory: boolean) => boolean;
-    // How many .gitignore files have been parsed (capped by MAX_GITIGNORE_FILES), plus
-    // whether the cap was hit. Exposed so a test — and a future diagnostic — can tell a
-    // complete rule set from a truncated one instead of guessing.
-    stats: () => { files: number; truncated: boolean };
+    // `files` is how many `.gitignore` files were registered (capped by
+    // MAX_GITIGNORE_FILES); `directories` is how many were checked, including the ones
+    // with no file at all. `truncated` says whether either cap cut the rule set. Exposed
+    // so a test — and a future diagnostic — can tell a complete rule set from a truncated
+    // one instead of guessing.
+    stats: () => { files: number; directories: number; truncated: boolean };
 };
 
 // Create one matcher for one search root. Fresh per root on purpose: rules from one root
@@ -325,9 +347,25 @@ export const createGitignoreMatcher = (): GitignoreMatcher => {
     // "the innermost .gitignore has the final say".
     const rules: GitignoreRule[] = [];
     const loadedBases = new Set<string>();
+    let checkedDirectories = 0;
     let truncated = false;
 
-    const load = async (absoluteDirectory: string, relativeDirectory: string): Promise<void> => {
+    const load = async (
+        absoluteDirectory: string,
+        relativeDirectory: string,
+        options?: { present?: boolean }
+    ): Promise<void> => {
+        // The walker knows from its own `readdir` entries whether the file is there. When
+        // it says no, there is nothing to read and nothing to register — and the cap must
+        // not be charged, because it bounds parsed files, not visited directories.
+        if (options?.present === false) {
+            checkedDirectories += 1;
+            return;
+        }
+
+        // The same directory loaded twice (a caller that re-walks a base) already
+        // counted its check; counting again would make the number describe the calls
+        // rather than the tree.
         if (loadedBases.has(relativeDirectory)) return;
 
         if (loadedBases.size >= MAX_GITIGNORE_FILES) {
@@ -336,6 +374,7 @@ export const createGitignoreMatcher = (): GitignoreMatcher => {
         }
 
         loadedBases.add(relativeDirectory);
+        checkedDirectories += 1;
 
         // Read as a Buffer so the bound is measured in BYTES: a UTF-16 `string.slice`
         // would cut a different (larger) amount of file whenever the ignore text carries
@@ -401,6 +440,6 @@ export const createGitignoreMatcher = (): GitignoreMatcher => {
     return {
         load,
         isIgnored,
-        stats: () => ({ files: loadedBases.size, truncated })
+        stats: () => ({ files: loadedBases.size, directories: checkedDirectories, truncated })
     };
 };
