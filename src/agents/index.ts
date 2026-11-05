@@ -105,14 +105,35 @@ export const isAgentProfileName = (name: string): name is AgentProfileName =>
 //
 // T3 EDITABLE CONFIGURATION — `instructionOverride` is the harness-level
 // per-agent instruction the operator saved (`HarnessPreset.agentInstructions`,
-// see ../server/harnesses/types.ts). It replaces ONLY the identity sentence:
-// `guidelines` stay trusted catalogue policy lines, so a saved configuration can
-// retune an agent's role without letting a stored document silently drop the
-// shared behavioural rules. An absent or blank override is "no override", which
-// keeps the trusted text byte-identical — the shipped profiles remain the default.
+// see ../server/harnesses/types.ts).
+//
+// T6 CONTRACT CHANGE — AN OVERRIDE IS THE COMPLETE PROMPT
+// -------------------------------------------------------
+// A non-blank `instructionOverride` is returned VERBATIM (trimmed): the profile's
+// `guidelines` are NOT appended below it. The editor that produces this text is one
+// box holding the FULL effective instruction — identity plus the guidelines the
+// profile ships — so the stored document already contains every line the agent is
+// meant to read. Appending `profile.guidelines` on top of it would duplicate them
+// (and make an edited guideline read two ways). Guidelines are therefore a DEFAULT
+// for an un-overridden profile, not policy that survives an override.
+//
+// Consequence to keep in mind for stored data: a harness that saved only an identity
+// sentence under the old rule now runs that sentence alone. Deleting and re-saving
+// the text from the full-prompt box is what restores the guidelines, and `null` (no
+// override at all) still falls back to the complete trusted prompt.
+//
+// An absent (`undefined`) or blank override means "no override": the trusted profile
+// text is composed exactly as before and stays byte-identical, so the shipped
+// profiles remain the default.
 export const agentInstruction = (profile: AgentProfile, instructionOverride?: string): string => {
     const custom = instructionOverride === undefined ? '' : instructionOverride.trim();
-    const instruction = custom.length > 0 ? custom : profile.instruction.trim();
+
+    // An explicit override wins outright and is the whole prompt: no guideline block,
+    // no appended header. Trimming only removes the editor's surrounding whitespace —
+    // the operator's own line breaks and paragraphs are preserved verbatim.
+    if (custom.length > 0) return custom;
+
+    const instruction = profile.instruction.trim();
 
     // A blank bullet would render as a stray "- " inside the joined prompt, so an
     // empty guideline never survives into the block.

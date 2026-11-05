@@ -257,9 +257,10 @@ export const providerOf = (settings: RunnerSettings) => ({
 //
 // `instruction` is the optional per-agent instruction override (T3 editable
 // configuration). It is already-validated harness text (never raw request text
-// here), and `agentInstruction` applies it to the identity sentence only, so the
-// profile's guidelines stay in force. Absent/blank means "the trusted profile",
-// which is why an untouched harness produces byte-identical system messages.
+// here), and since T6 `agentInstruction` treats it as the agent's COMPLETE prompt:
+// the profile's guidelines are the default for an un-overridden member and are never
+// appended below an override. Absent/blank means "the trusted profile", which is why
+// an untouched harness produces byte-identical system messages.
 //
 // T27: the CONFIGURATION form is split out because a host that adds a member to an
 // ALREADY-BUILT harness (`harness.addAgent`, the server's session agent-binding route)
@@ -310,8 +311,9 @@ export const agentConfigurationFromProfile = (
         name,
         model: override.length > 0 ? override : settings.model,
         // The per-HARNESS override wins over the global one (a harness-level choice is the
-        // more specific decision); the profile's guidelines — global override or shipped —
-        // are always composed below the identity sentence.
+        // more specific decision), and since T6 it wins outright: a stored override IS the
+        // whole prompt, while a member the map omits runs the effective profile's identity
+        // sentence composed with its guidelines (global override or shipped).
         instruction: agentInstruction(profile, instruction),
         provider: providerOf(settings),
         ...(swatch.length === 0 ? {} : { color: swatch })

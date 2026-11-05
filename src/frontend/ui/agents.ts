@@ -1,9 +1,9 @@
 // The harness agent row: one tile per configured agent, a trailing add tile and
-// the trusted preset picker.
+// the trusted agent picker.
 //
 // Product rules this component encodes (R2):
 //   - the row replaces the old description wall; each tile shows exactly ONE
-//     human-readable name (the preset title, e.g. "Summarizer") instead of a
+//     human-readable name (the display title, e.g. "Summarizer") instead of a
 //     duplicated slug + title pair, and no role badge. Role is conveyed by the
 //     name colour (primary green, secondary neutral, styles.css) plus the
 //     `aria-pressed` state below, so the control stays compact;
@@ -26,9 +26,10 @@
 //     new `primary` so a demotion cannot leave a stale duplicate behind. A hidden
 //     card's promotion button is out of the tab order and covered by the deck, so
 //     promoting is deliberately two steps: front the card, then press its name;
-//   - the trailing `+` opens a picker of agents the SERVER advertises. Harness
-//     creation here means choosing existing presets, never typing instructions:
-//     the instruction and guidelines are shown read-only;
+//   - the trailing `+` opens a picker of agents the SERVER advertises. Adding from the
+//     row means choosing an existing agent: its default instruction is shown read-only
+//     here as a preview, and the shared agent dialog (ui/agent-dialog.ts) is where the
+//     instruction itself is edited (R4/R5);
 //   - a member already in the team is visibly disabled in the picker, so a
 //     duplicate cannot be added;
 //   - removing a member is offered on every tile except the last one;
@@ -69,7 +70,7 @@ export type AgentRowOptions = {
     // Member names in display order; the primary is also present in this list.
     members: readonly string[];
     primary: string;
-    // Trusted preset library from GET /agents (or the boot fallback).
+    // Trusted agent library from GET /agents (or the boot fallback).
     agents: readonly AgentDescriptor[];
     // False while a run is in flight or while a saved session's frozen team is on
     // screen. The reason is conveyed by the disabled controls only: R7 removed the
@@ -150,7 +151,7 @@ const el = <K extends keyof HTMLElementTagNameMap>(
 // Unique ids for `aria-controls`; a module counter is enough for one document.
 let nextId = 0;
 
-// Resolve preset metadata for a name. A descriptor can name an agent the picker
+// Resolve agent metadata for a name. A descriptor can name an agent the picker
 // does not know (an old saved session); the tile still renders instead of
 // disappearing. The fallback title is a neutral word, NOT the slug: R3 keeps every
 // raw agent id out of visible text, and `data-agent` still carries the id.
@@ -164,26 +165,53 @@ export const agentDetailsOf = (
     agents.find((agent) => agent.name === name) ?? {
         name,
         title: 'Agent',
-        description: 'No preset details are available for this agent.',
+        description: 'No details are available for this agent.',
         instruction: '',
         guidelines: []
     };
 
-// The ONE visible label used by the preset picker: the server's display title.
+// The instruction an agent runs when NOTHING has been saved for it: the default
+// composition the server itself sends (../agents/index.ts `agentInstruction`), which
+// is the identity sentence plus one `Guidelines:` block of `- ` bullets in profile
+// order, separated by a blank line. An agent with no guidelines is that sentence
+// alone, and an agent the catalogue no longer advertises is the empty string.
+//
+// R4/R5: the shared agent dialog seeds its ONE editable instruction box with this, so
+// the reader always edits the full prompt the agent actually runs — never a stripped
+// "identity only" view that silently drops the shipped rules. It is a DEFAULT, not a
+// locked reference: saving what the reader typed replaces it for that scope.
+export const agentDefaultInstructionOf = (agent: AgentDescriptor | undefined): string => {
+    // Blank bullets would render as stray `- ` lines inside the joined prompt, so an
+    // empty guideline never survives — exactly the server's rule.
+    const identity = (agent?.instruction ?? '').trim();
+    const guidelines = (agent?.guidelines ?? [])
+        .map((guideline) => guideline.trim())
+        .filter((guideline) => guideline.length > 0);
+
+    if (guidelines.length === 0) return identity;
+
+    return `${identity}\n\nGuidelines:\n${guidelines.map((line) => `- ${line}`).join('\n')}`;
+};
+
+// The ONE visible label used by the agent picker: the server's display title.
 // R3: the slug is an internal id, so a descriptor without a title (never one of the
 // built-in profiles) falls back to a neutral word instead of exposing the id.
 export const displayTitleOf = (agent: AgentDescriptor): string =>
     agent.title.trim().length > 0 ? agent.title : 'Agent';
 
-// Read-only preset instructions (details/summary + instruction + guidelines).
+// Read-only agent instruction reference (details/summary + instruction + guidelines).
 //
-// `summary` defaults to the deck picker's historical wording; the agent dialog
-// passes the agent's display title so a collapsed entry is identifiable in a list
-// of many presets. Keeping ONE builder means the dialog cannot drift from the
-// picker's markup/classes, and `styles.css` already paints `.agent-detail*`.
+// R4: this is INFORMATIONAL only — what the server advertises for this agent — and it
+// is no longer rendered inside the agent dialog (which now has ONE editable box holding
+// the full effective instruction). It stays here because the deck's pre-add picker uses
+// it to answer "what would this agent do?" before anyone commits to adding it.
+//
+// `summary` defaults to the picker's neutral wording; a caller passes its own label so
+// a collapsed entry is identifiable in a list of many agents. Keeping ONE builder means
+// the picker markup/classes cannot drift, and `styles.css` already paints `.agent-detail*`.
 export const createAgentPresetDetail = (
     agent: AgentDescriptor,
-    summary = 'preset details'
+    summary = 'default instruction'
 ): HTMLElement => {
     const detail = el('details', 'agent-detail');
     detail.append(el('summary', 'agent-detail-summary', summary));
@@ -195,7 +223,7 @@ export const createAgentPresetDetail = (
             'agent-instruction',
             agent.instruction.length > 0
                 ? agent.instruction
-                : 'This server does not advertise an instruction for this agent.'
+                : 'This server does not advertise a default instruction for this agent.'
         )
     );
 
@@ -361,12 +389,12 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     picker.hidden = true;
     // A disclosure, not a modal: the rest of the page stays operable.
     picker.setAttribute('role', 'group');
-    picker.setAttribute('aria-label', 'Add an agent from the server presets');
+    picker.setAttribute('aria-label', 'Add an existing agent');
     picker.append(
         el(
             'p',
             'agent-picker-hint',
-            'Choose an existing preset agent. Instructions and guidelines are read-only; they come from the server.'
+            'Choose an existing agent. You can edit its instruction after adding.'
         )
     );
 
@@ -390,7 +418,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         setPickerOpen(picker.hidden === true);
     });
 
-    // One button per server preset. Already-added agents stay visible (so the
+    // One button per advertised agent. Already-added agents stay visible (so the
     // team is understandable) but cannot be added twice.
     for (const agent of options.agents) {
         const member = options.members.includes(agent.name);
@@ -401,7 +429,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         const choose = el('button', 'agent-option-add');
         choose.type = 'button';
         choose.disabled = !options.editable || member;
-        // R3/R5: ONE visible line per preset — the server's single-word display
+        // R3/R5: ONE visible line per agent — the server's single-word display
         // title. The slug (`agent.name`) is an INTERNAL id: it stays on the option's
         // `data-agent` for the add callback/tests but is never rendered. A descriptor
         // with no title (the built-in profiles always send one) falls back to a
@@ -422,7 +450,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     }
 
     if (options.agents.length === 0) {
-        picker.append(el('p', 'agent-picker-hint', 'The server did not advertise any agent presets.'));
+        picker.append(el('p', 'agent-picker-hint', 'The server did not advertise any agents.'));
     }
 
     // Member tiles. The whole card is not a button (a remove control and a model
@@ -553,7 +581,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         main.type = 'button';
         main.disabled = !options.editable;
         main.setAttribute('aria-pressed', isPrimary ? 'true' : 'false');
-        // Exactly one human-readable name (the preset title). The slug is kept in
+        // Exactly one human-readable name (the display title). The slug is kept in
         // `data-agent` for the callbacks and tests but is never displayed, so a
         // tile reads "Summarizer", not "summarizer" + "Summarizer". An unknown
         // descriptor (see agentDetailsOf) or an empty title reads a neutral word (R3).
