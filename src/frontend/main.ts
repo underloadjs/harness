@@ -112,7 +112,11 @@ import type { DisplayStep, TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlock
 // The pending-tool figure a cold display tree states per section (./view-api.ts
 // `readTurnDisplayWithPending`), seeded into the store as the `pending:set` ops it
 // would have arrived as on a live connection.
-import type { HarnessInstructionSummaryEntry, HarnessPendingTool, TaskReceipt, ToolDetail } from '../shared/harness-api';
+// `AgentProfile` is the payload of the identified catalogue read (see
+// `loadAgentPresetTexts`): the ONLY response that states an agent's preset
+// instruction text, because `GET /agents` rows are text-free summaries
+// (../shared/harness-api.ts:552-563).
+import type { AgentProfile, HarnessInstructionSummaryEntry, HarnessPendingTool, TaskReceipt, ToolDetail } from '../shared/harness-api';
 // The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
 // and every submit below speaks `/views`, so no round trip on this path can carry a
 // recorded event. The raw client (./api.ts) stays imported for the catalogue routes
@@ -212,6 +216,11 @@ import {
     // T32: the one member's effective instruction text, asked for only when the definition's
     // summary says THIS harness supplies that prompt (./api.ts:689).
     getHarnessInstructionText,
+    // The identified profile read: the only response that carries an agent's PRESET
+    // instruction text and its guideline rules (./api.ts:701). Asked for when the
+    // configuration dialog needs that text, exactly as `getTool` is asked for when a
+    // tool is opened (T50).
+    getAgent,
     updateSession,
     // T50: the identified catalogue read (argument schema + execution scope) and the row
     // mapper it shares with the page. A `ToolSummary` row has no schema; this is the read
@@ -6037,6 +6046,10 @@ const agentDialogOptionsOf = (view: AgentView, instance: Instance) => ({
     editable: view.editable,
     models: agentModelSelectOf(view),
     instructions: view.instructions,
+    // A selection that moves onto an agent the dialog-open walk never covered (a `[+]`
+    // addition) asks for its trusted preset text on that explicit action. A no-op once
+    // the row has text, so re-painting the same tab sends nothing.
+    onRequestPreset: (agent: string) => loadAgentPresetTexts(instance, [agent]),
     activity: [...instance.activity],
     ...(view.hint === undefined ? {} : { hint: view.hint }),
     // T3: the one write path. The dialog never PATCHes on select or on edit.
@@ -6086,6 +6099,13 @@ const agentDialogSignatureOf = (view: AgentView): string =>
 // conversation's configuration.
 const loadHarnessConfiguration = (instance: Instance): void => {
     const name = instance.descriptor.name;
+
+    // The preset instruction text is asked for alongside the definition read, from the
+    // member list already in hand (the FROZEN definition for a saved conversation, so
+    // the tabs on screen are the ones filled). It is a separate read because the two
+    // answers are different facts: this one states what each member runs when the
+    // harness does NOT override it. See `loadAgentPresetTexts`.
+    loadAgentPresetTexts(instance, membersOf(instance.frozen ?? instance.descriptor));
 
     void getHarness(name)
         .then(async (fetched) => {
@@ -6163,6 +6183,88 @@ const overriddenInstructionsOf = async (
     );
 
     return Object.fromEntries(entries.filter((entry): entry is [string, string] => entry !== undefined));
+};
+
+// ---------------------------------------------------------------------------
+// The trusted PRESET instruction text (the T11/T32 companion read)
+// ---------------------------------------------------------------------------
+//
+// The dialog seeds an agent that has no harness override from its trusted preset text,
+// and states that same text as the reference an override is compared against
+// (./ui/agent-dialog.ts `baselineInstructionOf`, `createAgentPresetDetail`). Two reads
+// look like they could supply it and neither does:
+//
+//   - `GET /agents` (the boot page the library is built from) answers SUMMARIES with no
+//     prompt at all, and `agentRowOf` maps that absence to '' on purpose
+//     (./api.ts:1246-1273, ../shared/harness-api.ts:552-563);
+//   - `GET /harnesses/:name/instructions/:agent` answers the EFFECTIVE text, so an
+//     overridden member reports its own override rather than the preset it replaces
+//     (../server/api-reads.ts:1091-1120) — useless for the comparison.
+//
+// `GET /agents/:id` (./api.ts `getAgent`) is the identified read that ships the shipped
+// profile text plus its guideline rules, resolved through the global layer
+// (`instruction_source`), and it had no caller at all. This is it. T50 states the same
+// rule for tools: a list row carries no schema, the identified read does, and only the
+// control that needs one asks (./main.ts `hydrateToolDetail`).
+//
+// Cost stays bounded and explicit: one read per agent whose library row still has no
+// text, fired when the dialog is opened (the definition's own members) or when a
+// selection moves onto an agent that walk never covered (a `[+]` addition). Never from
+// a render, a hydrate, a poll or a stream frame. `presetTextRequests` keeps a repaint of
+// the same tab free, and a failed read is deliberately NOT cached — a retired profile
+// 404s (../server/api.ts:1685-1688) and the honest blank stays until the next selection
+// asks again.
+const presetTextRequests = new Set<string>();
+
+// Library row + identified profile read, as one row. Only the two trusted TEXT fields
+// move: the title and description the summary already stated stay, so a late read
+// cannot relabel a tile or shift another agent's colour slot (R3/R4) under the reader.
+const agentRowWithTextOf = (row: AgentDescriptor, profile: AgentProfile): AgentDescriptor => ({
+    ...row,
+    instruction: profile.instruction,
+    guidelines: [...profile.guidelines]
+});
+
+const loadAgentPresetTexts = (instance: Instance, names: readonly string[]): void => {
+    const wanted = uniqueNames(names).filter((name) => {
+        const row = agentLibrary.find((agent) => agent.name === name);
+
+        // No row means no tile to fill — an agent this catalogue stopped advertising has
+        // nothing here to attach the text to, and `agentDetailsOf` already says so.
+        return (
+            row !== undefined &&
+            row.instruction.trim().length === 0 &&
+            !presetTextRequests.has(name)
+        );
+    });
+
+    if (wanted.length === 0) return;
+
+    for (const name of wanted) presetTextRequests.add(name);
+
+    void Promise.all(
+        wanted.map((name) => getAgent(name).catch<AgentProfile | undefined>(() => undefined))
+    ).then((profiles) => {
+        for (const name of wanted) presetTextRequests.delete(name);
+
+        const found = profiles.filter((profile): profile is AgentProfile => profile !== undefined);
+        if (found.length === 0) return;
+
+        agentLibrary = agentLibrary.map((row) => {
+            const profile = found.find((candidate) => candidate.name === row.name);
+
+            return profile === undefined ? row : agentRowWithTextOf(row, profile);
+        });
+
+        // A late answer for a conversation the reader already left repaints nothing, and
+        // the refresh is FORCED on purpose: `agentDialogSignatureOf` lists `agents` by
+        // NAME only, so text arriving for a name that was already there would otherwise
+        // never reach the open dialog. Drafts live in the dialog's own layer, so this
+        // rebuild cannot throw away what the reader is typing.
+        if (current !== instance) return;
+
+        refreshAgentDialog(agentViewOf(instance), instance, true);
+    });
 };
 
 // Open the dialog for the SELECTED instance. The click handler resolves `current`

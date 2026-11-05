@@ -21,7 +21,13 @@
 //   - the badges are keyboard-operable (one tab stop, arrows move the selection);
 //   - a frozen saved session locks the roster and the instruction WITH the reason on
 //     each control, and keeps models live;
-//   - `paintActivity()` paints rings without rebuilding the body.
+//   - `paintActivity()` paints rings without rebuilding the body;
+//   - the optional `onRequestPreset` read rides an EXPLICIT selection only (a badge
+//     click, an arrow move, a `[+]` pick), never a render, never a re-selection, and
+//     never a write;
+//   - the instruction editor is seeded from the stored override, else from the trusted
+//     text on the `options.agents` row, and the read-only preset detail keeps showing
+//     that library text even while an override is being edited.
 //
 // Every assertion names the exact expected value — see the deterministic rule.
 
@@ -87,6 +93,26 @@ const base = (overrides: Partial<AgentDialogOptions> = {}): AgentDialogOptions =
         ...overrides
     };
 };
+
+// The preset-read recorder: every test asserts the EXACT ask sequence (agent ids, in
+// the order the reader moved onto them) plus the call count, so a stray read during a
+// render, a duplicate on re-selection, or a display title instead of an id all fail.
+const presetOf = () => {
+    const calls: string[] = [];
+
+    return {
+        calls,
+        onRequestPreset: vi.fn((agent: string) => {
+            calls.push(agent);
+        })
+    };
+};
+
+// Wraps the apply recorder in a spy so a view-only press can be pinned at ZERO calls
+// with a count assertion, not only an empty-payload assertion.
+const applySpyOf = (apply: ReturnType<typeof applyOf>) => ({
+    onApply: vi.fn(apply.onApply)
+});
 
 let dialog: AgentDialog | undefined;
 
@@ -420,6 +446,386 @@ describe('the add picker', () => {
         expect(addButton().disabled).toBe(true);
         expect(addButton().title).toBe('Every agent the server offers is already on this team.');
         expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research', 'reviewer']);
+    });
+});
+
+describe('the preset read (onRequestPreset)', () => {
+    // The dialog's second source: the trusted preset text a baseline falls back to is
+    // NOT in the boot page, so the identified profile read rides an explicit
+    // selection (`selectMemberTab` plus the `[+]` pick) and never a render. These cases
+    // pin WHICH presses ask, how often, and with what exact argument.
+    it('asks once with the agent id when a badge becomes the view, and never for a re-selection', () => {
+        const apply = applyOf();
+        const { onApply } = applySpyOf(apply);
+        const preset = presetOf();
+
+        dialog = openAgentDialog(base({ onApply, onRequestPreset: preset.onRequestPreset }));
+
+        // Opening the dialog selects the primary WITHOUT asking: the page it was built
+        // from already carries that roster, so a read paid per render is the bug.
+        expect(preset.calls).toEqual([]);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(0);
+
+        // A press on the badge that is ALREADY the view moves nothing, so it asks nothing
+        // (main.ts dedupes nothing here — the dialog must not pay for a no-op).
+        selectAgent('instruct');
+        expect(preset.calls).toEqual([]);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(0);
+
+        selectAgent('research');
+
+        // Exactly one ask, carrying the AGENT ID — never the display title.
+        expect(preset.calls).toEqual(['research']);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(1);
+
+        selectAgent('research');
+        expect(preset.calls).toEqual(['research']);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(1);
+
+        // Moving onto another badge is a new selection, so it asks once more.
+        selectAgent('instruct');
+        expect(preset.calls).toEqual(['research', 'instruct']);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(2);
+
+        // The ask is a read request, never a write: the action was never pressed, and
+        // the draft layer is still empty so the action stays disabled.
+        expect(onApply).toHaveBeenCalledTimes(0);
+        expect(apply.calls).toEqual([]);
+        expect(applyButton().disabled).toBe(true);
+    });
+
+    it('asks once per badge the arrows move onto, and not for a move that lands on the viewed badge', () => {
+        const apply = applyOf();
+        const { onApply } = applySpyOf(apply);
+        const preset = presetOf();
+
+        dialog = openAgentDialog(base({ onApply, onRequestPreset: preset.onRequestPreset }));
+
+        byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').focus();
+
+        // Automatic activation: the view follows the focus, so the read follows too.
+        pressKey('ArrowRight');
+        expect(preset.calls).toEqual(['research']);
+
+        pressKey('ArrowLeft');
+        expect(preset.calls).toEqual(['research', 'instruct']);
+
+        // Home from the first badge is a no-op move, and the early return happens before
+        // any ask (the handler cannot fire a read for a badge that is already the view).
+        pressKey('Home');
+        expect(preset.calls).toEqual(['research', 'instruct']);
+
+        // End is a real move, so it asks again.
+        pressKey('End');
+        expect(preset.calls).toEqual(['research', 'instruct', 'research']);
+
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(3);
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
+        expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
+        expect(onApply).toHaveBeenCalledTimes(0);
+        expect(apply.calls).toEqual([]);
+    });
+
+    it('asks nothing when the arrows cannot move at all (a one-badge roster)', () => {
+        const apply = applyOf();
+        const { onApply } = applySpyOf(apply);
+        const preset = presetOf();
+
+        dialog = openAgentDialog(
+            base({ members: ['instruct'], onApply, onRequestPreset: preset.onRequestPreset })
+        );
+
+        byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').focus();
+
+        // With one badge, every wrap/warp computation lands back on the viewed agent, so
+        // the guard must short-circuit four times rather than fire four identical reads.
+        pressKey('ArrowRight');
+        pressKey('ArrowLeft');
+        pressKey('Home');
+        pressKey('End');
+
+        expect(preset.calls).toEqual([]);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(0);
+        expect(tabsOf().map((tab) => tab[2])).toEqual([true]);
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
+        expect(onApply).toHaveBeenCalledTimes(0);
+    });
+
+    it('asks for the id when the [+] picker drafts a tab, and keeps the drafted-tab facts', () => {
+        const apply = applyOf();
+        const { onApply } = applySpyOf(apply);
+        const preset = presetOf();
+
+        dialog = openAgentDialog(base({ onApply, onRequestPreset: preset.onRequestPreset }));
+
+        openPicker();
+
+        // Opening the picker adds nobody and asks for nothing.
+        expect(preset.calls).toEqual([]);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(0);
+
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
+
+        // The added agent was never covered by the dialog-open walk, so THIS press asks
+        // for its text — exactly once, with the id.
+        expect(preset.calls).toEqual(['reviewer']);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(1);
+
+        // The draft facts must not drift: `dataset.added` and the `new` chip are how the
+        // dialog says "not saved yet".
+        expect(
+            [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
+                tab.dataset.agent,
+                tab.dataset.added ?? '',
+                tab.getAttribute('aria-selected') === 'true'
+            ])
+        ).toEqual([
+            ['instruct', '', false],
+            ['research', '', false],
+            ['reviewer', 'true', true]
+        ]);
+        expect(
+            [
+                ...document.querySelectorAll<HTMLElement>(
+                    '.agent-dialog-tab[data-agent="reviewer"] .agent-dialog-agent-state'
+                )
+            ].map((chip) => chip.textContent)
+        ).toEqual(['new']);
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('reviewer');
+        expect(
+            [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
+        ).toEqual(['Reviewer joins the team when you save · nothing is sent yet.']);
+
+        // A read request is not a write and it does not arm the action by itself.
+        expect(onApply).toHaveBeenCalledTimes(0);
+        expect(apply.calls).toEqual([]);
+        expect(applyButton().disabled).toBe(false);
+    });
+
+    it('still paints, selects and edits when the host supplies no preset read', async () => {
+        const apply = applyOf();
+        const { onApply } = applySpyOf(apply);
+
+        // Back-compat: every existing call site omits `onRequestPreset`, so the option
+        // staying optional must not turn any of these paths into a crash.
+        const options = base({ onApply });
+        expect(options.onRequestPreset).toBeUndefined();
+
+        dialog = openAgentDialog(options);
+
+        selectAgent('research');
+        expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Researcher');
+        expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
+        expect(instructionBox().value).toBe('Investigate.');
+
+        byClass('.agent-dialog-tab[data-agent="research"]', 'button').focus();
+        pressKey('ArrowRight');
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
+        expect(tabsOf().map((tab) => tab[2])).toEqual([true, false]);
+
+        openPicker();
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('reviewer');
+
+        typeInstruction('Hunt for real bugs.');
+        expect(instructionBox().value).toBe('Hunt for real bugs.');
+        expect(applyButton().disabled).toBe(false);
+
+        applyButton().click();
+        await flush();
+
+        expect(onApply).toHaveBeenCalledTimes(1);
+        expect(apply.calls).toEqual([
+            {
+                agent: 'reviewer',
+                models: {},
+                instructions: { reviewer: 'Hunt for real bugs.' },
+                add: ['reviewer'],
+                remove: []
+            }
+        ]);
+    });
+
+    it('clears the stale verdict and an open picker when the selection moves', async () => {
+        const apply = applyOf({
+            applied: false,
+            message: 'An agent save is still in flight · try again in a moment.'
+        });
+        const preset = presetOf();
+
+        dialog = openAgentDialog(base({ onApply: apply.onApply, onRequestPreset: preset.onRequestPreset }));
+
+        selectAgent('research');
+        typeInstruction('Investigate with sources.');
+        applyButton().click();
+        await flush();
+
+        expect(byClass('.agent-dialog-error', 'p').textContent).toBe(
+            'An agent save is still in flight · try again in a moment.'
+        );
+
+        openPicker();
+        expect(addButton().getAttribute('aria-expanded')).toBe('true');
+
+        // Moving the view is neither an edit nor a retry: the refused verdict must stop
+        // describing work in progress, and the open picker closes with the selection.
+        selectAgent('instruct');
+
+        expect(byClass('.agent-dialog-error', 'p').textContent).toBe('');
+        expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
+            'Saves on this harness · new sessions run what you save here.'
+        );
+        expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
+        expect(addButton().getAttribute('aria-expanded')).toBe('false');
+        expect(preset.calls).toEqual(['research', 'instruct']);
+
+        // The drafts survive the verdict being cleared, so the retry still carries the edit.
+        selectAgent('research');
+        expect(instructionBox().value).toBe('Investigate with sources.');
+        expect(preset.calls).toEqual(['research', 'instruct', 'research']);
+    });
+});
+
+describe('the instruction seed and the trusted preset detail', () => {
+    // A library row whose text is reachable ONLY through `options.agents` (the boot
+    // summary carries no prompt), with an id and a display title that differ by case —
+    // so a seed reading the wrong source, or an ask passing the title, fails visibly.
+    const library: AgentDescriptor[] = [
+        {
+            name: 'instruct',
+            title: 'Instruct',
+            description: 'General agent.',
+            instruction: 'Answer directly.',
+            guidelines: []
+        },
+        {
+            name: 'summarizer',
+            title: 'Summarizer',
+            description: 'Condenses the transcript.',
+            instruction: 'Summarize the transcript in five bullets.',
+            guidelines: ['Name every source.', 'Never invent a quote.']
+        }
+    ];
+
+    it('seeds the editor with the trusted library text when the harness has no override', () => {
+        const preset = presetOf();
+
+        dialog = openAgentDialog(
+            base({
+                members: ['instruct', 'summarizer'],
+                agents: library,
+                instructions: {},
+                onRequestPreset: preset.onRequestPreset
+            })
+        );
+
+        selectAgent('summarizer');
+
+        // The absent override is NOT an empty box: the reader edits the words the agent
+        // actually runs, which is the library row's instruction.
+        expect(preset.calls).toEqual(['summarizer']);
+        expect(instructionBox().value).toBe('Summarize the transcript in five bullets.');
+        expect(instructionBox().getAttribute('aria-label')).toBe('Instruction for Summarizer');
+        expect(instructionBox().disabled).toBe(false);
+        expect(instructionBox().title).toBe(
+            'Saved on this harness and used by new sessions. The trusted preset instruction itself is never changed.'
+        );
+
+        // The same text is the read-only reference, so the editor and the reference can
+        // never disagree about what a baseline means.
+        const detail = byClass('.agent-detail', 'details');
+        expect(detail.open).toBe(false);
+        expect(byClass('.agent-detail-summary', 'summary').textContent).toBe(
+            'Preset instruction for Summarizer'
+        );
+        expect(byClass('.agent-instruction', 'p').textContent).toBe(
+            'Summarize the transcript in five bullets.'
+        );
+        expect(
+            [...byClass('.agent-detail-body', 'div').querySelectorAll<HTMLElement>('p')].map(
+                (node) => node.textContent
+            )
+        ).toEqual(['Summarize the transcript in five bullets.', 'guidelines']);
+        expect(
+            [...document.querySelectorAll<HTMLElement>('ul.agent-guidelines .agent-guideline')].map(
+                (node) => node.textContent
+            )
+        ).toEqual(['Name every source.', 'Never invent a quote.']);
+    });
+
+    it('seeds the stored override and keeps the library text in the read-only preset detail', () => {
+        const apply = applyOf();
+        const { onApply } = applySpyOf(apply);
+        const preset = presetOf();
+
+        dialog = openAgentDialog(
+            base({
+                members: ['instruct', 'summarizer'],
+                agents: library,
+                instructions: { summarizer: 'Override text.' },
+                onApply,
+                onRequestPreset: preset.onRequestPreset
+            })
+        );
+
+        selectAgent('summarizer');
+
+        // A stored override wins the editor, and the ask still rides the selection.
+        expect(preset.calls).toEqual(['summarizer']);
+        expect(instructionBox().value).toBe('Override text.');
+        expect(instructionBox().title).toBe(
+            'This harness overrides the preset instruction. Clear the text to run the preset instruction again.'
+        );
+        expect(byClass('.agent-dialog-revert', 'button').textContent).toBe('Use the preset instruction');
+
+        // The trusted reference never follows the override: it is the comparison the
+        // reader needs against the text this harness replaces, collapsed by default.
+        const detail = byClass('.agent-detail', 'details');
+        expect(detail.open).toBe(false);
+        expect(byClass('.agent-detail-summary', 'summary').textContent).toBe(
+            'Preset instruction for Summarizer'
+        );
+        expect(byClass('.agent-instruction', 'p').textContent).toBe(
+            'Summarize the transcript in five bullets.'
+        );
+        expect(
+            [...byClass('.agent-detail-body', 'div').querySelectorAll<HTMLElement>('p')].map(
+                (node) => node.textContent
+            )
+        ).toEqual(['Summarize the transcript in five bullets.', 'guidelines']);
+        expect(
+            [...document.querySelectorAll<HTMLElement>('ul.agent-guidelines .agent-guideline')].map(
+                (node) => node.textContent
+            )
+        ).toEqual(['Name every source.', 'Never invent a quote.']);
+
+        // Reading the reference and asking for the preset are both view-only.
+        expect(onApply).toHaveBeenCalledTimes(0);
+        expect(apply.calls).toEqual([]);
+        expect(applyButton().disabled).toBe(true);
+    });
+
+    it('seeds the honest blank for a member the catalogue no longer advertises', () => {
+        const preset = presetOf();
+
+        dialog = openAgentDialog(
+            base({ members: ['instruct', 'legacy'], onRequestPreset: preset.onRequestPreset })
+        );
+
+        selectAgent('legacy');
+
+        // The ask still uses the id, even though no row exists to display it.
+        expect(preset.calls).toEqual(['legacy']);
+        expect(instructionBox().value).toBe('');
+        expect(byClass('.agent-detail-summary', 'summary').textContent).toBe(
+            'Preset instruction for Agent'
+        );
+        expect(byClass('.agent-instruction', 'p').textContent).toBe(
+            'This server does not advertise an instruction for this agent.'
+        );
+
+        // A row with no guidelines renders no list at all (not an empty one).
+        expect(document.querySelector('ul.agent-guidelines')).toBeNull();
     });
 });
 

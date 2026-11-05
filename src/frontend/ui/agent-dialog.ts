@@ -36,6 +36,16 @@
 // "clear the override" (use the resolved default model / the trusted preset
 // instruction), which is how a saved override is reverted.
 //
+// The trusted PRESET text a baseline falls back to is a second source, and it is NOT
+// in the boot page: `GET /agents` rows are summaries with no prompt
+// (../shared/harness-api.ts:552-563), so main.ts folds the identified profile read
+// (`GET /agents/:id`, ./api.ts `getAgent`) into `options.agents` before this dialog
+// ever renders a fallback (./main.ts `loadAgentPresetTexts`). A tab that shows an
+// agent that walk never covered — an agent added through `[+]` — asks for its text
+// through `onRequestPreset`, so the read rides an explicit selection and never a
+// render. A row still empty after that means the server genuinely has no prompt to
+// show (a retired profile 404s), which is the honest blank, not a silent one.
+//
 // THE ROSTER (who has a tab)
 // --------------------------
 // `rosterOf()` is the saved team PLUS the drafted adds MINUS the drafted removals.
@@ -140,7 +150,9 @@ export type AgentApplyResult = {
 export type AgentDialogOptions = {
     members: readonly string[];
     primary: string;
-    // The trusted agent library from GET /agents (or the boot fallback).
+    // The trusted agent library from GET /agents (or the boot fallback), with each
+    // row's preset text filled in by the identified profile read — see the header
+    // note for why the page alone is not enough.
     agents: readonly AgentDescriptor[];
     // TEAM + instruction editing. Models carry their own flag inside `models`.
     editable: boolean;
@@ -149,6 +161,11 @@ export type AgentDialogOptions = {
     // absent here runs its trusted preset instruction, which is the text the editor
     // is seeded with.
     instructions: Readonly<Record<string, string>>;
+    // Asks main.ts for the trusted preset text of an agent this dialog is about to
+    // show (see the header note). Optional: a caller that has no such read (a test, a
+    // host without the agent route) simply keeps the library text it was given. The
+    // answer arrives through `update()`, so this never writes anything.
+    onRequestPreset?: (agent: string) => void;
     activity?: readonly string[];
     // The real reason the team/instructions are locked. Used as the accessible
     // description of every locked control; never invented.
@@ -281,7 +298,10 @@ const hasStoredOverride = (options: AgentDialogOptions, name: string): boolean =
 
 // The instruction the textarea starts from: the saved override when this harness has
 // one, otherwise the trusted preset text. An absent override is therefore NOT an
-// empty box — the reader edits the words the agent actually runs.
+// empty box — the reader edits the words the agent actually runs. The preset side of
+// that pair is the library row main.ts filled from `GET /agents/:id`
+// (./main.ts `loadAgentPresetTexts`); a row that is still empty after that read names
+// a profile this server no longer publishes, and the blank is the truth.
 const baselineInstructionOf = (options: AgentDialogOptions, name: string): string => {
     const override = (options.instructions[name] ?? '').trim();
 
@@ -420,6 +440,21 @@ const focusTab = (root: HTMLElement, name = ''): void => {
     tab?.focus();
 };
 
+// Move the view onto one agent. Selection is a VIEW change: nothing is sent and nobody
+// is promoted (R3), which is also what makes it the right moment to ask for that
+// agent's trusted preset text — the reader chose it explicitly, so the read is paid for
+// by a click or an arrow key, never by a render. `onRequestPreset` is a no-op for an
+// agent whose library row already carries text, so re-selecting a tab is free.
+const selectMemberTab = (options: AgentDialogOptions, state: DialogState, member: string): void => {
+    if (member === '' || state.selected === member) return;
+
+    state.selected = member;
+    state.result = undefined;
+    state.adding = false;
+    options.onRequestPreset?.(member);
+    state.paint(`tab:${member}`);
+};
+
 // The `[+]` control and its accessible reason. Disabled rather than hidden when the
 // team is locked, so the affordance does not vanish on a saved conversation and the
 // tooltip states the real cause (`hint` from main.ts, never invented).
@@ -479,6 +514,10 @@ const createAddPicker = (options: AgentDialogOptions, state: DialogState): HTMLE
             // The new tab is the configuration the reader is here to fill in.
             state.selected = name;
             state.adding = false;
+            // An agent added here was never part of the definition the dialog-open walk
+            // covered, so its trusted preset text is asked for by this same press
+            // (see `selectMemberTab` for why a selection is the right moment).
+            options.onRequestPreset?.(name);
             state.paint(`tab:${name}`);
         });
 
@@ -658,11 +697,7 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
 
         tab.addEventListener('click', () => {
             // A tab switch is a VIEW change: nothing is sent and nobody is promoted.
-            if (state.selected === member) return;
-            state.selected = member;
-            state.result = undefined;
-            state.adding = false;
-            state.paint(`tab:${member}`);
+            selectMemberTab(options, state, member);
         });
 
         tabs.append(tab);
@@ -692,10 +727,7 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         if (moved === '' || moved === state.selected) return;
 
         keyboard.preventDefault();
-        state.selected = moved;
-        state.result = undefined;
-        state.adding = false;
-        state.paint(`tab:${moved}`);
+        selectMemberTab(options, state, moved);
     });
 
     chooser.append(tabs, createAddControl(options, state));
