@@ -17,6 +17,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
@@ -29,6 +30,16 @@ const flush = async (): Promise<void> => {
 
 // One harness, one catalogue tool, one advertised agent preset: enough for boot to
 // select a harness, build the card row and open a real tool runner.
+//
+// T45: the body stays the compact legacy shape (`{rootPath, presets, tools, agents,
+// defaults, sessions}`) because that is the cheapest way to describe a server, but it is
+// no longer handed to the browser raw. `viewAwareFetch` (./view-test-support.ts) re-acts
+// it as the canonical control plane the shell actually dials: the service document, the
+// global config, ONE PAGE PER CATALOGUE (`/harnesses`, `/tools`, `/agents`, `/sessions`)
+// and the identified definition read (`/harnesses/:name`, which the configuration dialog
+// triggers) — the last three composed from this same fixture, so nothing here invents a
+// payload the fixture does not state. Without that adapter the client booted offline
+// (no page, no card, no definition) and every chrome assertion below read an empty head.
 const bootstrap = {
     rootPath: '/api',
     presets: [
@@ -86,15 +97,21 @@ afterEach(() => {
 });
 
 const boot = async (): Promise<void> => {
+    // Canonical adapter OUTSIDE, the fixture's raw routes INSIDE: the shell dials
+    // `/v1/harness/*`, the adapter rewrites each of those to the raw twin this fixture
+    // declares (`/api`, `/api/models`) and composes the pages/definition from that same
+    // boot body (see the note above `bootstrap`).
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
-            const url = String(input);
-            if (url === '/api') return json(bootstrap);
-            if (url === '/api/models') return json({ models: ['m1'] });
+        vi.fn(
+            viewAwareFetch(async (input: RequestInfo | URL) => {
+                const url = String(input);
+                if (url === '/api') return json(bootstrap);
+                if (url === '/api/models') return json({ models: ['m1'] });
 
-            throw new Error(`unexpected request: ${url}`);
-        })
+                throw new Error(`unexpected request: ${url}`);
+            }, { root: '/api' })
+        )
     );
 
     await import('./main');

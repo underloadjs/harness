@@ -23,11 +23,16 @@
 
 import { HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../shared/harness-api';
 import type {
+    AttachmentResponse,
     HarnessEvent,
     TaskReceipt,
     ThreadSummary,
     ThreadSummaryPage,
+    TranscriptDocumentResponse,
+    TranscriptMetadata,
+    TranscriptMetadataResponse,
     TranscriptMessagePage,
+    TranscriptWriteReceipt,
     TurnBlockDetail,
     TurnDisplay,
     TurnEventPage,
@@ -36,7 +41,7 @@ import type {
     TurnSummary,
     TurnSummaryPage
 } from '../shared/harness-api';
-import type { HarnessApiResult } from './api';
+import type { HarnessApiRequest, HarnessApiResult } from './api';
 
 /** Anything whose answer is a canonical `HarnessApiResult`, i.e. one API call. */
 export type CanonicalCall = (
@@ -47,6 +52,38 @@ export type CanonicalCall = (
 
 /** The method position of `CanonicalCall`, reused by the helpers below. */
 export type CanonicalMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+
+/**
+ * Binds one in-process dispatcher (`runtime.api`, or the result of `createHarnessApi`) to a
+ * mount, producing the `CanonicalCall` every helper below consumes.
+ *
+ * WHY THE QUERY SPLIT LIVES HERE: the helpers compose a cursor/limit onto the PATH with
+ * `?`, which is how a real HTTP request addresses a page. The dispatcher itself matches on a
+ * BARE pathname and reads paging out of `searchParams` (./api.ts `relativeSegments` +
+ * `queryOf`), so a test driving `runtime.api` directly must move the query across before the
+ * call. Doing it in the binding keeps each test file's transport one line and stops fourteen
+ * copies of the same `indexOf('?')` from disagreeing.
+ */
+export const bindApiCall = (
+    api: (request: HarnessApiRequest) => Promise<HarnessApiResult>,
+    mount: string
+): CanonicalCall => {
+    const call: CanonicalCall = (method, pathname, body) => {
+        const mark = pathname.indexOf('?');
+        const path = mark === -1 ? pathname : pathname.slice(0, mark);
+        const search = mark === -1 ? undefined : pathname.slice(mark + 1);
+
+        return api({
+            method,
+            pathname: path,
+            ...(search === undefined ? {} : { searchParams: search }),
+            mount,
+            readBody: async <T>() => (body === undefined ? ({} as T) : (body as T))
+        });
+    };
+
+    return call;
+};
 
 /** The canonical root every helper builds paths under (asserted, not assumed). */
 export const CANONICAL_MOUNT = HARNESS_API_ROOT_ALIAS();
@@ -242,6 +279,68 @@ export const readTranscriptMessages = (
         }),
         200
     );
+
+/** `GET .../threads/{threadId}/transcript` -> the cheap head (counts/size/validity, no content). */
+export const readTranscriptMetadata = (
+    call: CanonicalCall,
+    sessionId: string,
+    threadId: string
+): Promise<TranscriptMetadata> =>
+    readOk<TranscriptMetadataResponse>(
+        call,
+        'GET',
+        HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscript(sessionId, threadId),
+        200
+    ).then((body) => body.transcript);
+
+/** `GET .../threads/{threadId}/transcript/document` -> the whole transcript as one JSON TEXT. */
+export const readTranscriptDocument = (
+    call: CanonicalCall,
+    sessionId: string,
+    threadId: string
+): Promise<TranscriptDocumentResponse> =>
+    readOk<TranscriptDocumentResponse>(
+        call,
+        'GET',
+        HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscriptDocument(sessionId, threadId),
+        200
+    );
+
+/**
+ * `PUT .../threads/{threadId}/transcript` -> the write receipt.
+ *
+ * `messages` is deliberately `unknown` (the transcript is fully user-editable JSON and a
+ * structurally broken value is a SUCCESSFUL write), and `if_revision` is the contract's one
+ * optimistic lock — omitted unless the caller supplies it, so a plain write is not a 409.
+ */
+export const putTranscript = (
+    call: CanonicalCall,
+    sessionId: string,
+    threadId: string,
+    messages: unknown,
+    ifRevision?: number
+): Promise<TranscriptWriteReceipt> =>
+    readOk<TranscriptWriteReceipt>(
+        call,
+        'PUT',
+        HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscript(sessionId, threadId),
+        200,
+        ifRevision === undefined ? { messages } : { messages, if_revision: ifRevision }
+    );
+
+/** `GET .../turns/{turnId}/attachments/{attachmentId}` -> that attachment's recorded bytes. */
+export const readTurnAttachment = (
+    call: CanonicalCall,
+    sessionId: string,
+    turnId: string,
+    attachmentId: string
+): Promise<AttachmentResponse['attachment']> =>
+    readOk<AttachmentResponse>(
+        call,
+        'GET',
+        HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdAttachmentsByAttachmentId(sessionId, turnId, attachmentId),
+        200
+    ).then((body) => body.attachment);
 
 // ---------------------------------------------------------------------------
 // Deterministic waiting

@@ -266,24 +266,29 @@ describe('package layout', () => {
         }
     });
 
-    it('points the Vite dev and preview /api proxy at the already-running service', async () => {
-        // R1: the browser's fallback root is `/api` (src/frontend/api.ts), and the
-        // service gateway mounts the same API at `/v1/harness` on :5000. Both Vite
-        // modes must rewrite the prefix, so no UI launch ever needs an embedded API.
-        // A page-level `?apiRoot=` or build-time `VITE_HARNESS_API` still overrides
-        // the fallback at runtime; this pins only the default.
+    it('proxies the canonical /v1/harness root (REST and the stream upgrade) at the running service', async () => {
+        // R1 + T14: the browser dials the SAME path it uses in production - `/v1/harness/...` -
+        // because `/api` is gone from the contract (src/shared/harness-api.ts:39
+        // `HARNESS_API_ROOT`, mirrored by `API_ROOT` in src/frontend/api.ts). Both Vite modes
+        // therefore forward the canonical path to the service mount on :5000 with an IDENTITY
+        // rewrite, and `ws: true` carries the realtime upgrade (`GET /v1/harness/stream`) to that
+        // same host/port. No UI launch needs an embedded API.
         //
-        // HARNESS_DEV_API is read at config-module load. Clear it for this import so
-        // the assertion is independent of the shell that runs the suite.
+        // A page-level `?apiRoot=` or build-time `VITE_HARNESS_API` still overrides the fallback
+        // at runtime (src/frontend/api.ts `resolveApiRoot`); this pins only the default.
+        //
+        // HARNESS_DEV_API is read at config-module load. Clear it for this import so the
+        // assertion is independent of the shell that runs the suite.
         const previous = process.env.HARNESS_DEV_API;
         delete process.env.HARNESS_DEV_API;
 
         try {
             const config = (await import('./frontend/vite.config')).default as any;
-            // The proxy key is anchored to the API mount so it cannot capture the
-            // `api.ts` client module (`/api.ts`), which would blank the UI when the
-            // upstream is down. Pin the exact key at both launch seams.
-            const proxyKey = '^/api(?:/|$)';
+            // The proxy key is anchored to the API mount and Vite treats a leading `^` as a RegExp,
+            // so it matches exactly `/v1/harness` and `/v1/harness/...` - never an unrelated source
+            // module or page route, which would blank the UI when the upstream is down. Pin the
+            // exact key at both launch seams.
+            const proxyKey = '^/v1/harness(?:/|$)';
             expect(Object.keys(config.server.proxy)).toEqual([proxyKey]);
             expect(Object.keys(config.preview.proxy)).toEqual([proxyKey]);
 
@@ -294,8 +299,23 @@ describe('package layout', () => {
             expect(devProxy).toBe(previewProxy);
             expect(devProxy.target).toBe('http://127.0.0.1:5000');
             expect(devProxy.changeOrigin).toBe(true);
-            expect(devProxy.rewrite('/api')).toBe('/v1/harness');
-            expect(devProxy.rewrite('/api/sessions/s-1/events')).toBe('/v1/harness/sessions/s-1/events');
+
+            // Same host for both planes: the HTTP upgrade is proxied too, so the socket dials the
+            // page origin like every REST call. Without `ws` the REST reads work and the realtime
+            // plane silently 404s at Vite (./vite-proxy.ts:90-93).
+            expect(devProxy.ws).toBe(true);
+
+            // The service gate requires Origin host === request Host; the proxy stamps the target
+            // origin so a LAN page keeps working without widening that gate.
+            expect(devProxy.headers).toEqual({ origin: 'http://127.0.0.1:5000' });
+
+            // Identity rewrite: canonical path in, the same path out - including the stream path
+            // and a query string (a page size or cursor must survive the proxy).
+            expect(devProxy.rewrite('/v1/harness')).toBe('/v1/harness');
+            expect(devProxy.rewrite('/v1/harness/stream')).toBe('/v1/harness/stream');
+            expect(devProxy.rewrite('/v1/harness/sessions/s-1/events?limit=25')).toBe(
+                '/v1/harness/sessions/s-1/events?limit=25'
+            );
         } finally {
             if (previous === undefined) delete process.env.HARNESS_DEV_API;
             else process.env.HARNESS_DEV_API = previous;
@@ -303,21 +323,31 @@ describe('package layout', () => {
     });
 
     it('can point the same proxy at the separate standalone launcher', async () => {
-        // R2: `yarn dev:server` mounts the API at `/api` on :5181. The proxy helper
-        // replaces the client's `/api` prefix with the target's mount, so the same
-        // UI works against the standalone server with HARNESS_DEV_API set.
+        // R2 + T14: `yarn dev:server` publishes the SAME canonical root on :5181
+        // (`STANDALONE_MOUNT === HARNESS_API_ROOT`, ./server/api.ts:270-274), so pointing
+        // HARNESS_DEV_API at the standalone launcher is an identity rewrite exactly like the
+        // service mount. The helper still swaps the prefix for a host that publishes the API
+        // somewhere else - the only case where the browser's canonical path and the upstream path
+        // differ - which is what keeps `?apiRoot=`-style deployments working.
         const { createApiProxy, DEFAULT_DEV_API } = await import('./frontend/vite.config');
-        const standalone = createApiProxy('http://127.0.0.1:5181/api');
+        const standalone = createApiProxy('http://127.0.0.1:5181/v1/harness');
 
         expect(DEFAULT_DEV_API).toBe('http://127.0.0.1:5000/v1/harness');
         expect(standalone.target).toBe('http://127.0.0.1:5181');
         expect(standalone.changeOrigin).toBe(true);
-        expect(standalone.rewrite('/api')).toBe('/api');
-        expect(standalone.rewrite('/api/sessions/s-1/events')).toBe('/api/sessions/s-1/events');
+        expect(standalone.ws).toBe(true);
+        expect(standalone.headers).toEqual({ origin: 'http://127.0.0.1:5181' });
+        expect(standalone.rewrite('/v1/harness')).toBe('/v1/harness');
+        expect(standalone.rewrite('/v1/harness/sessions/s-1/events')).toBe('/v1/harness/sessions/s-1/events');
 
         // A trailing slash on the mount is normalized (no `//` in the URL).
         const trailing = createApiProxy('http://127.0.0.1:5000/v1/harness/');
-        expect(trailing.rewrite('/api/health')).toBe('/v1/harness/health');
+        expect(trailing.rewrite('/v1/harness/health')).toBe('/v1/harness/health');
+
+        // A non-canonical upstream swaps only the mount, and the stream upgrade follows it.
+        const custom = createApiProxy('http://127.0.0.1:5181/api');
+        expect(custom.rewrite('/v1/harness/stream')).toBe('/api/stream');
+        expect(custom.rewrite('/v1/harness')).toBe('/api');
     });
 
     it('keeps both dev launchers out of every imported surface', () => {
@@ -507,7 +537,12 @@ describe('import safety', () => {
         expect(root.SERVICE_MOUNT).toBe('/v1/harness');
         expect(root.SERVICE_ROOT_ROUTE).toBe('/v1/harness');
         expect(root.SERVICE_WILDCARD_ROUTE).toBe('/v1/harness/*');
-        expect(root.STANDALONE_MOUNT).toBe('/api');
+        // One API root for both hosts: the standalone launcher and the service gateway publish
+        // the SAME mount (./server/api.ts:270-274, `STANDALONE_MOUNT === SERVICE_MOUNT ===
+        // HARNESS_API_ROOT`). The old `/api` standalone mount is gone from the contract, so no
+        // client, proxy or adapter has to know which host answered.
+        expect(root.STANDALONE_MOUNT).toBe('/v1/harness');
+        expect(root.STANDALONE_MOUNT).toBe(root.SERVICE_MOUNT);
         expect(typeof root.createHarnessRuntime).toBe('function');
         expect(typeof root.createHarnessServiceHandler).toBe('function');
         expect(typeof root.SessionStore).toBe('function');
@@ -533,8 +568,9 @@ describe('import safety', () => {
             'demo',
             'flaky'
         ]);
-        // Client (import-safe under Node; no DOM work at module scope).
-        expect(root.API_ROOT).toBe('/api');
+        // Client (import-safe under Node; no DOM work at module scope). The browser's
+        // fallback root is the canonical mount, not the retired `/api`.
+        expect(root.API_ROOT).toBe('/v1/harness');
         expect(typeof root.createTurnBoard).toBe('function');
         expect(typeof root.loadBootstrap).toBe('function');
 

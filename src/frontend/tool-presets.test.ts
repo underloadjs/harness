@@ -633,16 +633,19 @@ it('sends the edited preset verbatim, with the playground session id', async () 
     await flush();
     await flush();
 
-    expect(calls.find((call) => call.url === '/api/tools/profileManage')).toEqual({
+    expect(
+        calls.find((call) => call.url === '/api/tools/profileManage' && call.method === 'POST')
+    ).toEqual({
         url: '/api/tools/profileManage',
         method: 'POST',
         body: { parameters: { action: 'get', id: 'p-7' }, sessionId: 's1' }
     });
 
-    // The response pane shows the answer JSON, so what is on screen is what the server said.
+    // The response pane shows the answer JSON, so what is on screen is what the server said —
+    // in the contract's spelling (`duration_ms`, ../shared/harness-api.ts:712).
     expect(JSON.parse(document.querySelector('.tool-output .card-body')?.textContent ?? '')).toEqual({
         ok: true,
         result: { ok: true },
-        durationMs: 3
+        duration_ms: 3
     });
 });

@@ -20,6 +20,17 @@
 //   6. One broken THREAD is per-thread tolerance. A corrupt DOCUMENT (a `core`
 //      that is not an object, a malformed `invalidThreads` map) stays fatal.
 //
+// T35 MIGRATION NOTE: one transcript is THREE canonical reads plus one write —
+// `GET .../transcript` (metadata head: counts, size, revision, validity),
+// `GET .../transcript/messages` (a paged slice), `GET .../transcript/document` (the whole
+// JSON TEXT the editor saves, which is where the RAW unreadable submission is served
+// verbatim), and `PUT .../transcript` (a `TranscriptWriteReceipt`, with the contract's one
+// `if_revision` optimistic lock). The second mount is gone: `/api` answers 404 and NAMES the
+// canonical root. Two shapes changed carrier, not meaning: a write answers a receipt instead
+// of `{transcript, session}`, and an UNREADABLE thread reads as an EMPTY transcript on the
+// wire (api.ts `transcriptMessagesOf` returns `[]` for an id in `invalidThreads`) — the
+// placeholder the model runs on stays a store-side fact, asserted through the store oracle.
+//
 // The invalid-transcript error texts below are the EXACT messages
 // `readHarnessMessages` (src/core/snapshot.ts) emits with the store's label,
 // asserted verbatim so the wire text cannot drift silently.
@@ -41,6 +52,15 @@ import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import type { SessionSnapshot, ThreadTranscriptResponse, UpdateThreadTranscriptResult } from './protocol';
 import { SessionError } from './sessions';
+import {
+    bindApiCall,
+    listThreads,
+    putTranscript,
+    readTranscriptDocument,
+    readTranscriptMessages,
+    readTranscriptMetadata,
+    type CanonicalCall
+} from './canonical-reads.test-support';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
@@ -258,6 +278,59 @@ const pretty = (value: unknown): string => JSON.stringify(value, null, 2);
 const transcriptPath = (id: string, threadId = 'thread-1'): string =>
     `/v1/harness/sessions/${id}/threads/${threadId}/transcript`;
 
+// T35: the canonical read/write composition lives in ./canonical-reads.test-support.ts, so
+// the transport (single `/v1/harness` mount, metadata + paged messages + document reads, and
+// a write receipt instead of a fat `{transcript, session}` body) is decided in one place.
+const callOf = (runtime: HarnessRuntime): CanonicalCall => bindApiCall(runtime.api, '/v1/harness');
+
+// The hub counter the transcript routes quote. Comparing a response to the hub rather than
+// to a literal is the convention ./api-canonical.test.ts established: one number per
+// revision, and the assertion cannot drift across a restart.
+const hubRevision = (
+    runtime: HarnessRuntime,
+    resource: 'transcript' | 'transcript_messages' | 'thread',
+    sessionId: string,
+    threadId: string
+): number => runtime.api.events.getRevision(resource, `${sessionId}:${threadId}`);
+
+// `chars` and `bytes` are the metadata's OWN definitions (api-reads.ts
+// `transcriptMetadataOf`: summed content length, and the UTF-8 size of the serialized
+// message array). Re-deriving them from the exact messages each test already pins keeps the
+// figures literal-quality without freezing a number that moves when a fixture's text moves.
+const charsOf = (messages: readonly HarnessMessage[]): number =>
+    messages.reduce((total, message) => total + String(message.content).length, 0);
+const bytesOf = (messages: readonly HarnessMessage[]): number =>
+    Buffer.byteLength(JSON.stringify(messages), 'utf8');
+
+// The receipt's `links`, spelled once: the canonical surface is links-relative, so a route
+// rename must show up as one diff here rather than in twelve tests.
+const transcriptLinks = (sessionId: string, threadId = 'thread-1') => ({
+    transcript: `/v1/harness/sessions/${sessionId}/threads/${threadId}/transcript`,
+    messages: `/v1/harness/sessions/${sessionId}/threads/${threadId}/transcript/messages?limit=25`,
+    document: `/v1/harness/sessions/${sessionId}/threads/${threadId}/transcript/document`
+});
+
+// The role histogram of a plain role/content transcript (the metadata carries it, so an
+// editor never has to download the messages to size a filter).
+const roleCounts = (messages: readonly HarnessMessage[]) => ({
+    system: messages.filter((message) => message.role === 'system').length,
+    user: messages.filter((message) => message.role === 'user').length,
+    assistant: messages.filter((message) => message.role === 'assistant').length,
+    tool: messages.filter((message) => message.role === 'tool').length
+});
+
+// An UNREADABLE thread reads as an EMPTY transcript on the canonical surface: api.ts
+// `transcriptMessagesOf` returns `[]` for any id in `invalidThreads`, and the metadata head
+// states the reason and the stored JSON type instead. The placeholder the model actually runs
+// on is a store-side fact (asserted through the store oracle below), never a wire shape.
+const EMPTY_HEAD = {
+    message_count: 0,
+    chars: 0,
+    // `bytes` is the serialized size of the message ARRAY, so an empty one is `[]` = 2.
+    bytes: 2,
+    role_counts: { system: 0, user: 0, assistant: 0, tool: 0 }
+};
+
 // Poll a condition on the 0-delay macrotask queue (the ./threads.test.ts
 // convention) so "this run is in flight" is OBSERVED, not assumed.
 const waitUntil = async (condition: () => boolean): Promise<void> => {
@@ -314,8 +387,9 @@ const seeded = async (label: string, scripted: Scripted = scriptedPreset('one'))
 };
 
 describe('thread transcript read/write (C4)', () => {
-    it('serves the editable JSON of a readable transcript over GET on both mounts', async () => {
+    it('serves the metadata, the paged messages, and the editable document of a readable transcript', async () => {
         const { runtime, sessionId, requests } = await seeded('get-valid');
+        const call = callOf(runtime);
 
         // The baseline every later assertion here is written against: the provider
         // received the seeded system message plus the prompt.
@@ -323,16 +397,55 @@ describe('thread transcript read/write (C4)', () => {
             [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hello' }]
         ]);
 
-        const got = await callApi(runtime, 'GET', transcriptPath(sessionId));
-        expect(got.status).toBe(200);
-        expect(transcriptOf(got.body)).toEqual({
-            threadId: 'thread-1',
+        // Canonical split (T13/T14): one transcript is THREE reads of different sizes —
+        // a metadata head, a paged message slice, and the whole document for the editor.
+        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
             agent: 'one',
-            messages: SEEDED_TRANSCRIPT,
-            raw: pretty(SEEDED_TRANSCRIPT)
+            transcript_state: 'ok',
+            message_count: 3,
+            chars: 20,
+            bytes: 115,
+            revision: hubRevision(runtime, 'transcript', sessionId, 'thread-1'),
+            role_counts: { system: 1, user: 1, assistant: 1, tool: 0 }
         });
 
-        // The `/api` mount reaches the same store (dispatcher-level routing).
+        const page = await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 });
+
+        expect(page).toEqual({
+            items: SEEDED_TRANSCRIPT,
+            // `limit` echoes the EFFECTIVE page size, not the requested bound
+            // (api-paging.ts `pageMeta`) — that is how a client spots a short final page.
+            limit: 3,
+            // A short transcript is a complete page: no cursor, `total` is the whole
+            // conversation's entry count regardless of the filter.
+            next_cursor: null,
+            // `observed_at` is the server's wall clock at read time (PageMeta); this file
+            // does not pin the clock, so the key is asserted present-and-self-equal and the
+            // revision is asserted against the hub that owns it.
+            observed_at: page.observed_at,
+            revision: hubRevision(runtime, 'transcript_messages', sessionId, 'thread-1'),
+            thread_id: 'thread-1',
+            agent: 'one',
+            transcript_state: 'ok',
+            total: 3
+        });
+
+        // Exact pretty-printed editor text: key order and the 2-space indent are what the
+        // user reads back after saving (`raw`, now its own route).
+        expect(await readTranscriptDocument(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            agent: 'one',
+            revision: hubRevision(runtime, 'transcript', sessionId, 'thread-1'),
+            transcript_state: 'ok',
+            document: pretty(SEEDED_TRANSCRIPT),
+            content_type: 'application/json'
+        });
+
+        // T13 removed the second mount: `/api` is not served at all, and the 404 NAMES the
+        // canonical root (an alias would keep a dead surface alive behind a flag).
         const viaApi = await callApi(
             runtime,
             'GET',
@@ -340,42 +453,81 @@ describe('thread transcript read/write (C4)', () => {
             {},
             '/api'
         );
-        expect(viaApi.status).toBe(200);
-        expect(viaApi.body).toEqual(got.body);
+
+        expect(viaApi.status).toBe(404);
+        expect(viaApi.body).toEqual({
+            error: { message: 'This server serves /v1/harness; "/api" is not mounted.' }
+        });
 
         runtime.store.dispose();
     });
 
     it('replaces the transcript with a valid PUT, and the model path runs from the replacement', async () => {
         const { root, runtime, sessionId, requests } = await seeded('put-valid');
+        const call = callOf(runtime);
 
-        const put = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
-            messages: [{ role: 'user', content: 'rewritten' }]
+        // The pre-write revision is the base the receipt's counter is asserted against: one
+        // transcript write moves the counter by exactly one.
+        const before = await readTranscriptMetadata(call, sessionId, 'thread-1');
+        expect(before.revision).toBe(0);
+
+        const put = await putTranscript(call, sessionId, 'thread-1', [
+            { role: 'user', content: 'rewritten' }
+        ]);
+
+        // Canonical write answer: a receipt (what was accepted, as what, how many entries,
+        // which revision, and where to re-read) — never the mutated aggregate.
+        expect(put).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            accepted_as: 'transcript',
+            message_count: 1,
+            revision: before.revision + 1,
+            links: transcriptLinks(sessionId)
         });
 
-        expect(put.status).toBe(200);
-        expect(transcriptOf(put.body)).toEqual({
-            threadId: 'thread-1',
+        // A readable transcript carries no invalid marker on the receipt.
+        expect(put).not.toHaveProperty('invalid');
+        expect(put.revision).toBe(hubRevision(runtime, 'transcript', sessionId, 'thread-1'));
+
+        const messages = [{ role: 'user', content: 'rewritten' }] as HarnessMessage[];
+
+        // The replacement is what every transcript read now serves...
+        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
             agent: 'one',
-            messages: [{ role: 'user', content: 'rewritten' }],
-            // Exact editor text: key order and the 2-space indent are what the
-            // user reads back after saving.
-            raw: '[\n  {\n    "role": "user",\n    "content": "rewritten"\n  }\n]'
+            transcript_state: 'ok',
+            message_count: 1,
+            chars: charsOf(messages),
+            bytes: bytesOf(messages),
+            revision: put.revision,
+            role_counts: roleCounts(messages)
         });
+        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+            messages
+        );
 
-        // A readable transcript carries no invalid marker anywhere.
-        expect(resultOf(put.body).transcript.invalid).toBeUndefined();
-        expect(resultOf(put.body).session.invalidThreads).toBeUndefined();
-        expect(threadOf(resultOf(put.body).session).messages).toEqual([{ role: 'user', content: 'rewritten' }]);
+        // Exact editor text: key order and the 2-space indent are what the user reads back
+        // after saving.
+        expect((await readTranscriptDocument(call, sessionId, 'thread-1')).document).toBe(
+            '[\n  {\n    "role": "user",\n    "content": "rewritten"\n  }\n]'
+        );
+
+        // The roster still addresses the conversation, and says how many entries it holds.
+        expect(
+            (await listThreads(call, sessionId)).map((row) => [
+                row.id,
+                row.status,
+                row.transcript_state,
+                row.message_count
+            ])
+        ).toEqual([['thread-1', 'idle', 'ok', 1]]);
 
         // Visible to the harness immediately (the roster is a live read), and
         // durable: the committed core snapshot holds the replacement.
-        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual([
-            { role: 'user', content: 'rewritten' }
-        ]);
-        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual([
-            { role: 'user', content: 'rewritten' }
-        ]);
+        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual(messages);
+        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(messages);
 
         // The next turn of the SAME conversation starts from the edited value: the
         // request the provider actually receives is the replacement plus the new
@@ -399,35 +551,78 @@ describe('thread transcript read/write (C4)', () => {
 
     it('accepts a structurally invalid transcript with 200 and reports it as unreadable', async () => {
         const { root, runtime, sessionId } = await seeded('put-invalid');
+        const call = callOf(runtime);
+        const submitted = [{ role: 'bogus', content: 'x' }] as unknown as HarnessMessage[];
 
-        const put = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
-            messages: [{ role: 'bogus', content: 'x' }]
+        const put = await putTranscript(call, sessionId, 'thread-1', submitted);
+
+        // A structurally invalid draft is a SUCCESSFUL write: `accepted_as: "raw"` plus the
+        // reason and the JSON type that was stored — the validation outcome is data, not a
+        // status code.
+        expect(put).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            accepted_as: 'raw',
+            // The canonical transcript is EMPTY while the draft is unreadable; the receipt
+            // counts what the conversation can read, not the raw submission.
+            message_count: 0,
+            revision: 1,
+            invalid: { error: BAD_ROLE, stored_type: 'array' },
+            links: transcriptLinks(sessionId)
         });
 
-        expect(put.status).toBe(200);
-
-        const result = resultOf(put.body);
-        expect(result.transcript).toEqual({
-            threadId: 'thread-1',
+        // The unreadable state is on the metadata head, and the raw submission is served by
+        // the document route so the editor shows the user exactly what they wrote.
+        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
             agent: 'one',
-            // The live transcript is the placeholder: that is what this conversation
-            // can legally run and restore with.
-            messages: placeholder(BAD_ROLE),
-            // `raw` is the submitted value VERBATIM (bad role included), so the
-            // editor shows the user exactly what they wrote.
-            raw: '[\n  {\n    "role": "bogus",\n    "content": "x"\n  }\n]',
-            invalid: { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
+            transcript_state: 'unreadable',
+            ...EMPTY_HEAD,
+            revision: put.revision,
+            unreadable_reason: BAD_ROLE,
+            stored_type: 'array'
         });
 
-        // The snapshot reports the unreadable thread, keyed and sorted by id.
-        expect(result.session.invalidThreads).toEqual([
+        const document = await readTranscriptDocument(call, sessionId, 'thread-1');
+
+        expect(document).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            agent: 'one',
+            revision: put.revision,
+            transcript_state: 'unreadable',
+            document: pretty(submitted),
+            content_type: 'application/json'
+        });
+
+        // The paged read serves an EMPTY transcript while the draft is unreadable, and says
+        // so — an editor pages this route and still learns the state from `total`.
+        const page = await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 });
+
+        expect(page.items).toEqual([]);
+        expect(page.limit).toBe(0);
+        expect(page.transcript_state).toBe('unreadable');
+        expect(page.total).toBe(0);
+
+        // The roster still addresses the thread (the visualiser keeps working), and names the
+        // transcript as unreadable with its exact reason.
+        expect(
+            (await listThreads(call, sessionId)).map((row) => [
+                row.id,
+                row.agent,
+                row.status,
+                row.transcript_state,
+                row.transcript_error,
+                row.message_count
+            ])
+        ).toEqual([['thread-1', 'one', 'idle', 'unreadable', BAD_ROLE, 0]]);
+
+        // The snapshot projection still reports the unreadable thread, keyed and sorted by id
+        // (store oracle — an accepted internal read, not a network compatibility shape).
+        expect(runtime.store.get(sessionId).invalidThreads).toEqual([
             { id: 'thread-1', agent: 'one', error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
         ]);
-        expect(runtime.store.get(sessionId).invalidThreads).toEqual(result.session.invalidThreads);
-
-        // The roster still addresses the thread (the visualiser keeps working).
-        expect(threadOf(result.session).id).toBe('thread-1');
-        expect(threadOf(result.session).status).toBe('idle');
 
         // And this is the durable record, not only the response.
         expect(storedSession(root, sessionId).invalidThreads).toEqual({
@@ -440,34 +635,60 @@ describe('thread transcript read/write (C4)', () => {
 
     it('accepts a value that is not an array, and a later valid save clears everything', async () => {
         const { root, runtime, sessionId } = await seeded('put-not-array');
+        const call = callOf(runtime);
 
-        const put = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
-            messages: { not: 'an array' }
+        const put = await putTranscript(call, sessionId, 'thread-1', { not: 'an array' });
+
+        expect(put).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            accepted_as: 'raw',
+            message_count: 0,
+            revision: 1,
+            invalid: { error: NOT_AN_ARRAY, stored_type: 'object' },
+            links: transcriptLinks(sessionId)
         });
 
-        expect(put.status).toBe(200);
+        // The raw submission survives verbatim on the document route, and the live
+        // transcript is the placeholder the store minted for it.
+        expect((await readTranscriptDocument(call, sessionId, 'thread-1')).document).toBe(
+            '{\n  "not": "an array"\n}'
+        );
+        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+            []
+        );
+        expect((await readTranscriptMetadata(call, sessionId, 'thread-1')).stored_type).toBe('object');
 
-        const result = resultOf(put.body);
-        expect(result.transcript.raw).toBe('{\n  "not": "an array"\n}');
-        expect(result.transcript.invalid).toEqual({
-            error: NOT_AN_ARRAY,
-            messages: { not: 'an array' }
-        });
-        expect(result.transcript.messages).toEqual(placeholder(NOT_AN_ARRAY));
-        expect(result.session.invalidThreads).toEqual([
+        // The snapshot projection carries the unreadable record (store oracle).
+        expect(runtime.store.get(sessionId).invalidThreads).toEqual([
             { id: 'thread-1', agent: 'one', error: NOT_AN_ARRAY, messages: { not: 'an array' } }
         ]);
 
         // An empty array is a VALID transcript (it is what the editor clears to).
-        const cleared = await callApi(runtime, 'PUT', transcriptPath(sessionId), { messages: [] });
-        expect(cleared.status).toBe(200);
-        expect(resultOf(cleared.body).transcript).toEqual({
-            threadId: 'thread-1',
-            agent: 'one',
-            messages: [],
-            raw: '[]'
+        const cleared = await putTranscript(call, sessionId, 'thread-1', []);
+
+        expect(cleared).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            accepted_as: 'transcript',
+            message_count: 0,
+            revision: 2,
+            links: transcriptLinks(sessionId)
         });
-        expect(resultOf(cleared.body).session.invalidThreads).toBeUndefined();
+        expect(cleared).not.toHaveProperty('invalid');
+
+        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            agent: 'one',
+            transcript_state: 'ok',
+            message_count: 0,
+            chars: 0,
+            bytes: 2,
+            revision: cleared.revision,
+            role_counts: { system: 0, user: 0, assistant: 0, tool: 0 }
+        });
+        expect((await readTranscriptDocument(call, sessionId, 'thread-1')).document).toBe('[]');
         expect(runtime.store.get(sessionId).invalidThreads).toBeUndefined();
 
         // A repaired document does not keep the raw record it no longer needs.
@@ -480,11 +701,12 @@ describe('thread transcript read/write (C4)', () => {
     it('serves the raw value and the error for an unreadable thread after a restart', async () => {
         const { root, runtime, sessionId } = await seeded('get-invalid');
 
-        await callApi(runtime, 'PUT', transcriptPath(sessionId), { messages: 'broken' });
+        await putTranscript(callOf(runtime), sessionId, 'thread-1', 'broken');
         runtime.store.dispose();
 
         // A FRESH runtime reads the persisted placeholder + raw value back.
         const second = runtimeOf(root, scriptedPreset('one').preset);
+        const secondCall = callOf(second);
         const snapshot = second.store.get(sessionId);
 
         expect(second.store.restoreErrors).toEqual([]);
@@ -493,15 +715,23 @@ describe('thread transcript read/write (C4)', () => {
             { id: 'thread-1', agent: 'one', error: NOT_AN_ARRAY, messages: 'broken' }
         ]);
 
-        const got = await callApi(second, 'GET', transcriptPath(sessionId));
-        expect(got.status).toBe(200);
-        expect(transcriptOf(got.body)).toEqual({
-            threadId: 'thread-1',
+        // The metadata head names the failure; the document route serves the RAW value the
+        // operator wrote, verbatim, for editing.
+        expect(await readTranscriptMetadata(secondCall, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
             agent: 'one',
-            messages: placeholder(NOT_AN_ARRAY),
-            raw: '"broken"',
-            invalid: { error: NOT_AN_ARRAY, messages: 'broken' }
+            transcript_state: 'unreadable',
+            ...EMPTY_HEAD,
+            revision: hubRevision(second, 'transcript', sessionId, 'thread-1'),
+            unreadable_reason: NOT_AN_ARRAY,
+            stored_type: 'string'
         });
+
+        const document = await readTranscriptDocument(secondCall, sessionId, 'thread-1');
+
+        expect(document.transcript_state).toBe('unreadable');
+        expect(document.document).toBe('"broken"');
 
         // The thread is still addressable and still runnable after the restart: a
         // broken transcript never takes the conversation down with it.
@@ -521,9 +751,9 @@ describe('thread transcript read/write (C4)', () => {
     it('round-trips an unreadable transcript through a restart without dropping the session', async () => {
         const { root, runtime, sessionId } = await seeded('persist-invalid');
 
-        await callApi(runtime, 'PUT', transcriptPath(sessionId), {
-            messages: [{ role: 'bogus', content: 'x' }]
-        });
+        await putTranscript(callOf(runtime), sessionId, 'thread-1', [
+            { role: 'bogus', content: 'x' }
+        ]);
 
         // The operator's raw text is IN the file, beside the placeholder core.
         const written = fs.readFileSync(stateFile(root), 'utf8');
@@ -550,11 +780,13 @@ describe('thread transcript read/write (C4)', () => {
 
         // A fix submitted after the restart clears the record for good — including
         // on disk.
-        const repaired = await callApi(second, 'PUT', transcriptPath(sessionId), {
-            messages: [{ role: 'user', content: 'fixed after restart' }]
-        });
+        const repaired = await putTranscript(callOf(second), sessionId, 'thread-1', [
+            { role: 'user', content: 'fixed after restart' }
+        ]);
 
-        expect(resultOf(repaired.body).transcript.invalid).toBeUndefined();
+        // The receipt says plainly that this write was accepted AS a transcript.
+        expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 1 });
+        expect(repaired).not.toHaveProperty('invalid');
         expect(fs.readFileSync(stateFile(root), 'utf8')).not.toContain('invalidThreads');
 
         // Third process: the repaired session loads with nothing unreadable.
@@ -630,17 +862,16 @@ describe('thread transcript read/write (C4)', () => {
 
         // The default conversation IS addressable by its `agent:<name>` id, and an
         // invalid submission is accepted exactly like a host thread's.
-        const put = await callApi(runtime, 'PUT', transcriptPath(sessionId, 'agent:one'), {
-            messages: 'broken'
-        });
+        const put = await putTranscript(callOf(runtime), sessionId, 'agent:one', 'broken');
 
-        expect(put.status).toBe(200);
-        expect(transcriptOf(put.body)).toEqual({
-            threadId: 'agent:one',
-            agent: 'one',
-            messages: placeholder(DEFAULT_NOT_ARRAY),
-            raw: '"broken"',
-            invalid: { error: DEFAULT_NOT_ARRAY, messages: 'broken' }
+        expect(put).toEqual({
+            session_id: sessionId,
+            thread_id: 'agent:one',
+            accepted_as: 'raw',
+            message_count: 0,
+            revision: 1,
+            invalid: { error: DEFAULT_NOT_ARRAY, stored_type: 'string' },
+            links: transcriptLinks(sessionId, 'agent:one')
         });
 
         // Durable BEFORE the restart, too.
@@ -662,23 +893,32 @@ describe('thread transcript read/write (C4)', () => {
         ]);
         expect(restored.messages).toEqual(placeholder(DEFAULT_NOT_ARRAY));
 
-        const got = await callApi(second, 'GET', transcriptPath(sessionId, 'agent:one'));
-        expect(got.status).toBe(200);
-        expect(transcriptOf(got.body)).toEqual({
-            threadId: 'agent:one',
+        const secondCall = callOf(second);
+
+        expect(await readTranscriptMetadata(secondCall, sessionId, 'agent:one')).toEqual({
+            session_id: sessionId,
+            thread_id: 'agent:one',
             agent: 'one',
-            messages: placeholder(DEFAULT_NOT_ARRAY),
-            raw: '"broken"',
-            invalid: { error: DEFAULT_NOT_ARRAY, messages: 'broken' }
+            transcript_state: 'unreadable',
+            ...EMPTY_HEAD,
+            revision: hubRevision(second, 'transcript', sessionId, 'agent:one'),
+            unreadable_reason: DEFAULT_NOT_ARRAY,
+            stored_type: 'string'
         });
+
+        const document = await readTranscriptDocument(secondCall, sessionId, 'agent:one');
+
+        expect(document.transcript_state).toBe('unreadable');
+        expect(document.document).toBe('"broken"');
 
         // A fix submitted after the restart clears the record for good, on disk as
         // well as in memory (the same lifecycle a host thread has).
-        const repaired = await callApi(second, 'PUT', transcriptPath(sessionId, 'agent:one'), {
-            messages: [{ role: 'user', content: 'fixed after restart' }]
-        });
+        const repaired = await putTranscript(secondCall, sessionId, 'agent:one', [
+            { role: 'user', content: 'fixed after restart' }
+        ]);
 
-        expect(resultOf(repaired.body).transcript.invalid).toBeUndefined();
+        expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 1 });
+        expect(repaired).not.toHaveProperty('invalid');
         expect(fs.readFileSync(stateFile(root), 'utf8')).not.toContain('invalidThreads');
         expect(second.store.get(sessionId).messages).toEqual([
             { role: 'user', content: 'fixed after restart' }
@@ -714,51 +954,60 @@ describe('thread transcript read/write (C4)', () => {
     // server state through a value it merely read.
     it('stores and serves the raw invalid value by value, not by reference', async () => {
         const { root, runtime, sessionId } = await seeded('invalid-by-reference');
+        const call = callOf(runtime);
 
         // A caller-held object, exactly what `PUT` hands the store.
         const submitted = [{ role: 'bogus', content: 'x' }];
-        const put = await callApi(runtime, 'PUT', transcriptPath(sessionId), { messages: submitted });
+        const put = await putTranscript(call, sessionId, 'thread-1', submitted);
 
-        expect(put.status).toBe(200);
-        expect(resultOf(put.body).transcript.invalid).toEqual({
-            error: BAD_ROLE,
-            messages: [{ role: 'bogus', content: 'x' }]
+        expect(put).toMatchObject({
+            accepted_as: 'raw',
+            invalid: { error: BAD_ROLE, stored_type: 'array' }
         });
 
         // Writing through the CALLER's array after the fact cannot rewrite the record.
         submitted[0].content = 'mutated by the writer';
         submitted.push({ role: 'also-bogus', content: 'y' });
 
-        // And neither can writing through the value the READER was handed.
-        const first = await callApi(runtime, 'GET', transcriptPath(sessionId));
-        const invalid = transcriptOf(first.body).invalid;
-
-        if (invalid === undefined) throw new Error('expected an unreadable transcript');
-        expect(invalid.messages).not.toBe(submitted);
-
-        (invalid.messages as unknown as Record<string, unknown>).mutated = true;
-        (invalid.messages as unknown as { content: string }[])[0].content = 'mutated by the reader';
-
-        const again = await callApi(runtime, 'GET', transcriptPath(sessionId));
-        expect(transcriptOf(again.body)).toEqual({
-            threadId: 'thread-1',
-            agent: 'one',
-            messages: placeholder(BAD_ROLE),
-            raw: pretty([{ role: 'bogus', content: 'x' }]),
-            invalid: { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
+        // The raw bytes the server stored are exactly what was SUBMITTED, on both the
+        // document route and the durable file.
+        expect((await readTranscriptDocument(call, sessionId, 'thread-1')).document).toBe(
+            pretty([{ role: 'bogus', content: 'x' }])
+        );
+        expect(storedSession(root, sessionId).invalidThreads).toEqual({
+            'thread-1': { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }], agent: 'one' }
         });
 
-        // The snapshot projection hands out a copy as well, and the durable document
-        // still carries exactly what was submitted.
-        const snapshot = runtime.store.get(sessionId);
-        const projected = snapshot.invalidThreads?.[0];
+        // Reading the transcript hands out a COPY, so writing through the value a reader
+        // was given cannot rewrite server state either.
+        const projected = runtime.store.get(sessionId).invalidThreads?.[0];
 
-        expect(projected?.messages).toEqual([{ role: 'bogus', content: 'x' }]);
-        if (projected !== undefined) (projected.messages as unknown as { content: string }[])[0].content = 'reader';
+        if (projected === undefined) throw new Error('expected an unreadable transcript');
+        expect(projected.messages).not.toBe(submitted);
+        expect(projected.messages).toEqual([{ role: 'bogus', content: 'x' }]);
+
+        (projected.messages as unknown as Record<string, unknown>).mutated = true;
+        (projected.messages as unknown as { content: string }[])[0].content = 'mutated by the reader';
+
+        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            agent: 'one',
+            transcript_state: 'unreadable',
+            ...EMPTY_HEAD,
+            revision: hubRevision(runtime, 'transcript', sessionId, 'thread-1'),
+            unreadable_reason: BAD_ROLE,
+            stored_type: 'array'
+        });
+        expect((await readTranscriptDocument(call, sessionId, 'thread-1')).document).toBe(
+            pretty([{ role: 'bogus', content: 'x' }])
+        );
+
+        // The snapshot projection hands out a fresh copy every time, and the durable
+        // document still carries exactly what was submitted.
         expect(runtime.store.get(sessionId).invalidThreads?.[0]?.messages).toEqual([
             { role: 'bogus', content: 'x' }
         ]);
-
         expect(storedSession(root, sessionId).invalidThreads).toEqual({
             'thread-1': { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }], agent: 'one' }
         });
@@ -790,15 +1039,21 @@ describe('thread transcript route status contract (C4)', () => {
     it('answers 404 for an unknown thread and an unknown session', async () => {
         const { runtime, sessionId } = await seeded('not-found');
 
+        // The canonical envelope is `{error:{message}}` for every failure, and the 404
+        // names the collection it searched (`in session "..."`) so a stale id is traceable.
         const missingGet = await callApi(runtime, 'GET', transcriptPath(sessionId, 'thread-9'));
         expect(missingGet.status).toBe(404);
-        expect(missingGet.body).toEqual({ error: { message: 'Unknown thread "thread-9".' } });
+        expect(missingGet.body).toEqual({
+            error: { message: `Unknown thread "thread-9" in session "${sessionId}".` }
+        });
 
         const missingPut = await callApi(runtime, 'PUT', transcriptPath(sessionId, 'thread-9'), {
             messages: []
         });
         expect(missingPut.status).toBe(404);
-        expect(missingPut.body).toEqual({ error: { message: 'Unknown thread "thread-9".' } });
+        expect(missingPut.body).toEqual({
+            error: { message: `Unknown thread "thread-9" in session "${sessionId}".` }
+        });
 
         const unknownSession = await callApi(
             runtime,
@@ -817,23 +1072,39 @@ describe('thread transcript route status contract (C4)', () => {
         expect(unknownSessionGet.status).toBe(404);
         expect(unknownSessionGet.body).toEqual({ error: { message: 'Unknown session "none".' } });
 
+        // The paged and document reads answer the same way: one error path for the surface.
+        for (const pathname of [
+            `/v1/harness/sessions/${sessionId}/threads/thread-9/transcript/messages`,
+            `/v1/harness/sessions/${sessionId}/threads/thread-9/transcript/document`
+        ]) {
+            const missing = await callApi(runtime, 'GET', pathname);
+
+            expect(missing.status).toBe(404);
+            expect(missing.body).toEqual({
+                error: { message: `Unknown thread "thread-9" in session "${sessionId}".` }
+            });
+        }
+
         runtime.store.dispose();
     });
 
     it('answers 400 for an absent messages field and a non-object body, and 405 for a wrong method', async () => {
         const { runtime, sessionId } = await seeded('bad-request');
+        const call = callOf(runtime);
 
         const absent = await callApi(runtime, 'PUT', transcriptPath(sessionId), {});
         expect(absent.status).toBe(400);
         expect(absent.body).toEqual({
-            error: { message: 'A transcript update requires a `messages` value.' }
+            error: { message: 'A transcript update requires a "messages" value.' }
         });
 
-        const nullMessages = await callApi(runtime, 'PUT', transcriptPath(sessionId), { messages: null });
-        expect(nullMessages.status).toBe(200);
-        expect(resultOf(nullMessages.body).transcript.invalid).toEqual({
-            error: NOT_AN_ARRAY,
-            messages: null
+        // A present-but-broken value is still a successful write: `null` is stored raw.
+        const nullMessages = await putTranscript(call, sessionId, 'thread-1', null);
+
+        expect(nullMessages).toMatchObject({
+            accepted_as: 'raw',
+            message_count: 0,
+            invalid: { error: NOT_AN_ARRAY, stored_type: 'null' }
         });
 
         const arrayBody = await callApi(runtime, 'PUT', transcriptPath(sessionId), []);
@@ -842,18 +1113,73 @@ describe('thread transcript route status contract (C4)', () => {
             error: { message: 'The request body must be a JSON object.' }
         });
 
+        // The dispatcher owns the method contract: the answer names the verbs the path
+        // actually serves, generated from the route table (api.ts `dispatch`).
         const wrongMethod = await callApi(runtime, 'POST', transcriptPath(sessionId), { messages: [] });
         expect(wrongMethod.status).toBe(405);
         expect(wrongMethod.body).toEqual({
-            error: { message: 'Use GET or PUT for /v1/harness/sessions/:id/threads/:threadId/transcript.' }
+            error: {
+                message: `Use GET, PUT for /v1/harness/sessions/${sessionId}/threads/thread-1/transcript.`
+            }
         });
 
         // Nothing above touched the seeded conversation except the accepted
         // `messages: null` save, which the readable save below repairs.
-        const repaired = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
-            messages: SEEDED_TRANSCRIPT
+        const repaired = await putTranscript(call, sessionId, 'thread-1', SEEDED_TRANSCRIPT);
+
+        expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 3 });
+        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+            SEEDED_TRANSCRIPT
+        );
+
+        // THE one optimistic lock in the contract: `if_revision` against a stale figure
+        // refuses with 409 naming the current revision and writes nothing.
+        const stale = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
+            messages: [{ role: 'user', content: 'stale write' }],
+            if_revision: repaired.revision - 1
         });
-        expect(resultOf(repaired.body).transcript.messages).toEqual(SEEDED_TRANSCRIPT);
+
+        expect(stale.status).toBe(409);
+        expect(stale.body).toEqual({
+            error: {
+                message: `This transcript is at revision ${repaired.revision}; the write expected ${repaired.revision - 1}. Re-read before writing.`
+            }
+        });
+        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+            SEEDED_TRANSCRIPT
+        );
+
+        // A non-integer guard is a 400, and the matching revision writes.
+        const malformedGuard = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
+            messages: [],
+            if_revision: '3'
+        });
+
+        expect(malformedGuard.status).toBe(400);
+        expect(malformedGuard.body).toEqual({ error: { message: '"if_revision" must be an integer.' } });
+
+        const current = await readTranscriptMetadata(call, sessionId, 'thread-1');
+        const matched = await putTranscript(
+            call,
+            sessionId,
+            'thread-1',
+            [{ role: 'user', content: 'locked write' }],
+            current.revision
+        );
+
+        expect(matched).toMatchObject({ accepted_as: 'transcript', message_count: 1 });
+        expect(matched.revision).toBe(current.revision + 1);
+
+        // An unknown body field is refused before anything is written.
+        const unknownField = await callApi(runtime, 'PUT', transcriptPath(sessionId), {
+            messages: [],
+            replace: true
+        });
+
+        expect(unknownField.status).toBe(400);
+        expect(unknownField.body).toEqual({
+            error: { message: 'Unknown field "replace". Allowed fields: messages, if_revision.' }
+        });
 
         runtime.store.dispose();
     });

@@ -187,6 +187,13 @@ it('saves through PUT and applies the returned session through the snapshot path
     } as unknown as SessionSnapshot;
     const bodies: string[] = [];
 
+    // The SERVER holds this record, and a successful write moves it. A canonical transcript PUT
+    // answers a WRITE RECEIPT only (../shared/harness-api.ts:1552) — never a session document — so
+    // the shell learns the saved state the ordinary way: one bounded re-read, applied through the
+    // snapshot path. The fixture therefore mutates its own document on the PUT, exactly as the
+    // store does, instead of answering every later read with the pre-save value.
+    let host: SessionSnapshot = before;
+
     localStorage.setItem(SESSION_KEY, 's1');
     vi.stubGlobal(
         'fetch',
@@ -197,6 +204,7 @@ it('saves through PUT and applies the returned session through the snapshot path
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions/s1/threads/thread-a/transcript' && method === 'PUT') {
                 bodies.push(String(init?.body ?? ''));
+                host = applied;
 
                 return json({
                     session: applied,
@@ -208,7 +216,7 @@ it('saves through PUT and applies the returned session through the snapshot path
                     }
                 });
             }
-            if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
+            if (url === '/api/sessions/s1' && method === undefined) return json({ session: host });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
         }, { root: '/api' }))
@@ -255,6 +263,9 @@ it('keeps the editor and marks the board when the saved transcript is unreadable
     ];
 
     const bodies: string[] = [];
+    // Same rule as the readable save: the write moves the SERVER's record, and the shell finds
+    // the new state (including the `invalidThreads` roster entry) by re-reading it.
+    let host: SessionSnapshot = before;
     localStorage.setItem(SESSION_KEY, 's1');
     vi.stubGlobal(
         'fetch',
@@ -265,6 +276,7 @@ it('keeps the editor and marks the board when the saved transcript is unreadable
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions/s1/threads/thread-a/transcript' && method === 'PUT') {
                 bodies.push(String(init?.body ?? ''));
+                host = applied;
 
                 return json({
                     session: applied,
@@ -277,7 +289,7 @@ it('keeps the editor and marks the board when the saved transcript is unreadable
                     }
                 });
             }
-            if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
+            if (url === '/api/sessions/s1' && method === undefined) return json({ session: host });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
         }, { root: '/api' }))

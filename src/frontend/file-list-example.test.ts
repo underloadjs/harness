@@ -10,6 +10,7 @@
 
 import type { ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const fileListTool: ToolDescriptor = {
     name: 'fileList',
@@ -62,7 +63,7 @@ beforeEach(() => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -97,6 +98,18 @@ beforeEach(() => {
 
             if (url === '/api/models') return json({ models: ['m1'] });
 
+            // T17: an argument schema exists only on the identified tool read
+            // (`GET /v1/harness/tools/{id}` → `ToolDetail`, ../shared/harness-api.ts:654;
+            // the catalogue PAGE row `ToolSummary` deliberately carries none). The adapter
+            // routes that read to this raw twin. The body is the same fixture entry plus
+            // the `execution` scope and `session_bound` the contract requires — nothing the
+            // fixture does not already state.
+            if (url === '/api/tools/fileList' && method === undefined) {
+                return json({
+                    tool: { ...fileListTool, session_bound: false, execution: { scope: 'global', manual: true } }
+                });
+            }
+
             if (url === '/api/tools/fileList' && method === 'POST') {
                 return json({
                     ok: true,
@@ -105,8 +118,13 @@ beforeEach(() => {
                 });
             }
 
+            // T45: the shell dials the canonical control plane (service document, global
+            // config, one page per catalogue) and `POST /tools/{id}/executions`; the
+            // `viewAwareFetch` adapter above re-acts those from the routes declared here,
+            // rewriting the execution call back to its `/api/tools/fileList` twin so the
+            // recorded `calls` log keeps the path this test asserts on.
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }, { root: '/api' }))
     );
 });
 
@@ -138,8 +156,10 @@ it('offers the paths array as the example and sends it unwrapped', async () => {
     await flush();
     await flush();
 
-    // Unwrapped on the wire, exactly like the harness and the server expect.
-    expect(calls.find((call) => call.url === '/api/tools/fileList')).toEqual({
+    // Unwrapped on the wire, exactly like the harness and the server expect. `method: 'POST'` is
+    // the execution (`POST /v1/harness/tools/{id}/executions`): opening the tool also spends one
+    // identified schema read on the same path (`GET`, ../shared/harness-api.ts:654).
+    expect(calls.find((call) => call.url === '/api/tools/fileList' && call.method === 'POST')).toEqual({
         url: '/api/tools/fileList',
         method: 'POST',
         body: { parameters: ['.'] }

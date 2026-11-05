@@ -24,6 +24,9 @@ import type {
     TaskReceipt
 } from '../shared/harness-api';
 import type { HarnessActionChoice } from '../types';
+// The shell's OWN provider record (camelCase). Type-only import, the same convention
+// ./main.ts:96-109 already follows for `../server/protocol`.
+import type { RunnerSettings } from '../server/protocol';
 import type { TurnDisplay, TurnDisplayOp, TurnSummary } from '../shared/turn-display';
 import {
     answerAction,
@@ -46,6 +49,7 @@ import {
     projectOps,
     readActions,
     readBlockDetail,
+    sessionPatchViewOf,
     readRawTurns,
     readStepDetail,
     readTranscript,
@@ -54,7 +58,9 @@ import {
     removeThread,
     resetConversation,
     rowFromReceipt,
-    sessionViewOf,
+    // T38: THE directory row normalizer (./view-api.ts:159). `listViews` and the boot
+    // document's embedded page both map through it, so a row is one camelCase record.
+    sessionRowOf,
     stopConversation,
     stopThread,
     submitConversationTask,
@@ -67,7 +73,13 @@ import {
 } from './view-api';
 import { harnessStream } from './stream';
 import type { StreamSubscription } from './stream';
-import type { WsResyncRequired, WsUpdate, WsUpdateDisplayOps, WsUpdateTurnUpsert } from '../shared/harness-stream';
+import type {
+    WsResyncRequired,
+    WsUpdate,
+    WsUpdateDisplayOps,
+    WsUpdateSession,
+    WsUpdateTurnUpsert
+} from '../shared/harness-stream';
 import type { ThreadTranscriptPayload } from './view-model';
 
 
@@ -77,27 +89,13 @@ import type { ThreadTranscriptPayload } from './view-model';
 
 // `GET /sessions?limit=25` mapped into the rail's row shape. The rail renders
 // metadata + counters, which is exactly what a session ROW is; it never needs turns
-// or display trees, so the directory is a constant-size read per page.
+// or display trees, so the directory is a constant-size read per page. One mapper with
+// the boot document's embedded page (`sessionRowOf`, ./view-api.ts:159) — both sources of
+// the directory therefore produce the same camelCase record, and neither is cast.
 export const listViews = async (): Promise<SessionView[]> => {
     const page = await listSessions();
 
-    return page.items.map((row) => ({
-        ...sessionViewOf({
-            ...row,
-            // A row is the metadata subset of a `SessionResource`; the four fields
-            // only the identified read publishes are stated as "not reported" here
-            // rather than invented, and no rail control reads them.
-            definition_revision: 0,
-            agent_models: {},
-            endpoint: { base_url: '', model: row.model, has_api_key: false },
-            runtime_execution: 'inline',
-            pending_action_count: 0,
-            created_tool_count: 0,
-            created_tool_limit: 0
-        } as never),
-        turnCount: row.turn_count,
-        threadCount: row.thread_count
-    }));
+    return page.items.map(sessionRowOf);
 };
 
 
@@ -110,8 +108,39 @@ export const listViews = async (): Promise<SessionView[]> => {
 // only for the tail that paints.
 export const getView = (sessionId: string): Promise<SessionView> => openSession(sessionId);
 
-export const createView = (harness: string, settings?: RunnerSettingsInput): Promise<SessionView> =>
-    createSessionView({ harness, ...(settings === undefined ? {} : { settings }) });
+// Total camelCase → snake_case mapping of the provider settings block. Every field is
+// sent even when blank: `api_key: ''` is what the server already accepts as "no key"
+// (../server/api.ts:553-556), and an omitted `model` is what makes the SERVER fall back
+// to its advertised default (main.ts:438-450), so a blank string keeps the current
+// behaviour rather than silently changing it.
+const settingsInputOf = (settings: RunnerSettings): RunnerSettingsInput => ({
+    base_url: settings.baseURL,
+    api_key: settings.apiKey,
+    model: settings.model
+});
+
+// `POST /sessions` — the settings the shell edits in its own camelCase record
+// (`RunnerSettings`, ../server/harnesses/types.ts:18-22: `baseURL`/`apiKey`/`model`)
+// while the contract's create body is snake_case (`RunnerSettingsInput`,
+// ../shared/harness-api.ts:369-373). The server REJECTS any other spelling with 400:
+// `requireKnownFields` (../server/api.ts:504-510) runs over the `settings` allow-list
+// `base_url, api_key, model` (../server/api.ts:544) before a session is created, so a
+// camelCase body fails the FIRST submit of every new conversation with
+// `Unknown field 'baseURL'. Allowed fields: base_url, api_key, model.`
+//
+// This is the one rename, exactly like `updateView`'s `agentModels → agent_models`
+// (:145-154) and `choiceInputOf`'s `optionId → option_id` (:199): no renderer or call
+// site in ./main.ts has to know which plane the wire is on.
+//
+// WHY THE PARAMETER IS THE DOMAIN RECORD AND NOT THE WIRE TYPE: `RunnerSettingsInput`
+// is all-optional, i.e. a TypeScript WEAK TYPE, and a non-literal argument skips the
+// excess-property check. That is why main.ts:9540 and main.ts:5137 could hand the
+// camelCase record straight through this signature and still compile. `RunnerSettings`
+// requires all three fields, so the wrong plane's record is now a COMPILE error
+// (missing `baseURL`/`apiKey`) instead of a runtime task failure — the same reasoning
+// recorded at main.ts:6474-6487 for the `agent_models` bug.
+export const createView = (harness: string, settings?: RunnerSettings): Promise<SessionView> =>
+    createSessionView({ harness, ...(settings === undefined ? {} : { settings: settingsInputOf(settings) }) });
 
 // The shell patches the live model map in camelCase (`agentModels`, its own render
 // spelling). The contract's field is `agent_models`; this is the one rename.
@@ -185,12 +214,14 @@ export const pendingActionsOf = (sessionId: string): Promise<PendingAction[]> =>
 // Submit
 // ---------------------------------------------------------------------------
 
-// The 202 answer is a RECEIPT. The envelope the shell expects (`view`, `turn`,
-// `steered`) is still produced, but `view` is the windowed document assembled from
-// the receipt — no extra round trip, no history — and `turn` is the optimistic row
-// `rowFromReceipt` builds, which the stream's authoritative `turn.upsert` replaces.
+// The 202 answer is a RECEIPT and NOTHING ELSE: identity, placement, the moved session
+// revision and the queue position (../shared/harness-api.ts `TaskReceipt`). It used to be
+// dressed up as a document, which cost a second full round trip per task and let a
+// whole-document apply erase the rows, the model map and the frozen team the receipt does
+// not carry. `turn` is the paint-only row `rowFromReceipt` builds — the stream's
+// `turn.upsert` is what replaces it — and the session-level figures travel through the
+// shell's own in-place patch (./main.ts `applyReceiptRow`).
 export type SubmitTaskViewResult = {
-    view: SessionView;
     turn: TurnRowView;
     steered?: true;
     steeredThreadId?: string;
@@ -211,16 +242,8 @@ export const submitViewTask = async (
         ...(threadId === undefined ? {} : { threadId })
     });
 
-    const session = await getSession(sessionId);
-    const view = sessionViewOf(session);
-
-    // The queue figure the receipt implies is applied locally: `queue_depth` on the
-    // fresh row already counts the new task, so no extra read is needed for the pill.
-    view.turns = [rowFromReceipt(receipt, input)];
-
     return {
-        view,
-        turn: view.turns[0],
+        turn: rowFromReceipt(receipt, input),
         ...(receipt.steered === true ? { steered: true } : {}),
         ...(receipt.steered_thread_id === undefined ? {} : { steeredThreadId: receipt.steered_thread_id }),
         receipt
@@ -439,9 +462,19 @@ export const createDisplayPlane = (options: DisplayPlaneOptions): DisplayPlane =
 // ---------------------------------------------------------------------------
 
 // The frame vocabulary the shell already handles. `view` is a WINDOWED document (a
-// resync re-read, never a snapshot), and `ops` is one projected frame.
+// resync re-read, never a snapshot), `ops` is one projected frame, and `header` is a
+// SESSION-LEVEL patch — status, queue depth, model map, last error, pending actions —
+// over the document the instance already renders.
+//
+// T44: `header` is deliberately NOT a `view`. A `SessionResource` carries counters and no
+// rows, and a document applied by the shell is AUTHORITATIVE for rows (`applyView` rebuilds
+// the record cache from `session.turns` and tombstones every id it no longer names), so a
+// metadata-only read published as a document wiped a running board. `session.updated`
+// carries no rows by contract (../shared/harness-api.ts `SessionStatePatch`: "No turns,
+// threads, transcripts, events, or definition data"), so nothing may treat it as one.
 export type ViewStreamItem =
     | { type: 'view'; view: SessionView }
+    | { type: 'header'; view: SessionView }
     | { type: 'ops'; turnId: string; at: number; ops: TurnDisplayOp[] }
     | { type: 'failed'; error: { message: string }; view: SessionView };
 
@@ -461,7 +494,9 @@ export type ObserveOptions = {
 //                          ./display-project.ts (never handed over raw)
 //   `turn.removed`       → a window re-read: a row the client held is gone, and the
 //                          rows page is the cheapest truth
-//   `session.updated`    → a header patch applied to the window it belongs to
+//   `session.updated`    → a `header` item (session facts onto the live document) —
+//                          NEVER a `view`: a patch carries no rows, and a `view` is
+//                          authoritative for them (T44)
 //   `thread.upsert`/
 //    `thread.removed`    → a roster re-read
 //   `action.opened`/
@@ -524,19 +559,18 @@ export const observeView = async (
         }
 
         if (update.kind === 'session.updated') {
-            // A metadata patch (status, queue depth, model map, last error) is the
-            // header half of the window; re-reading one metadata row is cheaper and
-            // less error-prone than stitching the patch into the render model here.
-            void getSession(sessionId)
-                .then((session) => {
-                    const view = sessionViewOf(session);
-
-                    // Rows and trees are untouched by a header patch, so the shell
-                    // reconciles the header only: the window it re-applies keeps the
-                    // rows this client already holds.
-                    onItem({ type: 'view', view: { ...view, turns: [] } });
-                })
-                .catch(() => undefined);
+            // The frame's OWN payload is the metadata patch (../shared/harness-api.ts
+            // `SessionStatePatch`: status, queue depth, the live model map, the last error).
+            // Renaming it into the render model is the whole job, so this is painted directly:
+            // a re-read of `GET /sessions/:id` costs a request the frame did not ask for and,
+            // when that route is refused or answers an older document, drops the frame — which
+            // left a streamed failure with no session note and a drained queue with a stale one.
+            //
+            // Rows and trees are untouched by a header patch, so this is a `header` item and
+            // NOT a document: the instance keeps the rows it already holds and takes only the
+            // session-level facts (T44 — a `{...view, turns: []}` document emptied the board
+            // mid-run, because `applyView` rebuilds the records from `session.turns`).
+            onItem({ type: 'header', view: sessionPatchViewOf((update as WsUpdateSession).session) });
 
             return;
         }
@@ -550,7 +584,9 @@ export const observeView = async (
         if (update.kind === 'action.opened' || update.kind === 'action.closed') {
             void readActions(sessionId)
                 .then((actions) => {
-                    onItem({ type: 'view', view: { ...(sessionStub(sessionId)), actions } });
+                    // T44: a pending-action list is a session-level fact, not a document —
+                    // the same zero-row wipe the `session.updated` document caused.
+                    onItem({ type: 'header', view: { ...sessionStub(sessionId), actions } });
                 })
                 .catch(() => undefined);
 
@@ -585,6 +621,22 @@ export const observeView = async (
             settle();
         }
     });
+
+    // T50: an UNDELIVERABLE connection settles here, so the caller's bounded-read path starts
+    // instead of freezing on the last painted document. `stream.ts:459-467` reports `closed`
+    // when the client has no transport to dial (no socket factory: a bare host, a blocked
+    // upgrade, a page that tore the plane down), and `subscribe` dials synchronously, so this
+    // is the only state that can tell the caller "nothing will ever arrive on this
+    // subscription". The early return above (:485) is the same answer for a host with no
+    // `WebSocket` constructor at all; a client that has the constructor and no transport still
+    // has to be answered, which is what this closes. `unsubscribe` keeps the client's
+    // subscription set clean; a closed client has no socket to write the goodbye to.
+    if (client.status() === 'closed') {
+        sub.unsubscribe();
+        settle();
+
+        return done;
+    }
 
     if (signal.aborted) {
         sub.unsubscribe();
@@ -706,9 +758,9 @@ export const observeTurn = async (
     return done;
 };
 
-// A minimal window stub for a frame that only changes the pending-action list. The
-// shell merges by id and ignores an empty row list, so a card answer repaints
-// without a rows read.
+// A minimal header stub for a frame that only changes the pending-action list. It is
+// applied as a `header` patch (T44), so the rows this client already holds survive it —
+// a card answer repaints without a rows read, and without a rows wipe.
 const sessionStub = (sessionId: string): SessionView => ({
     id: sessionId,
     harness: '',
@@ -750,7 +802,42 @@ export const getRawSession = async (
 
     const rows = page === undefined ? [] : ascRows(page);
     const ids = turnIds === undefined || turnIds.length === 0 ? rows.map((row) => row.id) : [...new Set(turnIds)];
-    const rawTurns = await readRawTurns(sessionId, ids);
+
+    // The transcript DOCUMENTS ride the same read, because the dialog this document feeds
+    // renders `threads[].messages` (ui/thread-transcript.ts `buildThreadTranscriptJson`) and
+    // the roster row carries only transcript SIGNALS. Bounded by the roster page it walks,
+    // concurrent because the documents are independent identified reads, and failure-tolerant:
+    // a thread whose document is unreadable keeps its roster row (and the `invalidThreads`
+    // marker the roster already states) rather than failing the whole export.
+    const [rawTurns, documents] = await Promise.all([
+        readRawTurns(sessionId, ids),
+        Promise.allSettled(roster.items.map((row) => readTranscript(sessionId, row.id)))
+    ]);
+
+    // A thread id -> the transcript payload read for it. Kept whole (not just `messages`)
+    // because an UNREADABLE transcript carries its stored bytes in `invalid.raw`, and the
+    // editor quotes those verbatim — the roster row alone states only the verdict.
+    const transcripts = new Map<string, Awaited<ReturnType<typeof readTranscript>>>();
+    documents.forEach((result, index) => {
+        if (result.status === 'fulfilled') transcripts.set(roster.items[index].id, result.value);
+    });
+
+    // The stored value behind an unreadable transcript, parsed back out of the document text so
+    // the editor shows the JSON the server kept rather than the placeholder roster row.
+    const storedValueOf = (threadId: string): unknown => {
+        const raw = transcripts.get(threadId)?.invalid?.raw;
+
+        if (raw === undefined) return undefined;
+
+        try {
+            return JSON.parse(raw);
+        } catch {
+            // A non-JSON document (the server accepted it as raw data) is quoted as its text.
+            return raw;
+        }
+    };
+
+    const rosterRows = roster.items.map(threadRowOf);
 
     return {
         id: session.id,
@@ -764,15 +851,18 @@ export const getRawSession = async (
         turns: rawTurns as unknown as import('../server/protocol').SessionTurn[],
         threads: roster.items.map((row) => ({
             ...threadRowOf(row),
-            // The roster row carries transcript SIGNALS; the export dialog reads the
-            // committed messages through `readTranscript` per thread, which is where a
-            // transcript's bytes belong (bounded, on demand), not in this envelope.
-            messages: []
+            // The transcript's committed messages, read above through `readTranscript` per
+            // thread: the document belongs on the thread the dialog is about to open, and the
+            // roster row alone carries only its signals.
+            messages: transcripts.get(row.id)?.messages ?? []
         })) as unknown as import('../server/protocol').SessionThread[],
-        threadViews: roster.items.map(threadRowOf) as unknown as import('../server/protocol').SessionThreadView[],
-        invalidThreads: invalidThreadsOf(roster.items.map(threadRowOf)) as unknown as import(
-            '../server/protocol'
-        ).SessionInvalidThread[]
+        threadViews: rosterRows as unknown as import('../server/protocol').SessionThreadView[],
+        // The break, with its bytes: `invalidThreadsOf` derives the verdict from the roster row,
+        // and the document read supplies the value the editor quotes (`messages`).
+        invalidThreads: invalidThreadsOf(rosterRows).map((entry) => ({
+            ...entry,
+            messages: storedValueOf(entry.id)
+        })) as unknown as import('../server/protocol').SessionInvalidThread[]
     } as unknown as import('../server/protocol').SessionSnapshot;
 };
 

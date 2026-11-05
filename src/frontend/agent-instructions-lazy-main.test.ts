@@ -117,7 +117,16 @@ const stub = (input: { stored?: Record<string, string>; status?: number; patches
                 }
 
                 throw new Error(`unexpected request: ${method} ${url}`);
-            })
+            },
+            // T32: this fixture declares its routes under `/api`, while the client dials the
+            // contract mount (`/v1/harness`, shared/harness-api.ts:39). The adapter only rewrites
+            // a canonical request into the fixture's own mount when it is TOLD that mount, so
+            // without this option the canonical boot catalogues answer empty and the shell has
+            // no harness to paint — which is the "missing .agent-control-button" this file kept
+            // reporting. `agent-instructions-main.test.ts` and `composer-agent-control.test.ts`
+            // already pass it; the assertions below are unchanged.
+            { root: '/api' }
+            )
         )
     );
 

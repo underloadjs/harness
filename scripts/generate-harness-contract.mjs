@@ -3,7 +3,7 @@
 // canonical spec. The spec is the single source of truth; this file is the projector.
 //
 // Cross-references:
-//   - src/server/harness.swagger.yaml        - target contract (45 paths / 63 ops / 158 component schemas)
+//   - src/server/harness.swagger.yaml        - target contract (45 paths / 63 ops / 185 component schemas)
 //   - src/shared/harness-api.ts              - OUTPUT: resource + request/response DTO types, route table, constants
 //   - src/shared/harness-stream.ts           - OUTPUT: WebSocket frame unions + stream constants
 //   - scripts/generate-tool-manifest.mjs     - same shape of tool (plain node, `--check` mode for CI)

@@ -112,7 +112,7 @@ import type { DisplayStep, TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlock
 // The pending-tool figure a cold display tree states per section (./view-api.ts
 // `readTurnDisplayWithPending`), seeded into the store as the `pending:set` ops it
 // would have arrived as on a live connection.
-import type { HarnessPendingTool } from '../shared/harness-api';
+import type { HarnessInstructionSummaryEntry, HarnessPendingTool, TaskReceipt, ToolDetail } from '../shared/harness-api';
 // The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
 // and every submit below speaks `/views`, so no round trip on this path can carry a
 // recorded event. The raw client (./api.ts) stays imported for the catalogue routes
@@ -140,14 +140,39 @@ import {
     updateView
 } from './view-shell';
 import type { DisplayPlane, ViewStreamItem } from './view-shell';
+// The connection the observation rides. The shell asks it ONE question, when an observation
+// ends: is there a transport at all? `closed` means nothing will ever arrive on a
+// subscription (no factory and no `WebSocket`, stream.ts:193-199 and :459-467), which is the
+// state where the bounded poll — not a one-off re-read — is the observation (see
+// `startWatching`). Accessing the singleton here cannot dial anything: `harnessStream()` only
+// creates the client the first time, and the observer above already did.
+import { harnessStream } from './stream';
 // The lazy payload reads the display plane needs: one turn's tree (the focused
 // subscription's resync recovery), the out-of-band pending figure a cold tree states,
 // and the frozen definition — the only remaining source of a conversation's
 // discovered toolbox, read when the tools surface opens (./view-api.ts header).
-import { readDefinition, readTurnDisplay, readTurnDisplayWithPending } from './view-api';
+// `sessionRowOf` is the SAME row normalizer the directory page uses (./view-api.ts:159):
+// the boot document embeds `SessionSummary` rows in the contract's snake_case spelling, and
+// casting them into `SessionRecord` left `createdAt`/`updatedAt`/`queueDepth` undefined.
+import {
+    readDefinition,
+    // T46: the archived reopen's descriptor (./view-api.ts `frozenDescriptorOf`).
+    frozenDescriptorOf,
+    readTurnDisplay,
+    readTurnDisplayWithPending,
+    // T52: the bounded ROW re-read a submit receipt cannot replace (./view-api.ts
+    // `readTurnRow`): a steer's text and a brand-new thread's label live only on the row.
+    readTurnRow,
+    // T38: the details dialog's lazy per-conversation usage fold (./view-api.ts:850).
+    readUsage,
+    sessionRowOf
+} from './view-api';
 import {
     activeAgentsOf,
     applyOpsToActivity,
+    // T46: the one session-patch merge rule (./view-state.ts), so the shell's header path and
+    // its test assert the SAME field set.
+    applySessionPatch,
     createViewStateStore,
     displayOf as viewDisplayOf,
     isPendingView,
@@ -155,6 +180,9 @@ import {
     stepIndex,
     summariesOf,
     transcriptTurnIdsOf,
+    // T49: the one row-merge rule (./view-state.ts:730) — the same guard the stream's row ops
+    // use, so a receipt row and a `turn.upsert` frame cannot fight over one tile.
+    upsertSummary,
     type ViewStateStore
 } from './view-state';
 // The unwrap of ONE lazy step detail (explicit clicks only): the panel expansion and
@@ -181,10 +209,18 @@ import {
     loadBootstrap,
     updateHarness,
     getHarness,
+    // T32: the one member's effective instruction text, asked for only when the definition's
+    // summary says THIS harness supplies that prompt (./api.ts:689).
+    getHarnessInstructionText,
     updateSession,
+    // T50: the identified catalogue read (argument schema + execution scope) and the row
+    // mapper it shares with the page. A `ToolSummary` row has no schema; this is the read
+    // that supplies one, asked for only when a tool is opened.
+    getTool,
+    toolRowOf
 } from './api';
 import type { HarnessBootstrap } from './api';
-import type { SessionView as RenderSessionView, ThreadTranscriptPayload } from './view-model';
+import type { SessionView as RenderSessionView, ThreadTranscriptPayload, TurnRowView } from './view-model';
 import {
     agentInstructionsOf,
     agentModelsOf,
@@ -465,6 +501,83 @@ const discoveredToolsOf = (sessionId: string, refresh = false): Promise<string[]
     return read;
 };
 
+// T46: the FROZEN TEAM of a conversation whose harness is gone.
+//
+// WHY A READ IS NEEDED AT ALL: the canonical session DTO carries `definition_revision`
+// only (../shared/harness-api.ts `SessionResource`), so after `DELETE /harnesses/:name`
+// the browser holds no team, no per-agent models and no tool list for that record — and
+// `openSession` used to answer "unknown harness" and refuse the conversation outright,
+// which made an archived session unreopenable (the exact R6 parity this closes).
+//
+// WHY THIS IS THE CHEAP SHAPE:
+//   - it is LAZY: `openSession` calls it only when the registry has no descriptor AND the
+//     document carries no frozen team, so an ordinary open costs zero extra reads;
+//   - it is ONE identified read (`GET /sessions/:id/definition`), deduped per conversation
+//     like `discoveredToolsOf` above, so a pill click plus the tools surface cannot cost
+//     two, and a failed read is dropped so a retry can still land;
+//   - it never writes `presetDescriptors` (a deleted harness must not reappear as a rail
+//     row) and never pulls the per-agent instruction TEXTS — the definition resource
+//     carries the override map, the prompts stay the agent dialog's own reads.
+const frozenReads = new Map<string, Promise<HarnessDescriptor | undefined>>();
+
+const readFrozenDefinition = (sessionId: string): Promise<HarnessDescriptor | undefined> => {
+    const cached = frozenReads.get(sessionId);
+    if (cached !== undefined) return cached;
+
+    const read = readDefinition(sessionId)
+        .then((definition) => frozenDescriptorOf(definition))
+        .catch(() => {
+            frozenReads.delete(sessionId);
+
+            return undefined;
+        });
+
+    frozenReads.set(sessionId, read);
+
+    return read;
+};
+
+// T50: the frozen team must reach the PAINT, not only the dialog that edits it.
+//
+// The canonical document states `definition_revision` only (../shared/harness-api.ts
+// `SessionResource`), so a saved conversation whose harness is STILL registered arrives with
+// no team of its own, and `agentViewOf` falls through to `instance.descriptor` — the LIVE
+// preset. That is the exact bug `frozenDefinitionOf` exists to prevent (./contract.ts:273:
+// "the frontend renders that descriptor, never the live one, so an edited harness cannot
+// rewrite a conversation that is already on screen"): the roster, the model selects and the
+// dialog tabs described whatever the harness is TODAY, so a saved team of two painted as
+// one and the per-agent model selects had no member to hold their value.
+//
+// Cost stays bounded and lazy, which is the rule this file follows everywhere:
+//   - one identified read per conversation (`readFrozenDefinition` dedupes and remembers a
+//     failure so a retry can still land), fired from the OPEN path only;
+//   - skipped entirely when the team is already in hand (the document carried one, or the
+//     dialog's own read answered first);
+//   - the answer is cached in `frozenDefinitions`, so every later document for this
+//     conversation re-derives the SAME team through `frozenTeamOf` instead of wiping it;
+//   - the repaint is guarded: a late answer for a conversation the reader left paints
+//     nothing, and an open dialog refreshes through the existing signature-forced path.
+const hydrateFrozenTeam = (instance: Instance): void => {
+    const sessionId = instance.sessionId;
+    if (sessionId === undefined || instance.frozen !== undefined) return;
+
+    void readFrozenDefinition(sessionId).then((frozen) => {
+        if (frozen === undefined) return;
+        // Stale guards: the reader moved on, or another surface (the dialog's own read)
+        // already established this conversation's team in the meantime.
+        if (instance.sessionId !== sessionId || instance.frozen !== undefined) return;
+
+        frozenDefinitions.set(sessionId, frozen);
+        instance.frozen = frozen;
+
+        if (current !== instance) return;
+
+        // The chrome and the dialog both read `instance.frozen`; nothing here re-opens a
+        // dialog the reader never asked for.
+        refreshAgentDialog(agentViewOf(instance), instance, true);
+    });
+};
+
 // The tools view's lazy reads, fired when the view OPENS (never at boot):
 //   - the selected conversation's discovered toolbox lands on the render document,
 //     which is where every renderer reads `SessionView.discoveredTools`;
@@ -519,12 +632,25 @@ const hydrateSessionDefinition = (instance: Instance | undefined, refresh = fals
 // dialog), and every later document for the same conversation re-uses that answer instead
 // of wiping the team it reopened with.
 //
-// What this cache deliberately does NOT do: invent an ARCHIVED harness's team. The
-// definition route answers with a NAMED record even for a conversation that never
-// captured one, so using the route to decide "refuse or reopen" fabricates data the
-// contract refuses to state. The document's own field stays the source for that decision;
-// a DTO that states "this session froze a definition" is the missing piece.
+// What this cache deliberately does NOT do: invent an ARCHIVED harness's team out of a
+// document that never captured one.
+//
+// T46: the archived REOPEN does read the conversation's frozen definition — but only as an
+// answer, never as a guess. The refusal case above is decided on that answer being absent
+// (the shared fixture now 404s a record with no frozen definition instead of naming one
+// after `host.harness`, so a legacy record cannot fabricate a team), and the answer is
+// cached here so `applyView` keeps describing THIS conversation.
 const frozenDefinitions = new Map<string, HarnessDescriptor>();
+
+// T46: the header label of an ARCHIVED conversation (see `openSession`). The registry has no
+// card to take a display title from, so the harness the record itself names is the label —
+// stated the way a card title looks, which is the only thing the reader can act on. The
+// internal key stays internal: `.harness-id` is blanked and hidden by `renderHarnessChrome`.
+const archivedHarnessLabel = (harness: string): string => {
+    const name = harness.trim();
+
+    return name.length === 0 ? name : `${name.charAt(0).toUpperCase()}${name.slice(1)}`;
+};
 
 // The one read a conversation's frozen team comes from: the document's own field when a
 // producer published it, otherwise the cached definition answer.
@@ -1580,7 +1706,7 @@ export type ToolRunnerOptions = {
 
 type ToolRunner = {
     pane: HTMLElement;
-    show: (entry: ToolDescriptor) => void;
+    show: (entry: ToolDescriptor, preserve?: boolean) => void;
     // Repaint the session-context line (the playground context changed underneath an
     // already-open runner).
     sync: () => void;
@@ -1808,6 +1934,13 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         setResponse(JSON.stringify({ ok: false, error }, null, 2), true);
     };
 
+    // The exact text the last preset fill wrote into the box, and the value the CURRENTLY painted
+    // preset list would fill. A schema that lands AFTER the row was painted must adopt its own
+    // starting value when the reader has not touched the box, and must leave it alone the moment
+    // they have — so "untouched" is decided against `lastFilled`, never against a guess.
+    let lastFilled: string | undefined;
+    let firstPresetValue: string | undefined;
+
     // The preset buttons for the entry being shown (R8). `fill` writes the FIRST
     // preset into the textarea, which is what makes the box start with a valid call
     // without ever locking the reader into it.
@@ -1838,6 +1971,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 // editable, so "Call tool" sends exactly this JSON plus any edit the
                 // reader makes on top of it.
                 args.value = JSON.stringify(preset.value, null, 2);
+                lastFilled = args.value;
 
                 for (const other of presetButtons.children) {
                     (other as HTMLButtonElement).setAttribute('aria-pressed', 'false');
@@ -1848,7 +1982,14 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             presetButtons.append(button);
         });
 
-        if (fill && presets.length > 0) args.value = JSON.stringify(presets[0].value, null, 2);
+        // Recorded whether or not this paint fills, so a preserve repaint knows the starting
+        // value the new schema would have offered.
+        firstPresetValue = presets.length > 0 ? JSON.stringify(presets[0].value, null, 2) : undefined;
+
+        if (fill && presets.length > 0) {
+            args.value = JSON.stringify(presets[0].value, null, 2);
+            lastFilled = args.value;
+        }
     };
 
     // Delegation is the one core tool whose VALIDITY depends on the harness the
@@ -2047,7 +2188,18 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     return {
         pane,
         sync,
-        show: (entry) => {
+        show: (entry, preserve = false) => {
+            // A late identified-read repaint (T50) must not destroy work in progress: the
+            // reader's draft, the response they are reading, and the panels/hint under it all
+            // stay exactly as they were. Captured before any painter runs, because every one of
+            // these surfaces writes through the same closures.
+            const prevDraft = preserve ? args.value : undefined;
+            const prevFilled = lastFilled;
+            const prevResponse = preserve ? responseText : undefined;
+            const prevIsError = preserve ? responseLabel === 'error' : false;
+            const prevHintHidden = preserve ? resultHint.hidden : true;
+            const prevHintText = preserve ? resultHint.textContent : '';
+
             active = entry;
 
             const single = singleProperty(entry.parameters);
@@ -2080,8 +2232,9 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             // R8: the preset buttons are painted first and the first one fills the box,
             // so the runner always starts from a named, schema-valid payload (curated
             // example when one exists, schema-derived otherwise) that the reader can
-            // edit freely.
-            paintPresets(entry, true);
+            // edit freely. On a PRESERVE repaint the presets are rebuilt but the box is
+            // not refilled: the draft the reader is working on wins.
+            paintPresets(entry, !preserve);
 
             // delegate's presets depend on the PLAYGROUND harness's team; every other
             // entry (including the server-wide catalogue listing) is team-independent.
@@ -2128,6 +2281,23 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                   : 'response';
             resultHint.hidden = true;
             resultHint.textContent = '';
+
+            // A schema repaint carries no new payload, so everything the previous frame showed
+            // is put back verbatim (see the capture at the top of this function) — EXCEPT an
+            // argument box the reader never touched: an untouched placeholder adopts the real
+            // schema's starting value, which is the whole point of the identified read.
+            if (preserve) {
+                if (prevDraft !== undefined && prevDraft !== prevFilled) args.value = prevDraft;
+                // Untouched box: adopt the real schema's starting value, which is the whole
+                // point of the identified read.
+                else if (firstPresetValue !== undefined) args.value = firstPresetValue;
+
+                if (prevResponse !== undefined) setResponse(prevResponse, prevIsError);
+                if (prevIsError) outputLabelNode.textContent = 'error';
+
+                resultHint.hidden = prevHintHidden;
+                resultHint.textContent = prevHintText;
+            }
 
             sync();
         }
@@ -2855,10 +3025,86 @@ const harnessStatFigures = (summary: SessionUsageSummary): HTMLElement[] => {
     return figures;
 };
 
+// T38: the lazy usage fold for the totals row. A directory row is metadata and counters —
+// it carries NO token figures (../shared/harness-api.ts:807-809), so on a page of rows the
+// honest answer for "input" / "cache" is "not reported" (ui/usage-summary.ts). The server's
+// own per-conversation fold (`GET /sessions/:id/usage`, ./view-api.ts `readUsage`) is the read
+// that turns that into a figure, and it belongs to THIS dialog: it is issued when the details
+// dialog is open, once per conversation, and never at boot — a closed dialog reads nothing
+// back, and a history the reader never opened costs no request.
+//
+// A conversation whose turns are on screen needs no fold: its rows already carry the per-turn
+// tallies the helper sums. `usageInFlight` is the single-flight guard, so a repaint storm
+// (every streamed frame repaints these figures) cannot turn into a request per frame, and a
+// failed fold leaves the figure absent — "not reported" stays true, which is a different fact
+// from zero.
+const usageFolds = new Map<string, HarnessUsage>();
+const usageInFlight = new Set<string>();
+
+const hydrateDialogUsage = (): void => {
+    for (const entry of sessionDirectory()) {
+        const session = entry.session;
+
+        // Nothing to fold: a conversation that never ran a task reports no tokens, and one
+        // already folded or already in flight needs no second read.
+        if (session.turnCount === 0 || session.turnCount === undefined) continue;
+        if (usageFolds.has(session.id) || usageInFlight.has(session.id)) continue;
+
+        usageInFlight.add(session.id);
+
+        void readUsage(session.id).then(
+            (fold) => {
+                usageInFlight.delete(session.id);
+
+                // `usage` is absent when NO turn ever reported a tally
+                // (../shared/harness-api.ts:1358-1368): that is the honest state, so nothing is
+                // stored and the figure stays "not reported" rather than becoming 0.
+                if (fold.usage === undefined) return;
+
+                usageFolds.set(session.id, fold.usage);
+                paintHarnessDialogStats();
+            },
+            () => usageInFlight.delete(session.id)
+        );
+    }
+};
+
 // The totals for the conversation set the dialog is describing, from the one directory
 // projection (`sessionDirectory()`), so the pills and the figures are the same set.
+//
+// T38: the mapping also fixes what a row IS. A directory row carries a turn COUNT and an
+// empty window (`sessionViewOf`'s rule, ./view-api.ts:151-152) — that is not a loaded
+// history, and ui/usage-summary.ts reads a PRESENT `turns` as exactly that (usage-summary.ts
+// :156-161), which would make every row look "fetched and silent" and print an honest zero
+// for a conversation whose rows were never read. So the window is passed through only when it
+// actually holds turns; otherwise the row stays a summary, the helper reports it as pending
+// (`pending`, usage-summary.ts:134-137), and the server's own fold is what turns that into a
+// figure. A row whose fold has been read contributes the aggregate; nothing is invented.
 const harnessDialogSummary = (): SessionUsageSummary =>
-    summarizeSessionUsage(sessionDirectory().map((entry) => entry.session));
+    summarizeSessionUsage(
+        sessionDirectory().map((entry) => {
+            const session = entry.session;
+            const fold = usageFolds.get(session.id);
+
+            // T43: the empty window has to be REMOVED, not just left out of the spread.
+            // `sessionViewOf`/`sessionRowOf` always publish `turns: []` for a directory row
+            // (./view-api.ts:151-155), and `loadedTurns` reads a PRESENT array — even an
+            // empty one — as "history loaded" (./ui/usage-summary.ts:96-98, :159), which
+            // classified every compact row as DETAILED-with-nothing-to-report. That made the
+            // state-2 aggregate below unreachable: the lazy `/sessions/:id/usage` fold was
+            // fetched and cached, then quietly ignored, so the totals showed only the
+            // conversation whose rows happened to be on screen. Destructuring the window out
+            // is what leaves the row a SUMMARY, exactly as the wire describes it.
+            const { turns: rowWindow, ...rest } = session;
+            const loaded = (rowWindow ?? []).length > 0 ? rowWindow : undefined;
+
+            return {
+                ...rest,
+                ...(loaded === undefined ? {} : { turns: loaded }),
+                ...(fold === undefined ? {} : { usage: fold })
+            };
+        })
+    );
 
 // The live `<p>` inside an OPEN dialog, kept so a repaint can touch ONLY these figures.
 // `renderSessions()` is the single painter every snapshot already flows through
@@ -2877,6 +3123,11 @@ const paintHarnessDialogStats = (): void => {
         dialogStats = undefined;
         return;
     }
+
+    // T38: painting the figures is also the moment it is worth READING them — this painter
+    // only runs while the details dialog is on screen, and a directory row carries no token
+    // figure at all. See `hydrateDialogUsage` for the bounded, once-per-conversation rule.
+    hydrateDialogUsage();
 
     const summary = harnessDialogSummary();
 
@@ -4576,6 +4827,12 @@ type Instance = {
     // stored text. Undefined = never read; a harness whose read failed or answered nothing
     // keeps the document-derived map, which is the pre-T11 behaviour rather than a blank.
     harnessInstructions?: Record<string, string>;
+    // T32: the harness's per-agent MODEL overrides, read on the same explicit action
+    // (opening the configuration dialog). A definition CARD omits `agent_models`
+    // (../shared/harness-api.ts:418-433), so the model selects would otherwise show no
+    // override for a harness that has one. Same rule as `harnessInstructions`: undefined
+    // means never read, and a failed read keeps the document-derived map.
+    harnessModels?: Record<string, string>;
     // Tools toolRequest enabled for this session (SessionSnapshot.discoveredTools),
     // shown on the tools view's session note (R21.2 — there is no core dropdown any
     // more). Refreshed by the snapshot a core call triggers.
@@ -4654,6 +4911,16 @@ type Instance = {
     // subscription cannot deliver streamed text; this is the connection that does.
     // Aborting it unsubscribes and never cancels a task.
     turnWatch?: { turnId: string; sessionId: string; controller: AbortController };
+    // T44: the turns whose STALE display tree this instance has already re-read because a
+    // settling row arrived without a flow frame (see `refreshUnopenedTree`). Scoped to the
+    // session id so a conversation switch starts the budget over; one bounded tree read per
+    // turn per open, never a per-frame read.
+    reloadedTrees?: { sessionId: string; ids: Set<string> };
+    // T52: the turns whose compact ROW this instance has already re-read because its submit
+    // receipt could not describe the tile (a steer's text, a new thread's label — see
+    // `refreshReceiptRow`). Same scoping rule as `reloadedTrees`: one bounded row-page read per
+    // turn per open conversation, never one per frame.
+    reloadedRows?: { sessionId: string; ids: Set<string> };
 };
 
 const instances = new Map<string, Instance>();
@@ -4689,10 +4956,20 @@ type SessionRecord = {
     lastError?: string;
     queueDepth?: number;
     threads?: SessionThread[];
-    turns: DirectoryTurn[];
+    // A directory ROW states a turn COUNT, never the turns themselves
+    // (../shared/harness-api.ts:807-809), so the list is optional by contract: an absent
+    // field means "this read never loaded a history", and every reader treats that as no
+    // live record (`?? []`) instead of crashing or assuming an empty queue.
+    turns?: DirectoryTurn[];
     harnessDefinition?: HarnessDescriptor;
     agentModels?: Record<string, string>;
     discoveredTools?: string[];
+    // The server's own counter, carried by every session ROW
+    // (../shared/harness-api.ts:822-823). It is what tells the details dialog whether a
+    // conversation has anything to fold at all (`hydrateDialogUsage`), and it arrives through
+    // `sessionRowOf` (./view-api.ts:159) — a raw row's `turn_count` never reaches the shell in
+    // any other spelling.
+    turnCount?: number;
 };
 
 // The session directory. `SessionViewSummary` is the compact counterpart of
@@ -5585,6 +5862,17 @@ const storedInstructionsOf = (display: HarnessDescriptor, instance: Instance): R
     ...(instance.harnessInstructions ?? {}),
     ...agentInstructionsOf(display)
 });
+
+// T32: the same precedence for the per-agent MODEL map, and for the same reason. A card
+// omits `agent_models` (../shared/harness-api.ts:418-419), so the only complete view of
+// what each member runs is the document plus the definition the dialog's open read
+// produced (`instance.harnessModels`, ./api.ts `getHarness`). Both the selects and every
+// harness PATCH restate THIS map: the server replaces the whole field, so writing only
+// what one frame happened to carry would silently drop another member's override.
+const storedModelsOf = (display: HarnessDescriptor, instance: Instance): Record<string, string> => ({
+    ...(instance.harnessModels ?? {}),
+    ...agentModelsOf(display)
+});
 type AgentView = {
     display: HarnessDescriptor;
     members: string[];
@@ -5629,11 +5917,17 @@ const agentViewOf = (instance: Instance): AgentView => {
     // which is passed as `fallbackModel` and rendered as that model id — never
     // "inherit".
     const overrides = agentModelsOf(display);
+    // T32: the definition the dialog's open read produced is merged in, but only for a
+    // harness WITHOUT a session. A saved conversation keeps its historical precedence —
+    // its own live map (`instance.sessionModels`), then the overrides it was created with
+    // — because a live harness override written after the conversation started is not a
+    // model that conversation runs.
+    const harnessOverrides = storedModelsOf(display, instance);
     const models: Record<string, string> = {};
     for (const name of members) {
         const model = locked
             ? (instance.sessionModels?.[name] ?? overrides[name] ?? instance.sessionModel)
-            : overrides[name];
+            : harnessOverrides[name];
         if (model !== undefined && model.length > 0) models[name] = model;
     }
 
@@ -5767,38 +6061,65 @@ const agentDialogSignatureOf = (view: AgentView): string =>
         agents: agentLibrary.map((agent) => agent.name)
     });
 
-// T11: the configuration dialog's instruction text is NOT part of the compiled view. A
-// `/views` frame types `harnessDefinition` as a `HarnessDescriptor` but OMITS
-// `agentInstructions` (../server/protocol.ts:655-663), because that map is per-agent
-// instruction TEXT and the default wire exists to stop carrying text. Opening the dialog is
-// therefore the ONE explicit action that needs it, and this is the only place the read
-// happens — never during a render, a hydrate, a poll or a stream frame.
+// T11/T32: the configuration dialog's MODEL map and instruction TEXT are not part of the
+// compiled view. A `/views` frame types `harnessDefinition` as a `HarnessDescriptor` but omits
+// both (../server/protocol.ts:655-663), and a definition CARD omits them by contract
+// (../shared/harness-api.ts:418-433) — the identified read adds the model map and an
+// instruction SUMMARY whose rows carry provenance and length, never the prompt
+// (../shared/harness-api.ts:449-460). Opening the dialog is therefore the ONE explicit action
+// that needs either, and this is the only place the read happens: never during a render, a
+// hydrate, a poll or a stream frame.
 //
-// Every failure mode keeps the text this browser already had instead of blanking the
-// editor: a gateway that has not mounted the GET answers 405 and ./api.ts reports
-// `undefined`; a network failure rejects. Both leave the document-derived overrides on
-// screen, which is the pre-T11 behaviour rather than a lost edit. And the answer is applied
-// only while this instance is STILL the one whose dialog was opened, so a late response
-// cannot paint another conversation's configuration.
-const loadHarnessInstructions = (instance: Instance): void => {
+// The text is a second, bounded step. The summary names which members this definition
+// overrides, and only those members are worth a `GET /harnesses/:name/instructions/:agent`
+// (./api.ts `getHarnessInstructionText`); a member that runs the trusted preset already has its
+// text in the agents catalogue the app booted with, so it costs nothing. A definition that
+// states its own `agent_instructions` (an unredacted server) skips the walk entirely.
+//
+// Every failure mode keeps what this browser already had instead of blanking the editor: a
+// gateway that has not mounted the GET answers 405/404 and ./api.ts reports `undefined`; a
+// network failure rejects; a text row that fails leaves that one member unoverridden, which is
+// the honest reading — the write path restates only the overrides this browser has SEEN
+// (`agent-instructions-lazy-main.test.ts` pins it), because the server replaces the map and an
+// invented key would store text nobody ever ran. And the answer is applied only while this
+// instance is STILL the one whose dialog was opened, so a late response cannot paint another
+// conversation's configuration.
+const loadHarnessConfiguration = (instance: Instance): void => {
     const name = instance.descriptor.name;
 
     void getHarness(name)
-        .then((fetched) => {
+        .then(async (fetched) => {
             // No such route (or an answer that names a different harness): keep what we have.
             if (fetched === undefined || fetched.name !== name) return;
 
-            const stored = agentInstructionsOf(descriptorOf(fetched));
+            const definition = descriptorOf(fetched);
+            const models = agentModelsOf(definition);
 
-            // A harness with no stored override needs no repaint at all: every member
-            // already renders the trusted preset text, which is the correct answer.
-            if (Object.keys(stored).length === 0 && instance.harnessInstructions === undefined) return;
+            // An unredacted definition states its own overrides, so the summary walk is not
+            // needed at all; otherwise only the rows this definition supplies are fetched.
+            const stated = agentInstructionsOf(definition);
+            const stored =
+                Object.keys(stated).length > 0
+                    ? stated
+                    : await overriddenInstructionsOf(name, definition.instructionSummary ?? []);
 
+            // Nothing moved: no repaint, and no caret loss for a reader already typing. A
+            // harness with no model override and no stored instruction answers with two empty
+            // maps, which is exactly what an unread instance holds, so the early return is the
+            // same rule T11 stated for the map alone.
+            if (
+                sameStringMap(instance.harnessModels, models) &&
+                sameStringMap(instance.harnessInstructions, stored)
+            ) {
+                return;
+            }
+
+            instance.harnessModels = models;
             instance.harnessInstructions = stored;
             if (current !== instance) return;
 
-            // `refreshAgentDialog` is signature-guarded: an unchanged map repaints nothing,
-            // and a changed one rebuilds the body the reader has not typed into yet (a draft
+            // `refreshAgentDialog` is signature-guarded: unchanged state repaints nothing,
+            // and a changed map rebuilds the body the reader has not typed into yet (a draft
             // they ARE typing survives, because the dialog owns drafts separately).
             refreshAgentDialog(agentViewOf(instance), instance);
         })
@@ -5806,6 +6127,42 @@ const loadHarnessInstructions = (instance: Instance): void => {
             // Stated, not swallowed: the dialog is still usable with the definition this
             // browser was given, and the next open asks again.
         });
+};
+
+// Two override maps are the same server state when every key and value matches. `undefined`
+// (never read) is deliberately NOT the same as `{}` (read, and nothing is overridden): a
+// harness whose first read came back empty still has to record that it asked, or every frame
+// would look like a change.
+const sameStringMap = (left: Record<string, string> | undefined, right: Record<string, string>): boolean => {
+    if (left === undefined) return Object.keys(right).length === 0;
+
+    const names = Object.keys(left);
+
+    return names.length === Object.keys(right).length && names.every((name) => left[name] === right[name]);
+};
+
+// The instruction overrides this definition actually runs, one bounded text read per member
+// the summary flags as THIS harness's own prompt. A row that fails is skipped rather than
+// guessed, and the rows run in parallel because the member set is bounded by the definition
+// (../shared/harness-api.ts:515-524 says the index is not even paged).
+const overriddenInstructionsOf = async (
+    name: string,
+    summary: readonly HarnessInstructionSummaryEntry[]
+): Promise<Record<string, string>> => {
+    const overridden = summary.filter((row) => row.overridden === true && row.source === 'harness');
+    const entries = await Promise.all(
+        overridden.map(async (row): Promise<[string, string] | undefined> => {
+            try {
+                const text = await getHarnessInstructionText(name, row.agent);
+
+                return [row.agent, text.instruction];
+            } catch {
+                return undefined;
+            }
+        })
+    );
+
+    return Object.fromEntries(entries.filter((entry): entry is [string, string] => entry !== undefined));
 };
 
 // Open the dialog for the SELECTED instance. The click handler resolves `current`
@@ -5849,10 +6206,11 @@ const openAgentDialogForCurrent = (): void => {
         }
     });
 
-    // T11: the dialog opened, so the instruction text it edits is now the thing worth one
-    // request. The dialog itself is already painted from the definition in hand, so this
-    // read only ever refines it — a slow or missing route cannot delay or blank the modal.
-    loadHarnessInstructions(instance);
+    // T11/T32: the dialog opened, so the model map and the instruction text it edits are now
+    // the thing worth one request. The dialog itself is already painted from the definition in
+    // hand, so this read only ever refines it — a slow or missing route cannot delay or blank
+    // the modal.
+    loadHarnessConfiguration(instance);
 };
 
 // Close the app-scoped agent dialog (lifecycle changes, Tools view). Idempotent.
@@ -6101,6 +6459,11 @@ const patchAgents = async (
     const subagents = unique.filter((name) => name !== nextPrimary);
     const includeModels = Object.keys(models).length > 0;
     const includeInstructions = Object.keys(instructions).length > 0;
+    // T3: `{}` is meaningful and must still be SENT when an override is being cleared — an
+    // omitted field would leave the stored map in place while the UI claimed the preset was
+    // running again. The same condition decides whether this browser may restate its cached
+    // map below, so the two can never disagree about what the server now holds.
+    const sendsInstructions = includeInstructions || Object.keys(storedInstructionsOf(display, instance)).length > 0;
 
     savingAgents = true;
     // R3: `saving` is the visible word; the label says WHAT is being saved in the
@@ -6108,20 +6471,38 @@ const patchAgents = async (
     setStatus('saving', `saving ${label}`);
 
     try {
+        // T38: the contract's field names, verbatim. `UpdateHarnessRequest`
+        // (../shared/harness-api.ts:488-499) spells the two override maps `agent_models` and
+        // `agent_instructions`; this call used to send the shell's camelCase render spelling
+        // under a conditional spread, which is the one shape TypeScript's excess-property check
+        // does not catch, so the body went to a CLOSED object (`additionalProperties: false`)
+        // with two unknown keys and the maps themselves absent. The answer is read back through
+        // `descriptorOf` (./api.ts:1203), which already maps the snake fields, so nothing else
+        // in the write path needed to change.
         const updated = await updateHarness(display.name, {
             primary: nextPrimary,
             subagents,
-            ...(includeModels ? { agentModels: models } : {}),
-            // T3: `{}` is meaningful and must still be sent — it clears every stored
-            // override so every member runs its trusted preset instruction again.
-            ...(includeInstructions || Object.keys(storedInstructionsOf(display, instance)).length > 0
-                ? { agentInstructions: instructions }
-                : {})
+            ...(includeModels ? { agent_models: models } : {}),
+            ...(sendsInstructions ? { agent_instructions: instructions } : {})
         });
         // descriptorOf is the canonical card/definition -> render descriptor mapping (./api.ts);
         // the cast is nominal only: the protocol type carries legacy optional fields this
         // deployment no longer publishes.
         replaceDescriptor(descriptorOf(updated) as unknown as HarnessDescriptor);
+
+        // T32: the PATCH REPLACED both maps with exactly what was sent, so the two lazy caches
+        // are restated from the request itself. The identified read that `replaceDescriptor`
+        // just consumed publishes an instruction SUMMARY without the prompts
+        // (../shared/harness-api.ts:449-460), so trusting the answer alone would drop a stored
+        // override the reader can still see on screen; a field this PATCH omitted keeps whatever
+        // the browser had, because the server kept it too.
+        const live = instances.get(display.name);
+
+        if (live !== undefined) {
+            if (includeModels) live.harnessModels = { ...models };
+            if (sendsInstructions) live.harnessInstructions = { ...instructions };
+        }
+
         buildHarnesses();
         renderHarnessChrome();
 
@@ -6374,7 +6755,14 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     // runs against the state that was actually on screen.
     closeToolDialog();
 
-    currentTool = entry;
+    // T50: the list row is a `ToolSummary` — identity, group, tags, availability, scope, and no
+    // argument schema. Paint from the cached identified read when this browser already has one,
+    // otherwise paint the row immediately (the first frame must never wait on a request) and let
+    // `hydrateToolDetail` repaint the runner the moment the schema lands.
+    const known = toolDetails.get(entry.name);
+    const shown = known ?? entry;
+
+    currentTool = shown;
     // Selecting a tool ensures the GLOBAL tools view is behind the dialog: that is
     // the only tool listing (R21.2).
     showingTools = true;
@@ -6422,9 +6810,13 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     delete stage.dataset.preset;
     // Populate the persistent runner BEFORE it is adopted, so the dialog paints the
     // argument template/schema on its first frame.
-    runner.show(entry);
-    openToolDialog(entry, trigger);
+    runner.show(shown);
+    openToolDialog(shown, trigger);
     setStatus('idle');
+
+    // The schema is the identified read, and one open costs exactly one of them (memoized until
+    // the catalogue page changes). Awaited nowhere: the row paints immediately.
+    if (known === undefined) void hydrateToolDetail(entry);
 };
 
 // Open or close the GLOBAL tools view (R3). One function for both directions: the
@@ -6569,11 +6961,63 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
     }
 };
 
+// The identified tool reads this browser has already paid for (T50).
+//
+// A catalogue PAGE row is a `ToolSummary`: name, group, description, tags, visibility,
+// availability and `session_bound` — and deliberately NO argument schema, because the schema
+// lives on the identified read (../shared/harness-api.ts:636-648, `ToolDetail` at :654). The
+// runner paints three things from that schema — the preset list, the single-property rule line
+// and the schema pane — so painting a bare row fills the box with `{}` and claims "this schema
+// declares no properties" for a tool that has a full one (the `fileList`/`widgetManage`
+// regressions this memo exists to end).
+//
+// The detail is therefore fetched when, and only when, a tool is opened, and memoized for as
+// long as the catalogue page it came from is current: `buildTools` replaces that page (boot, a
+// catalogue refresh) and drops the memo, which is the revision boundary this resource actually
+// publishes (`ToolDetail` carries no counter of its own). A failed read is not memoized, so the
+// next open asks again, and no list render ever waits on or fans out these reads.
+const toolDetails = new Map<string, ToolDescriptor>();
+
+// Row + identified read, as one descriptor. The row's display facts stay (that is what the list
+// showed and what the click was made on); the schema, availability and session scope come from
+// the detail, because that is the only read that states them.
+const toolDescriptorOf = (row: ToolDescriptor, detail: ToolDetail): ToolDescriptor => {
+    const merged = toolRowOf(detail);
+
+    return {
+        ...row,
+        ...(merged.availability === undefined ? {} : { availability: merged.availability }),
+        sessionBound: merged.sessionBound,
+        parameters: (detail.parameters ?? {}) as Record<string, unknown>
+    };
+};
+
+// Pull one entry's schema, then repaint ONLY if that tool is still the one on screen. A late
+// answer for a tool the reader already left must not replace the runner underneath them.
+const hydrateToolDetail = async (row: ToolDescriptor): Promise<void> => {
+    const detail = await getTool(row.name).catch<ToolDetail | undefined>(() => undefined);
+    if (detail === undefined) return;
+
+    const merged = toolDescriptorOf(row, detail);
+    toolDetails.set(row.name, merged);
+    if (currentTool === undefined || currentTool.name !== row.name) return;
+
+    currentTool = merged;
+    // The runner owns every schema-derived surface (schema pane, presets, the rule line and the
+    // availability note), so one repaint is the whole update. The head keeps the facts the row
+    // already stated: `availability` rides the catalogue row, and a tools-view heading painter
+    // would erase the selected tool's name.
+    runner.show(merged, true);
+};
+
 // Boot entry for the catalogue. R21.2: the tools view is the sole listing, so this
 // only caches the entries (for `setToolsView`) and rebuilds that list — no
 // right-rail duplicate to keep in sync any more.
 const buildTools = (entries: readonly ToolDescriptor[]): void => {
     toolEntries = entries;
+    // A new catalogue page is a new revision of every row in it, so every memoized identified
+    // read describes a list the server has since replaced.
+    toolDetails.clear();
     buildToolsTab(entries);
 };
 
@@ -7246,7 +7690,10 @@ const pendingOf = (session: SessionRecord): boolean => {
     if (queueDepthOf(session) > 0) return true;
     if (session.status === 'running') return true;
 
-    return session.turns.some((turn) => {
+    // A directory row answers a turn COUNT, not the turns (../shared/harness-api.ts:807-809),
+    // so the list is optional: absent means this read never loaded a history, and that is "no
+    // live record", not a crash and not a queue. Only an opened conversation has rows.
+    return (session.turns ?? []).some((turn) => {
         const status = turn.status as string;
         return status === 'running' || status === 'queued';
     });
@@ -7284,6 +7731,23 @@ const markSnapshot = (instance: Instance, session: SessionRecord): void => {
 // The turn tile already renders the `cancelled` status, so the sentence is
 // suppressed from the pane note: a user's own Stop is not an error to report.
 const CANCELLED_MESSAGE = 'The run was cancelled.';
+
+// R1/R2: the ONE rule for the session-scoped failure line. The topbar pill is app-scoped, so
+// a run's outcome is reported here — the tile's status word says `error`/`cancelled`, and this
+// sentence adds the server's message, which the record's events do not carry. A deliberate stop
+// is suppressed: the server stores `The run was cancelled.` as `lastError`, and repeating the
+// user's own Stop as an error is the bug this rule exists to prevent.
+//
+// Both authority paths use it: a whole document (`applyView`) and a `session.updated` metadata
+// patch (`applyHeaderPatch`). Before this, a failure that arrived on the stream — the `failed`
+// frame's session, or a status a poll reported — left the note empty while the tile already
+// read `error`, which is the half-reported failure the status-scope contract refuses.
+const sessionFailureOf = (session: { status?: string; lastError?: string }): string | undefined =>
+    session.status === 'error'
+        ? session.lastError === CANCELLED_MESSAGE
+            ? undefined
+            : (session.lastError ?? 'session error')
+        : undefined;
 
 // Drop `#` reference chips whose turn no longer exists in the authoritative record
 // (R7: deleting a thread deletes its turns). A chip is the ONLY place the exact
@@ -7571,6 +8035,88 @@ const reloadTurnTree = (instance: Instance, sessionId: string, turnId: string): 
         .catch(() => undefined);
 };
 
+// T44: recovery for a turn that settles WITHOUT a flow frame (see the call in
+// `applyOpsFrame`), and T51: recovery for a turn that settles while this document holds
+// NO tree for it at all. The rule is deliberately narrow:
+//   - a turn with no tree is normally UNOPENED (the lazy plane reads it when the reader opens
+//     it), but a row that has now SETTLED is a finished answer the reader can already see with
+//     nothing painted in it: a 202-adopted row never entered the plane's queue, because the
+//     plane pumps the rows of the document that was open when the gesture happened. Claiming it
+//     once is the difference between a settled tile with its answer and a settled tile that is
+//     permanently blank;
+//   - only once per turn id per conversation (the scoped budget below), so a 25-row window
+//     that settles cannot turn into 25 reads per frame;
+//   - only through `reloadTurnTree`, which is one bounded identified read and a stale guard —
+//     the same recovery the turn subscription's own `onResync` uses.
+const refreshUnopenedTree = (instance: Instance, turnId: string): void => {
+    const view = instance.compiled;
+    const sessionId = instance.sessionId;
+
+    if (view === undefined || sessionId === undefined) return;
+
+    const budget = instance.reloadedTrees;
+
+    if (budget === undefined || budget.sessionId !== sessionId) {
+        instance.reloadedTrees = { sessionId, ids: new Set<string>([turnId]) };
+    } else {
+        if (budget.ids.has(turnId)) return;
+        budget.ids.add(turnId);
+    }
+
+    reloadTurnTree(instance, sessionId, turnId);
+};
+
+// T52: one bounded ROW re-read for the turn a submit receipt names, deduped per conversation
+// exactly like the tree claim above. Why the receipt is not enough (decision: the DTO stays
+// closed, so no new wire fields):
+//   - `steered` (flagged, or recognised below as an ack that folded into a turn this document
+//     already holds): the steer TEXT lives on the row (`TurnSummary.steers`), never on the
+//     receipt, so an accepted steer painted nothing inside the running conversation;
+//   - a `thread_id` the roster does not describe: a thread the server minted in this submit is
+//     not in the roster this browser loaded, so the badge has no label to prefer
+//     (./ui/turns.ts falls back to `T?`);
+//   - the row also carries the attachment facts the compact wire publishes, so one read feeds
+//     the chips as well.
+// Anything else (a plain new turn in a known conversation, or a `queued` accept that the
+// socket is about to move) costs nothing: the stream's own `turn.upsert` is authoritative.
+const refreshReceiptRow = (instance: Instance, sessionId: string, turnId: string): void => {
+    const budget = instance.reloadedRows;
+
+    if (budget === undefined || budget.sessionId !== sessionId) {
+        instance.reloadedRows = { sessionId, ids: new Set<string>([turnId]) };
+    } else {
+        if (budget.ids.has(turnId)) return;
+        budget.ids.add(turnId);
+    }
+
+    void readTurnRow(sessionId, turnId)
+        .then((row) => {
+            const view = instance.compiled;
+
+            // Stale guard: the reader left this conversation while the read ran.
+            if (row === undefined || view === undefined || instance.sessionId !== sessionId) return;
+
+            // The record cache first, so Stop/pending and the delete baseline read the same
+            // revision the tile is about to show.
+            instance.records.set(row.id, row);
+            refreshPending(instance);
+
+            // Monotonic merge into the ONE document the board and every ops frame share; a
+            // stamped row always replaces the optimistic receipt row (./view-state.ts).
+            upsertSummary(view, row);
+            instance.store.setView(view);
+
+            // Repaint that tile only, through the same board entry an ops frame uses: the row
+            // is the tile's authority, and a whole-document re-apply would erase what the
+            // socket already delivered.
+            instance.view.upsertSummary(row, view);
+            derivePanels(instance);
+
+            if (current === instance) setBusy(instance.pending);
+        })
+        .catch(() => undefined);
+};
+
 // One frame from the FOCUSED TURN's subscription (T24 item 6). `display.ops` is a
 // turn-scope kind — the contract's scope table publishes it nowhere else — so these
 // frames are how streamed text reaches an opened tile at all. The reducer work is
@@ -7821,20 +8367,10 @@ const applyView = (instance: Instance, session: SessionView): void => {
     upsertSession(session);
     renderSessions();
 
-    // Session outcome detail (R1/R2). This is the ONE report of a failed run: the
-    // topbar pill is app-scoped, so a failure can neither leak into another session's
-    // header nor go stale when the reader switches away. The tile's status word still
-    // says `error`/`cancelled`; this line adds the server's message, which the
-    // record's events do not carry. A deliberate stop is suppressed: the server
-    // stores `The run was cancelled.` as `lastError`, and the tile already reports
-    // `cancelled` — repeating it here would present the user's own Stop as an error.
-    const failure =
-        session.status === 'error'
-            ? session.lastError === CANCELLED_MESSAGE
-                ? undefined
-                : (session.lastError ?? 'session error')
-            : undefined;
-    instance.view.setNotice(failure);
+    // Session outcome detail (R1/R2) — the SAME rule the header patch paints below, so a
+    // failure that arrives as a `session.updated` frame and one that arrives inside a document
+    // cannot describe themselves differently.
+    instance.view.setNotice(sessionFailureOf(session));
 
     if (current !== instance) return;
 
@@ -8053,13 +8589,22 @@ const saveThreadTranscriptFor = async (
 
     const result = await updateViewThreadTranscript(sessionId, threadId, messages);
 
-    // A transcript save answers a WRITE RECEIPT plus the document, never a whole
-    // view (T14). The receipt's `revision` is the figure the stream compares against,
-    // and `transcript` is the newest authority for the editable value the dialog
-    // repaints from. Nothing else on the board moved — a transcript edit changes one
-    // conversation's stored value, and the stream's `transcript.updated` frame
-    // invalidates the roster copy — so no document is re-downloaded here.
+    // T49: a transcript save answers a WRITE RECEIPT (what was accepted, the new revision, and
+    // the validator's verdict when the JSON is broken) — never a session document. The receipt
+    // proves the conversation moved, so the newest authority is fetched the ordinary way: one
+    // bounded open, applied through `applyView`, which owns the stale-watermark guard, the
+    // deletion tombstones, the roster reconcile and the session-outcome note. The dialog's own
+    // bytes come from the document read `updateViewThreadTranscript` already performed, so the
+    // editor never waits on this round trip.
     void result.receipt;
+
+    try {
+        const view = await getView(sessionId);
+        if (instance.sessionId === sessionId) applyView(instance, view);
+    } catch {
+        // A failed freshness read leaves the applied document in place: the save itself landed,
+        // and the transcript payload below is what the dialog repaints from.
+    }
 
     return result.transcript;
 };
@@ -8096,6 +8641,89 @@ const refreshPending = (instance: Instance): void => {
         const status = turn.status as string;
         return status === 'running' || status === 'queued';
     });
+};
+
+// T49: the receipt a submit answers, merged IN PLACE.
+//
+// A canonical `TaskReceipt` (../shared/harness-api.ts) states identity, placement, the
+// moved session revision and the queue position. It is NOT a document, and the contract
+// stopped sending one with a submit, so this is the whole post-write reconciliation:
+//   - the accepted row joins `instance.records` (the Stop/pending authority the stream's
+//     row ops also write) and the compiled document the board renders, through the SAME
+//     monotonic merge `upsertSummary` uses for a `turn.upsert` frame — the optimistic tile
+//     and the receipt row are one id, never two;
+//   - the session-level figures the receipt names (`status`, `revision`, `queue_position`)
+//     patch the held document and the directory row;
+//   - nothing else moves. The running row, the tally and the streamed answer arrive on the
+//     socket (`turn.upsert`, `session.updated`, `display.ops`).
+//
+// Re-reading the conversation instead cost a second round trip per task, and applying that
+// read through `applyView` — a WHOLE-document apply — erased the rows, the live model map
+// and the frozen team the re-read did not carry, which is why an accepted second task
+// painted as `error` behind the first.
+const applyReceiptRow = (instance: Instance, record: TurnRowView, receipt: TaskReceipt): void => {
+    // The queue figure is the row's position; a steer does not open a new slot.
+    const live = receipt.status === 'queued' || receipt.status === 'running';
+
+    instance.records.set(record.id, record);
+    refreshPending(instance);
+
+    const compiled = instance.compiled;
+
+    if (compiled !== undefined && compiled.id === receipt.session_id) {
+        // A session with an accepted task is doing work. `SessionStatus` has no `queued` member
+        // (../shared/harness-api.ts:790): the queue figure is `queue_depth`, and the row's own
+        // status is what paints `queued` on the tile. A steer opens no slot and leaves both alone.
+        if (live) compiled.status = 'running';
+        (compiled as { revision?: number }).revision = receipt.session_revision;
+        if (typeof receipt.queue_position === 'number') compiled.queueDepth = receipt.queue_position;
+
+        upsertSummary(compiled, record);
+        // The store and the document are ONE object (./view-state.ts), so the board and any
+        // ops frame now read the row this receipt accepted.
+        instance.store.setView(compiled);
+
+        // T52: this receipt just grew the document the board renders, and a row painted from a
+        // receipt carries NO display tree (./view-api.ts `rowFromReceipt` states identity, status
+        // and placement only). A document apply ends by asking the plane for the trees of the rows
+        // on screen (`applyView`, last line); the receipt path skipped that step, so an accepted
+        // submit — running or settled — stayed a prompt with no answer in it. The plane is the
+        // only caller here: its queue is capped (4 concurrent), deduped and generation-guarded, so
+        // this cannot fan out into a read per row.
+        if (current === instance) instance.view.reveal();
+        // T51: a background card gets nothing from the plane (its pane is not on screen, which is
+        // the whole lazy rule), so a row the ack already SETTLED is claimed once through the
+        // bounded identified read — it will never settle again on the socket, and a reader who
+        // opens this conversation later is served the tree by the plane anyway.
+        else if (!live) refreshUnopenedTree(instance, record.id);
+
+        // T52: the receipt is a closed DTO, so it cannot state the two facts above (a steer's
+        // text, a brand-new thread's label). Pay ONE bounded row re-read for that turn.
+        const ackFoldsIntoAHeldTurn = summariesOf(compiled).some(
+            (row) => row.id === record.id && (row as { optimistic?: boolean }).optimistic !== true
+        );
+        const ackThread = receipt.thread_id;
+        const ackThreadUnknown =
+            typeof ackThread === 'string' &&
+            ackThread.length > 0 &&
+            !sessionThreadsOf(compiled).some((entry) => entry.id === ackThread);
+
+        if (receipt.steered === true || ackFoldsIntoAHeldTurn || ackThreadUnknown) {
+            refreshReceiptRow(instance, receipt.session_id, record.id);
+        }
+    }
+
+    // The directory row for this conversation moves with it: the pill's tally and the
+    // running/queued figure come from the same receipt, not from a re-read.
+    const row = sessions.find((candidate) => candidate.id === receipt.session_id);
+
+    if (row !== undefined) {
+        if (live) row.status = 'running';
+        if (typeof receipt.queue_position === 'number') row.queueDepth = receipt.queue_position;
+    }
+
+    // Stop lights the moment the task is accepted (R4), and the counters repaint.
+    if (current === instance) setBusy(instance.pending);
 };
 
 // Activity rings come from running state only. A queued task is not working yet, so
@@ -8169,7 +8797,34 @@ const applyOpsFrame = (
     //    this frame belongs to a turn this view does not hold (another tab, or the
     //    row has not arrived yet): the closing `view` frame reconciles it, so
     //    guessing here would be a client-side projection.
-    const applied = instance.view.applyOps(item.turnId, item.ops ?? [], view);
+    let applied = instance.view.applyOps(item.turnId, item.ops ?? [], view);
+
+    // T47: a `turn.upsert` for a row this instance has NEVER held (another tab started a
+    // conversation, or the server minted a second thread mid-run). The session scope
+    // publishes rows only (../shared/harness-stream.ts scope table), so before this the row
+    // landed in the document — `store.applyItem` upserted it — with no tile to route it to,
+    // and the transcript kept showing the older window: a follow-up in a NEW conversation
+    // was simply invisible until the next re-read.
+    //
+    // Minting from the FRAME is deliberate. A window re-read here would be a second cost for
+    // information the frame already carries, and against a server whose REST answer is
+    // captured before the frame (the N2 fixture's late 202/GET) it would delete the row the
+    // frame just delivered. The document already holds the row, so the tile is one call:
+    // `view.upsertSummary` (./ui/turns.ts `upsertView`) mints the tile AND its conversation
+    // shell, which is the same path a submit receipt uses for its optimistic row.
+    //
+    // Guards: only a ROW op (a flow frame for an unknown turn stays the "not mine" no-op it
+    // always was), only a turn still named by the document (a tombstone or a delete that beat
+    // this frame must not mint), and only once — `applyOps` already returned true for a tile
+    // that exists.
+    if (!applied && summaryOp !== undefined && summaryOp.op === 'turn' && !turnTombstoned(instance, summaryOp.summary)) {
+        const held = summariesOf(view).some((row) => row.id === item.turnId);
+
+        if (held) {
+            applied = true;
+            instance.view.upsertSummary(summaryOp.summary, view);
+        }
+    }
 
     if (!applied) return;
 
@@ -8185,6 +8840,14 @@ const applyOpsFrame = (
     const settlesTurn = (item.ops ?? []).some(
         (op) => op.op === 'turn' && op.summary.status !== 'running'
     );
+
+    // T44: a settling row for a turn this instance is NOT streaming. `display.ops` rides the
+    // `turn` scope only (../shared/harness-stream.ts:201) and `followTurnFlow` holds ONE
+    // subscription — the expanded tile — so every other visible turn gets row patches without
+    // flow: its tree, loaded once at open time, is stale by construction the moment the row
+    // settles. One bounded re-read of THAT tree (the turn scope's own full state, never a
+    // history snapshot or a window re-read) closes the gap the focused subscriber leaves.
+    if (settlesTurn && instance.turnWatch?.turnId !== item.turnId) refreshUnopenedTree(instance, item.turnId);
 
     if (settlesTurn) refreshActivity(instance);
     else {
@@ -8230,7 +8893,58 @@ const onViewItem = (
     // both carry a complete document. Applying it reconciles everything the frames may
     // have missed — and `lastError` populates the pane's session note. The pill is NOT
     // touched: a failed run is session-scoped (R1); its detail is in the transcript (R2).
+    if (item.type === 'header') {
+        applyHeaderPatch(instance, item.view);
+
+        return;
+    }
+
     applyView(instance, item.view);
+};
+
+// T44: a session-level patch (`session.updated`, a pending-action list) applied WITHOUT
+// reconciling rows. `applyView` is the reconciliation path: it rebuilds `instance.records`
+// from `session.turns` and tombstones every id that list no longer names. A metadata read
+// carries NO rows (`SessionResource` is counters, ../shared/harness-api.ts:807-809), so
+// publishing it as a document deleted every live turn mid-run — the board went empty the
+// moment the terminal `session.updated` landed, and the tombstones kept the re-delivered
+// rows from coming back. Only the session facts named by the patch move; rows, trees, the
+// paging cursor and the snapshot watermark (which is about DOCUMENTS, see `applyView` N2)
+// all stay exactly as this instance holds them.
+const applyHeaderPatch = (instance: Instance, patch: SessionView): void => {
+    // Same routing guards as a document: a deleted session and a late answer for another
+    // one are authoritative for nothing.
+    if (deletedSessions.has(patch.id) || instance.sessionId !== patch.id) return;
+
+    const view = instance.compiled;
+    if (view === undefined || view.id !== patch.id) return;
+
+    // Header facts only, through the one merge rule (./view-state.ts
+    // `applySessionPatch`): `turns`, `displays` and `olderCursor` are never written here, so
+    // the rows keep flowing from `turn.upsert`, and a document that IS authoritative still
+    // arrives as a `view` item.
+    applySessionPatch(view, patch);
+
+    // R2: the composer edits the LIVE per-agent map, so the patch is the newest statement
+    // of it this client has. The frozen team is definition data a patch never carries.
+    instance.sessionModels = agentModelsOf(view);
+    instance.sessionModel = typeof view.model === 'string' ? view.model : undefined;
+
+    // Stop/pill and rings come from the patched document, exactly as the document path
+    // derives them — no new rules, one authority.
+    refreshPending(instance);
+    refreshActivity(instance);
+    instance.view.setSessionView(view);
+
+    // R1/R2: the patch carries the session's own outcome (`status` + `lastError`), so the
+    // session-scoped note repaints from it — the same rule the document path uses, and the
+    // reason a streamed failure is never left without its detail line.
+    instance.view.setNotice(sessionFailureOf(view));
+
+    if (current === instance) {
+        setBusy(instance.pending);
+        paintControls();
+    }
 };
 
 // Re-read the session after an observer ends, then reopen it only if work is
@@ -8293,6 +9007,23 @@ const startWatching = (instance: Instance, sessionId: string): void => {
         .then(() => {
             if (watch?.controller !== controller) return;
             watch = undefined;
+
+            // T50: an observation that ended because this host has NO transport at all is the
+            // degraded case ./view-shell.ts:485-490 names out loud — "the caller's bounded-poll
+            // path is the degraded observation". Going through `resyncSession` first costs one
+            // extra read of the very document `applyView` just painted, on every single tick of
+            // the reconnect loop, and the board never gains anything from it. `pollSession` is
+            // that re-read with the cadence and the bound attached, so the degraded host reads
+            // once per `POLL_INTERVAL_MS` and stops when the work settles. Every OTHER way this
+            // promise ends (the server ended the subscription, a protocol error, an unsubscribe)
+            // keeps the single authoritative re-read, because there the socket may come back and
+            // the document in hand may already be stale.
+            if (harnessStream().status() === 'closed') {
+                pollSession(instance, sessionId);
+
+                return;
+            }
+
             void resyncSession(instance, sessionId);
         })
         .catch(() => {
@@ -8467,20 +9198,46 @@ const openSession = async (
         // and the conversation-level definition read (which the agent dialog triggers for
         // its own purposes) answers with a named record regardless. `frozenTeamOf` is for
         // the chrome paths that must not WIPE a team this page already knows.
-        const frozen = frozenDefinitionOf(session);
+        // T46: the document's own frozen team first (a legacy snapshot still carries it, and a
+        // conversation opened while the harness existed is cached). Only when NEITHER exists
+        // does the shell spend the one identified definition read — the server's own statement
+        // of the team this record ran with.
+        const frozen = frozenDefinitionOf(session) ?? (await readFrozenDefinition(id));
 
         if (frozen === undefined) {
-            // No frozen definition to rebuild from (a legacy record whose harness is also
-            // gone): the honest answer is still an error, not a invented descriptor.
+            // No frozen definition anywhere (the harness is gone AND the record never captured
+            // a team, or the definition read failed): the honest answer is still an error, not
+            // an invented descriptor.
             setStatus('error', `unknown harness "${session.harness}"`);
             return;
         }
+
+        // T46: the definition read is a second hop, so the reader may have moved on or deleted
+        // the conversation while it was in flight. These are the same two guards the open itself
+        // applies above, re-checked before anything is selected or painted.
+        if (stale !== undefined && stale()) return;
+        if (deletedSessions.has(id)) return;
 
         // Cache it so `applyView` below (which re-derives the team from the document, and
         // finds none on the canonical wire) keeps describing THIS conversation rather than
         // wiping the team it just reopened with.
         frozenDefinitions.set(id, frozen);
-        descriptor = frozen;
+
+        // T46: the header names the harness this conversation BELONGS TO, which is the
+        // identity the reader picked from the pill. The frozen copy still supplies everything
+        // the conversation RUNS with (team, per-agent models, tools); only its `title` is a
+        // historical string the registry no longer owns, and an archived conversation has no
+        // card left to take a display label from. The `Deleted harness · …` sentence that
+        // `renderHarnessChrome` paints for an unregistered name is what states the loss (R6).
+        //
+        // The CACHE gets the same object the instance does: `renderHarnessChrome` renders
+        // `instance.frozen ?? instance.descriptor`, and `frozenTeamOf` answers from this cache
+        // on every later document (`applyView`), so caching the raw definition would let a
+        // repaint put the historical title back after the open painted the right one.
+        const archived = { ...frozen, title: archivedHarnessLabel(harnessName) };
+
+        frozenDefinitions.set(id, archived);
+        descriptor = archived;
     }
 
     const target = ensureInstance(descriptor);
@@ -8534,6 +9291,9 @@ const openSession = async (
         options?.automatic === true ? { keepStatus: true } : undefined
     );
     applyView(target, session);
+    // T50: the conversation's OWN team (see `hydrateFrozenTeam`). A registered harness with a
+    // document that carries no frozen team would otherwise paint the live preset's roster.
+    hydrateFrozenTeam(target);
     // T21 R22: a loaded conversation starts with EVERY thread collapsed. `applyView`
     // just reconciled the document, and the board's first-content rule opened the
     // newest surface while doing so (`reconcileView`'s `!hadTurns` branch, and its
@@ -8949,19 +9709,21 @@ const run = async (): Promise<void> => {
         // exactly one session (creatingSessions + the instance id).
         sessionId = await ensureSession(instance);
 
-        // 202 on the DISPLAY wire: the server retained the task and answered with the
-        // compact row plus the whole compiled document — no recorded event anywhere,
-        // which is the payload this route exists to remove (T5 R1). The request is
-        // over here; execution and streaming are observed on GET /views/:id/events.
+        // 202 on the canonical wire: a TASK RECEIPT, never a document. The row the receipt
+        // names is merged into the document this browser already paints, the session figures it
+        // states are patched in place, and everything else — the running row, the tally, the
+        // streamed answer — arrives on the socket. A re-read here was a second round trip per
+        // task, and applying it as a document erased the rows, the model map and the frozen team
+        // the receipt does not carry (an accepted second task then painted as `error`).
         // `references` carries the exact block bindings picked via # (omitted when the
         // prompt has none, so a plain typed `#LABEL` keeps the old body shape).
-        const { view: session, turn: record } = await submitViewTask(
+        const { turn: record, receipt } = await submitViewTask(
             sessionId,
             prompt,
             validated,
             references.length === 0 ? undefined : references,
-            // Absent for a new thread: the server decides the new thread's id and
-            // reports it on the row (and in the roster of the document below).
+            // Absent for a new thread: the server decides the new thread's id and reports it on
+            // the row; the roster learns it from the stream's `turn.upsert`.
             target.threadId
         );
 
@@ -8969,7 +9731,7 @@ const run = async (): Promise<void> => {
         // new one: the optimistic steering row must not survive as an unbound queued
         // ghost, so it is discarded and the row binds to the tile that already
         // represents that conversation. Every other path binds this tile as usual, and
-        // binding a compiled row can never duplicate streamed text — a node's content
+        // binding a compiled row can never duplicate streamed text - a node's content
         // is painted from the node, not from a replayed delta.
         //
         // The id check is kept alongside the marker: it also collapses the (rare)
@@ -8979,20 +9741,19 @@ const run = async (): Promise<void> => {
             instance.view.discard(turn);
         }
 
-        instance.view.upsertSummary(record, session);
+        instance.view.upsertSummary(record);
 
         // Keep the steering target visible on the conversation that received the
         // message: continuing/steering must not silently move focus elsewhere.
         if (target.threadId !== undefined) instance.view.focusThread(target.threadId);
 
-        upsertSession(session);
+        // The receipt's own merge: rows, pending flag, session figures, directory row.
+        applyReceiptRow(instance, record, receipt);
         renderSessions();
 
         if (instance.sessionId === sessionId) {
-            // The POST answer is a complete compiled document and already includes the
-            // new row: reconcile from it (the optimistic tile matches by id) and start
-            // observing the queue. `applyView` sets pending + the pill.
-            applyView(instance, session);
+            // The task is accepted and this card owns the conversation: start observing.
+            // The queue figure is already painted from the receipt, so nothing is re-read.
             startWatching(instance, sessionId);
             if (current === instance) rememberSession(sessionId);
         }
@@ -9264,7 +10025,13 @@ const stopRun = (): void => {
     const sessionId = instance?.sessionId;
     if (instance === undefined || sessionId === undefined || !instance.pending) return;
 
-    stopWatching();
+    // T52: Stop cancels WORK, it does not end OBSERVATION. The server publishes the terminal
+    // records of a deliberate stop on the very subscription this client already holds (the
+    // cancelled `turn.upsert`, then `session.updated`), and those frames are what repaint the
+    // tile — the abort here left the cancelled row with no subscriber, so the tile stayed
+    // `streaming` while the session had stopped. Aborting also forced the re-read below to
+    // become the only reconciliation, and a re-read captured before the server applied the
+    // cancel answered the still-running document.
 
     // The cancel round trip is async; the tile keeps its last state until the
     // server confirms. No header acknowledgement: Stop is a session action and is
@@ -9280,9 +10047,10 @@ const stopRun = (): void => {
         .finally(() => {
             if (instance.sessionId !== sessionId) return;
 
-            // Re-read the server's terminal records (the observer was unsubscribed
-            // above). A cancel that failed leaves work pending, and the resync then
-            // reopens observation rather than pretending it stopped.
+            // Reconciliation of the session figures stays a re-read (it is the only path that
+            // works when the live plane is a bounded poll, i.e. a host with no transport). It is
+            // NOT the source of the tile's terminal state any more: the cancelled rows also
+            // arrive on the subscription that is still open above.
             void resyncSession(instance, sessionId);
             void refreshSessions();
         });
@@ -9517,12 +10285,15 @@ const boot = async (): Promise<void> => {
         buildHarnesses();
         buildTools(data.tools as unknown as readonly ToolDescriptor[]);
 
-        // T5 R1: the conversation directory is the COMPACT surface. The bootstrap document already
-        // embeds one row per conversation (the server's own catalogue read), which is the cheapest
-        // source and never leaves boot waiting behind a second request; the index route is read
-        // only when the catalogue carried none. Neither path issues a raw `GET /sessions`, and
-        // directory rows need no events (see `SessionRecord`).
-        const embedded = Array.isArray(data.sessions) ? (data.sessions as unknown as SessionRecord[]) : [];
+        // T5 R1 / T38: the conversation directory is the COMPACT surface. The bootstrap already
+        // embedded one row per conversation, and a row is the CONTRACT's snake_case metadata
+        // document (`SessionSummary`, ../shared/harness-api.ts:812-825): it carries
+        // `created_at`/`updated_at`/`queue_depth` and NO turns. It therefore goes through
+        // `directoryRowOf` — the exact mapper the `GET /sessions` page uses (./view-shell.ts) —
+        // instead of being cast into the shell's record. The cast is what made "open the latest
+        // session" meaningless (every row ranked at recency 0, because `recencyOf` reads the
+        // camel stamps) and what left a `running` conversation unwatched after a reload.
+        const embedded = Array.isArray(data.sessions) ? data.sessions.map(sessionRowOf) : [];
         sessions = embedded.length > 0 ? embedded : await listViews().catch(() => []);
         renderSessions();
 

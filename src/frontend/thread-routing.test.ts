@@ -26,6 +26,9 @@
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+// The double's option/result types stay static (erased at compile time, they cannot pin a
+// module instance); the double ITSELF is installed through the dynamic import below.
+import type { HarnessStreamOptions, StreamDouble } from './view-test-support';
 
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
@@ -108,21 +111,57 @@ type Stub = {
     cancels: unknown[];
     // The snapshot every GET /sessions/s1 answers after a mutation.
     current: SessionSnapshot;
+    // The record the LAST read answered — the document the client holds. A pushed `snapshot`
+    // frame is diffed against it, which is what makes the wire publish `turn.removed`/
+    // `thread.removed` for a delete this client did not perform (./view-test-support.ts
+    // `HarnessStreamOptions.record`).
+    wire: SessionSnapshot;
+    // The `harness.v1` socket the shell dialed (see the note at the top of this file).
+    stream?: StreamDouble;
     // Push one frame into the OPEN observer stream (late snapshot/turn/event).
     emit: (item: unknown) => void;
 };
 
-const stubServer = (initial: SessionSnapshot, options: { steer?: boolean } = {}): Stub => {
+// T50: the live plane is the canonical `harness.v1` WebSocket (./stream.ts:40-43 states there is
+// NO SSE path in the client), so a frame reaches the shell through the socket double, which
+// bridges the raw `SessionStreamItem` through the SERVER's own projector. The double is resolved
+// by a DYNAMIC import — `vi.resetModules()` clears the registry, so a statically imported
+// `installHarnessStream` would configure the PREVIOUS `./stream` instance while `main` dials a
+// fresh singleton with no factory at all.
+const installLiveStream = (options: HarnessStreamOptions): Promise<StreamDouble> =>
+    import('./view-test-support').then((support) => support.installHarnessStream(options));
+
+const stubServer = async (initial: SessionSnapshot, options: { steer?: boolean } = {}): Promise<Stub> => {
     const stub: Stub = {
         tasks: [],
         cancels: [],
         current: initial,
+        wire: initial,
         emit: () => undefined
     };
     let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
     stub.emit = (item) => {
+        const frame = item as { type?: string; session?: SessionSnapshot };
+
+        // A `snapshot`/`failed` frame IS the record now: the same document the REST routes
+        // answer. The fold happens BEFORE the push because a document that drops a row publishes
+        // `turn.removed`/`thread.removed`, and the window re-read those frames trigger must
+        // answer the record the server really has — otherwise the frame and REST disagree and the
+        // deleted row comes straight back.
+        if ((frame.type === 'snapshot' || frame.type === 'failed') && frame.session !== undefined) {
+            stub.wire = stub.current;
+            stub.current = frame.session;
+        }
+
+        stub.stream?.push(item);
+        // The legacy SSE body stays wired for a host that still opens it, so a frame is also
+        // visible to anything reading that route.
         stream?.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
     };
+
+    // Installed BEFORE any case imports `./main`, so the shell's first `harnessStream()` call
+    // captures this factory instead of the browser socket.
+    stub.stream = await installLiveStream({ sessionId: 's1', snapshot: () => stub.wire, record: () => stub.wire });
 
     vi.stubGlobal(
         'fetch',
@@ -261,12 +300,17 @@ beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
 });
 
-afterEach(() => {
+afterEach(async () => {
     vi.unstubAllGlobals();
+    // The stream singleton is process-wide (./stream.ts:647): leaving this file's double
+    // configured hands the next test file's shell a socket that was never its own.
+    const { resetHarnessStream } = await import('./stream');
+
+    resetHarnessStream();
 });
 
 it('renders the roster, and continues the thread the reader focused with threadId', async () => {
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             turns: [
                 turn({ id: 'turn-1', index: 0, threadId: 'thread-1' }),
@@ -309,11 +353,11 @@ it('renders the roster, and continues the thread the reader focused with threadI
     await flush();
     await flush();
 
-    expect(stub.tasks).toEqual([{ input: 'next step', threadId: 'thread-1' }]);
+    expect(stub.tasks).toEqual([{ input: 'next step', thread_id: 'thread-1' }]);
 });
 
 it('submits without a threadId when nothing is focused (new thread)', async () => {
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             turns: [turn({ id: 'turn-1', index: 0, threadId: 'thread-1' })],
             threads: [
@@ -371,7 +415,7 @@ it('never resurrects a deleted thread from a late snapshot, turn or event (S3)',
             }
         ]
     });
-    const stub = stubServer(initial);
+    const stub = await stubServer(initial);
     await mount();
 
     // T21 R22: the reader opens the conversation whose thread is about to disappear, so
@@ -438,7 +482,7 @@ it('steers a child conversation from its nested invocation row (S2)', async () =
         { type: 'tool_call', agent: 'instruct', call: { id: 'd1', name: 'delegate', arguments: '{}' } },
         { type: 'start', agent: 'helper', model: 'h1', thread: { id: 'inv-9' } }
     ];
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             turns: [
                 turn({
@@ -483,11 +527,11 @@ it('steers a child conversation from its nested invocation row (S2)', async () =
     await flush();
     await flush();
 
-    expect(stub.tasks).toEqual([{ input: 'child follow up', threadId: 'thread-child' }]);
+    expect(stub.tasks).toEqual([{ input: 'child follow up', thread_id: 'thread-child' }]);
 });
 
 it('steers a running focused thread and keeps exactly one conversation row', async () => {
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             status: 'running',
             turns: [turn({ id: 'turn-1', index: 0, status: 'running', threadId: 'thread-1' })],
@@ -510,7 +554,7 @@ it('steers a running focused thread and keeps exactly one conversation row', asy
     await flush();
 
     // The steering message targets the focused thread...
-    expect(stub.tasks).toEqual([{ input: 'change direction', threadId: 'thread-1' }]);
+    expect(stub.tasks).toEqual([{ input: 'change direction', thread_id: 'thread-1' }]);
     // ...and the owning turn is the ONLY row: the optimistic steering row was
     // discarded when the answer named an existing turn (no unbound queued ghost).
     expect(document.querySelectorAll('.tile')).toHaveLength(1);
@@ -520,7 +564,7 @@ it('steers a running focused thread and keeps exactly one conversation row', asy
 });
 
 it('labels a running focus with an unfinished reference as queued, keeping the same threadId', async () => {
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             status: 'running',
             turns: [
@@ -566,12 +610,12 @@ it('labels a running focus with an unfinished reference as queued, keeping the s
 
     // The BODY is unchanged: same focused thread, same reference binding.
     expect(stub.tasks).toEqual([
-        { input: '#IT2', references: [{ turnId: 'turn-2', label: 'IT2' }], threadId: 'thread-1' }
+        { input: '#IT2', references: [{ turnId: 'turn-2', label: 'IT2' }], thread_id: 'thread-1' }
     ]);
 });
 
 it('removes # reference chips whose turn was deleted, without touching surviving labels', async () => {
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             // thread-2 is RUNNING, so the session is pending and the observer stream
             // is open — the only way this client can learn about another writer's
@@ -633,7 +677,7 @@ it('removes # reference chips whose turn was deleted, without touching surviving
 });
 
 it('keeps a separate stop-all available while a draft exists', async () => {
-    const stub = stubServer(
+    const stub = await stubServer(
         snapshot({
             status: 'running',
             turns: [turn({ id: 'turn-1', index: 0, status: 'running', threadId: 'thread-1' })],

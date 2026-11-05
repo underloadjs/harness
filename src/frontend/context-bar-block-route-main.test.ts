@@ -3,7 +3,7 @@
 // The tile-level suite (./ui/turns-context-bar.test.ts) drives the board with an INJECTED
 // loader, so it proves the click contract while saying nothing about the client that answers
 // it. This file removes that seam: the shell boots against the composed views adapter
-// (./view-test-support.ts), which serves `GET /views/:id/turns/:turnId/blocks/:blockId` from
+// (./view-test-support.ts), which serves the canonical `GET /sessions/:id/turns/:turnId/blocks/:blockId` from
 // the SAME raw session record the rest of the test declares. A segment click therefore goes
 // through `createApi.getBlockDetail` (./api.ts) -> `getBlockDetail` (./view-api.ts) ->
 // `blockDetailPayloadOf` (./view-detail.ts) -> the dialog (./ui/context-detail.ts), which is
@@ -218,8 +218,13 @@ it('costs no detail request to paint, and exactly one to open a segment', async 
     await flush();
 
     // R8: one request, on the block route, addressed by the SERVER's block id.
+    // T24/R: the route is the CANONICAL session address, not the legacy `/views` spelling —
+    // proven from source, not from an alias: the shared table declares
+    // `sessionsBySessionIdTurnsByTurnIdBlocksByBlockId` (../shared/harness-api.ts:97,189) and the
+    // server mounts only that handler (../server/api.ts:3912). `createApi.getBlockDetail`
+    // (./api.ts:1013) therefore asks for `/sessions/:id/turns/:turnId/blocks/:blockId`.
     expect(blockCalls(calls)).toEqual([
-        { url: `/api/views/s1/turns/t1/blocks/0-tool-1`, method: undefined }
+        { url: `/api/sessions/s1/turns/t1/blocks/0-tool-1`, method: undefined }
     ]);
 
     const detail = byClass('.block-detail', 'div');
@@ -255,8 +260,8 @@ it('costs no detail request to paint, and exactly one to open a segment', async 
     await flush();
 
     expect(blockCalls(calls).map((call) => call.url)).toEqual([
-        '/api/views/s1/turns/t1/blocks/0-tool-1',
-        '/api/views/s1/turns/t1/blocks/0-user-prompt'
+        '/api/sessions/s1/turns/t1/blocks/0-tool-1',
+        '/api/sessions/s1/turns/t1/blocks/0-user-prompt'
     ]);
     expect(byClass('.block-detail', 'div').dataset.kind).toBe('user');
     expect(document.querySelector<HTMLElement>('[data-pane="text"]')?.textContent).toContain(PROMPT);

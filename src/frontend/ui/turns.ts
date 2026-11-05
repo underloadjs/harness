@@ -6316,21 +6316,40 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // R3: only the structural role attribute; there is no visible badge.
             entry.section.root.dataset.role = section.role;
 
-            const meta = entry.meta;
-            if (meta !== undefined) {
+            // T47 (U3 parity): the ROOT entry has no `meta` of its own — its header figures
+            // are the TILE's `blockMeta` (lines 5254/5268/6686 already pair the two with
+            // `entry.meta ?? blockMeta`). Reading `entry.meta` alone left the root section's
+            // OWN token figures unpainted, so a turn whose stamped row had not arrived yet
+            // (the submit receipt carries no usage, `view-api.ts:258 rowFromReceipt`) printed
+            // no tally at all, while the same turn printed one the moment a `usage` op or a
+            // row landed. The wire carries the pair on the section TODAY
+            // (../shared/harness-api.ts `TurnSection.latestInput`/`cachedInput`, stamped by
+            // ../server/turn-projector.ts:2247-2248), so this is a dropped field, not a new
+            // one. Ordering stays as `renderCompiledDisplay` documents: the section figure
+            // first, the row re-assertion (`applyRowFigures`) second, so the row — the
+            // documented authority for the TURN-level figure — still wins when it carries one.
+            const meta = entry.meta ?? blockMeta;
+
+            // TIMING is different: `settle` assigns `startedAt` outright (line 929), so an
+            // end-only section patch would CLEAR the start the row already bound and print a
+            // blank elapsed. A child conversation owns its own meta and its own server pair,
+            // so it keeps settling from its section; the root's span stays the row's business
+            // (`setCompiledSummary`, which always passes the row's `startedAt`).
+            if (entry.meta !== undefined) {
                 const hasStart = section.startedAt !== undefined;
                 const hasEnd = section.endedAt !== undefined;
+
                 if (hasStart || hasEnd)
-                    meta.settle({
+                    entry.meta.settle({
                         ...(hasStart ? { startedAt: section.startedAt } : {}),
                         ...(hasEnd ? { endedAt: section.endedAt } : {})
                     });
-
-                meta.setFigures({
-                    ...(section.latestInput === undefined ? {} : { latestInput: section.latestInput }),
-                    ...(section.cachedInput === undefined ? {} : { cachedInput: section.cachedInput })
-                });
             }
+
+            meta.setFigures({
+                ...(section.latestInput === undefined ? {} : { latestInput: section.latestInput }),
+                ...(section.cachedInput === undefined ? {} : { cachedInput: section.cachedInput })
+            });
 
             setThreadState(entry, sectionThreadState(section.state));
             // A terminal section is closed by the server, so its row gets the same
@@ -7494,7 +7513,30 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // guard a queued row repaints a tile the stream already moved to `streaming`.
         const setCompiledSummary = (summary: TurnSummary): void => {
             compiledMode = true;
-            if (isNewerSummary(compiledSummary, summary)) return;
+
+            // T47: the optimistic escape hatch `view-state.ts:730 upsertSummary` already
+            // applies, mirrored here. The submit receipt row (`view-api.ts:258
+            // rowFromReceipt`) is stamped with the receipt's `accepted_at` — the LOCAL
+            // clock — so whenever that clock runs ahead of the server's, the guard below
+            // would read the FIRST authoritative row for this turn as "late" and reject it.
+            // The tile then keeps the receipt's figures forever: no `usage`, so no token
+            // tally, and `queued`, so the state never advances. A stamped row for the same
+            // id always replaces an optimistic one; an optimistic row still beats nothing,
+            // which is what a receipt is for.
+            const knownOptimistic =
+                (compiledSummary as (TurnSummary & { optimistic?: boolean }) | undefined)?.optimistic === true;
+
+            // T47 (the other direction, mirroring `view-state.ts upsertSummary` above): the
+            // RECEIPT row is the one arriving here on a submit ack, and it is stamped with the
+            // local `accepted_at`. A placeholder never outranks a statement — when the tile has
+            // ALREADY painted a stamped row for this turn, this ack is the late answer and the
+            // tile must keep what it painted (a `queued` receipt repainting a `streaming` row
+            // put the state pill back to sleep and dropped the tally). With nothing stamped yet
+            // the receipt still paints, which is the whole point of painting before the ack.
+            const incomingOptimistic = (summary as TurnSummary & { optimistic?: boolean }).optimistic === true;
+            const holdsStampedRow = compiledSummary !== undefined && !knownOptimistic;
+
+            if (holdsStampedRow && (incomingOptimistic || isNewerSummary(compiledSummary, summary))) return;
 
             compiledSummary = summary;
 
@@ -7523,7 +7565,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // pending lines) that the fold used to reach through events.
             setState(summary.state, summary.detail);
 
-            setCompiledAttachments(summary.attachments);
+            // T52: a RECEIPT row states identity, status and placement and NOTHING else
+            // (./view-api.ts `rowFromReceipt`), so `attachments` being ABSENT on it is not the
+            // same statement as "this turn has no files" — the projector omits that field for a
+            // text-only turn, and a receipt omits it for every turn, including one that
+            // accepted a file. Clearing the chips here erased the inline chip the reader had
+            // just pasted, so an accepted submit painted a prompt with no file in it.
+            if (!(incomingOptimistic && summary.attachments === undefined))
+                setCompiledAttachments(summary.attachments);
             renderCompiledSteers(summary);
 
             syncRootAgentVisibility();

@@ -197,15 +197,37 @@ const openStream = async (): Promise<{ socket: WebSocket; frames: Frame[]; close
     };
 };
 
-const poll = async (predicate: () => boolean, timeoutMs = 5_000): Promise<boolean> => {
+// Bounded wait used for every "eventually true" claim in this file. The predicate may be async so
+// the same helper drives a socket-frame check (sync over the recorded frames) AND a REST read
+// (the settle check below), instead of a second, drifting timing constant per seam.
+//
+// The final predicate evaluation is returned rather than `false`, so a caller that times out still
+// sees the last real observation; the bound is what makes the wait deterministic, not the sleep.
+const poll = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 5_000): Promise<boolean> => {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
-        if (predicate()) return true;
+        if (await predicate()) return true;
         await new Promise((resolve) => setTimeout(resolve, 25));
     }
 
     return predicate();
+};
+
+// One REST read against the gateway, parsed once. Kept as a helper because the settle loop below
+// reads the same document repeatedly and a non-200 must be visible as a status, not as a crash.
+const readSessionRow = async (
+    sessionId: string
+): Promise<{ status: number; session?: { status?: string } }> => {
+    const response = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(sessionId)}`);
+
+    return { status: response.status, ...((await response.json()) as { session?: { status?: string } }) };
+};
+
+const readTurnStatus = async (sessionId: string, turnId: string): Promise<{ status: number; turn?: { status?: string } }> => {
+    const response = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnId(sessionId, turnId)}`);
+
+    return { status: response.status, ...((await response.json()) as { turn?: { status?: string } }) };
 };
 
 describeService('gateway-mounted update stream', () => {
@@ -449,22 +471,62 @@ describeService('gateway-mounted update stream', () => {
             expect(Buffer.byteLength(JSON.stringify(frame), 'utf8')).toBeLessThan(4_096);
         }
 
-        // Disconnect the pane mid/no-more-delivery and prove the stream is a READER: no frame is
-        // delivered after the unsubscribe, and the run still settles on its own (the session row
-        // returns to `idle`, which a cancel would have moved to `cancelled`/`error`).
+        // Disconnect the pane mid-flight and prove the stream is a READER: nothing is delivered to a
+        // subscription that no longer exists, and the run still finishes on its own.
         client.send({ type: 'unsubscribe', subscription_id: 'pane' });
 
         const paneFramesAtDisconnect = client.frames.filter((frame) => (frame as Frame).subscription_id === 'pane').length;
 
+        // This quiet window only measures the NEGATIVE half of the claim (no late push for a dead
+        // subscription). It is deliberately not what the settle below waits on.
         await new Promise((resolve) => setTimeout(resolve, 250));
 
         expect(client.frames.filter((frame) => (frame as Frame).subscription_id === 'pane').length).toBe(paneFramesAtDisconnect);
 
-        const settled = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(session.id)}`);
-        const settledSession = (await settled.json()) as { session?: { status?: string } };
+        // Deterministic settle, replacing the fixed sleep that used to read the row here: the scripted
+        // run is still in flight the instant the pane unsubscribes (a 250ms wait observed `running`),
+        // so `idle` is an EVENTUAL state of the store, reached when the run's last event is applied.
+        // Poll the real REST read until it leaves `running`, bounded.
+        //
+        // If it never leaves `running`, the assertion below fails with the transition trail printed:
+        // that is a real store bug (a run that cannot settle) and it stays a failure - it must not be
+        // weakened into "any status" or into a longer sleep.
+        const statusTrail: string[] = [];
 
-        expect(settled.status).toBe(200);
-        expect(settledSession.session?.status).toBe('idle');
+        const settledIdle = await poll(async () => {
+            const row = await readSessionRow(session.id);
+
+            // Only transitions are recorded, so a stuck row prints `["running"]` instead of 600 lines.
+            if (statusTrail[statusTrail.length - 1] !== row.session?.status) statusTrail.push(String(row.session?.status));
+
+            return row.session?.status === 'idle';
+        }, 15_000);
+
+        const settledSession = await readSessionRow(session.id);
+
+        expect({
+            settled_idle: settledIdle,
+            read_status: settledSession.status,
+            session_status: settledSession.session?.status,
+            // A reader that cancelled the run would drive the row to `error`; the trail would also
+            // never end on `idle` unless the store settled it.
+            trail: statusTrail
+        }).toEqual({
+            settled_idle: true,
+            read_status: 200,
+            session_status: 'idle',
+            trail: expect.arrayContaining(['idle'])
+        });
+
+        // THE non-cancel proof, read from the store instead of inferred from a sleep: the session row
+        // returns to `idle` after a cancel too (see src/server/api-live-events.test.ts:610-640), so
+        // `idle` alone cannot separate "the run finished" from "unsubscribing the pane cancelled it".
+        // The cancel marker is the TURN status, so every turn this test drove must be `done` - not
+        // `cancelled`, not `error`, not still `running`.
+        const drivenTurnIds = secondTurnId === '' ? [receipt.turn_id] : [receipt.turn_id, secondTurnId];
+        const turnReads = await Promise.all(drivenTurnIds.map(async (turnId) => await readTurnStatus(session.id, turnId)));
+
+        expect(turnReads.map((read) => [read.status, read.turn?.status])).toEqual(drivenTurnIds.map(() => [200, 'done']));
 
         // Monotonic sequences are PER SUBSCRIPTION: each live subscription numbers its own frames
         // 1..n, so the check runs per id rather than over a merged list.
@@ -495,7 +557,7 @@ describeService('gateway-mounted update stream', () => {
 
         client.send({ type: 'bye' });
         await poll(() => client.closes.length > 0);
-    });
+    }, 60_000);
 
     it('answers 400 for a plain HTTP GET on the stream path, through the real loader pipeline', async () => {
         const response = await fetch(`${base}${HARNESS_WS_STREAM_PATH}`);

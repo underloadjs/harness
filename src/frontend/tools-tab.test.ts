@@ -99,6 +99,11 @@ const snapshot = (overrides: Partial<SessionSnapshot> = {}): SessionSnapshot =>
         updatedAt: 2,
         messages: [],
         turns: [],
+        // A CREATED conversation has a frozen definition — that is the record the identified
+        // definition read (`GET /sessions/:id/definition`) serves, and the only place the
+        // canonical surface answers `discovered_tools`. A fixture without it is a record the
+        // server never created, and the double correctly reports 404.
+        harnessDefinition: descriptor(),
         ...overrides
     }) as SessionSnapshot;
 
@@ -152,10 +157,14 @@ afterEach(() => {
 
 it('lists core tools in the global tools view, calls with the captured session and refreshes the snapshot', async () => {
     const calls: Call[] = [];
+    // The URL the SHELL dialed, recorded OUTSIDE the test-only adapter. `calls` below sees the raw
+    // twin the double composes its answers from, and two different canonical resources — the
+    // session row and its frozen definition (where `discovered_tools` lives, ./view-api.ts header)
+    // — are both re-expressed from this fixture's single `/api/sessions/s1` route. The "exactly
+    // one refresh read" rule is therefore stated against the request the browser actually made.
+    const dialed: string[] = [];
 
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const fixtureFetch = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -192,7 +201,17 @@ it('lists core tools in the global tools view, calls with the captured session a
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }, { root: '/api' }))
+    }, { root: '/api' });
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            dialed.push(`${init?.method ?? 'GET'} ${String(input)}`);
+
+            const answer = fixtureFetch(input, init);
+
+            return answer instanceof Promise ? await answer : answer;
+        })
     );
 
     await import('./main');
@@ -277,7 +296,7 @@ it('lists core tools in the global tools view, calls with the captured session a
     // The session was created for the selected harness and the captured id was
     // sent with the call. Nothing else ran: a browser cannot evaluate these tools.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toHaveLength(1);
-    expect(calls.find((call) => call.url === '/api/tools/toolRequest')).toEqual({
+    expect(calls.find((call) => call.url === '/api/tools/toolRequest' && call.method === 'POST')).toEqual({
         url: '/api/tools/toolRequest',
         method: 'POST',
         body: { parameters: { tags: ['web'] }, sessionId: 's1' }
@@ -310,7 +329,10 @@ it('lists core tools in the global tools view, calls with the captured session a
     // The post-call snapshot refresh surfaced the discovery in the tools view, while
     // the tools view still owns the centre (R21.2: this replaced the removed
     // right-rail core dropdown).
-    expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
+    // One canonical session-row read for the refresh (`GET /v1/harness/sessions/{id}`), and one
+    // frozen-definition read for the discovery line — each exactly once, no storms.
+    expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1')).toHaveLength(1);
+    expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1/definition').length).toBeGreaterThanOrEqual(1);
     // R7: the discovery line describes the PLAYGROUND context, and it is refreshed by
     // the temporary session's snapshot — never by the selected conversation's one.
     expect(byClass('.tools-session-note', 'p').textContent).toBe(
@@ -329,7 +351,7 @@ it('lists core tools in the global tools view, calls with the captured session a
     await flush();
     await flush();
 
-    expect(calls.find((call) => call.url === '/api/tools/read')).toEqual({
+    expect(calls.find((call) => call.url === '/api/tools/read' && call.method === 'POST')).toEqual({
         url: '/api/tools/read',
         method: 'POST',
         body: { parameters: ['package.json'] }
@@ -607,5 +629,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
     // A programmatic click cannot reach the server either.
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();
     await flush();
-    expect(calls.filter((call) => call.url.includes('/tools/'))).toEqual([]);
+    // No EXECUTION left the browser (`POST /tools/{id}/executions`). The identified schema read
+    // an opened tool costs is a GET on the same path and is not a call.
+    expect(calls.filter((call) => call.url.includes('/tools/') && call.method === 'POST')).toEqual([]);
 });

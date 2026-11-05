@@ -443,7 +443,7 @@ it('labels a running focused thread as queued once a ready attachment exists', a
                     data: PNG_BASE64
                 }
             ],
-            threadId: 'thread-1'
+            thread_id: 'thread-1'
         }
     ]);
 });

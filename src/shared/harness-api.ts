@@ -1807,7 +1807,12 @@ export interface DisplayStep {
 /**
  * One segment of the ONE context bar: METADATA ONLY, carrying no text, which is what lets the default wire grow
  * with the NUMBER of segments and never with their length. The bytes are exactly one identified read away at
- * the block detail route.
+ * the block detail route. The display and block routes transport the projector's record VERBATIM (./api.ts
+ * `getSessionTurnDisplay` and `getSessionTurnBlock` cast, never restate, `projector.display()` and
+ * `store.blockDetail()`), so these property names ARE the projector's field names (src/shared/turn-display.ts
+ * `ContextBlock`): `name`, never a renamed `label`, is what the server sends. No time figure, no span, and no
+ * `inPrompt` verdict is dropped by this record either, because every one of them is a figure the durable record
+ * already holds and a client may not re-derive.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ContextBlock {
@@ -1815,9 +1820,16 @@ export interface ContextBlock {
     id: string;
     turnId: string;
     sectionId: string;
-    label: string;
+    name?: string;
+    label?: string;
     chars: number;
-    state: SectionDisplayState;
+    state?: StepDisplayState;
+    at?: number;
+    endedAt?: number;
+    durationMs?: number;
+    argsChars?: number;
+    resultChars?: number;
+    inPrompt?: boolean;
     eventFrom?: number;
     eventTo?: number;
     callId?: string;

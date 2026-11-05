@@ -385,10 +385,12 @@ it('opens a session from its pill, marking it active, and keeps the harness sele
 
     // The pointer and the projection both moved to s2, through one GET of the record.
     expect(localStorage.getItem(SESSION_KEY)).toBe('s2');
-    // T5: the record read now goes through the display surface (`/views/:id`), which carries
-    // the compiled rows for the tile; the raw `/sessions/:id` read is only for the explicit
-    // "export raw" action.
-    expect(calls.filter((call) => call.url === '/api/views/s2')).toHaveLength(1);
+    // T43: the `/views` mirror is gone (./view-api.ts:7), so the record read IS the canonical
+    // identified read `GET /v1/harness/sessions/:id` (../shared/harness-api.ts:69), and it is
+    // followed by that conversation's named subresources (`/turns`, `/threads`, `/actions`).
+    // The exact-path match is the point: one ROW read per switch, and a subresource read is
+    // never a second record read.
+    expect(calls.filter((call) => call.url === '/v1/harness/sessions/s2')).toHaveLength(1);
     expect(pillIds(dashboard())).toEqual(['s1', 's2']);
     expect(
         dashboard().querySelector('.session-pill[data-session-id="s1"]')?.dataset.active
@@ -398,8 +400,9 @@ it('opens a session from its pill, marking it active, and keeps the harness sele
     );
     expect(document.querySelector('.tile')?.textContent).toContain('second in');
     // Switching sessions is a view change: the harness stays selected, and nothing was
-    // written. (`/api/models` is the background model lookup the boot flow always fires;
-    // it is a read of the provider list, not a conversation write.)
+    // written. (`/v1/harness/models` is the background model discovery boot always fires;
+    // the canonical route is a POST with the endpoint settings, and it is a read of the
+    // provider list, not a conversation write.)
     expect(byClass('.harness-item[data-harness="instruct"]', 'button').getAttribute('aria-pressed')).toBe(
         'true'
     );
@@ -407,7 +410,7 @@ it('opens a session from its pill, marking it active, and keeps the harness sele
         calls.filter(
             (call) =>
                 (call.method === 'POST' || call.method === 'DELETE' || call.method === 'PATCH') &&
-                call.url !== '/api/models'
+                call.url !== '/v1/harness/models'
         )
     ).toEqual([]);
 });
@@ -447,8 +450,10 @@ it('deletes a session from its pill with one click', async () => {
     await flush();
     await flush();
 
+    // T43: one click, one canonical delete (`DELETE /v1/harness/sessions/:id`,
+    // ./api.ts `deleteSession`); the `/views` mirror this used to name no longer exists.
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
-        { url: '/api/views/s2', method: 'DELETE', body: undefined }
+        { url: '/v1/harness/sessions/s2', method: 'DELETE', body: undefined }
     ]);
     // A DELETE leaves the layer open (only opening a conversation dismisses it), so this is
     // the same strip the click landed on.
@@ -486,10 +491,10 @@ it('starts a fresh conversation from the header `+`, without opening the dashboa
     await flush();
 
     // Same contract the rail's New session had: no conversation write is sent, the pointer
-    // is forgotten, the transcript is empty and no pill is active. (`/api/models` is the
-    // background provider lookup, not a write.)
+    // is forgotten, the transcript is empty and no pill is active. (`/v1/harness/models` is
+    // the background provider discovery POST boot always fires, not a conversation write.)
     expect(
-        calls.filter((call) => (call.method === 'POST' || call.method === 'DELETE') && call.url !== '/api/models')
+        calls.filter((call) => (call.method === 'POST' || call.method === 'DELETE') && call.url !== '/v1/harness/models')
     ).toEqual([]);
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
@@ -525,10 +530,17 @@ it('re-reads the directory automatically when a submit is rejected, with no refr
     expect(pillIds(dashboard())).toEqual(['s1']);
 
 
-    // T5 R1: boot reads the compact directory index (`GET /views`); count what it did before
-    // the submit so the re-read below is attributable to the rejected run alone.
+    // T43 R1: boot reads the compact directory page (`GET /v1/harness/sessions?<page>`,
+    // ./view-api.ts `listAllSessions` → ./api.ts `listSessions`); count what it did before
+    // the submit so the re-read below is attributable to the rejected run alone. The match
+    // is the ROUTE, method-less: a create is a POST on the same path, and a page cursor is
+    // still the same directory read.
     const directoryReads = (): number =>
-        calls.filter((call) => call.url === '/api/views' && call.method === undefined).length;
+        calls.filter(
+            (call) =>
+                call.method === undefined &&
+                (call.url === '/v1/harness/sessions' || call.url.startsWith('/v1/harness/sessions?'))
+        ).length;
     const readByBoot = directoryReads();
     // The server gained a conversation while the page was open.
     listed = [first, snapshot({ id: 's9', turns: [doneTurn('from another tab')] })];
@@ -538,10 +550,10 @@ it('re-reads the directory automatically when a submit is rejected, with no refr
     await flush();
     await flush();
 
-    // T5 R1: boot reads the compact directory index once (`GET /views`), so the reads after
-    // boot are the baseline. The ONE additional index read here is the automatic re-read the
-    // rejected run triggered, and it answers with compact rows (`{views}`), never raw
-    // snapshots. Nothing on this path waits for a manual refresh.
+    // T43 R1: boot reads the compact directory page once, so the reads after boot are the
+    // baseline. The ONE additional page read here is the automatic re-read the rejected run
+    // triggered, and it answers with the same rows the strip projects. Nothing on this path
+    // waits for a manual refresh.
     expect(directoryReads()).toBe(readByBoot + 1);
     expect(pillIds(dashboard())).toEqual(['s1', 's9']);
     // Nothing manual is left to press, and the create control is live again once the failed
@@ -714,9 +726,11 @@ it('keeps the same compact header and the same dashboard at a desktop width', as
 //              thread `host/worker`, which its second turn also names (so 2, not 3);
 //   input    — EVERY turn that reported a tally counts, including the one still running
 //              (its spend is real): 40,000 + 9,935 + 2,000 + 500 = 52,435;
-//   time     — completed turns only: 62,000 + 30,000 + 5,000 = 97,000ms. s2's RUNNING
-//              turn is excluded because its `updatedAt` is a heartbeat, not an end
-//              stamp — `1m37s`;
+//   time     — completed turns of the conversation whose ROWS are on screen: 30,000 +
+//              5,000 = 35,000ms → `35.0s`. s1 stays a compact row (boot opened the newest
+//              conversation, s2), and the server's fold carries tokens only, so s1's 62,000ms
+//              is honestly unknown rather than added. s2's RUNNING turn is excluded either
+//              way because its `updatedAt` is a heartbeat, not an end stamp;
 //   cache    — 8,000 + 1,472, because s2's `host/worker` turn reported input but no cache
 //              figure and contributes nothing (it does not contribute 0).
 const billedTurn = (overrides: Partial<SessionTurn> = {}): SessionTurn =>
@@ -789,6 +803,27 @@ it('totals threads, input, time and cache for every session of the harness', asy
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1') return json({ session: first });
         if (url === '/api/sessions/s2') return json({ session: second });
+        // T38/T43: s1 stays a compact directory ROW here (boot opened the newest
+        // conversation, s2, so only s2's turns are on screen). A row carries no token
+        // figure (../shared/harness-api.ts:807-809), so the totals line reads the server's
+        // own fold — `GET /v1/harness/sessions/:id/usage` (./view-api.ts `readUsage`),
+        // issued once when the details dialog opens and cached. The fold is the payload a
+        // shell test has to author (./view-test-support.ts:1826-1848 composes everything
+        // except `usage`), and these are exactly s1's turn figures: 40,000 input / 8,000
+        // cached. The adapter dials the test's OWN route for it (its offer-first rule hands
+        // the raw twin, `${root}/sessions/:id/usage`, to this handler — view-test-support.ts
+        // :1000-1007), which is why the path below is the raw spelling while the recorded
+        // request log above shows the canonical URL the browser asked for.
+        if (url === '/api/sessions/s1/usage')
+            return json({
+                session_id: 's1',
+                turn_count: 1,
+                reported_turns: 1,
+                usage: { input: 40_000, output: 120, total: 40_120, cached: 8_000 },
+                by_thread: [],
+                truncated: false,
+                revision: 1
+            });
         return undefined;
     });
 
@@ -798,13 +833,30 @@ it('totals threads, input, time and cache for every session of the harness', asy
 
     openDetails();
     await flush();
+    // The fold is a read, so the figures it carries land one round-trip after the dialog
+    // opened (main.ts `hydrateDialogUsage` → `paintHarnessDialogStats`).
+    await flush();
 
     const stats = byClass('.harness-details', 'div').querySelector('.harness-details-stats');
     expect(stats).not.toBeNull();
     // Exact copy, in this order. The `' | '` between figures is generated by CSS, so it
     // is NOT part of any node's text — each value stays copy-pastable.
+    //
+    // T43 re-anchors two figures to what the canonical wire states in this MIXED state
+    // (s2's rows are on screen, s1 is a compact directory row plus its `/usage` fold):
+    //   - `2 threads`: a directory row's counter is the HOST roster only
+    //     (src/server/api-reads.ts:211 `thread_count: hostThreads(record).length`, proved by
+    //     src/server/api.test.ts:1367 `thread_count === 0` for a default-only conversation),
+    //     so s1's default conversation is not countable from its row — the turn ids that made
+    //     it countable are exactly what a row omits. s2 stays 2 (`agent:instruct` +
+    //     `host/worker`);
+    //   - `35.0s`: `SessionUsageResponse` carries TOKENS only
+    //     (../shared/harness-api.ts:1364-1371 — no duration field), so the folded
+    //     conversation contributes no run time and ./ui/usage-summary.ts leaves
+    //     `durationMs` unknown rather than inventing 0.
+    // The token figures are the full total across BOTH conversations.
     expect([...stats?.querySelectorAll<HTMLElement>('.harness-details-stat') ?? []].map((node) => node.textContent))
-        .toEqual(['3 threads', '52,435 input', '1m37s', '9,472 cache']);
+        .toEqual(['2 threads', '52,435 input', '35.0s', '9,472 cache']);
     // The labels that are not self-evident say what they measure.
     expect(
         [...stats?.querySelectorAll<HTMLElement>('.harness-details-stat') ?? []].map((node) => node.title)
@@ -862,6 +914,24 @@ it("keeps an open dialog's totals in step with a directory read, on the same nod
         if (url === '/api/sessions/s1/tasks' && method === 'POST')
             return json({ error: { message: 'provider is offline' } }, 500);
         if (url === '/api/sessions/s1') return json({ session: listed[0] });
+        // T38/T43: after the re-read BOTH conversations are compact rows, so their token
+        // figures can only come from the server's fold, once per conversation, and only
+        // while the details dialog is open. s1's conversation never reported a tally, so
+        // its fold honestly carries NO `usage` field; s2's carries exactly its one billed
+        // turn (1,000 input / 250 cached). Raw-twin spelling, offered to this handler by the
+        // adapter's offer-first rule (see the totals test above).
+        if (url === '/api/sessions/s1/usage')
+            return json({ session_id: 's1', turn_count: 1, reported_turns: 0, by_thread: [], truncated: false, revision: 1 });
+        if (url === '/api/sessions/s2/usage')
+            return json({
+                session_id: 's2',
+                turn_count: 1,
+                reported_turns: 1,
+                usage: { input: 1_000, output: 5, total: 1_005, cached: 250 },
+                by_thread: [],
+                truncated: false,
+                revision: 1
+            });
         return undefined;
     });
 
@@ -904,9 +974,16 @@ it("keeps an open dialog's totals in step with a directory read, on the same nod
 
     // Same node, same layer: only the figures were replaced, so the open dialog never
     // flickers or loses the reader's place (a full body rebuild would).
+    //
+    // T43: the figures are the ones the canonical wire can state for this state. Both rows
+    // are compact after the re-read, so the tokens come from the folds declared above and
+    // the time figure is ABSENT — `SessionUsageResponse` publishes tokens only
+    // (../shared/harness-api.ts:1364-1371), and ./ui/usage-summary.ts leaves `durationMs`
+    // undefined for a summary row instead of inventing 0. Dropping a figure the server
+    // never reported is the honest reading; keeping `30.0s` would have been the stale one.
     expect(byClass('.harness-details', 'div').querySelector('.harness-details-stats')).toBe(before);
     expect([...before?.querySelectorAll<HTMLElement>('.harness-details-stat') ?? []].map((node) => node.textContent))
-        .toEqual(['2 threads', '1,000 input', '30.0s', '250 cache']);
+        .toEqual(['0 threads', '1,000 input', '250 cache']);
 });
 
 it('omits the totals row for a harness with no sessions', async () => {
@@ -978,7 +1055,7 @@ it('opens a session from a dialog pill and closes the dialog, and deletes from t
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
-        { url: '/api/views/s3', method: 'DELETE', body: undefined }
+        { url: '/v1/harness/sessions/s3', method: 'DELETE', body: undefined }
     ]);
     // T9 leaves exactly one strip in the page, so the reopen returns the SAME live node the
     // delete repainted — no header copy to fall out of step.

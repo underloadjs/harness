@@ -19,6 +19,24 @@
 import type { AgentDescriptor, HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import type { StreamDouble } from './view-test-support';
+
+// T38: the live case below drives the canonical `harness.v1` stream, and the double is
+// resolved by a DYNAMIC import. `vi.resetModules()` clears the module registry, so a static
+// import would configure the PREVIOUS `./stream` instance while `main.ts` — imported after the
+// reset — dials a fresh singleton with no factory at all: the frame would land nowhere and the
+// case would fail for a reason that has nothing to do with the shell (the same discipline
+// `main-lazy-display.test.ts:521-525` and `canonical-directory-live-main.test.ts` follow).
+const installLiveStream = (options: { sessionId?: string; snapshot?: () => SessionSnapshot | undefined }): Promise<StreamDouble> =>
+    import('./view-test-support').then((support) => support.installHarnessStream(options));
+
+// The singleton is process-wide (./stream.ts:647), so the double is released through the SAME
+// module instance the shell used, or it leaks into the next file's boot.
+const releaseLiveStream = async (): Promise<void> => {
+    const { resetHarnessStream } = await import('./stream');
+
+    resetHarnessStream();
+};
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 const SESSION_KEY = 'underload-harness-app:session';
@@ -121,12 +139,15 @@ beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
 });
 
-afterEach(() => {
+afterEach(async () => {
     // A leaked dialog overlay would own the next test's focus/Escape handling.
     for (const button of document.querySelectorAll<HTMLButtonElement>('.dialog-close')) {
         button.click();
     }
     vi.unstubAllGlobals();
+    // T38: the live case installs the stream double; it is released through the same module
+    // instance the shell used, or it leaks into the next test file's boot.
+    await releaseLiveStream();
 });
 
 it('removes the entry-agent transcript button and its raw session.messages dialog', async () => {
@@ -661,19 +682,27 @@ it('discards every draft on close, overlay and Escape without a single request',
 });
 
 it('keeps the open dialog and the focused control across a live snapshot rebuild', async () => {
-    const session = snapshot({
+    // The conversation as the SERVER holds it. A settled frame is followed by a header
+    // re-read (`session.updated` reconciles through `GET /sessions/:id`,
+    // ./view-shell.ts:515-529), so the document and the frame move together — which is what
+    // makes "pending released" a statement about the shell rather than about a fixture whose
+    // answer never changed.
+    let session = snapshot({
         harnessDefinition: descriptor(),
         status: 'running',
         updatedAt: 2
     });
     localStorage.setItem(SESSION_KEY, 's1');
 
-    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
-    const streamBody = new ReadableStream<Uint8Array>({
-        start(controller) {
-            streamController = controller;
-        }
-    });
+    // T38: the live surface is the canonical `harness.v1` stream, and the shell has NO SSE
+    // fallback (./stream.ts:40-43). The hand-raised `ReadableStream` this case used to push its
+    // frames through was therefore never dialled at all: the snapshot landed nowhere, the shell
+    // kept believing the run was live, `paintSessionActions()` (./main.ts:7301) left
+    // `.new-session` disabled, and the click that was supposed to dismiss the dialog did
+    // nothing. The double below speaks the real wire and folds the SAME raw `SessionStreamItem`
+    // this fixture always declared through the server's own projector
+    // (./view-test-support.ts:2100-2108) — the assertions are unchanged.
+    const stream = await installLiveStream({ sessionId: 's1', snapshot: () => session });
 
     vi.stubGlobal(
         'fetch',
@@ -691,12 +720,6 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
             }
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions/s1') return json({ session });
-            if (url === '/api/sessions/s1/events') {
-                return new Response(streamBody, {
-                    status: 200,
-                    headers: { 'Content-Type': 'text/event-stream' }
-                });
-            }
 
             throw new Error(`unexpected request: ${url}`);
         }, { root: '/api' }))
@@ -715,19 +738,14 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
     expect(document.activeElement).toBe(firstSelect);
 
     const pushSnapshot = async (updatedAt: number): Promise<void> => {
-        if (streamController === undefined) throw new Error('stream not attached');
-        streamController.enqueue(
-            new TextEncoder().encode(
-                `data: ${JSON.stringify({
-                    type: 'snapshot',
-                    session: snapshot({
-                        harnessDefinition: descriptor(),
-                        status: 'idle',
-                        updatedAt
-                    })
-                })}\n\n`
-            )
-        );
+        session = snapshot({
+            harnessDefinition: descriptor(),
+            status: 'idle',
+            updatedAt
+        });
+        // Frames pushed before the shell registered its subscription are queued by the double,
+        // so the order declared here is the order the socket delivers.
+        stream.push([{ type: 'snapshot', session }]);
         await flush();
         await flush();
     };

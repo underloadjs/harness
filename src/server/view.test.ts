@@ -1,5 +1,16 @@
-// The compact view surface, its durable reconstruction, and the `/views` routes
-// (R1/R2/R3/R4).
+// The compact view surface, its durable reconstruction, and the canonical REST reads that
+// replaced the old `/views` routes (R1/R2/R3/R4).
+//
+// T35 MIGRATION NOTE: `/api` and `/views/*` are gone from the network surface. The same
+// compiled-state contract is now pinned on `/v1/harness/sessions/...`: the session aggregate
+// is a bounded page/row read, one turn is metadata + counts, the tree is
+// `.../turns/{id}/display`, one step is `.../steps/{id}`, one context segment is
+// `.../blocks/{id}`, and the verbatim record is the paged `.../events` read. The old
+// per-session display STREAM is no longer a REST route: realtime is one WebSocket upgrade on
+// `/v1/harness/stream`, so the frames this file used to pull off a dispatcher stream are now
+// pinned at the hub that plane subscribes to (`api.events`) and at the store seam
+// (`store.watchView`). Only the CARRIERS changed; every compiled-state expectation below is
+// the original one.
 //
 // What is pinned here, in the user's own terms:
 //   - the UI wire carries SERVER-COMPILED display state, and no raw step/tool
@@ -566,7 +577,7 @@ describe('restart reconstruction (R4)', () => {
     });
 });
 
-describe('the /views routes (R3)', () => {
+describe('the canonical session surface (R3)', () => {
     const apiOf = (store: SessionStore) =>
         createHarnessApi({
             store,
@@ -574,6 +585,8 @@ describe('the /views routes (R3)', () => {
             registry: createHarnessRegistry([singlePreset(), toolRoundPreset()])
         });
 
+    // T13 removed the `/api` mount and the `/views` resource family: ONE mount, and the
+    // compact view is now a set of named reads under `/v1/harness/sessions/...`.
     const call = async (
         api: (request: HarnessApiRequest) => Promise<HarnessApiResult>,
         method: string,
@@ -583,7 +596,7 @@ describe('the /views routes (R3)', () => {
         const result = await api({
             method,
             pathname,
-            mount: '/api',
+            mount: '/v1/harness',
             readBody: async <T>() => (body === undefined ? ({} as T) : (body as T))
         });
 
@@ -592,141 +605,285 @@ describe('the /views routes (R3)', () => {
         return { status: result.status, json: result.body as Record<string, unknown> };
     };
 
-    it('answers every read and mutation with compiled state only', async () => {
-        const api = apiOf(storeOf([toolRoundPreset()]));
-
-        const created = await call(api, 'POST', '/api/views', { harness: 'worker' });
+    /** Creates one session and answers its id. */
+    const createViaApi = async (
+        api: (request: HarnessApiRequest) => Promise<HarnessApiResult>,
+        harness: string
+    ): Promise<string> => {
+        const created = await call(api, 'POST', '/v1/harness/sessions', { harness });
 
         expect(created.status).toBe(201);
         expect(JSON.stringify(created.json)).not.toContain('"events"');
 
-        const sessionId = (created.json.view as SessionView).id;
+        return (created.json.session as { id: string }).id;
+    };
 
-        const submitted = await call(api, 'POST', `/api/views/${sessionId}/tasks`, { input: 'route me' });
+    it('answers every read and mutation with compiled state only', async () => {
+        const store = storeOf([toolRoundPreset()]);
+        const api = apiOf(store);
+
+        const sessionId = await createViaApi(api, 'worker');
+
+        // The submit answers a 202 receipt: the turn is named, not carried, and the heavy
+        // children stay behind their own routes (R1/R3 — no raw payload on this wire).
+        const submitted = await call(api, 'POST', `/v1/harness/sessions/${sessionId}/tasks`, {
+            input: 'route me'
+        });
 
         expect(submitted.status).toBe(202);
-        expect(submitted.json).toHaveProperty('view');
-        expect((submitted.json.turn as { id: string }).id).toBeTruthy();
+        expect(Object.keys(submitted.json).sort()).toEqual([
+            'accepted_at',
+            'links',
+            'session_id',
+            'session_revision',
+            'status',
+            'thread_id',
+            'turn_id'
+        ]);
+        expect(String((submitted.json.turn_id as string) ?? '')).toBeTruthy();
         expect(JSON.stringify(submitted.json)).not.toContain(SENTINEL);
 
-        const listed = await call(api, 'GET', '/api/views');
+        const turnId = submitted.json.turn_id as string;
+
+        // Let the scripted run finish, so the cancel below is a clean "nothing is running"
+        // answer and the rail page is the settled one (store oracle, not a wire shape).
+        await store.waitForIdle(sessionId);
+
+        // The rail read is a bounded page of turn rows, never the compiled tree.
+        const listed = await call(api, 'GET', '/v1/harness/sessions');
 
         expect(listed.status).toBe(200);
-        expect((listed.json.views as unknown[]).length).toBe(1);
+        expect((listed.json.items as unknown[]).length).toBe(1);
 
-        const one = await call(api, 'GET', `/api/views/${sessionId}`);
+        const turns = await call(api, 'GET', `/v1/harness/sessions/${sessionId}/turns`);
+
+        expect(turns.status).toBe(200);
+        expect((turns.json.items as { id: string; promptPreview: string }[]).map((row) => row.id)).toEqual([
+            turnId
+        ]);
+        expect(JSON.stringify(turns.json)).not.toContain(SENTINEL);
+        expect(JSON.stringify(turns.json)).not.toContain('"events"');
+
+        const one = await call(api, 'GET', `/v1/harness/sessions/${sessionId}`);
 
         expect(one.status).toBe(200);
         expect(JSON.stringify(one.json)).not.toContain(SENTINEL);
 
-        const cancelled = await call(api, 'POST', `/api/views/${sessionId}/cancel`, {});
+        // A turn's own metadata read carries counts, never the recorded event array.
+        const turn = await call(api, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}`);
 
+        expect(turn.status).toBe(200);
+        expect(turn.json.turn).toMatchObject({ id: turnId, prompt: 'route me' });
+        expect(turn.json.turn).not.toHaveProperty('events');
+        expect(turn.json.turn).not.toHaveProperty('eventTimes');
+
+        const cancelled = await call(api, 'POST', `/v1/harness/sessions/${sessionId}/cancel`, {});
+
+        // A receipt again: the answer states what it did and the revision it moved, so a
+        // client never re-reads the aggregate to confirm the write. Nothing is running and
+        // nothing is queued, so `active_turn_id` is absent rather than null.
         expect(cancelled.status).toBe(200);
-        expect(Object.keys(cancelled.json)).toEqual(['cancelled']);
+        expect(cancelled.json).toEqual({
+            cancelled: false,
+            session_id: sessionId,
+            dropped_queued_tasks: 0,
+            revision: api.events.getRevision('session', sessionId)
+        });
 
-        const patched = await call(api, 'PATCH', `/api/views/${sessionId}`, { agentModels: { worker: 'next/model' } });
+        const patched = await call(api, 'PATCH', `/v1/harness/sessions/${sessionId}`, {
+            agent_models: { worker: 'next/model' }
+        });
 
         expect(patched.status).toBe(200);
-        expect((patched.json.view as SessionView).agentModels).toEqual({ worker: 'next/model' });
+        expect((patched.json.session as { agent_models: Record<string, string> }).agent_models).toEqual({
+            worker: 'next/model'
+        });
 
-        const removed = await call(api, 'DELETE', `/api/views/${sessionId}`);
+        const removed = await call(api, 'DELETE', `/v1/harness/sessions/${sessionId}`);
 
-        expect(removed.json).toEqual({ deleted: true });
+        expect(removed.json).toEqual({
+            deleted: true,
+            session_id: sessionId,
+            aborted_turns: 0,
+            dropped_queued_tasks: 0
+        });
     });
 
-    it('serves the lazy step detail and the raw turn, and refuses unknown ones', async () => {
+    it('serves the lazy step detail and the verbatim events, and refuses unknown ones', async () => {
         const store = storeOf([toolRoundPreset()]);
         const api = apiOf(store);
-        const created = await call(api, 'POST', '/api/views', { harness: 'worker' });
-        const sessionId = (created.json.view as SessionView).id;
+        const sessionId = await createViaApi(api, 'worker');
 
-        await call(api, 'POST', `/api/views/${sessionId}/tasks`, { input: 'route detail' });
+        await call(api, 'POST', `/v1/harness/sessions/${sessionId}/tasks`, { input: 'route detail' });
         await store.waitForIdle(sessionId);
 
         const view = store.getView(sessionId);
         const turnId = view.turns[0].id;
         const stepId = (view.displays[turnId].sections[0].nodes.find((node) => node.kind === 'tool') as { id: string }).id;
 
-        const detail = await call(api, 'GET', `/api/views/${sessionId}/turns/${turnId}/steps/${stepId}`);
+        const detail = await call(api, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}/steps/${stepId}`);
 
         expect(detail.status).toBe(200);
         // The full payloads ride the DETAIL answer, and only here.
         expect(JSON.stringify(detail.json)).toContain(SENTINEL);
 
-        const raw = await call(api, 'GET', `/api/views/${sessionId}/turns/${turnId}/raw`);
+        // The old `raw` aggregate read is now the events route: the same verbatim pair,
+        // each row carrying its ordinal and recorded time.
+        const events = await call(api, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}/events`);
 
-        expect(JSON.stringify(raw.json)).toContain(SENTINEL);
+        expect(events.status).toBe(200);
+        expect(JSON.stringify(events.json)).toContain(SENTINEL);
+        expect(
+            (events.json.items as { event: { type: string } }[]).map((row) => row.event.type)
+        ).toEqual(store.get(sessionId).turns[0].events.map((event) => event.type));
 
-        const missing = await call(api, 'GET', `/api/views/${sessionId}/turns/${turnId}/steps/424242`);
+        // The compiled tree is its own lazy read as well (nothing folds per request).
+        const display = await call(api, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}/display`);
+
+        expect(display.status).toBe(200);
+        expect(JSON.stringify(display.json)).not.toContain(SENTINEL);
+
+        const missing = await call(
+            api,
+            'GET',
+            `/v1/harness/sessions/${sessionId}/turns/${turnId}/steps/424242`
+        );
 
         expect(missing.status).toBe(404);
     });
 
-    it('keeps the method and route rules of the raw surface', async () => {
+    it('keeps the method and route rules of the single canonical mount', async () => {
         const api = apiOf(storeOf([singlePreset()]));
 
-        const created = await call(api, 'POST', '/api/views', { harness: 'one' });
-        const sessionId = (created.json.view as SessionView).id;
+        const sessionId = await createViaApi(api, 'one');
 
         // The dispatcher maps every known failure to a JSON status, exactly like the
         // raw routes do (the adapters never re-implement the mapping).
-        expect((await call(api, 'PUT', '/api/views')).status).toBe(405);
-        expect((await call(api, 'POST', `/api/views/${sessionId}/events`)).status).toBe(405);
-        expect((await call(api, 'GET', '/api/views/nope')).status).toBe(404);
-        expect((await call(api, 'GET', '/api/views/nope/turns/x/steps/0')).status).toBe(404);
-        expect((await call(api, 'GET', '/api/views/nonsense/route')).status).toBe(404);
-        expect((await call(api, 'DELETE', `/api/views/${sessionId}`)).status).toBe(200);
-        expect((await call(api, 'DELETE', `/api/views/${sessionId}`)).status).toBe(404);
-    });
+        expect((await call(api, 'PUT', '/v1/harness/sessions')).status).toBe(405);
+        expect((await call(api, 'GET', '/v1/harness/sessions/nope')).status).toBe(404);
+        expect((await call(api, 'GET', '/v1/harness/sessions/nope/turns/x/steps/0')).status).toBe(404);
+        expect((await call(api, 'GET', '/v1/harness/nonsense/route')).status).toBe(404);
 
-    it('streams display frames through the dispatcher, view first', async () => {
-        const store = storeOf([singlePreset()]);
-        const api = apiOf(store);
-        const created = await call(api, 'POST', '/api/views', { harness: 'one' });
-        const sessionId = (created.json.view as SessionView).id;
+        // T13/T15: the per-session SSE path is gone from the network surface — realtime is
+        // one WebSocket upgrade on `/stream`, so a REST client addressing `/events` gets a
+        // 404 naming the route it asked for, and a plain (non-upgrading) GET `/stream` is
+        // the 400 the capability document promised.
+        expect((await call(api, 'GET', `/v1/harness/sessions/${sessionId}/events`)).status).toBe(404);
 
-        const result = await api({
-            method: 'GET',
-            pathname: `/api/views/${sessionId}/events`,
-            mount: '/api',
-            readBody: async <T>() => ({} as T)
+        const noUpgrade = await call(api, 'GET', '/v1/harness/stream');
+
+        expect(noUpgrade.status).toBe(400);
+        expect(noUpgrade.json).toEqual({
+            error: {
+                message:
+                    'GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for the harness.v1 subprotocol.'
+            }
         });
 
-        expect(result.kind).toBe('stream');
+        // The legacy prefix is not mounted at all, and the 404 says what IS served.
+        const stale = await call(api, 'GET', '/v1/harness/sessions');
 
-        const frames: unknown[] = [];
-        const controller = new AbortController();
+        expect(stale.status).toBe(200);
 
-        if (result.kind !== 'stream') throw new Error('unreachable');
-
-        const started = result.start((item) => {
-            frames.push(item);
-
-            if (frames.length >= 2) controller.abort();
-        }, controller.signal);
-
-        await store.dispatch(sessionId, 'observed');
-        await store.waitForIdle(sessionId);
-
-        await started;
-
-        expect((frames[0] as { type: string }).type).toBe('view');
-        expect(frames.some((frame) => (frame as { type: string }).type === 'ops')).toBe(true);
-        expect(JSON.stringify(frames)).not.toContain('"events"');
-        // A raw stream item type must never appear on the display stream.
-        expect(frames.some((frame) => (frame as { type: string }).type === 'event')).toBe(false);
+        expect((await call(api, 'DELETE', `/v1/harness/sessions/${sessionId}`)).status).toBe(200);
+        expect((await call(api, 'DELETE', `/v1/harness/sessions/${sessionId}`)).status).toBe(404);
     });
 
-    it('gives the compact submit the same attachment body bound as the raw one', async () => {
+    it('publishes compiled display frames on the hub, and never a raw event frame', async () => {
+        const store = storeOf([singlePreset()]);
+        const api = apiOf(store);
+        const sessionId = await createViaApi(api, 'one');
+
+        // TRANSPORT CHANGE, SAME DOMAIN: the dispatcher no longer streams (T15 moved
+        // realtime to the WebSocket plane), but what that plane carries is decided HERE, at
+        // the hub it subscribes to. The old "view first, then ops, never a raw event" rule
+        // becomes: the run publishes `turn.upsert` + `display.ops`, and no kind named
+        // `event` exists on this plane at all.
+        const frames: { kind: string; payload?: unknown }[] = [];
+        const unsubscribe = api.events.subscribe((event) => {
+            frames.push(event as unknown as { kind: string; payload?: unknown });
+        });
+
+        await call(api, 'POST', `/v1/harness/sessions/${sessionId}/tasks`, { input: 'observed' });
+        await store.waitForIdle(sessionId);
+        unsubscribe();
+
+        const kinds = frames.map((frame) => frame.kind);
+
+        expect(kinds).toContain('turn.upsert');
+        expect(kinds).toContain('display.ops');
+        expect(kinds).toContain('session.updated');
+        // A raw stream item type must never reach the display plane.
+        expect(kinds).not.toContain('event');
+        expect(kinds).not.toContain('snapshot');
+
+        const ops = frames
+            .filter((frame) => frame.kind === 'display.ops')
+            // The published record carries the ops at the TOP level (api.ts `display.ops`
+            // publish), not nested in a payload envelope.
+            .flatMap((frame) => (frame as unknown as { ops: { op: string }[] }).ops)
+            .map((op) => op.op);
+
+        // The op sequence a single scripted answer mints, in order. Note the absence of a
+        // `turn` op: on this plane the ROW is delivered by the `turn.upsert` event above, so
+        // publishing it again inside the ops would be two figures for one change (the store
+        // seam test at `watchView` is where the self-sufficient `turn` op is pinned).
+        expect(ops).toEqual([
+            'section:open',
+            'context:add',
+            'context:add',
+            'section:set',
+            'node:insert',
+            'context:add',
+            'node:append',
+            'context:set',
+            'tail:set',
+            'usage',
+            'usage',
+            'node:set',
+            'section:set',
+            'attempt:commit'
+        ]);
+
+        // Section open, prose node insert + append, and the commit that closes the attempt:
+        // every frame is compiled display state, never a raw event.
+        expect(ops.filter((op) => op === 'node:insert' || op === 'node:append')).toEqual([
+            'node:insert',
+            'node:append'
+        ]);
+        expect(ops.filter((op) => op === 'attempt:commit')).toEqual(['attempt:commit']);
+
+        // R1/R3 on the WIRE: nothing in any frame carries a raw events array.
+        expect(JSON.stringify(frames)).not.toContain('"events"');
+    });
+
+    it('gives the canonical submit the attachment body bound and nothing else does', async () => {
         const { MAX_SUBMIT_BODY_BYTES } = await import('../shared/attachments');
         const { MAX_API_BODY_BYTES, bodyLimitFor } = await import('./api');
 
-        expect(bodyLimitFor('POST', '/api/views/abc/tasks', '/api')).toBe(MAX_SUBMIT_BODY_BYTES);
+        // The one submit route, on the one mount.
+        expect(bodyLimitFor('POST', '/v1/harness/sessions/abc/tasks', '/v1/harness')).toBe(
+            MAX_SUBMIT_BODY_BYTES
+        );
+
+        // Every sibling and every other verb keeps the legacy cap.
+        expect(bodyLimitFor('POST', '/v1/harness/sessions/abc/cancel', '/v1/harness')).toBe(
+            MAX_API_BODY_BYTES
+        );
+        expect(bodyLimitFor('GET', '/v1/harness/sessions/abc/tasks', '/v1/harness')).toBe(
+            MAX_API_BODY_BYTES
+        );
+        expect(bodyLimitFor('POST', '/v1/harness/sessions/abc/messages', '/v1/harness')).toBe(
+            MAX_API_BODY_BYTES
+        );
+        expect(bodyLimitFor('POST', '/v1/harness/sessions/abc/turns/x/steps/0', '/v1/harness')).toBe(
+            MAX_API_BODY_BYTES
+        );
+
+        // `bodyLimitFor` classifies the MOUNT-RELATIVE path, so the same submit shape under a
+        // stale prefix still classifies as a submit — that prefix is refused by ROUTING
+        // (`dispatch` answers 404 and names the canonical root), never by a different cap.
         expect(bodyLimitFor('POST', '/api/sessions/abc/tasks', '/api')).toBe(MAX_SUBMIT_BODY_BYTES);
-        expect(bodyLimitFor('POST', '/v1/harness/views/abc/tasks', '/v1/harness')).toBe(MAX_SUBMIT_BODY_BYTES);
-        // Every other route keeps the legacy cap.
-        expect(bodyLimitFor('POST', '/api/views/abc/cancel', '/api')).toBe(MAX_API_BODY_BYTES);
-        expect(bodyLimitFor('GET', '/api/views/abc/tasks', '/api')).toBe(MAX_API_BODY_BYTES);
     });
 
     // -----------------------------------------------------------------------
@@ -793,7 +950,9 @@ describe('the /views routes (R3)', () => {
         const textIndex = record.events.findIndex((event) => event.type === 'text');
         const args = (record.events[argsIndex] as { call: { arguments: string } }).call.arguments;
         const result = (record.events[resultIndex] as { content: string }).content;
-        const route = (blockId: string) => `/api/views/${created.id}/turns/${turn.id}/blocks/${blockId}`;
+        // The bar's click target is now a canonical child route of the turn.
+        const route = (blockId: string) =>
+            `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${blockId}`;
         const view = store.getView(created.id);
 
         // The `system` segment answers with the instruction entries the agent ACTUALLY
@@ -834,8 +993,14 @@ describe('the /views routes (R3)', () => {
         // A segment the bar never minted (or one a discarded attempt removed) is an
         // honest 404, and a non-GET keeps the mount's method contract.
         expect((await call(api, 'GET', route('0-tool-9999'))).status).toBe(404);
-        expect((await call(api, 'GET', `/api/views/${created.id}/turns/nope/blocks/0-user-prompt`)).status).toBe(404);
-        expect((await call(api, 'POST', route('0-user-prompt'))).status).toBe(405);
+        expect((await call(api, 'GET', `/v1/harness/sessions/${created.id}/turns/nope/blocks/0-user-prompt`)).status).toBe(404);
+
+        const wrongMethod = await call(api, 'POST', route('0-user-prompt'));
+
+        expect(wrongMethod.status).toBe(405);
+        expect(wrongMethod.json).toEqual({
+            error: { message: `Use GET for /v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/0-user-prompt.` }
+        });
 
         // R3: an instruction OVERRIDE is per-agent system-prompt text, so the compact
         // surface trims it out of the descriptor...

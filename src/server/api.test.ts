@@ -1,18 +1,44 @@
-// The transport-neutral API and the @underload/service adapter.
+﻿// The transport-neutral canonical API, reached through the @underload/service adapter.
 //
-// These tests call the service handler directly (no listener, no Hono): the
-// handler is structurally typed, so a plain object with `req.path`, `req.header`
-// and `req.raw` exercises exactly what the service loader provides. The SSE path
-// is a real Response with a ReadableStream, consumed through `response.text()`.
+// T34: rewritten against the FINAL target contract (harness.swagger.yaml + the generated
+// ../shared/harness-api.ts routes), NOT against the old bootstrap/SSE surface. Nothing here
+// asks the server for a compatibility alias: `/api`, `/presets`, `/tools/bootstrap`,
+// `POST /sessions/:id/messages` and the SSE submit are pinned as GONE (404/400), which is the
+// acceptance criterion (no back-compat shims).
 //
-// Scope note: session internals (turns, cancellation) are covered by the session
-// suite; this file pins the HTTP contract — routing, bootstrap, statuses, origin
-// gate, body policy/bounds, and frame passthrough.
+// What the file pins:
+//   1. ROOT/CONFIG     - `GET /v1/harness` is a constant-size identity/links/limits document;
+//                        provider defaults live on `GET /config` (the only writable settings doc).
+//   2. CATALOGUE READS - harness cards, agent profiles and tool rows are PAGED SUMMARIES with
+//                        exact key sets; the heavy members (one definition, one instruction text,
+//                        one tool schema) are each exactly one named read away.
+//   3. SESSIONS        - a session resource is metadata + counters (never turns or messages); the
+//                        frozen definition, usage fold, roster, toolbox and conversations are
+//                        separate reads.
+//   4. TASKS           - a submit answers 202 + `TaskReceipt`; completion is proven by re-reading
+//                        the turn (deterministic polling), and the recorded history is the PAGED
+//                        events read - not a response-owned stream.
+//   5. LAZY DISPLAY    - the compiled display tree, one step and one context block are explicit
+//                        reads (the old `/views` frame is gone).
+//   6. EXECUTION       - global `POST /tools/{id}/executions` vs session-scoped
+//                        `POST /sessions/{id}/tools/{id}/executions`; the gate is advertised on the
+//                        detail read, and a 403 is a policy refusal rather than an absence.
+//   7. ADAPTER         - origin gate, route-aware body caps, loader query forwarding, and the
+//                        epoch/revision headers the contract stamps on every response.
 //
-// No network is touched: `settings`/`defaults` are injected, search keys are
-// stubbed empty, and only the scripted demo preset runs.
+// Determinism: every status, key list, count, and message below is an EXACT value taken from the
+// contract or from the scripted demo's own recorded numbers. Timestamps are never compared to
+// literals. No network: `settings`/`defaults` are injected, search keys are stubbed empty, and
+// only the scripted templates run.
+//
+// Cross-references:
+//   - ./api.ts                       - the dispatcher (route table at :3783, 405 wording at :3870)
+//   - ./api-paging.ts:148            - `limit` echoes the RETURNED row count (asserted below)
+//   - ../shared/harness-api.ts       - routes, limits, capabilities quoted here
+//   - ./canonical-reads.test-support.ts - the composed read helpers this file binds to the adapter
+//   - ./api-canonical.test.ts        - the sibling file that pins the same contract at `runtime.api`
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -25,9 +51,11 @@ import {
     createWebSearchCatalogueEntry,
     WEBSEARCH_UNCONFIGURED_HINT
 } from './harnesses';
-// The shared policy lines of the trusted catalogue (src/agents/guidelines.ts). The
-// profile-specific sentences and rules are hardcoded below, but these are imported so
-// the arrays asserted here can never disagree with the single source they compose from.
+import { agent, harness } from '../harness';
+import type { HarnessPreset, RunnerSettings } from './harnesses/types';
+// The shared policy lines of the trusted catalogue (src/agents/guidelines.ts). Profile-specific
+// sentences are hardcoded below; these are IMPORTED so the arrays asserted here can never
+// disagree with the single source they compose from.
 import {
     DELEGATION_GUIDELINE,
     DISCOVERY_GUIDELINE,
@@ -35,62 +63,87 @@ import {
     TOOL_CREATE_GUIDELINE,
     WEB_SEARCH_GUIDELINE
 } from '../agents/guidelines';
-import { TOOL_REGISTRY_METADATA, TOOL_REQUEST_METADATA } from '../core';
-import { MAX_API_BODY_BYTES } from './api';
+import { MAX_API_BODY_BYTES, bodyLimitFor } from './api';
+import type { HarnessApiResult } from './api';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import { createHarnessServiceHandler } from './service';
-import type { ServiceEndpointContext } from './service';
-import { startHarnessServer } from './index';
+import type { ServiceEndpointContext, ServiceEndpointParameters, ServiceEndpointResult } from './service';
 import { SessionStore } from './sessions';
 import { HarnessPersistence } from './persistence';
-import type { DeleteHarnessResult, HarnessDescriptor, HarnessIndex, SessionSnapshot, SessionStreamItem, ToolCallResult, ToolIndex } from './protocol';
+import {
+    HARNESS_PAGE_LIMIT,
+    HARNESS_ROUTES,
+    HARNESS_SERVICE_CAPABILITIES,
+    HARNESS_SERVICE_LIMITS
+} from '../shared/harness-api';
+// The shared composition layer for the canonical reads (assertion-neutral by design: this file
+// still decides every expected value).
+import {
+    allTurnEvents,
+    listTurns,
+    readBlockDetail,
+    readDisplay,
+    readOk,
+    readStepDetail,
+    readTurn,
+    readTurnEvents,
+    submitTask,
+    waitForTurnStatus,
+    type CanonicalCall
+} from './canonical-reads.test-support';
 
-const SETTINGS = {
+const MOUNT = '/v1/harness';
+
+const SETTINGS: RunnerSettings = {
     baseURL: 'http://provider.test/v1',
     apiKey: 'server-secret',
     model: 'demo-model'
 };
 
-const DEFAULTS = {
-    baseURL: 'http://provider.test/v1',
-    model: 'demo-model',
-    hasApiKey: true
-};
+const DEFAULTS = { baseURL: 'http://provider.test/v1', model: 'demo-model', hasApiKey: true };
 
-// The session record tools (src/core/metadata.ts coreToolMetadata): registered
-// right after task, in this order, by every harness. Spread into the exact
-// core lists below so one edit keeps every projection in step.
-const RECORD_TOOL_NAMES = ['profileManage', 'chapterManage', 'locationManage'];
+// The seven cards this file sees: the five shipped production templates PLUS the two scripted
+// fixtures injected by `createRuntime`. A runtime built without an injection lists only the first
+// five - pinned by 'ships only the production cards without an injected registry'.
+const CARD_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
 
-// The harness-owned core tools lead the catalogue (R8): GET /tools, its
-// /tools/bootstrap alias, and the bootstrap document all list them so a client can
-// review and manually execute them against a session.
-const CORE_TOOL_NAMES = [
-    // The source-registration entry is ordinary and session-bound too; the kernel
-    // registers it before every other core tool. R9-R11 changed VISIBILITY, not
-    // the catalogue: every session-bound runtime row is still listed here so a
-    // client can review and manually execute it against a session.
+// The exact card row `GET /harnesses` answers (`HarnessCard` in ../shared/harness-api.ts). Pinned
+// once at module scope so a projection change is a visible diff, not a renamed field nobody
+// noticed. A card carries NO definition text and NO per-agent instruction map.
+const CARD_KEY_SET = [
+    'agents',
+    'builtin',
+    'definition_revision',
+    'description',
+    'name',
+    'primary',
+    'requires_endpoint',
+    'subagents',
+    'title',
+    'tools'
+];
+
+// The trusted agent registry (src/agents): five roles plus summarizer, then the two fixtures.
+const AGENT_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer', 'demo', 'flaky'];
+
+// The whole catalogue, in the order the route emits it: the fourteen harness-owned core rows,
+// then the package/app tools, then the two environment-backed rows (search, fetch).
+const TOOL_NAMES = [
     'toolRegistry',
     'toolRequest',
     'toolList',
     'toolManage',
     'toolCreate',
     'task',
-    ...RECORD_TOOL_NAMES,
+    'profileManage',
+    'chapterManage',
+    'locationManage',
     'agentManage',
     'agentResult',
     'delegate',
-    // N4: conditional harness-owned tools, appended after delegate in the
-    // global catalogue. They are sessionBound and answer 404 in a session whose
-    // harness lacks an owner answerer / fork configuration.
     'actionRequest',
-    'threadFork'
-];
-
-// The exact catalogue order after the core set: eight package presets, six
-// harness tools, then the environment-backed core pair (search, fetch).
-const CATALOGUE_TOOL_NAMES = [
+    'threadFork',
     'syntax',
     'read',
     'write',
@@ -108,36 +161,42 @@ const CATALOGUE_TOOL_NAMES = [
     'textSummarize',
     'testFlaky',
     'search',
-    // R9-R11: the fetch entry rides with search; it is listed by every
-    // runtime catalogue because the native provider needs no credential.
     'fetch'
 ];
 
-const TOOL_NAMES = [...CORE_TOOL_NAMES, ...CATALOGUE_TOOL_NAMES];
+// The shared toolbox every real card registers, and the two rows the environment decides. On a
+// keyless host `fetch` still registers (the native provider needs no credential); `search` only
+// appears once a web-search key exists.
+const TOOLBOX = [
+    'syntax',
+    'read',
+    'write',
+    'edit',
+    'fileList',
+    'glob',
+    'grep',
+    'shell',
+    'gitDiff',
+    'download',
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize'
+];
 
-// The registry every HTTP assertion here sees: the five shipped production presets
-// PLUS the two fixtures the file injects (T5 moved demo/flaky out of `presets`; see
-// `createRuntime`). A runtime built without an injection lists only the first five —
-// pinned by 'ships only the real production presets over HTTP'.
-const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
+// The declared core of a live card WITH subagents (R9-R11 visibility): the bootstrap pair, the
+// session plan, delegation, the five file tools, and the credential-free fetch row.
+const LIVE_CORE_TOOLS = ['toolRequest', 'task', 'delegate', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
 // ---------------------------------------------------------------------------
 // The trusted prompt text (src/agents), as it reaches the wire.
 //
-// `agentInstruction()` (src/agents/index.ts) returns ONE string per agent: the
-// identity sentence, a BLANK line, then a `Guidelines:` block with one `- ` bullet per
-// profile guideline, in profile order (blank guidelines dropped). It is one string and
-// NOT `[instruction, guidelines]` because `agent({ instruction })` seeds one `system`
-// message per entry (src/core/agent.ts `seed`) and the transport forwards them verbatim
-// — several OpenAI-compatible gateways accept only a single system turn, so the previous
-// two-message seed silently dropped the guidelines there. Every profile-built agent
-// therefore seeds exactly ONE `system` message, which the assertions below pin.
-//
-// The guideline ARRAYS are the raw profile fields (`GET /agents` exposes them unjoined,
-// so the picker still renders identity and rules separately); the PROMPT constants are
-// what an agent actually runs. Identity sentences are hardcoded because they are
-// profile-specific catalogue text; shared lines come from ../agents/guidelines so the
-// two copies inside this file cannot drift from each other.
+// `GET /agents/{id}` and `GET /harnesses/{name}/instructions/{agent}` expose the RAW profile
+// fields: the identity sentence and the guidelines array, unjoined. The runtime composition
+// (src/agents/index.ts `agentInstruction()`) joins them into ONE system message, and that joined
+// text is what the session-scoped instruction read answers - both shapes are pinned below,
+// because a client renders the raw halves and the model receives the join.
 // ---------------------------------------------------------------------------
 
 // Mirrors the single documented join rule in src/agents/index.ts `agentInstruction()`.
@@ -157,51 +216,22 @@ const INSTRUCT_GUIDELINES = [
 ];
 
 const RESEARCH_IDENTITY = 'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.';
-const RESEARCH_GUIDELINES = [
-    'Search the repository before reasoning about it: grep({ pattern, patterns, paths }) returns matching lines with file and line numbers; glob returns paths only.',
-    'Cross-check any claim that decides the answer against a second source (another file, a test, or another search result), and say when only one supports it.',
-    DISCOVERY_GUIDELINE,
-    WEB_SEARCH_GUIDELINE,
-    DELEGATION_GUIDELINE,
-    'Delegate narrow follow-ups: summarizer condenses notes, workspace verifies a code path, reviewer challenges a conclusion.',
-    'Finish with the answer, cite the file and line, tool, or URL behind each claim, and label anything you could not verify.'
-];
-
-// The `workspace` profile is titled "Coder", and the identity sentence says so too.
-const WORKSPACE_IDENTITY = 'You are the Coder agent. Read, edit, and verify files in the server workspace, and keep every change as small as the task allows.';
-const WORKSPACE_GUIDELINES = [
-    'Batch file work into one call: read takes `paths`, write takes `files: [{ path, content }]`, edit takes `edits: [{ path, oldString, newString }]`.',
-    'Paths are absolute or relative to the server working directory; glob with no arguments lists every file under it.',
-    'Read before writing, prefer edit over rewriting a whole file, and confirm the result by re-reading it or running the check that covers it.',
-    'shell, gitDiff, syntax and fileList are searchable, not declared: enable the one you need with toolRequest before calling it.',
-    DISCOVERY_GUIDELINE,
-    DELEGATION_GUIDELINE,
-    PERMISSIONS_GUIDELINE,
-    'Report exactly what you changed and what you actually ran to verify it.'
-];
-
-const SUMMARIZER_GUIDELINES = ['Keep names, numbers, and conclusions.', 'Drop preamble and repetition.'];
-
-const INSTRUCT_PROMPT = joinedPrompt(INSTRUCT_IDENTITY, INSTRUCT_GUIDELINES);
-const RESEARCH_PROMPT = joinedPrompt(RESEARCH_IDENTITY, RESEARCH_GUIDELINES);
-const WORKSPACE_PROMPT = joinedPrompt(WORKSPACE_IDENTITY, WORKSPACE_GUIDELINES);
-const SUMMARIZER_PROMPT = joinedPrompt('You compress technical notes into at most two sentences.', SUMMARIZER_GUIDELINES);
-const DEMO_PROMPT = joinedPrompt('You are the offline demo agent. The transport is scripted; nothing is sent to a model.', [
+const DEMO_IDENTITY = 'You are the offline demo agent. The transport is scripted; nothing is sent to a model.';
+const DEMO_GUIDELINES = [
     'Narrate the loop the transport demonstrates: a toolRequest discovery round, one tool call, then the answer.',
     'The demo registry is timeNow-only; the shared toolbox is not part of this fixture.'
-]);
+];
 
-// Filesystem fixtures live under a `Temp/` directory INSIDE the checkout (never
-// OS temp). The location is resolved by walking the tree instead of counting `..`
-// segments: this package is both a workspace member
-// (`<repo>/packages/underload/harness/src/server`) and its own standalone GitHub
-// repository (`<checkout>/src/server`), so any fixed depth lands outside the
-// repository in one of the two layouts — that is exactly how CI ended up calling
-// `mkdtemp('/home/runner/Temp/...')` and failing with ENOENT.
+// Filesystem fixtures live under a `Temp/` directory INSIDE the checkout (never OS temp). The
+// location is resolved by walking the tree instead of counting `..` segments: this package is both
+// a workspace member (`<repo>/packages/underload/harness/src/server`) and its own standalone GitHub
+// repository (`<checkout>/src/server`), so any fixed depth lands outside the repository in one of
+// the two layouts - that is exactly how CI ended up calling `mkdtemp('/home/runner/Temp/...')` and
+// failing with ENOENT.
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 
-// Nearest ancestor (inclusive) satisfying `matches`; undefined at the filesystem
-// root. Bounded by the parent-equals-self check so it can never loop.
+// Nearest ancestor (inclusive) satisfying `matches`; undefined at the filesystem root. Bounded by
+// the parent-equals-self check so it can never loop.
 const findAncestor = (start: string, matches: (directory: string) => boolean): string | undefined => {
     let directory = start;
 
@@ -215,38 +245,24 @@ const findAncestor = (start: string, matches: (directory: string) => boolean): s
     }
 };
 
-// Package root: nearest ancestor holding `package.json` (src/server/ -> harness/
-// in the source tree, which is the same answer as src/server/package-root.ts).
+// Package root: nearest ancestor holding `package.json` (the same answer as
+// src/server/package-root.ts).
 const PACKAGE_ROOT =
-    findAncestor(MODULE_DIRECTORY, (directory) => existsSync(join(directory, 'package.json'))) ??
-    MODULE_DIRECTORY;
+    findAncestor(MODULE_DIRECTORY, (directory) => existsSync(join(directory, 'package.json'))) ?? MODULE_DIRECTORY;
 
-// Workspace root: nearest ancestor ABOVE the package that carries the shared agent
-// rules (root AGENTS.md), a `package.json`, AND a `workspaces` manifest that
-// actually covers this package. Present when the package is developed inside the
-// noobscript workspace, absent in the standalone checkout.
-//
-// Why the manifest check: a checkout can be nested inside another repository (a
-// vendored copy, a scratch clone) and inheriting that repository's `Temp/` would
-// put fixtures outside the checkout under test. Requiring the `workspaces`
-// patterns to cover the package keeps the answer "this package's own repository"
-// for anything that is not a real member.
-//
-// `Temp/` itself is NOT required to exist — `createFixture` creates it, so a clean
-// clone works (the CI failure was a missing parent directory, not missing rules).
+// Workspace root: nearest ancestor ABOVE the package that carries the shared agent rules (root
+// AGENTS.md), a `package.json`, AND a `workspaces` manifest that actually covers this package.
+// Present in the monorepo, absent in a standalone checkout. The manifest check keeps a vendored
+// copy from inheriting some other repository's `Temp/`.
 const workspaceCovers = (workspaceRoot: string, packageRoot: string): boolean => {
     try {
         const manifest = JSON.parse(readFileSync(join(workspaceRoot, 'package.json'), 'utf8')) as {
             workspaces?: string[] | { packages?: string[] };
         };
-        const patterns = Array.isArray(manifest.workspaces)
-            ? manifest.workspaces
-            : (manifest.workspaces?.packages ?? []);
+        const patterns = Array.isArray(manifest.workspaces) ? manifest.workspaces : (manifest.workspaces?.packages ?? []);
         const relativePath = relative(workspaceRoot, packageRoot).split(sep).join('/');
 
-        // Glob -> anchored regex: '**' spans separators, '*' stays within one
-        // segment. So 'packages/underload/*' and 'packages/*/*' both cover
-        // 'packages/underload/harness', while an unrelated tree does not.
+        // Glob -> anchored regex: '**' spans separators, '*' stays within one segment.
         return patterns.some((pattern) => {
             const expression = pattern
                 .split('**')
@@ -263,965 +279,958 @@ const workspaceCovers = (workspaceRoot: string, packageRoot: string): boolean =>
 const WORKSPACE_ROOT = findAncestor(
     dirname(PACKAGE_ROOT),
     (directory) =>
-        existsSync(join(directory, 'AGENTS.md')) &&
-        existsSync(join(directory, 'package.json')) &&
-        workspaceCovers(directory, PACKAGE_ROOT)
+        existsSync(join(directory, 'AGENTS.md')) && existsSync(join(directory, 'package.json')) && workspaceCovers(directory, PACKAGE_ROOT)
 );
 
-// Scratch root for this file's fixtures: the workspace `Temp/` in the monorepo,
-// otherwise the package `Temp/` (ignored by the package's own `.gitignore`). Both
-// answers sit directly under a directory that holds `package.json`, i.e. inside
-// the checkout — see the `fixture scratch root` test below. Same policy as
-// scripts/scratch.mjs, which the packaging checks already use.
+// Scratch root for this file's fixtures: the workspace `Temp/` in the monorepo, otherwise the
+// package `Temp/`. Both answers sit directly under a directory holding `package.json`, i.e.
+// inside the checkout. Same policy as scripts/scratch.mjs.
 const CHECKOUT_ROOT = WORKSPACE_ROOT ?? PACKAGE_ROOT;
 const TEMP_LIST_ROOT = join(CHECKOUT_ROOT, 'Temp');
 
-// Create one unique fixture directory under TEMP_LIST_ROOT. The recursive mkdir
-// is the fix for CI: `mkdtemp` does not create its parent, so a clean checkout
-// (where nothing has created `Temp/` yet) failed with ENOENT. Callers still own
-// removal through their `finally` blocks.
-//
-// `root` is a parameter only so the regression test below can point the same
-// behaviour at a nested, definitely-absent parent without touching the shared
-// root or anything another agent already left in `Temp/`.
+// One unique fixture directory under TEMP_LIST_ROOT. The recursive mkdir is the CI fix: `mkdtemp`
+// does not create its parent, so a clean checkout failed with ENOENT. Callers own removal.
+// `root` is a parameter only so the regression test can point the same behaviour at a nested,
+// definitely-absent parent without touching the shared root.
 const createFixture = async (prefix: string, root: string = TEMP_LIST_ROOT): Promise<string> => {
     await mkdir(root, { recursive: true });
     return mkdtemp(join(root, prefix));
 };
 
-// fileList reports posix separators on every platform, so an absolute Windows
-// fixture path has to be compared in that same form.
+// fileList reports posix separators on every platform, so an absolute Windows fixture path has to
+// be compared in that same form.
 const posix = (value: string): string => value.split(sep).join('/');
 
-// Stub search keys so `search` is deterministically listed as unconfigured
-// regardless of the machine/.env running the suite.
+// Stub search keys so `search` is deterministically listed as unconfigured regardless of the
+// machine/.env running the suite.
 const stubEmptySearchKeys = (): void => {
     vi.stubEnv('EXA_API_KEY', '');
     vi.stubEnv('TAVILY_API_KEY', '');
     vi.stubEnv('LINKUP_API_KEY', '');
 };
 
+// A runtime holding the shipped catalogue PLUS the two scripted fixtures: this file's HTTP
+// contract needs a harness that runs with NO provider (the scripted demo) and it also pins the
+// failure example's descriptors, so the fixtures are injected EXPLICITLY here, exactly as a host
+// that wants them does.
 const createRuntime = (
-    settings: { baseURL: string; apiKey: string; model: string } = SETTINGS,
-    defaults: { baseURL: string; model: string; hasApiKey: boolean } = DEFAULTS
+    settings: RunnerSettings = SETTINGS,
+    defaults: { baseURL: string; model: string; hasApiKey: boolean } = DEFAULTS,
+    extraPresets: HarnessPreset[] = []
 ): HarnessRuntime => {
     stubEmptySearchKeys();
+
     return createHarnessRuntime({
         settings,
         defaults,
-        // T5: the shipped catalogue is the five real roles only, but this file's
-        // HTTP contract needs a harness that runs with NO provider — the scripted
-        // demo — and it also pins the flaky template's descriptors. So the fixtures
-        // are injected EXPLICITLY here, exactly as a host that wants them does, and
-        // `PRESET_NAMES` below lists catalogue + fixtures. The production default
-        // (no injection) is pinned by its own test:
-        // 'ships only the real production presets over HTTP'.
-        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+        registry: createHarnessRegistry([...ALL_PRESET_TEMPLATES, ...extraPresets]),
         loadEnvironment: false
     });
 };
 
-type CallOptions = {
-    body?: unknown;
-    headers?: Record<string, string>;
-    signal?: AbortSignal;
+// A runtime whose catalogue was built with an explicit web-search key, so the configured half of
+// the environment-backed rows is pinned without reading or mutating the real process environment.
+const createConfiguredRuntime = (): HarnessRuntime => {
+    stubEmptySearchKeys();
+
+    return createHarnessRuntime({
+        settings: SETTINGS,
+        defaults: DEFAULTS,
+        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+        loadEnvironment: false,
+        catalogue: createToolCatalogue({
+            websearch: createWebSearchCatalogueEntry({ configuration: { env: { EXA_API_KEY: 'configured-exa-key' } } })
+        })
+    });
 };
 
-// Mirrors the loader: path is the full URL path, body is already parsed.
+// ---------------------------------------------------------------------------
+// The adapter harness
+//
+// Requests go through `createHarnessServiceHandler`, i.e. the structurally-typed service
+// endpoint: `req.path` is the full URL path, `req.header` is the case-insensitive lookup Hono
+// provides, `req.raw.method` carries the verb, and the loader's pre-parsed `{ query, body }` is
+// handed over exactly as the gateway builds it. That is what makes this file the pin for the
+// ADAPTER (origin, caps, query, headers) while api-canonical.test.ts pins the dispatcher.
+// ---------------------------------------------------------------------------
+
+type CallOptions = { body?: unknown; headers?: Record<string, string>; query?: Record<string, string> };
+
 const callHandler = (
     runtime: HarnessRuntime,
     method: string,
     pathname: string,
     options: CallOptions = {}
-): ReturnType<ReturnType<typeof createHarnessServiceHandler>> => {
+): Promise<ServiceEndpointResult> => {
     const handler = createHarnessServiceHandler({ runtime });
     const headers = options.headers ?? {};
     const context: ServiceEndpointContext = {
         req: {
             path: pathname,
             header: (name) => headers[name.toLowerCase()],
-            raw: { method, signal: options.signal ?? new AbortController().signal }
+            raw: { method, signal: new AbortController().signal }
         }
     };
+    const parameters: ServiceEndpointParameters = {
+        // `body: undefined` is the loader's "raw stream" signal, so a JSON-mode call always sets it.
+        body: options.body === undefined ? {} : options.body,
+        ...(options.query === undefined ? {} : { query: options.query })
+    };
 
-    return handler(context, { body: options.body === undefined ? {} : options.body });
+    return handler(context, parameters);
 };
 
-const jsonBody = async <T>(result: Awaited<ReturnType<ReturnType<typeof createHarnessServiceHandler>>>): Promise<{ status: number; body: T }> => {
+// The JSON arm of an adapter result. `raw` is only ever the WebSocket/SSE arm, which no canonical
+// REST route returns any more.
+const jsonOf = async (result: ServiceEndpointResult): Promise<{ status: number; body: any; headers?: Record<string, string> }> => {
     expect(result.raw).toBeUndefined();
-    expect(result.response).toBeDefined();
-    return { status: result.status, body: result.response as T };
+
+    return { status: result.status, body: result.response as any, ...(result.headers === undefined ? {} : { headers: result.headers }) };
 };
 
-const parseSse = (text: string): SessionStreamItem[] => {
-    const items: SessionStreamItem[] = [];
+// A normal call: status + body. The contract headers are a separate concern (see
+// `callWithHeaders`), so an exact `toEqual` over a response never depends on whether this
+// particular route happened to stamp a revision.
+const call = async (
+    runtime: HarnessRuntime,
+    method: string,
+    pathname: string,
+    body: unknown = {},
+    query?: Record<string, string>
+) => {
+    const { status, body: payload } = await jsonOf(await callHandler(runtime, method, pathname, { body, ...(query === undefined ? {} : { query }) }));
 
-    for (const block of text.split('\n\n')) {
-        const data = block
-            .split('\n')
-            .filter((line) => line.startsWith('data:'))
-            .map((line) => line.slice(5).trimStart())
-            .join('\n');
+    return { status, body: payload };
+};
 
-        if (data.length > 0) items.push(JSON.parse(data) as SessionStreamItem);
+// The same call, with the stamped epoch/revision headers kept for the assertions that pin them.
+const callWithHeaders = async (
+    runtime: HarnessRuntime,
+    method: string,
+    pathname: string,
+    body: unknown = {},
+    query?: Record<string, string>
+) => jsonOf(await callHandler(runtime, method, pathname, { body, ...(query === undefined ? {} : { query }) }));
+
+// The same mount, expressed as the `CanonicalCall` the shared read helpers take: a path may carry
+// a query string, and the adapter's query channel is a record, so the split happens here (never
+// inside the helpers, which stay mount-agnostic).
+const canonicalCall = (runtime: HarnessRuntime): CanonicalCall => async (method, pathname, body) => {
+    const mark = pathname.indexOf('?');
+    const path = mark === -1 ? pathname : pathname.slice(0, mark);
+    const query = mark === -1 ? undefined : Object.fromEntries(new URLSearchParams(pathname.slice(mark + 1)));
+    const result = await callHandler(runtime, method, path, { body: body ?? {}, query });
+
+    if (result.raw !== undefined) {
+        throw new Error(`${method} ${pathname} answered a non-JSON arm.`);
     }
 
-    return items;
+    const mapped: HarnessApiResult = {
+        kind: 'json',
+        status: result.status,
+        body: result.response,
+        ...(result.headers === undefined ? {} : { headers: result.headers })
+    };
+
+    return mapped;
 };
 
-const streamItems = async (
-    result: Awaited<ReturnType<ReturnType<typeof createHarnessServiceHandler>>>
-): Promise<SessionStreamItem[]> => {
-    expect(result.raw).toBeInstanceOf(Response);
-    const raw = result.raw!;
-    expect(raw.status).toBe(200);
-    expect(raw.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
-    return parseSse(await raw.text());
-};
+// A scripted preset whose run waits on a gate, so "the session is busy" is a fact the test
+// controls instead of a race against a provider or a scripted delay.
+const gatedPreset = (gate: Promise<void>): HarnessPreset => ({
+    name: 'gated',
+    title: 'Gated',
+    description: 'Scripted gated preset for busy-session policy',
+    requiresEndpoint: false,
+    primary: 'gated',
+    subagents: [],
+    agents: ['gated'],
+    tools: [],
+    builtin: true,
+    editable: true,
+    create: (settings, progress) =>
+        harness({
+            agents: {
+                gated: agent({
+                    model: settings.model,
+                    instruction: 'Gated test agent.',
+                    stream: async function* () {
+                        yield { type: 'text', delta: 'half' };
+                        await gate;
+                        yield { type: 'text', delta: ' done' };
+                        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                    }
+                })
+            },
+            primary: 'gated',
+            presets: false,
+            // The store hands its recorder in as `progress`; without it the run records no events.
+            report: { progress }
+        })
+});
 
-const createDemo = async (runtime: HarnessRuntime): Promise<SessionSnapshot> => {
-    const result = await callHandler(runtime, 'POST', '/v1/harness/sessions', {
-        body: { harness: 'demo' }
-    });
-    const { status, body } = await jsonBody<{ session: SessionSnapshot }>(result);
-    expect(status).toBe(201);
-    return body.session;
+const createDemo = async (runtime: HarnessRuntime): Promise<Record<string, any>> => {
+    const result = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' });
+    expect(result.status).toBe(201);
+    return result.body.session;
 };
 
 afterEach(() => {
     vi.unstubAllEnvs();
 });
 
-// Regression guard for the CI failure (GitHub Actions, ubuntu, standalone
-// checkout): the four fixture-using tests below called
-// `mkdtemp('/home/runner/Temp/...')` because `../../../../../Temp` counted five
-// levels up from `src/server/` — correct only inside the noobscript monorepo, one
-// level ABOVE the standalone repository root. `mkdtemp` does not create its
-// parent, so a clean checkout (no `Temp/` anywhere yet) died with ENOENT.
-//
-// These assertions pin the two properties that fix it, without depending on the
-// machine: the scratch root sits directly inside the checkout, and fixture
-// creation succeeds even when its parent directory does not exist yet.
+// Regression guard for the CI failure (GitHub Actions, ubuntu, standalone checkout): the
+// fixture-using tests below used to call `mkdtemp('/home/runner/Temp/...')` because a fixed
+// `../../../../../Temp` counted levels correct only inside the monorepo. `mkdtemp` does not create
+// its parent, so a clean checkout died with ENOENT. These two assertions pin the fix.
 describe('fixture scratch root', () => {
     it('resolves Temp/ inside the checkout, not outside it', () => {
-        // `basename` is the same on every platform: `Temp`, not the OS temp name.
         expect(basename(TEMP_LIST_ROOT)).toBe('Temp');
-
-        // Inside the checkout: CHECKOUT_ROOT is the workspace root in the monorepo
-        // and the package root standalone, and both hold package.json. A one-level
-        // relative path proves the fixture root travels with the repository, and
-        // that it never climbs out of the checkout (the old fixed depth resolved to
-        // `<repo>/../Temp` on the standalone CI runner). No `os.tmpdir()` comparison
-        // here: the repo policy itself points TEMP/TMP/TMPDIR at this same `Temp/`,
-        // so such an assertion would be a false negative on a correctly configured
-        // developer machine.
         expect(existsSync(join(CHECKOUT_ROOT, 'package.json'))).toBe(true);
         expect(relative(CHECKOUT_ROOT, TEMP_LIST_ROOT)).toBe('Temp');
     });
 
     it('creates the Temp/ parent chain on a clean checkout before making a fixture', async () => {
-        // A path that cannot exist yet: unique name, two levels of absent parents.
-        // Nothing is written at the shared TEMP_LIST_ROOT itself, so other agents'
-        // scratch directories are untouched.
         const root = join(TEMP_LIST_ROOT, `harness-clean-parent-${randomUUID()}`);
         const absentParent = join(root, 'missing', 'deeper');
 
         try {
-            // The old code path, kept as the failure being regressed: mkdtemp alone
-            // cannot create `missing/deeper/`, which is exactly the CI ENOENT.
-            await expect(mkdtemp(join(absentParent, 'fixture-'))).rejects.toMatchObject({
-                code: 'ENOENT'
-            });
+            // The old code path, kept as the failure being regressed.
+            await expect(mkdtemp(join(absentParent, 'fixture-'))).rejects.toMatchObject({ code: 'ENOENT' });
 
-            // The fix: createFixture creates the parent chain, then the unique dir.
             const fixture = await createFixture('fixture-', absentParent);
 
-            // Exact shape: `<absentParent>/fixture-XXXXXX`.
             expect(dirname(fixture)).toBe(absentParent);
             expect(basename(fixture).startsWith('fixture-')).toBe(true);
             expect(existsSync(absentParent)).toBe(true);
             expect(existsSync(fixture)).toBe(true);
         } finally {
-            // Only this test's own unique directory is removed.
             await rm(root, { recursive: true, force: true });
         }
 
         expect(existsSync(root)).toBe(false);
     });
 });
-
-describe('canonical bootstrap document', () => {
-    it('answers GET /v1/harness with the exact bootstrap shape', async () => {
-        const runtime = createRuntime();
-        const { status, body } = await jsonBody<Record<string, unknown>>(
-            await callHandler(runtime, 'GET', '/v1/harness')
-        );
-
-        expect(status).toBe(200);
-        expect(Object.keys(body)).toEqual(['rootPath', 'presets', 'agents', 'tools', 'defaults', 'sessions']);
-        // The advertised root is the canonical API URL, not a filesystem path.
-        expect(body.rootPath).toBe('/v1/harness');
-        expect((body.presets as { name: string }[]).map((preset) => preset.name)).toEqual(PRESET_NAMES);
-        // The trusted agents are part of the boot document: a client can offer a
-        // primary/subagent picker without a second request.
-        expect((body.agents as { name: string }[]).map((agent) => agent.name)).toEqual([
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'planner',
-            'summarizer',
-            'demo',
-            'flaky'
-        ]);
-        expect((body.tools as { name: string }[]).map((tool) => tool.name)).toEqual(TOOL_NAMES);
-        expect(body.defaults).toEqual(DEFAULTS);
-        expect(body.sessions).toEqual([]);
-
-        // Descriptors, not factories: the first card is the Instruct harness. Its
-        // core set is the four file tools, the harness-owned set, and delegate
-        // (T3 gives every real preset a team); a keyless host has no core search.
-        // fileList and the command/app tools stay searchable.
-        expect((body.presets as unknown[])[0]).toEqual({
-            name: 'instruct',
-            title: 'Instruct',
-            description:
-                'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
-            requiresEndpoint: true,
-            primary: 'instruct',
-            subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer'],
-            agents: ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer'],
-            tools: [
-                'syntax',
-                'read',
-                'write',
-                'edit',
-                'fileList',
-                'glob',
-                'grep',
-                'shell',
-                'gitDiff',
-                'download',
-                'timeNow',
-                'textCount',
-                'diceRoll',
-                'noteSearch',
-                'textSummarize',
-                // R9-R11: the live toolbox opts into webfetch, and the runtime
-                // catalogue carries an executable fetch entry, so a card lists and
-                // declares it even on a keyless host.
-                'fetch'
-            ],
-            coreTools: [
-                'toolRequest',
-                'task',
-                'delegate',
-                'read',
-                'write',
-                'edit',
-                'glob',
-                'grep',
-                'fetch',
-            ],
-            builtin: true,
-            editable: true
-        });
-
-        // The offline fixture is still described, just no longer the first card.
-        // R20.1: it is editable like every template (`editable` is compatibility
-        // data now, not a read-only flag); a metadata-only patch keeps its script.
-        expect((body.presets as { name: string; tools: string[]; coreTools: string[] }[]).find(
-            (preset) => preset.name === 'demo'
-        )).toEqual({
-            name: 'demo',
-            title: 'Scripted demo',
-            description:
-                'Runs a scripted transport: a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to the real presets.',
-            requiresEndpoint: false,
-            primary: 'demo',
-            subagents: [],
-            agents: ['demo'],
-            tools: ['timeNow'],
-            coreTools: ['toolRequest', 'task'],
-            builtin: true,
-            editable: true
-        });
-    });
-
-    it('rejects methods other than GET on the canonical root', async () => {
-        const runtime = createRuntime();
-        const { status, body } = await jsonBody<{ error: { message: string } }>(
-            await callHandler(runtime, 'POST', '/v1/harness', { body: {} })
-        );
-
-        expect(status).toBe(405);
-        expect(body).toEqual({ error: { message: 'Use GET for /v1/harness.' } });
-    });
-
-    it('serves /presets as an alias of /harnesses', async () => {
-        const runtime = createRuntime();
-        const harnesses = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        const presets = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/presets'));
-
-        expect(presets).toEqual(harnesses);
-        expect(presets.body.harnesses.map((entry) => entry.name)).toEqual(PRESET_NAMES);
-        expect(presets.body.defaults).toEqual(DEFAULTS);
-    });
-
-    it('lists the tool catalogue under the mount', async () => {
-        const runtime = createRuntime();
-        const { status, body } = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-
-        expect(status).toBe(200);
-        expect(body.tools.map((tool) => tool.name)).toEqual(TOOL_NAMES);
-    });
-});
-
-// Preset descriptors and the environment-backed `search` tool.
+// The boot document, the health line, and the writable provider document.
 //
-// The declarative half (`environmentTools` in src/harnesses/presets.ts) says WHICH
-// preset can run search; the runtime catalogue says WHETHER this host has it.
-// These tests pin the resolver in api.ts: configured hosts advertise the tool on
-// every live preset (instruct/research/workspace), keyless hosts advertise the
-// same shared toolbox minus search. The configured catalogue is injected with
-// an explicit `env`, so the test never reads or mutates the real process
-// environment.
-describe('preset descriptor tool metadata', () => {
-    // The exact shared toolbox every real preset advertises: eight package tools,
-    // then five app tools. No real card gets a subset any more.
-    const TOOLBOX = [
-        'syntax',
-        'read',
-        'write',
-        'edit',
-        'fileList',
-        'glob',
-        'grep',
-        'shell',
-        'gitDiff',
-        'download',
-        'timeNow',
-        'textCount',
-        'diceRoll',
-        'noteSearch',
-        'textSummarize'
-    ];
-
-    // The five real roles (T3). Each one declares subagents, so each one advertises
-    // delegate; the two examples do not.
-    const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
-    // The core-declared preset rows, in registration order. R9-R11 keeps `download`
-    // searchable, so it stays in the registered `tools` toolbox and never appears
-    // in a `coreTools` list.
-    const FILES = ['read', 'write', 'edit', 'glob', 'grep'];
-    // R9-R11: the declared harness-owned core is exactly the bootstrap plus the
-    // session plan. The record, agent, fork and tool-management rows are searchable.
-    const CORE_BASE = ['toolRequest', 'task'];
-
-    const CONFIGURED_PRESET_TOOLS = {
-        instruct: [...TOOLBOX, 'search', 'fetch'],
-        research: [...TOOLBOX, 'search', 'fetch'],
-        workspace: [...TOOLBOX, 'search', 'fetch'],
-        reviewer: [...TOOLBOX, 'search', 'fetch'],
-        planner: [...TOOLBOX, 'search', 'fetch'],
-        demo: ['timeNow'],
-        // The example adds its own failure tool and shares the same opt-in search
-        // wiring as the real presets (createToolboxHarness).
-        flaky: [...TOOLBOX, 'testFlaky', 'search', 'fetch']
-    };
-
-    // R18 core sets. Every real preset/flaky registers the four file tools; the demo
-    // fixture registers timeNow only, so it must NOT advertise them. Every real
-    // preset declares subagents, so every one advertises delegate; flaky and
-    // the demo do not. A configured host adds search after the file tools (the
-    // order coreToolNames emits).
-    const CORE_TOOLS = {
-        instruct: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
-        research: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
-        workspace: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
-        reviewer: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
-        planner: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
-        demo: [...CORE_BASE],
-        flaky: [...CORE_BASE, ...FILES, 'fetch']
-    };
-
-    const CONFIGURED_CORE_TOOLS = {
-        instruct: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
-        research: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
-        workspace: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
-        reviewer: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
-        planner: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
-        demo: [...CORE_BASE],
-        flaky: [...CORE_BASE, ...FILES, 'search', 'fetch']
-    };
-
-    const configuredRuntime = (): HarnessRuntime => {
-        // Explicit env: this catalogue is configured regardless of the machine.
-        const catalogue = createToolCatalogue({
-            websearch: createWebSearchCatalogueEntry({
-                configuration: { env: { EXA_API_KEY: 'configured-exa-key' } }
-            })
-        });
-
-        return createHarnessRuntime({
-            settings: SETTINGS,
-            defaults: DEFAULTS,
-            // T5: the per-preset tool/coreTools tables below include the scripted
-            // demo and the failure example, so this runtime injects the fixtures
-            // (the production default lists only the five real roles).
-            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
-            loadEnvironment: false,
-            catalogue
-        });
-    };
-
-    const toolLists = (presets: HarnessDescriptor[]): Record<string, string[]> =>
-        Object.fromEntries(presets.map((preset) => [preset.name, preset.tools]));
-
-    const coreLists = (presets: HarnessDescriptor[]): Record<string, string[] | undefined> =>
-        Object.fromEntries(presets.map((preset) => [preset.name, preset.coreTools]));
-
-    it('appends search to every live preset when configured', async () => {
-        const runtime = configuredRuntime();
-        const bootstrap = await jsonBody<{ presets: HarnessDescriptor[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness')
-        );
-
-        expect(toolLists(bootstrap.body.presets)).toEqual(CONFIGURED_PRESET_TOOLS);
-        expect(coreLists(bootstrap.body.presets)).toEqual(CONFIGURED_CORE_TOOLS);
-
-        // Every real card advertises the identical list: the toolbox is not part
-        // of what a harness choice changes.
-        const lists = toolLists(bootstrap.body.presets);
-        for (const name of REAL) expect(lists[name]).toEqual(lists.instruct);
-
-        // The direct-call catalogue agrees: the same key makes the tool callable.
-        const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        expect(tools.body.tools.find((tool) => tool.name === 'search')?.availability).toEqual({
-            state: 'available',
-            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY']
-        });
-
-        // /harnesses and the /presets alias resolve through the same descriptors.
-        const harnesses = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        const presets = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/presets'));
-
-        expect(presets.body).toEqual(harnesses.body);
-        expect(harnesses.body.harnesses).toEqual(bootstrap.body.presets);
-    });
-
-    it('keeps the same toolbox on every live preset when no search key is configured', async () => {
-        const runtime = createRuntime();
-        const bootstrap = await jsonBody<{ presets: HarnessDescriptor[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness')
-        );
-
-        // R9-R11: keyless still registers fetch (the native provider needs no key),
-        // so every live card's registered list ends with it; only `search` is absent.
-        expect(toolLists(bootstrap.body.presets)).toEqual({
-            instruct: [...TOOLBOX, 'fetch'],
-            research: [...TOOLBOX, 'fetch'],
-            workspace: [...TOOLBOX, 'fetch'],
-            reviewer: [...TOOLBOX, 'fetch'],
-            planner: [...TOOLBOX, 'fetch'],
-            demo: ['timeNow'],
-            flaky: [...TOOLBOX, 'testFlaky', 'fetch']
-        });
-
-        // Keyless honesty: no card advertises a core search it cannot run, and
-        // the demo's timeNow-only registry does not inherit the package core set.
-        expect(coreLists(bootstrap.body.presets)).toEqual(CORE_TOOLS);
-
-        // Keyless stays honest: the global catalogue still lists search, but as
-        // unconfigured, and no preset card advertises a tool it cannot call.
-        const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        expect(tools.body.tools.find((tool) => tool.name === 'search')?.availability).toEqual({
-            state: 'unconfigured',
-            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
-            hint: WEBSEARCH_UNCONFIGURED_HINT
-        });
-    });
-
-    it('resolves legacy preset identifiers to the canonical session harness', async () => {
+// Replaces the old 'canonical bootstrap document' block: the fat `{ rootPath, presets, agents,
+// tools, defaults, sessions }` aggregate is gone, and each of those five families now has its own
+// route (`/harnesses`, `/agents`, `/tools`, `/config`, `/sessions`). The defaults the boot document
+// used to carry live on `GET /config`.
+describe('canonical root and provider document', () => {
+    it('answers GET /v1/harness as a constant-size identity document', async () => {
         const runtime = createRuntime();
 
-        const created = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'POST', '/v1/harness/sessions', {
-                body: { harness: 'researcher' }
-            })
-        );
+        // History exists, and the boot document still does not carry any of it.
+        await createDemo(runtime);
 
-        expect(created.status).toBe(201);
-        expect(created.body.session.harness).toBe('research');
-    });
-});
+        const result = await callWithHeaders(runtime, 'GET', MOUNT);
 
-describe('canonical sessions', () => {
-    it('creates, lists, reads, and deletes a session', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        // Everything except the generated id/timestamps is fixed. `turns` is part
-        // of the snapshot contract and must start empty.
-        expect(Object.keys(session)).toEqual([
-            'id',
-            'harness',
-            'status',
-            'model',
-            'agentModels',
-            'createdAt',
-            'updatedAt',
-            'messages',
-            'turns',
-            'harnessDefinition',
-            'discoveredTools'
+        expect(result.status).toBe(200);
+        expect(Object.keys(result.body).sort()).toEqual([
+            'api_root',
+            'api_version',
+            'capabilities',
+            'epoch',
+            'limits',
+            'links',
+            'server_time',
+            'service'
         ]);
-        expect(session.harness).toBe('demo');
-        expect(session.status).toBe('idle');
-        expect(session.model).toBe('demo-model');
-        expect(session.createdAt).toBe(session.updatedAt);
-        expect(session.turns).toEqual([]);
-        // ONE seeded system message, not two: `agentInstruction()` joins the demo
-        // profile's identity sentence and its guidelines block into a single string, so
-        // a gateway that accepts only one system turn still receives the guidelines.
-        expect(session.messages).toEqual([{ role: 'system', content: DEMO_PROMPT }]);
+        expect(result.body.api_root).toBe(MOUNT);
+        expect(result.body.api_version).toBe('v1');
+        expect(result.body.service).toBe('noobscript-harness');
+        expect(result.body.limits).toEqual(HARNESS_SERVICE_LIMITS);
+        expect(result.body.capabilities).toEqual(HARNESS_SERVICE_CAPABILITIES);
+        // The epoch the boot document reports is the runtime's own hub epoch - the same value the
+        // WebSocket transport welcomes with (./api-events.ts).
+        expect(result.body.epoch).toBe(runtime.events.epoch);
 
-        const list = await jsonBody<{ sessions: SessionSnapshot[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness/sessions')
-        );
-        expect(list.status).toBe(200);
-        expect(list.body.sessions.map((entry) => entry.id)).toEqual([session.id]);
+        // Links are named pointers only; nothing catalogued rides along.
+        expect(result.body.links).toEqual({
+            self: MOUNT,
+            health: `${MOUNT}/health`,
+            config: `${MOUNT}/config`,
+            harnesses: `${MOUNT}/harnesses`,
+            agents: `${MOUNT}/agents`,
+            tools: `${MOUNT}/tools`,
+            models: `${MOUNT}/models`,
+            sessions: `${MOUNT}/sessions`,
+            stream: `${MOUNT}/stream`
+        });
 
-        const read = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
-        );
-        expect(read.status).toBe(200);
-        expect(read.body.session.id).toBe(session.id);
+        // The acceptance number: one session with a scripted history, and the boot document is
+        // still under 2 KB. The legacy bootstrap carried every descriptor, every session and every
+        // recorded turn of the same state.
+        expect(Buffer.byteLength(JSON.stringify(result.body), 'utf8')).toBeLessThan(2_048);
+        expect(result.headers).toEqual({ 'X-Harness-Epoch': runtime.events.epoch });
+    });
 
-        const removed = await jsonBody<{ deleted: boolean }>(
-            await callHandler(runtime, 'DELETE', `/v1/harness/sessions/${session.id}`)
-        );
-        expect(removed).toEqual({ status: 200, body: { deleted: true } });
+    it('rejects a verb the root does not declare, naming the one it does', async () => {
+        const runtime = createRuntime();
 
-        const missing = await jsonBody<{ error: { message: string } }>(
-            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
-        );
-        expect(missing).toEqual({
-            status: 404,
-            body: { error: { message: `Unknown session "${session.id}".` } }
+        expect(await call(runtime, 'POST', MOUNT)).toEqual({
+            status: 405,
+            body: { error: { message: 'Use GET for /v1/harness.' } }
         });
     });
 
-    // PATCH /sessions/:id — change which model an already-selected agent runs,
-    // while the session keeps its harness, history, and frozen definition. The
-    // response envelope matches GET /sessions/:id exactly (`{ session }`).
-    it('retargets an agent model over HTTP and keeps the frozen definition', async () => {
+    it('answers health with the live session count and the epoch', async () => {
         const runtime = createRuntime();
-        const session = await createDemo(runtime);
 
-        // Baseline: one agent, running the session model, no preset override in the
-        // frozen definition.
-        expect(session.model).toBe('demo-model');
-        expect(session.agentModels).toEqual({ demo: 'demo-model' });
-        expect(session.harnessDefinition?.agentModels).toBeUndefined();
+        expect(await callWithHeaders(runtime, 'GET', `${MOUNT}/health`)).toEqual({
+            status: 200,
+            body: { ok: true, sessions: 0, epoch: runtime.events.epoch },
+            headers: { 'X-Harness-Epoch': runtime.events.epoch }
+        });
 
-        const patched = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'PATCH', `/v1/harness/sessions/${session.id}`, {
-                body: { agentModels: { demo: '  next/model  ' } }
-            })
-        );
+        await createDemo(runtime);
+
+        const after = await call(runtime, 'GET', `${MOUNT}/health`);
+        expect(after.body).toEqual({ ok: true, sessions: 1, epoch: runtime.events.epoch });
+    });
+
+    it('reads global config as a bounded defaults document with a revision', async () => {
+        const runtime = createRuntime();
+
+        const before = await callWithHeaders(runtime, 'GET', `${MOUNT}/config`);
+
+        expect(before.status).toBe(200);
+        expect(Object.keys(before.body).sort()).toEqual(['defaults', 'revision', 'runtime', 'writable_fields']);
+        expect(before.body.revision).toBe(0);
+        // snake_case on the wire, and key-free: `has_api_key` is an advertisement, not a secret.
+        expect(before.body.defaults).toEqual({
+            base_url: 'http://provider.test/v1',
+            model: 'demo-model',
+            has_api_key: true
+        });
+        expect(before.body.runtime).toEqual({
+            thread_execution: 'inline',
+            worker_idle_ms: 120_000,
+            max_lane_workers: 16,
+            worker_handshake_ms: 60_000
+        });
+        expect(before.body.writable_fields).toEqual(['settings.base_url', 'settings.model', 'settings.api_key']);
+        expect(before.headers).toEqual({ 'X-Harness-Epoch': runtime.events.epoch, 'X-Harness-Revision': '0' });
+
+        const patched = await call(runtime, 'PATCH', `${MOUNT}/config`, { settings: { model: 'next/model' } });
 
         expect(patched.status).toBe(200);
-        // Envelope parity with GET: one `session` key, same shape.
-        expect(Object.keys(patched.body)).toEqual(['session']);
-        expect(Object.keys(patched.body.session)).toEqual(Object.keys(session));
-        // Live map (and the entry model derived from it) moved; attribution of what
-        // the session was BUILT with did not.
-        expect(patched.body.session.model).toBe('next/model');
-        expect(patched.body.session.agentModels).toEqual({ demo: 'next/model' });
-        expect(patched.body.session.harnessDefinition).toEqual(session.harnessDefinition);
-        // Nothing else about the session changed: same id, same harness, no turn.
-        expect(patched.body.session.id).toBe(session.id);
-        expect(patched.body.session.harness).toBe('demo');
-        expect(patched.body.session.status).toBe('idle');
-        expect(patched.body.session.turns).toEqual([]);
+        expect(patched.body.revision).toBe(1);
+        expect(patched.body.defaults.model).toBe('next/model');
 
-        // A reload (and the list) report the change; no second session was made.
-        const read = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
-        );
-        expect(read.body.session.model).toBe('next/model');
-        expect(read.body.session.agentModels).toEqual({ demo: 'next/model' });
-        const list = await jsonBody<{ sessions: SessionSnapshot[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness/sessions')
-        );
-        expect(list.body.sessions.map((entry) => entry.id)).toEqual([session.id]);
+        // The write landed: a reload reports it, and the revision header moved with it.
+        const reload = await callWithHeaders(runtime, 'GET', `${MOUNT}/config`);
+        expect(reload.body.defaults.model).toBe('next/model');
+        expect(reload.body.revision).toBe(1);
+        expect(reload.headers).toEqual({ 'X-Harness-Epoch': runtime.events.epoch, 'X-Harness-Revision': '1' });
+
+        // A credential write never echoes the secret back: `defaults` stays key-free.
+        const keyed = await call(runtime, 'PATCH', `${MOUNT}/config`, { settings: { api_key: 'client-key' } });
+        expect(keyed.status).toBe(200);
+        expect(keyed.body.defaults).toEqual({
+            base_url: 'http://provider.test/v1',
+            model: 'next/model',
+            has_api_key: true
+        });
+        expect(JSON.stringify(keyed.body)).not.toContain('client-key');
     });
 
-    it('rejects invalid session patches without changing anything', async () => {
+    it('refuses a config field the contract does not allow to be written', async () => {
         const runtime = createRuntime();
-        const session = await createDemo(runtime);
-        const path = `/v1/harness/sessions/${session.id}`;
 
-        const patch = (body: unknown) =>
-            callHandler(runtime, 'PATCH', path, { body }).then((result) =>
-                jsonBody<{ error: { message: string } }>(result)
-            );
+        // A capability the wire does not name is a 400 that lists what it does.
+        expect(await call(runtime, 'PATCH', `${MOUNT}/config`, { settings: { temperature: 1 } })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "temperature". Allowed fields: base_url, model, api_key.' } }
+        });
 
-        // Unknown agent (the key space is THIS session's harness), empty/garbage
-        // model ids, and a non-object map are all 400s from the shared validator.
-        expect(await patch({ agentModels: { ghost: 'x' } })).toEqual({
+        // camelCase is NOT accepted on a request body: the contract is snake_case, so the legacy
+        // spelling is an unknown field rather than a quietly-coerced alias.
+        expect(await call(runtime, 'PATCH', `${MOUNT}/config`, { settings: { baseURL: 'http://x.test/v1' } })).toEqual({
             status: 400,
-            body: {
-                error: {
-                    message:
-                        '`agentModels` names "ghost", which is not a member of this harness. Members: demo.'
-                }
-            }
+            body: { error: { message: 'Unknown field "baseURL". Allowed fields: base_url, model, api_key.' } }
         });
-        expect(await patch({ agentModels: { demo: '   ' } })).toEqual({
+
+        expect(await call(runtime, 'PATCH', `${MOUNT}/config`, {})).toEqual({
             status: 400,
-            body: { error: { message: '`agentModels.demo` cannot be empty.' } }
+            body: { error: { message: 'A config patch requires a "settings" object.' } }
         });
-        expect(await patch({ agentModels: { demo: 7 } })).toEqual({
-            status: 400,
-            body: { error: { message: '`agentModels.demo` must be a model id string.' } }
-        });
-        expect(await patch({ agentModels: ['demo'] })).toEqual({
-            status: 400,
-            body: { error: { message: '`agentModels` must be an object mapping agent ids to model ids.' } }
-        });
-        // An empty map changes nothing, so it is not a silent success.
-        expect(await patch({ agentModels: {} })).toEqual({
-            status: 400,
-            body: { error: { message: 'A patch must change at least one agent model.' } }
-        });
-        // Only `agentModels` is client-writable on a live session.
-        expect(await patch({ model: 'sneaky/model' })).toEqual({
-            status: 400,
-            body: { error: { message: 'Unknown field "model". Allowed fields: agentModels.' } }
-        });
-        expect(await patch({ agentModels: { demo: 'ok/model' }, harness: 'instruct' })).toEqual({
-            status: 400,
-            body: { error: { message: 'Unknown field "harness". Allowed fields: agentModels.' } }
-        });
-        expect(await patch({})).toEqual({
-            status: 400,
-            body: { error: { message: 'A patch must change at least one of: agentModels.' } }
-        });
-        // A non-object body never reaches the route's field checks.
-        expect(await patch([])).toEqual({
+
+        expect(await call(runtime, 'PATCH', `${MOUNT}/config`, [])).toEqual({
             status: 400,
             body: { error: { message: 'The request body must be a JSON object.' } }
         });
 
-        // The method surface is documented, and an unknown id is a 404 before any
-        // validation (a patch cannot leak which ids exist).
-        const wrongMethod = await jsonBody<{ error: { message: string } }>(
-            await callHandler(runtime, 'PUT', path, { body: { agentModels: {} } })
-        );
-        expect(wrongMethod).toEqual({
+        // Only GET and PATCH are mounted here.
+        expect(await call(runtime, 'DELETE', `${MOUNT}/config`)).toEqual({
             status: 405,
-            body: { error: { message: 'Use GET, PATCH or DELETE for /v1/harness/sessions/:id.' } }
+            body: { error: { message: 'Use GET, PATCH for /v1/harness/config.' } }
         });
-        expect(
-            await jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, 'PATCH', '/v1/harness/sessions/missing', {
-                    body: { agentModels: { demo: 'ok/model' } }
-                })
-            )
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown session "missing".' } } });
-
-        // Every rejection above left the live session untouched.
-        const after = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'GET', path)
-        );
-        expect(after.body.session.model).toBe('demo-model');
-        expect(after.body.session.agentModels).toEqual({ demo: 'demo-model' });
     });
 
-    it('streams a run and forwards every frame unchanged', async () => {
+    it('discovers models through the route-aware settings body and never leaks the key', async () => {
         const runtime = createRuntime();
-        const session = await createDemo(runtime);
 
-        const result = await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-            body: { input: 'What time is it?' }
-        });
-        const items = await streamItems(result);
+        // The provider call is stubbed: the contract pin is the response shape and the fact that
+        // the ids come back in the provider's own order (no server-side sorting).
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () =>
+                new Response(JSON.stringify({ data: [{ id: 'z-model' }, { id: 'a-model' }] }), {
+                    status: 200,
+                    headers: { 'content-type': 'application/json' }
+                })
+            )
+        );
 
-        // The turn frame opens the stream; the session contract owns its id.
-        const first = items[0];
-        expect(first.type).toBe('turn');
-        if (first.type !== 'turn') throw new Error('expected a turn frame');
-        expect(Object.keys(first.turn)).toEqual([
-            'id',
-            'index',
-            'prompt',
-            'status',
-            'startedAt',
-            'updatedAt',
-            'events',
-            'eventTimes'
-        ]);
-        expect(first.turn.index).toBe(0);
-        expect(first.turn.prompt).toBe('What time is it?');
-        expect(first.turn.status).toBe('running');
+        try {
+            const ok = await call(runtime, 'POST', `${MOUNT}/models`, {
+                settings: { base_url: 'http://provider.test/v1', api_key: 'client-key' }
+            });
 
-        // Non-delta events follow the scripted loop exactly: discovery call, clock
-        // call, then the answer — each request's `usage` reported BEFORE the tool
-        // call (or the final `done`) it belongs to. Delta events are checked by
-        // membership in the terminal equality assertion below.
-        const events = items.flatMap((item) => (item.type === 'event' ? [item.event] : []));
-        expect(
-            events
-                .filter((event) => event.type !== 'text' && event.type !== 'reasoning')
-                .map((event) => event.type)
-        ).toEqual([
-            'start',
-            'usage',
-            'tool_call',
-            // R3/F1: each tool-calling request closes with `attempt_commit` (a tool
-            // round never gets a `done`).
-            'attempt_commit',
-            'tool_result',
-            'usage',
-            'tool_call',
-            'attempt_commit',
-            'tool_result',
-            'usage',
-            'done'
-        ]);
-
-        // Every event frame names the turn it belongs to.
-        for (const item of items) {
-            if (item.type === 'event') expect(item.turnId).toBe(first.turn.id);
+            expect(ok.status).toBe(200);
+            expect(Object.keys(ok.body).sort()).toEqual(['models', 'observed_at']);
+            expect(ok.body.models).toEqual(['z-model', 'a-model']);
+            expect(JSON.stringify(ok.body)).not.toContain('client-key');
+        } finally {
+            vi.unstubAllGlobals();
         }
-
-        // Frame-level token tally. Only frames exist for events that were actually
-        // reported: `start` precedes every request, so it carries no `usage` key,
-        // while every frame from the first `usage` event onward repeats the
-        // server's running sum.
-        const eventFrames = items.flatMap((item) => (item.type === 'event' ? [item] : []));
-        expect(eventFrames[0].event.type).toBe('start');
-        expect(eventFrames[0]).not.toHaveProperty('usage');
-
-        const usageFrames = eventFrames.filter((frame) => frame.event.type === 'usage');
-        // Each `usage` EVENT is one request's own figures (the demo transport's
-        // scripted numbers: 48/18/66, then 96/22/118, then 148/64/212)...
-        expect(usageFrames.map((frame) => frame.event)).toEqual([
-            { type: 'usage', agent: 'demo', usage: { input: 48, output: 18, total: 66, cached: 0 } },
-            { type: 'usage', agent: 'demo', usage: { input: 96, output: 22, total: 118, cached: 48 } },
-            { type: 'usage', agent: 'demo', usage: { input: 148, output: 64, total: 212, cached: 120 } }
-        ]);
-        // ...while the FRAME's `usage` is the server's running tally after that
-        // event: the first request has no cached prefix, and each later request
-        // re-sends (and caches) the earlier transcript.
-        expect(usageFrames.map((frame) => frame.usage)).toEqual([
-            { input: 48, output: 18, total: 66, cached: 0 },
-            { input: 144, output: 40, total: 184, cached: 48 },
-            { input: 292, output: 104, total: 396, cached: 168 }
-        ]);
-
-        // Terminal frame: complete session, turn done, events byte-identical to
-        // the frames the client just received (the dispatcher must not reshape).
-        const terminal = items.at(-1);
-        expect(terminal?.type).toBe('snapshot');
-        if (terminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot');
-
-        expect(terminal.session.id).toBe(session.id);
-        expect(terminal.session.status).toBe('idle');
-        expect(terminal.session.turns).toHaveLength(1);
-        expect(terminal.session.turns[0].status).toBe('done');
-        expect(terminal.session.turns[0].events).toEqual(events);
-        // The terminal snapshot's turn carries the same figure the last frame did:
-        // the sum of all three reported requests, cached part included.
-        expect(terminal.session.turns[0].usage).toEqual({
-            input: 292,
-            output: 104,
-            total: 396,
-            cached: 168
-        });
-
-        // A snapshot read after the run reports the turn usage over plain JSON too.
-        const readAfterRun = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
-        );
-        expect(readAfterRun.body.session.turns[0].usage).toEqual({
-            input: 292,
-            output: 104,
-            total: 396,
-            cached: 168
-        });
     });
 
-    it('resets a canonical session', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        const result = await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/reset`, {
-            body: {}
-        });
-        const { status, body } = await jsonBody<{ session: SessionSnapshot }>(result);
-
-        expect(status).toBe(200);
-        expect(body.session.status).toBe('idle');
-        expect(body.session.turns).toEqual([]);
-        // A reset re-seeds the frozen harness's prompts: exactly ONE joined system
-        // message (identity + guidelines), never the old instruction/guidelines pair.
-        expect(body.session.messages).toEqual([{ role: 'system', content: DEMO_PROMPT }]);
-    });
-
-    it('rejects a second run while the first is still open with 409', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        // Dispatch directly to reach the stream object before its frames flow.
-        const stream = await runtime.api({
-            method: 'POST',
-            pathname: `/v1/harness/sessions/${session.id}/messages`,
-            mount: '/v1/harness',
-            readBody: async () => ({ input: 'first' }),
-            bootstrapRoot: true
-        });
-        if (stream.kind !== 'stream') throw new Error('expected a stream');
-
-        // Block on the turn frame: at this point SessionStore.status is 'running'.
-        let release: () => void = () => {};
-        const gate = new Promise<void>((resolve) => {
-            release = resolve;
-        });
-        let reached: () => void = () => {};
-        const turnReached = new Promise<void>((resolve) => {
-            reached = resolve;
-        });
-
-        const controller = new AbortController();
-        const run = stream.start(async (item) => {
-            if (item.type === 'turn') {
-                reached();
-                await gate;
-            }
-        }, controller.signal);
-
-        await turnReached;
-
-        const busy = await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-            body: { input: 'second' }
-        });
-        expect(await jsonBody<unknown>(busy)).toEqual({
-            status: 409,
-            body: { error: { message: 'A task is already running in this session.' } }
-        });
-
-        // Abort + release so the busy test cannot leak a running session.
-        controller.abort();
-        release();
-        await run;
-    });
-
-    it('maps validation and lookup failures to exact statuses', async () => {
+    it('maps shared settings validation to 400 with the exact message', async () => {
         const runtime = createRuntime();
 
+        // The shared settings validator still owns these bounds; only the field spelling moved.
         expect(
-            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: {} }))
-        ).toEqual({ status: 400, body: { error: { message: 'A session requires a harness name.' } } });
-
-        expect(
-            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'nope' } }))
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown harness "nope".' } } });
-
-        const session = await createDemo(runtime);
+            await call(runtime, 'POST', `${MOUNT}/models`, { settings: { base_url: 'x'.repeat(2_049) } })
+        ).toEqual({
+            status: 400,
+            body: { error: { message: 'A provider base URL cannot exceed 2048 characters.' } }
+        });
 
         expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-                    body: { input: '   ' }
-                })
-            )
-        ).toEqual({ status: 400, body: { error: { message: 'A task cannot be empty.' } } });
+            await call(runtime, 'POST', `${MOUNT}/models`, { settings: { model: 'x'.repeat(257) } })
+        ).toEqual({ status: 400, body: { error: { message: 'A model name cannot exceed 256 characters.' } } });
 
         expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-                    body: { input: 7 }
-                })
-            )
-        ).toEqual({ status: 400, body: { error: { message: 'A task must be a string.' } } });
+            await call(runtime, 'POST', `${MOUNT}/models`, { settings: { base_url: 5 } })
+        ).toEqual({ status: 400, body: { error: { message: '"body.settings.base_url" must be a string.' } } });
 
         expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/sessions/not-a-session'))
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown session "not-a-session".' } } });
+            await call(runtime, 'POST', `${MOUNT}/models`, { settings: { baseURL: 'http://x.test/v1' } })
+        ).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "baseURL". Allowed fields: base_url, api_key, model.' } }
+        });
 
-        // The models route merges over the STORE's live settings (which hold the
-        // key), not the key-free defaults advertised to clients. A blank base URL
-        // is rejected before any network call.
+        // The models route merges over the STORE's live settings, not the key-free defaults
+        // advertised to clients; a blank base URL is rejected before any network call.
         const blank = createRuntime(
             { baseURL: '', apiKey: '', model: 'demo-model' },
             { baseURL: '', model: 'demo-model', hasApiKey: false }
         );
-        expect(
-            await jsonBody(await callHandler(blank, 'POST', '/v1/harness/models', { body: {} }))
-        ).toEqual({
+
+        expect(await call(blank, 'POST', `${MOUNT}/models`, {})).toEqual({
             status: 400,
             body: { error: { message: 'Set a provider base URL before listing models.' } }
         });
-
-        expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/not-a-route'))
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown API route: GET /v1/harness/not-a-route' } } });
-
-        expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/sessions/'))
-        ).toEqual({ status: 200, body: { sessions: [session] } });
     });
 
-    it('calls a tool directly and reports an unknown tool as 404', async () => {
+    it('lists nothing for a GET on a write-only route and refuses an undeclared verb', async () => {
         const runtime = createRuntime();
 
-        const clock = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: { parameters: 'UTC' } })
-        );
-        expect(clock.status).toBe(200);
-        expect(clock.body.ok).toBe(true);
-        if (clock.body.ok) {
-            const result = clock.body.result as { timezone: string; iso: string; unix: number };
-            expect(result.timezone).toBe('UTC');
-            expect(typeof result.iso).toBe('string');
-            expect(typeof result.unix).toBe('number');
+        expect(await call(runtime, 'GET', `${MOUNT}/models`)).toEqual({
+            status: 405,
+            body: { error: { message: 'Use POST for /v1/harness/models.' } }
+        });
+
+        expect(await call(runtime, 'DELETE', `${MOUNT}/tools`)).toEqual({
+            status: 405,
+            body: { error: { message: 'Use GET for /v1/harness/tools.' } }
+        });
+
+        expect(await call(runtime, 'DELETE', `${MOUNT}/sessions`)).toEqual({
+            status: 405,
+            body: { error: { message: 'Use GET, POST for /v1/harness/sessions.' } }
+        });
+    });
+});
+
+// The removed surface, pinned as REMOVED. Replaces the old '/presets alias', '/tools/bootstrap'
+// and 'standalone /api compatibility' blocks: an old address is a 404 that names the canonical
+// root's rules, never a redirect and never a second route table.
+describe('legacy surface is gone', () => {
+    it('404s every old address instead of aliasing it', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+
+        expect(await call(runtime, 'GET', '/api/harnesses')).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown API route: GET /api/harnesses' } }
+        });
+        expect(await call(runtime, 'GET', `${MOUNT}/presets`)).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown API route: GET /v1/harness/presets' } }
+        });
+        expect(await call(runtime, 'GET', `${MOUNT}/presets/instruct`)).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown API route: GET /v1/harness/presets/instruct' } }
+        });
+        // `/tools/bootstrap` now matches the identified-tool route, so the honest answer is that no
+        // tool is named "bootstrap".
+        expect(await call(runtime, 'GET', `${MOUNT}/tools/bootstrap`)).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown tool "bootstrap".' } }
+        });
+        // The SSE submit is gone: a task is 202 + receipt, and realtime is the WebSocket stream.
+        expect(
+            await call(runtime, 'POST', `${MOUNT}/sessions/${session.id}/messages`, { input: 'hi' })
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown API route: POST /v1/harness/sessions/${session.id}/messages` } }
+        });
+        expect(await call(runtime, 'GET', `${MOUNT}/not-a-route`)).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown API route: GET /v1/harness/not-a-route' } }
+        });
+    });
+
+    it('answers the stream path as an upgrade the JSON pipeline never serves', async () => {
+        const runtime = createRuntime();
+
+        // The adapter owns this answer (./service.ts:472): the upgrade is taken on the raw socket by
+        // `createHarnessServiceUpgrade`, so a plain GET here asked for something it did not send.
+        expect(await call(runtime, 'GET', `${MOUNT}/stream`)).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message: 'GET /v1/harness/stream is a WebSocket upgrade: send Upgrade: websocket and Connection: Upgrade.'
+                }
+            }
+        });
+    });
+});
+
+// The browser access boundary. Unchanged semantics from the old file; only the URLs it is applied
+// to moved.
+describe('service origin gate', () => {
+    it('allows requests with no Origin, same-origin, and loopback origins', async () => {
+        const runtime = createRuntime();
+
+        const noOrigin = await callWithHeaders(runtime, 'GET', `${MOUNT}/health`);
+        expect(noOrigin.status).toBe(200);
+
+        const sameOrigin = await callHandler(runtime, 'GET', `${MOUNT}/health`, {
+            headers: { origin: 'http://127.0.0.1:5000', host: '127.0.0.1:5000' }
+        });
+        expect(sameOrigin.status).toBe(200);
+
+        const devLoopback = await callHandler(runtime, 'GET', `${MOUNT}/health`, {
+            headers: { origin: 'http://localhost:5173', host: '127.0.0.1:5000' }
+        });
+        expect(devLoopback.status).toBe(200);
+    });
+
+    it('rejects a non-loopback cross-origin browser request with 403', async () => {
+        const runtime = createRuntime();
+
+        const hostile = await callHandler(runtime, 'GET', MOUNT, {
+            headers: { origin: 'https://evil.example', host: '127.0.0.1:5000' }
+        });
+        expect(await jsonOf(hostile)).toEqual({
+            status: 403,
+            body: { error: { message: 'Cross-origin requests are not allowed.' } }
+        });
+
+        // Loopback is allowed by design (dev UI), even on another port; a LAN origin is not.
+        const sameHostDifferentPort = await callHandler(runtime, 'GET', MOUNT, {
+            headers: { origin: 'http://127.0.0.1:6000', host: '127.0.0.1:5000' }
+        });
+        expect(sameHostDifferentPort.status).toBe(200);
+
+        const lanOrigin = await callHandler(runtime, 'GET', MOUNT, {
+            headers: { origin: 'http://192.168.1.20:8080', host: '127.0.0.1:5000' }
+        });
+        expect(lanOrigin.status).toBe(403);
+    });
+
+    it('allows the deployed GitHub Pages UI to dial the service cross-origin', async () => {
+        const runtime = createRuntime();
+
+        const pagesHealth = await callHandler(runtime, 'GET', `${MOUNT}/health`, {
+            headers: { origin: 'https://underloadjs.github.io', host: '127.0.0.1:5000' }
+        });
+        expect((await jsonOf(pagesHealth)).status).toBe(200);
+
+        // The LAN host is the chain's last entry, and the root document is the first request the
+        // deployed UI makes.
+        const pagesRoot = await callHandler(runtime, 'GET', MOUNT, {
+            headers: { origin: 'https://underloadjs.github.io', host: '192.168.50.109:5000' }
+        });
+        expect(pagesRoot.status).toBe(200);
+    });
+
+    it('keeps the Pages allowance to an https github.io origin', async () => {
+        const runtime = createRuntime();
+
+        const rejected = [
+            'http://underloadjs.github.io', // Pages serves the UI over https only
+            'https://github.io', // the zone itself is not a Pages site
+            'https://github.io.attacker.test', // label-boundary lookalike
+            'https://underloadjs.github.io.attacker.test', // same, with a subdomain
+            'https://evil.example' // any other public page
+        ];
+
+        for (const origin of rejected) {
+            const result = await callHandler(runtime, 'GET', `${MOUNT}/health`, {
+                headers: { origin, host: '127.0.0.1:5000' }
+            });
+
+            expect(result.status, origin).toBe(403);
         }
+    });
+});
+// Catalogue reads: paged summaries on the collection routes, the heavy member one named read away.
+//
+// Replaces the old 'preset descriptor tool metadata' block and the old 'GET /tools' listing test.
+// A card no longer carries `coreTools`, `agentModels`, `agentInstructions`, or `editable`: those
+// are definition/instruction reads now, and the write field list names what a client may send.
+describe('harness catalogue reads', () => {
+    const INSTRUCT_DESCRIPTION =
+        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.';
 
-        expect(
-            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/tools/nope', { body: {} }))
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown tool "nope".' } } });
+    it('pages the cards as identity + tool names, with no definition text', async () => {
+        const runtime = createRuntime();
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+
+        expect(page.status).toBe(200);
+        expect(Object.keys(page.body).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
+        // `limit` echoes the RETURNED row count (./api-paging.ts:148), and a page that is not full
+        // carries no cursor.
+        expect(page.body.limit).toBe(CARD_NAMES.length);
+        expect(page.body.next_cursor).toBeNull();
+        expect(page.body.revision).toBe(runtime.events.getRevision('harnesses'));
+
+        for (const card of page.body.items) expect(Object.keys(card).sort()).toEqual(CARD_KEY_SET);
+
+        // The first card, byte for byte. `requires_endpoint` is the snake_case spelling of the old
+        // `requiresEndpoint`, and `editable` is gone: every template is patchable now.
+        expect(page.body.items[0]).toEqual({
+            name: 'instruct',
+            title: 'Instruct',
+            description: INSTRUCT_DESCRIPTION,
+            requires_endpoint: true,
+            primary: 'instruct',
+            subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer'],
+            agents: ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer'],
+            tools: [...TOOLBOX, 'fetch'],
+            builtin: true,
+            definition_revision: 0
+        });
+
+        // The offline fixture stays described, just not first, and its registry is still
+        // timeNow-only (no package toolbox).
+        expect(page.body.items[5]).toEqual({
+            name: 'demo',
+            title: 'Scripted demo',
+            description:
+                'Runs a scripted transport: a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to the real presets.',
+            requires_endpoint: false,
+            primary: 'demo',
+            subagents: [],
+            agents: ['demo'],
+            tools: ['timeNow'],
+            builtin: true,
+            definition_revision: 0
+        });
     });
 
-    // T12: fileList takes a directory array. The server declares the schema it
-    // reads from the catalogue and applies the single-property rule to the body,
-    // so `parameters` IS the `paths` array — exactly what a direct call passes.
-    it('declares and runs fileList with a directory array', async () => {
+    it('pages with a cursor and refuses a bad limit by naming the parameter', async () => {
         const runtime = createRuntime();
 
-        const index = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        const fileListEntry = index.body.tools.find((tool) => tool.name === 'fileList');
-        expect(fileListEntry?.parameters).toEqual({
+        const first = await call(runtime, 'GET', HARNESS_ROUTES.harnesses(), {}, { limit: '2' });
+
+        expect(first.status).toBe(200);
+        expect(first.body.items.map((card: any) => card.name)).toEqual(['instruct', 'research']);
+        // A page that returns exactly its limit ALWAYS carries a cursor, even when the collection
+        // ends after the next row (./api-paging.ts:7).
+        expect(first.body.next_cursor).toEqual(expect.any(String));
+
+        const second = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.harnesses(),
+            {},
+            { limit: '2', cursor: first.body.next_cursor as string }
+        );
+        expect(second.body.items.map((card: any) => card.name)).toEqual(['workspace', 'reviewer']);
+
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.harnesses(), {}, { limit: '0' })).toEqual({
+            status: 400,
+            body: { error: { message: `Query parameter "limit" must be an integer between 1 and ${HARNESS_PAGE_LIMIT.max}.` } }
+        });
+
+        expect(
+            (await call(runtime, 'GET', HARNESS_ROUTES.harnesses(), {}, { cursor: 'not-a-cursor' })).status
+        ).toBe(400);
+    });
+
+    it('reads one definition: the card plus core tools and the instruction summary', async () => {
+        const runtime = createRuntime();
+
+        const definition = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('instruct'));
+
+        expect(definition.status).toBe(200);
+        expect(Object.keys(definition.body).sort()).toEqual(['harness']);
+        expect(Object.keys(definition.body.harness).sort()).toEqual(
+            [...CARD_KEY_SET, 'core_tools', 'instruction_summary'].sort()
+        );
+
+        const { harness: card } = definition.body;
+        expect(card.name).toBe('instruct');
+        expect(card.definition_revision).toBe(runtime.events.getRevision('definition', 'instruct'));
+        // The core set is what THIS host would declare: the bootstrap pair, the session plan,
+        // delegation (this card has subagents), the five file tools, and the credential-free fetch.
+        expect(card.core_tools).toEqual(LIVE_CORE_TOOLS);
+        // Summary rows carry sizes, never text: the instruction routes below are where text lives.
+        expect(card.instruction_summary).toEqual([
+            { agent: 'instruct', source: 'catalogue', overridden: false, chars: 98 },
+            { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+            { agent: 'workspace', source: 'catalogue', overridden: false, chars: 129 },
+            { agent: 'reviewer', source: 'catalogue', overridden: false, chars: 111 },
+            { agent: 'planner', source: 'catalogue', overridden: false, chars: 137 },
+            { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
+        ]);
+
+        // The scripted fixture declares only what its own registry can run.
+        const demo = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('demo'));
+        expect(demo.body.harness.core_tools).toEqual(['toolRequest', 'task']);
+        expect(demo.body.harness.tools).toEqual(['timeNow']);
+        expect(demo.body.harness.instruction_summary).toEqual([
+            { agent: 'demo', source: 'catalogue', overridden: false, chars: 86 }
+        ]);
+
+        // An unknown card is the registry's own 404 wording, and an identified read resolves a
+        // LEGACY ALIAS to the canonical card it names (the same read semantics as creation).
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('ghost'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "ghost".' } }
+        });
+
+        const alias = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('writer'));
+        expect(alias.status).toBe(200);
+        expect(alias.body.harness.name).toBe('instruct');
+        expect(alias.body.harness).toEqual(definition.body.harness);
+    });
+
+    it('summaries and instruction text agree with the trusted profile', async () => {
+        const runtime = createRuntime();
+
+        const list = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessNameInstructions('instruct'));
+
+        expect(list.status).toBe(200);
+        expect(Object.keys(list.body).sort()).toEqual(['harness_name', 'items', 'total']);
+        expect(list.body.total).toBe(6);
+        // The rows are exactly the `instruction_summary` the definition read carries.
+        expect(list.body.items).toEqual((await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('instruct'))).body.harness.instruction_summary);
+
+        const text = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.harnessesByHarnessNameInstructionsByAgentId('instruct', 'instruct')
+        );
+
+        expect(text.status).toBe(200);
+        expect(Object.keys(text.body).sort()).toEqual(['agent', 'chars', 'guidelines', 'harness_name', 'instruction', 'source']);
+        // RAW profile halves, unjoined: the picker renders identity and rules separately, and the
+        // `chars` figure above is the identity length.
+        expect(text.body.harness_name).toBe('instruct');
+        expect(text.body.agent).toBe('instruct');
+        expect(text.body.source).toBe('catalogue');
+        expect(text.body.instruction).toBe(INSTRUCT_IDENTITY);
+        expect(text.body.chars).toBe(INSTRUCT_IDENTITY.length);
+        expect(text.body.guidelines).toEqual(INSTRUCT_GUIDELINES);
+
+        // An agent outside the team is a 400-shaped 404 that names both sides.
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessNameInstructionsByAgentId('demo', 'ghost'))
+        ).toEqual({ status: 404, body: { error: { message: 'Agent "ghost" is not a member of harness "demo".' } } });
+    });
+
+    it('pages the trusted agent profiles and reads one', async () => {
+        const runtime = createRuntime();
+
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.agents());
+
+        expect(page.status).toBe(200);
+        expect(Object.keys(page.body).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        expect(page.body.items.map((agent: any) => agent.name)).toEqual(AGENT_NAMES);
+        // A profile row is a picker row: identity text only, no guideline arrays.
+        for (const row of page.body.items) {
+            expect(Object.keys(row).sort()).toEqual(['description', 'has_global_override', 'has_instruction_override', 'name', 'title']);
+        }
+        expect(page.body.items[0]).toEqual({
+            name: 'instruct',
+            title: 'Instruct',
+            description:
+                'General instruction-following agent. Answers directly and concisely with the tools it is given; every other role is available to it as a subagent.',
+            has_instruction_override: false,
+            has_global_override: false
+        });
+
+        const profile = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('instruct'));
+
+        expect(profile.status).toBe(200);
+        expect(Object.keys(profile.body).sort()).toEqual(['agent']);
+        expect(Object.keys(profile.body.agent).sort()).toEqual([
+            'description',
+            'guidelines',
+            'instruction',
+            'instruction_source',
+            'name',
+            'referenced_by',
+            'revision',
+            'title'
+        ]);
+        expect(profile.body.agent.instruction).toBe(INSTRUCT_IDENTITY);
+        expect(profile.body.agent.guidelines).toEqual(INSTRUCT_GUIDELINES);
+        expect(profile.body.agent.instruction_source).toBe('catalogue');
+        // `referenced_by` is derived from the live registry, so a removal impact list cannot drift.
+        expect(profile.body.agent.referenced_by).toEqual(['instruct', 'research', 'workspace', 'reviewer', 'planner']);
+
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('ghost'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown agent "ghost".' } }
+        });
+    });
+
+    it('pages tool rows without an argument schema and reads the schema on demand', async () => {
+        const runtime = createRuntime();
+
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.tools(), {}, { limit: '100' });
+
+        expect(page.status).toBe(200);
+        expect(Object.keys(page.body).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        expect(page.body.items.map((tool: any) => tool.name)).toEqual(TOOL_NAMES);
+        expect(page.body.limit).toBe(TOOL_NAMES.length);
+        expect(page.body.next_cursor).toBeNull();
+
+        // A row is the picker shape: description, gate and availability - the argument schema never
+        // rides it, which is the size signal the whole read model exists for.
+        expect(Object.keys(page.body.items[0]).sort()).toEqual([
+            'availability',
+            'description',
+            'group',
+            'name',
+            'session_bound',
+            'tags',
+            'visibility'
+        ]);
+        expect('parameters' in page.body.items[0]).toBe(false);
+        expect(page.body.items[0].name).toBe('toolRegistry');
+        expect(page.body.items[0].group).toBe('Core tools');
+        expect(page.body.items[0].visibility).toBe('searchable');
+        expect(page.body.items[0].session_bound).toBe(true);
+        expect(page.body.items[0].availability).toEqual({
+            state: 'available',
+            hint: 'Runs inside a session harness: send a sessionId with the call.'
+        });
+
+        const rows = new Map(page.body.items.map((tool: any) => [tool.name, tool]));
+        // R9-R11 visibility stays honest in the row projection: the bootstrap pair and the session
+        // plan are `core`, the demoted runtime rows are `searchable`.
+        expect(rows.get('toolRequest').visibility).toBe('core');
+        expect(rows.get('task').visibility).toBe('core');
+        expect(rows.get('delegate').visibility).toBe('core');
+        expect(rows.get('toolList').visibility).toBe('searchable');
+        expect(rows.get('read').visibility).toBe('core');
+        expect(rows.get('read').group).toBe('Package presets');
+        expect(rows.get('read').session_bound).toBe(false);
+        // A keyless search is still LISTED, and says so, without being falsely session-bound.
+        expect(rows.get('search').availability).toEqual({
+            state: 'unconfigured',
+            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
+            hint: WEBSEARCH_UNCONFIGURED_HINT
+        });
+        // A tool with nothing to add omits `availability` rather than repeating "available".
+        expect(Object.keys(rows.get('timeNow')).sort()).toEqual([
+            'description',
+            'group',
+            'name',
+            'session_bound',
+            'tags',
+            'visibility'
+        ]);
+
+        // The detail read is the row PLUS the schema and the execution gate.
+        const clock = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('timeNow'));
+        expect(clock.status).toBe(200);
+        expect(Object.keys(clock.body.tool).sort()).toEqual([
+            'description',
+            'execution',
+            'group',
+            'name',
+            'parameters',
+            'session_bound',
+            'tags',
+            'visibility'
+        ]);
+        expect(clock.body.tool.execution).toEqual({ scope: 'global', manual: true });
+        expect(clock.body.tool.parameters).toEqual({
+            type: 'object',
+            properties: {
+                timezone: { type: 'string', maxLength: 64, description: 'Label for the timezone being asked about, e.g. "UTC".' }
+            },
+            required: ['timezone'],
+            additionalProperties: false
+        });
+
+        // A harness-owned control tool advertises the gate that makes the global call a 403.
+        const discovery = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('toolRequest'));
+        expect(discovery.body.tool.execution).toEqual({ scope: 'session_required', manual: false });
+        expect(discovery.body.tool.parameters).toEqual({
+            type: 'object',
+            properties: {
+                names: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Exact wire names to enable, case-sensitive (e.g. ["fileList"]).'
+                },
+                regex: { type: 'string', description: 'JavaScript regex tested against tool names; bare source or /source/flags.' },
+                tags: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Capability tags to look for, e.g. ["files", "read", "shell"].'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    description:
+                        "Optional per-query narrowing: return at most this many of THIS query's matches. It is not a global request cap."
+                }
+            },
+            required: [],
+            additionalProperties: false
+        });
+
+        // T12/T16: fileList declares the default AND the two paging knobs the implementation reads.
+        const fileList = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('fileList'));
+        expect(fileList.body.tool.parameters).toEqual({
             type: 'object',
             properties: {
                 paths: {
                     type: 'array',
                     items: { type: 'string' },
-                    // T16: the documented default is declared in the schema, so a
-                    // client does not have to parse the description to find it.
                     default: ['.'],
                     description:
                         'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
                 },
-                // R9 paging cursor: the listing is a bounded page, so the schema must
-                // carry the two knobs the implementation reads.
                 offset: {
                     type: 'integer',
                     minimum: 0,
-                    description:
-                        '0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page.'
+                    description: '0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page.'
                 },
                 limit: {
                     type: 'integer',
@@ -1232,215 +1241,1173 @@ describe('canonical sessions', () => {
             },
             additionalProperties: false
         });
-        // No `required`: the documented default is ["."], so an argument-less call
-        // is legal for both a model and a client.
-        expect(fileListEntry !== undefined && 'required' in fileListEntry.parameters).toBe(false);
 
-        // Real fixture directories under the checkout-local Temp/ (never OS temp).
-        const fixture = await createFixture('harness-list-api-');
-        try {
-            await mkdir(join(fixture, 'src', 'nested'), { recursive: true });
-            await mkdir(join(fixture, 'task'), { recursive: true });
-            await writeTextFile(join(fixture, 'src', 'a.ts'), 'a\n', 'utf8');
-            await writeTextFile(join(fixture, 'task', 'b.ts'), 'b\n', 'utf8');
+        // The unconfigured environment row is listed but not manually executable, and a name the
+        // catalogue never had is a 404.
+        const search = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('search'));
+        expect(search.body.tool.execution).toEqual({ scope: 'global', manual: false });
+        expect(search.body.tool.availability).toEqual({
+            state: 'unconfigured',
+            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
+            hint: WEBSEARCH_UNCONFIGURED_HINT
+        });
 
-            // The direct runner applies the same single-property rule as the
-            // harness: `parameters` IS the value of "paths", not a wrapper object
-            // (src/server/api.ts callToolRoute). This is the exact body the frontend
-            // runner sends for a fileList example.
-            const result = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
-                    body: { parameters: [join(fixture, 'src'), join(fixture, 'task')] }
-                })
-            );
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('nope'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown tool "nope".' } }
+        });
+    });
 
-            // Absolute inputs keep their absolute prefix, posix-normalized, and the
-            // directory order is the caller's: src (with its child) then task.
-            // R9: the answer is one bounded PAGE (the whole listing here), so the
-            // cursor fields are part of the exact result.
-            const expectedEntries = [
-                `${posix(fixture)}/src/a.ts`,
-                `${posix(fixture)}/src/nested/`,
-                `${posix(fixture)}/task/b.ts`
-            ];
-            expect(result.body).toEqual({
-                ok: true,
-                result: {
-                    entries: expectedEntries,
-                    truncated: false,
-                    nextOffset: null,
-                    offset: 0,
-                    limit: 200,
-                    bytes: expectedEntries.reduce(
-                        (total, entry) => total + Buffer.byteLength(entry, 'utf8'),
-                        0
-                    ),
-                    contentBudget: 64 * 1024
-                },
-                durationMs: expect.any(Number)
-            });
+    it('keeps the same toolbox on every live card, and adds search only with a key', async () => {
+        const keyless = createRuntime();
+        const keylessCards = (await call(keyless, 'GET', HARNESS_ROUTES.harnesses())).body.items;
+        const keylessTools = new Map(keylessCards.map((card: any) => [card.name, card.tools]));
 
-            // A missing directory is a tool failure reported as data (200 + ok:false),
-            // not a partial list and not a request error.
-            const missing = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
-                    body: { parameters: [join(fixture, 'src'), join(fixture, 'nope')] }
-                })
-            );
-            expect(missing.status).toBe(200);
-            expect(missing.body.ok).toBe(false);
-
-            // T16/R13: the direct route resolves `parameters` through the shared
-            // validator (`resolveToolParameters`, 'direct' mode) before `execute`
-            // sees it. Both shapes therefore mean the same request: the legacy
-            // unwrapped value (`["."]`, which `fileList` also accepts directly) and
-            // the schema wrapper (`{ paths: [...] }`). An empty argument box is
-            // valid and means the documented default.
-            const emptyBox = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
-                    body: { parameters: {} }
-                })
-            );
-            const nullBox = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
-                    body: { parameters: null }
-                })
-            );
-            const wrapped = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
-                    body: { parameters: { paths: [join(fixture, 'task')] } }
-                })
-            );
-
-            // `{}` and `null` list the server process's working directory with bare
-            // entry names: compared against the same directory requested explicitly
-            // as ".", so the assertion is exact without depending on what the package
-            // folder happens to contain.
-            const explicitCwd = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
-                    body: { parameters: ['.'] }
-                })
-            );
-
-            for (const box of [emptyBox, nullBox]) {
-                expect(box.status).toBe(200);
-                expect(box.body).toEqual({
-                    ok: true,
-                    result: (explicitCwd.body as { result: unknown }).result,
-                    durationMs: expect.any(Number)
-                });
-            }
-
-            const wrappedEntry = `${posix(fixture)}/task/b.ts`;
-            expect(wrapped.body).toEqual({
-                ok: true,
-                result: {
-                    entries: [wrappedEntry],
-                    truncated: false,
-                    nextOffset: null,
-                    offset: 0,
-                    limit: 200,
-                    bytes: Buffer.byteLength(wrappedEntry, 'utf8'),
-                    contentBudget: 64 * 1024
-                },
-                durationMs: expect.any(Number)
-            });
-        } finally {
-            await rm(fixture, { recursive: true, force: true });
+        // R9-R11: keyless still registers `fetch` (the native provider needs no credential), so
+        // every live card's registered list ends with it; only `search` is absent. No real card
+        // gets a subset any more - the toolbox is not part of what a harness choice changes.
+        for (const name of ['instruct', 'research', 'workspace', 'reviewer', 'planner']) {
+            expect(keylessTools.get(name)).toEqual([...TOOLBOX, 'fetch']);
         }
+        expect(keylessTools.get('demo')).toEqual(['timeNow']);
+        expect(keylessTools.get('flaky')).toEqual([...TOOLBOX, 'testFlaky', 'fetch']);
+
+        // The configured host: the same cards, plus the environment row.
+        const configured = createConfiguredRuntime();
+        const configuredCards = (await call(configured, 'GET', HARNESS_ROUTES.harnesses())).body.items;
+        const configuredTools = new Map(configuredCards.map((card: any) => [card.name, card.tools]));
+
+        for (const name of ['instruct', 'research', 'workspace', 'reviewer', 'planner']) {
+            expect(configuredTools.get(name)).toEqual([...TOOLBOX, 'search', 'fetch']);
+        }
+        expect(configuredTools.get('demo')).toEqual(['timeNow']);
+        expect(configuredTools.get('flaky')).toEqual([...TOOLBOX, 'testFlaky', 'search', 'fetch']);
+
+        // The direct catalogue agrees: the same key makes the tool callable.
+        const row = (await call(configured, 'GET', HARNESS_ROUTES.tools(), {}, { limit: '100' })).body.items.find(
+            (tool: any) => tool.name === 'search'
+        );
+        expect(row.availability).toEqual({ state: 'available', environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'] });
+
+        // ...and the keyless host's row keeps the credential names (never values) as the hint.
+        const unconfigured = (await call(keyless, 'GET', HARNESS_ROUTES.toolsByToolId('search'))).body.tool;
+        expect(unconfigured.availability.hint).toBe(WEBSEARCH_UNCONFIGURED_HINT);
+    });
+
+    it('ships only the production cards without an injected registry', async () => {
+        // No injected registry: exactly what `startHarnessServer` and the discovered service route
+        // build. The catalogue a user sees must contain no scripted card and no failing example.
+        stubEmptySearchKeys();
+        const runtime = createHarnessRuntime({
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            loadEnvironment: false
+        });
+
+        const PRODUCTION = ['instruct', 'research', 'workspace', 'reviewer', 'planner'];
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+
+        expect(page.body.items.map((card: any) => card.name)).toEqual(PRODUCTION);
+        expect(page.body.items.map((card: any) => card.requires_endpoint)).toEqual([true, true, true, true, true]);
+        expect(page.body.items.every((card: any) => card.tools.includes('testFlaky'))).toBe(false);
+
+        // The fixtures are not runnable by accident: the offline demo is a template this build
+        // ships, but not a catalogue entry, so a session on it is a 404.
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "demo".' } }
+        });
     });
 });
-
-// R8 — all-tools manual execution, server-side.
+// Sessions over HTTP: a session RESOURCE is metadata + counters, never a snapshot.
 //
-// The Tools tab lists EVERY tool, core included, and every call executes on the
-// server. A core tool has no standalone implementation: it runs inside a session's
-// harness, so discovery, runtime creation, todos, and delegation change the
-// conversation the user is looking at. These tests pin the listing shape, the
-// session binding, the status contract (400 missing session, 404 unknown session or
-// unavailable tool, 409 while running) and the effect on the session.
-describe('all-tools manual execution', () => {
-    const coreHint = 'Runs inside a session harness: send a sessionId with the call.';
+// Replaces the old full-snapshot assertions (`messages`, `turns`, `harnessDefinition` on one
+// object). The heavy children moved to named reads - `GET /definition`, `GET /usage`,
+// `GET /agents`, `GET /tools`, `GET /threads`, `GET /turns` - and the counts ride the row so a
+// client knows whether a child read is worth asking for.
+describe('canonical sessions', () => {
+    // The exact resource shape, pinned once.
+    const SESSION_KEYS = [
+        'agent_models',
+        'created_at',
+        'created_tool_count',
+        'created_tool_limit',
+        'definition_revision',
+        'endpoint',
+        'harness',
+        'id',
+        'model',
+        'pending_action_count',
+        'revision',
+        'runtime_execution',
+        'status',
+        'thread_count',
+        'turn_count',
+        'updated_at'
+    ];
 
-    it('lists the core tools with their visibility and session binding', async () => {
+    it('creates, lists, reads, and deletes a session', async () => {
         const runtime = createRuntime();
-        const { status, body } = await jsonBody<ToolIndex>(
-            await callHandler(runtime, 'GET', '/v1/harness/tools')
-        );
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' });
 
-        expect(status).toBe(200);
-        const core = body.tools.slice(0, CORE_TOOL_NAMES.length);
-        expect(core.map((tool) => tool.name)).toEqual(CORE_TOOL_NAMES);
+        expect(created.status).toBe(201);
+        expect(Object.keys(created.body).sort()).toEqual(['session']);
+        expect(Object.keys(created.body.session).sort()).toEqual(SESSION_KEYS);
 
-        // toolRegistry is first and exact: it is the ordinary session-bound
-        // registration entry, described from the kernel's single metadata copy.
-        // R9-R11 demotes it (searchable), so the index says so honestly.
-        expect(core[0]).toEqual({
-            name: 'toolRegistry',
-            group: 'Core tools',
-            description: TOOL_REGISTRY_METADATA.description,
-            tags: TOOL_REGISTRY_METADATA.tags,
-            visibility: 'searchable',
-            parameters: TOOL_REGISTRY_METADATA.parameters,
-            availability: { state: 'available', hint: coreHint },
-            sessionBound: true
+        const session = created.body.session;
+        expect(session.harness).toBe('demo');
+        expect(session.status).toBe('idle');
+        expect(session.model).toBe('demo-model');
+        expect(session.agent_models).toEqual({ demo: 'demo-model' });
+        expect(session.endpoint).toEqual({ base_url: SETTINGS.baseURL, model: 'demo-model', has_api_key: true });
+        expect(session.runtime_execution).toBe('inline');
+        expect(session.created_at).toBe(session.updated_at);
+        // Counters, not content: a fresh session has run nothing.
+        expect(session.turn_count).toBe(0);
+        expect(session.thread_count).toBe(0);
+        expect(session.pending_action_count).toBe(0);
+        expect(session.created_tool_count).toBe(0);
+        expect(session.created_tool_limit).toBe(HARNESS_SERVICE_LIMITS.created_tools);
+        // `title` is absent until someone sets one, and no turn/message/definition rides the row.
+        expect('title' in session).toBe(false);
+        expect('turns' in session).toBe(false);
+        expect('messages' in session).toBe(false);
+        expect('harnessDefinition' in session).toBe(false);
+        // The create response is a receipt: the epoch AND the row revision are both stamped.
+        expect(created.headers).toEqual({ 'X-Harness-Epoch': runtime.events.epoch, 'X-Harness-Revision': String(session.revision) });
+
+        const list = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+        expect(list.status).toBe(200);
+        expect(Object.keys(list.body).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        // A list row is a strict subset of the resource: identity + counters, nothing else.
+        expect(Object.keys(list.body.items[0]).sort()).toEqual([
+            'created_at',
+            'harness',
+            'id',
+            'model',
+            'revision',
+            'status',
+            'thread_count',
+            'turn_count',
+            'updated_at'
+        ]);
+        expect(list.body.items.map((row: any) => row.id)).toEqual([session.id]);
+        expect(list.body.limit).toBe(1);
+
+        // A trailing slash is the collection route, not a 404 with an empty id.
+        const trailing = await call(runtime, 'GET', `${HARNESS_ROUTES.sessions()}/`);
+        expect(trailing.status).toBe(200);
+        expect(trailing.body.items.map((row: any) => row.id)).toEqual([session.id]);
+
+        const read = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionId(session.id));
+        expect(read.status).toBe(200);
+        expect(read.body.session).toEqual(session);
+
+        const removed = await callWithHeaders(runtime, 'DELETE', HARNESS_ROUTES.sessionsBySessionId(session.id));
+        expect(removed.status).toBe(200);
+        expect(removed.body).toEqual({
+            deleted: true,
+            session_id: session.id,
+            aborted_turns: 0,
+            dropped_queued_tasks: 0
         });
+        // A delete receipt is stamped with both contract headers; WHICH revision the hub landed on
+        // is the hub's own number, so it is compared to the hub rather than guessed here.
+        expect(Object.keys(removed.headers ?? {}).sort()).toEqual(['X-Harness-Epoch', 'X-Harness-Revision']);
 
-        // toolRequest is exact: the same declarative copy the runtime registers
-        // (names/regex/tags, uncapped selection, per-query limit only).
-        expect(core[1]).toEqual({
-            name: 'toolRequest',
-            group: 'Core tools',
-            description: TOOL_REQUEST_METADATA.description,
-            tags: TOOL_REQUEST_METADATA.tags,
-            visibility: 'core',
-            parameters: TOOL_REQUEST_METADATA.parameters,
-            availability: { state: 'available', hint: coreHint },
-            sessionBound: true
+        const missing = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionId(session.id));
+        expect(missing).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown session "${session.id}".` } }
         });
-
-        // The rest are session-bound and carry a real schema. R9-R11 splits the
-        // visibility honestly: only the bootstrap pair, the session plan, and
-        // delegate stay `core`; the eleven demoted runtime rows report
-        // `searchable` while staying listed and manually executable.
-        const DECLARED_CORE = new Set(['toolRequest', 'task', 'delegate']);
-        expect(core.slice(2)).toEqual(
-            [
-                'toolList',
-                'toolManage',
-                'toolCreate',
-                'task',
-                ...RECORD_TOOL_NAMES,
-                'agentManage',
-                'agentResult',
-                'delegate',
-                'actionRequest',
-                'threadFork'
-            ].map((name) => ({
-                name,
-                group: 'Core tools',
-                description: expect.any(String),
-                tags: expect.any(Array),
-                visibility: DECLARED_CORE.has(name) ? 'core' : 'searchable',
-                parameters: expect.any(Object),
-                availability: { state: 'available', hint: coreHint },
-                sessionBound: true
-            }))
-        );
-
-        // Everything else keeps the directly callable shape: no session binding.
-        expect(body.tools.slice(CORE_TOOL_NAMES.length).map((tool) => tool.name)).toEqual(CATALOGUE_TOOL_NAMES);
-        expect(body.tools.slice(CORE_TOOL_NAMES.length).every((tool) => tool.sessionBound === undefined)).toBe(
-            true
-        );
     });
 
-    it('returns plain content plus bounded declarative panels for timeNow', async () => {
+    it('refuses a bad limit and a stale cursor by naming the parameter', async () => {
+        const runtime = createRuntime();
+        await createDemo(runtime);
+        await createDemo(runtime);
+
+        const first = await call(runtime, 'GET', HARNESS_ROUTES.sessions(), {}, { limit: '1' });
+        expect(first.body.items).toHaveLength(1);
+        expect(first.body.limit).toBe(1);
+        expect(first.body.next_cursor).toEqual(expect.any(String));
+
+        const second = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.sessions(),
+            {},
+            { limit: '1', cursor: first.body.next_cursor as string }
+        );
+        expect(second.body.items).toHaveLength(1);
+        expect(second.body.items[0].id).not.toBe(first.body.items[0].id);
+        expect(second.body.next_cursor).toBeNull();
+
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.sessions(), {}, { limit: '0' })).toEqual({
+            status: 400,
+            body: { error: { message: `Query parameter "limit" must be an integer between 1 and ${HARNESS_PAGE_LIMIT.max}.` } }
+        });
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessions(), {}, { cursor: 'not-a-cursor' })
+        ).toEqual({
+            status: 400,
+            body: { error: { message: 'Query parameter "cursor" is stale or foreign; restart from the first page.' } }
+        });
+    });
+
+    it('reads the frozen definition, the roster, and the instruction the session runs', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+        const call_ = canonicalCall(runtime);
+
+        const definition = await readOk<{ definition: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdDefinition(session.id),
+            200
+        );
+
+        expect(Object.keys(definition.definition).sort()).toEqual([
+            'agents',
+            'builtin',
+            'core_tools',
+            'current',
+            'current_revision',
+            'definition_revision',
+            'description',
+            'frozen_at',
+            'name',
+            'primary',
+            'requires_endpoint',
+            'revision',
+            'session_id',
+            'source_revision',
+            'subagents',
+            'title',
+            'tools'
+        ].sort());
+        // The frozen copy names the card it was built from and stays behind the session id.
+        expect(definition.definition.session_id).toBe(session.id);
+        expect(definition.definition.name).toBe('demo');
+        expect(definition.definition.title).toBe('Scripted demo');
+        expect(definition.definition.requires_endpoint).toBe(false);
+        expect(definition.definition.tools).toEqual(['timeNow']);
+        expect(definition.definition.core_tools).toEqual(['toolRequest', 'task']);
+        expect(definition.definition.current).toBe(true);
+        // `agent_models` rides the definition ONLY when the card held an override map; the
+        // effective per-agent models are stated on the session resource, and attribution of what the
+        // session was BUILT with stays here.
+        expect(Object.hasOwn(definition.definition, 'agent_models')).toBe(false);
+
+        // The roster states the model each member actually runs and whether its text is editable.
+        const roster = await readOk<Record<string, any>>(call_, 'GET', HARNESS_ROUTES.sessionsBySessionIdAgents(session.id), 200);
+        expect(Object.keys(roster).sort()).toEqual(['agents', 'revision', 'session_id', 'total']);
+        expect(roster.total).toBe(1);
+        expect(Object.keys(roster.agents[0]).sort()).toEqual([
+            'agent_id',
+            'deletable',
+            'editable',
+            'guidelines_count',
+            'inherited_model',
+            'instruction_chars',
+            'instruction_source',
+            'model',
+            'origin',
+            'profile',
+            'restorable',
+            'revision',
+            'role'
+        ].sort());
+        expect(roster.agents[0]).toEqual({
+            agent_id: 'demo',
+            profile: 'demo',
+            role: 'primary',
+            origin: 'definition',
+            model: 'demo-model',
+            inherited_model: 'demo-model',
+            instruction_source: 'catalogue',
+            instruction_chars: joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES).length,
+            // `guidelines_count` is the seeded SYSTEM-ENTRY count of the agent's brain
+            // (./api-reads.ts:927 `brain.instructions.length`), i.e. the joined-prompt invariant:
+            // exactly ONE entry, never identity + guidelines as two. The guideline ARRAY itself is
+            // one named read away and is asserted below.
+            guidelines_count: 1,
+            editable: true,
+            deletable: false,
+            restorable: false,
+            revision: 0
+        });
+
+        // The one place the FULL joined prompt the model receives is answerable over REST: identity
+        // and guidelines joined by the single documented rule, never two system messages.
+        const instruction = await readOk<Record<string, any>>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdInstruction(session.id, 'demo'),
+            200
+        );
+        expect(Object.keys(instruction).sort()).toEqual(['agent_id', 'chars', 'guidelines', 'instruction', 'session_id', 'source']);
+        expect(instruction.session_id).toBe(session.id);
+        expect(instruction.agent_id).toBe('demo');
+        expect(instruction.source).toBe('catalogue');
+        expect(instruction.instruction).toBe(joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES));
+        expect(instruction.chars).toBe(joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES).length);
+        expect(instruction.guidelines).toEqual(DEMO_GUIDELINES);
+
+        // The live toolbox is the session registry, budgeted, with no source text on a row.
+        const tools = await readOk<Record<string, any>>(
+            call_,
+            'GET',
+            `${HARNESS_ROUTES.sessionsBySessionIdTools(session.id)}?limit=100`,
+            200
+        );
+        expect(Object.keys(tools).sort()).toEqual(['budget', 'items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        expect(tools.budget).toEqual({ used: 0, limit: HARNESS_SERVICE_LIMITS.created_tools });
+        // A row states the live session facts; the argument schema, the source TEXT, and any tool
+        // result never ride it. `source_revision` rides only for a row with an installed revision,
+        // and item[0] here (toolRegistry) is a source-registered tool - the bytes themselves are one
+        // named route away.
+        expect(Object.keys(tools.items[0]).sort()).toEqual([
+            'declared',
+            'description',
+            'enabled',
+            'group',
+            'name',
+            'origin',
+            'protected',
+            'session_bound',
+            'session_id',
+            'source_available',
+            'source_revision',
+            'tags',
+            'visibility'
+        ]);
+        expect('parameters' in tools.items[0]).toBe(false);
+        expect('source' in tools.items[0]).toBe(false);
+    });
+
+    it('retargets an agent model over HTTP and keeps the frozen definition', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+        const path = HARNESS_ROUTES.sessionsBySessionId(session.id);
+
+        expect(await callWithHeaders(runtime, 'PATCH', path, { agent_models: { demo: '  next/model  ' } })).toEqual({
+            status: 200,
+            body: {
+                session: {
+                    ...session,
+                    model: 'next/model',
+                    updated_at: expect.any(Number),
+                    revision: session.revision + 1,
+                    agent_models: { demo: 'next/model' }
+                }
+            },
+            headers: { 'X-Harness-Epoch': runtime.events.epoch, 'X-Harness-Revision': String(session.revision + 1) }
+        });
+
+        // A reload reports the change, and no second session was made.
+        const read = await call(runtime, 'GET', path);
+        expect(read.body.session.model).toBe('next/model');
+        expect(read.body.session.agent_models).toEqual({ demo: 'next/model' });
+        // Attribution of what the session was BUILT with did not move: the frozen copy carries no
+        // override map, because the card had none.
+        const definition = await call(runtime, 'GET', `${path}/definition`);
+        expect(Object.hasOwn(definition.body.definition, 'agent_models')).toBe(false);
+
+        const list = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+        expect(list.body.items.map((row: any) => row.id)).toEqual([session.id]);
+    });
+
+    it('rejects invalid session patches without changing anything', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+        const path = HARNESS_ROUTES.sessionsBySessionId(session.id);
+        const patch = (body: unknown) => call(runtime, 'PATCH', path, body);
+
+        // camelCase is not an alias: the request field is `agent_models`.
+        expect(await patch({ agentModels: { demo: 'x' } })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "agentModels". Allowed fields: agent_models, title.' } }
+        });
+
+        // The validator keeps its own wording (it names the map it knows internally), and the key
+        // space is THIS session's harness.
+        expect(await patch({ agent_models: { ghost: 'x' } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels` names "ghost", which is not a member of this harness. Members: demo.' } }
+        });
+        expect(await patch({ agent_models: { demo: '   ' } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels.demo` cannot be empty.' } }
+        });
+        expect(await patch({ agent_models: { demo: 7 } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels.demo` must be a model id string.' } }
+        });
+        expect(await patch({ agent_models: ['demo'] })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels` names "0", which is not a member of this harness. Members: demo.' } }
+        });
+        expect(await patch({ model: 'sneaky/model' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "model". Allowed fields: agent_models, title.' } }
+        });
+        expect(await patch({ status: 'idle' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "status". Allowed fields: agent_models, title.' } }
+        });
+        expect(await patch({ agent_models: { demo: 'ok/model' }, harness: 'instruct' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "harness". Allowed fields: agent_models, title.' } }
+        });
+        // A body that names no writable field is still a 400.
+        expect(await patch({})).toEqual({
+            status: 400,
+            body: { error: { message: 'A patch must change at least one field.' } }
+        });
+        // A non-object body never reaches the route's field checks.
+        expect(await patch([])).toEqual({
+            status: 400,
+            body: { error: { message: 'The request body must be a JSON object.' } }
+        });
+
+        // T34 replacement of the old "an empty map is not a silent success" 400: on the target
+        // contract an empty map is a VALID patch that replaces nothing, so it answers 200 and the
+        // live map is unchanged (the store's replace-with-no-entries is a no-op).
+        const emptyMap = await patch({ agent_models: {} });
+        expect(emptyMap.status).toBe(200);
+        expect(emptyMap.body.session.agent_models).toEqual({ demo: 'demo-model' });
+
+        // Setting a rail label is the other writable field.
+        const renamed = await patch({ title: 'Rail row' });
+        expect(renamed.status).toBe(200);
+        expect(renamed.body.session.title).toBe('Rail row');
+
+        // The method surface is documented, and an unknown id is a 404 before any validation (a
+        // patch cannot leak which ids exist).
+        expect(await call(runtime, 'PUT', path, { agent_models: {} })).toEqual({
+            status: 405,
+            // The 405 quotes the CONCRETE path the caller used (./api.ts:3870), not the template.
+            body: { error: { message: `Use GET, PATCH, DELETE for /v1/harness/sessions/${session.id}.` } }
+        });
+        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.sessionsBySessionId('missing'), { agent_models: { demo: 'ok/model' } })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown session "missing".' } }
+        });
+
+        // Every rejection above left the live session untouched apart from the two accepted writes.
+        const after = await call(runtime, 'GET', path);
+        expect(after.body.session.model).toBe('demo-model');
+        expect(after.body.session.agent_models).toEqual({ demo: 'demo-model' });
+    });
+
+    // The create body's `settings` block is the SAME snake_case contract as `POST /models`: the
+    // route hands it to `settingsInputOf` (./api.ts:1972), whose allow-list is
+    // `['base_url', 'api_key', 'model']` (./api.ts:544). camelCase is therefore an UNKNOWN field,
+    // never a coerced alias, and `requireKnownFields` throws on the first offending key in body
+    // order (./api.ts:505-508) - hence the message names `baseURL`, the first key sent.
+    it('refuses a camelCase settings field on a create and creates no session', async () => {
         const runtime = createRuntime();
 
-        // Exact panel projection shared by the direct and session paths. The
-        // values come from the call's own result because the clock is real.
-        const panelsFor = (value: { timezone: string; iso: string; unix: number }) => [
+        const before = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+        expect(before.status).toBe(200);
+        expect(before.body.items).toEqual([]);
+
+        // The exact spelling the browser UI used to send: `{ baseURL, apiKey, model }`.
+        expect(
+            await call(runtime, 'POST', HARNESS_ROUTES.sessions(), {
+                harness: 'demo',
+                settings: { baseURL: 'http://provider.test/v1', apiKey: 'sk', model: 'm1' }
+            })
+        ).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "baseURL". Allowed fields: base_url, api_key, model.' } }
+        });
+
+        // The refusal happens BEFORE `store.create` (./api.ts:1991), so no row appeared: the
+        // collection is identical to the read taken above.
+        const after = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+        expect(after.status).toBe(200);
+        expect(after.body.items).toEqual([]);
+    });
+
+    // The sibling positive: the snake_case spelling the validator accepts, so the settings reach
+    // the session. `endpoint` is the key-free projection of the merged settings
+    // (./api-reads.ts:149-153 reads `record.settings`), and `mergeSettings` takes the client's
+    // base_url/model verbatim (./config.ts:419-420) with an explicit non-blank key winning
+    // (./config.ts:441-446), so all three requested values are what comes back.
+    it('creates a session from a snake_case settings block and names its base URL key-free', async () => {
+        const runtime = createRuntime();
+
+        const created = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), {
+            harness: 'demo',
+            settings: { base_url: 'http://provider.test/v1', api_key: 'client-key', model: 'm1' }
+        });
+
+        expect(created.status).toBe(201);
+        expect(Object.keys(created.body).sort()).toEqual(['session']);
+        expect(created.body.session.endpoint).toEqual({
+            base_url: 'http://provider.test/v1',
+            model: 'm1',
+            has_api_key: true
+        });
+        // Presence, never the secret: the credential the body sent appears nowhere in the receipt.
+        expect(JSON.stringify(created.body)).not.toContain('client-key');
+
+        // The create really did land, unlike the camelCase refusal above.
+        const list = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+        expect(list.body.items.map((row: any) => row.id)).toEqual([created.body.session.id]);
+    });
+
+    it('maps validation and lookup failures to exact statuses', async () => {
+        const runtime = createRuntime();
+
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), {})).toEqual({
+            status: 400,
+            body: { error: { message: 'A session requires a harness name.' } }
+        });
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'nope' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "nope".' } }
+        });
+        // Legacy identifiers still resolve to the canonical harness - that is a registry alias, not
+        // a wire alias, so the answer names the canonical card.
+        const alias = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'researcher' });
+        expect(alias.status).toBe(201);
+        expect(alias.body.session.harness).toBe('research');
+
+        const session = await createDemo(runtime);
+        const tasks = HARNESS_ROUTES.sessionsBySessionIdTasks(session.id);
+
+        expect(await call(runtime, 'POST', tasks, { input: '   ' })).toEqual({
+            status: 400,
+            body: { error: { message: 'A task cannot be empty.' } }
+        });
+        expect(await call(runtime, 'POST', tasks, { input: 7 })).toEqual({
+            status: 400,
+            body: { error: { message: 'A task must be a string.' } }
+        });
+        // The character budget is its own refusal, and it is a payload size (413), not a shape (400).
+        const tooLong = await call(runtime, 'POST', tasks, { input: 'x'.repeat(HARNESS_SERVICE_LIMITS.input_chars + 1) });
+        expect(tooLong).toEqual({
+            status: 413,
+            body: { error: { message: `A task cannot exceed ${HARNESS_SERVICE_LIMITS.input_chars} characters.` } }
+        });
+        // A submit names its own thread field in snake_case; the camelCase spelling is unknown.
+        expect(await call(runtime, 'POST', tasks, { input: 'x', threadId: 'thread-1' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "threadId". Allowed fields: input, attachments, references, thread_id.' } }
+        });
+        expect(await call(runtime, 'POST', tasks, [])).toEqual({
+            status: 400,
+            body: { error: { message: 'The request body must be a JSON object.' } }
+        });
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks('missing'), { input: 'go' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown session "missing".' } }
+        });
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionId('not-a-session'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown session "not-a-session".' } }
+        });
+        // A turn id is session-scoped: an unknown one says which session was searched.
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnId(session.id, 'not-a-turn'))
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown turn "not-a-turn" in session "${session.id}".` } }
+        });
+    });
+});
+// Task submit, recorded history, and the lazy display reads.
+//
+// The contract's core exchange: `POST /sessions/{id}/tasks` answers 202 + `TaskReceipt` (never the
+// mutated aggregate), and everything the old SSE body streamed is now a bounded, addressable read:
+// one turn resource, one paged events collection, one compiled display tree, one step, one context
+// block. Completion is proven the way any REST client proves it - by re-reading the turn - so this
+// block has no dependency on a response body staying open.
+describe('task submit and recorded history', () => {
+    const runtime = createRuntime();
+
+    // One scripted run, shared by the assertions below: the demo transport is deterministic, so the
+    // recorded event stream is a fixed fixture rather than a race. Created once to keep the file's
+    // wall-clock cost to one scripted run.
+    const state: {
+        sessionId: string;
+        turnId: string;
+        receipt: Record<string, any>;
+        events: Array<{ index: number; at: number; event: Record<string, any> }>;
+    } = {} as never;
+
+    beforeAll(async () => {
+        const call_ = canonicalCall(runtime);
+        const session = await createDemo(runtime);
+        state.sessionId = session.id;
+
+        state.receipt = await submitTask(call_, session.id, { input: '  What time is it?  ' });
+        state.turnId = state.receipt.turn_id;
+
+        // Deterministic completion: poll the identified turn read until it settles.
+        await waitForTurnStatus(call_, session.id, state.turnId, ['done']);
+        state.events = (await allTurnEvents(call_, session.id, state.turnId)) as never;
+    });
+
+    it('answers a submit with a slim receipt and links, never the aggregate', async () => {
+        const { receipt } = state;
+
+        // A fresh submit on a second session, so the status/revision facts below are observed
+        // against a session this block has not already mutated.
+        const other = await createDemo(runtime);
+        const fresh = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks(other.id), {
+            input: '  plan the thing  '
+        });
+
+        expect(fresh.status).toBe(202);
+        expect(Object.keys(fresh.body).sort()).toEqual([
+            'accepted_at',
+            'links',
+            'session_id',
+            'session_revision',
+            'status',
+            'thread_id',
+            'turn_id'
+        ]);
+        // Neither `session` nor `turn` rides a receipt: the stream and the bounded pages carry it.
+        expect('session' in fresh.body).toBe(false);
+        expect('turn' in fresh.body).toBe(false);
+        expect(fresh.body.session_id).toBe(other.id);
+        expect(fresh.body.status).toBe('queued');
+        expect(fresh.body.turn_id).toEqual(expect.any(String));
+        expect(fresh.body.thread_id).toBe('thread-1');
+        expect(fresh.body.session_revision).toBe(runtime.events.getRevision('session', other.id));
+        expect(fresh.body.links).toEqual({
+            turn: `${MOUNT}/sessions/${other.id}/turns/${fresh.body.turn_id}`,
+            turns: `${MOUNT}/sessions/${other.id}/turns`,
+            thread: `${MOUNT}/sessions/${other.id}/threads/thread-1`,
+            stream: `${MOUNT}/stream`
+        });
+        expect(fresh.headers).toEqual({
+            'X-Harness-Epoch': runtime.events.epoch,
+            'X-Harness-Revision': String(fresh.body.session_revision)
+        });
+
+        // The receipt's turn settles, and the submit TRIMMED the prompt exactly as the store's own
+        // validation does. Completion is proven by re-reading the turn (deterministic polling), which
+        // is the target replacement for "the SSE response body ended".
+        const turn = await waitForTurnStatus(
+            canonicalCall(runtime),
+            other.id,
+            fresh.body.turn_id,
+            ['done']
+        );
+        expect(turn.status).toBe('done');
+        expect(turn.prompt).toBe('plan the thing');
+        expect(state.receipt.status).toBe('queued');
+    });
+
+    it('answers the lifecycle guards the stream used to imply', async () => {
+        const call_ = canonicalCall(runtime);
+
+        // A second submit while the first is still running is NOT a 409 on this contract: each
+        // submit opens its own conversation and the pump runs them. This replaces the old
+        // 'rejects a second run while the first is still open with 409' assertion.
+        let release: () => void = () => {};
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const busy = createRuntime(SETTINGS, DEFAULTS, [gatedPreset(gate)]);
+        const busySession = await call(busy, 'POST', HARNESS_ROUTES.sessions(), { harness: 'gated' });
+        const busyId = busySession.body.session.id as string;
+
+        const first = await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks(busyId), { input: 'first' });
+        expect(first.status).toBe(202);
+
+        const running = await call(busy, 'GET', HARNESS_ROUTES.sessionsBySessionId(busyId));
+        expect(running.body.session.status).toBe('running');
+
+        const second = await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks(busyId), { input: 'second' });
+        expect(second.status).toBe(202);
+        expect(second.body.thread_id).toBe('thread-2');
+        expect(second.body.turn_id).not.toBe(first.body.turn_id);
+
+        // A manual mutation, though, must not race a live turn: it writes harness state the running
+        // transcript depends on. 409 is preserved for exactly that case.
+        expect(
+            await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(busyId, 'task'), {
+                parameters: {}
+            })
+        ).toEqual({ status: 409, body: { error: { message: 'A task is running in this session; try again when it finishes.' } } });
+        expect(
+            await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(busyId, 'toolRequest'), {
+                parameters: { names: ['timeNow'] }
+            })
+        ).toEqual({ status: 409, body: { error: { message: 'A task is running in this session; try again when it finishes.' } } });
+
+        // A reset while a turn is in flight is refused rather than silently discarding it, while a
+        // model retarget is allowed (it changes the next request, not the running one).
+        expect(await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdReset(busyId), {})).toEqual({
+            status: 409,
+            body: { error: { message: 'Cancel the running task before resetting the session.' } }
+        });
+
+        const patched = await call(busy, 'PATCH', HARNESS_ROUTES.sessionsBySessionId(busyId), {
+            agent_models: { gated: 'later/model' }
+        });
+        expect(patched.status).toBe(200);
+        expect(patched.body.session.model).toBe('later/model');
+
+        // Cancel is a real operation with an honest receipt: it names the turn it aborted.
+        const cancelled = await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdCancel(busyId), {});
+        expect(cancelled.status).toBe(200);
+        expect(cancelled.body.cancelled).toBe(true);
+        expect(cancelled.body.session_id).toBe(busyId);
+        expect(cancelled.body.active_turn_id).toBe(first.body.turn_id);
+        expect(cancelled.body.dropped_queued_tasks).toBe(0);
+
+        release();
+        await busy.store.waitForIdle(busyId);
+
+        const rows = await listTurns(canonicalCall(busy), busyId);
+        expect(rows.items.map((row: any) => row.status)).toEqual(['cancelled', 'cancelled']);
+
+        void call_;
+    });
+
+    it('reports the counters and the usage fold instead of a fat snapshot', async () => {
+        const call_ = canonicalCall(runtime);
+        const session = await readOk<{ session: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionId(state.sessionId),
+            200
+        );
+
+        expect(session.session.status).toBe('idle');
+        expect(session.session.turn_count).toBe(1);
+        expect(session.session.thread_count).toBe(1);
+
+        const usage = await readOk<Record<string, any>>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdUsage(state.sessionId),
+            200
+        );
+        expect(Object.keys(usage).sort()).toEqual([
+            'by_thread',
+            'reported_turns',
+            'revision',
+            'session_id',
+            'truncated',
+            'turn_count',
+            'usage'
+        ]);
+        expect(usage.turn_count).toBe(1);
+        expect(usage.reported_turns).toBe(1);
+        expect(usage.truncated).toBe(false);
+        // This REPLACES the old frame-level running tally: the fold is the sum of the three
+        // reported requests, per thread, computed by the read model instead of piggybacking frames.
+        expect(usage.usage).toEqual({ input: 292, output: 104, total: 396 });
+        expect(usage.by_thread).toEqual([{ thread_id: 'thread-1', usage: { input: 292, output: 104, total: 396 } }]);
+
+        const turn = await readTurn(call_, state.sessionId, state.turnId);
+        expect(Object.keys(turn).sort()).toEqual([
+            'attachment_count',
+            'event_count',
+            'event_time_count',
+            'id',
+            'index',
+            'prompt',
+            'revision',
+            'session_id',
+            'started_at',
+            'status',
+            'steer_count',
+            'thread_id',
+            'thread_label',
+            'updated_at',
+            'usage'
+        ]);
+        expect(turn.session_id).toBe(state.sessionId);
+        expect(turn.id).toBe(state.turnId);
+        expect(turn.index).toBe(0);
+        expect(turn.status).toBe('done');
+        expect(turn.prompt).toBe('What time is it?');
+        expect(turn.thread_id).toBe('thread-1');
+        expect(turn.steer_count).toBe(0);
+        expect(turn.attachment_count).toBe(0);
+        // The turn carries the same figure the last event did, cached part included: the sum of all
+        // three reported requests.
+        expect(turn.usage).toEqual({ input: 292, output: 104, total: 396, cached: 168 });
+        expect(turn.event_count).toBe(state.events.length);
+        expect(turn.event_time_count).toBe(state.events.length);
+    });
+
+    it('pages every recorded event verbatim, paired with its recorded time', async () => {
+        const call_ = canonicalCall(runtime);
+
+        // The stream contract the old file pinned frame by frame survives as RECORDING truth: the
+        // non-delta events still come out of the transport in this exact order.
+        expect(state.events.map((row) => row.event.type).filter((type) => type !== 'text' && type !== 'reasoning')).toEqual([
+            'start',
+            'usage',
+            'tool_call',
+            // R3/F1: each tool-calling request closes with `attempt_commit` (a tool round never
+            // gets a `done`).
+            'attempt_commit',
+            'tool_result',
+            'usage',
+            'tool_call',
+            'attempt_commit',
+            'tool_result',
+            'usage',
+            'done'
+        ]);
+        expect(state.events).toHaveLength(177);
+
+        // Rows are ordinals paired with times, in recorded order, and the index is the position -
+        // that pairing is what the old `eventTimes` array meant, now stated per row.
+        expect(state.events.map((row) => row.index)).toEqual(state.events.map((_, index) => index));
+        expect(state.events.every((row) => typeof row.at === 'number' && row.at > 0)).toBe(true);
+        expect(state.events.every((row, index) => index === 0 || row.at >= state.events[index - 1].at)).toBe(true);
+
+        // Each `usage` EVENT is one request's own figures (the scripted numbers the old file
+        // asserted off the SSE frames): 48/18/66, then 96/22/118, then 148/64/212.
+        expect(state.events.filter((row) => row.event.type === 'usage').map((row) => row.event)).toEqual([
+            { type: 'usage', agent: 'demo', usage: { input: 48, output: 18, total: 66, cached: 0 }, thread: { id: '1' } },
+            { type: 'usage', agent: 'demo', usage: { input: 96, output: 22, total: 118, cached: 48 }, thread: { id: '1' } },
+            { type: 'usage', agent: 'demo', usage: { input: 148, output: 64, total: 212, cached: 120 }, thread: { id: '1' } }
+        ]);
+
+        // The scripted loop's discovery call, verbatim: the dispatcher must not reshape content.
+        const discovery = state.events.find((row) => row.event.type === 'tool_result' && row.event.name === 'toolRequest');
+        if (discovery === undefined) throw new Error('expected a recorded toolRequest result');
+        expect(JSON.parse(discovery.event.content).enabled).toEqual([
+            'timeNow',
+            'actionRequest',
+            'threadFork',
+            'toolManage',
+            'toolRegistry'
+        ]);
+        expect(discovery.event.isError).toBe(false);
+        expect(discovery.event.outcome).toBe('completed');
+
+        // R20.2: the declarative panels ride the SAME recorded event the stream used to carry them.
+        const clock = state.events.find((row) => row.event.type === 'tool_result' && row.event.name === 'timeNow');
+        if (clock === undefined) throw new Error('expected a recorded timeNow result');
+        const clockValue = JSON.parse(clock.event.content) as { timezone: string; iso: string; unix: number };
+        expect(clockValue.timezone).toBe('UTC');
+        expect(clock.event.ui).toEqual([
+            {
+                id: 'timeNow',
+                slot: 'right',
+                title: 'Current time',
+                blocks: [
+                    {
+                        type: 'keyValue',
+                        items: [
+                            { label: 'Timezone', value: clockValue.timezone },
+                            { label: 'ISO 8601', value: clockValue.iso },
+                            { label: 'Unix', value: String(clockValue.unix) }
+                        ]
+                    },
+                    { type: 'text', text: 'Read from the server clock at execution time.' }
+                ]
+            }
+        ]);
+
+        // One page at a time: `limit` echoes the returned rows, and the cursor continues the same
+        // ordinals (no re-pairing, no gaps, no duplicates).
+        const page = await readTurnEvents(call_, state.sessionId, state.turnId, { limit: 2 });
+        expect(Object.keys(page).sort()).toEqual([
+            'items',
+            'limit',
+            'next_cursor',
+            'observed_at',
+            'partial',
+            'revision',
+            'total_events',
+            'turn_id'
+        ]);
+        expect(page.turn_id).toBe(state.turnId);
+        expect(page.total_events).toBe(177);
+        expect(page.partial).toBe(false);
+        expect(page.limit).toBe(2);
+        expect(page.items.map((row: any) => row.index)).toEqual([0, 1]);
+        expect(typeof page.next_cursor).toBe('string');
+
+        const next = await readTurnEvents(call_, state.sessionId, state.turnId, {
+            limit: 2,
+            cursor: page.next_cursor as string
+        });
+        expect(next.items.map((row: any) => row.index)).toEqual([2, 3]);
+
+        // A page request the contract cannot honour names the parameter, and a cursor from another
+        // epoch is refused rather than silently restarted.
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdEvents(state.sessionId, state.turnId), {}, { limit: '0' })
+        ).toEqual({
+            status: 400,
+            body: { error: { message: `Query parameter "limit" must be an integer between 1 and ${HARNESS_PAGE_LIMIT.max}.` } }
+        });
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdEvents(state.sessionId, state.turnId), {}, { cursor: 'not-a-cursor' })
+        ).toEqual({
+            status: 400,
+            body: { error: { message: 'Query parameter "cursor" is stale or foreign; restart from the first page.' } }
+        });
+    });
+
+    it('pages turn history as bounded previews, in order or reversed', async () => {
+        const call_ = canonicalCall(runtime);
+
+        // A second turn on the SAME session, so ordering is a fact rather than a single row.
+        const receipt = await submitTask(call_, state.sessionId, { input: 'And again?' });
+        await waitForTurnStatus(call_, state.sessionId, receipt.turn_id, ['done']);
+
+        const page = await listTurns(call_, state.sessionId);
+        expect(Object.keys(page).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        expect(page.items.map((row: any) => row.index)).toEqual([0, 1]);
+        // A row states the EXACT recorded length next to a bounded preview, and counts instead of
+        // content: the old snapshot copy of every turn is what this read replaces.
+        expect(page.items.map((row: any) => row.promptPreview)).toEqual(['What time is it?', 'And again?']);
+        expect(page.items.map((row: any) => row.promptChars)).toEqual([16, 10]);
+        expect(page.items.map((row: any) => row.status)).toEqual(['done', 'done']);
+        expect(page.items.map((row: any) => row.threadId)).toEqual(['thread-1', 'thread-2']);
+        for (const row of page.items) {
+            expect('events' in row).toBe(false);
+            expect('eventTimes' in row).toBe(false);
+            expect('steerTexts' in row).toBe(false);
+            // `activeAgents` names agents whose run is IN FLIGHT; a settled row states none.
+            expect(row.activeAgents).toEqual([]);
+        }
+        expect(page.items[0].stepCount).toBe(2);
+        expect(page.items[0].sectionCount).toBe(1);
+        expect(page.items[0].detail).toBe('demo-model');
+
+        const reversed = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurns(state.sessionId), {}, { order: 'desc' });
+        expect(reversed.body.items.map((row: any) => row.index)).toEqual([1, 0]);
+
+        // The session counters moved with the second turn, and the fold covers both threads.
+        const session = await readOk<{ session: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionId(state.sessionId),
+            200
+        );
+        expect(session.session.turn_count).toBe(2);
+        expect(session.session.thread_count).toBe(2);
+
+        const usage = await readOk<Record<string, any>>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdUsage(state.sessionId),
+            200
+        );
+        expect(usage.turn_count).toBe(2);
+        expect(usage.reported_turns).toBe(2);
+        expect(usage.usage).toEqual({ input: 584, output: 208, total: 792 });
+        expect(usage.by_thread).toEqual([
+            { thread_id: 'thread-1', usage: { input: 292, output: 104, total: 396 } },
+            { thread_id: 'thread-2', usage: { input: 292, output: 104, total: 396 } }
+        ]);
+    });
+
+    it('serves the lazy display tree and its two detail reads', async () => {
+        const call_ = canonicalCall(runtime);
+
+        // The compiled display tree (the old `/views` frame, now one named read per turn).
+        const display = await readDisplay(call_, state.sessionId, state.turnId);
+        expect(Object.keys(display).sort()).toEqual(['revision', 'sections', 'turnId']);
+        expect(display.turnId).toBe(state.turnId);
+        expect(display.revision).toBe(runtime.events.getRevision('turn', `${state.sessionId}:${state.turnId}`));
+        expect(display.sections).toHaveLength(1);
+
+        const section = display.sections[0];
+        expect(Object.keys(section).sort()).toEqual([
+            'agent',
+            'agentLabel',
+            'answerNodeId',
+            'cachedInput',
+            'context',
+            'endedAt',
+            'id',
+            'invocationId',
+            'latestInput',
+            'model',
+            'nodes',
+            'role',
+            'state',
+            'tail',
+            'threadId',
+            'threadLabel'
+        ]);
+        expect(section.agent).toBe('demo');
+        expect(section.role).toBe('primary');
+        expect(section.state).toBe('done');
+        expect(section.model).toBe('demo-model');
+        expect(section.threadLabel).toBe('DO1');
+        expect(section.id).toBe(`${state.turnId}:0`);
+
+        // One context block: the segment with its recorded text, one hop from the tree.
+        const block = await readBlockDetail(call_, state.sessionId, state.turnId, section.context[0].id);
+        expect(Object.keys(block).sort()).toEqual([
+            'at',
+            'chars',
+            'entries',
+            'id',
+            'inPrompt',
+            'kind',
+            'name',
+            'sectionId',
+            'sessionId',
+            'turnId'
+        ].sort());
+        expect(block.kind).toBe('system');
+        expect(block.name).toBe('instructions');
+        expect(block.turnId).toBe(state.turnId);
+        expect(block.sectionId).toBe(`${state.turnId}:0`);
+        expect(block.sessionId).toBe(state.sessionId);
+        expect(block.inPrompt).toBe(true);
+        // The stored system segment IS the joined prompt, byte for byte.
+        expect(block.entries).toEqual([joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES)]);
+        expect(block.chars).toBe(joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES).length);
+
+        // One step: the recorded tool_call ordinal paired with its result event - the two verbatim
+        // rows behind a display step.
+        const toolCallIndex = state.events.find((row) => row.event.type === 'tool_call')!.index;
+        const toolResultIndex = state.events.find((row) => row.event.type === 'tool_result')!.index;
+        const step = await readStepDetail(call_, state.sessionId, state.turnId, String(toolCallIndex));
+        expect(Object.keys(step).sort()).toEqual([
+            'callId',
+            'opening',
+            'result',
+            'sectionId',
+            'sessionId',
+            'stepId',
+            'turnId'
+        ]);
+        expect(step.stepId).toBe(String(toolCallIndex));
+        expect(step.turnId).toBe(state.turnId);
+        expect(step.sectionId).toBe(`${state.turnId}:0`);
+        expect(step.callId).toBe('call_tool_request_1');
+        expect(step.opening).toEqual({
+            index: toolCallIndex,
+            at: expect.any(Number),
+            event: {
+                type: 'tool_call',
+                agent: 'demo',
+                call: { id: 'call_tool_request_1', name: 'toolRequest', arguments: '{"tags":["time"]}' },
+                thread: { id: '1' }
+            }
+        });
+        expect(step.result.index).toBe(toolResultIndex);
+        expect(step.result.event.type).toBe('tool_result');
+        expect(step.result.event.name).toBe('toolRequest');
+        expect(step.result.event.isError).toBe(false);
+
+        // A step id is the OPENING ordinal only, and it must parse: a result index is 404 and prose
+        // is 400, both naming the rule.
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdStepsByStepId(state.sessionId, state.turnId, String(toolResultIndex)))
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown step "${toolResultIndex}" in turn "${state.turnId}".` } }
+        });
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdStepsByStepId(state.sessionId, state.turnId, 'not-a-number'))
+        ).toEqual({
+            status: 400,
+            body: { error: { message: 'A step id must be the recorded event index of the step.' } }
+        });
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdBlocksByBlockId(state.sessionId, state.turnId, 'nope'))
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown context block "nope" in turn "${state.turnId}".` } }
+        });
+        expect(
+            await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdAttachmentsByAttachmentId(state.sessionId, state.turnId, 'nope'))
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown attachment "nope" in session "${state.sessionId}".` } }
+        });
+    });
+
+    it('resets and cancels with receipts, not with a copied session', async () => {
+        const call_ = canonicalCall(runtime);
+        const sessionId = state.sessionId;
+
+        const reset = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdReset(sessionId), {});
+
+        expect(reset.status).toBe(200);
+        expect(Object.keys(reset.body).sort()).toEqual([
+            'discarded_threads',
+            'discarded_turns',
+            'dropped_queued_tasks',
+            'reset',
+            'revision',
+            'session_id'
+        ]);
+        expect(reset.body).toEqual({
+            reset: true,
+            session_id: sessionId,
+            // A reset discards the two turns and the two conversations the block built.
+            discarded_turns: 2,
+            discarded_threads: 2,
+            dropped_queued_tasks: 0,
+            revision: expect.any(Number)
+        });
+
+        // The history really went away, and the counters on the row say so without a child read.
+        expect((await listTurns(call_, sessionId)).items).toEqual([]);
+
+        const counters = await readOk<{ session: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionId(sessionId),
+            200
+        );
+        expect(counters.session.turn_count).toBe(0);
+        expect(counters.session.thread_count).toBe(0);
+
+        // Cancelling an idle session did not abort anything, and says so.
+        const cancelled = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdCancel(sessionId), {});
+        expect(cancelled).toEqual({
+            status: 200,
+            body: {
+                cancelled: false,
+                session_id: sessionId,
+                dropped_queued_tasks: 0,
+                revision: expect.any(Number)
+            }
+        });
+    });
+});
+// Manual tool execution, and the two gates that decide WHICH route may run a tool.
+//
+// Replaces the old 'all-tools manual execution' block. The catalogue listing no longer carries the
+// execution answer: the DETAIL read does, via `execution: { scope, manual }`, and the routes honour
+// it - `global` runs at `POST /tools/{id}/executions`, `session_required` answers 403 there (a
+// policy refusal, not an absence) and runs at `POST /sessions/{id}/tools/{id}/executions`. A call
+// that executed and failed is 200 `ok:false`; a call the server cannot make is an HTTP status.
+describe('manual tool execution', () => {
+    it('runs a catalogue tool globally with its declarative panels', async () => {
+        const runtime = createRuntime();
+
+        const result = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('timeNow'), {
+            parameters: 'UTC'
+        });
+
+        expect(result.status).toBe(200);
+        // `durationMs` became `duration_ms`; the payload itself is the tool's own camelCase value.
+        expect(Object.keys(result.body).sort()).toEqual(['duration_ms', 'ok', 'panels', 'result']);
+        expect(result.body.ok).toBe(true);
+
+        const value = result.body.result as { timezone: string; iso: string; unix: number };
+        expect(value.timezone).toBe('UTC');
+        expect(value.iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        expect(Number.isInteger(value.unix)).toBe(true);
+        expect(result.body.panels).toEqual([
             {
                 id: 'timeNow',
                 slot: 'right',
@@ -1457,49 +2424,30 @@ describe('all-tools manual execution', () => {
                     { type: 'text', text: 'Read from the server clock at execution time.' }
                 ]
             }
-        ];
+        ]);
 
-        // Direct catalogue path: `result` is the underlying content, not the
-        // `toolUi()` envelope, and the optional `panels` carries the UI data.
-        const direct = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
-                body: { parameters: 'UTC' }
-            })
-        );
-        expect(direct.status).toBe(200);
-        if (!direct.body.ok) throw new Error('expected a successful tool call');
+        // T34 replacement of the old "a tool call requires a parameters property" 400: the contract
+        // declares `parameters` OPTIONAL, so an absent field IS the empty argument box (exactly
+        // `{"parameters": {}}`, ./api.ts:1809) and timeNow's documented default label answers.
+        expect((await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('timeNow'), {})).status).toBe(200);
+        const emptyBox = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('timeNow'), {
+            parameters: {}
+        });
+        expect(emptyBox.status).toBe(200);
+        expect((emptyBox.body.result as { timezone: string }).timezone).toBe('UTC');
 
-        const directValue = direct.body.result as { timezone: string; iso: string; unix: number };
-        expect(directValue.timezone).toBe('UTC');
-        expect(directValue.iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
-        expect(Number.isInteger(directValue.unix)).toBe(true);
-        expect(direct.body.panels).toEqual(panelsFor(directValue));
-
-        // Session-bound path through the demo harness: same unwrapping, same panel
-        // shape. The demo registers timeNow even though its toolbox is the script.
-        const session = await createDemo(runtime);
-        const viaSession = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
-                body: { parameters: 'UTC', sessionId: session.id }
-            })
-        );
-        expect(viaSession.status).toBe(200);
-        if (!viaSession.body.ok) throw new Error('expected a successful session tool call');
-
-        const sessionValue = viaSession.body.result as { timezone: string; iso: string; unix: number };
-        expect(sessionValue.timezone).toBe('UTC');
-        expect(viaSession.body.panels).toEqual(panelsFor(sessionValue));
+        // Only POST is mounted on an execution collection.
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolIdExecutions('timeNow'))).toEqual({
+            status: 405,
+            body: { error: { message: 'Use POST for /v1/harness/tools/timeNow/executions.' } }
+        });
     });
 
-    // R3/R4: `download` returns the companion `toolMedia(content, attachments)`
-    // envelope. The manual route must unwrap it EXACTLY like the model path
-    // (harness.ts deliverTask): `result` is the small JSON summary, `media` is
-    // the descriptor projection, and the base64 never enters the response body.
     it('unwraps tool media into a descriptor list for a manual download', async () => {
         const runtime = createRuntime();
 
-        // A real PNG header so the shared magic-signature check passes, served
-        // with an explicit content-length so the pre-check path is exercised.
+        // A real PNG header so the shared magic-signature check passes, served with an explicit
+        // content-length so the pre-check path is exercised.
         const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
 
         vi.stubGlobal(
@@ -1522,17 +2470,14 @@ describe('all-tools manual execution', () => {
         );
 
         try {
-            const { status, body } = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/download', {
-                    // `download` declares two properties, so the whole object is
-                    // handed to execute (the single-property rule does not apply).
-                    body: { parameters: { url: 'https://files.test/img/pixel.png' } }
-                })
-            );
+            const { status, body } = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('download'), {
+                // `download` declares two properties, so the whole object is handed to execute
+                // (the single-property rule does not apply).
+                parameters: { url: 'https://files.test/img/pixel.png' }
+            });
 
             expect(status).toBe(200);
-            if (!body.ok) throw new Error(`expected a successful download, got ${JSON.stringify(body)}`);
-
+            expect(Object.keys(body).sort()).toEqual(['duration_ms', 'media', 'ok', 'result']);
             expect(body.result).toEqual({
                 url: 'https://files.test/img/pixel.png',
                 finalUrl: 'https://files.test/img/pixel.png',
@@ -1544,72 +2489,100 @@ describe('all-tools manual execution', () => {
                 media: 'attached',
                 mediaId: 'dl-1'
             });
-            expect(body.media).toEqual([
-                { id: 'dl-1', kind: 'image', name: 'pixel.png', mime: 'image/png', size: 12 }
-            ]);
+            expect(body.media).toEqual([{ id: 'dl-1', kind: 'image', name: 'pixel.png', mime: 'image/png', size: 12 }]);
 
-            // The payload itself stays out of the HTTP body: 12 bytes of PNG are
-            // `iVBORw0KGgoBAgME` in canonical base64.
+            // The payload itself stays out of the HTTP body: 12 bytes of PNG are `iVBORw0KGgoBAgME`
+            // in canonical base64, and a manual call has no transcript to attach bytes to.
             expect(JSON.stringify(body)).not.toContain('iVBORw0KGgoBAgME');
-            expect(typeof body.durationMs).toBe('number');
+            expect(typeof body.duration_ms).toBe('number');
         } finally {
-            // This file's afterEach only unstubs envs; a leaked global fetch would
-            // break the streaming and model tests that run after this one.
+            // This file's afterEach only unstubs envs; a leaked global fetch would break the model
+            // and download tests that run after this one.
             vi.unstubAllGlobals();
         }
     });
 
-    it('lists core file tools as direct-call entries and runs one without a session', async () => {
+    it('runs a bounded listing and a bounded read page from a real fixture', async () => {
         const runtime = createRuntime();
-        const { body } = await jsonBody<ToolIndex>(
-            await callHandler(runtime, 'GET', '/v1/harness/tools')
-        );
-
-        // R18: core visibility, but NOT session-bound — they have real
-        // implementations in the direct-call catalogue.
-        const read = body.tools.find((tool) => tool.name === 'read');
-        expect(read).toMatchObject({
-            name: 'read',
-            group: 'Package presets',
-            visibility: 'core'
-        });
-        expect(read?.sessionBound).toBeUndefined();
-
-        // A keyless search is visible and core-marked, but has no executable
-        // tool and is not falsely session-bound or runnable.
-        const search = body.tools.find((tool) => tool.name === 'search');
-        expect(search).toMatchObject({
-            name: 'search',
-            group: 'Web search',
-            visibility: 'core',
-            availability: {
-                state: 'unconfigured',
-                environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
-                hint: WEBSEARCH_UNCONFIGURED_HINT
-            }
-        });
-        expect(search?.sessionBound).toBeUndefined();
-
-        // The manual call needs no `sessionId`: it is an ordinary direct call.
-        const fixture = await createFixture('api-core-file-');
-        const path = join(fixture, 'note.txt');
+        const fixture = await createFixture('harness-list-api-');
 
         try {
+            await mkdir(join(fixture, 'src', 'nested'), { recursive: true });
+            await mkdir(join(fixture, 'task'), { recursive: true });
+            await writeTextFile(join(fixture, 'src', 'a.ts'), 'a\n', 'utf8');
+            await writeTextFile(join(fixture, 'task', 'b.ts'), 'b\n', 'utf8');
+
+            // The direct runner applies the same single-property rule as the harness: `parameters`
+            // IS the value of "paths", not a wrapper object (./api.ts resolveToolParameters).
+            const listed = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('fileList'), {
+                parameters: [join(fixture, 'src'), join(fixture, 'task')]
+            });
+
+            // Absolute inputs keep their absolute prefix, posix-normalized, and the directory order
+            // is the caller's: src (with its child) then task. The answer is one bounded PAGE.
+            const expectedEntries = [
+                `${posix(fixture)}/src/a.ts`,
+                `${posix(fixture)}/src/nested/`,
+                `${posix(fixture)}/task/b.ts`
+            ];
+            expect(listed.body).toEqual({
+                ok: true,
+                result: {
+                    entries: expectedEntries,
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: 200,
+                    bytes: expectedEntries.reduce((total, entry) => total + Buffer.byteLength(entry, 'utf8'), 0),
+                    contentBudget: 64 * 1024
+                },
+                duration_ms: expect.any(Number)
+            });
+
+            // The schema-wrapper spelling means the same request (both documented shapes resolve
+            // through the shared validator in 'direct' mode).
+            const wrapped = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('fileList'), {
+                parameters: { paths: [join(fixture, 'task')] }
+            });
+            const wrappedEntry = `${posix(fixture)}/task/b.ts`;
+            expect(wrapped.body).toEqual({
+                ok: true,
+                result: {
+                    entries: [wrappedEntry],
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: 200,
+                    bytes: Buffer.byteLength(wrappedEntry, 'utf8'),
+                    contentBudget: 64 * 1024
+                },
+                duration_ms: expect.any(Number)
+            });
+
+            // A missing directory is a tool failure reported as DATA (200 + ok:false), not a partial
+            // list and not a request error.
+            const missing = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('fileList'), {
+                parameters: [join(fixture, 'src'), join(fixture, 'nope')]
+            });
+            expect(missing.status).toBe(200);
+            expect(missing.body.ok).toBe(false);
+
+            // `read` with a number where an array of paths belongs is a schema failure reported as
+            // a tool error, never an implementation crash.
+            const wrong = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('read'), { parameters: 7 });
+            expect(wrong).toEqual({
+                status: 200,
+                body: { ok: false, error: { message: '$.paths must be of type array.' }, duration_ms: expect.any(Number) }
+            });
+
+            // A real one-file read, exactly bounded by the tool's own budget report. 'core file' is
+            // one unterminated line of 9 UTF-8 bytes, so every figure below is derivable.
+            const path = join(fixture, 'note.txt');
             await writeTextFile(path, 'core file', 'utf8');
 
-            const result = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
-                    // read declares ONE property, so `parameters` IS the array
-                    // (the direct-call contract, not a { paths } wrapper).
-                    body: { parameters: [path] }
-                })
-            );
-
-            expect(result.status).toBe(200);
-            expect(result.body).toEqual({
+            const read = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('read'), { parameters: [path] });
+            expect(read.body).toEqual({
                 ok: true,
-                // read now returns a bounded batch object, not a bare array.
-                // 'core file' is one unterminated line of 9 UTF-8 bytes.
                 result: {
                     files: [
                         {
@@ -1627,483 +2600,34 @@ describe('all-tools manual execution', () => {
                     bytes: 9,
                     contentBudget: 65536
                 },
-                durationMs: expect.any(Number)
+                duration_ms: expect.any(Number)
             });
         } finally {
             await rm(fixture, { recursive: true, force: true });
         }
     });
 
-    it('serves the same catalogue at /tools/bootstrap', async () => {
+    it('bounds a huge manual result with the shared cap instead of returning it verbatim', async () => {
         const runtime = createRuntime();
 
-        const listed = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        const bootstrapped = await jsonBody<ToolIndex>(
-            await callHandler(runtime, 'GET', '/v1/harness/tools/bootstrap')
-        );
-
-        expect(bootstrapped).toEqual(listed);
-
-        // The bootstrap document (GET /v1/harness) carries the same list.
-        const root = await jsonBody<{ tools: unknown[] }>(await callHandler(runtime, 'GET', '/v1/harness'));
-        expect(root.body.tools).toEqual(listed.body.tools);
-
-        expect(
-            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/tools/bootstrap', { body: {} }))
-        ).toEqual({
-            status: 405,
-            body: { error: { message: 'Use GET for /v1/harness/tools/bootstrap.' } }
-        });
-    });
-
-    it('runs toolRequest inside the session so the match is enabled there', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        const result = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/toolRequest', {
-                body: { sessionId: session.id, parameters: { names: ['timeNow'] } }
-            })
-        );
-
-        expect(result.status).toBe(200);
-        expect(result.body).toEqual({
-            ok: true,
-            result: {
-                enabled: ['timeNow'],
-                tools: [
-                    {
-                        name: 'timeNow',
-                        description:
-                            'Read the current time. Returns an ISO 8601 timestamp and the Unix time in seconds. The timezone argument is only a label for the answer.',
-                        tags: ['time', 'clock', 'date']
-                    }
-                ],
-                matched: 1,
-                omitted: 0
-            },
-            durationMs: expect.any(Number)
-        });
-
-        // The SESSION changed, not a detached catalogue: its snapshot now reports
-        // the discovery, exactly as a model-driven toolRequest would.
-        expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
-    });
-
-    it('runs toolCreate inside the session with the guarded registration policy', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        const created = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
-                body: {
-                    sessionId: session.id,
-                    parameters: {
-                        name: 'uppercase',
-                        description: 'Uppercase text.',
-                        tags: ['text', 'upper'],
-                        source: 'return String(args).toUpperCase();'
-                    }
-                }
-            })
-        );
-
-        expect(created.status).toBe(200);
-        expect(created.body).toEqual({
-            ok: true,
-            result: {
-                name: 'uppercase',
-                description: 'Uppercase text.',
-                tags: ['text', 'upper'],
-                enabled: true
-            },
-            durationMs: expect.any(Number)
-        });
-        expect(runtime.store.get(session.id).discoveredTools).toEqual(['uppercase']);
-
-        // An intentional second creation REPLACES the definition through the same
-        // guarded kernel path (no "already registered" rejection).
-        const replaced = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
-                body: {
-                    sessionId: session.id,
-                    parameters: {
-                        name: 'uppercase',
-                        description: 'Again.',
-                        tags: ['text'],
-                        source: 'return 1;'
-                    }
-                }
-            })
-        );
-
-        expect(replaced.status).toBe(200);
-        expect(replaced.body).toEqual({
-            ok: true,
-            result: {
-                name: 'uppercase',
-                description: 'Again.',
-                tags: ['text'],
-                enabled: true
-            },
-            durationMs: expect.any(Number)
-        });
-
-        // Built-in names are ordinary replaceable registrations too.
-        const reserved = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
-                body: {
-                    sessionId: session.id,
-                    parameters: {
-                        name: 'task',
-                        description: 'Mine.',
-                        tags: ['text'],
-                        source: 'return 1;'
-                    }
-                }
-            })
-        );
-        expect(reserved.body.ok).toBe(true);
-        if (reserved.body.ok) {
-            expect(reserved.body.result.name).toBe('task');
-        }
-    });
-
-    it('runs task against the session list', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        const added = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                body: { sessionId: session.id, parameters: { tasks: [{ text: '  check bounds ' }] } }
-            })
-        );
-
-        expect(added.body).toEqual({
-            ok: true,
-            result: {
-                tasks: [{ id: '1', text: 'check bounds', completed: false }],
-                counts: { total: 1, completed: 0, pending: 1 },
-                // R9-R11: every successful task call returns the current page.
-                page: { offset: 0, limit: 20, hasMore: false }
-            },
-            durationMs: expect.any(Number)
-        });
-
-        // A second call sees the SAME list: the tool lives in the session harness.
-        const listed = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                body: { sessionId: session.id, parameters: {} }
-            })
-        );
-
-        expect(listed.body).toEqual({
-            ok: true,
-            result: {
-                tasks: [{ id: '1', text: 'check bounds', completed: false }],
-                counts: { total: 1, completed: 0, pending: 1 },
-                // R9: `list` is one bounded page (default 20).
-                page: { offset: 0, limit: 20, hasMore: false }
-            },
-            durationMs: expect.any(Number)
-        });
-    });
-
-    it('requires a usable sessionId for a core call', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                    body: { parameters: {} }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message: 'Tool "task" runs inside a session; send a "sessionId" with the call.'
-                }
-            }
-        });
-
-        // An empty id is "no session" for this purpose, not a lookup.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                    body: { sessionId: '', parameters: {} }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message: 'Tool "task" runs inside a session; send a "sessionId" with the call.'
-                }
-            }
-        });
-
-        // A present-but-unusable type is a 400, never coerced into a 404 lookup.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                    body: { sessionId: 7, parameters: {} }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: { error: { message: '`sessionId` must be a string when present.' } }
-        });
-
-        // The parameters wrapper is still mandatory, and an unknown tool still
-        // answers 404 before the body is read.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                    body: { sessionId: session.id }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message:
-                        'A tool call requires a "parameters" property. Send {"parameters": {}} for a tool with no arguments.'
-                }
-            }
-        });
-        // R13: with a session named, an unknown name is resolved against THAT
-        // session's registry (created/plugin tools), so the 404 names the session
-        // rather than the global catalogue. Without a session it stays "Unknown tool".
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/nope', {
-                    body: { sessionId: session.id, parameters: {} }
-                })
-            )
-        ).toEqual({
-            status: 404,
-            body: { error: { message: 'Tool "nope" is not available in this session.' } }
-        });
-    });
-
-    it('answers 404 for an unknown session and for a core tool that session lacks', async () => {
-        const runtime = createRuntime();
-        await createDemo(runtime);
-
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
-                    body: { sessionId: 'missing', parameters: {} }
-                })
-            )
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown session "missing".' } } });
-
-        // The scripted demo has no subagents, so its harness registers no delegate.
-        // The catalogue still DESCRIBES delegate; the session answers clearly.
-        const session = await createDemo(runtime);
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/delegate', {
-                    body: { sessionId: session.id, parameters: { agent: 'helper', input: 'go' } }
-                })
-            )
-        ).toEqual({
-            status: 404,
-            body: { error: { message: 'Tool "delegate" is not available in this session.' } }
-        });
-    });
-
-    it('rejects a core call while the session is running with 409', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        // Hold the run open on its turn frame, exactly like the busy-session test.
-        const stream = await runtime.api({
-            method: 'POST',
-            pathname: `/v1/harness/sessions/${session.id}/messages`,
-            mount: '/v1/harness',
-            readBody: async () => ({ input: 'first' }),
-            bootstrapRoot: true
-        });
-        if (stream.kind !== 'stream') throw new Error('expected a stream');
-
-        let release: () => void = () => {};
-        const gate = new Promise<void>((resolve) => {
-            release = resolve;
-        });
-        let reached: () => void = () => {};
-        const turnReached = new Promise<void>((resolve) => {
-            reached = resolve;
-        });
-
-        const controller = new AbortController();
-        const run = stream.start(async (item) => {
-            if (item.type === 'turn') {
-                reached();
-                await gate;
-            }
-        }, controller.signal);
-
-        await turnReached;
-
-        // A manual mutation must not race a live turn: discovery, created tools, and
-        // todos all write harness state the running transcript depends on.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/toolRequest', {
-                    body: { sessionId: session.id, parameters: { tags: ['time'] } }
-                })
-            )
-        ).toEqual({
-            status: 409,
-            body: { error: { message: 'A task is running in this session; try again when it finishes.' } }
-        });
-
-        controller.abort();
-        release();
-        await run;
-    });
-
-    it('accepts the verb-named /call alias for the same route', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        const alias = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/task/call', {
-                body: { sessionId: session.id, parameters: {} }
-            })
-        );
-
-        expect(alias.body).toEqual({
-            ok: true,
-            result: {
-                tasks: [],
-                counts: { total: 0, completed: 0, pending: 0 },
-                page: { offset: 0, limit: 20, hasMore: false }
-            },
-            durationMs: expect.any(Number)
-        });
-
-        expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/tools/task/call'))
-        ).toEqual({
-            status: 405,
-            body: { error: { message: 'Use POST for /v1/harness/tools/:name/call.' } }
-        });
-    });
-
-    it('runs a known catalogue tool through the named session without enabling it', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        // One request shape: a UI may send the selected session with any call.
-        // R4 (self-modifying tools): a named session resolves the call through its
-        // LIVE registry, so a replaced catalogue tool is honored. The demo registers
-        // timeNow, so the call succeeds there; a manual call never enables discovery.
-        const clock = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
-                body: { sessionId: session.id, parameters: 'UTC' }
-            })
-        );
-
-        expect(clock.status).toBe(200);
-        expect(clock.body.ok).toBe(true);
-        if (clock.body.ok) {
-            expect((clock.body.result as { timezone: string }).timezone).toBe('UTC');
-        }
-        expect(runtime.store.get(session.id).discoveredTools).toEqual([]);
-    });
-});
-
-describe('body policy and bounds', () => {
-    it('requires a JSON object body on every action endpoint', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        // `null`, arrays, strings, and numbers are not objects; every action
-        // endpoint answers the same 400 before reading a field off them.
-        const cases: { method: string; pathname: string; body: unknown }[] = [
-            { method: 'POST', pathname: '/v1/harness/models', body: null },
-            { method: 'POST', pathname: '/v1/harness/models', body: [] },
-            { method: 'POST', pathname: '/v1/harness/models', body: 'https://provider.example/v1' },
-            { method: 'POST', pathname: '/v1/harness/models', body: 7 },
-            { method: 'POST', pathname: '/v1/harness/sessions', body: [] },
-            { method: 'POST', pathname: `/v1/harness/sessions/${session.id}/messages`, body: 'hello' },
-            { method: 'POST', pathname: '/v1/harness/tools/timeNow', body: 7 }
-        ];
-
-        for (const entry of cases) {
-            const result = await jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, entry.method, entry.pathname, { body: entry.body })
-            );
-
-            expect({ pathname: entry.pathname, result }).toEqual({
-                pathname: entry.pathname,
-                result: {
-                    status: 400,
-                    body: { error: { message: 'The request body must be a JSON object.' } }
-                }
-            });
-        }
-    });
-
-    it('rejects a tool call without the parameters wrapper and keeps an empty wrapper valid', async () => {
-        const runtime = createRuntime();
-
-        // `{}` is exactly what the service loader produces when JSON parsing
-        // fails, so it must never reach a tool as "no arguments". `clock` would
-        // happily answer with its default timezone if it did.
-        expect(
-            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: {} }))
-        ).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message:
-                        'A tool call requires a "parameters" property. Send {"parameters": {}} for a tool with no arguments.'
-                }
-            }
-        });
-
-        // An explicit empty wrapper stays a VALID CALL (the UI sends this when the
-        // argument box is empty): the single-property rule unwraps it to
-        // `undefined`, and `timeNow` documents "UTC" as the omitted-label default.
-        const clock = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: { parameters: {} } })
-        );
-        expect(clock.status).toBe(200);
-        expect(clock.body.ok).toBe(true);
-        if (clock.body.ok) {
-            const result = clock.body.result as { timezone: unknown };
-            expect(result.timezone).toBe('UTC');
-        }
-    });
-
-    it('bounds a huge manual result with the shared truncation envelope', async () => {
-        const runtime = createRuntime();
-
-        // A file long enough that even a bounded read serializes past the 64 KiB
-        // manual cap: read's own 64 KiB content budget fills the page, and the
-        // JSON envelope around it crosses the cap. That is exactly the "huge value"
-        // case the manual route must not return verbatim.
+        // A file long enough that even a bounded read serializes past the cap: read's own 64 KiB
+        // content budget fills the page and the JSON envelope around it crosses it.
         const fixture = await createFixture('harness-bounds-api-');
+
         try {
             const path = join(fixture, 'big.txt');
             await writeTextFile(path, 'x'.repeat(70_000), 'utf8');
 
-            const read = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
-                    body: { parameters: [path] }
-                })
-            );
+            const read = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('read'), {
+                parameters: [path]
+            });
 
             expect(read.status).toBe(200);
-            if (!read.body.ok) throw new Error('expected a successful read');
+            expect(read.body.ok).toBe(true);
 
-            // R13: the result is the SHARED envelope, parsed back into an object so
-            // the HTTP body stays valid JSON instead of a half-written document.
+            // The shared 64 KiB cap still produces the SHARED envelope: `boundToolValue` (./api.ts:557)
+            // cuts the serialized value with `boundToolResult` and re-parses the envelope, so the HTTP
+            // body stays valid JSON while the prefix of the tool's own document is preserved inside it.
             const bounded = read.body.result as {
                 truncated: boolean;
                 originalBytes: number;
@@ -2111,21 +2635,14 @@ describe('body policy and bounds', () => {
                 content: string;
             };
 
-            expect(Object.keys(bounded).sort()).toEqual([
-                'budgetBytes',
-                'content',
-                'originalBytes',
-                'truncated'
-            ]);
+            expect(Object.keys(bounded).sort()).toEqual(['budgetBytes', 'content', 'originalBytes', 'truncated']);
             expect(bounded.truncated).toBe(true);
-            expect(bounded.budgetBytes).toBe(64 * 1024);
-            // EXACT and PORTABLE: `originalBytes` is the UTF-8 length of the tool's
-            // own serialized result, so the expectation is derived from the fixture
-            // instead of hard-coded. read returns the 64 KiB content budget as
-            // ONE unterminated line for this fixture, and its metadata is fixed
-            // (1-based line 1, `nextColumn` at the cut, the same byte count at both
-            // levels). `JSON.stringify(path)` makes the separator/prefix handling the
-            // platform's problem, so the number holds on any OS and TEMP root.
+            expect(bounded.budgetBytes).toBe(HARNESS_SERVICE_LIMITS.tool_result_bytes);
+
+            // EXACT and PORTABLE: `originalBytes` is the UTF-8 length of the tool's own serialized
+            // result. read returns the 64 KiB content budget as ONE unterminated line for this
+            // fixture, and its metadata is fixed, so the expectation is DERIVED from the fixture
+            // rather than hard-coded (`JSON.stringify(path)` makes separators the platform's problem).
             const expectedResult = {
                 files: [
                     {
@@ -2143,708 +2660,781 @@ describe('body policy and bounds', () => {
                 bytes: 64 * 1024,
                 contentBudget: 64 * 1024
             };
-            expect(bounded.originalBytes).toBe(
-                Buffer.byteLength(JSON.stringify(expectedResult), 'utf8')
-            );
-            // The prefix is preserved (it IS the beginning of the tool's JSON text,
-            // which starts with the serialized result object).
+            expect(bounded.originalBytes).toBe(Buffer.byteLength(JSON.stringify(expectedResult), 'utf8'));
+            // The prefix IS the beginning of the tool's JSON text, and the envelope itself fits the cap.
             expect(bounded.content.startsWith('{"files":[{"path"')).toBe(true);
             expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(
-                64 * 1024
+                HARNESS_SERVICE_LIMITS.tool_result_bytes
             );
         } finally {
             await rm(fixture, { recursive: true, force: true });
         }
     });
 
-    it('accepts the legacy and wrapped direct argument shapes identically', async () => {
+    it('refuses a session-bound tool at the global route, and states the route that serves it', async () => {
         const runtime = createRuntime();
 
-        const fixture = await createFixture('harness-parity-api-');
-        try {
-            const path = join(fixture, 'note.txt');
-            await writeTextFile(path, 'one line\n', 'utf8');
-
-            // R13: the direct route now validates through the shared resolver in
-            // 'direct' mode, so both documented shapes reach `execute` with the same
-            // value. A wrong type is a tool error, not an implementation crash.
-            const legacy = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
-                    body: { parameters: [path] }
-                })
-            );
-            const wrapped = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
-                    body: { parameters: { paths: [path] } }
-                })
-            );
-
-            expect(legacy.status).toBe(200);
-            expect(wrapped.status).toBe(200);
-            expect(legacy.body.ok).toBe(true);
-            // `durationMs` is wall-clock time, so it legitimately differs between two
-            // calls (1ms vs 0ms). Compare the payload with that field removed, which
-            // is what "the shapes are identical" actually means.
-            const withoutDuration = ({ durationMs: _durationMs, ...rest }: ToolCallResult) => rest;
-            expect(withoutDuration(wrapped.body)).toEqual(withoutDuration(legacy.body));
-            if (legacy.body.ok) {
-                expect(legacy.body.result).toMatchObject({ files: [{ content: 'one line\n' }] });
-            }
-
-            // A number where an array of paths belongs is rejected by the schema.
-            const wrong = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
-                    body: { parameters: 7 }
-                })
-            );
-            expect(wrong.status).toBe(200);
-            expect(wrong.body).toEqual({
-                ok: false,
-                error: { message: '$.paths must be of type array.' },
-                durationMs: expect.any(Number)
-            });
-        } finally {
-            await rm(fixture, { recursive: true, force: true });
-        }
-    });
-
-    it('runs a session-created tool through its own session and nowhere else', async () => {
-        const runtime = createRuntime();
-        const owner = await createDemo(runtime);
-        const sibling = await createDemo(runtime);
-
-        // toolCreate in the owner session registers a runtime tool in THAT harness.
-        const created = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
-                body: {
-                    sessionId: owner.id,
-                    parameters: {
-                        name: 'shout',
-                        description: 'Uppercase a string.',
-                        tags: ['text'],
-                        // `source` is the BODY of an async function taking (args, context).
-                        source: 'return String(args ?? "").toUpperCase();'
-                    }
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('toolRequest'), { parameters: {} })).toEqual({
+            status: 403,
+            body: {
+                error: {
+                    message:
+                        'Tool "toolRequest" runs inside a session; call it through /v1/harness/sessions/{session_id}/tools/toolRequest/executions.'
                 }
-            })
-        );
-
-        expect(created.body.ok).toBe(true);
-
-        // R13: the name is not in the static catalogue, so the route resolves it
-        // through the named session's registry.
-        const call = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/shout', {
-                body: { sessionId: owner.id, parameters: 'hello' }
-            })
-        );
-        expect(call.body).toEqual({
-            ok: true,
-            result: 'HELLO',
-            durationMs: expect.any(Number)
+            }
+        });
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('task'), { parameters: {} })).toEqual({
+            status: 403,
+            body: {
+                error: {
+                    message: 'Tool "task" runs inside a session; call it through /v1/harness/sessions/{session_id}/tools/task/executions.'
+                }
+            }
         });
 
-        // ISOLATION: a different session does not see it ...
+        // The global body has ONE field: the old `sessionId` channel is gone, and a stale spelling
+        // is refused rather than ignored (the session belongs in the PATH).
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('task'), { parameters: {}, session_id: 'x' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "session_id". Allowed fields: parameters.' } }
+        });
+
+        // Absence is a 404 at either route, with the wording that says WHICH namespace failed.
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('nope'), { parameters: {} })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown tool "nope".' } }
+        });
+
+        const session = await createDemo(runtime);
         expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/shout', {
-                    body: { sessionId: sibling.id, parameters: 'hello' }
-                })
+            await call(
+                runtime,
+                'POST',
+                HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(session.id, 'nope'),
+                { parameters: {} }
             )
         ).toEqual({
             status: 404,
-            body: { error: { message: 'Tool "shout" is not available in this session.' } }
+            body: { error: { message: `Unknown tool "nope" in session "${session.id}".` } }
         });
-
-        // ... and neither does a session-less call, which only knows the catalogue.
+        // A harness-owned row the session's own harness never registered answers the same way.
         expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/shout', {
-                    body: { parameters: 'hello' }
-                })
+            await call(
+                runtime,
+                'POST',
+                HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(session.id, 'delegate'),
+                { parameters: { agent: 'helper', input: 'go' } }
             )
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown tool "shout".' } } });
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown tool "delegate" in session "${session.id}".` } }
+        });
+        expect(
+            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions('missing', 'task'), {
+                parameters: {}
+            })
+        ).toEqual({ status: 404, body: { error: { message: 'Unknown session "missing".' } } });
     });
 
-    it('rejects an over-sized body by declared length or serialized size with 413', async () => {
+    it('runs harness control tools against the named session and changes that session', async () => {
         const runtime = createRuntime();
-        const limit = `A request body cannot exceed ${MAX_API_BODY_BYTES} bytes.`;
+        const session = await createDemo(runtime);
+        const executions = (tool: string) =>
+            HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(session.id, tool);
 
-        // Honest content-length: rejected before the dispatcher inspects anything.
-        const declared = await callHandler(runtime, 'POST', '/v1/harness/models', {
-            body: {},
-            headers: { 'content-length': String(MAX_API_BODY_BYTES + 1) }
+        const discovered = await call(runtime, 'POST', executions('toolRequest'), {
+            parameters: { names: ['timeNow'] }
         });
-        expect(await jsonBody(declared)).toEqual({ status: 413, body: { error: { message: limit } } });
 
-        // The loader pre-parses JSON, so this body is already in memory by the
-        // time the adapter runs (documented residual); the adapter still refuses
-        // to dispatch it.
-        const oversized = await callHandler(runtime, 'POST', '/v1/harness/models', {
-            body: { settings: { apiKey: 'x'.repeat(MAX_API_BODY_BYTES + 1_000) } }
+        expect(discovered.status).toBe(200);
+        expect(discovered.body).toEqual({
+            ok: true,
+            result: {
+                enabled: ['timeNow'],
+                tools: [
+                    {
+                        name: 'timeNow',
+                        description:
+                            'Read the current time. Returns an ISO 8601 timestamp and the Unix time in seconds. The timezone argument is only a label for the answer.',
+                        tags: ['time', 'clock', 'date']
+                    }
+                ],
+                matched: 1,
+                omitted: 0
+            },
+            duration_ms: expect.any(Number)
         });
-        expect(await jsonBody(oversized)).toEqual({ status: 413, body: { error: { message: limit } } });
+        // The SESSION changed, not a detached catalogue: the store is the oracle behind the toolbox
+        // read (./canonical-reads.test-support.ts header: the store stays reachable in a test).
+        expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
+
+        const added = await call(runtime, 'POST', executions('task'), {
+            parameters: { tasks: [{ text: '  check bounds ' }] }
+        });
+        expect(added.body).toEqual({
+            ok: true,
+            result: {
+                tasks: [{ id: '1', text: 'check bounds', completed: false }],
+                counts: { total: 1, completed: 0, pending: 1 },
+                // R9-R11: every successful task call returns the current bounded page.
+                page: { offset: 0, limit: 20, hasMore: false }
+            },
+            duration_ms: expect.any(Number)
+        });
+
+        // A second call sees the SAME list: the tool lives in the session harness.
+        const listed = await call(runtime, 'POST', executions('task'), { parameters: {} });
+        expect(listed.body).toEqual({
+            ok: true,
+            result: {
+                tasks: [{ id: '1', text: 'check bounds', completed: false }],
+                counts: { total: 1, completed: 0, pending: 1 },
+                page: { offset: 0, limit: 20, hasMore: false }
+            },
+            duration_ms: expect.any(Number)
+        });
+
+        // A catalogue tool through the named session needs no enabling, and does not enable itself.
+        const clock = await call(runtime, 'POST', executions('timeNow'), { parameters: 'UTC' });
+        expect(clock.status).toBe(200);
+        expect((clock.body.result as { timezone: string }).timezone).toBe('UTC');
+        expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
+
+        // A multi-property tool with NO argument box is a readable tool error, not a 400: the
+        // session route forwards the box verbatim and the schema decides.
+        expect(
+            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(session.id, 'toolCreate'), {})
+        ).toEqual({
+            status: 200,
+            body: { ok: false, error: { message: '$ must be of type object.' }, duration_ms: expect.any(Number) }
+        });
     });
 
-    it('maps shared settings validation to 400 with the exact message', async () => {
+    it('creates a tool through the session registration kernel and isolates it', async () => {
         const runtime = createRuntime();
+        const call_ = canonicalCall(runtime);
+        const owner = await createDemo(runtime);
+        const sibling = await createDemo(runtime);
 
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/models', {
-                    body: { settings: { baseURL: 'x'.repeat(2_049) } }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: { error: { message: 'A provider base URL cannot exceed 2048 characters.' } }
+        const registered = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTools(owner.id), {
+            name: 'shout',
+            description: 'Uppercase a string.',
+            tags: ['text'],
+            // `source` is the BODY of an async function taking (args, context).
+            source: 'return String(args ?? "").toUpperCase();'
         });
 
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/models', {
-                    body: { settings: { model: 'x'.repeat(257) } }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: { error: { message: 'A model name cannot exceed 256 characters.' } }
+        expect(registered.status).toBe(201);
+        // The receipt is metadata only: no source text, no schema, no result.
+        expect(Object.keys(registered.body.registration).sort()).toEqual([
+            'budget',
+            'checks',
+            'created',
+            'name',
+            'replaced',
+            'source_revision'
+        ]);
+        expect(registered.body.registration.name).toBe('shout');
+        expect(registered.body.registration.created).toBe(true);
+        expect(registered.body.registration.replaced).toBe(false);
+        expect(registered.body.registration.budget).toEqual({
+            used: 1,
+            limit: HARNESS_SERVICE_LIMITS.created_tools
         });
 
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/models', {
-                    body: { settings: { baseURL: 5 } }
-                })
-            )
-        ).toEqual({
-            status: 400,
-            body: { error: { message: '`settings.baseURL` must be a string when present.' } }
+        // The bytes live on their own route, and quote the revision the receipt reported.
+        const source = await readOk<Record<string, any>>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdSource(owner.id, 'shout'),
+            200
+        );
+        expect(Object.keys(source).sort()).toEqual(['name', 'revision', 'session_id', 'source']);
+        expect(source.session_id).toBe(owner.id);
+        expect(source.name).toBe('shout');
+        expect(source.revision).toBe(registered.body.registration.source_revision);
+        expect(source.source).toBe('return String(args ?? "").toUpperCase();');
+
+        // The detail read is the toolbox row PLUS the schema and the execution gate.
+        const detail = await readOk<{ tool: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdToolsByToolId(owner.id, 'shout'),
+            200
+        );
+        expect(detail.tool).toEqual({
+            name: 'shout',
+            group: 'Created tools',
+            description: 'Uppercase a string.',
+            tags: [],
+            visibility: 'searchable',
+            session_bound: false,
+            session_id: owner.id,
+            declared: false,
+            enabled: true,
+            origin: 'created',
+            protected: false,
+            source_available: true,
+            source_revision: registered.body.registration.source_revision,
+            execution: { scope: 'session_only', manual: true }
         });
+
+        // The tool runs INSIDE its own session and nowhere else.
+        expect(
+            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(owner.id, 'shout'), {
+                parameters: 'hello'
+            })
+        ).toEqual({ status: 200, body: { ok: true, result: 'HELLO', duration_ms: expect.any(Number) } });
+
+        expect(
+            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(sibling.id, 'shout'), {
+                parameters: 'hello'
+            })
+        ).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown tool "shout" in session "${sibling.id}".` } }
+        });
+        // ...and the global route only knows the deployment catalogue.
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('shout'), { parameters: 'hello' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown tool "shout".' } }
+        });
+
+        // An intentional second creation REPLACES the definition through the same guarded kernel
+        // path (no "already registered" rejection). T39: `created`/`replaced` state what this write
+        // did to a PRIOR REGISTRATION in this session — the kernel's own rule for the identical
+        // write (../harness.ts:1292-1293 `existed = tools[name] !== undefined`, reported at
+        // :1386-1399) — so overwriting the session's own earlier registration is a REPLACEMENT, not
+        // a fresh creation. The old pin (created: true, replaced: false) contradicted the receipt's
+        // own budget figure, which correctly did not grow, and the PATCH route, which reports the
+        // kernel's `replaced` for the same operation.
+        const replaced = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTools(owner.id), {
+            name: 'shout',
+            description: 'Again.',
+            tags: ['text'],
+            source: 'return 1;'
+        });
+        expect(replaced.status).toBe(201);
+        expect(replaced.body.registration.created).toBe(false);
+        expect(replaced.body.registration.replaced).toBe(true);
+        // The revision this write displaced is named, so a client can tell a replacement from a
+        // first registration without re-reading the source route.
+        expect(replaced.body.registration.previous_revision).toBe(registered.body.registration.source_revision);
+        expect(replaced.body.registration.budget).toEqual({
+            used: 1,
+            limit: HARNESS_SERVICE_LIMITS.created_tools
+        });
+        expect(replaced.body.registration.source_revision).not.toBe(registered.body.registration.source_revision);
+
+        const reloaded = await callWithHeaders(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdToolsByToolId(owner.id, 'shout')
+        );
+        expect(reloaded.status).toBe(200);
+        expect(reloaded.body.tool.description).toBe('Again.');
+        expect(reloaded.body.tool.source_revision).toBe(replaced.body.registration.source_revision);
+
+        // The NEW body is what runs.
+        expect(
+            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(owner.id, 'shout'), {
+                parameters: 'hello'
+            })
+        ).toEqual({ status: 200, body: { ok: true, result: 1, duration_ms: expect.any(Number) } });
+
+        // Built-in names are ordinary replaceable registrations too, and the receipt says so: the
+        // live registry already had `task`, so this write REPLACED a prior registration (the same
+        // `existed` test the kernel applies, ../harness.ts:1292-1293). It is not a statement about
+        // the static catalogue, which this route never mutates.
+        const reserved = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTools(owner.id), {
+            name: 'task',
+            description: 'Mine.',
+            tags: ['text'],
+            source: 'return 1;'
+        });
+        expect(reserved.status).toBe(201);
+        expect(reserved.body.registration.name).toBe('task');
+        expect(reserved.body.registration.created).toBe(false);
+        expect(reserved.body.registration.replaced).toBe(true);
     });
 });
 
-describe('service origin gate', () => {
-    it('allows requests with no Origin, same-origin, and loopback origins', async () => {
+// Request policy at the adapter: what a body may be, and how large it may be.
+//
+// The caps are now ROUTE-aware: every route 1 MB, the submit route 16 MiB for base64 media
+// (`bodyLimitFor`, shared with the Node adapter). The old single-constant 413 message quoted the
+// same figure for everything; the target message quotes the cap of the route that answered.
+describe('body policy and bounds', () => {
+    it('requires a JSON object body on every action endpoint', async () => {
         const runtime = createRuntime();
+        const session = await createDemo(runtime);
 
-        const noOrigin = await jsonBody<{ ok: boolean }>(await callHandler(runtime, 'GET', '/v1/harness/health'));
-        expect(noOrigin).toEqual({ status: 200, body: { ok: true, sessions: 0 } });
-
-        const sameOrigin = await callHandler(runtime, 'GET', '/v1/harness/health', {
-            headers: { origin: 'http://127.0.0.1:5000', host: '127.0.0.1:5000' }
-        });
-        expect(sameOrigin.status).toBe(200);
-
-        const devLoopback = await callHandler(runtime, 'GET', '/v1/harness/health', {
-            headers: { origin: 'http://localhost:5173', host: '127.0.0.1:5000' }
-        });
-        expect(devLoopback.status).toBe(200);
-    });
-
-    it('rejects a non-loopback cross-origin browser request with 403', async () => {
-        const runtime = createRuntime();
-
-        const hostile = await callHandler(runtime, 'GET', '/v1/harness', {
-            headers: { origin: 'https://evil.example', host: '127.0.0.1:5000' }
-        });
-        expect(await jsonBody<unknown>(hostile)).toEqual({
-            status: 403,
-            body: { error: { message: 'Cross-origin requests are not allowed.' } }
-        });
-
-        const sameHostDifferentPort = await callHandler(runtime, 'GET', '/v1/harness', {
-            headers: { origin: 'http://127.0.0.1:6000', host: '127.0.0.1:5000' }
-        });
-        // Loopback is allowed by design (dev UI); a LAN origin on another host is not.
-        expect(sameHostDifferentPort.status).toBe(200);
-
-        const lanOrigin = await callHandler(runtime, 'GET', '/v1/harness', {
-            headers: { origin: 'http://192.168.1.20:8080', host: '127.0.0.1:5000' }
-        });
-        expect(lanOrigin.status).toBe(403);
-    });
-
-    it('allows the deployed GitHub Pages UI to dial the service cross-origin', async () => {
-        // The Pages bundle (ci.yml publishes src/frontend/dist) has no API on its
-        // own origin, so it dials a loopback or LAN gateway directly with
-        // `Origin: https://<user>.github.io` (../frontend/deployment.ts). Before
-        // that chain existed this request was the 403 that made the deployed UI
-        // look offline.
-        const runtime = createRuntime();
-
-        const pagesHealth = await jsonBody<{ ok: boolean }>(
-            await callHandler(runtime, 'GET', '/v1/harness/health', {
-                headers: { origin: 'https://underloadjs.github.io', host: '127.0.0.1:5000' }
-            })
-        );
-        expect(pagesHealth).toEqual({ status: 200, body: { ok: true, sessions: 0 } });
-
-        // The LAN host is the chain's last entry, and the bootstrap root document is
-        // the request the deployed UI makes first.
-        const pagesRoot = await callHandler(runtime, 'GET', '/v1/harness', {
-            headers: { origin: 'https://underloadjs.github.io', host: '192.168.50.109:5000' }
-        });
-        expect(pagesRoot.status).toBe(200);
-    });
-
-    it('keeps the Pages allowance to an https github.io origin', async () => {
-        const runtime = createRuntime();
-
-        const rejected = [
-            'http://underloadjs.github.io', // Pages serves the UI over https only
-            'https://github.io', // the zone itself is not a Pages site
-            'https://github.io.attacker.test', // label-boundary lookalike
-            'https://underloadjs.github.io.attacker.test', // same, with a subdomain
-            'https://evil.example' // any other public page
+        const cases: { method: string; pathname: string; body: unknown }[] = [
+            { method: 'POST', pathname: HARNESS_ROUTES.models(), body: null },
+            { method: 'POST', pathname: HARNESS_ROUTES.models(), body: [] },
+            { method: 'POST', pathname: HARNESS_ROUTES.models(), body: 'https://provider.example/v1' },
+            { method: 'POST', pathname: HARNESS_ROUTES.models(), body: 7 },
+            { method: 'POST', pathname: HARNESS_ROUTES.sessions(), body: [] },
+            { method: 'POST', pathname: HARNESS_ROUTES.sessionsBySessionIdTasks(session.id), body: 'hello' },
+            { method: 'POST', pathname: HARNESS_ROUTES.toolsByToolIdExecutions('timeNow'), body: 7 },
+            { method: 'PATCH', pathname: HARNESS_ROUTES.sessionsBySessionId(session.id), body: [] }
         ];
 
-        for (const origin of rejected) {
-            const result = await callHandler(runtime, 'GET', '/v1/harness/health', {
-                headers: { origin, host: '127.0.0.1:5000' }
-            });
+        for (const entry of cases) {
+            const result = await call(runtime, entry.method, entry.pathname, entry.body);
 
-            expect(result.status, origin).toBe(403);
+            expect({ pathname: entry.pathname, result }).toEqual({
+                pathname: entry.pathname,
+                result: { status: 400, body: { error: { message: 'The request body must be a JSON object.' } } }
+            });
         }
     });
-});
 
-describe('standalone /api compatibility', () => {
-    it('preserves /api root 404, client header auth, and adds the presets alias', async () => {
-        const server = await startHarnessServer({ port: 0, staticRoot: null });
+    it('resolves the cap per route and quotes it in the refusal', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
 
-        try {
-            // The canonical bootstrap does not leak into the legacy mount.
-            const root = await fetch(`${server.url}/api`, { headers: { 'X-Harness-Client': 'ui' } });
-            expect(root.status).toBe(404);
-            expect(await root.json()).toEqual({ error: { message: 'Unknown API route.' } });
+        // Unit pin of the shared resolver both adapters call.
+        expect(MAX_API_BODY_BYTES).toBe(HARNESS_SERVICE_LIMITS.body_bytes);
+        expect(bodyLimitFor('POST', HARNESS_ROUTES.sessionsBySessionIdTasks('x'), MOUNT)).toBe(
+            HARNESS_SERVICE_LIMITS.submit_body_bytes
+        );
+        expect(bodyLimitFor('POST', HARNESS_ROUTES.models(), MOUNT)).toBe(HARNESS_SERVICE_LIMITS.body_bytes);
+        expect(bodyLimitFor('POST', HARNESS_ROUTES.toolsByToolIdExecutions('timeNow'), MOUNT)).toBe(
+            HARNESS_SERVICE_LIMITS.body_bytes
+        );
 
-            const withoutHeader = await fetch(`${server.url}/api/harnesses`);
-            expect(withoutHeader.status).toBe(403);
+        // Honest content-length: rejected before the dispatcher inspects anything.
+        const declared = await callHandler(runtime, 'POST', HARNESS_ROUTES.models(), {
+            body: {},
+            headers: { 'content-length': String(HARNESS_SERVICE_LIMITS.body_bytes + 1) }
+        });
+        expect(await jsonOf(declared)).toEqual({
+            status: 413,
+            body: { error: { message: `A request body cannot exceed ${HARNESS_SERVICE_LIMITS.body_bytes} bytes.` } }
+        });
 
-            const harnesses = await fetch(`${server.url}/api/harnesses`, {
-                headers: { 'X-Harness-Client': 'ui' }
-            });
-            const presets = await fetch(`${server.url}/api/presets`, {
-                headers: { 'X-Harness-Client': 'ui' }
-            });
-            expect(harnesses.status).toBe(200);
-            expect(presets.status).toBe(200);
-            expect(await presets.json()).toEqual(await harnesses.json());
-        } finally {
-            await server.close();
-        }
+        // The loader pre-parses JSON, so this body is already in memory by the time the adapter
+        // runs (documented residual); the adapter still refuses to dispatch it.
+        const oversized = await callHandler(runtime, 'POST', HARNESS_ROUTES.models(), {
+            body: { settings: { api_key: 'x'.repeat(HARNESS_SERVICE_LIMITS.body_bytes + 1_000) } }
+        });
+        expect((await jsonOf(oversized)).status).toBe(413);
+
+        // On the submit route the SAME declared length is legal (16 MiB cap), and the payload stays
+        // inside the task's own character budget so the route's answer is the receipt, not a 413.
+        const submit = await callHandler(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks(session.id), {
+            body: { input: 'x'.repeat(2_000) },
+            headers: { 'content-length': String(HARNESS_SERVICE_LIMITS.body_bytes + 1) }
+        });
+        expect(submit.status).toBe(202);
+
+        const submitTooBig = await callHandler(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks(session.id), {
+            body: { input: 'x'.repeat(2_000) },
+            headers: { 'content-length': String(HARNESS_SERVICE_LIMITS.submit_body_bytes + 1) }
+        });
+        expect(await jsonOf(submitTooBig)).toEqual({
+            status: 413,
+            body: { error: { message: `A request body cannot exceed ${HARNESS_SERVICE_LIMITS.submit_body_bytes} bytes.` } }
+        });
+    });
+
+    it('forwards the loader query channel and stamps the contract headers', async () => {
+        const runtime = createRuntime();
+
+        await createDemo(runtime);
+        await createDemo(runtime);
+
+        // T18: the gateway hands the query over pre-split; forwarding it is what makes `?limit=1`
+        // mean something on this mount instead of silently answering the default page.
+        const page = await callHandler(runtime, 'GET', HARNESS_ROUTES.sessions(), { query: { limit: '1' } });
+        const body = (await jsonOf(page)).body;
+        expect(body.items).toHaveLength(1);
+        expect(body.limit).toBe(1);
+
+        // Every response carries the epoch; every response that has a revision carries it too.
+        expect(page.headers).toEqual({
+            'X-Harness-Epoch': runtime.events.epoch,
+            'X-Harness-Revision': String(body.revision)
+        });
+
+        const receipt = await callHandler(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTasks(body.items[0].id), {
+            body: { input: 'stamp me' }
+        });
+        const settled = (await jsonOf(receipt)).body;
+        expect(receipt.headers).toEqual({
+            'X-Harness-Epoch': runtime.events.epoch,
+            'X-Harness-Revision': String(settled.session_revision)
+        });
+
+        await runtime.store.waitForIdle(body.items[0].id);
     });
 });
-
-// The harness registry over HTTP.
+// The harness registry over HTTP: create, patch, read back, and the validation surface.
 //
-// A client may CREATE a harness (select trusted agents) and PATCH a built-in
-// live harness's metadata/routing. Both are in-memory; both affect future
-// sessions only, which the frozen-definition assertions below pin directly.
-describe('harness registry over HTTP', () => {
-    const createSessionFor = async (runtime: HarnessRuntime, harness: string): Promise<SessionSnapshot> => {
-        const result = await callHandler(runtime, 'POST', '/v1/harness/sessions', {
-            body: { harness }
-        });
-        const { status, body } = await jsonBody<{ session: SessionSnapshot }>(result);
-        expect(status).toBe(201);
-        return body.session;
-    };
+// Same guarantees as before the migration - a client may CREATE a harness by selecting trusted
+// agents and PATCH a template's metadata/routing, writes affect FUTURE sessions only, and the
+// frozen definition plus the effective per-agent models stay attributed to the session that was
+// already running. What moved: every request field is snake_case, `editable` is gone (every
+// template is patchable), and the per-agent instruction TEXT is answerable on its own routes
+// instead of being smuggled through a fat card.
+describe('harness registry writes over HTTP', () => {
+    const RESEARCH_GUIDELINES = [
+        'Search the repository before reasoning about it: grep({ pattern, patterns, paths }) returns matching lines with file and line numbers; glob returns paths only.',
+        'Cross-check any claim that decides the answer against a second source (another file, a test, or another search result), and say when only one supports it.',
+        DISCOVERY_GUIDELINE,
+        WEB_SEARCH_GUIDELINE,
+        DELEGATION_GUIDELINE,
+        'Delegate narrow follow-ups: summarizer condenses notes, workspace verifies a code path, reviewer challenges a conclusion.',
+        'Finish with the answer, cite the file and line, tool, or URL behind each claim, and label anything you could not verify.'
+    ];
+    const SUMMARIZER_GUIDELINES = ['Keep names, numbers, and conclusions.', 'Drop preamble and repetition.'];
 
-    it('serves the trusted agent registry', async () => {
-        const runtime = createRuntime();
-        const { status, body } = await jsonBody<{ agents: unknown[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness/agents')
-        );
-
-        expect(status).toBe(200);
-        // The first descriptor is exact: the profile text is catalogue data, and a
-        // picker renders it verbatim. The wire shape is UNCHANGED by the joined-prompt
-        // work — `GET /agents` still exposes the RAW `instruction` sentence and the RAW
-        // `guidelines` array, because only the runtime composition in
-        // src/agents/index.ts `agentInstruction()` joined them. Availability is NOT here
-        // — the tool declarations carry it.
-        expect(body.agents[0]).toEqual({
-            name: 'instruct',
-            title: 'Instruct',
-            description:
-                'General instruction-following agent. Answers directly and concisely with the tools it is given; every other role is available to it as a subagent.',
-            instruction: INSTRUCT_IDENTITY,
-            guidelines: INSTRUCT_GUIDELINES
-        });
-        expect((body.agents as { name: string }[]).map((agent) => agent.name)).toEqual([
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'planner',
-            'summarizer',
-            'demo',
-            'flaky'
-        ]);
-
-        // It is also part of the harness index and the boot document.
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(index.body.agents).toEqual(body.agents);
-        const bootstrap = await jsonBody<{ agents: unknown[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness')
-        );
-        expect(bootstrap.body.agents).toEqual(body.agents);
-    });
-
-    it('creates a harness, lists it, and runs a session with it', async () => {
+    it('creates a harness, lists it, and reads its definition back', async () => {
         const runtime = createRuntime();
 
-        const created = await callHandler(runtime, 'POST', '/v1/harness/harnesses', {
-            body: {
-                name: 'review',
-                title: 'Review pair',
-                description: 'Research plus a summarizer.',
-                primary: 'research',
-                subagents: ['summarizer']
-            }
-        });
-        const { status, body } = await jsonBody<{ harness: HarnessDescriptor }>(created);
-
-        expect(status).toBe(201);
-        expect(body.harness).toEqual({
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
             name: 'review',
             title: 'Review pair',
             description: 'Research plus a summarizer.',
-            requiresEndpoint: true,
+            primary: 'research',
+            subagents: ['summarizer']
+        });
+
+        expect(created.status).toBe(201);
+        expect(Object.keys(created.body.harness).sort()).toEqual(
+            [...CARD_KEY_SET, 'core_tools', 'instruction_summary'].sort()
+        );
+        expect(created.body.harness).toEqual({
+            name: 'review',
+            title: 'Review pair',
+            description: 'Research plus a summarizer.',
+            requires_endpoint: true,
             primary: 'research',
             subagents: ['summarizer'],
             agents: ['research', 'summarizer'],
-            // The keyless runtime catalogue has no callable search, so the
-            // descriptor advertises exactly the registered static toolbox.
-            tools: [
-                'syntax',
-                'read',
-                'write',
-                'edit',
-                'fileList',
-                'glob',
-                'grep',
-                'shell',
-                'gitDiff',
-                'download',
-                'timeNow',
-                'textCount',
-                'diceRoll',
-                'noteSearch',
-                'textSummarize',
-                // R9-R11: the live toolbox opts into webfetch, and the runtime
-                // catalogue carries an executable fetch entry, so a card lists and
-                // declares it even on a keyless host.
-                'fetch'
-            ],
-            coreTools: [
-                'toolRequest',
-                'task',
-                'delegate',
-                'read',
-                'write',
-                'edit',
-                'glob',
-                'grep',
-                'fetch',
-            ],
+            tools: [...TOOLBOX, 'fetch'],
             builtin: false,
-            editable: true
+            definition_revision: 1,
+            core_tools: LIVE_CORE_TOOLS,
+            instruction_summary: [
+                { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+                { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
+            ]
+        });
+        // A write response is stamped with the definition revision the hub just moved to.
+        expect(created.headers).toEqual({
+            'X-Harness-Epoch': runtime.events.epoch,
+            'X-Harness-Revision': String(created.body.harness.definition_revision)
         });
 
-        // The index now lists it after the built-ins, with the same descriptor.
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(index.body.harnesses.map((entry) => entry.name)).toEqual([
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'planner',
-            'demo',
-            'flaky',
-            'review'
-        ]);
-        expect(index.body.harnesses.at(-1)).toEqual(body.harness);
+        // The index now lists it after the built-ins, with the same card (no definition extras).
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+        expect(page.body.items.map((card: any) => card.name)).toEqual([...CARD_NAMES, 'review']);
+        expect(page.body.items.at(-1)).toEqual({
+            name: 'review',
+            title: 'Review pair',
+            description: 'Research plus a summarizer.',
+            requires_endpoint: true,
+            primary: 'research',
+            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
+            tools: [...TOOLBOX, 'fetch'],
+            builtin: false,
+            definition_revision: 1
+        });
 
-        // A session resolved by the same registry runs it; the snapshot freezes
-        // the descriptor and the seeded agents. The research primary contributes exactly
-        // ONE system message — the joined identity + guidelines prompt — and a subagent
-        // seeds nothing into the primary's transcript.
-        const session = await createSessionFor(runtime, 'review');
-        expect(session.harness).toBe('review');
-        expect(session.harnessDefinition).toEqual(body.harness);
-        expect(session.messages).toEqual([{ role: 'system', content: RESEARCH_PROMPT }]);
+        // A session resolved by the same registry freezes the definition, and its roster is the
+        // team the card selected.
+        const session = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'review' });
+        expect(session.status).toBe(201);
+        const definition = await call(runtime, 'GET', `${HARNESS_ROUTES.sessionsBySessionId(session.body.session.id)}/definition`);
+        expect(definition.body.definition.name).toBe('review');
+        expect(definition.body.definition.agents).toEqual(['research', 'summarizer']);
+        expect(definition.body.definition.core_tools).toEqual(LIVE_CORE_TOOLS);
+
+        const roster = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdAgents(session.body.session.id));
+        expect(roster.body.total).toBe(2);
+        expect(roster.body.agents.map((row: any) => [row.agent_id, row.role, row.model])).toEqual([
+            ['research', 'primary', 'demo-model'],
+            ['summarizer', 'subagent', 'demo-model']
+        ]);
+
+        // The instruction text the research primary actually runs, read from the harness definition
+        // routes: raw identity plus the trusted guidelines block, joined by the one documented rule.
+        const instruction = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.harnessesByHarnessNameInstructionsByAgentId('review', 'research')
+        );
+        expect(instruction.body.source).toBe('catalogue');
+        expect(instruction.body.instruction).toBe(RESEARCH_IDENTITY);
+        expect(instruction.body.guidelines).toEqual(RESEARCH_GUIDELINES);
+        expect(instruction.body.chars).toBe(RESEARCH_IDENTITY.length);
     });
 
     it('applies per-agent models and freezes them per session', async () => {
         const runtime = createRuntime();
 
-        const created = await callHandler(runtime, 'POST', '/v1/harness/harnesses', {
-            body: {
-                name: 'modelled',
-                primary: 'research',
-                subagents: ['summarizer'],
-                agentModels: { summarizer: 'small/fast' }
-            }
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
+            name: 'modelled',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agent_models: { summarizer: 'small/fast' }
         });
-        const { status, body } = await jsonBody<{ harness: HarnessDescriptor }>(created);
 
-        expect(status).toBe(201);
-        // The descriptor carries the OVERRIDE map: the primary is absent because it
-        // uses the session model, which is what a dropdown renders as "default".
-        expect(body.harness.agentModels).toEqual({ summarizer: 'small/fast' });
+        expect(created.status).toBe(201);
+        // The card carries the OVERRIDE map only: the primary is absent because it uses the session
+        // model, which is what a dropdown renders as "default".
+        expect(created.body.harness.agent_models).toEqual({ summarizer: 'small/fast' });
 
-        // The live factory applies the map per agent: the summarizer uses the
-        // override, the primary falls back to the session model.
-        const preset = runtime.registry.find('modelled')!;
-        const built = preset.create(
-            { baseURL: 'http://provider.test/v1', apiKey: '', model: 'demo-model' },
-            () => undefined
+        // The session resource reports the EFFECTIVE model per agent, so a reload can render every
+        // dropdown without a second read.
+        const session = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'modelled' });
+        expect(session.body.session.model).toBe('demo-model');
+        expect(session.body.session.agent_models).toEqual({
+            research: 'demo-model',
+            summarizer: 'small/fast'
+        });
+
+        // ...and the frozen copy keeps the map the card held at creation time.
+        const definition = await call(
+            runtime,
+            'GET',
+            `${HARNESS_ROUTES.sessionsBySessionId(session.body.session.id)}/definition`
         );
-        expect(built.agents.summarizer.model()).toBe('small/fast');
-        expect(built.agents.research.model()).toBe('demo-model');
+        expect(definition.body.definition.agent_models).toEqual({ summarizer: 'small/fast' });
 
-        // A session captures the map in its frozen definition, and reports the
-        // EFFECTIVE model per agent so a reload can render every dropdown.
-        const session = await createSessionFor(runtime, 'modelled');
-        expect(session.harnessDefinition?.agentModels).toEqual({ summarizer: 'small/fast' });
-        expect(session.model).toBe('demo-model');
-        expect(session.agentModels).toEqual({
-            // Omitted in the map, so it uses the session model.
+        // A stated map on PATCH REPLACES the previous one.
+        const patched = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('modelled'), {
+            agent_models: { research: 'big/model' }
+        });
+        expect(patched.status).toBe(200);
+        expect(patched.body.harness.agent_models).toEqual({ research: 'big/model' });
+
+        // The earlier session keeps what it was built with (frozen definition AND the effective
+        // per-agent models it reports).
+        expect(runtime.store.get(session.body.session.id).harnessDefinition?.agentModels).toEqual({
+            summarizer: 'small/fast'
+        });
+        expect(runtime.store.get(session.body.session.id).agentModels).toEqual({
             research: 'demo-model',
             summarizer: 'small/fast'
         });
 
-        // A stated map on PATCH replaces the previous one.
-        const patched = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/modelled', {
-            body: { agentModels: { research: 'big/model' } }
-        });
-        expect((await jsonBody<{ harness: HarnessDescriptor }>(patched)).body.harness.agentModels).toEqual({
-            research: 'big/model'
-        });
+        // An override on the primary becomes the session model, and the member the replacement map
+        // dropped falls back again.
+        const focused = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'modelled' });
+        expect(focused.body.session.model).toBe('big/model');
+        expect(focused.body.session.agent_models).toEqual({ research: 'big/model', summarizer: 'demo-model' });
 
-        // The earlier session keeps what it was built with (frozen definition AND
-        // the effective per-agent models it reports).
-        expect(runtime.store.get(session.id).harnessDefinition?.agentModels).toEqual({
-            summarizer: 'small/fast'
+        // `{}` clears every override, and the card drops the field again.
+        const cleared = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('modelled'), {
+            agent_models: {}
         });
-        expect(runtime.store.get(session.id).agentModels).toEqual({
-            research: 'demo-model',
-            summarizer: 'small/fast'
-        });
-
-        // An override on the primary shows up as the session's model, and the
-        // summarizer falls back again because the replacement map omits it.
-        const focused = await createSessionFor(runtime, 'modelled');
-        expect(focused.model).toBe('big/model');
-        expect(focused.agentModels).toEqual({ research: 'big/model', summarizer: 'demo-model' });
-
-        // `{}` clears every override, and the descriptor drops the field again.
-        const cleared = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/modelled', {
-            body: { agentModels: {} }
-        });
-        expect(
-            (await jsonBody<{ harness: HarnessDescriptor }>(cleared)).body.harness.agentModels
-        ).toBeUndefined();
+        expect(Object.hasOwn(cleared.body.harness, 'agent_models')).toBe(false);
     });
 
-    // T3 editable configuration over HTTP: the sibling of the model contract above.
-    // The evidence that matters is that the words reach the AGENT, not just the card.
-    it('applies per-agent instructions and freezes them per session', async () => {
+    it('applies per-agent instructions and answers the text that a card summary only counts', async () => {
         const runtime = createRuntime();
 
-        const created = await callHandler(runtime, 'POST', '/v1/harness/harnesses', {
-            body: {
-                name: 'voiced',
-                primary: 'research',
-                subagents: ['summarizer'],
-                agentInstructions: { summarizer: 'Condense to one line.' }
-            }
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
+            name: 'voiced',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agent_instructions: { summarizer: 'Condense to one line.' }
         });
-        const { status, body } = await jsonBody<{ harness: HarnessDescriptor }>(created);
-
-        expect(status).toBe(201);
-        // The descriptor carries the OVERRIDE map only: `research` is absent because
-        // it runs the trusted preset instruction, which is what the UI shows as the
-        // un-overridden state (and offers to revert to).
-        expect(body.harness.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
-
-        // The factory the registry stored builds the real agents with it. `instructions`
-        // is a ONE-entry array now: the joined prompt, in which the override replaced only
-        // the identity sentence — the trusted guidelines block still rides below it inside
-        // the same system message, so a saved configuration can retune a role without
-        // dropping shared policy.
-        const built = runtime.registry.find('voiced')!.create(SETTINGS, () => undefined);
-        expect(built.agents.summarizer.instructions).toEqual([
-            joinedPrompt('Condense to one line.', SUMMARIZER_GUIDELINES)
+        expect(created.status).toBe(201);
+        // The summary states WHICH member is overridden and how long its text is - never the text.
+        expect(created.body.harness.instruction_summary).toEqual([
+            { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+            { agent: 'summarizer', source: 'harness', overridden: true, chars: 21 }
         ]);
-        expect(built.agents.research.instructions).toEqual([RESEARCH_PROMPT]);
 
-        // A session records the override in its frozen definition, and the words really
-        // reach that session's prompt.
-        const session = await createSessionFor(runtime, 'voiced');
-        expect(session.harnessDefinition?.agentInstructions).toEqual({
-            summarizer: 'Condense to one line.'
+        // The route the configuration dialog reads: the stored override plus the trusted guidelines
+        // that still ride below it.
+        const text = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.harnessesByHarnessNameInstructionsByAgentId('voiced', 'summarizer')
+        );
+        expect(text.body.source).toBe('harness');
+        expect(text.body.instruction).toBe('Condense to one line.');
+        expect(text.body.guidelines).toEqual(SUMMARIZER_GUIDELINES);
+        expect(text.body.chars).toBe('Condense to one line.'.length);
+
+        // A session built with it runs the override for that member; the primary keeps its trusted
+        // profile, and the store proves the words reached the AGENT rather than only the card.
+        const session = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'voiced' });
+        const sessionId = session.body.session.id as string;
+        const agents = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdAgents(sessionId));
+        expect(agents.body.agents.map((row: any) => [row.agent_id, row.instruction_source, row.instruction_chars])).toEqual([
+            ['research', 'catalogue', joinedPrompt(RESEARCH_IDENTITY, RESEARCH_GUIDELINES).length],
+            ['summarizer', 'harness', joinedPrompt('Condense to one line.', SUMMARIZER_GUIDELINES).length]
+        ]);
+
+        const researchInstruction = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdInstruction(sessionId, 'research')
+        );
+        expect(researchInstruction.body.instruction).toBe(joinedPrompt(RESEARCH_IDENTITY, RESEARCH_GUIDELINES));
+
+        // A later PATCH cannot rewrite what that session was built with, and the replacement map is
+        // a replace: the member it drops is back on its trusted prompt.
+        const patched = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('voiced'), {
+            agent_instructions: { research: 'Ask before acting.' }
         });
-        expect(session.messages).toEqual([{ role: 'system', content: RESEARCH_PROMPT }]);
-
-        // ...and a later PATCH cannot rewrite what that session was built with.
-        const patched = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/voiced', {
-            body: { agentInstructions: { research: 'Ask before acting.' } }
-        });
-        expect(
-            (await jsonBody<{ harness: HarnessDescriptor }>(patched)).body.harness.agentInstructions
-        ).toEqual({ research: 'Ask before acting.' });
-
-        expect(runtime.store.get(session.id).harnessDefinition?.agentInstructions).toEqual({
+        expect(patched.body.harness.instruction_summary).toEqual([
+            { agent: 'research', source: 'harness', overridden: true, chars: 'Ask before acting.'.length },
+            { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
+        ]);
+        expect(runtime.store.get(sessionId).harnessDefinition?.agentInstructions).toEqual({
             summarizer: 'Condense to one line.'
         });
 
-        // A NEW session runs the new words, and the agent the replacement map dropped
-        // is back on its trusted prompt (replace, not merge).
-        const next = await createSessionFor(runtime, 'voiced');
-        expect(next.harnessDefinition?.agentInstructions).toEqual({ research: 'Ask before acting.' });
-        expect(
-            runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.research.instructions
-        ).toEqual([joinedPrompt('Ask before acting.', RESEARCH_GUIDELINES)]);
-        expect(
-            runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.summarizer.instructions
-        ).toEqual([SUMMARIZER_PROMPT]);
-        // The session snapshot carries the same single joined message, so a reload shows
-        // exactly what the model was sent.
-        expect(next.messages).toEqual([
-            { role: 'system', content: joinedPrompt('Ask before acting.', RESEARCH_GUIDELINES) }
-        ]);
+        const next = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'voiced' });
+        const nextInstruction = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdInstruction(next.body.session.id, 'research')
+        );
+        expect(nextInstruction.body.instruction).toBe(
+            joinedPrompt('Ask before acting.', RESEARCH_GUIDELINES)
+        );
 
-        // `{}` clears every override, and the descriptor drops the field again.
-        const cleared = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/voiced', {
-            body: { agentInstructions: {} }
+        // `{}` clears every override and the summary goes back to the catalogue rows.
+        const cleared = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('voiced'), {
+            agent_instructions: {}
         });
-        expect(
-            (await jsonBody<{ harness: HarnessDescriptor }>(cleared)).body.harness.agentInstructions
-        ).toBeUndefined();
+        expect(cleared.body.harness.instruction_summary).toEqual([
+            { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+            { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
+        ]);
     });
 
-    it('validates per-agent instructions: members only, bounded non-empty text', async () => {
+    it('validates create requests: one primary, trusted agents, no client prompt', async () => {
         const runtime = createRuntime();
+        const post = (body: unknown) => call(runtime, 'POST', HARNESS_ROUTES.harnesses(), body);
 
-        const post = async (body: unknown) =>
-            jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, 'POST', '/v1/harness/harnesses', { body })
-            );
-
-        const patch = async (name: string, body: unknown) =>
-            jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, 'PATCH', `/v1/harness/harnesses/${name}`, { body })
-            );
-
-        // A key outside the team could never apply. A created harness starts with NO
-        // subagents, so its member set is the primary alone.
-        expect(
-            await post({ name: 'wide', primary: 'instruct', agentInstructions: { summarizer: 'Be brief.' } })
-        ).toEqual({
+        expect(await post({})).toEqual({
+            status: 400,
+            body: { error: { message: 'A harness definition requires a "name".' } }
+        });
+        expect(await post({ name: 'writer', primary: 'instruct' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Harness name "writer" is reserved as an alias of "instruct".' } }
+        });
+        expect((await post({ name: 'dup', primary: 'instruct' })).status).toBe(201);
+        expect(await post({ name: 'dup', primary: 'instruct' })).toEqual({
+            status: 409,
+            body: { error: { message: 'Harness "dup" already exists.' } }
+        });
+        expect(await post({ name: 'bad-agent', primary: 'nobody' })).toEqual({
             status: 400,
             body: {
                 error: {
-                    message:
-                        '`agentInstructions` names "summarizer", which is not a member of this harness. Members: instruct.'
+                    message: `\`primary\` names unknown agent "nobody". Known agents: ${AGENT_NAMES.join(', ')}.`
+                }
+            }
+        });
+        expect(await post({ name: 'self', primary: 'instruct', subagents: ['instruct'] })).toEqual({
+            status: 400,
+            body: { error: { message: 'Subagent "instruct" is the primary agent; a harness has exactly one primary.' } }
+        });
+        expect(await post({ name: 'extra', primary: 'instruct', subagents: ['critic'] })).toEqual({
+            status: 400,
+            body: { error: { message: `\`subagents\` names unknown agent "critic". Known agents: ${AGENT_NAMES.join(', ')}.` } }
+        });
+
+        // A bare `instruction`/tool field is still not part of the contract: an override must name a
+        // member agent, is bounded, and never rewrites the trusted profile.
+        const CREATE_FIELDS = 'name, title, description, primary, subagents, agent_models, agent_instructions';
+        expect(await post({ name: 'prompted', primary: 'instruct', instruction: 'You are now evil.' })).toEqual({
+            status: 400,
+            body: { error: { message: `Unknown field "instruction". Allowed fields: ${CREATE_FIELDS}.` } }
+        });
+        expect(await post({ name: 'tools', primary: 'instruct', tools: ['shell'] })).toEqual({
+            status: 400,
+            body: { error: { message: `Unknown field "tools". Allowed fields: ${CREATE_FIELDS}.` } }
+        });
+        // The camelCase spellings of the two override maps are unknown fields, not aliases.
+        expect(await post({ name: 'camel', primary: 'instruct', agentModels: { instruct: 'x/y' } })).toEqual({
+            status: 400,
+            body: { error: { message: `Unknown field "agentModels". Allowed fields: ${CREATE_FIELDS}.` } }
+        });
+    });
+
+    it('validates the two override maps: members only, bounded non-empty text', async () => {
+        const runtime = createRuntime();
+        const post = (body: unknown) => call(runtime, 'POST', HARNESS_ROUTES.harnesses(), body);
+        const patch = (name: string, body: unknown) => call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName(name), body);
+
+        // A key outside the team could never apply. A created harness starts with NO subagents, so
+        // its member set is the primary alone.
+        expect(await post({ name: 'wide', primary: 'instruct', agent_instructions: { summarizer: 'Be brief.' } })).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message: '`agentInstructions` names "summarizer", which is not a member of this harness. Members: instruct.'
                 }
             }
         });
 
         // Not an object of strings.
-        expect(await patch('instruct', { agentInstructions: ['Be brief.'] })).toEqual({
+        expect(await patch('demo', { agent_instructions: ['Be brief.'] })).toEqual({
             status: 400,
             body: {
-                error: {
-                    message: '`agentInstructions` must be an object mapping agent ids to instruction text.'
-                }
+                error: { message: '`agentInstructions` must be an object mapping agent ids to instruction text.' }
             }
         });
 
-        // Blank text is a visible mistake: clearing an override is omitting the key
-        // (or sending `{}`), never storing an empty prompt.
-        expect(await patch('instruct', { agentInstructions: { instruct: '   ' } })).toEqual({
+        // Blank text is a visible mistake: clearing an override is omitting the key (or sending
+        // `{}`), never storing an empty prompt.
+        expect(await patch('demo', { agent_instructions: { demo: '   ' } })).toEqual({
             status: 400,
             body: {
                 error: {
-                    message:
-                        '`agentInstructions.instruct` cannot be empty. Omit the key to run the trusted instruction.'
+                    message: '`agentInstructions.demo` cannot be empty. Omit the key to run the trusted instruction.'
                 }
             }
         });
-
-        expect(await patch('instruct', { agentInstructions: { instruct: 'a'.repeat(8_001) } })).toEqual({
+        expect(await patch('demo', { agent_instructions: { demo: 'a'.repeat(8_001) } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentInstructions.instruct` cannot exceed 8000 characters.' } }
+            body: { error: { message: '`agentInstructions.demo` cannot exceed 8000 characters.' } }
         });
-
-        expect(await patch('instruct', { agentInstructions: { instruct: 'bad\u0000model' } })).toEqual({
+        expect(await patch('demo', { agent_instructions: { demo: 'bad\u0000model' } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentInstructions.instruct` contains control characters.' } }
+            body: { error: { message: '`agentInstructions.demo` contains control characters.' } }
         });
 
-        // Multi-line prose is legitimate prompt text and is accepted (a model id, by
-        // contrast, rejects a newline).
-        const accepted = await patch('instruct', {
-            agentInstructions: { instruct: 'Lead with the answer.\nThen cite the file.' }
-        });
-        expect((accepted.body as { harness: HarnessDescriptor }).harness.agentInstructions).toEqual({
-            instruct: 'Lead with the answer.\nThen cite the file.'
-        });
-    });
+        // Multi-line prose IS legitimate prompt text (a model id, by contrast, rejects a newline).
+        const accepted = await patch('demo', { agent_instructions: { demo: 'Lead with the answer.\nThen cite the file.' } });
+        expect(accepted.status).toBe(200);
+        expect(accepted.body.harness.instruction_summary).toEqual([
+            { agent: 'demo', source: 'harness', overridden: true, chars: 'Lead with the answer.\nThen cite the file.'.length }
+        ]);
 
-    it('validates per-agent models: members only, bounded non-empty ids', async () => {
-        const runtime = createRuntime();
-
-        const post = async (body: unknown) =>
-            jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, 'POST', '/v1/harness/harnesses', { body })
-            );
-
-        // A key that is not a selected member is rejected with the member list.
-        // A created harness starts with NO subagents, so its member set is the
-        // primary alone; `demo` is a known agent but never a member here.
-        expect(
-            await post({ name: 'model-x', primary: 'instruct', agentModels: { demo: 'small/fast' } })
-        ).toEqual({
+        // Models: members only, an object of strings, bounded non-empty ids - naming the agent.
+        expect(await post({ name: 'model-x', primary: 'instruct', agent_models: { demo: 'small/fast' } })).toEqual({
             status: 400,
-            body: {
-                error: {
-                    message:
-                        '`agentModels` names "demo", which is not a member of this harness. Members: instruct.'
-                }
-            }
+            body: { error: { message: '`agentModels` names "demo", which is not a member of this harness. Members: instruct.' } }
         });
-
-        // Not an object of strings.
-        expect(await post({ name: 'model-y', primary: 'instruct', agentModels: ['small/fast'] })).toEqual({
+        expect(await post({ name: 'model-y', primary: 'instruct', agent_models: ['small/fast'] })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels` must be an object mapping agent ids to model ids.' } }
         });
-
-        // Blank and over-long ids are rejected, naming the agent.
-        expect(await post({ name: 'model-z', primary: 'instruct', agentModels: { instruct: '  ' } })).toEqual({
+        expect(await post({ name: 'model-z', primary: 'instruct', agent_models: { instruct: '  ' } })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels.instruct` cannot be empty.' } }
         });
-        expect(
-            await post({ name: 'model-w', primary: 'instruct', agentModels: { instruct: 'a'.repeat(201) } })
-        ).toEqual({
+        expect(await post({ name: 'model-w', primary: 'instruct', agent_models: { instruct: 'a'.repeat(201) } })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels.instruct` cannot exceed 200 characters.' } }
         });
 
-        // The same validation applies on PATCH, against the final member set.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/instruct', {
-                    body: { agentModels: { demo: 'small/fast' } }
-                })
-            )
-        ).toEqual({
+        // The same validation applies on PATCH, against the FINAL member set.
+        expect(await patch('instruct', { agent_models: { demo: 'small/fast' } })).toEqual({
             status: 400,
             body: {
                 error: {
@@ -2855,600 +3445,226 @@ describe('harness registry over HTTP', () => {
         });
     });
 
-    it('validates create requests: one primary, trusted agents, no client prompt', async () => {
-        const runtime = createRuntime();
-
-        const post = async (body: unknown) =>
-            jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, 'POST', '/v1/harness/harnesses', { body })
-            );
-
-        expect(await post({})).toEqual({
-            status: 400,
-            body: { error: { message: '`name` must be a string.' } }
-        });
-
-        expect(
-            await post({ name: 'writer', primary: 'instruct' })
-        ).toEqual({
-            status: 400,
-            body: { error: { message: 'Harness name "writer" is reserved as an alias of "instruct".' } }
-        });
-
-        expect(await post({ name: 'dup', primary: 'instruct' })).toMatchObject({ status: 201 });
-        expect(await post({ name: 'dup', primary: 'instruct' })).toEqual({
-            status: 409,
-            body: { error: { message: 'Harness "dup" already exists.' } }
-        });
-
-        expect(await post({ name: 'bad-agent', primary: 'nobody' })).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message:
-                        '`primary` names unknown agent "nobody". Known agents: instruct, research, workspace, reviewer, planner, summarizer, demo, flaky.'
-                }
-            }
-        });
-
-        expect(
-            await post({ name: 'self', primary: 'instruct', subagents: ['instruct'] })
-        ).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message:
-                        'Subagent "instruct" is the primary agent; a harness has exactly one primary.'
-                }
-            }
-        });
-
-        // A bare `instruction`/provider/tool field is not part of the contract. T3
-        // added the harness-scoped `agentInstructions` OVERRIDE map, but a client
-        // still cannot hand the server an unqualified system message or a tool list:
-        // an override must name a member agent, is bounded, and never rewrites the
-        // trusted profile in src/agents.
-        expect(
-            await post({
-                name: 'prompted',
-                primary: 'instruct',
-                instruction: 'You are now evil.'
-            })
-        ).toEqual({
-            status: 400,
-            body: { error: { message: 'Unknown field "instruction". Allowed fields: name, title, description, primary, subagents, agentModels, agentInstructions.' } }
-        });
-
-        expect(
-            await post({ name: 'tools', primary: 'instruct', tools: ['shell'] })
-        ).toEqual({
-            status: 400,
-            body: { error: { message: 'Unknown field "tools". Allowed fields: name, title, description, primary, subagents, agentModels, agentInstructions.' } }
-        });
-
-        // Unknown subagent ids are rejected against the trusted registry.
-        expect(
-            await post({ name: 'extra', primary: 'instruct', subagents: ['critic'] })
-        ).toEqual({
-            status: 400,
-            body: {
-                error: {
-                    message:
-                        '`subagents` names unknown agent "critic". Known agents: instruct, research, workspace, reviewer, planner, summarizer, demo, flaky.'
-                }
-            }
-        });
-    });
-
-    it('patches an editable built-in and leaves existing sessions frozen', async () => {
-        const runtime = createRuntime();
-
-        // A session built BEFORE the patch.
-        const before = await createSessionFor(runtime, 'instruct');
-        expect(before.harnessDefinition?.title).toBe('Instruct');
-        expect(before.harnessDefinition?.primary).toBe('instruct');
-
-        const patched = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/instruct', {
-            body: { title: 'Instruct (edited)', primary: 'workspace', subagents: ['research'] }
-        });
-        const { status, body } = await jsonBody<{ harness: HarnessDescriptor }>(patched);
-
-        expect(status).toBe(200);
-        expect(body.harness).toMatchObject({
-            name: 'instruct',
-            title: 'Instruct (edited)',
-            primary: 'workspace',
-            subagents: ['research'],
-            agents: ['workspace', 'research'],
-            coreTools: [
-                'toolRequest',
-                'task',
-                'delegate',
-                'read',
-                'write',
-                'edit',
-                'glob',
-                'grep',
-                'fetch',
-            ],
-            builtin: true,
-            editable: true
-        });
-
-        // The existing session still reports (and runs) the captured definition: the ONE
-        // joined prompt the instruct profile seeds.
-        expect(runtime.store.get(before.id).harnessDefinition).toEqual(before.harnessDefinition);
-        expect(runtime.store.get(before.id).messages).toEqual([
-            { role: 'system', content: INSTRUCT_PROMPT }
-        ]);
-
-        // A session created after the patch sees the new configuration, so its single
-        // system message is now the workspace ("Coder") profile's joined prompt.
-        const after = await createSessionFor(runtime, 'instruct');
-        expect(after.harnessDefinition).toEqual(body.harness);
-        expect(after.messages).toEqual([{ role: 'system', content: WORKSPACE_PROMPT }]);
-    });
-
-    // T12: the read the browser's configuration dialog depends on. A compiled `/views`
-    // frame deliberately OMITS `agentInstructions` (../server/sessions.ts
-    // `viewDescriptorOf`, ./protocol.ts:655-663), so `GET /harnesses/:name` is the only
-    // place the stored per-agent instruction text is answerable, and it must agree with
-    // the index and with PATCH byte for byte.
-    it('reads one harness definition, including the instruction map the views omit', async () => {
-        const runtime = createRuntime();
-
-        const patched = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/instruct', {
-                body: { agentInstructions: { instruct: 'Stored override the dialog edits.' } }
-            })
-        );
-        expect(patched.status).toBe(200);
-
-        const read = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'GET', '/v1/harness/harnesses/instruct')
-        );
-
-        // Same `{ harness }` envelope as PATCH/DELETE, and the identical projection the
-        // index lists for this card.
-        expect(read.status).toBe(200);
-        expect(read.body.harness).toEqual(patched.body.harness);
-
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(read.body.harness).toEqual(index.body.harnesses.find((entry) => entry.name === 'instruct'));
-
-        // The field the route exists for, plus the rest of the card unchanged.
-        expect(read.body.harness.agentInstructions).toEqual({ instruct: 'Stored override the dialog edits.' });
-        expect(read.body.harness).toMatchObject({ name: 'instruct', primary: 'instruct', builtin: true });
-
-        // A card that overrides nothing omits the key, exactly like `agentModels` does,
-        // so every pre-T3 response shape survives.
-        const plain = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'GET', '/v1/harness/harnesses/demo')
-        );
-        expect(plain.status).toBe(200);
-        expect(Object.hasOwn(plain.body.harness, 'agentInstructions')).toBe(false);
-
-        // An unknown name is the registry's own 404 wording, like PATCH's.
-        expect(await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/harnesses/ghost'))).toEqual({
-            status: 404,
-            body: { error: { message: 'Unknown harness "ghost".' } }
-        });
-
-        // Reads resolve a LEGACY ALIAS to the card it redirects to (the same read
-        // semantics as session creation), and the answer names the canonical card.
-        const alias = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'GET', '/v1/harness/harnesses/writer')
-        );
-        expect(alias.status).toBe(200);
-        expect(alias.body.harness.name).toBe('instruct');
-
-        // `/presets` stays an INDEX alias: the one-card read is mounted on the canonical
-        // name only, so there is no second surface with different rules.
-        expect(await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/presets/instruct'))).toEqual({
-            status: 404,
-            body: { error: { message: 'Unknown API route: GET /v1/harness/presets/instruct' } }
-        });
-    });
-
     it('patches every template (no read-only category) and keeps invalid patches rejected', async () => {
         const runtime = createRuntime();
 
-        const patch = async (name: string, body: unknown) =>
-            jsonBody<{ harness?: HarnessDescriptor; error?: { message: string } }>(
-                await callHandler(runtime, 'PATCH', `/v1/harness/harnesses/${name}`, { body })
-            );
+        // R20.1: a metadata-only PATCH is a 200 for EVERY shipped template (the formerly frozen
+        // demo/flaky included). `editable` no longer exists: the definition revision is the fact a
+        // client acts on, and it moves with every accepted write.
+        for (const name of CARD_NAMES) {
+            const result = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName(name), {
+                title: `${name} patched`
+            });
 
-        // R20.1: a metadata-only PATCH is a 200 for EVERY shipped template (the
-        // formerly frozen demo/flaky included), and the wire field stays true.
-        for (const name of PRESET_NAMES) {
-            const result = await patch(name, { title: `${name} patched` });
             expect(result.status).toBe(200);
-            expect(result.body.harness?.title).toBe(`${name} patched`);
-            expect(result.body.harness?.editable).toBe(true);
+            expect(result.body.harness.title).toBe(`${name} patched`);
+            expect(result.body.harness.definition_revision).toBe(1);
+            expect(Object.hasOwn(result.body.harness, 'editable')).toBe(false);
         }
 
-        // An unknown harness is still a 404, not a permission question.
-        expect(await patch('missing', { title: 'Nope' })).toEqual({
+        // A metadata-only write did NOT make the offline fixture live.
+        const demo = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('demo'));
+        expect(demo.body.harness.requires_endpoint).toBe(false);
+        expect(demo.body.harness.tools).toEqual(['timeNow']);
+
+        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('missing'), { title: 'Nope' })).toEqual({
             status: 404,
             body: { error: { message: 'Unknown harness "missing".' } }
         });
 
-        expect(await patch('instruct', {})).toEqual({
+        const PATCH_FIELDS = 'title, description, primary, subagents, agent_models, agent_instructions';
+        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('instruct'), {})).toEqual({
             status: 400,
-            body: {
-                error: {
-                    message:
-                        'A patch must change at least one of: title, description, primary, subagents, agentModels, agentInstructions.'
-                }
-            }
+            body: { error: { message: `A patch must change at least one field.` } }
+        });
+        // `name` is immutable, and a client still cannot smuggle a BARE instruction.
+        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('instruct'), { name: 'renamed' })).toEqual({
+            status: 400,
+            body: { error: { message: `Unknown field "name". Allowed fields: ${PATCH_FIELDS}.` } }
+        });
+        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('instruct'), { instruction: 'x' })).toEqual({
+            status: 400,
+            body: { error: { message: `Unknown field "instruction". Allowed fields: ${PATCH_FIELDS}.` } }
         });
 
-        // `name` is immutable, and a client still cannot smuggle a BARE instruction:
-        // the only writable text field is the per-member `agentInstructions` map.
-        expect(await patch('instruct', { name: 'renamed' })).toEqual({
-            status: 400,
-            body: { error: { message: 'Unknown field "name". Allowed fields: title, description, primary, subagents, agentModels, agentInstructions.' } }
+        // Only the declared verbs are mounted on an identified definition.
+        expect(await call(runtime, 'PUT', HARNESS_ROUTES.harnessesByHarnessName('instruct'))).toEqual({
+            status: 405,
+            body: { error: { message: 'Use GET, PATCH, DELETE for /v1/harness/harnesses/instruct.' } }
         });
-        expect(await patch('instruct', { instruction: 'x' })).toEqual({
-            status: 400,
-            body: { error: { message: 'Unknown field "instruction". Allowed fields: title, description, primary, subagents, agentModels, agentInstructions.' } }
-        });
-
-        // Writes are only on the canonical mount: /presets stays a read-only alias.
-        const aliasWrite = await jsonBody<{ error: { message: string } }>(
-            await callHandler(runtime, 'POST', '/v1/harness/presets', {
-                body: { name: 'x', primary: 'instruct' }
-            })
-        );
-        expect(aliasWrite).toEqual({ status: 405, body: { error: { message: 'Use GET for /v1/harness/presets.' } } });
     });
 
     it('keeps demo scripted through metadata edits and makes an executable edit live', async () => {
         const runtime = createRuntime();
 
-        // A session created from the shipped template is scripted and requires no
-        // endpoint; its frozen definition says so.
+        // A session created from the shipped template is scripted and requires no endpoint.
         const scripted = await createDemo(runtime);
-        expect(scripted.harnessDefinition).toMatchObject({
-            requiresEndpoint: false,
-            tools: ['timeNow'],
-            editable: true
+        const before = await call(runtime, 'GET', `${HARNESS_ROUTES.sessionsBySessionId(scripted.id)}/definition`);
+        expect(before.body.definition.requires_endpoint).toBe(false);
+        expect(before.body.definition.tools).toEqual(['timeNow']);
+
+        // Executable PATCH: demo becomes an honest live profiled harness, so the descriptor stops
+        // advertising the offline script.
+        const live = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('demo'), {
+            primary: 'workspace'
         });
-
-        // Metadata-only PATCH: 200, and the descriptor still describes the script.
-        const renamed = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/demo', {
-                body: { title: 'Scripted demo (renamed)', description: 'Still the offline fixture.' }
-            })
-        );
-        expect(renamed.status).toBe(200);
-        expect(renamed.body.harness).toMatchObject({
-            name: 'demo',
-            title: 'Scripted demo (renamed)',
-            description: 'Still the offline fixture.',
-            requiresEndpoint: false,
-            tools: ['timeNow'],
-            builtin: true,
-            editable: true
-        });
-
-        // The already-created session keeps the shipped frozen definition.
-        expect(runtime.store.get(scripted.id).harnessDefinition?.title).toBe('Scripted demo');
-
-        // Executable PATCH: demo becomes an honest live profiled harness. The
-        // descriptor must stop advertising the offline script.
-        const live = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/demo', {
-                body: { primary: 'workspace' }
-            })
-        );
         expect(live.status).toBe(200);
         expect(live.body.harness).toMatchObject({
             name: 'demo',
-            title: 'Scripted demo (renamed)',
-            requiresEndpoint: true,
+            requires_endpoint: true,
             primary: 'workspace',
             subagents: [],
             agents: ['workspace'],
-            builtin: true,
-            editable: true
+            builtin: true
         });
-        // The upgrade replaces the script with the live toolbox, so the card now
-        // registers the shared toolbox PLUS the environment rows it can run: fetch
-        // (native, no credential) always, search only with a key (R9-R11).
-        expect(live.body.harness.tools).toEqual([
-            'syntax',
-            'read',
-            'write',
-            'edit',
-            'fileList',
-            'glob',
-            'grep',
-            'shell',
-            'gitDiff',
-            'download',
-            'timeNow',
-            'textCount',
-            'diceRoll',
-            'noteSearch',
-            'textSummarize',
-            'fetch'
-        ]);
-        expect(live.body.harness.coreTools).toEqual([
-            'toolRequest',
-            'task',
-            'read',
-            'write',
-            'edit',
-            'glob',
-            'grep',
-            'fetch',
-        ]);
+        // The upgrade replaces the script with the live toolbox plus the environment rows this
+        // keyless host can run: `fetch` (native, no credential) always, `search` only with a key.
+        expect(live.body.harness.tools).toEqual([...TOOLBOX, 'fetch']);
+        // No subagents, so no `delegate` in the declared core - the same rule a card and a frozen
+        // session both follow, so they cannot disagree.
+        expect(live.body.harness.core_tools).toEqual(['toolRequest', 'task', 'read', 'write', 'edit', 'glob', 'grep', 'fetch']);
 
-        // A NEW session runs the live agent configuration with the shared toolbox, so its
-        // one system message is the workspace ("Coder") profile's joined prompt.
-        const after = await createSessionFor(runtime, 'demo');
-        expect(after.harnessDefinition).toEqual(live.body.harness);
-        expect(after.messages).toEqual([{ role: 'system', content: WORKSPACE_PROMPT }]);
-
-        // The old scripted session is untouched: its definition and prompt stay.
-        expect(runtime.store.get(scripted.id).harnessDefinition).toEqual(scripted.harnessDefinition);
-        expect(runtime.store.get(scripted.id).messages).toEqual([
-            { role: 'system', content: DEMO_PROMPT }
-        ]);
-    });
-
-    it('keeps flaky extras through metadata edits and on an executable edit', async () => {
-        const runtime = createRuntime();
-
-        const renamed = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/flaky', {
-                body: { description: 'Still the failure example.' }
-            })
+        // A NEW session runs the live configuration; the scripted session keeps what it was built
+        // with, and is still runnable offline.
+        const after = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' });
+        const afterDefinition = await call(
+            runtime,
+            'GET',
+            `${HARNESS_ROUTES.sessionsBySessionId(after.body.session.id)}/definition`
         );
-        expect(renamed.status).toBe(200);
-        expect(renamed.body.harness.tools).toEqual([
-            'syntax',
-            'read',
-            'write',
-            'edit',
-            'fileList',
-            'glob',
-            'grep',
-            'shell',
-            'gitDiff',
-            'download',
-            'timeNow',
-            'textCount',
-            'diceRoll',
-            'noteSearch',
-            'textSummarize',
-            'testFlaky',
-            // R9-R11: flaky builds its toolbox through createToolboxHarness too. This
-            // runtime is keyless, so only fetch (native, no credential) registers.
-            'fetch'
-        ]);
+        expect(afterDefinition.body.definition.primary).toBe('workspace');
+        expect(afterDefinition.body.definition.requires_endpoint).toBe(true);
 
-        const live = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/flaky', {
-                body: { primary: 'workspace' }
-            })
-        );
-        expect(live.status).toBe(200);
-        expect(live.body.harness).toMatchObject({
-            name: 'flaky',
-            requiresEndpoint: true,
-            primary: 'workspace',
-            agents: ['workspace'],
-            editable: true
-        });
-        // The executable rebuild retains the example-only extra.
-        expect(live.body.harness.tools).toContain('testFlaky');
+        // The scripted session is untouched: its frozen copy still describes the offline script,
+        // while the CARD moved (the wire projection and the stored copy are different shapes, so the
+        // facts are compared field by field against the store oracle).
+        const frozen = runtime.store.get(scripted.id).harnessDefinition;
+        expect(frozen?.name).toBe('demo');
+        expect(frozen?.requiresEndpoint).toBe(false);
+        expect(frozen?.tools).toEqual(['timeNow']);
     });
 });
 
-// T5: the remove action the UI calls. `DELETE /harnesses/:name` takes any harness out
-// of the catalogue — a shipped default exactly like a user-created one — and the
-// response is the minimal `{ deleted: true }` (the authoritative record is the
-// database, not a second copy of the harness). An unknown name and a repeat delete are
-// both 404, and a durability failure answers 500 WITHOUT having deleted anything.
+// `DELETE /harnesses/{name}` takes any harness out of the catalogue - a shipped default exactly
+// like a user-created one - and answers the minimal delete receipt. The authoritative record is the
+// database, not a second copy of the harness.
 describe('deleting a harness over HTTP', () => {
-    it('ships only the real production presets over HTTP (T5)', async () => {
-        // No injected registry: exactly what `startHarnessServer` and the discovered
-        // service route build. The catalogue a user sees must contain no scripted
-        // card and no card that fails on purpose.
-        stubEmptySearchKeys();
-        const runtime = createHarnessRuntime({
-            settings: SETTINGS,
-            defaults: DEFAULTS,
-            loadEnvironment: false
-        });
-
-        const PRODUCTION_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner'];
-
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRODUCTION_NAMES);
-
-        // Every shipped card is a live configuration: it needs the provider and it
-        // carries the shared toolbox, so nothing here can only answer from a script.
-        expect(index.body.harnesses.map((harness) => harness.requiresEndpoint)).toEqual([
-            true,
-            true,
-            true,
-            true,
-            true
-        ]);
-        expect(index.body.harnesses.every((harness) => harness.tools.includes('testFlaky'))).toBe(false);
-
-        // The boot document and the `/presets` alias carry the same list.
-        const bootstrap = await jsonBody<{ presets: { name: string }[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness')
-        );
-        expect(bootstrap.body.presets.map((harness) => harness.name)).toEqual(PRODUCTION_NAMES);
-
-        const alias = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/presets'));
-        expect(alias.body.harnesses.map((harness) => harness.name)).toEqual(PRODUCTION_NAMES);
-
-        // The fixtures are not runnable by accident: the offline demo is a preset this
-        // build ships, but not a catalogue entry, so a session on it is a 404.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'demo' } })
-            )
-        ).toEqual({
-            status: 404,
-            body: { error: { message: 'Unknown harness "demo".' } }
-        });
-    });
-
     it('deletes a user harness and drops it from every listing', async () => {
         const runtime = createRuntime();
 
-        const created = await jsonBody<{ harness: HarnessDescriptor }>(
-            await callHandler(runtime, 'POST', '/v1/harness/harnesses', {
-                body: { name: 'temporary', primary: 'instruct' }
-            })
-        );
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), { name: 'temporary', primary: 'instruct' });
         expect(created.status).toBe(201);
 
-        const removed = await jsonBody<DeleteHarnessResult>(
-            await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/temporary')
-        );
-        // The exact frontend contract: 200 with one field.
-        expect(removed).toEqual({ status: 200, body: { deleted: true } });
+        const removed = await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('temporary'));
 
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
+        // The exact frontend contract: 200 with the identity, and the durability truth stated.
+        expect(removed).toEqual({
+            status: 200,
+            body: { deleted: true, harness_name: 'temporary', tombstoned: false, restored_by_restart: false }
+        });
 
-        // A new session cannot reach it any more.
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'temporary' } })
-            )
-        ).toEqual({
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+        expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
+
+        // A new session cannot reach it any more, and a repeat delete removed nothing, so it is not
+        // reported as a success.
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'temporary' })).toEqual({
             status: 404,
             body: { error: { message: 'Unknown harness "temporary".' } }
         });
-
-        // A repeat delete removed nothing, so it is not reported as a success.
-        expect(
-            await jsonBody(await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/temporary'))
-        ).toEqual({
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('temporary'))).toEqual({
             status: 404,
             body: { error: { message: 'Unknown harness "temporary".' } }
         });
     });
 
-    it('deletes a shipped built-in and leaves the conversation that used it', async () => {
+    it('tombstones a shipped built-in and leaves the conversation that used it', async () => {
         const runtime = createRuntime();
+        const call_ = canonicalCall(runtime);
 
-        // A real recorded conversation on the shipped fixture, created first.
+        // A real recorded conversation on the shipped fixture, created FIRST.
         const session = await createDemo(runtime);
-        const firstFrames = await streamItems(
-            await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-                body: { input: 'What time is it?' }
-            })
-        );
-        const firstTerminal = firstFrames.at(-1);
-        expect(firstTerminal?.type).toBe('snapshot');
-        if (firstTerminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot frame');
-        expect(firstTerminal.session.turns.map((turn) => turn.status)).toEqual(['done']);
+        const receipt = await submitTask(call_, session.id, { input: 'What time is it?' });
+        await waitForTurnStatus(call_, session.id, receipt.turn_id, ['done']);
 
-        const removed = await jsonBody<DeleteHarnessResult>(
-            await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/demo')
-        );
-        expect(removed).toEqual({ status: 200, body: { deleted: true } });
+        const removed = await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'));
+        // An in-memory deployment has no database to record the removal in, so the receipt says the
+        // built-in WOULD come back on restart - honestly, rather than claiming durability.
+        expect(removed).toEqual({
+            status: 200,
+            body: { deleted: true, harness_name: 'demo', tombstoned: true, restored_by_restart: false }
+        });
 
-        // Gone from the catalogue, exactly like a user harness.
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(
-            PRESET_NAMES.filter((name) => name !== 'demo')
-        );
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+        expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES.filter((name) => name !== 'demo'));
 
         // A NEW session on the deleted card is a 404 ...
-        expect(
-            await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'demo' } })
-            )
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown harness "demo".' } } });
-
-        // ... while the existing conversation is untouched: it still lists, still
-        // reports the harness it captured, and its turns are intact.
-        const listed = await jsonBody<{ sessions: { id: string; harness: string }[] }>(
-            await callHandler(runtime, 'GET', '/v1/harness/sessions')
-        );
-        expect(listed.body.sessions.map((entry) => entry.id)).toEqual([session.id]);
-
-        const after = await jsonBody<{ session: SessionSnapshot }>(
-            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
-        );
-        expect(after.status).toBe(200);
-        expect(after.body.session.harness).toBe('demo');
-        expect(after.body.session.harnessDefinition?.title).toBe('Scripted demo');
-        expect(after.body.session.turns.map((turn) => turn.prompt)).toEqual(['What time is it?']);
-        expect(after.body.session.turns.map((turn) => turn.status)).toEqual(['done']);
-
-        // The live session is still usable: its frozen harness runs the next turn,
-        // offline, exactly as before the deletion.
-        const streamed = await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-            body: { input: 'And again?' }
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "demo".' } }
         });
-        expect(streamed.status).toBe(200);
-        const frames = await streamItems(streamed);
-        const terminal = frames.at(-1);
-        expect(terminal?.type).toBe('snapshot');
-        if (terminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot frame');
-        expect(terminal.session.harness).toBe('demo');
-        expect(terminal.session.turns.map((turn) => turn.prompt)).toEqual(['What time is it?', 'And again?']);
-        expect(terminal.session.turns.map((turn) => turn.status)).toEqual(['done', 'done']);
+
+        // ... while the existing conversation is untouched: it still lists, still reports the
+        // harness it captured, and its turns are intact.
+        const listed = await readOk<Record<string, any>>(call_, 'GET', HARNESS_ROUTES.sessions(), 200);
+        expect(listed.items.map((row: any) => row.id)).toEqual([session.id]);
+
+        const after = await readOk<{ session: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionId(session.id),
+            200
+        );
+        expect(after.session.harness).toBe('demo');
+        expect(after.session.turn_count).toBe(1);
+
+        const definition = await readOk<{ definition: Record<string, any> }>(
+            call_,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdDefinition(session.id),
+            200
+        );
+        expect(definition.definition.name).toBe('demo');
+        expect(definition.definition.title).toBe('Scripted demo');
+
+        const turns = await listTurns(call_, session.id);
+        expect(turns.items.map((row: any) => [row.promptPreview, row.status])).toEqual([['What time is it?', 'done']]);
+
+        // The live session is still usable: its frozen harness runs the next turn, offline, exactly
+        // as before the deletion. (The old version of this assertion read the SSE frames.)
+        const next = await submitTask(call_, session.id, { input: 'And again?' });
+        const settled = await waitForTurnStatus(call_, session.id, next.turn_id, ['done']);
+        expect(settled.status).toBe('done');
+
+        const history = await listTurns(call_, session.id);
+        expect(history.items.map((row: any) => row.promptPreview)).toEqual(['What time is it?', 'And again?']);
     });
 
     it('refuses to delete through a legacy alias, which is not an identity', async () => {
         const runtime = createRuntime();
 
-        expect(
-            await jsonBody(await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/writer'))
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown harness "writer".' } } });
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('writer'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "writer".' } }
+        });
 
         // The target survived the attempt.
-        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+        expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
     });
 
-    it('answers 405 naming every accepted method, and keeps the alias mount read-only', async () => {
-        const runtime = createRuntime();
-
-        // GET is a mounted read now (T12), so only an unsupported verb is refused, and
-        // the message names all three accepted methods (GET/PATCH/DELETE).
-        expect(
-            await jsonBody(await callHandler(runtime, 'PUT', '/v1/harness/harnesses/instruct'))
-        ).toEqual({
-            status: 405,
-            body: { error: { message: 'Use GET, PATCH or DELETE for /v1/harness/harnesses/:name.' } }
-        });
-        expect((await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/harnesses/instruct'))).status).toBe(200);
-
-        // `/presets` stays a read-only alias: only the canonical mount mutates, so
-        // there is no second surface that could delete a harness.
-        expect(
-            await jsonBody(await callHandler(runtime, 'DELETE', '/v1/harness/presets/instruct'))
-        ).toEqual({
-            status: 404,
-            body: { error: { message: 'Unknown API route: DELETE /v1/harness/presets/instruct' } }
-        });
-    });
-
-    it('answers 500 without deleting anything when the durable write fails', async () => {
+    it('answers 500 when the durable write fails', async () => {
+        // The database directory cannot be created: its parent is a plain file, so the store's own
+        // write fails for a real reason (no mock).
         const root = await createFixture('harness-delete-blocked-');
+        const blocker = join(root, 'blocked');
 
         try {
-            // The database directory cannot be created: its parent is a plain file, so
-            // the store's own write fails for a real reason (no mock).
-            await writeTextFile(join(root, 'blocked'), 'not a directory', 'utf8');
+            await writeTextFile(blocker, 'not a directory', 'utf8');
 
             const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
             const store = new SessionStore(SETTINGS, registry, undefined, {
-                persistence: new HarnessPersistence(join(root, 'blocked', 'nested'))
+                persistence: new HarnessPersistence(join(blocker, 'nested'))
             });
             const runtime = createHarnessRuntime({
                 settings: SETTINGS,
@@ -3458,116 +3674,20 @@ describe('deleting a harness over HTTP', () => {
                 registry
             });
 
-            const failure = await jsonBody<{ error: { message: string } }>(
-                await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/demo')
-            );
+            const failure = await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'));
+
             expect(failure.status).toBe(500);
             expect(failure.body.error.message).toContain('Could not save the harness database');
 
-            // Nothing half-happened: the card is still listed, and no tombstone was
-            // left behind to delete it on the next start.
-            const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
-            expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
+            // The refusal is honest and ATOMIC: the durable write failed, so the card is still
+            // listed in this process, the registry still holds it, and no tombstone was written that
+            // would delete it on the next start.
+            const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+            expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
             expect(registry.find('demo')).toBeDefined();
             expect(registry.deletedBuiltins()).toEqual([]);
         } finally {
             await rm(root, { recursive: true, force: true });
         }
-    });
-});
-
-// Timing and discovery through the server record.
-describe('recorded run timing', () => {
-    it('stamps every event frame and persists the same times on the turn', async () => {
-        const runtime = createRuntime();
-        const session = await createDemo(runtime);
-
-        const items = await streamItems(
-            await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
-                body: { input: 'What time is it?' }
-            })
-        );
-
-        const frames = items.flatMap((item) => (item.type === 'event' ? [item] : []));
-
-        // Every frame carries an epoch-ms stamp; the server clock is real here, so
-        // assert alignment rather than one number.
-        expect(frames.every((frame) => typeof frame.at === 'number' && frame.at > 0)).toBe(true);
-
-        const terminal = items.at(-1);
-        if (terminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot');
-
-        const turn = terminal.session.turns[0];
-        expect(turn.eventTimes).toEqual(frames.map((frame) => frame.at));
-        expect(turn.eventTimes).toHaveLength(turn.events.length);
-
-        // Times are monotonic within the turn (the sink records in order).
-        const times = turn.eventTimes!;
-        expect(times.every((value, index) => index === 0 || value >= times[index - 1])).toBe(true);
-
-        // Discovery is part of the recorded snapshot: the scripted demo enabled
-        // `timeNow` through toolRequest, so a reload can show it.
-        // R9-R11: the demoted runtime rows carry the same free-text vocabulary, so
-        // the demo's tags:['time'] request now matches five tools; they are all
-        // recorded as discovered for the session.
-        expect(terminal.session.discoveredTools).toEqual([
-            'timeNow',
-            'actionRequest',
-            'threadFork',
-            'toolManage',
-            'toolRegistry',
-        ]);
-
-        // R20.2: the demo's timeNow call carries declarative panels in the SAME
-        // recorded event, both on the stream frame and after a reload. The model
-        // content stays the ordinary serialized value.
-        const timeResult = terminal.session.turns[0].events.find(
-            (event) => event.type === 'tool_result' && event.name === 'timeNow'
-        );
-        if (timeResult?.type !== 'tool_result') throw new Error('expected a recorded timeNow result');
-
-        const timeValue = JSON.parse(timeResult.content) as {
-            timezone: string;
-            iso: string;
-            unix: number;
-        };
-        const expectedPanels = [
-            {
-                id: 'timeNow',
-                slot: 'right',
-                title: 'Current time',
-                blocks: [
-                    {
-                        type: 'keyValue',
-                        items: [
-                            { label: 'Timezone', value: timeValue.timezone },
-                            { label: 'ISO 8601', value: timeValue.iso },
-                            { label: 'Unix', value: String(timeValue.unix) }
-                        ]
-                    },
-                    { type: 'text', text: 'Read from the server clock at execution time.' }
-                ]
-            }
-        ];
-        expect(timeResult.ui).toEqual(expectedPanels);
-
-        const streamed = frames.find(
-            (frame) => frame.event.type === 'tool_result' && frame.event.name === 'timeNow'
-        );
-        if (streamed?.event.type !== 'tool_result') throw new Error('expected a streamed timeNow result');
-        expect(streamed.event.ui).toEqual(expectedPanels);
-        expect(streamed.event.content).toBe(timeResult.content);
-
-        // And the record survives the reload path unchanged, UI panels included.
-        expect(runtime.store.get(session.id).turns).toEqual(terminal.session.turns);
-        // R9-R11: the demoted runtime rows share the 'time' vocabulary the scripted
-        // demo asks for, so all five matches stay recorded on the session.
-        expect(runtime.store.get(session.id).discoveredTools).toEqual([
-            'timeNow',
-            'actionRequest',
-            'threadFork',
-            'toolManage',
-            'toolRegistry',
-        ]);
     });
 });

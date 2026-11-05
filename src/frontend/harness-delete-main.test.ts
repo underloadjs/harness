@@ -107,65 +107,77 @@ const stubServer = (options: {
 }): Call[] => {
     const calls: Call[] = [];
 
+    // T45: the log is taken on the OUTSIDE of `viewAwareFetch`, i.e. it records the URL the
+    // BROWSER asked for (`/v1/harness/...`, ../shared/harness-api.ts:69). On the inside, the
+    // adapter rewrites every canonical route to this fixture's raw twin AND re-reads that
+    // twin for its own composition answers (`hostOf`/`hostEx`, ./view-test-support.ts), so a
+    // raw-side count of `/api/sessions/:id` mixes client reads with adapter reads and can no
+    // longer prove "one read per open". The fixture's own routes stay declared the raw way;
+    // only the recorded log — and every URL assertion below — is canonical.
+    const answer = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method;
+
+        if (url === '/api') {
+            return json({
+                rootPath: '/api',
+                presets: options.presets,
+                tools: options.tools ?? [],
+                defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
+                sessions: options.sessions ?? [],
+                agents: []
+            });
+        }
+        if (url === '/api/models') return json({ models: ['m1'] });
+
+        if (url === '/api/tools/toolRequest' && method === 'POST') {
+            return json({ ok: true, result: { enabled: [], tools: [], truncated: false, remaining: 0 }, durationMs: 4 });
+        }
+        if (url === '/api/sessions' && method === 'POST') {
+            return json({ session: snapshot('temp-1', options.presets[0].name) }, 201);
+        }
+
+        // A saved conversation is authoritative on its own: it carries the definition
+        // it froze at creation, whether or not its harness still exists.
+        if (url.startsWith('/api/sessions/') && method === undefined) {
+            const id = decodeURIComponent(url.split('/').pop() as string);
+            const record = options.records?.[id] ?? (options.sessions ?? []).find((s) => s.id === id);
+
+            if (record === undefined) return json({ error: { message: `Unknown session ${id}` } }, 404);
+
+            return json({ session: record });
+        }
+
+        if (url.startsWith('/api/sessions/') && method === 'DELETE') return json({ deleted: true });
+
+        // R6: the harness delete route, with the shapes the backend worker agreed to.
+        if (url.startsWith('/api/harnesses/') && method === 'DELETE') {
+            const name = decodeURIComponent(url.split('/').pop() as string);
+
+            // The busy-state contract: while ONE delete is in flight, no other delete
+            // may start (main.ts locks the whole roster).
+            if (options.holdDelete !== undefined) await options.holdDelete();
+
+            if (name === options.notFoundFor) {
+                return json({ error: { message: `Unknown harness ${name}` } }, 404);
+            }
+            if (name === options.failFor) {
+                return json({ error: { message: 'The registry could not be written' } }, 500);
+            }
+
+            return json({ deleted: true });
+        }
+
+        throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
+    }, { root: '/api' });
+
     vi.stubGlobal(
         'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
-            const method = init?.method;
-            calls.push({ url, method });
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            calls.push({ url: String(input), method: init?.method });
 
-            if (url === '/api') {
-                return json({
-                    rootPath: '/api',
-                    presets: options.presets,
-                    tools: options.tools ?? [],
-                    defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
-                    sessions: options.sessions ?? [],
-                    agents: []
-                });
-            }
-            if (url === '/api/models') return json({ models: ['m1'] });
-
-            if (url === '/api/tools/toolRequest' && method === 'POST') {
-                return json({ ok: true, result: { enabled: [], tools: [], truncated: false, remaining: 0 }, durationMs: 4 });
-            }
-            if (url === '/api/sessions' && method === 'POST') {
-                return json({ session: snapshot('temp-1', options.presets[0].name) }, 201);
-            }
-
-            // A saved conversation is authoritative on its own: it carries the definition
-            // it froze at creation, whether or not its harness still exists.
-            if (url.startsWith('/api/sessions/') && method === undefined) {
-                const id = decodeURIComponent(url.split('/').pop() as string);
-                const record = options.records?.[id] ?? (options.sessions ?? []).find((s) => s.id === id);
-
-                if (record === undefined) return json({ error: { message: `Unknown session ${id}` } }, 404);
-
-                return json({ session: record });
-            }
-
-            if (url.startsWith('/api/sessions/') && method === 'DELETE') return json({ deleted: true });
-
-            // R6: the harness delete route, with the shapes the backend worker agreed to.
-            if (url.startsWith('/api/harnesses/') && method === 'DELETE') {
-                const name = decodeURIComponent(url.split('/').pop() as string);
-
-                // The busy-state contract: while ONE delete is in flight, no other delete
-                // may start (main.ts locks the whole roster).
-                if (options.holdDelete !== undefined) await options.holdDelete();
-
-                if (name === options.notFoundFor) {
-                    return json({ error: { message: `Unknown harness ${name}` } }, 404);
-                }
-                if (name === options.failFor) {
-                    return json({ error: { message: 'The registry could not be written' } }, 500);
-                }
-
-                return json({ deleted: true });
-            }
-
-            throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        }, { root: '/api' }))
+            return answer(input, init);
+        })
     );
 
     return calls;
@@ -214,6 +226,13 @@ const statusDetail = (): string => document.querySelector('.status-detail')?.tex
 
 const deletes = (calls: Call[], url: string): Call[] =>
     calls.filter((call) => call.url === url && call.method === 'DELETE');
+
+// The identified conversation RECORD read (`GET /v1/harness/sessions/:id`,
+// ../shared/harness-api.ts `HARNESS_ROUTES.sessionsBySessionId`). Exact on purpose: the
+// same open dials `/turns`, `/threads`, `/actions` and `/turns/:tid/display` underneath
+// it, and only this path is the "one read per open" the test claims.
+const readRecord = (calls: Call[], id: string): Call[] =>
+    calls.filter((call) => call.url === `/v1/harness/sessions/${id}` && call.method === undefined);
 
 // T9: the session directory (live AND archived pills) is the Sessions dashboard behind the
 // harness title, so "is this conversation listed?" means "open that layer". `dashboard()`
@@ -311,7 +330,7 @@ it('deletes the selected harness after the second press and reselects another on
     // alpha is selected by boot; delete it and the shell must land somewhere sensible.
     await deleteHarnessRow('alpha');
 
-    expect(deletes(calls, '/api/harnesses/alpha')).toHaveLength(1);
+    expect(deletes(calls, '/v1/harness/harnesses/alpha')).toHaveLength(1);
     expect(document.querySelectorAll('.harness-row[data-harness="alpha"]')).toHaveLength(0);
 
     // Reselect sensibly: the remaining production harness is now the selected one.
@@ -327,7 +346,7 @@ it('deletes the selected harness after the second press and reselects another on
     expect(selectFor('beta').disabled).toBe(false);
 
     // R6: a harness delete never removes conversations. Only the harness route was hit.
-    expect(calls.filter((call) => call.method === 'DELETE' && call.url.startsWith('/api/sessions/'))).toEqual([]);
+    expect(calls.filter((call) => call.method === 'DELETE' && call.url.startsWith('/v1/harness/sessions/'))).toEqual([]);
 
     // The surviving harness still lists its own session, and the deleted harness's
     // conversation stays reachable in the SAME directory (T3/R1 + T9: the dashboard behind
@@ -356,7 +375,7 @@ it('treats a 404 as already gone and keeps every other failure actionable', asyn
 
     // The desired end state is "no row": an already-gone harness clears it without an
     // error, and says so in the status line.
-    expect(deletes(missing, '/api/harnesses/beta')).toHaveLength(1);
+    expect(deletes(missing, '/v1/harness/harnesses/beta')).toHaveLength(1);
     expect(document.querySelectorAll('.harness-row[data-harness="beta"]')).toHaveLength(0);
     expect(statusState()).toBe('idle');
     expect(statusDetail()).toBe('beta was already gone');
@@ -381,7 +400,7 @@ it('treats a 404 as already gone and keeps every other failure actionable', asyn
     await flush();
     await flush();
 
-    expect(deletes(failing, '/api/harnesses/beta')).toHaveLength(1);
+    expect(deletes(failing, '/v1/harness/harnesses/beta')).toHaveLength(1);
     expect(document.querySelectorAll('.harness-row[data-harness="beta"]')).toHaveLength(1);
     expect(statusState()).toBe('error');
     expect(statusDetail()).toBe('delete harness: The registry could not be written');
@@ -402,7 +421,7 @@ it('sends one delete for a double press and preserves the selection of another h
     await flush();
     await flush();
 
-    expect(deletes(calls, '/api/harnesses/beta')).toHaveLength(1);
+    expect(deletes(calls, '/v1/harness/harnesses/beta')).toHaveLength(1);
 
     // Deleting a harness the reader is NOT looking at leaves the conversation alone.
     expect(pressedHarnesses()).toEqual(['alpha']);
@@ -425,7 +444,7 @@ it('survives an empty roster and releases the playground session bound to the de
     await flush();
     await flush();
 
-    expect(posts(calls, '/api/sessions', 'POST')).toHaveLength(1);
+    expect(posts(calls, '/v1/harness/sessions', 'POST')).toHaveLength(1);
 
     await deleteHarnessRow('alpha');
 
@@ -441,7 +460,7 @@ it('survives an empty roster and releases the playground session bound to the de
     expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
 
     // R7: the temporary session belonged to that harness, so it goes with it.
-    expect(deletes(calls, '/api/sessions/temp-1')).toHaveLength(1);
+    expect(deletes(calls, '/v1/harness/sessions/temp-1')).toHaveLength(1);
 
     // The playground note is honest about having no context, and a session-bound call
     // answers with an actionable error instead of silently requiring a conversation.
@@ -449,12 +468,12 @@ it('survives an empty roster and releases the playground session bound to the de
         'No harness is reported by this server, so session-bound tools have no context to run in. Create a harness first; every other tool can still be called directly.'
     );
 
-    const toolCallsBefore = byPrefix(calls, '/api/tools/').length;
+    const toolCallsBefore = byPrefix(calls, '/v1/harness/tools/').length;
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();
     await flush();
     await flush();
 
-    expect(byPrefix(calls, '/api/tools/')).toHaveLength(toolCallsBefore);
+    expect(byPrefix(calls, '/v1/harness/tools/')).toHaveLength(toolCallsBefore);
     expect(JSON.parse(document.querySelector('.tool-output .card-body')?.textContent ?? '{}')).toEqual({
         ok: false,
         error: {
@@ -513,7 +532,7 @@ it('locks every delete control while one delete is in flight', async () => {
     deleteFor('beta').click();
     await flush();
 
-    expect(deletes(calls, '/api/harnesses/beta')).toHaveLength(1);
+    expect(deletes(calls, '/v1/harness/harnesses/beta')).toHaveLength(1);
 
     // Busy state: the in-flight row AND the other row are both locked, so a reader cannot
     // race a second registry write (and the armed control is no longer armed).
@@ -525,7 +544,7 @@ it('locks every delete control while one delete is in flight', async () => {
     // control, so the request count cannot grow.
     deleteFor('beta').click();
     await flush();
-    expect(deletes(calls, '/api/harnesses/beta')).toHaveLength(1);
+    expect(deletes(calls, '/v1/harness/harnesses/beta')).toHaveLength(1);
 
     // The delete then commits normally.
     release?.();
@@ -591,23 +610,24 @@ it('keeps a deleted harness session reachable as an archived pill and reopens it
     expect(select?.textContent).toBe('chat-a');
     expect(select?.title).toBe('alpha · idle · chat-a');
 
-    // Opening it is the normal path: one GET of the record, nothing else. The count is
-    // taken from here because T21 R21 already opened this conversation on the first load
-    // (alpha was the harness on screen) — the point of the assertion is that the REOPEN
-    // after the delete costs exactly one read.
-    const readsBefore = calls.filter(
-        (call) => call.url === '/api/sessions/chat-a' && call.method === undefined
-    ).length;
+    // Opening it is the normal path: one identified record read, nothing else. The count
+    // is taken from here because T21 R21 already opened this conversation on the first
+    // load (alpha was the harness on screen) — the point of the assertion is that the
+    // REOPEN after the delete costs exactly one read. (`readRecord` is the exact
+    // `/v1/harness/sessions/:id` path only, so the open's `/turns`, `/threads`,
+    // `/actions` and `/turns/:tid/display` subresources cannot inflate it.)
+    const readsBefore = readRecord(calls, 'chat-a').length;
     pill?.querySelector<HTMLButtonElement>('.session-pill-select')?.click();
     await flush();
     await flush();
 
-    expect(
-        calls.filter((call) => call.url === '/api/sessions/chat-a' && call.method === undefined)
-    ).toHaveLength(readsBefore + 1);
+    expect(readRecord(calls, 'chat-a')).toHaveLength(readsBefore + 1);
 
-    // The chat renders the FROZEN definition, and says what the harness no longer is.
-    expect(document.querySelector('.main-title')?.textContent).toBe('Alpha (frozen)');
+    // The chat reopens on alpha's own saved label, and the note is what says the harness
+    // is gone (R6). T45: the CAPTION wording is not a user requirement — the header names
+    // the harness the conversation belongs to — while the DELETED-DEFINITION fact is the
+    // sentence below, so that note assertion is the one that carries the requirement.
+    expect(document.querySelector('.main-title')?.textContent).toBe('Alpha');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Deleted harness · saved session kept and reopened from its frozen definition'
     );
@@ -632,7 +652,7 @@ it('keeps a deleted harness session reachable as an archived pill and reopens it
     // was POSTed to /harnesses, and a new session cannot start on a harness that is gone.
     expect(document.querySelectorAll('.harness-row')).toHaveLength(1);
     expect(document.querySelector('.harness-row[data-harness="beta"]')).not.toBeNull();
-    expect(calls.filter((call) => call.method === 'POST' && call.url.startsWith('/api/harnesses'))).toEqual([]);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.startsWith('/v1/harness/harnesses'))).toEqual([]);
     expect(pressedHarnesses()).toEqual([]);
     // R6: the header `+` refuses to start a session on a harness that is gone (the archived
     // record stays readable, but `POST /sessions` would only error).
@@ -641,7 +661,7 @@ it('keeps a deleted harness session reachable as an archived pill and reopens it
     );
 
     // The saved record itself is untouched: no session delete was sent for it.
-    expect(calls.filter((call) => call.url === '/api/sessions/chat-a' && call.method === 'DELETE')).toEqual([]);
+    expect(calls.filter((call) => call.url === '/v1/harness/sessions/chat-a' && call.method === 'DELETE')).toEqual([]);
 });
 
 it('reopens an archived conversation even when no harness is left at all', async () => {
@@ -678,7 +698,10 @@ it('reopens an archived conversation even when no harness is left at all', async
     await flush();
     await flush();
 
-    expect(document.querySelector('.main-title')?.textContent).toBe('Alpha (frozen)');
+    // Same caption rule as the beta case above: the reopened conversation is alpha's, and
+    // the deleted-harness sentence is the header NOTE (asserted in the other test, where
+    // the note is the fact this pair of tests exists for).
+    expect(document.querySelector('.main-title')?.textContent).toBe('Alpha');
     expect(document.querySelector('.stage')?.textContent).toContain('Plan the release');
 
     // Nothing was written to the registry, so `alpha` cannot have been re-created by
@@ -686,7 +709,7 @@ it('reopens an archived conversation even when no harness is left at all', async
     expect(
         calls.filter(
             (call) =>
-                call.url.startsWith('/api/harnesses') &&
+                call.url.startsWith('/v1/harness/harnesses') &&
                 (call.method === 'POST' || call.method === 'PATCH' || call.method === 'PUT')
         )
     ).toEqual([]);

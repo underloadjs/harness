@@ -198,7 +198,16 @@ import type { RunnerSettings } from './harnesses/types';
 import { createToolCatalogue, createCoreToolEntries, createHarnessRegistry, describeHarness } from './harnesses';
 import type { CatalogueEntry, HarnessPreset, HarnessRegistry, ToolCatalogue } from './harnesses';
 import { coreToolNames } from './harnesses/toolbox';
-import { DEFAULT_RUNTIME_CONFIGURATION, loadRuntimeConfiguration, mergeSettings, SettingsError } from './config';
+// T39: the SAME settings bounds `mergeSettings` enforces (./config.ts:140-141) travel here so
+// `PATCH /config` refuses an oversize value instead of parking it in `defaults`.
+import {
+    DEFAULT_RUNTIME_CONFIGURATION,
+    loadRuntimeConfiguration,
+    MAX_BASE_URL_LENGTH,
+    MAX_MODEL_LENGTH,
+    mergeSettings,
+    SettingsError
+} from './config';
 import type { ProviderCredential, ServerRuntimeConfiguration } from './config';
 import { HarnessRegistryError } from './harnesses/registry';
 // T19: the global agent overlay's error type (status-carrying, like the registry's) and the
@@ -1343,9 +1352,26 @@ export const createHarnessApi = ({
 
         if (keys.length === 0) throw new HttpError(400, 'A config patch must change at least one setting.');
 
-        // T28: set when this body issues a credential, so the scope can be assigned after the
-        // loop instead of depending on key order.
+        // T39 (regression): the patch is DECIDED on a candidate copy of the live settings and only
+        // a fully valid candidate is committed. Two defects lived in the previous write-as-you-go
+        // loop, and both were invisible until a later route read the damage:
+        //   1. no length bound was applied here, so `PATCH /config {base_url: <2049 chars>}`
+        //      answered 200 and POISONED `defaults` — every later `POST /sessions` then failed with
+        //      the shared validator's 400 ("A provider base URL cannot exceed 2048 characters.")
+        //      for a body the client never sent. The caps are therefore imported from
+        //      ./config.ts (the single source `mergeSettings` uses, ./config.ts:424-430) and applied
+        //      here with the SAME message, so the route that sets the default answers exactly what
+        //      the route that consumes it does;
+        //   2. the empty-URL refusal (and any refusal below the first key) ran AFTER earlier keys
+        //      had already mutated `globalSettings`, so `{base_url: '', model: 'x'}` answered 400
+        //      while still moving `model`. A refused patch must mutate nothing.
+        // `issuedKey`/`resetKey` keep the T28 credential rule order-independent: the scope of a new
+        // credential is assigned from the FINAL base URL, never from key order.
+        let nextBaseURL = globalSettings.baseURL;
+        let nextModel = globalSettings.model;
+        let nextApiKey: string | undefined;
         let issuedKey = false;
+        let resetKey = false;
 
         // A runtime knob in this body is a 400 NAMING it, which is how "deployment-only"
         // stays enforceable instead of being prose. They are not in the allowed set above,
@@ -1355,16 +1381,12 @@ export const createHarnessApi = ({
 
             if (value === null) {
                 // `null` = "back to the shipped default" (the reset target is `defaults`).
-                if (key === 'base_url') globalSettings.baseURL = defaults.baseURL;
-                else if (key === 'model') globalSettings.model = defaults.model;
-                else {
-                    // T28: resetting the key restores the SHIPPED credential together with the
-                    // provider it belongs to — not "no key", and not the same key pointed at an
-                    // endpoint a later `base_url` patch happened to move.
-                    globalSettings.apiKey = bootCredential.apiKey;
-                    globalSettings.hasKey = defaults.hasApiKey;
-                    credentialBaseURL = bootCredential.baseURL;
-                }
+                if (key === 'base_url') nextBaseURL = defaults.baseURL;
+                else if (key === 'model') nextModel = defaults.model;
+                // T28: resetting the key restores the SHIPPED credential together with the
+                // provider it belongs to — not "no key", and not the same key pointed at an
+                // endpoint a later `base_url` patch happened to move.
+                else resetKey = true;
 
                 continue;
             }
@@ -1373,32 +1395,55 @@ export const createHarnessApi = ({
                 throw new HttpError(400, `"settings.${key}" must be a string or null.`);
             }
 
-            if (key === 'base_url') globalSettings.baseURL = value.trim();
-            else if (key === 'model') globalSettings.model = value.trim();
+            if (key === 'base_url') nextBaseURL = value.trim();
+            else if (key === 'model') nextModel = value.trim();
+            // T28: an explicit key write issues a NEW process-only credential. Its scope is
+            // assigned after validation (see `issuedKey`) so the pair stays well-defined whatever
+            // order the body's keys arrive in, and a body the route refuses never retargets the
+            // live credential.
             else {
-                // T28: an explicit key write issues a NEW process-only credential. Its scope is
-                // assigned AFTER the URL validation below (see `issuedKey`) so the pair stays
-                // well-defined whatever order the body's keys arrive in, and a body the route
-                // refuses never retargets the live credential.
-                globalSettings.apiKey = value.trim();
+                nextApiKey = value.trim();
                 issuedKey = true;
             }
         }
 
-        if (globalSettings.baseURL.trim().length === 0) {
+        // Bounds and the non-empty rule, all BEFORE the commit below. The caps measure the
+        // TRIMMED value, because that is the string `mergeSettings` later validates and sends.
+        if (nextBaseURL.length > MAX_BASE_URL_LENGTH) {
+            throw new HttpError(400, `A provider base URL cannot exceed ${MAX_BASE_URL_LENGTH} characters.`);
+        }
+
+        if (nextModel.length > MAX_MODEL_LENGTH) {
+            throw new HttpError(400, `A model name cannot exceed ${MAX_MODEL_LENGTH} characters.`);
+        }
+
+        if (nextBaseURL.trim().length === 0) {
             throw new HttpError(400, 'A provider base URL cannot be empty.');
+        }
+
+        // ---- COMMIT: nothing above can fail now, so a 400 left the settings untouched. ----
+        globalSettings.baseURL = nextBaseURL;
+        globalSettings.model = nextModel;
+
+        if (resetKey) {
+            globalSettings.apiKey = bootCredential.apiKey;
+            globalSettings.hasKey = defaults.hasApiKey;
+            credentialBaseURL = bootCredential.baseURL;
         }
 
         // T28: the new credential belongs to the endpoint in effect once the whole patch is
         // applied — a body that sets `base_url` and `api_key` together issues the key FOR that
         // provider, and nothing else may receive it.
-        if (issuedKey) credentialBaseURL = globalSettings.baseURL;
+        if (issuedKey) {
+            globalSettings.apiKey = nextApiKey ?? '';
+            credentialBaseURL = globalSettings.baseURL;
 
-        // T28: the key must never be echoed, and the `has_api_key` claim follows a credential
-        // this process actually issued; an explicit empty string means "no key", which the
-        // credential rule and the advertisement both enforce. A `null` write instead restores
-        // the shipped claim, which the branch above already did — it is not a key write.
-        if (issuedKey) globalSettings.hasKey = globalSettings.apiKey.trim().length > 0;
+            // T28: the key must never be echoed, and the `has_api_key` claim follows a credential
+            // this process actually issued; an explicit empty string means "no key", which the
+            // credential rule and the advertisement both enforce. A `null` write instead restores
+            // the shipped claim, which the reset branch above did — it is not a key write.
+            globalSettings.hasKey = globalSettings.apiKey.trim().length > 0;
+        }
 
         syncDefaults();
 
@@ -2146,7 +2191,19 @@ export const createHarnessApi = ({
         );
 
         const live = store.liveSession(record.id);
-        const position = queueRowsOf(live).find((row) => row.turn_id === submitted.turn.id)?.position;
+
+        // T39 (regression): the contract's `TaskReceipt.queue_position` is an ORDINAL with
+        // `minimum: 1` (./harness.swagger.yaml:5001-5005 — "equal to `GET .../queue`'s
+        // ordering"), while `QueuedTask.position` is the 0-based array slot of the same ordering
+        // (./harness.swagger.yaml:5101-5104). Deriving the receipt figure straight from
+        // `row.position` therefore reported the FIRST queued task as slot `0`, which the contract
+        // forbids and which read as "no place in line". `findIndex` over the same projection keeps
+        // the two figures consistent: receipt N == queue page row N-1.
+        //
+        // A submit that is NOT in a backlog has no position at all: it either became the active
+        // run or was steered into one (both report `status` without `queue_position`), which is
+        // the intended concurrent plain-thread behaviour.
+        const queuedAt = queueRowsOf(live).findIndex((row) => row.turn_id === submitted.turn.id);
 
         const sessionRevision = events.bumpRevision('session', record.id);
 
@@ -2170,7 +2227,7 @@ export const createHarnessApi = ({
             thread_id: submitted.turn.threadId ?? submitted.steeredThreadId ?? submitted.turn.threadId ?? '',
             ...(submitted.steered === true ? { steered: true } : {}),
             ...(submitted.steeredThreadId === undefined ? {} : { steered_thread_id: submitted.steeredThreadId }),
-            ...(position === undefined ? {} : { queue_position: position }),
+            ...(queuedAt === -1 ? {} : { queue_position: queuedAt + 1 }),
             session_revision: sessionRevision,
             accepted_at: Date.now(),
             links: {
@@ -2239,6 +2296,15 @@ export const createHarnessApi = ({
         const body = requireObjectBody<CancelSessionRequest>(await ctx.body().catch(() => ({})));
 
         requireKnownFields(body, ['all']);
+
+        // T39 (regression): `all` is a BOOLEAN or the request is refused before anything is
+        // cancelled. The field-set check alone accepted `{all:'yes'}` and ran it as `all:false`
+        // (a truthy string is not `=== true`), so a client that asked for the backlog to be
+        // dropped got a 200 receipt claiming `dropped_queued_tasks: 0` and a run that kept the
+        // backlog. The legacy surface's wording is kept verbatim.
+        if (body.all !== undefined && typeof body.all !== 'boolean') {
+            throw new HttpError(400, '`all` must be a boolean when present.');
+        }
 
         const lanes = [...record.lanes.values()];
         const activeTurn =
@@ -2927,6 +2993,22 @@ export const createHarnessApi = ({
         }
 
         try {
+            // T39 (regression): the create path has to observe the PRIOR registration itself, because
+            // `harness.toolCreate` (../harness.ts:2452-2483) returns only the compiled definition and
+            // throws away the kernel's own report. Hardcoding `created: true, replaced: false` made
+            // this receipt contradict three things at once: the kernel rule for the identical write
+            // (`acceptTool` computes `existed` and answers `created: !existed, replaced: existed`,
+            // ../harness.ts:1292-1293 and :1386-1399), the budget figure in the SAME receipt (a
+            // re-registration does not spend a creation slot, so `used` correctly stayed flat), and
+            // the PATCH path below, which reports `registered.replaced` from the kernel.
+            //
+            // `existed` is "this session's live registry already had this name", exactly the kernel's
+            // test — NOT "a static catalogue entry was displaced": the catalogue is never mutated by
+            // this route (a detached-catalogue call still runs the shipped definition).
+            const hadPriorRegistration =
+                (record.harness.tools as Record<string, unknown>)[name] !== undefined;
+            const previousRevision = record.harness.toolSource(name)?.revision;
+
             // TWO domain paths, deliberately chosen per mode:
             //   - create  -> `harness.createTool`, the SAME host path the model's `toolCreate`
             //     uses, so validation, the lifetime creation budget, collision rules, and
@@ -2946,8 +3028,9 @@ export const createHarnessApi = ({
                     : (({
                           name: created.name,
                           revision: record.harness.toolSource(created.name)?.revision ?? '',
-                          created: true,
-                          replaced: false,
+                          created: !hadPriorRegistration,
+                          replaced: hadPriorRegistration,
+                          ...(previousRevision === undefined ? {} : { previousRevision }),
                           checks: record.harness.toolSource(created.name)?.checks ?? [],
                           sourcePath: record.harness.toolSource(created.name)?.sourcePath
                       }) as unknown as Awaited<ReturnType<typeof record.harness.registerTool>>);

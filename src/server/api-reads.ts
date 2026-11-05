@@ -268,8 +268,10 @@ export const createdToolNames = (record: SessionRecord): string[] =>
  * no event fold and no `copyTurns`.
  *
  * The projector's row is the camelCase display model; the wire row is the same field names
- * (spec: the display subtree keeps camelCase) except `prompt`, which becomes the bounded
- * `promptPreview` + exact `promptChars` pair.
+ * (spec: the display subtree keeps camelCase) except the task text, which becomes the bounded
+ * `promptPreview` + exact `promptChars` pair — for the row's own `prompt` AND for every
+ * `steers[i]` entry (spec: `TurnSummary` and `DisplaySteerSummary` are both closed objects with
+ * that pair, ./harness.swagger.yaml:6108 / :6075).
  */
 export const turnRowOf = (projector: TurnProjector, turnId: string): WireTurnSummary => {
     const row = projector.summary() as unknown as Record<string, unknown>;
@@ -281,8 +283,45 @@ export const turnRowOf = (projector: TurnProjector, turnId: string): WireTurnSum
     projected.promptPreview = promptPreview(prompt);
     projected.promptChars = prompt.length;
 
+    // The steer entries ride the same rename (see `steerRowOf`): the projector's row carries the
+    // submit's verbatim text under `prompt`, the wire row carries `promptPreview` + `promptChars`.
+    if (Array.isArray(projected.steers)) {
+        projected.steers = (projected.steers as unknown[]).map((steer) =>
+            steer === null || typeof steer !== 'object' ? steer : steerRowOf(steer as Record<string, unknown>)
+        );
+    }
+
     // `detail` is a projector-internal one-liner; keep it (the wire row allows it).
     return projected as unknown as WireTurnSummary & { id: string };
+};
+
+/**
+ * One steer entry of the projector's row -> the WIRE `DisplaySteerSummary`.
+ *
+ * The contract (../shared/harness-api.ts:1718-1726, from ./harness.swagger.yaml:6075-6107) is a
+ * CLOSED object whose text field is `promptPreview` beside the EXACT `promptChars`; it requires
+ * `[at, promptPreview, promptChars]` and sends nothing outside that set. The projector instead
+ * keeps the submit's verbatim text under `prompt` (./turn-projector.ts:2794-2808, whose member
+ * type is the INTERNAL render model ../shared/turn-display.ts:281-296), so copying the row's steer
+ * list verbatim shipped a field the spec forbids and omitted both fields the spec requires — a
+ * consumer that followed the spec would have read `undefined`.
+ *
+ * This is the identical delta `turnRowOf` applies to the row's own prompt one line above, per
+ * entry: same bound (`TURN_PROMPT_PREVIEW_CHARS`), same exact length. WIRE PROJECTION ONLY — the
+ * projector, the audit record (`SessionSteerRecord`, ./protocol.ts:224-246) and every event/domain
+ * shape keep `prompt`, and the client's render model keeps `prompt`
+ * (../frontend/display-project.ts `projectSteers`).
+ */
+export const steerRowOf = (steer: Record<string, unknown>): Record<string, unknown> => {
+    const text = typeof steer.prompt === 'string' ? steer.prompt : '';
+
+    const projected: Record<string, unknown> = { ...steer };
+
+    delete projected.prompt;
+    projected.promptPreview = promptPreview(text);
+    projected.promptChars = text.length;
+
+    return projected;
 };
 
 /** A bounded preview of a task text, with the exact length reported separately. */

@@ -38,6 +38,16 @@ import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionStreamItem, SessionTurn } from './protocol';
+// T35: the canonical transport. A submit answers a 202 `TaskReceipt` and the turn's own
+// members are separate named reads, so every HTTP assertion below composes them through
+// the shared helpers (./canonical-reads.test-support.ts) instead of a fat aggregate.
+import {
+    allTurnEvents,
+    bindApiCall,
+    readTurn,
+    submitTask,
+    type CanonicalCall
+} from './canonical-reads.test-support';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
@@ -302,6 +312,17 @@ const jsonBody = <T>(result: Awaited<ReturnType<HarnessRuntime['api']>>): { stat
     return { status: result.status, body: result.body as T };
 };
 
+// One `CanonicalCall` bound to the single canonical mount, so the shared read helpers can
+// drive the same runtime the in-process `callApi` above uses. Mount is passed explicitly
+// (never guessed), which is what makes `/api` a 404 rather than an alias.
+const canonicalCall = (runtime: HarnessRuntime): CanonicalCall => bindApiCall(runtime.api, '/v1/harness');
+
+// The hub counter the canonical reads quote. Comparing a response to the hub (rather than
+// to a literal) is the convention ./api-canonical.test.ts established: one number per
+// revision, and the assertion cannot drift across a restart.
+const hubRevision = (runtime: HarnessRuntime, resource: 'session' | 'turn' | 'turns' | 'queue', id?: string): number =>
+    runtime.api.events.getRevision(resource, id ?? null);
+
 // One command turn, read back from the store by id (the HTTP body and the stored
 // record must be the same copy of the same truth).
 const turnOf = (store: SessionStore, id: string, turnId: string): SessionTurn => {
@@ -316,67 +337,101 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         pinClock();
         const fixture = scriptedFixture();
         const runtime = runtimeOf([fixture.preset]);
+        const call = canonicalCall(runtime);
         const id = await createSession(runtime, 'instruct');
 
-        const accepted = jsonBody<{
-            session: { status: string; queueDepth?: number; turns: SessionTurn[] };
-            turn: SessionTurn;
-            steered?: true;
-        }>(await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
-            input: '  /task add "testing"  '
-        }));
+        // TRANSPORT CHANGE ONLY: the submit answers a 202 `TaskReceipt` instead of
+        // `{session, turn}`. Every domain expectation below survives, just read from the
+        // route that owns it: the receipt states terminality, the turn route states the
+        // record, the events route states the synthesized event pair.
+        const receipt = await submitTask(call, id, { input: '  /task add "testing"  ' });
 
-        expect(accepted.status).toBe(202);
-        expect(accepted.body.steered).toBeUndefined();
-
-        // The 202 body carries the FINISHED turn: a command never waits for a pump.
-        const turn = accepted.body.turn;
-
-        expect(turn).toEqual({
-            id: turn.id,
-            index: 0,
-            prompt: '/task add "testing"',
+        expect(receipt).toEqual({
+            session_id: id,
+            turn_id: receipt.turn_id,
+            // A command never waits for a pump: the receipt already says `done`.
             status: 'done',
-            startedAt: 2_000,
-            updatedAt: 2_000,
-            events: [
-                { type: 'start', agent: primary, model: 'scripted/test' },
-                {
-                    type: 'tool_call',
-                    agent: primary,
-                    call: {
-                        id: String((turn.events[1] as { call: { id: string } }).call.id),
-                        name: 'command',
-                        arguments: '{"input":"/task add \\"testing\\""}'
-                    }
-                },
-                {
-                    type: 'tool_result',
-                    agent: primary,
-                    name: 'command',
-                    callId: String((turn.events[1] as { call: { id: string } }).call.id),
-                    content:
-                        '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
-                    isError: false,
-                    outcome: 'completed'
-                }
-            ],
-            eventTimes: [2_000, 2_000, 2_000]
+            // Session scope — a slash command owns no conversation, so the receipt
+            // names none, and `links.thread` falls back to the turns collection.
+            thread_id: '',
+            session_revision: hubRevision(runtime, 'session', id),
+            accepted_at: 2_000,
+            links: {
+                turn: `/v1/harness/sessions/${id}/turns/${receipt.turn_id}`,
+                turns: `/v1/harness/sessions/${id}/turns`,
+                thread: `/v1/harness/sessions/${id}/turns`,
+                stream: '/v1/harness/stream'
+            }
         });
 
-        // The synthesized call id is a real uuid and pairs the two frames exactly.
-        const callId = String((turn.events[1] as { call: { id: string } }).call.id);
-        expect(callId).toMatch(UUID_PATTERN);
-        expect((turn.events[2] as { callId?: string }).callId).toBe(callId);
+        // No steering and no queue slot: a command is executed inline.
+        expect(receipt).not.toHaveProperty('steered');
+        expect(receipt).not.toHaveProperty('steered_thread_id');
+        expect(receipt).not.toHaveProperty('queue_position');
+        expect(receipt.turn_id).toMatch(UUID_PATTERN);
 
-        // Session scope: no thread, no lane, no usage (nothing was billed), and the
-        // session itself is still idle with no pending work.
-        expect(turn).not.toHaveProperty('threadId');
-        expect(turn).not.toHaveProperty('threadLabel');
+        // Durable turn metadata, read back over the canonical route: the counts replace
+        // the arrays the old aggregate carried, and no heavy member rides this read.
+        const turn = await readTurn(call, id, receipt.turn_id);
+
+        expect(turn).toEqual({
+            session_id: id,
+            id: receipt.turn_id,
+            index: 0,
+            status: 'done',
+            prompt: '/task add "testing"',
+            started_at: 2_000,
+            updated_at: 2_000,
+            event_count: 3,
+            event_time_count: 3,
+            attachment_count: 0,
+            steer_count: 0,
+            revision: hubRevision(runtime, 'turn', `${id}:${receipt.turn_id}`)
+        });
+
+        // Session scope: no thread, no label, no usage (nothing was billed).
+        expect(turn).not.toHaveProperty('thread_id');
+        expect(turn).not.toHaveProperty('thread_label');
         expect(turn).not.toHaveProperty('usage');
-        expect(accepted.body.session.status).toBe('idle');
-        expect(accepted.body.session.queueDepth).toBeUndefined();
-        expect(accepted.body.session.turns.map((record) => record.status)).toEqual(['done']);
+
+        // The synthesized events, verbatim and paired with their recorded times.
+        const rows = await allTurnEvents(call, id, receipt.turn_id);
+
+        expect(rows.map((row) => row.index)).toEqual([0, 1, 2]);
+        expect(rows.map((row) => row.at)).toEqual([2_000, 2_000, 2_000]);
+        expect(rows[0]!.event).toEqual({ type: 'start', agent: primary, model: 'scripted/test' });
+
+        // The synthesized call id is a real uuid and pairs the two frames exactly.
+        const callId = String((rows[1]!.event as { call: { id: string } }).call.id);
+
+        expect(rows[1]!.event).toEqual({
+            type: 'tool_call',
+            agent: primary,
+            call: {
+                id: callId,
+                name: 'command',
+                arguments: '{"input":"/task add \\"testing\\""}'
+            }
+        });
+        expect(rows[2]!.event).toEqual({
+            type: 'tool_result',
+            agent: primary,
+            name: 'command',
+            callId,
+            content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
+            isError: false,
+            outcome: 'completed'
+        });
+        expect(callId).toMatch(UUID_PATTERN);
+
+        // Session scope, stated through the turn rows as well: one terminal row only, and
+        // the session itself is idle with no pending work (store oracle — an accepted
+        // internal read, not a compatibility fixture).
+        const live = runtime.store.get(id);
+
+        expect(live.status).toBe('idle');
+        expect(live.queueDepth).toBeUndefined();
+        expect(live.turns.map((record) => record.status)).toEqual(['done']);
 
         // NO model request was made for a command turn.
         expect(fixture.requests).toEqual([]);
@@ -387,8 +442,12 @@ describe('POST /sessions/:id/tasks slash commands', () => {
             taskPage([{ id: '1', text: 'testing', completed: false }], 1, 0, 1)
         );
 
-        // The stored record equals the response copy: a reload renders the same turn.
-        expect(turnOf(runtime.store, id, turn.id)).toEqual(turn);
+        // The stored record equals what the wire promised: a reload renders the same turn.
+        const stored = turnOf(runtime.store, id, receipt.turn_id);
+
+        expect(stored).toMatchObject({ index: 0, prompt: '/task add "testing"', status: 'done' });
+        expect(stored.events).toEqual(rows.map((row) => row.event));
+        expect(stored.eventTimes).toEqual(rows.map((row) => row.at));
     });
 
     it('lists the added task in the next command turn through /task', async () => {
@@ -397,22 +456,29 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'instruct');
 
-        await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
-            input: '/task add "testing"'
-        });
+        // First command seeds the task store (transport: receipt, not an aggregate).
+        await submitTask(canonicalCall(runtime), id, { input: '/task add "testing"' });
 
-        const listed = jsonBody<{ turn: SessionTurn }>(
-            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: '/task' })
-        );
+        // Second command: `/task` re-reads the store, and the listing lands in the
+        // recorded `tool_result` — read back from the events route.
+        const listed = await submitTask(canonicalCall(runtime), id, { input: '/task' });
 
-        expect(listed.status).toBe(202);
-        expect(listed.body.turn.index).toBe(1);
-        expect(listed.body.turn.status).toBe('done');
-        expect(listed.body.turn.events[2]).toEqual({
+        expect(listed.status).toBe('done');
+        expect(listed.session_id).toBe(id);
+
+        const turn = await readTurn(canonicalCall(runtime), id, listed.turn_id);
+
+        expect(turn.index).toBe(1);
+        expect(turn.status).toBe('done');
+
+        const rows = await allTurnEvents(canonicalCall(runtime), id, listed.turn_id);
+        const callId = String((rows[1]!.event as { call: { id: string } }).call.id);
+
+        expect(rows[2]!.event).toEqual({
             type: 'tool_result',
             agent: primary,
             name: 'command',
-            callId: String((listed.body.turn.events[1] as { call: { id: string } }).call.id),
+            callId,
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
             isError: false,
             outcome: 'completed'
@@ -426,17 +492,19 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'instruct');
 
-        const help = jsonBody<{ turn: SessionTurn }>(
-            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: '/help' })
-        );
+        // `/help` — the answer is recorded verbatim on the events route (canonical
+        // transport); the domain expectation is the exact built-in inventory.
+        const help = await submitTask(canonicalCall(runtime), id, { input: '/help' });
+        const helpRows = await allTurnEvents(canonicalCall(runtime), id, help.turn_id);
+        const helpTurn = await readTurn(canonicalCall(runtime), id, help.turn_id);
 
         // Exact inventory of the five built-ins (core/command-builtins.ts renders
         // them sorted with their usage lines), so a registry regression is visible.
-        expect(help.body.turn.events[2]).toEqual({
+        expect(helpRows[2]!.event).toEqual({
             type: 'tool_result',
             agent: primary,
             name: 'command',
-            callId: String((help.body.turn.events[1] as { call: { id: string } }).call.id),
+            callId: String((helpRows[1]!.event as { call: { id: string } }).call.id),
             content: [
                 '/help  List the commands in this harness, or show one command.',
                 '  usage: /help [command]',
@@ -452,14 +520,14 @@ describe('POST /sessions/:id/tasks slash commands', () => {
             isError: false,
             outcome: 'completed'
         });
-        expect(help.body.turn.status).toBe('done');
+        expect(helpTurn.status).toBe('done');
 
-        const tools = jsonBody<{ turn: SessionTurn }>(
-            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: '/tools' })
-        );
+        const tools = await submitTask(canonicalCall(runtime), id, { input: '/tools' });
+        const toolRows = await allTurnEvents(canonicalCall(runtime), id, tools.turn_id);
+        const toolTurn = await readTurn(canonicalCall(runtime), id, tools.turn_id);
 
-        expect(tools.status).toBe(202);
-        expect(tools.body.turn.status).toBe('done');
+        expect(tools.status).toBe('done');
+        expect(toolTurn.status).toBe('done');
 
         // `/tools` renders one preview line per registered tool
         // (`<name> — <description, flattened and capped at 200 chars>`), so the
@@ -468,7 +536,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         // name list is asserted exactly; the description previews belong to the tools
         // themselves (already pinned by harness.commands.test.ts) and are not part of
         // this contract, except the fixture's own one-line tool, asserted verbatim.
-        const result = tools.body.turn.events[2] as {
+        const result = toolRows[2]!.event as {
             type: string;
             agent: string;
             name: string;
@@ -478,7 +546,6 @@ describe('POST /sessions/:id/tasks slash commands', () => {
             outcome: string;
         };
 
-        expect(result).toBeDefined();
         expect(result.type).toBe('tool_result');
         expect(result.agent).toBe(primary);
         expect(result.name).toBe('command');
@@ -486,7 +553,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         expect(result.outcome).toBe('completed');
         // Paired with the synthesized call by id, exactly like a model tool round.
         expect(result.callId).toMatch(UUID_PATTERN);
-        expect(result.callId).toBe((tools.body.turn.events[1] as { call: { id: string } }).call.id);
+        expect(result.callId).toBe((toolRows[1]!.event as { call: { id: string } }).call.id);
 
         const lines = result.content.split('\n');
 
@@ -518,25 +585,28 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'instruct');
 
-        const accepted = jsonBody<{
-            session: { status: string; lastError?: string };
-            turn: SessionTurn;
-        }>(await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: '/nope' }));
+        // Canonical transport: 202 + a receipt whose `status` is already `error`.
+        const receipt = await submitTask(canonicalCall(runtime), id, { input: '/nope' });
 
         // 202, NOT 4xx/5xx: an unknown name is an operator typo with an answer.
-        expect(accepted.status).toBe(202);
+        expect(receipt.session_id).toBe(id);
+        expect(receipt.status).toBe('error');
 
-        const turn = accepted.body.turn;
+        const turn = await readTurn(canonicalCall(runtime), id, receipt.turn_id);
 
         // `executeCommand` THROWS `unknown command: /nope` (src/harness.ts:7206); the
-        // store converts it into this error-shaped result rather than a 500.
-        expect(turn.events).toEqual([
+        // store converts it into this error-shaped result rather than a 500. The pair is
+        // verbatim on the events route.
+        const rows = await allTurnEvents(canonicalCall(runtime), id, receipt.turn_id);
+        const callId = String((rows[1]!.event as { call: { id: string } }).call.id);
+
+        expect(rows.map((row) => row.event)).toEqual([
             { type: 'start', agent: primary, model: 'scripted/test' },
             {
                 type: 'tool_call',
                 agent: primary,
                 call: {
-                    id: String((turn.events[1] as { call: { id: string } }).call.id),
+                    id: callId,
                     name: 'command',
                     arguments: '{"input":"/nope"}'
                 }
@@ -545,7 +615,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
                 type: 'tool_result',
                 agent: primary,
                 name: 'command',
-                callId: String((turn.events[1] as { call: { id: string } }).call.id),
+                callId,
                 content: 'unknown command: /nope',
                 isError: true,
                 outcome: 'failed'
@@ -553,9 +623,13 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         ]);
 
         expect(turn.status).toBe('error');
-        expect(accepted.body.session.status).toBe('idle');
+        expect(turn.event_count).toBe(3);
+
+        const live = runtime.store.get(id);
+
+        expect(live.status).toBe('idle');
         // A failed command must not raise the session-wide error banner a run owns.
-        expect(accepted.body.session.lastError).toBeUndefined();
+        expect(live.lastError).toBeUndefined();
         expect(fixture.requests).toEqual([]);
     });
 
@@ -832,37 +906,45 @@ describe('POST /sessions/:id/tasks slash commands', () => {
 
         // The command is accepted anyway: 202 with an ALREADY TERMINAL record, and the
         // backlog is exactly as full as it was (the command never entered it).
-        const accepted = jsonBody<{
-            session: { queueDepth?: number; status: string };
-            turn: SessionTurn;
-        }>(
-            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: '/task' })
-        );
+        // The command is accepted anyway: a receipt whose record is ALREADY terminal, and
+        // the backlog is exactly as full as it was (the command never entered it).
+        const accepted = await submitTask(canonicalCall(runtime), id, { input: '/task' });
 
-        expect(accepted.status).toBe(202);
-        expect(accepted.body.turn.status).toBe('done');
-        expect(accepted.body.turn).not.toHaveProperty('threadId');
-        expect(accepted.body.session.queueDepth).toBe(100);
+        expect(accepted.status).toBe('done');
+        // Session scope: the receipt names no conversation even though lanes are busy.
+        expect(accepted.thread_id).toBe('');
+        // The command took no queue slot: no position is reported for its turn.
+        expect(accepted).not.toHaveProperty('queue_position');
+
+        const turn = await readTurn(canonicalCall(runtime), id, accepted.turn_id);
+
+        expect(turn).toMatchObject({ status: 'done' });
+        expect(turn).not.toHaveProperty('thread_id');
+        expect(turn).not.toHaveProperty('thread_label');
+
         // The session is `running` because the parked legacy run still owns the gate —
         // the command neither started nor displaced anything.
-        expect(accepted.body.session.status).toBe('running');
+        expect(store.get(id).status).toBe('running');
+        expect(store.get(id).queueDepth).toBe(100);
 
         // The listing the empty task store answers (core/task.ts page shape rendered
-        // by core/command-builtins.ts `formatTaskPage`).
-        expect(accepted.body.turn.events[2]).toEqual({
+        // by core/command-builtins.ts `formatTaskPage`), verbatim on the events route.
+        const rows = await allTurnEvents(canonicalCall(runtime), id, accepted.turn_id);
+
+        expect(rows[2]!.event).toEqual({
             type: 'tool_result',
             agent: 'gated',
             name: 'command',
-            callId: String((accepted.body.turn.events[1] as { call: { id: string } }).call.id),
+            callId: String((rows[1]!.event as { call: { id: string } }).call.id),
             content: 'No tasks.\n0 total, 0 completed, 0 pending\npage: offset 0, limit 20, showing 0',
             isError: false,
             outcome: 'completed'
         });
 
         // Still no room for model work, and the command turn is terminal in the
-        // session as well as in the response.
+        // session as well as in the receipt.
         expect(store.get(id).queueDepth).toBe(100);
-        expect(turnOf(store, id, accepted.body.turn.id).status).toBe('done');
+        expect(turnOf(store, id, accepted.turn_id).status).toBe('done');
 
         // Release the parked run so the fixture cannot leak a live gate.
         await store.cancel(id, { all: true });

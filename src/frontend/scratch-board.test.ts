@@ -12,7 +12,29 @@
 
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { viewAwareFetch } from './view-test-support';
+import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
+import type { StreamDouble } from './view-test-support';
+
+// T24: the live case below drives the canonical `harness.v1` WebSocket (./stream.ts), and the
+// double is resolved by a DYNAMIC import. `vi.resetModules()` clears the module registry, so a
+// statically imported double would configure the PREVIOUS `./stream` instance while `main.ts`
+// — imported after the reset — dials a fresh singleton with no factory at all: the frames would
+// land nowhere (the discipline composer-agent-control.test.ts:24-39 follows). There is no SSE
+// fallback in the client (stream.ts:40-43), so a dead `GET /sessions/:id/events` stub is not a
+// substitute — production keeps the canonical route and the fixture follows it.
+const installLiveStream = (options: {
+    sessionId?: string;
+    snapshot?: () => SessionSnapshot | undefined;
+}): Promise<StreamDouble> =>
+    import('./view-test-support').then((support) => support.installHarnessStream(options));
+
+// The singleton is process-wide (./stream.ts:647), so the double is released through the SAME
+// module instance the shell used, or it leaks into the next file's boot.
+const releaseLiveStream = async (): Promise<void> => {
+    const { resetHarnessStream } = await import('./stream');
+
+    resetHarnessStream();
+};
 
 const SESSION_KEY = 'underload-harness-app:session';
 const T = 1_700_000_000_000;
@@ -159,9 +181,11 @@ beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
 });
 
-afterEach(() => {
+afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    // T38: release the stream double through the module instance the shell used.
+    await releaseLiveStream();
 });
 
 it('keeps a legacy editable:false preset fully editable and never says read-only', async () => {
@@ -439,18 +463,6 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
 });
 
 it('renders live tool_result.ui panels and keeps them across the terminal snapshot', async () => {
-    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-    const body = new ReadableStream<Uint8Array>({
-        start(streamController) {
-            controller = streamController;
-        }
-    });
-
-    const push = (items: readonly unknown[]): void => {
-        const text = items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join('');
-        controller?.enqueue(new TextEncoder().encode(text));
-    };
-
     const resultEvent = {
         type: 'tool_result' as const,
         agent: 'instruct',
@@ -469,18 +481,26 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
         events: [{ type: 'start', agent: 'instruct', model: 'm1' }, resultEvent]
     });
 
+    // The double must exist before the shell boots, or the client's subscription has no socket.
+    const live = await installLiveStream({ sessionId: 's1', snapshot: () => undefined });
+
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() });
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             const opening = { ...recorded, status: 'running' as const, events: [] };
+
             return json(
                 { session: snapshot({ status: 'running', turns: [opening] }), turn: opening },
                 202
             );
         }
-        if (url === '/api/sessions/s1/events') return new Response(body, { status: 200 });
+
+        // T24: there is no SSE route to stub any more — the live frames arrive over the
+        // canonical `harness.v1` socket double installed above, folded by the server's own
+        // projector, so the `tool_result` reaches the browser as the same `display.ops` frame
+        // a server sends (which is what ../view-state.ts `panelEntriesOf` reads).
         return undefined;
     });
 
@@ -492,9 +512,12 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
 
-    push([{ type: 'turn', turn: { ...recorded, status: 'running', events: [] } }]);
-    push([{ type: 'event', turnId: 't1', event: { type: 'start', agent: 'instruct', model: 'm1' } }]);
-    push([{ type: 'event', turnId: 't1', event: resultEvent }]);
+    live.push([
+        { type: 'turn', turn: { ...recorded, status: 'running', events: [] } },
+        { type: 'event', turnId: 't1', event: { type: 'start', agent: 'instruct', model: 'm1' } },
+        { type: 'event', turnId: 't1', event: resultEvent }
+    ]);
+    await flush();
     await flush();
 
     // LIVE: the panel is on the board while the turn runs, and the agent ring is
@@ -503,8 +526,8 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
     expect(panelText('scratch')).toEqual(['running now']);
     expect(ringActivity()).toBe('active');
 
-    push([{ type: 'snapshot', session: snapshot({ turns: [recorded] }) }]);
-    controller?.close();
+    live.push([{ type: 'snapshot', session: snapshot({ turns: [recorded] }) }]);
+    live.close();
     await flush();
     await flush();
 
@@ -551,21 +574,43 @@ it('derives panels from a polled snapshot without replaying old activity', async
     localStorage.setItem(SESSION_KEY, 'r1');
 
     let gets = 0;
+    // The record this fixture's routes serve. A poll is only meaningful when the server has
+    // MOVED on, so the test changes this value at the moment it says the run progressed; the
+    // `bumpFixtureEpoch` call below is what tells the shared composition memo about it.
+    let served = running;
     stubFetch((url) => {
         if (url === '/api') return json(bootstrap({ sessions: [running] }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/r1') {
             gets += 1;
-            return json({ session: gets < 2 ? running : polled });
+            return json({ session: served });
         }
         return undefined;
     });
+
+    // T50: the degraded host this test is about. `pollSession` is the fallback for a run the
+    // socket CANNOT carry (main.ts:8885), and `stream.ts` resolves its transport when the client
+    // is CREATED (stream.ts:193-199): with jsdom's `WebSocket` present the client dials a real
+    // socket and re-dials with backoff forever, so the observation never settles and polling
+    // would mean a second plane running next to a live connection — the pattern the R5
+    // performance rule forbids. No constructor at all is the honest statement of "this host has
+    // no sockets": ./view-shell.ts:485-490 and :589-604 then settle the observation immediately
+    // and the bounded re-read takes over on `POLL_INTERVAL_MS`. `afterEach` un-stubs it.
+    vi.stubGlobal('WebSocket', undefined);
 
     await import('./main');
     await vi.advanceTimersByTimeAsync(50);
 
     expect(gets).toBe(1);
     expect(host('scratch').hidden).toBe(true);
+
+    // The run progressed SERVER-SIDE: the next read answers the snapshot that carries the tool
+    // result. Nothing in this case goes through a write or a pushed frame (that is the point of a
+    // poll), so the fixture names the move — otherwise the composition memo answers the poll with
+    // the document the open already read and the panel never lands (./view-test-support.ts
+    // `bumpFixtureEpoch`).
+    served = polled;
+    bumpFixtureEpoch();
 
     // The poll's snapshot carries the tool result; the board follows it.
     await vi.advanceTimersByTimeAsync(1_000);

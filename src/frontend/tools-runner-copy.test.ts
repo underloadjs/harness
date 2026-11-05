@@ -188,23 +188,30 @@ it('copies the payload and the response separately, and sends the edited payload
     await flush();
 
     // Direct call: no sessionId (R7 — only a session-bound tool gets the temporary one).
-    expect(calls.find((call) => call.url === '/api/tools/read')).toEqual({
+    // `method: 'POST'` names the EXECUTION: opening a tool also spends one identified schema
+    // read (`GET /v1/harness/tools/{id}`, ../shared/harness-api.ts:654), which the double
+    // re-expresses from this same raw path.
+    expect(calls.find((call) => call.url === '/api/tools/read' && call.method === 'POST')).toEqual({
         url: '/api/tools/read',
         method: 'POST',
         body: { parameters: ['src/index.ts'] }
     });
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toHaveLength(0);
 
-    // The response box is the server's answer envelope, as JSON.
+    // The response box is the server's answer envelope, as JSON — in the CONTRACT's spelling,
+    // because the runner paints what the canonical call answered: `duration_ms`
+    // (../shared/harness-api.ts:712), not the raw surface's `durationMs`.
     const body = document.querySelector('.tool-output .card-body')?.textContent ?? '';
-    expect(JSON.parse(body)).toEqual({ ok: true, result: READ_RESULT, durationMs: 9 });
+    expect(JSON.parse(body)).toEqual({ ok: true, result: READ_RESULT, duration_ms: 9 });
     expect(document.querySelector('.tool-output .card-label')?.textContent).toBe('response · 9ms');
 
     // Copy RESPONSE: the answer, with no tool identity, no label decoration and no
-    // highlight spans.
+    // highlight spans — the same canonical envelope the box shows (`duration_ms`).
     copyButton('Copy response')?.click();
     await flush();
-    expect(writeText).toHaveBeenLastCalledWith(JSON.stringify({ ok: true, result: READ_RESULT, durationMs: 9 }, null, 2));
+    expect(writeText).toHaveBeenLastCalledWith(
+        JSON.stringify({ ok: true, result: READ_RESULT, duration_ms: 9 }, null, 2)
+    );
 
     // Copy PAYLOAD: the edited request, verbatim — not the preset it started from and
     // not re-serialized.
@@ -233,12 +240,14 @@ it('pressing a preset fills the editable box without calling the server', async 
         [...document.querySelectorAll<HTMLElement>('.tool-preset')].map((node) => node.getAttribute('aria-pressed'))
     ).toEqual(['false', 'true', 'false']);
 
-    // A preset is a fill, not a call: nothing but boot traffic happened.
-    // T5 R1: the catalogue embeds no conversations here, so boot also reads the compact
-    // directory index (`GET /views`). The double answers that route from this test's raw
-    // `/sessions` route, which is the URL its stub recorded — and no tool call was made,
-    // which is what this assertion exists to pin.
-    expect(calls.map((call) => call.url)).toEqual(['/api', '/api/models', '/api/sessions']);
+    // A preset is a fill, not a call: nothing was EXECUTED. The recorded log is the raw twin the
+    // test-only adapter re-expresses the canonical routes from (boot alone is a bounded set of
+    // service/config/catalogue/directory reads), so this names the operation that must be absent
+    // — an execution — instead of enumerating the double's probes.
+    expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === 'POST')).toEqual([]);
+    // The only traffic opening a tool costs is its ONE identified schema read, and pressing a
+    // preset after that costs nothing at all.
+    expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === undefined)).toHaveLength(1);
 });
 
 it('keeps an invalid draft untouched and reports it as a structured response', async () => {
@@ -251,8 +260,9 @@ it('keeps an invalid draft untouched and reports it as a structured response', a
     await flush();
     await flush();
 
-    // Nothing was sent: the payload never reached the server.
-    expect(calls.filter((call) => call.url === '/api/tools/read')).toHaveLength(0);
+    // Nothing was sent: the payload never reached the server. (`POST` is the execution; the one
+    // identified schema read an opened tool costs is not a call.)
+    expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === 'POST')).toHaveLength(0);
 
     // The draft is exactly as typed, so it can be corrected and re-sent.
     expect(argsBox().value).toBe(draft);

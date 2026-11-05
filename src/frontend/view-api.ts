@@ -54,6 +54,7 @@ import type {
     SessionResource,
     SessionUsageResponse,
     SessionDefinitionResource,
+    SessionStatePatch,
     SessionSummary,
     TaskReceipt,
     ThreadResource,
@@ -105,10 +106,13 @@ import {
     submitTask,
     updateSession,
     apiUrl,
+    descriptorOf,
     type Page,
     type PageQuery
 } from './api';
 import type { InvalidThreadRow, RawTurnDocument, SessionView, ThreadRow, TurnRowView } from './view-model';
+// The instance key the shell renders a conversation with (`ensureInstance`, ./main.ts).
+import type { HarnessDescriptor } from '../server/protocol';
 
 // Re-exported so the shell and the `ui/` renderers import the render model from the
 // facade that produces it, and there is one place to look for its shape.
@@ -155,6 +159,65 @@ export const sessionViewOf = (session: SessionResource): SessionView => ({
     turns: [],
     displays: {}
 });
+
+// A `session.updated` PATCH payload -> the shell's header patch (../shared/harness-api.ts
+// `SessionStatePatch`: status, queue depth, the live model map and the last error, plus the
+// revision the frame is ordered by). The frame ALREADY states every field a header patch may
+// change, so this mapping — not a re-read — is the authority: an extra `GET /sessions/:id`
+// costs a request the contract did not ask for, and on a deployment whose metadata route is
+// refused (or whose answer is an older document) it silently dropped the frame, which is how a
+// streamed failure left the pane's session note empty while its tile already read `error`.
+//
+// Only the fields the patch names are written. `applySessionPatch` (./view-state.ts:823)
+// merges exactly this set and never `turns`/`displays`/`olderCursor`, so a patch can never
+// wipe the rows a live board holds (T44).
+export const sessionPatchViewOf = (patch: SessionStatePatch): SessionView =>
+    ({
+        id: patch.id,
+        // The zero-row shape a header item must keep (`turns: []` is what makes it a patch and
+        // never a document — ./view-shell.ts:429), and every UNNAMED fact is omitted rather
+        // than invented, so `applySessionPatch` leaves it exactly as the live document holds it.
+        harness: '',
+        createdAt: 0,
+        updatedAt: 0,
+        turns: [],
+        displays: {},
+        revision: patch.revision,
+        ...(patch.status === undefined ? {} : { status: patch.status }),
+        ...(patch.model === undefined ? {} : { model: patch.model }),
+        ...(patch.queue_depth === undefined ? {} : { queueDepth: patch.queue_depth }),
+        ...(patch.last_error === undefined ? {} : { lastError: patch.last_error }),
+        ...(patch.agent_models === undefined ? {} : { agentModels: { ...patch.agent_models } })
+    }) as SessionView;
+
+// A directory ROW (`SessionSummary`) -> the shell's render record. THE normalizer, used by
+// both sources of the directory: the `GET /sessions` page (./view-shell.ts `listViews`) and
+// the boot document's embedded page (./main.ts boot).
+//
+// The contract is explicit that a row is metadata and counters with NO turns, no thread
+// roster, no frozen definition and no live model map (../shared/harness-api.ts:807-809),
+// while the shell reads ONE camelCase record for both a row and an opened conversation. This
+// is where that gap closes, once:
+//   - the stamps become `createdAt`/`updatedAt`, so `recencyOf` (main.ts:6809) ranks on the
+//     server's own figure and "open the latest session" means the latest USED conversation —
+//     a raw row left BOTH stamps `undefined` and every row tied at recency 0;
+//   - `queue_depth` becomes `queueDepth`, so `pendingOf` (main.ts:7350) recognizes a queue and
+//     a restored `running` conversation actually opens an observer instead of sitting idle;
+//   - the four fields only the identified read publishes are stated as "not reported"
+//     (0 / empty), never invented, and no rail control reads them;
+//   - `turns` stays the empty window `sessionViewOf` documents (view-api.ts:151-152): a row
+//     answers a COUNT, so nothing here claims a history this read never carried.
+export const sessionRowOf = (row: SessionSummary): SessionView =>
+    sessionViewOf({
+        ...row,
+        definition_revision: 0,
+        agent_models: {},
+        endpoint: { base_url: '', model: row.model, has_api_key: false },
+        runtime_execution: 'inline',
+        pending_action_count: 0,
+        created_tool_count: 0,
+        created_tool_limit: 0
+    });
 
 // A roster row renamed. Both `ThreadSummary` (page row) and `ThreadResource`
 // (identified read) satisfy this: the extra fields are copied only when present,
@@ -217,6 +280,20 @@ export const turnRowOf = (row: WireTurnSummary): TurnRowView => projectRow(row);
 // pointing further back.
 export const ascRows = (page: Page<WireTurnSummary>): TurnRowView[] =>
     [...page.items].reverse().map(projectRow);
+
+// ONE turn's compact row, re-read through the rows page. This is the bounded answer to
+// "the receipt named a turn but cannot describe it": a `TaskReceipt` is a closed DTO
+// (../shared/harness-api.ts) that states identity, placement and revisions only, so the
+// conversation label a brand-new thread carries and the steer text a folded submit added
+// live on the PROJECTED row and nowhere else. `GET .../turns/{turnId}` is the identified
+// metadata read (counts, verbatim prompt), but it is NOT a row — the tile consumes
+// `TurnSummary`, and one row page is the smallest read that yields it.
+export const readTurnRow = async (sessionId: string, turnId: string): Promise<TurnRowView | undefined> => {
+    const page = await listTurns(sessionId, { limit: TURNS_PAGE_LIMIT, order: 'desc' });
+    const row = page.items.find((item) => item.id === turnId);
+
+    return row === undefined ? undefined : turnRowOf(row);
+};
 
 // The optimistic row a submit paints before the server's `turn.upsert` lands. The
 // receipt carries identity, status, placement and revisions — NOT a display row —
@@ -789,12 +866,17 @@ export const readBlockDetail = async (
 ): Promise<InternalTurnBlockDetail> => {
     const block = await getBlockDetail(sessionId, turnId, blockId);
 
-    // Same rename the bar applies everywhere else: the wire's `label` is the render
-    // model's `name`, and `inPrompt` is not published (see ./display-project.ts).
+    // Same rule the BAR applies to every segment (./display-project.ts:309 `projectBlock`):
+    // the wire's `name` is the server-decided label (`read`, `delegate`, `answer`, ...),
+    // `label` is the older optional spelling, and `kind` is the last resort. Reading
+    // `label` FIRST dropped the recorded tool name and painted `tool · tool · ok`.
+    // `inPrompt` keeps the wire verdict when published, with the projector's total rule
+    // (./display-project.ts:312 — reasoning is never replayed) as the only fallback, so a
+    // thinking segment still answers "not replayed into the prompt" (./ui/context-detail.ts:212).
     return {
         ...block,
-        name: block.label ?? block.kind,
-        inPrompt: true
+        name: block.name ?? block.label ?? block.kind,
+        inPrompt: block.inPrompt ?? block.kind !== 'reasoning'
     } as InternalTurnBlockDetail;
 };
 
@@ -815,6 +897,40 @@ export const readTurnPrompt = async (sessionId: string, turnId: string): Promise
 // Frozen definition: the configuration panel's read, never the transcript path's.
 export const readDefinition = (sessionId: string): Promise<SessionDefinitionResource> =>
     getSessionDefinition(sessionId);
+
+// T46: an ARCHIVED conversation's frozen team, in the shape the shell keys an instance with
+// (`HarnessDescriptor`, ../server/protocol.ts:261). The canonical session DTO states only
+// `definition_revision` (`SessionResource`), so when the harness was DELETED after this
+// conversation started, the identified definition read is the only place the team, its
+// per-agent models and its tools still exist — and the reopen has to build the descriptor
+// from it. `descriptorOf` (./api.ts:1203) is the contract's existing definition -> view
+// mapper, so no field is re-derived here; `editable` is the protocol's compat flag, which
+// the registry always states as true. Deliberately cheap: the definition resource carries
+// the instruction OVERRIDE MAP, so no per-agent prompt read is pulled, and nothing is ever
+// written back to the harness registry (a deleted harness must not reappear as a row).
+export const frozenDescriptorOf = (definition: SessionDefinitionResource): HarnessDescriptor | undefined => {
+    const card = descriptorOf(definition);
+
+    // A definition without a name cannot describe a team: the shell would key an instance on
+    // an empty string and render the header of a harness that never existed.
+    if (typeof card.name !== 'string' || card.name.length === 0) return undefined;
+
+    return {
+        name: card.name,
+        title: card.title,
+        description: card.description,
+        requiresEndpoint: card.requiresEndpoint,
+        primary: card.primary,
+        subagents: [...card.subagents],
+        agents: [...card.agents],
+        tools: [...card.tools],
+        ...(card.coreTools === undefined ? {} : { coreTools: [...card.coreTools] }),
+        ...(card.agentModels === undefined ? {} : { agentModels: { ...card.agentModels } }),
+        ...(card.agentInstructions === undefined ? {} : { agentInstructions: { ...card.agentInstructions } }),
+        builtin: card.builtin,
+        editable: true
+    };
+};
 
 // Cost: the details dialog's read. The session header no longer carries a usage
 // figure at all, so a stale tab refreshes this rather than the whole document.
@@ -1030,14 +1146,27 @@ export const readRawTurns = async (
 
             const ordered = [...rows.entries()].sort((a, b) => a[0] - b[0]);
 
+            // The wire record is `TurnResource` (../shared/harness-api.ts:1609-1630): metadata
+            // plus counts, and the three figures an export quotes are spelled snake_case there —
+            // `thread_id`, `started_at`, `updated_at` — exactly as the server emits them
+            // (../server/api-reads.ts:314-317). Reading only the projector's camelCase names
+            // silently lost the turn's THREAD, so the transcript document attributed every turn to
+            // no conversation and the dialog showed an empty `turns` list. The camel spelling is
+            // still accepted (a turn resource that names it is the same fact, and
+            // ./view-api.test.ts:722 pins it).
+            const wire = metadata as unknown as Record<string, unknown>;
+            const threadId = (wire.thread_id ?? wire.threadId) as string | undefined;
+            const startedAt = (wire.started_at ?? wire.startedAt) as number | undefined;
+            const updatedAt = (wire.updated_at ?? wire.updatedAt) as number | undefined;
+
             documents.push({
                 id: metadata.id,
                 index: metadata.index,
                 prompt: metadata.prompt ?? '',
                 status: metadata.status,
-                ...(metadata.threadId === undefined ? {} : { threadId: metadata.threadId }),
-                ...(metadata.startedAt === undefined ? {} : { startedAt: metadata.startedAt }),
-                updatedAt: metadata.updatedAt,
+                ...(threadId === undefined ? {} : { threadId }),
+                ...(startedAt === undefined ? {} : { startedAt }),
+                updatedAt: updatedAt ?? metadata.updatedAt,
                 ...(metadata.usage === undefined ? {} : { usage: metadata.usage }),
                 events: ordered.map(([, row]) => row.event),
                 eventTimes: ordered.map(([, row]) => row.at)

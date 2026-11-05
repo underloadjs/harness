@@ -352,11 +352,13 @@ describe('startup and readiness', () => {
         expect(started.runtime.ioExecution).toBe('worker');
         expect(started.store.workerIoExecution).toBe(true);
 
-        const response = await fetch(`${started.url}/api/sessions`, {
+        // Canonical create: `POST {root}/sessions` -> 201 `{ session }` (./api.ts:282 for the
+        // root, ./api.ts:1963 for the route). The legacy `/api` mount 404s, and the
+        // `X-Harness-Client` gate was retired with it (./handler.ts:8-13) — the Origin policy
+        // is the boundary, and a Node fetch sends no Origin.
+        const response = await fetch(`${started.url}/v1/harness/sessions`, {
             method: 'POST',
-            // The standalone dispatcher answers a browser-shaped write only when the client
-            // identifies itself (see ./api.ts and the `X-Harness-Client` usage in server.test.ts).
-            headers: { 'content-type': 'application/json', 'X-Harness-Client': 'ui' },
+            headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ harness: 'instruct' })
         });
 

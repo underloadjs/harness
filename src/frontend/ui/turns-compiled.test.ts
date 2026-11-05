@@ -802,6 +802,60 @@ describe('the latest-request context through a document paint', () => {
         expect(tile.tokens()).toBe('200,000 (330,000)');
     });
 
+    it('paints the pair the ROOT section carries when the row that opened the tile carries none', () => {
+        // T47, the other half of the same parity rule. A submit paints its tile from the
+        // receipt row (`view-api.ts:258 rowFromReceipt`), which states identity, status and
+        // placement and NOTHING else — no `usage`, no `latestInput`, no `cachedInput`. The
+        // display tree the shell fetches for that same turn carries the pair on its root
+        // section TODAY (../server/turn-projector.ts:2247-2248, the wire's
+        // `TurnSection.latestInput`/`cachedInput`). Before this, only a DELEGATED row read
+        // its section's pair (`entry.meta` is undefined for the root, whose figures live on
+        // the tile's own `blockMeta`), so the tile stayed blank until a stamped row or a
+        // `usage` op happened to arrive — the live view and a reload disagreed.
+        const receipt = summary({ status: 'running', state: 'streaming' });
+        const opened = documentOf([receipt], {
+            t1: [rootSection({ state: 'streaming', model: 'm1', latestInput: 48, cachedInput: 0 })]
+        });
+        const { board } = mount();
+        const [tile] = board.hydrateView(opened);
+
+        tile.flush();
+
+        // EXACT: the section's own latest request, with the honest zero cache — the same
+        // string `main.test.ts` pins for the live tile at this point in a run.
+        expect(tile.tokens()).toBe('48 (0)');
+        expect(tile.element.querySelector('.tile-tokens')?.hidden).toBe(false);
+    });
+
+    it('lets the first stamped row replace a receipt row whose local stamp runs ahead', () => {
+        // T47, the clock-skew half. The receipt is stamped with `accepted_at` — the LOCAL
+        // clock — so on a machine running ahead of the server the tile's own monotonic guard
+        // (`setCompiledSummary`, which mirrors `view-state.ts:730 upsertSummary`) reads the
+        // FIRST authoritative row as late and drops it: the tile keeps the receipt's figures
+        // forever, prints no tally, and never leaves `queued`. A stamped row for the same id
+        // always replaces an optimistic one.
+        const { board } = mount();
+
+        const receipt = {
+            ...summary({ status: 'running', state: 'queued', updatedAt: T + 9_000_000 }),
+            optimistic: true
+        } as TurnSummary;
+
+        const handle = board.upsertView(receipt, documentOf([receipt], {}));
+
+        // Precondition: the optimistic tile really is the queued receipt with no figures.
+        expect(handle.element.dataset.state).toBe('queued');
+        expect(handle.tokens()).toBe('');
+
+        const authoritative = figures({ status: 'done', state: 'done', updatedAt: T + 3_600 });
+
+        board.upsertView(authoritative, documentOf([authoritative], {}));
+
+        expect(handle.element.dataset.state).toBe('done');
+        expect(handle.element.querySelector('.tile-status-text')?.textContent).toBe('done');
+        expect(handle.tokens()).toBe('200,000 (330,000)');
+    });
+
     it('restores each delegated row from the figures the document carries', () => {
         // A nested invocation prints its OWN pair (R1): the child's latest request and the
         // child's own cumulative cached, never the turn's. The projector mirrors both onto

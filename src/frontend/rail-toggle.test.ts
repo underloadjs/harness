@@ -43,6 +43,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
@@ -97,16 +98,24 @@ afterEach(() => {
 
 // Boot main.ts against the stub. Every request the shell makes on load is answered
 // here; anything else throws so a new boot request cannot pass silently.
+//
+// T45: the body stays the compact legacy fixture because that is the cheapest way to
+// describe a server, but the shell now dials the canonical control plane (`/v1/harness`,
+// `/config`, one page per catalogue). `viewAwareFetch` (./view-test-support.ts) re-acts
+// those routes from this same document, so the harness card in `presets` actually
+// renders as a `.harness-item` row — which is what the drawer-dismissal test below
+// clicks. Without the adapter the shell boots with no directory and every rail
+// interaction that needs a real row reads an empty list.
 const boot = async (): Promise<HTMLElement> => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') return json(bootstrap);
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }, { root: '/api' }))
     );
 
     await import('./main');

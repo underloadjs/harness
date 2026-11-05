@@ -15,6 +15,31 @@ import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
 
+// T47: the live transport. The shell follows a conversation over ONE `harness.v1`
+// WebSocket (./view-shell.ts `observeView` → ./stream.ts), and stream.ts:40-43 states there
+// is NO SSE path in the client. The `/events` route below stays in the fixture only because
+// a strict stub must keep answering a route a legacy embedder may still ask for; a live
+// frame reaches the shell through the socket double, which bridges the raw `SessionStreamItem`
+// through the SERVER's own projector (./view-test-support `installHarnessStream`).
+//
+// The double is installed through a DYNAMIC import, exactly as the canonical live suite does
+// (./canonical-directory-live-main.test.ts:34-52): `vi.resetModules()` clears the registry, so
+// a statically imported double would configure the PREVIOUS `./stream` instance while `main`
+// dials a fresh singleton with no factory at all.
+import type { HarnessStreamOptions, StreamDouble } from './view-test-support';
+
+const installLiveStream = (options: HarnessStreamOptions): Promise<StreamDouble> =>
+    import('./view-test-support').then((support) => support.installHarnessStream(options));
+
+// The twin of that import: the stream singleton is process-wide (./stream.ts:647), so the
+// double is released through the SAME module instance the shell used, or it leaks into the
+// next file's boot.
+const releaseLiveStream = async (): Promise<void> => {
+    const { resetHarnessStream } = await import('./stream');
+
+    resetHarnessStream();
+};
+
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
@@ -106,19 +131,49 @@ const targetHidden = (): boolean => byClass('.composer-target', 'p').hidden;
 
 type Stub = {
     sessions: Map<string, SessionSnapshot>;
+    // The record each conversation's LAST read answered — the document the client holds. A
+    // pushed `snapshot` frame is diffed against it (that is what makes the wire publish
+    // `turn.removed`/`thread.removed` for a server-side delete), while `sessions` is the
+    // record the NEXT read must answer.
+    wire: Map<string, SessionSnapshot>;
     tasks: Array<{ sessionId: string; body: Record<string, unknown> }>;
     emit: (sessionId: string, item: unknown) => void;
     holdTasks: boolean;
     release: () => void;
     failTasks?: string;
+    // The socket the shell dialed (see the note at the top of this file).
+    stream?: StreamDouble;
 };
 
-const stubServer = (sessions: SessionSnapshot[], options: { holdTasks?: boolean } = {}): Stub => {
+const stubServer = async (sessions: SessionSnapshot[], options: { holdTasks?: boolean } = {}): Promise<Stub> => {
     const streams = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
     const stub: Stub = {
         sessions: new Map(sessions.map((session) => [session.id, session])),
+        wire: new Map(sessions.map((session) => [session.id, session])),
         tasks: [],
+        // A live frame is pushed on the WebSocket the shell actually holds; the double routes
+        // it to the newest session-scope subscription, which is the conversation the shell is
+        // watching after a switch. A frame for a conversation the shell left is dropped by
+        // `onViewItem`'s own session guard — the same guard the real server's routing implies.
         emit: (sessionId, item) => {
+            if (stub.sessions.get(sessionId) === undefined) return;
+
+            // A `snapshot`/`failed` frame IS the record now: the same document the REST routes
+            // serve. The fold therefore happens BEFORE the push (the removal frame triggers a
+            // window re-read, and that read has to answer the document that no longer names the
+            // deleted row — otherwise the frame and REST disagree and the row comes straight
+            // back), while `wire` keeps the pre-frame record so the double can still see which
+            // ids this document dropped. `turn`/`event` frames are row patches, not documents,
+            // so they move nothing here.
+            const frame = item as { type?: string; session?: SessionSnapshot };
+            if ((frame.type === 'snapshot' || frame.type === 'failed') && frame.session !== undefined) {
+                stub.wire.set(sessionId, stub.sessions.get(sessionId) as SessionSnapshot);
+                stub.sessions.set(sessionId, frame.session);
+            }
+
+            stub.stream?.push(item);
+            // The legacy SSE body stays wired for a host that still opens it, so a frame is
+            // also visible to anything reading that route.
             streams.get(sessionId)?.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
         },
         holdTasks: options.holdTasks === true,
@@ -204,6 +259,13 @@ const stubServer = (sessions: SessionSnapshot[], options: { holdTasks?: boolean 
         }, { root: '/api' }))
     );
 
+    // Installed here, BEFORE any case imports `./main`, so the shell's first
+    // `harnessStream()` call captures this factory instead of the browser socket.
+    // `record` is the live per-conversation document: the double diffs a pushed `snapshot`
+    // frame against it (that is what produces `turn.removed`/`thread.removed`), and `emit`
+    // folds the frame into it so the re-read those frames cause answers the same record.
+    stub.stream = await installLiveStream({ record: (id) => stub.wire.get(id) });
+
     return stub;
 };
 
@@ -225,13 +287,16 @@ beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
 });
 
-afterEach(() => {
+afterEach(async () => {
     vi.unstubAllGlobals();
+    // The stream singleton is process-wide (./stream.ts:647): leaving this file's double
+    // configured hands the next test file's shell a socket that was never its own.
+    await releaseLiveStream();
 });
 
 it('does not poison the next session with the previous session thread ids (N1)', async () => {
     localStorage.setItem(SESSION_KEY, 's1');
-    const stub = stubServer([
+    const stub = await stubServer([
         snapshot({
             id: 's1',
             // T21 R21: a first load opens the newest conversation, and this test starts
@@ -315,7 +380,7 @@ it('does not poison the next session with the previous session thread ids (N1)',
 
 it('keeps a live turn that an older snapshot no longer lists (N2)', async () => {
     localStorage.setItem(SESSION_KEY, 's2');
-    const stub = stubServer([
+    const stub = await stubServer([
         snapshot({
             id: 's2',
             status: 'running',
@@ -362,7 +427,7 @@ it('keeps a live turn that an older snapshot no longer lists (N2)', async () => 
 
 it('does not restore a # chip whose target was deleted while the submit was in flight (N3)', async () => {
     localStorage.setItem(SESSION_KEY, 's2');
-    const stub = stubServer(
+    const stub = await stubServer(
         [
             // `status: 'running'` keeps the session pending with NO running turn, which
             // is what opens the observer stream (openSession -> startWatching). Without
@@ -398,7 +463,7 @@ it('does not restore a # chip whose target was deleted while the submit was in f
             body: {
                 input: '#IN1 follow up',
                 references: [{ turnId: 'turn-1', label: 'IN1' }],
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             }
         }
     ]);
@@ -443,7 +508,7 @@ it('does not restore a # chip whose target was deleted while the submit was in f
             body: {
                 input: '#IN1 follow up',
                 references: [{ turnId: 'turn-1', label: 'IN1' }],
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             }
         }
     ]);
@@ -480,7 +545,7 @@ it('does not restore a # chip whose target was deleted while the submit was in f
             body: {
                 input: '#IN1 follow up',
                 references: [{ turnId: 'turn-1', label: 'IN1' }],
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             }
         }
     ]);
@@ -497,7 +562,7 @@ it('does not restore a # chip whose target was deleted while the submit was in f
             body: {
                 input: '#IN1 follow up',
                 references: [{ turnId: 'turn-1', label: 'IN1' }],
-                threadId: 'thread-1'
+                thread_id: 'thread-1'
             }
         },
         {

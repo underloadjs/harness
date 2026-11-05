@@ -375,11 +375,11 @@ it('leaves the arguments editable and executes nothing on selection', async () =
         '}'
     ]);
 
-    // No tool call was made: only the boot document and the model catalogue.
-    // T5 R1: the catalogue embeds no conversations here, so boot also reads the compact
-    // directory index (`GET /views`). The double answers that route from this test's raw
-    // `/sessions` route, which is the URL its stub recorded — and no tool call was made,
-    // which is what this assertion exists to pin.
-    expect(calls.map((call) => call.url)).toEqual(['/api', '/api/models', '/api/sessions']);
-    expect(calls.some((call) => call.url.startsWith('/api/tools/'))).toBe(false);
+    // No tool call was made: the runner spent its ONE identified schema read (`GET
+    // /v1/harness/tools/{id}` — the route that carries `parameters`, ../shared/harness-api.ts:654)
+    // and nothing else. T5 R1: the catalogue embeds no conversations, so boot also reads the
+    // compact directory index, which the double answers from this test's raw `/sessions` route.
+    // What this assertion pins is that SELECTING a tool executes nothing.
+    expect(calls.filter((call) => call.url.startsWith('/api/tools/') && call.method === 'POST')).toEqual([]);
+    expect(calls.some((call) => call.url.includes('/executions'))).toBe(false);
 });

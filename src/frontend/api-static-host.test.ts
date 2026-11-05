@@ -19,28 +19,63 @@
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+    HARNESS_PAGE_LIMIT,
+    HARNESS_SERVICE_CAPABILITIES,
+    HARNESS_SERVICE_LIMITS
+} from '../shared/harness-api';
 import { LOCAL_AREA_NETWORK_HOST_NAME, STATIC_API_CANDIDATES, isStaticPagesHost } from './deployment';
 
-const descriptor = {
+// One harness definition, as the canonical `GET /harnesses` page publishes it: the
+// contract's resources are snake_case (../shared/harness-api.ts), so the card spells
+// `requires_endpoint`/`definition_revision` and the shell's `descriptorOf`
+// (./api.ts:1203) is what turns it back into the camelCase view the UI renders.
+const card = {
+    name: 'demo',
+    title: 'Demo',
+    description: 'demo preset',
+    requires_endpoint: false,
+    primary: 'demo',
+    subagents: [],
+    agents: ['writer'],
+    tools: [],
+    builtin: true,
+    definition_revision: 1
+};
+
+// The exact view `descriptorOf(card)` produces — the value `loadBootstrap().presets`
+// must carry when the boot documents came from the probed gateway.
+const cardView = {
     name: 'demo',
     title: 'Demo',
     description: 'demo preset',
     requiresEndpoint: false,
+    primary: 'demo',
+    subagents: [],
     agents: ['writer'],
-    tools: []
+    tools: [],
+    builtin: true,
+    definitionRevision: 1
 };
 
-const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
-
-const bootstrapBody = { rootPath: 'D:/repo', presets: [descriptor], tools: [], defaults, sessions: [] };
+const defaults = { base_url: 'http://provider/v1', model: 'm1', has_api_key: false };
 
 const json = (value: unknown, status = 200): Response =>
     new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
 
-// Stand in for the gateway(s) a Pages page may dial. Every root in `live` answers
-// its health probe and its bootstrap document; every other URL — including a root
-// that is NOT live — rejects the way an unlistened port or a blocked mixed-content
-// request does, with a network error rather than an HTTP status.
+// One page of a canonical collection (shared/harness-api.ts page envelope: `items`,
+// `limit`, `next_cursor`, `observed_at`, `revision`). Every catalogue here is empty
+// except the harness list, because the assertion is about WHICH root answered.
+const pageOf = <T>(items: T[]): Response =>
+    json({ items, limit: HARNESS_PAGE_LIMIT.default, next_cursor: null, observed_at: 1_700_000_000_000, revision: 1 });
+
+// Stand in for the gateway(s) a Pages page may dial. Every root in `live` answers its
+// health probe and the whole boot control plane the shell dials on that root (the
+// service document, the global config and one page per catalogue — ./api.ts
+// `loadBootstrap`); every other URL — including a root that is NOT live — rejects the
+// way an unlistened port or a blocked mixed-content request does, with a network error
+// rather than an HTTP status. A path the gateway knows nothing about still gets the
+// service's own 404, so a request aimed at the wrong root cannot pass silently.
 const stubGateways = (live: readonly string[]): string[] => {
     const calls: string[] = [];
 
@@ -60,7 +95,33 @@ const stubGateways = (live: readonly string[]): string[] => {
                 return json({ ok: true, sessions: 0 });
             }
 
-            if (url === root) return json(bootstrapBody);
+            // The page reads carry `?limit=25` (./api.ts `pageParams`); the ROUTE is what
+            // this stub dispatches on, so the query is dropped before matching.
+            const path = url.slice(root.length).split('?')[0];
+
+            if (path === '') {
+                return json({
+                    api_root: root,
+                    service: 'harness',
+                    api_version: 'v1',
+                    server_time: 1_700_000_000_000,
+                    epoch: 'test-epoch',
+                    capabilities: HARNESS_SERVICE_CAPABILITIES,
+                    limits: HARNESS_SERVICE_LIMITS,
+                    links: {}
+                });
+            }
+
+            if (path === '/config') {
+                return json({
+                    defaults,
+                    writable_fields: ['settings.base_url', 'settings.model', 'settings.api_key'],
+                    revision: 1
+                });
+            }
+
+            if (path === '/harnesses') return pageOf([card]);
+            if (path === '/tools' || path === '/agents' || path === '/sessions') return pageOf([]);
 
             return json({ error: { message: 'Unknown API route.' } }, 404);
         })
@@ -121,12 +182,34 @@ describe('ensureApiRoot on a Pages host', () => {
         expect(root).toBe(live);
         expect(module.API_ROOT).toBe(live);
 
-        // Probed in order, and every later request follows the winner.
+        // Probed in order: the first candidate refused, the second answered.
         expect(calls).toEqual([`${STATIC_API_CANDIDATES[0]}/health`, `${live}/health`]);
 
         const bootstrap = await module.loadBootstrap();
 
-        expect(bootstrap.presets).toEqual([descriptor]);
+        expect(bootstrap.presets).toEqual([cardView]);
+        expect(bootstrap.defaults).toEqual(defaults);
+
+        // T17: the boot is one round of canonical control-plane reads (service document,
+        // global config, one page per catalogue), and EVERY one of them is dialled on the
+        // root the probe pinned — not on github.io, and not on the candidate that never
+        // answered. The chain is walked again inside `loadBootstrap` (./api.ts:1297),
+        // because `ensureApiRoot` re-walks rather than memoising; the second walk stops at
+        // the same winner, so no request below ever leaves `live`.
+        expect(calls.filter((call) => call.endsWith('/health'))).toEqual([
+            `${STATIC_API_CANDIDATES[0]}/health`,
+            `${live}/health`,
+            `${STATIC_API_CANDIDATES[0]}/health`,
+            `${live}/health`
+        ]);
+        expect(calls.filter((call) => !call.endsWith('/health'))).toEqual([
+            live,
+            `${live}/config`,
+            `${live}/harnesses?limit=${HARNESS_PAGE_LIMIT.default}`,
+            `${live}/tools?limit=${HARNESS_PAGE_LIMIT.default}`,
+            `${live}/agents?limit=${HARNESS_PAGE_LIMIT.default}`,
+            `${live}/sessions?limit=${HARNESS_PAGE_LIMIT.default}`
+        ]);
         expect(calls).toContain(live);
     });
 

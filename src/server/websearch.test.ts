@@ -1,7 +1,7 @@
 // Websearch over the real HTTP API.
 //
-// C1 fixes a specific gap: `GET /api/tools` must list search even on a host
-// with no provider key, `POST /api/tools/search` must explain that honestly,
+// C1 fixes a specific gap: the tool catalogue must list search even on a host
+// with no provider key, a direct execution must explain that honestly,
 // and with EXA_API_KEY in the process environment the same endpoint must execute
 // with the server-side key. Both cases run against a real server on an ephemeral
 // port; the configured case intercepts only the outbound Exa request, so no
@@ -13,39 +13,75 @@
 //
 // Environment values are stubbed per test, which also proves the catalogue is
 // built when the server starts (after `.env` loading), not at module import.
+//
+// ---------------------------------------------------------------------------
+// CANONICAL SURFACE (the `/api` mount is gone — T13 removed the second mount)
+//
+// One root only: `STANDALONE_MOUNT = HARNESS_API_ROOT = '/v1/harness'`
+// (./api.ts:282, and dispatch refuses any other mount with a 404 that NAMES the
+// root, ./api.ts:3928). Routes and payload shapes come from the generated
+// contract (../shared/harness-api.ts), so the three reads this file needs are:
+//   - `GET  {root}/tools`                     -> `ToolSummaryPage`
+//       `{ limit, next_cursor, observed_at, revision, items }` (./api-paging.ts:142,
+//       handler ./api.ts:1791). A row is a `ToolSummary` (./api-reads.ts:1091):
+//       identity + availability + `session_bound`, and the argument schema does NOT
+//       ride a row.
+//   - `GET  {root}/tools/{name}`              -> `{ tool: ToolDetail }`
+//       the row PLUS `parameters` and `execution` (./api-reads.ts:1116, ./api.ts:1821).
+//       That identified read is where the schema assertions live now.
+//   - `POST {root}/tools/{name}/executions`   -> `ToolCallResult`
+//       body `{ parameters }`; both outcomes are 200 and the duration field is the
+//       contract's snake_case `duration_ms` (./api.ts:1835, :591, ./api-reads.ts:1253).
+//
+// The legacy `X-Harness-Client: ui` header gate was retired with the old mount
+// (./handler.ts:8-13): the Origin policy is the boundary, and a Node `fetch` sends
+// no Origin, so these requests carry no client header.
+// ---------------------------------------------------------------------------
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
 import { WEB_SEARCH_METADATA } from '../harness';
 import { startHarnessServer } from './index';
-import type { ToolCallResult, ToolIndex } from './protocol';
+import type { ToolCallResult, ToolDetailResponse, ToolSummaryPage } from '../shared/harness-api';
 
-const CLIENT = { 'X-Harness-Client': 'ui' };
+// The one canonical API root (see the header above).
+const API = '/v1/harness';
 
-const toolsIndex = async (base: string): Promise<ToolIndex> => {
-    const response = await fetch(`${base}/api/tools`, { headers: CLIENT });
+// Catalogue pages are bounded (default 25, cap 100 — ./api-paging.ts), and core entries
+// are concatenated BEFORE the deployment catalogue (./api.ts:750). Asking for the cap
+// keeps `search` — a core entry — on the first page no matter how many created tools the
+// host carries, which is what "the catalogue lists search" has to mean.
+const toolsPage = async (base: string): Promise<ToolSummaryPage> => {
+    const response = await fetch(`${base}${API}/tools?limit=100`);
     expect(response.status).toBe(200);
-    return (await response.json()) as ToolIndex;
+    return (await response.json()) as ToolSummaryPage;
+};
+
+// The identified read is the only one that carries the argument schema.
+const toolDetail = async (base: string, name: string): Promise<ToolDetailResponse> => {
+    const response = await fetch(`${base}${API}/tools/${name}`);
+    expect(response.status).toBe(200);
+    return (await response.json()) as ToolDetailResponse;
 };
 
 const callTool = async (base: string, name: string, parameters: unknown): Promise<ToolCallResult> => {
-    const response = await fetch(`${base}/api/tools/${name}`, {
+    const response = await fetch(`${base}${API}/tools/${name}/executions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...CLIENT },
+        headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ parameters })
     });
 
-    // A tool failure is data on a 200, like every other direct call.
+    // A tool failure is data on a 200, like every other execution (./api.ts:1863).
     expect(response.status).toBe(200);
     return (await response.json()) as ToolCallResult;
 };
 
-// `durationMs` is genuinely wall-clock; compare every other field exactly and
+// `duration_ms` is genuinely wall-clock; compare every other field exactly and
 // assert the duration is a number instead of inventing a bound.
-const withoutDuration = (result: ToolCallResult): Omit<ToolCallResult, 'durationMs'> => {
-    expect(typeof result.durationMs).toBe('number');
+const withoutDuration = (result: ToolCallResult): Omit<ToolCallResult, 'duration_ms'> => {
+    expect(typeof result.duration_ms).toBe('number');
 
-    const { durationMs: _durationMs, ...payload } = result;
+    const { duration_ms: _durationMs, ...payload } = result;
     return payload;
 };
 
@@ -65,21 +101,45 @@ describe('search catalogue', () => {
         const server = await startHarnessServer({ port: 0, staticRoot: null });
 
         try {
-            const index = await toolsIndex(server.url);
-            const descriptor = index.tools.find((tool) => tool.name === 'search');
+            // A catalogue ROW: identity plus the honest availability block. `parameters`
+            // is not on a row (./api-reads.ts:1091), so the schema check reads the detail
+            // route below instead.
+            const page = await toolsPage(server.url);
+            const row = page.items.find((tool) => tool.name === 'search');
 
-            expect(descriptor).toEqual({
+            expect(row).toEqual({
                 name: 'search',
                 group: 'Web search',
                 description: WEB_SEARCH_METADATA.description,
                 tags: ['web', 'search', 'internet', 'news', 'research'],
                 visibility: 'core',
-                parameters: WEB_SEARCH_METADATA.parameters,
                 availability: {
                     state: 'unconfigured',
                     environment: [...WEBSEARCH_ENVIRONMENT],
                     hint: WEBSEARCH_UNCONFIGURED_HINT
-                }
+                },
+                session_bound: false
+            });
+
+            // The identified read is the same row PLUS the schema and the execution gate.
+            // `manual: false` is the honest answer for a listed-but-keyless tool: the
+            // entry has no implementation to run (./api.ts:1860).
+            const detail = await toolDetail(server.url, 'search');
+
+            expect(detail.tool).toEqual({
+                name: 'search',
+                group: 'Web search',
+                description: WEB_SEARCH_METADATA.description,
+                tags: ['web', 'search', 'internet', 'news', 'research'],
+                visibility: 'core',
+                availability: {
+                    state: 'unconfigured',
+                    environment: [...WEBSEARCH_ENVIRONMENT],
+                    hint: WEBSEARCH_UNCONFIGURED_HINT
+                },
+                session_bound: false,
+                parameters: WEB_SEARCH_METADATA.parameters,
+                execution: { scope: 'global', manual: false }
             });
 
             const result = await callTool(server.url, 'search', { query: 'anything' });
@@ -133,14 +193,14 @@ describe('search catalogue', () => {
         try {
             // Fetch the raw body as text so the assertion covers the *entire*
             // payload: no field, nested or not, may contain the credential.
-            const toolsResponse = await fetch(`${server.url}/api/tools`, { headers: CLIENT });
+            const toolsResponse = await fetch(`${server.url}${API}/tools?limit=100`);
             const toolsBody = await toolsResponse.text();
             expect(toolsBody).not.toContain(KEY);
 
-            const index = JSON.parse(toolsBody) as ToolIndex;
-            const descriptor = index.tools.find((tool) => tool.name === 'search');
+            const page = JSON.parse(toolsBody) as ToolSummaryPage;
+            const row = page.items.find((tool) => tool.name === 'search');
 
-            expect(descriptor?.availability).toEqual({
+            expect(row?.availability).toEqual({
                 state: 'available',
                 environment: [...WEBSEARCH_ENVIRONMENT]
             });
@@ -229,21 +289,28 @@ describe('search catalogue', () => {
         const server = await startHarnessServer({ port: 0, staticRoot: null });
 
         try {
-            const toolsResponse = await fetch(`${server.url}/api/tools`, { headers: CLIENT });
+            const toolsResponse = await fetch(`${server.url}${API}/tools?limit=100`);
             const toolsBody = await toolsResponse.text();
             expect(toolsBody).not.toContain(KEY);
 
-            const index = JSON.parse(toolsBody) as ToolIndex;
-            const descriptor = index.tools.find((tool) => tool.name === 'search');
+            const page = JSON.parse(toolsBody) as ToolSummaryPage;
+            const row = page.items.find((tool) => tool.name === 'search');
 
-            expect(descriptor?.availability).toEqual({
+            expect(row?.availability).toEqual({
                 state: 'available',
                 environment: [...WEBSEARCH_ENVIRONMENT]
             });
 
-            // Exactly one configured provider, so no `provider` argument is offered.
-            const properties = (descriptor?.parameters as { properties: Record<string, unknown> }).properties;
-            expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+            // Exactly one configured provider, so no `provider` argument is offered. The
+            // schema is on the identified read, never on a catalogue row.
+            const detail = await toolDetail(server.url, 'search');
+
+            expect(Object.keys((detail.tool.parameters as { properties: Record<string, unknown> }).properties)).toEqual([
+                'query',
+                'maxResults'
+            ]);
+            // A configured entry has a real implementation, so the gate says it can run.
+            expect(detail.tool.execution).toEqual({ scope: 'global', manual: true });
 
             const result = await callTool(server.url, 'search', { query: 'harness', maxResults: 3 });
 

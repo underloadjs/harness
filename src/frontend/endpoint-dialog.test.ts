@@ -157,7 +157,14 @@ const pastDebounce = async (): Promise<void> => {
     await flush();
 };
 
-type Call = { url: string; method: string; body: unknown };
+// `raw` is the request body as the CLIENT serialized it (the JSON string in `init.body`,
+// which `viewAwareFetch` forwards verbatim — see its note at ./view-test-support.ts:2695).
+// The parsed `body` cannot prove the WIRE spelling on its own: a camelCase key that
+// survived serialization would still parse into a differently-named property only after
+// the damage is done, and a `JSON.parse`/`JSON.stringify` round trip hides which bytes
+// were actually sent. Both are recorded so a test can pin the exact field names on the
+// wire (`POST /sessions` rejects anything outside its allow-list, ../server/api.ts:544).
+type Call = { url: string; method: string; body: unknown; raw?: string };
 
 // Every boot answers the same two reads; a test adds the session/task routes it needs.
 // An unmapped URL throws LOUDLY instead of letting a missing request masquerade as
@@ -170,8 +177,9 @@ const stub = (extra?: (url: string, method: string, body: unknown) => Response |
         vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method ?? 'GET';
-            const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
-            calls.push({ url, method, body });
+            const raw = init?.body === undefined ? undefined : String(init.body);
+            const body = raw === undefined ? undefined : JSON.parse(raw);
+            calls.push({ url, method, body, ...(raw === undefined ? {} : { raw }) });
 
             const handled = extra?.(url, method, body);
             if (handled !== undefined) return handled;
@@ -426,8 +434,12 @@ it('persists dialog edits to storage and fires one debounced catalogue refresh',
     const refreshes = modelCalls(calls);
     expect(refreshes).toHaveLength(modelsAtBoot + 1);
     expect(refreshes[modelsAtBoot]?.method).toBe('POST');
+    // T17: `POST /models` carries the contract's `RunnerSettingsInput`
+    // (../shared/harness-api.ts:369 — `base_url`/`api_key`, snake_case, write-only key).
+    // The camelCase spelling was the pre-canonical body; the settings the dialog shows are
+    // still exactly the pair that was typed, which is the behaviour this assertion pins.
     expect(refreshes[modelsAtBoot]?.body).toEqual({
-        settings: { baseURL: 'http://other/v1', apiKey: 'sk-test' }
+        settings: { base_url: 'http://other/v1', api_key: 'sk-test' }
     });
 
     // The refreshed catalogue repaints the SAME persistent dropdown and status line:
@@ -498,10 +510,32 @@ it('sends the dialog values to the session it creates next', async () => {
 
     const created = calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST');
     expect(created).toHaveLength(1);
+    // T-A: the `settings` block is the CONTRACT's snake_case `RunnerSettingsInput`
+    // (../shared/harness-api.ts:369-373), NOT the shell's camelCase `RunnerSettings`
+    // (../server/harnesses/types.ts:18-22). The server runs `requireKnownFields` over the
+    // allow-list `base_url, api_key, model` (../server/api.ts:504-510, :544) BEFORE it
+    // creates anything, so a camelCase body was a 400 on the FIRST submit of every new
+    // conversation: `Unknown field "baseURL". Allowed fields: base_url, api_key, model.`
+    // This is the spelling `POST /models` already sends (:437-443); only the WIRE changes
+    // — `localStorage` keeps the camelCase domain record (see :414-428).
     expect(created[0]?.body).toEqual({
         harness: 'instruct',
-        settings: { baseURL: 'http://other/v1', apiKey: 'sk-test', model: 'm2' }
+        settings: { base_url: 'http://other/v1', api_key: 'sk-test', model: 'm2' }
     });
+
+    // The whole-body `toEqual` above is ORDER-INSENSITIVE, so the field list is pinned
+    // separately: exactly these three keys, in the mapper's order, and no fourth one.
+    const createdSettings = (created[0]?.body as { settings: Record<string, string> }).settings;
+    expect(Object.keys(createdSettings)).toEqual(['base_url', 'api_key', 'model']);
+
+    // The serialized bytes, exact. `not.toContain` is the regression guard that survives a
+    // future mapper growing an additive field: the camelCase names may never appear on this
+    // request again, anywhere in it.
+    expect(created[0]?.raw).toBe(
+        '{"harness":"instruct","settings":{"base_url":"http://other/v1","api_key":"sk-test","model":"m2"}}'
+    );
+    expect(created[0]?.raw).not.toContain('baseURL');
+    expect(created[0]?.raw).not.toContain('apiKey');
 
     // The conversation really opened, so the drafted settings were the ones in use.
     expect(document.querySelectorAll('.tile')).toHaveLength(1);

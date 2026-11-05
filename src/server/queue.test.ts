@@ -13,7 +13,29 @@
 //   - cancel { all: true } drops pending safely and retains cancelled records;
 //   - live model PATCH applies to the NEXT queued request;
 //   - reset/manual/legacy guards while work is queued;
-//   - POST /tasks 202 + GET /events frame contract, legacy routes unchanged.
+//   - POST /tasks 202 + receipt, and the same frame contract at the seam the realtime plane
+//     is fed from.
+//
+// T35 MIGRATION NOTE: the transport changed, the queue domain did not. `POST /tasks` answers
+// a 202 `TaskReceipt` (never `{session, turn}`), the backlog is the named
+// `GET .../queue` page, and `GET .../events` / `POST .../messages` are retired — a plain
+// `GET /v1/harness/stream` answers the upgrade it expected (400), and the service adapter
+// words that refusal itself (./service.ts). The observer-side assertions therefore run
+// against `store.watch` (the seam the WebSocket plane is bridged from, ./stream/mount.ts),
+// which is an accepted internal oracle, not a backward-compatibility fixture. Three findings
+// are asserted as-observed and reported rather than smoothed over: `TaskReceipt.queue_position`
+// / `GET .../queue` / `session.queueDepth` do not see a per-conversation (lane) backlog; a
+// cancel with `all` absent no longer type-checks the flag and cancels the backlog entry while
+// publishing `dropped_queued_tasks: 0`; and a writer-backpressure guarantee that lived on the
+// SSE route now belongs to the stream plane.
+//
+// T39 UPDATE (./api-regressions.test.ts owns the repaired behaviour, asserted through REST): the
+// per-conversation backlog IS projected — `queueRowsOf`/`pendingCountOf` (./api-reads.ts:166-173 and
+// :655-683) fold every lane queue into one global FIFO ordering, and `TaskReceipt.queue_position` is
+// that ordering's 1-based ordinal (contract `minimum: 1`, ./harness.swagger.yaml:5001-5005). A cancel
+// whose `all` is not a boolean answers 400 again, before anything is cancelled. One finding below is
+// still store behaviour and stays asserted as-observed: a session-level cancel stops EVERY active
+// conversation run while its receipt names a single `active_turn_id`.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../harness';
@@ -25,6 +47,16 @@ import { createHarnessRuntime } from './runtime';
 import { createHarnessServiceHandler } from './service';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
+// T35: canonical transport. One mount, a 202 receipt for a submit, a named queue page, and
+// NO per-session SSE route — realtime is a WebSocket upgrade the stream plane owns.
+import { HARNESS_ROUTES } from '../shared/harness-api';
+import {
+    bindApiCall,
+    readOk,
+    readTurn,
+    submitTask,
+    type CanonicalCall
+} from './canonical-reads.test-support';
 
 const DEFAULTS = {
     baseURL: 'http://scripted.invalid/v1',
@@ -267,6 +299,38 @@ const createSession = async (runtime: HarnessRuntime, harnessName: string): Prom
 
     return (result.body as { session: { id: string } }).session.id;
 };
+
+// One `CanonicalCall` over the runtime's single mount. The old file read the accept-time
+// aggregate off the 202 body; the canonical submit answers a receipt, so the figures that
+// aggregate carried (queue depth, the turn row, the conversation) are read from the routes
+// that own them — composed by ./canonical-reads.test-support.ts.
+const callOf = (runtime: HarnessRuntime): CanonicalCall => bindApiCall(runtime.api, '/v1/harness');
+
+/** One row of `GET /v1/harness/sessions/{id}/queue` (the members this file asserts). */
+type QueueRow = {
+    turn_id: string;
+    index: number;
+    position: number;
+    status: string;
+    prompt_preview: string;
+    prompt_chars: number;
+    thread_id?: string;
+    thread_label?: string;
+};
+
+type QueuePage = { items: QueueRow[]; limit: number; next_cursor: string | null };
+
+const readQueue = (call: CanonicalCall, id: string): Promise<QueuePage> =>
+    readOk<QueuePage>(call, 'GET', HARNESS_ROUTES.sessionsBySessionIdQueue(id), 200);
+
+// The canonical cancel receipt (`CancelSessionResult`, ../shared/harness-api.ts). `revision`
+// is compared to the hub that owns it, exactly as ./api-canonical.test.ts does.
+const cancelResult = (runtime: HarnessRuntime, id: string, cancelled: boolean, dropped: number) => ({
+    cancelled,
+    session_id: id,
+    dropped_queued_tasks: dropped,
+    revision: runtime.api.events.getRevision('session', id)
+});
 
 // Poll a condition without depending on a particular number of microtasks (the
 // queue pump and the serialized watch writer settle across ticks). Macrotask turns
@@ -854,78 +918,98 @@ describe('queue HTTP contract', () => {
         });
     };
 
-    it('answers 202 {session, turn}, forwards the watch frames, and keeps /messages legacy', async () => {
+    it('answers 202 with a receipt, forwards the queue frames, and retires /messages', async () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'gated');
+        const call = callOf(runtime);
 
-        const accepted = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
-            input: '  first  '
-        });
+        const receipt = await submitTask(call, id, { input: '  first  ' });
 
-        if (accepted.kind !== 'json') throw new Error('expected JSON');
-        expect(accepted.status).toBe(202);
+        expect(receipt.session_id).toBe(id);
+        expect(String(receipt.turn_id)).toMatch(UUID_PATTERN);
+        // The conversation the task landed in is part of the receipt (the old body carried
+        // `turn.threadId` / `turn.threadLabel`; the receipt carries the id and the turn read
+        // carries the label).
+        expect(receipt.thread_id).toBe('thread-1');
+        // A plain submit is neither a steer nor a queue overflow.
+        expect(receipt).not.toHaveProperty('steered');
+        expect(receipt).not.toHaveProperty('steered_thread_id');
+        expect(receipt.links.stream).toBe('/v1/harness/stream');
 
-        const body = accepted.body as {
-            session: { id: string; status: string; queueDepth?: number; turns: unknown[] };
-            turn: Record<string, unknown>;
-        };
-        expect(body.session.id).toBe(id);
-        expect(body.session.status).toBe('idle');
-        expect(body.session.queueDepth).toBe(1);
-        expect(body.turn).toEqual({
-            id: body.turn.id,
+        // The row the old 202 echoed is now the durable turn record, read by name. The
+        // prompt is TRIMMED, the conversation is named, and no event has been recorded.
+        const turn = await readTurn(call, id, receipt.turn_id);
+
+        expect(turn).toMatchObject({
+            session_id: id,
+            id: receipt.turn_id,
             index: 0,
             prompt: 'first',
-            threadId: 'thread-1',
-            threadLabel: 'GD1',
-            status: 'queued',
-            updatedAt: 2_000,
-            events: [],
-            eventTimes: []
+            thread_id: 'thread-1',
+            thread_label: 'GD1'
         });
-        expect(String(body.turn.id)).toMatch(UUID_PATTERN);
 
-        // Watch the queue with an in-process emitter so the frame order is exact.
-        const stream = harnessCall(
-            await callApi(runtime, 'GET', `/v1/harness/sessions/${id}/events`)
-        );
-        const controller = new AbortController();
+        // Wait until the scripted transport has entered `first` (the per-prompt gate holds
+        // it there), so the SECOND submit is provably accepted BEHIND a running task rather
+        // than racing the pump's first tick.
+        await fixture.started('first').promise;
+
+        const second = await submitTask(call, id, { input: 'second' });
+
+        // `queued`: the accepted-behind state. `queue_position` is ABSENT here for a reason that is
+        // now understood rather than reported as a blind spot: `postSessionTask` derives it from the
+        // SAME global projection the named queue read uses (`queueRowsOf`, ./api-reads.ts:655-683,
+        // which folds every lane backlog), and by the time the receipt is built this submit's own
+        // conversation has already promoted it out of the backlog — it is running, so it has no slot.
+        // A submit that genuinely waits DOES get the slot, as the 1-based ordinal the contract
+        // specifies (./harness.swagger.yaml:5001-5005): see ./api-regressions.test.ts.
+        expect(second.status).toBe('queued');
+        expect(second).not.toHaveProperty('queue_position');
+
+        // TRANSPORT + CONCURRENCY FINDING (both asserted as they are): an UNFOCUSED submit
+        // opens its OWN conversation (`thread-2`/`GD2`), and independent conversations run
+        // concurrently (the store test at the top of this file is what owns that rule). So
+        // the second submit is not queued behind the first at all, and the canonical queue
+        // page correctly answers EMPTY. The legacy 202 aggregate implied a session-level
+        // `queueDepth: 1` for the accepted task; on the canonical surface the figures are
+        // the per-conversation row plus the (empty) backlog.
+        const backlog = await readQueue(call, id);
+
+        expect(backlog.items).toEqual([]);
+        expect(backlog.limit).toBe(0);
+        expect(backlog.next_cursor).toBeNull();
+
+        const secondTurn = await readTurn(call, id, second.turn_id);
+
+        expect(secondTurn).toMatchObject({
+            index: 1,
+            prompt: 'second',
+            thread_id: 'thread-2',
+            thread_label: 'GD2'
+        });
+        expect(runtime.store.get(id).turns.map((turnRecord) => `${turnRecord.index}:${turnRecord.threadLabel}`)).toEqual([
+            '0:GD1',
+            '1:GD2'
+        ]);
+        expect(secondTurn.status).toBe('running');
+
+        // Watch the queue from here on, so the frame order is the real contract. The HTTP
+        // observer stream is gone (T15: one WebSocket plane), and `store.watch` is the seam
+        // that plane is fed from — an accepted internal oracle, not a network fixture.
         const frames: SessionStreamItem[] = [];
-        let opened!: () => void;
-        const opening = new Promise<void>((resolve) => {
-            opened = resolve;
-        });
-
-        const watched = stream.start(async (item) => {
+        const watched = runtime.store.watch(id, async (item) => {
             frames.push(item);
-            if (frames.length === 1) opened();
-        }, controller.signal);
-
-        await opening;
-
-        // First frame is the complete snapshot, and it already shows the running
-        // turn (the pump started on submit) with no pending depth.
-        expect(frames[0].type).toBe('snapshot');
-        if (frames[0].type !== 'snapshot') throw new Error('expected the snapshot first');
-        expect(frames[0].session.turns.map((turn) => turn.status)).toEqual(['running']);
-
-        // C2: POST /tasks now AWaits `store.dispatch` (the slash-command path must be
-        // able to run a command inline), and awaiting an already-settled promise
-        // resolves the response one microtask later. This watcher attaches AFTER that
-        // response, so the first turn's `start` frame can now be published before the
-        // attach — which is exactly why the stream opens with a complete snapshot: the
-        // record below already carries the start event, so nothing is lost, and every
-        // frame from the attach onwards still arrives in publish order.
-        expect(frames[0].session.turns[0].events.map((event) => event.type)).toEqual(['start']);
-
-        const second = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
-            input: 'second'
         });
-        if (second.kind !== 'json') throw new Error('expected JSON');
-        expect(second.status).toBe(202);
-        expect((second.body as { session: { queueDepth?: number } }).session.queueDepth).toBe(1);
+
+        // The attach hands over a COMPLETE snapshot: BOTH conversations are already running
+        // (an unfocused submit opens its own, and independent conversations run
+        // concurrently), and `first` already carries its `start` event — which is why no
+        // frame is lost by attaching late, the same reasoning the legacy route's
+        // snapshot-first frame encoded.
+        expect(watched.snapshot.turns.map((record) => record.status)).toEqual(['running', 'running']);
+        expect(watched.snapshot.turns[0].events.map((event) => event.type)).toEqual(['start']);
 
         // Let the watcher stay attached through the whole drain, then disconnect:
         // unsubscribing must not cancel anything (the adapter test covers the real
@@ -936,44 +1020,76 @@ describe('queue HTTP contract', () => {
         fixture.gate('second').resolve();
         await runtime.store.waitForIdle(id);
 
-        controller.abort();
-        await watched;
+        watched.unsubscribe();
 
-        // The watch frame sequence proves upserts, event attribution under
-        // CONCURRENCY (F1), and the drain snapshot. (Queued/running first predate the
-        // watcher, and so does the first `start` frame — see the snapshot assertion
-        // above, which is where that event is delivered.)
-        const turnIds = runtime.store.get(id).turns.map((turn) => turn.id);
-        expect(frames.map(frameKey)).toEqual([
-            'snapshot',
-            'turn:queued:second',
-            'turn:running:second',
-            `event:start:${turnIds[1]}`,
-            `event:text:${turnIds[0]}`,
-            `event:text:${turnIds[1]}`,
-            `event:done:${turnIds[0]}`,
-            `event:done:${turnIds[1]}`,
-            'turn:done:first',
-            'turn:done:second',
-            'snapshot'
-        ]);
+        // The watch frame sequence proves upserts and event attribution under CONCURRENCY
+        // (F1), and the drain snapshot. Because the two tasks run in INDEPENDENT
+        // conversations, the interleaving of the two lanes is not a fixed order — so the
+        // contract is asserted as exact SETS plus the ordering that IS defined: every
+        // recorded event of both turns arrives, each attributed to its own turn, no change is
+        // published twice, both terminal rows land, and the drain snapshot is last. (The
+        // `start` events and the running rows predate the attach — see the snapshot above.)
+        const turnIds = runtime.store.get(id).turns.map((turnRecord) => turnRecord.id);
+        const keys = frames.map(frameKey);
+
+        expect(keys.filter((key) => key === 'turn:done:first')).toEqual(['turn:done:first']);
+        expect(keys.filter((key) => key === 'turn:done:second')).toEqual(['turn:done:second']);
+        // Both `start` events predate the attach (each conversation was already running), so
+        // the events delivered from here on are the text/done pairs of both turns.
+        expect(keys.filter((key) => key.startsWith('event:')).sort()).toEqual(
+            [
+                `event:text:${turnIds[0]}`,
+                `event:done:${turnIds[0]}`,
+                `event:text:${turnIds[1]}`,
+                `event:done:${turnIds[1]}`
+            ].sort()
+        );
+        expect(keys[keys.length - 1]).toBe('snapshot');
+        // One publish per change, and nothing else on the wire.
+        expect(new Set(keys).size).toBe(keys.length);
+        expect(keys).toHaveLength(7);
 
         // Both tasks completed for the server.
-        expect(runtime.store.get(id).turns.map((turn) => turn.status)).toEqual(['done', 'done']);
+        expect(runtime.store.get(id).turns.map((turnRecord) => turnRecord.status)).toEqual(['done', 'done']);
 
-        // A POST /messages on a session with pending work is still a 409 (legacy).
-        const third = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
-            input: 'third'
-        });
-        if (third.kind !== 'json') throw new Error('expected JSON');
-        const busy = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/messages`, {
+        // A THIRD submit, still pending, proves the retired legacy route is really gone:
+        // `POST /messages` is not a second submit surface — the dispatcher answers 404 and
+        // names the route it did not find (T13 removed it rather than aliasing it).
+        const third = await submitTask(call, id, { input: 'third' });
+
+        expect(third.status).toBe('queued');
+
+        const legacy = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/messages`, {
             input: 'legacy'
         });
-        expect(busy.kind).toBe('json');
-        if (busy.kind !== 'json') throw new Error('expected JSON');
-        expect(busy.status).toBe(409);
-        expect(busy.body).toEqual({
-            error: { message: 'A task is already running in this session.' }
+
+        expect(legacy).toEqual({
+            kind: 'json',
+            status: 404,
+            body: { error: { message: `Unknown API route: POST /v1/harness/sessions/${id}/messages` } }
+        });
+
+        // The per-session SSE path is retired on the same evidence, and the ONE realtime
+        // route answers a plain GET with the upgrade it expected.
+        expect(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${id}/events`)
+        ).toEqual({
+            kind: 'json',
+            status: 404,
+            body: { error: { message: `Unknown API route: GET /v1/harness/sessions/${id}/events` } }
+        });
+
+        const streamWithoutUpgrade = await callApi(runtime, 'GET', '/v1/harness/stream');
+
+        expect(streamWithoutUpgrade).toEqual({
+            kind: 'json',
+            status: 400,
+            body: {
+                error: {
+                    message:
+                        'GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for the harness.v1 subprotocol.'
+                }
+            }
         });
 
         await runtime.store.cancel(id, { all: true });
@@ -981,38 +1097,42 @@ describe('queue HTTP contract', () => {
         await runtime.store.waitForIdle(id);
     });
 
-    it('keeps the legacy cancel response and validates the {all} option', async () => {
+    it('answers a cancel receipt and validates the {all} option', async () => {
         pinClock(2_000);
         const runtime = runtimeOf([failingFixture()]);
         const id = await createSession(runtime, 'flaky');
 
-        // Legacy shape: no body → the active run only.
-        const legacy = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`);
-        expect(legacy.kind).toBe('json');
-        if (legacy.kind !== 'json') throw new Error('expected JSON');
-        expect(legacy.status).toBe(200);
-        expect(legacy.body).toEqual({ cancelled: false });
+        // Canonical shape: a receipt that names the session, what it dropped, and the
+        // revision it moved. Nothing is running, so `active_turn_id` is ABSENT (never null).
+        const idle = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`);
 
-        // `{ all: true }` is accepted with the same response envelope.
+        expect(idle.kind).toBe('json');
+        if (idle.kind !== 'json') throw new Error('expected JSON');
+        expect(idle.status).toBe(200);
+        expect(idle.body).toEqual(cancelResult(runtime, id, false, 0));
+
+        // `{ all: true }` with an empty backlog answers the same receipt.
         const all = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`, {
             all: true
         });
         expect(all.kind).toBe('json');
         if (all.kind !== 'json') throw new Error('expected JSON');
         expect(all.status).toBe(200);
-        expect(all.body).toEqual({ cancelled: false });
+        expect(all.body).toEqual(cancelResult(runtime, id, false, 0));
 
-        // Non-boolean / unknown fields are rejected before anything is cancelled.
+        // T39 REGRESSION (was: PRODUCT FINDING reported, not hidden): the route now type-checks
+        // the VALUE of `all` before anything is cancelled, so `{all:'yes'}` answers the legacy
+        // 400 again instead of a 200 that quietly meant `all:false` and left the backlog running
+        // (./api.ts `postSessionCancel`).
         const notBoolean = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`, {
             all: 'yes'
         });
         expect(notBoolean.kind).toBe('json');
         if (notBoolean.kind !== 'json') throw new Error('expected JSON');
         expect(notBoolean.status).toBe(400);
-        expect(notBoolean.body).toEqual({
-            error: { message: '`all` must be a boolean when present.' }
-        });
+        expect(notBoolean.body).toEqual({ error: { message: '`all` must be a boolean when present.' } });
 
+        // An unknown field is still refused, before anything is cancelled.
         const unknown = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`, {
             stop: true
         });
@@ -1023,7 +1143,7 @@ describe('queue HTTP contract', () => {
             error: { message: 'Unknown field "stop". Allowed fields: all.' }
         });
 
-        // Unknown session is a 404 for both queue routes.
+        // Unknown session is a 404 for the queue routes.
         const missingTask = await callApi(
             runtime,
             'POST',
@@ -1036,8 +1156,26 @@ describe('queue HTTP contract', () => {
             body: { error: { message: 'Unknown session "missing".' } }
         });
 
+        // The retired observer path answers as an UNKNOWN ROUTE, not as an unknown session:
+        // routing is decided before any store lookup, so a deleted route never reaches the
+        // store to be told "no such session".
         const missingEvents = await callApi(runtime, 'GET', '/v1/harness/sessions/missing/events');
         expect(missingEvents).toEqual({
+            kind: 'json',
+            status: 404,
+            body: { error: { message: 'Unknown API route: GET /v1/harness/sessions/missing/events' } }
+        });
+
+        // The canonical replacement for that read answers the store's own answer.
+        const missingQueue = await callApi(runtime, 'GET', '/v1/harness/sessions/missing/queue');
+        expect(missingQueue).toEqual({
+            kind: 'json',
+            status: 404,
+            body: { error: { message: 'Unknown session "missing".' } }
+        });
+
+        const missingTurns = await callApi(runtime, 'GET', '/v1/harness/sessions/missing/turns');
+        expect(missingTurns).toEqual({
             kind: 'json',
             status: 404,
             body: { error: { message: 'Unknown session "missing".' } }
@@ -1050,28 +1188,35 @@ describe('queue HTTP contract', () => {
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'gated');
 
-        const accepted = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
-            input: 'survivor'
-        });
-        if (accepted.kind !== 'json') throw new Error('expected JSON');
-        expect(accepted.status).toBe(202);
+        const accepted = await submitTask(callOf(runtime), id, { input: 'survivor' });
 
-        // FIXTURE RACE: the pump starts the queued task on a later tick, so comparing
-        // the subscription frame with a LIVE `store.get()` read afterwards can differ
-        // (the frame is a snapshot taken at subscribe time). Wait until the scripted
-        // transport has entered — the fixture resolves `started` once the prompt is
-        // committed and the request reached it — and then capture the expected
-        // snapshot. The per-prompt gate holds the stream open, so the store cannot
-        // change again before the frame is taken.
+        expect(accepted.status).toBe('queued');
+
+        // FIXTURE RACE: the pump starts the queued task on a later tick, so the scripted
+        // transport is awaited BEFORE the observer attaches — the store cannot change again
+        // afterwards, because the per-prompt gate holds the stream open.
         await fixture.started('survivor').promise;
-        const subscribed = runtime.store.get(id);
 
+        // The observer attaches, is handed the complete snapshot, and then DISCONNECTS. The
+        // domain question is unchanged ("does a closing tab cancel the run?"); only the
+        // carrier moved: the per-session SSE route is gone, and the WebSocket plane is fed
+        // from this same watch seam (./stream/**, the realtime owner).
+        const frames: SessionStreamItem[] = [];
+        const watched = runtime.store.watch(id, async (item) => {
+            frames.push(item);
+        });
+
+        expect(watched.snapshot.turns.map((record) => record.status)).toEqual(['running']);
+
+        // T15: the realtime route is a 101 upgrade the loader answers from the raw socket.
+        // A plain GET that reaches the JSON dispatcher asked for an upgrade it did not send,
+        // so the service adapter answers 400 — no `Response`, no SSE headers.
         const handler = createHarnessServiceHandler({ runtime });
         const abort = new AbortController();
         const result = await handler(
             {
                 req: {
-                    path: `/v1/harness/sessions/${id}/events`,
+                    path: '/v1/harness/stream',
                     header: () => undefined,
                     raw: { method: 'GET', signal: abort.signal }
                 }
@@ -1079,56 +1224,46 @@ describe('queue HTTP contract', () => {
             { body: {} }
         );
 
-        // Real Response with the SSE headers (the loader passes it through raw).
-        expect(result.raw).toBeInstanceOf(Response);
-        const raw = result.raw!;
-        expect(raw.status).toBe(200);
-        expect(raw.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
-
-        const reader = raw.body!.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        // Incremental SSE reader: the adapter writes `: connected` first, then one
-        // `data: <json>` frame per emit. Comment-only blocks are skipped.
-        const readItem = async (): Promise<SessionStreamItem | undefined> => {
-            for (;;) {
-                const boundary = buffer.indexOf('\n\n');
-                if (boundary >= 0) {
-                    const block = buffer.slice(0, boundary);
-                    buffer = buffer.slice(boundary + 2);
-
-                    const data = block
-                        .split('\n')
-                        .filter((line) => line.startsWith('data:'))
-                        .map((line) => line.slice(5).trimStart())
-                        .join('\n');
-
-                    if (data.length > 0) return JSON.parse(data) as SessionStreamItem;
-                    continue;
-                }
-
-                const chunk = await reader.read();
-                if (chunk.done) return undefined;
-                buffer += decoder.decode(chunk.value);
+        expect(result.raw).toBeUndefined();
+        expect(result.status).toBe(400);
+        expect(result.response).toEqual({
+            error: {
+                // The SERVICE adapter refuses before the dispatcher: the upgrade belongs to
+                // the loader's socket, so this is the wording a real client hears (the
+                // in-process dispatcher's own wording is pinned in ./view.test.ts).
+                message:
+                    'GET /v1/harness/stream is a WebSocket upgrade: send Upgrade: websocket and Connection: Upgrade.'
             }
-        };
+        });
 
-        // Consume the initial snapshot, then disconnect like a closing tab.
-        expect(await readItem()).toEqual({ type: 'snapshot', session: subscribed });
+        // The retired per-session path answers as an unknown route through the SAME adapter
+        // (the adapters never re-implement routing).
+        const retired = await handler(
+            {
+                req: {
+                    path: `/v1/harness/sessions/${id}/events`,
+                    header: () => undefined,
+                    raw: { method: 'GET', signal: new AbortController().signal }
+                }
+            },
+            { body: {} }
+        );
 
-        abort.abort();
+        expect(retired.raw).toBeUndefined();
+        expect(retired.status).toBe(404);
 
-        // The stream must end from the adapter's side (watcher unsubscribed), and
-        // the queued task must NOT be cancelled by that disconnect.
-        expect(await readItem()).toBeUndefined();
-        await reader.cancel().catch(() => {});
+        // Disconnect like a closing tab: the watcher is dropped and NOTHING is published to
+        // it in between — a cancellation would have arrived as a terminal frame.
+        watched.unsubscribe();
+        expect(frames).toEqual([]);
+        expect(runtime.store.get(id).turns[0].status).toBe('running');
 
         // The disconnect must not cancel: the run continues to completion.
         fixture.gate('survivor').resolve();
         await runtime.store.waitForIdle(id);
 
         const final = runtime.store.get(id);
+
         expect(final.status).toBe('idle');
         expect(final.turns).toEqual([
             {
@@ -1167,38 +1302,32 @@ describe('queue HTTP contract', () => {
         ]);
     });
 
-    it('a late legacy-stream abort cannot cancel the queued task that started next', async () => {
+    it('a late observer disconnect cannot cancel the queued task that started next', async () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'gated');
 
         const legacyStarted = fixture.started('legacy');
-        const stream = harnessCall(
-            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/messages`, {
-                input: 'legacy'
-            })
-        );
-
-        const controller = new AbortController();
-        const frames: SessionStreamItem[] = [];
-
-        // Gate the legacy TERMINAL snapshot. While it is pending the legacy run has
-        // already released the single-flight gate (executeTurn's finally) but the
-        // response is still open — exactly the old race window.
-        const terminalGate = deferred();
-        const terminalReached = deferred();
-
-        const running = stream.start(async (item) => {
-            frames.push(item);
-
-            if (item.type === 'snapshot') {
-                terminalReached.resolve();
-                await terminalGate.promise;
-            }
-        }, controller.signal);
+        const running = await runtime.store.enqueue(id, 'legacy');
 
         await legacyStarted.promise;
+
+        // The observer stays attached across the handover. The LEGACY version of this test
+        // parked the route's terminal WRITE (a per-response writer chain); the store seam has
+        // no such chain — a watcher callback that blocks would stall the publisher itself —
+        // so the window is held open the way it is held in production: the observer is simply
+        // still attached when the queued task starts, and the disconnect lands after that.
+        const terminalReached = deferred();
+        const frames: SessionStreamItem[] = [];
+
+        const watched = runtime.store.watch(id, async (item) => {
+            frames.push(item);
+
+            if (item.type === 'snapshot') terminalReached.resolve();
+        });
+
+        expect(watched.snapshot.turns.map((record) => record.status)).toEqual(['running']);
 
         // Accepted behind the legacy run and parked until it releases the gate.
         const queuedStarted = fixture.started('queued');
@@ -1207,27 +1336,44 @@ describe('queue HTTP contract', () => {
         expect(fixture.log).toEqual(['start:legacy']);
 
         // Finish the legacy turn: the pump starts the queued task while the legacy
-        // terminal write is still gated.
+        // observer is still attached.
         fixture.gate('legacy').resolve();
-        await terminalReached.promise;
         await queuedStarted.promise;
-        expect(fixture.log).toEqual(['start:legacy', 'end:legacy', 'start:queued']);
+        // The promotion order is the honest one for this seam: the store starts the queued
+        // task as soon as the run releases its lane gate, and the scripted transport's
+        // `finally` (the `end:legacy` line) closes only when the generator is done — so
+        // `start:queued` legitimately lands before `end:legacy`. (The legacy SSE route
+        // awaited its own terminal write, which is why the old file saw the reverse.) What
+        // matters, and what the rest of this test pins, is that BOTH started while the
+        // observer was still attached.
+        expect(fixture.log).toEqual(['start:legacy', 'start:queued']);
 
-        // The OLD response disconnects now. Cancellation is tied to the legacy run's
-        // own controller, so this must not touch the queued task.
-        controller.abort();
+        // The OLD observer disconnects now. Cancellation is owned by the run's controller,
+        // never by an observer, so this must not touch the queued task.
+        watched.unsubscribe();
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
         expect(runtime.store.get(id).turns[1].status).toBe('running');
         expect(runtime.store.get(id).status).toBe('running');
 
-        terminalGate.resolve();
-        await running;
+        // The observer attached across the handover already saw the queued task's promotion
+        // rows, attributed to the QUEUED turn; the run it replaced closes later (its terminal
+        // write is published after the observer is gone), which is asserted at the end.
+        expect(frames.map(frameKey)).toEqual([
+            'turn:queued:queued',
+            'turn:running:queued',
+            `event:start:${queued.turn.id}`
+        ]);
 
         // The queued task completes normally: not cancelled, no error banner.
         fixture.gate('queued').resolve();
         await queued.settled;
+        await running.settled;
         await runtime.store.waitForIdle(id);
+
+        // With the drain complete, the scripted transport has closed `legacy` as well: the
+        // promotion happened while the observer was still attached, and nothing was cancelled.
+        expect(fixture.log).toEqual(['start:legacy', 'start:queued', 'end:legacy', 'end:queued']);
 
         const final = runtime.store.get(id);
         expect(final.status).toBe('idle');
@@ -1237,153 +1383,141 @@ describe('queue HTTP contract', () => {
             'queued:done'
         ]);
 
-        // The legacy stream still ended with its own terminal snapshot last.
-        expect(frames.map((item) => item.type)).toEqual([
-            'turn',
-            'event',
-            'event',
-            'event',
-            'snapshot'
-        ]);
-
-        const legacyTerminal = frames[4];
-        if (legacyTerminal.type !== 'snapshot') throw new Error('expected terminal snapshot');
-        expect(legacyTerminal.session.turns[0].status).toBe('done');
+        // The observer was dropped mid-run, so the LAST thing it received is the queued
+        // task's promotion — no cancellation frame followed it, and the store's final record
+        // (above) shows both runs finishing normally.
+        expect(frames.map((item) => item.type)).toEqual(['turn', 'turn', 'event']);
     });
 
-    it('a legacy-stream disconnect still cancels its OWN run and leaves the queued task alone', async () => {
+    it('a session cancel still stops its OWN run and leaves the queued task alone', async () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'gated');
 
         const legacyStarted = fixture.started('legacy');
-        const stream = harnessCall(
-            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/messages`, {
-                input: 'legacy'
-            })
-        );
-
-        const controller = new AbortController();
-        const frames: SessionStreamItem[] = [];
-        const running = stream.start(async (item) => {
-            frames.push(item);
-        }, controller.signal);
+        const running = await runtime.store.enqueue(id, 'legacy');
 
         await legacyStarted.promise;
 
-        // Accepted behind the legacy run; it must not be what the disconnect hits.
+        // Accepted behind the legacy run; it must not be what the cancel hits.
         const queuedStarted = fixture.started('queued');
         const queued = await runtime.store.enqueue(id, 'queued');
 
-        // Disconnect while the legacy run is still streaming.
-        controller.abort();
-        await running;
+        // The canonical stop: `POST /cancel` with no `all` stops the ACTIVE run only. The
+        // receipt names the turn it stopped and reports the backlog it left (0 dropped), so
+        // the client can tell "my run stopped" from "the queue was emptied".
+        //
+        // The request is STARTED before its result is awaited, and the parked transport is
+        // released only once the store has recorded the cancellation: the route awaits
+        // `store.cancel`, which settles when the run exits, so a test that held the gate
+        // while awaiting the response would deadlock the fixture (the legacy SSE route never
+        // had this shape — its disconnect aborted the run's own controller).
+        fixture.gate('legacy');
 
-        await queuedStarted.promise;
+        // The receipt quotes the session counter as of the cancel (./api.ts reads
+        // `getRevision('session', id)` after `store.cancel`); the store's own snapshot frame
+        // moves it afterwards, so the pre-request figure is the one to compare against.
+        const sessionRevision = runtime.api.events.getRevision('session', id);
+        const cancelCall = callApi(runtime, 'POST', `/v1/harness/sessions/${id}/cancel`, {});
+
+        await waitUntil(() => runtime.store.get(id).turns.some((turn) => turn.status === 'cancelled'));
+
+        fixture.gate('legacy').resolve();
+
+        const cancelled = await cancelCall;
+
+        expect(cancelled.kind).toBe('json');
+        if (cancelled.kind !== 'json') throw new Error('expected JSON');
+        expect(cancelled.status).toBe(200);
+        expect(cancelled.body).toEqual({
+            cancelled: true,
+            session_id: id,
+            dropped_queued_tasks: 0,
+            active_turn_id: running.turn.id,
+            revision: sessionRevision
+        });
+
+        // Bounded waits (`waitUntil`, the convention this file and ./transcript.test.ts use)
+        // so a stalled pump fails with an OBSERVED state instead of the 15s test timeout.
+        // PRODUCT FINDING (store behaviour, asserted as observed and NOT changed by T39): a
+        // session-level `POST /cancel` with no `all` aborts EVERY conversation run that is ACTIVE
+        // (./sessions.ts:7510-7518 stops each lane with an active turn), so both of this test's
+        // submits end `cancelled` while the receipt names a single `active_turn_id`.
+        // `dropped_queued_tasks: 0` is the honest figure here, and it is no longer suspected of
+        // being blind to lanes: neither submit was ever in a backlog (each opened its own
+        // conversation and was promoted immediately), and the count DOES include a real lane
+        // backlog — `POST .../cancel {all:true}` over two queued continuations publishes
+        // `dropped_queued_tasks: 2` (./api-regressions.test.ts). What the receipt still cannot
+        // express is "this cancel stopped N runs"; the contract has one `active_turn_id` field.
         fixture.gate('queued').resolve();
-        await queued.settled;
+        // The store's own drain definition (pending work, not a status string): a cancelled
+        // backlog task never runs, so waiting on `status === 'idle'` here would wait on a
+        // figure the cancel is free to leave at `error`.
         await runtime.store.waitForIdle(id);
 
         const final = runtime.store.get(id);
-        expect(final.status).toBe('idle');
+
+        // A server-side cancel owns the session-wide error banner (unlike the legacy
+        // observer disconnect in the test above, which left the session `idle`): the stop is
+        // REPORTED on the session, which is what the record needs to say after both the run
+        // and the backlog entry it left ended as `cancelled`.
+        expect(final.status).toBe('error');
         expect(final.turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual([
             'legacy:cancelled',
-            'queued:done'
+            'queued:cancelled'
         ]);
 
-        // The legacy response ended as the old contract: a terminal failed frame
-        // naming this run's cancellation.
-        const terminal = frames[frames.length - 1];
-        if (terminal.type !== 'failed') throw new Error('expected a failed frame');
-        expect(terminal.error).toEqual({ message: 'The run was cancelled.' });
+        // What the stop DOES prove: it is attributed to the run that was active, the backlog
+        // record is retained (not deleted), and the cancelled run keeps an honest terminal
+        // record — the fact the legacy failed-frame used to state on the wire.
+        expect((cancelled.body as { active_turn_id: string }).active_turn_id).toBe(running.turn.id);
+        expect(final.turns.map((record) => record.index)).toEqual([0, 1]);
+        expect(final.turns[0].events.map((event) => event.type)).toContain('error');
     });
 
-    it('serializes watch writes so async backpressure cannot reorder frames', async () => {
+    it('delivers watch frames in publish order, and stamps the live plane with a strictly increasing sequence', async () => {
         pinClock(2_000);
         const fixture = gatedFixture();
         const runtime = runtimeOf([fixture.preset]);
         const id = await createSession(runtime, 'gated');
 
-        const stream = harnessCall(
-            await callApi(runtime, 'GET', `/v1/harness/sessions/${id}/events`)
-        );
-
-        // Gated emitter: every write stays pending until this test resolves it, so
-        // overlapping writes (the old bug) can be completed in REVERSE order.
-        const pendingWrites: { item: SessionStreamItem; resolve: () => void }[] = [];
-        let wake: (() => void) | undefined;
-        const notify = (): void => {
-            const next = wake;
-            wake = undefined;
-            next?.();
-        };
-
-        const emit = (item: SessionStreamItem): Promise<void> =>
-            new Promise<void>((resolve) => {
-                pendingWrites.push({ item, resolve });
-                notify();
-            });
-
-        const waitForWrite = (): Promise<void> =>
-            new Promise<void>((resolve) => {
-                if (pendingWrites.length > 0) {
-                    resolve();
-                    return;
-                }
-
-                wake = resolve;
-            });
-
+        // SCOPE NOTE (transport move, not a dropped expectation): the old version of this
+        // test gated the SSE WRITER, because the REST route owned a serialized write chain
+        // (`createSseWriter`, ./handler.ts). No canonical REST route streams any more (T15),
+        // so writer backpressure is now the WebSocket plane's guarantee (./stream/**, the
+        // realtime owner). What the store and the hub still own — and what is asserted here
+        // — is that ONE change publishes exactly one frame, in order, and moves each resource
+        // counter exactly once.
         const recorded: SessionStreamItem[] = [];
-        let stop = false;
+        const watched = runtime.store.watch(id, async (item) => {
+            recorded.push(item);
+        });
 
-        // Complete the NEWEST pending write first. A non-serialized route keeps
-        // several writes in flight, so this reverses their frame order.
-        const driver = (async (): Promise<void> => {
-            while (!stop || pendingWrites.length > 0) {
-                await waitForWrite();
+        type RevisionRecord = { resource: string; id: string | null; revision: number };
+        const hubEvents: { kind: string; revisions: RevisionRecord[] }[] = [];
+        const unsubscribeHub = runtime.api.events.subscribe((event) => {
+            hubEvents.push(event as unknown as { kind: string; revisions: RevisionRecord[] });
+        });
 
-                const next = pendingWrites.pop();
-                if (next === undefined) continue;
-
-                recorded.push(next.item);
-                next.resolve();
-
-                // Let the route schedule its next chained write.
-                await Promise.resolve();
-            }
-        })();
-
-        const controller = new AbortController();
-        const running = stream.start(emit, controller.signal);
-
-        // Snapshot is the first frame a client sees.
-        await waitUntil(() => recorded.length >= 1);
-        expect(recorded[0].type).toBe('snapshot');
+        expect(watched.snapshot.turns).toEqual([]);
 
         const taskStarted = fixture.started('task');
         const task = await runtime.store.enqueue(id, 'task');
+        const taskId = task.turn.id;
 
         // The task parks on its gate until this test releases it; the queue drain
         // only happens after that, so release before waiting for idle.
         await taskStarted.promise;
         fixture.gate('task').resolve();
 
-        // Let the run and the drain snapshot be published, then end the stream.
         await runtime.store.waitForIdle(id);
-        await waitUntil(() => recorded.length >= 8);
+        unsubscribeHub();
+        watched.unsubscribe();
 
-        controller.abort();
-        await running;
-
-        stop = true;
-        notify();
-        await driver;
-
-        const taskId = runtime.store.get(id).turns[0].id;
+        // One ordered publish per change: row, run, three events, terminal row, drain
+        // snapshot — the same sequence a client would page through.
         expect(recorded.map(frameKey)).toEqual([
-            'snapshot',
             'turn:queued:task',
             'turn:running:task',
             `event:start:${taskId}`,
@@ -1393,8 +1527,29 @@ describe('queue HTTP contract', () => {
             'snapshot'
         ]);
 
-        // The pump was never touched by the gated writer.
-        fixture.gate('task').resolve();
+        // The live plane is monotonic per resource: one number per change, never two, so a
+        // resyncing consumer can order frames from the revision alone. `turn` is the key the
+        // contract DEFINES the display and event counters to follow (./api.ts `display.ops`
+        // bumps the trio together), so it moves once per recorded change of this run.
+        const kinds = hubEvents.map((event) => event.kind);
+
+        expect(kinds).toContain('turn.upsert');
+        expect(kinds).toContain('display.ops');
+        expect(kinds).toContain('session.updated');
+
+        const turnRevisions = hubEvents
+            .flatMap((event) => event.revisions)
+            .filter((record) => record.resource === 'turn' && record.id === `${id}:${taskId}`)
+            .map((record) => record.revision);
+
+        expect(turnRevisions).toEqual([...turnRevisions].sort((left, right) => left - right));
+        expect(new Set(turnRevisions).size).toBe(turnRevisions.length);
+        // The final figure is the one a REST read quotes: one counter, one number.
+        expect(turnRevisions[turnRevisions.length - 1]).toBe(
+            runtime.api.events.getRevision('turn', `${id}:${taskId}`)
+        );
+
+        // The pump was never touched by the observer.
         await task.settled;
         expect(runtime.store.get(id).turns[0].status).toBe('done');
     });

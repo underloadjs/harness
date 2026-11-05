@@ -12,7 +12,9 @@ import { fileURLToPath } from 'node:url';
 import { loadConfiguration } from './config';
 import { ENVIRONMENT_PATH, loadEnvironmentFile } from './environment';
 import { startHarnessServer } from './index';
-import type { HarnessIndex } from './protocol';
+// Canonical `/v1/harness/config` payload (../shared/harness-api.ts:394); the legacy
+// `HarnessIndex` type describes the retired `/api` mount.
+import type { GlobalConfigDocument } from '../shared/harness-api';
 
 // Repo-root Temp/ (five levels up from src/server/). Module-relative so the
 // location does not depend on the cwd Vitest was started from.
@@ -264,17 +266,22 @@ describe('configuration wiring', () => {
         const server = await startHarnessServer({ port: 0, staticRoot: null });
 
         try {
-            const response = await fetch(`${server.url}/api/harnesses`, {
-                headers: { 'X-Harness-Client': 'ui' }
-            });
+            // Canonical defaults read: `GET {root}/config` -> `GlobalConfigDocument`
+            // (./api.ts:1329). The `/api` mount and the `X-Harness-Client` gate are both
+            // gone (./api.ts:282, ./handler.ts:8-13), and the projection is key-free by
+            // contract: `ProviderDefaults` carries `has_api_key`, never the key itself.
+            const response = await fetch(`${server.url}/v1/harness/config`);
+            const body = await response.text();
 
             expect(response.status).toBe(200);
-            const index = (await response.json()) as HarnessIndex;
+            expect(body).not.toContain('server-key');
 
-            expect(index.defaults).toEqual({
-                baseURL: 'http://server.example/v1',
+            const config = JSON.parse(body) as GlobalConfigDocument;
+
+            expect(config.defaults).toEqual({
+                base_url: 'http://server.example/v1',
                 model: 'server-model',
-                hasApiKey: true
+                has_api_key: true
             });
         } finally {
             await server.close();

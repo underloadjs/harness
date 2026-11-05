@@ -860,6 +860,16 @@ type TranscriptState = {
     baseline: string;
     dirty: boolean;
     pending: boolean;
+    // T24/C6: the CANONICAL roster states an unreadable transcript as a VERDICT on the row
+    // (`transcript_state` + `transcript_error`), never the stored bytes, so
+    // `view-api.ts#invalidThreadsOf` leaves `messages` undefined and the value the reader
+    // came to repair is not in the browser yet. The dialog then opens on the documented
+    // `null` fallback with this flag set; the document read the shell fires on the same
+    // click (main.ts#refreshTranscriptSnapshot -> ../view-shell.ts#getRawSession, which
+    // parses `invalid.raw` back into `invalidThreads[].messages`) supplies the exact value,
+    // and `rebasePendingRaw` puts it in the field. Cleared by every explicit re-base
+    // (refresh, Cancel, entering the editor), so a typed draft is never overwritten.
+    rawPending?: boolean;
     // Host transport, already bound to this session + thread. Resolves with the
     // transcript answer; the host owns applying the returned session snapshot.
     onSave?: (messages: unknown) => Promise<ThreadTranscriptPayload>;
@@ -896,6 +906,8 @@ const enterEdit = (state: TranscriptState): void => {
     state.baseline = state.editor.raw;
     state.dirty = false;
     state.localError = undefined;
+    // Entering the editor is an explicit re-base off the newest authority, pending or not.
+    state.rawPending = undefined;
 
     state.handle.update({ title: dialogTitle(state.editor), content: editorContent(state) });
     state.handle.element
@@ -935,12 +947,30 @@ const applySavedPayload = (state: TranscriptState, payload: ThreadTranscriptPayl
         // view built from a placeholder) would hide the break the reader caused.
         // `status` is unknown to the payload, so the identity keeps the last value
         // until the applied snapshot refreshes it.
+        //
+        // T24: a save made while the field was still PENDING sends the `null` fallback,
+        // because the roster never carried the stored bytes. The answer's own document
+        // text (../view-model.ts `ThreadTranscriptPayload.invalid.raw` — the bytes the
+        // server kept) is then the authority for what the conversation holds, so the
+        // field moves to it instead of keeping a value the reader never chose.
+        if (state.rawPending === true && typeof invalid.raw === 'string') {
+            state.text = invalid.raw;
+            state.baseline = invalid.raw;
+            state.rawPending = undefined;
+
+            const pending = state.handle.element.querySelector<HTMLTextAreaElement>(
+                '.thread-transcript-editor'
+            );
+            if (pending !== null) pending.value = invalid.raw;
+        }
+
         state.editor = { ...state.editor, raw: state.text, error: invalid.error };
         state.mode = 'edit';
         paintEditorChrome(state);
         return;
     }
 
+    state.rawPending = undefined;
     state.editor = {
         ...state.editor,
         agent: payload.agent,
@@ -1047,6 +1077,9 @@ export const openThreadTranscript = (
         baseline: editor.raw,
         dirty: false,
         pending: false,
+        // The roster named this conversation unreadable but carries no value (canonical
+        // roster = signals only), so the exact stored JSON is still to come.
+        ...(invalid !== undefined && invalid.messages === undefined ? { rawPending: true } : {}),
         localErrorTone: 'local',
         ...(options.onSave === undefined ? {} : { onSave: options.onSave })
     };
@@ -1089,6 +1122,27 @@ export const openThreadTranscript = (
 // here to repair.
 export type ThreadTranscriptRefresh = 'updated' | 'closed' | 'ignored';
 
+// C6/T24: move a PENDING unreadable field onto the exact stored value once the document
+// read supplies it. The guard is the reader's work: while nothing was typed, the text is
+// still the `null` fallback (../view-api.ts:238 keeps the roster's `messages` undefined),
+// so replacing it is a fill-in, not a loss. A typed draft always wins, and Cancel/Save
+// remain the only other explicit re-bases.
+//
+// The textarea is written in place rather than rebuilt: `handle.update` would replace the
+// node and with it the caret and scroll the reader may already have moved.
+const rebasePendingRaw = (state: TranscriptState, invalid?: InvalidThreadRecord): void => {
+    if (state.rawPending !== true) return;
+    if (invalid === undefined || invalid.messages === undefined) return;
+    if (state.dirty) return;
+
+    state.text = state.editor.raw;
+    state.baseline = state.editor.raw;
+    state.rawPending = undefined;
+
+    const editor = state.handle.element.querySelector<HTMLTextAreaElement>('.thread-transcript-editor');
+    if (editor !== null) editor.value = state.text;
+};
+
 // Refresh the open transcript from a newer authority of the SAME board/session.
 // Only the tracked dialog is touched. A missing thread closes it; a different
 // session id is ignored (the board closes/moves on session switches explicitly).
@@ -1127,6 +1181,10 @@ export const refreshOpenThreadTranscript = (
         // return to the lossless document. Anything else keeps the surface exactly as
         // the reader left it and only re-paints the chrome.
         if (invalid === undefined && !state.dirty && paintRead(state)) return 'updated';
+
+        // The stored bytes may have arrived with this snapshot (the roster alone never
+        // carries them); fill the field in before the chrome follows.
+        rebasePendingRaw(state, invalid);
 
         paintEditorChrome(state);
         return 'updated';

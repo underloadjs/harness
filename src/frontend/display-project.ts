@@ -28,6 +28,12 @@
 //      already treat an absent outcome as "the frame says nothing", which is the
 //      honest statement, and a synthesized one would be a claim about a run this
 //      client did not observe.
+//
+// A FOURTH gap, escalated in the same report and now CLOSED: the wire `ContextBlock`
+// declared a required `label`, a required `state`, and none of the recorded times, spans,
+// or the `inPrompt` verdict, while the routes transport the projector's record verbatim
+// (`name`, `at`, `endedAt`, `durationMs`, `argsChars`, `resultChars`, `inPrompt`). See
+// `projectBlock` below for the one mapping that reads them.
 import type {
     ContextBlock as WireContextBlock,
     DisplayBlockSummary,
@@ -49,6 +55,9 @@ import type {
     DisplayPanelSummary,
     DisplayStep,
     DisplayTail,
+    // The section-vocabulary union, kept only so `segmentStateOf` can type its tolerant
+    // input (see the comment above it); the wire's own ref is `StepDisplayState`.
+    SectionDisplayState,
     TurnDisplay,
     TurnSection
 } from '../shared/turn-display';
@@ -85,29 +94,59 @@ const previewOf = (panel: ToolUiPanel): string | undefined => {
     return undefined;
 };
 
-export const summarizePanels = (panels: readonly ToolUiPanel[] | undefined): DisplayPanelSummary[] | undefined => {
+// A wire panel entry arrives in one of two shapes, and the difference decides how it
+// is bounded:
+//
+//   1. a FULL `ToolUiPanel` (what the generated contract declares,
+//      ../shared/harness-api.ts:1792 `DisplayStep.panels?: ToolUiPanel[]`) — its blocks
+//      carry CONTENT (`text`, `rows`, `items`);
+//   2. an already-bounded `DisplayPanelSummary` (what the projector ACTUALLY ships on the
+//      display route, ../server/turn-projector.ts:383 `panelSummaryOf`, transported
+//      verbatim by ../server/api.ts `getSessionTurnDisplay`) — its blocks carry COUNTS
+//      (`length`/`rows`/`items` figures) and it carries `truncated` + `totalPanels`.
+//
+// `totalPanels` exists on neither a `ToolUiPanel` nor a `ToolUiBlock`, so it is the one
+// honest discriminator. Re-summarizing shape (2) used to run the summary through the
+// shape-(1) reducer, which read `block.text` (absent on a summary) and therefore dropped
+// the preview line and zeroed every count — so the scratch board drew nothing at all.
+const isPanelSummary = (panel: ToolUiPanel | DisplayPanelSummary): panel is DisplayPanelSummary =>
+    typeof (panel as DisplayPanelSummary).totalPanels === 'number';
+
+// One FULL panel -> the bounded summary the render model holds.
+const summaryOfPanel = (panel: ToolUiPanel): DisplayPanelSummary => {
+    const blocks = blockSummaryOf(panel);
+    const droppedBlocks = (panel.blocks ?? []).length > blocks.length;
+    const preview = previewOf(panel);
+
+    return {
+        id: panel.id,
+        slot: panel.slot,
+        // The wire title is already bounded at `DISPLAY_PANEL_TITLE_CHARS`; this
+        // guard only matters for a producer that sent more.
+        title: panel.title.length > DISPLAY_PANEL_TITLE_CHARS
+            ? `${panel.title.slice(0, DISPLAY_PANEL_TITLE_CHARS)}…`
+            : panel.title,
+        blocks,
+        ...(preview === undefined ? {} : { preview }),
+        truncated: droppedBlocks,
+        totalPanels: 0
+    };
+};
+
+export const summarizePanels = (
+    panels: readonly (ToolUiPanel | DisplayPanelSummary)[] | undefined
+): DisplayPanelSummary[] | undefined => {
     if (!Array.isArray(panels) || panels.length === 0) return undefined;
 
     const kept = panels.slice(0, PANELS_PER_STEP);
 
     return kept.map((panel) => {
-        const blocks = blockSummaryOf(panel);
-        const droppedBlocks = (panel.blocks ?? []).length > blocks.length;
-        const preview = previewOf(panel);
+        // Shape (2): the server already bounded it — keep its figures verbatim, because
+        // `truncated` and `totalPanels` are the server's statement of what it left out
+        // and a client may not restate them (turn-display.ts:229-234).
+        if (isPanelSummary(panel)) return panel;
 
-        return {
-            id: panel.id,
-            slot: panel.slot,
-            // The wire title is already bounded at `DISPLAY_PANEL_TITLE_CHARS`; this
-            // guard only matters for a producer that sent more.
-            title: panel.title.length > DISPLAY_PANEL_TITLE_CHARS
-                ? `${panel.title.slice(0, DISPLAY_PANEL_TITLE_CHARS)}…`
-                : panel.title,
-            blocks,
-            ...(preview === undefined ? {} : { preview }),
-            truncated: droppedBlocks || panels.length > kept.length,
-            totalPanels: panels.length
-        };
+        return { ...summaryOfPanel(panel), totalPanels: panels.length };
     });
 };
 
@@ -156,9 +195,19 @@ export const projectNode = (node: WireNode): DisplayNode | undefined => {
     const id = node.id;
     const text = node.text ?? '';
 
-    if (node.kind === 'step') {
-        // A `step` node inside a section's flow is the same record as `DisplayStep`;
-        // the section supplies the addressing the wire omits.
+    // A `step` node inside a section's flow is the same record as `DisplayStep`;
+    // the section supplies the addressing the wire omits.
+    //
+    // THE REAL NODE VOCABULARY. The generated contract spells a step node `kind: 'step'`
+    // (../shared/harness-api.ts:1774), but the display route transports the projector's
+    // record VERBATIM (../server/api.ts `getSessionTurnDisplay`), and the projector mints
+    // its flow nodes in the STEP vocabulary — `kind: 'tool' | 'action'`
+    // (../shared/turn-display.ts:675, emitted by ../server/turn-projector.ts). A tool row
+    // therefore arrives inside `section.nodes` under its own kind. Accepting only `'step'`
+    // dropped every tool node on the floor: the panel summaries ride on those nodes
+    // (`DisplayStep.panels`), so the scratch board and every step-addressed action died with
+    // them. Both spellings map to the same projection; neither is invented.
+    if (node.kind === 'step' || node.kind === ('tool' as WireNode['kind']) || node.kind === ('action' as WireNode['kind'])) {
         return projectStep(node as unknown as WireStep, { turnId: '', sectionId: '' });
     }
 
@@ -198,20 +247,48 @@ export const projectNode = (node: WireNode): DisplayNode | undefined => {
     return undefined;
 };
 
-// A wire context segment -> the render-model block. Two renames, both escalated:
-//   - the wire's `label` IS the render model's `name` (the server-decided display
-//     name: the recorded tool name for a tool block, `prompt`/`answer`/`instructions`
-//     /`reasoning`/`steer` for the others). `ContextBlock.name` is required in the
-//     render model, so an absent label becomes the kind, never an empty string.
-//   - the wire publishes NO `inPrompt`. That flag tells the bar whether the segment
-//     was part of what the model actually ran; with no figure on the wire the client
-//     states the optimistic reading (every listed segment is part of the bar the
-//     server built) and says so here rather than inventing a per-kind rule.
-// A segment's state travels as a SECTION state on the wire (`SectionDisplayState`)
-// and as a STEP state in the render model, because a bar segment mirrors the thing
-// it names (a settled call is `ok`, an in-flight one is `running`). One mapping,
-// applied here so no renderer compares two vocabularies.
-const segmentStateOf = (state: WireContextBlock['state']): 'running' | 'ok' | 'error' | 'cancelled' | undefined => {
+// A wire context segment -> the render-model block.
+//
+// THE NAME. The render model's `name` is required (../shared/turn-display.ts:475) and
+// the wire now publishes it under that same spelling: the display and block routes
+// transport the projector's record verbatim (../server/api.ts:3741-3768
+// `getSessionTurnDisplay` and :3807-3823 `getSessionTurnBlock` cast it, never restate
+// it), so the field on the wire IS `name` — proven by the closed key set the server
+// answers with for a system segment, `name` present and `label` absent
+// (../server/api.test.ts:2195-2208). `label` stays in the contract as an OPTIONAL older
+// spelling (../server/harness.swagger.yaml `ContextBlock`) for a producer that publishes
+// it, so the read order is exactly `name` -> `label` -> `kind`: the recorded name wins, a
+// legacy label still answers, and only a record with NEITHER falls back to the kind
+// (never an empty string, because `ContextBlock.name` is required downstream).
+//
+// THE TIMES AND SPANS. `at` / `endedAt` / `durationMs` / `argsChars` / `resultChars`
+// travel when the record supports them, and ABSENCE IS THE ANSWER: a call that never
+// settled, a `user`/`system` segment with no recorded span, and an event with no
+// timestamp each report nothing (../shared/turn-display.ts:476-522), so each key is
+// copied only when the wire stated it. A synthesized `0` would be drawn as "12:00:00 AM"
+// or "0ms" and read as a measurement (`view-context.ts:293` `contextBlockDurationOf`
+// distinguishes an absent figure from a zero one, and `contextBlockCharsOf` likewise).
+//
+// `inPrompt` is the one field this client used to derive. The projector tracks it per
+// block (../server/turn-projector.ts:1401/1887/1933/2021/2138/2195), the routes carry it,
+// so the wire's value is used whenever present; the old per-kind rule survives ONLY as
+// the fallback for a producer that omits the flag (the projector's rule is total:
+// `reasoning` is never replayed, every other kind always is,
+// ../shared/turn-display.ts:523-536), which keeps a thinking segment out of the bar's
+// replayed figure either way (`view-context.ts:356` `unpromptedChars`, :441 "not replayed
+// into the prompt").
+//
+// A segment's state travels in the STEP vocabulary the projector mints (`running` /
+// `ok` / `error` / `cancelled`, ../server/turn-projector.ts:2022 and :2482, and now the
+// declared wire ref too: ../server/harness.swagger.yaml `ContextBlock.state` refs
+// `StepDisplayState`), and it is ABSENT for every non-tool kind and for a call that has
+// not settled (../server/api.test.ts:2195-2206 shows a system segment answering with no
+// `state` key at all). A record that carries a SECTION-vocabulary value anyway (`open` /
+// `streaming` / `done`, ../shared/turn-display.ts:189) is still mapped here rather than
+// passed through, so no renderer ever compares the two vocabularies.
+const segmentStateOf = (
+    state: WireContextBlock['state'] | SectionDisplayState
+): 'running' | 'ok' | 'error' | 'cancelled' | undefined => {
     if (state === undefined) return undefined;
     if (state === 'open' || state === 'streaming') return 'running';
     if (state === 'done') return 'ok';
@@ -227,15 +304,21 @@ export const projectBlock = (block: WireContextBlock): ContextBlock => {
         id: block.id,
         turnId: block.turnId,
         sectionId: block.sectionId,
-        name: block.label ?? block.kind,
+        // `name` is the projector's spelling and the one this server sends; `label` is
+        // the optional older spelling; `kind` is the last resort, never an empty string.
+        name: block.name ?? block.label ?? block.kind,
         chars: block.chars,
-        // Derived, not assumed: the projector's rule is total — `reasoning` is never
-        // replayed into the next request, every other kind always is
-        // (../shared/turn-display.ts:523-536). A flat `true` would mislabel every
-        // thinking segment in the bar (`view-context.ts:356` counts `unpromptedChars`
-        // and `:441` prints "not replayed into the prompt").
-        inPrompt: block.kind !== 'reasoning',
+        // Wire figure when published, projector's total rule as the fallback only.
+        inPrompt: block.inPrompt ?? block.kind !== 'reasoning',
         ...(state === undefined ? {} : { state }),
+        // Each figure below is copied ONLY when the wire stated it - the same idiom this
+        // module uses for every optional field, and the reason "unknown" never reaches a
+        // renderer as `0` (see "THE TIMES AND SPANS" above).
+        ...(block.at === undefined ? {} : { at: block.at }),
+        ...(block.endedAt === undefined ? {} : { endedAt: block.endedAt }),
+        ...(block.durationMs === undefined ? {} : { durationMs: block.durationMs }),
+        ...(block.argsChars === undefined ? {} : { argsChars: block.argsChars }),
+        ...(block.resultChars === undefined ? {} : { resultChars: block.resultChars }),
         ...(block.eventFrom === undefined ? {} : { eventFrom: block.eventFrom }),
         ...(block.eventTo === undefined ? {} : { eventTo: block.eventTo }),
         ...(block.callId === undefined ? {} : { callId: block.callId })
@@ -243,9 +326,15 @@ export const projectBlock = (block: WireContextBlock): ContextBlock => {
 };
 
 // A steered submit: the wire carries `promptPreview` + `promptChars`, the render
-// model names the bounded text `prompt`. Same shape of delta as the row's prompt,
-// so the same rule: the preview stands in, and the verbatim text is the block this
-// row's id keys.
+// model names the bounded text `prompt`. Same shape of delta as the row's own
+// prompt, so the same rule: the preview stands in, and the verbatim text is the
+// block this row's id keys.
+//
+// ONE spelling now, the contract's: the server row serializer renames each steer entry's
+// text exactly as it renames the row's own prompt (../server/api-reads.ts `turnRowOf` /
+// `steerRowOf`), so the client reads `promptPreview` and nothing else. (The dual read this
+// replaces was a workaround for a serializer that shipped the projector's internal
+// `prompt` while the spec (../shared/harness-api.ts:1718-1726) requires `promptPreview`.)
 const projectSteers = (
     steers: readonly DisplaySteerSummaryWire[] | undefined
 ): DisplaySteerSummary[] | undefined => {
@@ -254,7 +343,10 @@ const projectSteers = (
     return steers.map((steer) => ({
         ...(steer.id === undefined ? {} : { id: steer.id }),
         at: steer.at,
-        prompt: steer.promptPreview,
+        // The closed contract REQUIRES this field, so the only reason it can be missing is a
+        // producer outside the spec; `''` keeps the render model total (a tile that renders
+        // `steer.prompt` never sees `undefined`) instead of reinstating the old spelling.
+        prompt: steer.promptPreview ?? '',
         ...(steer.sectionId === undefined ? {} : { sectionId: steer.sectionId }),
         ...(steer.threadId === undefined ? {} : { threadId: steer.threadId }),
         ...(steer.references === undefined ? {} : { references: steer.references })

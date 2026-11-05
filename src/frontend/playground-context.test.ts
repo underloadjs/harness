@@ -283,8 +283,9 @@ it('runs a session-bound call in its own session and never adopts it into the ch
     expect((created[0].body as { harness: string }).harness).toBe('alpha');
     expect((created[0].body as { settings: { model: string } }).settings.model).toBe('m1');
 
-    // The call carries the TEMPORARY id, never the reader's conversation id.
-    expect(calls.find((entry) => entry.url === '/api/tools/toolRequest')).toEqual({
+    // The call carries the TEMPORARY id, never the reader's conversation id. `POST` is the
+    // execution; the opened tool also spent one identified schema read (`GET` on the same path).
+    expect(calls.find((entry) => entry.url === '/api/tools/toolRequest' && entry.method === 'POST')).toEqual({
         url: '/api/tools/toolRequest',
         method: 'POST',
         body: { parameters: { tags: ['web'] }, sessionId: 'temp-1' }
@@ -332,10 +333,12 @@ it('keeps the same temporary context across playground calls and stays on its ow
 
     expect(posts(calls, '/api/sessions', 'POST')).toHaveLength(1);
     expect(
-        byPrefix(calls, '/api/tools/').map((entry) => [
-            entry.url.split('/').pop(),
-            (entry.body as { sessionId?: string }).sessionId
-        ])
+        byPrefix(calls, '/api/tools/')
+            .filter((entry) => entry.method === 'POST')
+            .map((entry) => [
+                entry.url.split('/').pop(),
+                (entry.body as { sessionId?: string }).sessionId
+            ])
     ).toEqual([
         ['toolRequest', 'temp-1'],
         ['task', 'temp-1']
@@ -359,7 +362,9 @@ it('keeps the same temporary context across playground calls and stays on its ow
         posts(calls, '/api/sessions', 'POST').map((entry) => (entry.body as { harness: string }).harness)
     ).toEqual(['alpha', 'alpha']);
     expect(
-        byPrefix(calls, '/api/tools/').map((entry) => (entry.body as { sessionId?: string }).sessionId)
+        byPrefix(calls, '/api/tools/')
+            .filter((entry) => entry.method === 'POST')
+            .map((entry) => (entry.body as { sessionId?: string }).sessionId)
     ).toEqual(['temp-1', 'temp-1', 'temp-2']);
 
     // The closed context was deleted rather than left behind as a conversation.
@@ -398,7 +403,9 @@ it('deletes the temporary session when the playground closes, and starts a fresh
 
     expect(posts(calls, '/api/sessions', 'POST')).toHaveLength(2);
     expect(
-        byPrefix(calls, '/api/tools/').map((entry) => (entry.body as { sessionId?: string }).sessionId)
+        byPrefix(calls, '/api/tools/')
+            .filter((entry) => entry.method === 'POST')
+            .map((entry) => (entry.body as { sessionId?: string }).sessionId)
     ).toEqual(['temp-1', 'temp-2']);
     // T9: the reader's directory is only reachable from the chat view.
     await backToChat();
@@ -437,9 +444,10 @@ it('discards a session whose create lands after the playground was closed', asyn
     await flush();
     await flush();
 
-    // The late record is removed instead of being adopted, and the call never ran.
+    // The late record is removed instead of being adopted, and the call never ran. (`POST` is
+    // the execution; the identified schema read the opened tool costs is not a call.)
     expect(byPrefix(calls, '/api/sessions/late-1', 'DELETE')).toHaveLength(1);
-    expect(byPrefix(calls, '/api/tools/')).toEqual([]);
+    expect(byPrefix(calls, '/api/tools/').filter((entry) => entry.method === 'POST')).toEqual([]);
 
     // The runner says honestly why nothing happened, as a structured response.
     expect(JSON.parse(box.textContent ?? '{}')).toEqual({
@@ -475,7 +483,9 @@ it('calls a tool that needs no session directly, with no session traffic at all'
 
     // R7: a catalogue tool stays a bare function call — the request body is byte-identical
     // to the pre-playground contract, with no `sessionId` key.
-    expect(calls.find((entry) => entry.url === '/api/tools/read')).toEqual({
+    expect(
+        calls.find((entry) => entry.url === '/api/tools/read' && entry.method === 'POST')
+    ).toEqual({
         url: '/api/tools/read',
         method: 'POST',
         body: { parameters: ['package.json'] }

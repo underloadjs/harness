@@ -6303,8 +6303,13 @@ components:
       description: >-
         One segment of the ONE context bar: METADATA ONLY, carrying no text, which is what lets the default wire
         grow with the NUMBER of segments and never with their length. The bytes are exactly one identified read
-        away at the block detail route.
-      required: [kind, id, turnId, sectionId, label, chars, state]
+        away at the block detail route. The display and block routes transport the projector's record VERBATIM
+        (./api.ts `getSessionTurnDisplay` and `getSessionTurnBlock` cast, never restate, `projector.display()` and
+        `store.blockDetail()`), so these property names ARE the projector's field names
+        (src/shared/turn-display.ts `ContextBlock`): `name`, never a renamed `label`, is what the server sends.
+        No time figure, no span, and no `inPrompt` verdict is dropped by this record either, because every one of
+        them is a figure the durable record already holds and a client may not re-derive.
+      required: [kind, id, turnId, sectionId, chars]
       additionalProperties: false
       properties:
         kind:
@@ -6321,16 +6326,72 @@ components:
           type: string
         sectionId:
           type: string
+        name:
+          type: string
+          description: >-
+            THE server-decided display name, in the projector's own spelling, and the spelling this server actually
+            transports: the recorded tool name for a tool block, and `instructions` / `reasoning` / `answer` /
+            `prompt` / `steer` for the others. Optional so a client reads `name`, then `label`, then `kind`, and
+            never synthesizes a figure the record does hold; a server producer always states it, and
+            `context:set` re-stamps it ONLY when the recorded name changes.
         label:
           type: string
           maxLength: 200
-          description: Display label decided by the server (the recorded tool name for a tool block), so the renderer invents nothing.
+          description: >-
+            The same server-decided display figure under its older spelling. No harness producer sends it (the
+            display and block routes carry the projector's `name`, and `TurnBlockDetail` is this record plus its
+            text), so it is OPTIONAL and a client prefers `name` over it. It stays in the closed set because
+            `additionalProperties: false` would otherwise forbid a record a bounded producer may still publish.
         chars:
           type: integer
           minimum: 0
           description: EXACT recorded length of the segment's text, the figure a preview stands in for.
         state:
-          $ref: '#/components/schemas/SectionDisplayState'
+          $ref: '#/components/schemas/StepDisplayState'
+          description: >-
+            `tool` only: the call's own state, in the STEP vocabulary the projector mints (`running` while the
+            call is open, `ok` / `error` / `cancelled` once it settles, src/server/turn-projector.ts:2022 and
+            :2482, and the same figure `DisplayStep.state` carries). ABSENT for a `user` / `system` / `reasoning` /
+            `assistant` segment and before a call settles - a system segment answers with NO `state` key at all,
+            which is the closed key set the block route returns (src/server/api.test.ts:2195-2206). A record that
+            carries a SECTION-vocabulary value anyway is mapped, not narrowed, by the client
+            (src/frontend/display-project.ts `segmentStateOf`).
+        at:
+          type: integer
+          minimum: 0
+          description: >-
+            Recorded time this block's text entered the conversation: the opening event's timestamp, a steered
+            submit's own `at`, or the turn's `startedAt` for the prompt. ABSENT when the record carries no
+            timestamp, and never `0`, so a renderer never paints a fake time.
+        endedAt:
+          type: integer
+          minimum: 0
+          description: Settle time of a tool block (its `tool_result`'s recorded time). Absent while the call is still running, and for every other kind.
+        durationMs:
+          type: integer
+          minimum: 0
+          description: >-
+            Time taken, so a segment states its own duration without a fetch, and ONLY ever a figure the record
+            supports - never a re-derivation or an estimate: the tool's own measured span for a `tool` block (the
+            same value `DisplayStep.durationMs` carries, deliberately NOT `endedAt - at`), the recorded stream
+            window's span for a `reasoning` / `assistant` window with two distinct timestamped events, and absent
+            for `user` / `system`, which have no recorded span.
+        argsChars:
+          type: integer
+          minimum: 0
+          description: '`tool` only: EXACT length of the recorded `tool_call.arguments` string (raw JSON); while the call runs, every argument byte recorded SO FAR, which is all the record holds.'
+        resultChars:
+          type: integer
+          minimum: 0
+          description: '`tool` only: EXACT length of the recorded `tool_result.content`. ABSENT while no result is recorded (then `chars === argsChars`), exact once the call settles, including a failed or cancelled result.'
+        inPrompt:
+          type: boolean
+          description: >-
+            True when this block's recorded text is part of what the requests that follow replay: instructions,
+            the user prompt, a steered submit, a committed answer, and a tool block whose text is a settled
+            (including failed or cancelled) result or only the arguments of a call still running. False for a
+            `reasoning` block, which is streamed and recorded but NEVER replayed into the next request. Stated
+            explicitly so a bar never assumes every counted segment is prompt text.
         eventFrom:
           type: integer
           minimum: 0

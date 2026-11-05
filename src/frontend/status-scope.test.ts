@@ -23,6 +23,28 @@ import type {
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import type { StreamDouble } from './view-test-support';
+
+// T38/T24: the shell follows a conversation over the canonical `harness.v1` WebSocket
+// (./stream.ts), and there is NO SSE fallback in the client (stream.ts:40-43). A live case
+// therefore drives `installHarnessStream`, resolved by a DYNAMIC import: `vi.resetModules()`
+// clears the module registry, so a statically imported double would configure the PREVIOUS
+// `./stream` instance while `main.ts` — imported after the reset — dials a fresh singleton
+// with no factory at all, and the frames would land nowhere (the same discipline
+// composer-agent-control.test.ts:24-39 and main-lazy-display.test.ts:521-525 follow).
+const installLiveStream = (options: {
+    sessionId?: string;
+    snapshot?: () => SessionSnapshot | undefined;
+}): Promise<StreamDouble> =>
+    import('./view-test-support').then((support) => support.installHarnessStream(options));
+
+// The singleton is process-wide (./stream.ts:647), so the double is released through the SAME
+// module instance the shell used, or it leaks into the next file's boot.
+const releaseLiveStream = async (): Promise<void> => {
+    const { resetHarnessStream } = await import('./stream');
+
+    resetHarnessStream();
+};
 
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
@@ -81,49 +103,6 @@ const turn = (overrides: Partial<SessionTurn>): SessionTurn =>
         events: [],
         ...overrides
     }) as SessionTurn;
-
-// One SSE frame per `SessionStreamItem`, exactly the shape api.ts parses.
-const dataOf = (items: readonly unknown[]): Uint8Array =>
-    new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''));
-
-const sse = (items: readonly unknown[]): Response => {
-    const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-            controller.enqueue(dataOf(items));
-            controller.close();
-        }
-    });
-
-    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
-};
-
-// A stream whose tail is released by the test, so the state BEFORE the terminal
-// snapshot (a failure still owning a pane) can be observed deterministically.
-const splitSse = (
-    first: readonly unknown[],
-    rest: readonly unknown[]
-): { response: Response; release: () => void } => {
-    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-
-    const stream = new ReadableStream<Uint8Array>({
-        start(next) {
-            controller = next;
-            next.enqueue(dataOf(first));
-        }
-    });
-
-    return {
-        response: new Response(stream, {
-            status: 200,
-            headers: { 'Content-Type': 'text/event-stream' }
-        }),
-        release: (): void => {
-            if (controller === undefined) throw new Error('the stream never started');
-            controller.enqueue(dataOf(rest));
-            controller.close();
-        }
-    };
-};
 
 const json = (value: unknown, status = 200): Response =>
     new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -185,9 +164,12 @@ beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
 });
 
-afterEach(() => {
+afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    // T38: a live case installs the stream double; release it through the same module
+    // instance the shell used so it cannot leak into the next file's boot.
+    await releaseLiveStream();
 });
 
 it('opens a saved cancelled session without a run status in the app header', async () => {
@@ -329,6 +311,12 @@ it('reports an active task failure on its tile and note, never in the app header
         turns: [turn({ status: 'error', prompt: 'say hi', updatedAt: T + 200 })]
     });
 
+    // T24: the live frames arrive over the canonical `harness.v1` socket double (there is no
+    // SSE route to stub any more), installed BEFORE the shell boots so the subscription the
+    // client opens lands on it. The frames are the raw `SessionStreamItem`s a recorded server
+    // emits; the double folds them with the server's own projector.
+    const live = await installLiveStream({ sessionId: 's1' });
+
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
@@ -349,13 +337,6 @@ it('reports an active task failure on its tile and note, never in the app header
             );
         }
 
-        if (url === '/api/sessions/s1/events') {
-            return sse([
-                { type: 'turn', turn: opening },
-                { type: 'failed', error: { message: FAILURE }, session: failed }
-            ]);
-        }
-
         return undefined;
     });
 
@@ -365,6 +346,13 @@ it('reports an active task failure on its tile and note, never in the app header
     const input = byClass('.composer-input', 'textarea');
     input.value = 'say hi';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+
+    await flush();
+
+    live.push([
+        { type: 'turn', turn: opening },
+        { type: 'failed', error: { message: FAILURE }, session: failed }
+    ]);
 
     await flush();
     await flush();
@@ -418,26 +406,16 @@ it('keeps a failure local while the rest of the queue keeps running', async () =
     });
 
     localStorage.setItem(SESSION_KEY, 's1');
-    let releaseStream: () => void = () => {
-        throw new Error('the events stream never opened');
-    };
+
+    // T24: the queue advances over the canonical socket double. The frames the released SSE
+    // tail used to carry are pushed when the test asks for them, which keeps the state BEFORE
+    // the advance observable.
+    const live = await installLiveStream({ sessionId: 's1', snapshot: () => holding });
 
     stubFetch((url) => {
         if (url === '/api') return json(bootstrap({ sessions: [holding] }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1') return json({ session: holding });
-
-        if (url === '/api/sessions/s1/events') {
-            const stream = splitSse(
-                [],
-                [
-                    { type: 'turn', turn: running },
-                    { type: 'snapshot', session: final }
-                ]
-            );
-            releaseStream = stream.release;
-            return stream.response;
-        }
 
         return undefined;
     });
@@ -455,7 +433,10 @@ it('keeps a failure local while the rest of the queue keeps running', async () =
 
     // The queue advances: the second task runs and finishes. Only the session state
     // moves; the app header never becomes a run display.
-    releaseStream();
+    live.push([
+        { type: 'turn', turn: running },
+        { type: 'snapshot', session: final }
+    ]);
     await flush();
     await flush();
 

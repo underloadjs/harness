@@ -694,16 +694,42 @@ export const applyOpToDisplay = (
     }
 };
 
-// Apply a whole frame's ops to one turn's tree. Missing trees are tolerated: an
-// `ops` frame for an unknown turn is a no-op (the terminal `view` frame reconciles).
+// Apply a whole frame's ops to one turn's tree.
+//
+// A tree the document never carried is NOT automatically a no-op: the ordering contract
+// (../shared/turn-display.ts:1062) makes a frame's `section:open` ops self-sufficient —
+// each carries a WHOLE section — so a turn the document names a row for converges from
+// the frame alone. That is the difference between "this client has never heard of the
+// turn" and "this client accepted the task and its row is paint-only" (a submit receipt,
+// ./view-api.ts `rowFromReceipt`, or a window whose tree the lazy plane has not fetched
+// yet, T24). Dropping those frames left the streaming tile with no tree at all, so
+// `section:set`/`node:*` had nothing to address: streamed text never painted and the
+// delegated agent's activity ring could never be resolved for removal (view-state.ts
+// `applyOpsToActivity` looks a section's agent up in this tree).
+//
+// A frame for a turn the document holds NO ROW for stays a no-op, and no tree is minted:
+// that is the "another tab's turn, the terminal `view` frame reconciles it" case.
 export const applyOpsToDisplay = (
     view: SessionView,
     turnId: string,
     ops: readonly TurnDisplayOp[],
     pending: PendingSections
 ): void => {
-    const display = displayOf(view, turnId);
-    if (display === undefined) return;
+    let display = displayOf(view, turnId);
+
+    if (display === undefined) {
+        const opensSection = ops.some((op) => op.op === 'section:open');
+        const knownRow = summariesOf(view).some((summary) => summary.id === turnId);
+
+        // Nothing to seed the tree from, or a turn this document does not hold: leave it
+        // absent so a later `section:open` (or the terminal frame) is the thing that mints it.
+        if (!opensSection || !knownRow) return;
+
+        display = { turnId, sections: [] };
+
+        if (view.displays === null || typeof view.displays !== 'object') view.displays = {};
+        (view.displays as Record<string, TurnDisplay>)[turnId] = display;
+    }
 
     for (const op of ops) void applyOpToDisplay(display, turnId, op, pending);
 };
@@ -718,11 +744,32 @@ export const applyOpsToDisplay = (
 // tile (a `queued` row painted over a `streaming` one), so it is dropped. An EQUAL
 // stamp still applies: the server bumps `updatedAt` on every state change, so equal is
 // the same moment, not an older one.
+//
+// T44 (live merge semantics): that comparison must NOT run against a row this client
+// painted from a submit receipt (`view-api.ts rowFromReceipt`, flagged `optimistic: true`
+// and stamped with the receipt's `accepted_at`, i.e. the LOCAL clock). An optimistic row
+// is not a server statement, and it is stamped later than every row the server publishes
+// for that turn whenever the two clocks differ — so it outranked the real `turn.upsert`
+// and the tile kept the receipt's figures forever (no `usage`, so no token tally;
+// `queued`, so the pill never cleared). A stamped row for the same id always replaces an
+// optimistic one; an optimistic row still beats nothing, which is what a receipt is for.
 export const upsertSummary = (view: SessionView | SessionViewSummary, summary: TurnSummary): void => {
     const rows = summariesOf(view as SessionView);
     const index = rows.findIndex((row) => row.id === summary.id);
 
-    if (index >= 0 && isNewerSummary(rows[index] as TurnSummary, summary)) return;
+    // Both rows of the same id, read once: the row this document holds and the one arriving.
+    const known = rows[index] as TurnSummary & { optimistic?: boolean };
+    const incoming = summary as TurnSummary & { optimistic?: boolean };
+
+    // T47 (the mirror of the tile rule in ./ui/turns.ts `setCompiledSummary`): an OPTIMISTIC
+    // row loses to any stamped row for the same id, no matter what `accepted_at` says. The
+    // receipt is stamped with the LOCAL clock, so on a machine running ahead of the server it
+    // outranked the `streaming`/`done` row the observer had already delivered and the tile fell
+    // back to `queued` forever. A receipt is a placeholder: it may paint a row that does not
+    // exist yet (append below) and nothing else.
+    if (index >= 0 && incoming.optimistic === true && known.optimistic !== true) return;
+
+    if (index >= 0 && known.optimistic !== true && isNewerSummary(known, summary)) return;
 
     if (index < 0) rows.push(summary);
     else rows[index] = summary;
@@ -768,6 +815,35 @@ export const applyOpToView = (view: SessionView, op: TurnDisplayOp, pending: Pen
         if (op.latestInput !== undefined) summary.latestInput = op.latestInput;
         if (op.cachedInput !== undefined) summary.cachedInput = op.cachedInput;
     } else applyOpsToDisplay(view, op.turnId, [op], pending);
+};
+
+// T46: the ONE rule for what a SESSION-level patch may change, stated once so the shell and
+// its tests agree. `session.updated` (`SessionStatePatch`,
+// ../shared/harness-api.ts:2048-2059) and a pending-action list are the only inputs of this
+// kind, and both are metadata: they state status, queue depth, the model map, the last error
+// and the open questions — never rows, trees or the paging cursor.
+//
+// Keeping the merge here (rather than in `main.ts`'s frame handler) is what makes the rule
+// testable without a browser: a whole-document apply (`applyView`) is authoritative for rows
+// and tombstones every id it no longer names, so applying a metadata read through it deletes
+// a running board (T44). This function can never do that, because it never touches `turns`,
+// `displays` or `olderCursor`.
+export const applySessionPatch = (
+    view: SessionView,
+    patch: Partial<SessionView> & { actions?: unknown }
+): SessionView => {
+    if (patch.status !== undefined) view.status = patch.status;
+    if (patch.queueDepth !== undefined) view.queueDepth = patch.queueDepth;
+    if (patch.lastError !== undefined) view.lastError = patch.lastError;
+    // An empty model string states nothing: a patch that omits the model must not blank the
+    // one this conversation is actually running.
+    if (typeof patch.model === 'string' && patch.model.length > 0) view.model = patch.model;
+    if (patch.agentModels !== undefined) view.agentModels = { ...patch.agentModels };
+    // `actions` is a display-plane field (the protocol document type does not name it), and a
+    // card answer is exactly what this patch carries.
+    if (patch.actions !== undefined) (view as { actions?: unknown }).actions = patch.actions;
+
+    return view;
 };
 
 // ---------------------------------------------------------------------------
@@ -820,8 +896,19 @@ export const applyOpsToActivity = (
     // The agent a section id names, from the tree as it stands BEFORE the frame (which is
     // what the caller passes): the only case that needs it after the mutation is
     // `section:remove`, where the tree no longer holds the section.
+    //
+    // A section the pre-state tree does not hold is resolved from THIS frame's own
+    // `section:open` ops: a submit-accepted row arrives with no tree (the receipt is
+    // paint-only), and the frame that opens the delegation carries the section itself.
+    // Without that fallback a `section:set` in the same frame cannot name its agent, so
+    // the delegated ring could never be cleared.
+    const openedAgents = new Map<string, string>();
+    for (const op of ops) {
+        if (op.op === 'section:open') openedAgents.set(op.section.id, op.section.agent);
+    }
+
     const agentOf = (sectionId: string): string | undefined =>
-        sectionsOf(display).find((section) => section.id === sectionId)?.agent;
+        sectionsOf(display).find((section) => section.id === sectionId)?.agent ?? openedAgents.get(sectionId);
 
     for (const op of ops) {
         switch (op.op) {

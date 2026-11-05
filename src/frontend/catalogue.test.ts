@@ -12,14 +12,23 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
-const descriptor = {
+// T17: `GET /harnesses` publishes contract CARDS, which are snake_case, and the shell
+// maps them through `descriptorOf` (./api.ts:1203) — a mapping that reads
+// `requires_endpoint` and spreads `subagents`, so a pre-canonical body without those
+// fields threw during boot and left the whole shell offline.
+const card = {
     name: 'demo',
     title: 'Demo harness',
     description: 'A harness for the catalogue test.',
-    requiresEndpoint: false,
+    requires_endpoint: false,
+    primary: 'demo',
+    subagents: [],
     agents: ['demo'],
-    tools: []
+    tools: [],
+    builtin: true,
+    definition_revision: 1
 };
 
 const WEBSEARCH_PARAMETERS = {
@@ -38,15 +47,19 @@ const json = (value: unknown): Response =>
 const stubFetch = (availability: unknown): void => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
 
             // Canonical-style bootstrap document: one answer carries the presets,
-            // the tool catalogue and the (empty) session list.
+            // the tool catalogue and the (empty) session list. T45: the shell dials the
+            // canonical control plane (`/v1/harness`, `/config`, one page per catalogue),
+            // so this legacy body is handed to `viewAwareFetch` (./view-test-support.ts),
+            // which re-acts it as those canonical routes without inventing any payload
+            // the fixture does not already state.
             if (url === '/api') {
                 return json({
                     rootPath: 'D:/repo',
-                    presets: [descriptor],
+                    presets: [card],
                     tools: [
                         {
                             name: 'search',
@@ -55,6 +68,9 @@ const stubFetch = (availability: unknown): void => {
                             tags: ['web', 'search', 'internet', 'news', 'research'],
                             // R18: a configured (or listed) search is core.
                             visibility: 'core',
+                            // A direct call, not a session-registry tool (`session_bound`
+                            // is the contract's spelling, shared/harness-api.ts:647).
+                            session_bound: false,
                             parameters: WEBSEARCH_PARAMETERS,
                             availability
                         }
@@ -68,7 +84,7 @@ const stubFetch = (availability: unknown): void => {
             if (url.endsWith('/api/models')) return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }, { root: '/api' }))
     );
 };
 

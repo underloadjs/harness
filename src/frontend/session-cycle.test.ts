@@ -124,24 +124,39 @@ const bootstrap = (overrides: Record<string, unknown> = {}): Record<string, unkn
 
 // Router stub: log every call, answer only what the test declares, and fail loudly on
 // anything else — which is what makes "one GET per switch, zero writes" provable.
+//
+// T43: the log is taken on the OUTSIDE of `viewAwareFetch`, i.e. it records the URL the
+// BROWSER asked for. On the inside, the adapter rewrites every canonical route to its raw
+// twin AND reads that twin again for its own composition answers (./view-test-support.ts
+// `hostOf`/`hostEx`), so a raw-side count of `/api/sessions/:id` is a mix of client reads
+// and adapter reads and can no longer prove "one record read per press". The test's own
+// routes stay declared the raw way; only the recorded log is canonical.
 const stubFetch = (
     handler: (url: string, method: string | undefined, body: unknown) => Response | undefined
 ): Call[] => {
     const calls: Call[] = [];
 
+    const answer = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method;
+        const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+
+        const response = handler(url, method, body);
+        if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
+
+        return response;
+    }, { root: '/api' });
+
     vi.stubGlobal(
         'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
             calls.push({ url, method, body });
 
-            const response = handler(url, method, body);
-            if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-
-            return response;
-        }, { root: '/api' }))
+            return answer(input, init);
+        })
     );
 
     return calls;
@@ -205,13 +220,21 @@ const rereadDirectory = async (): Promise<void> => {
     await flush();
 };
 
-// Reads of a conversation RECORD — i.e. exactly the `openSession` calls, in order. Neither
-// `/api/models` (the provider list boot always asks for) nor `/api/sessions` (the directory
-// read) opens a conversation, so the trailing slash excludes both.
+// Reads of a conversation RECORD — i.e. exactly the `openSession` calls, in order.
+//
+// T43: the client speaks the canonical wire (../shared/harness-api.ts:69), and an
+// `openSession` is ONE unqualified `GET /v1/harness/sessions/:id` followed by that
+// conversation's NAMED subresources (`/turns`, `/threads`, `/actions`,
+// `/turns/:tid/display`, and the dialog's `/usage` fold). The exact-path pattern below is
+// what keeps this list one entry per open: neither `/v1/harness/models` (the provider
+// discovery boot always fires) nor `/v1/harness/sessions?limit=25` (the directory page) nor
+// any subresource can inflate it, so "one read per switch" is still the assertion.
+const SESSION_ROW = /^\/v1\/harness\/sessions\/([^/?]+)$/;
 const opened = (calls: Call[]): string[] =>
     calls
-        .filter((call) => call.method === undefined && call.url.startsWith('/api/sessions/'))
-        .map((call) => call.url.slice('/api/sessions/'.length));
+        .filter((call) => call.method === undefined)
+        .map((call) => SESSION_ROW.exec(call.url)?.[1])
+        .filter((id): id is string => id !== undefined);
 
 // Three conversations of the selected harness, in directory order. Every test that cycles
 // starts from s1 (the remembered pointer), so the expected walk is fully known: s1 → s2 → s3
@@ -469,14 +492,15 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
         expect(document.querySelector('.tile')?.textContent).toContain('first in');
 
         // Exactly one record GET per hop, in directory order, and no write of any kind:
-        // cycling is a view change, never a cancellation or a save (R4). (`/api/models` is the
-        // background provider lookup boot always fires.)
+        // cycling is a view change, never a cancellation or a save (R4). (`/v1/harness/models`
+        // is the background provider discovery boot always fires — a POST on the canonical
+        // route, and a read of the provider list, not a conversation write.)
         expect(opened(calls)).toEqual(['s1', 's2', 's3', 's1']);
         expect(
             calls.filter(
                 (call) =>
                     (call.method === 'POST' || call.method === 'DELETE' || call.method === 'PATCH') &&
-                    call.url !== '/api/models'
+                    call.url !== '/v1/harness/models'
             )
         ).toEqual([]);
     });
@@ -583,12 +607,25 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
         });
 
         localStorage.setItem(SESSION_KEY, 's1');
+        // The directory the SERVER lists is mutable on purpose. The canonical session page
+        // (`GET /v1/harness/sessions?limit=25`, ./shared/harness-api.ts) is dialled at boot AND
+        // again by the re-read the delete triggers, so one static answer would describe two
+        // different moments: with only `second` declared the boot page never contained the
+        // remembered conversation, and the harness entry opened the page's newest row (s2)
+        // instead of the remembered s1 (T21 R21). The deleted conversation leaves the list
+        // exactly when its DELETE lands, which is what the server does.
+        let listed = [first, second];
+
         const calls = stubFetch((url, method) => {
-            if (url === '/api') return json(bootstrap({ sessions: [first, second] }));
+            if (url === '/api') return json(bootstrap({ sessions: listed }));
             if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && method === undefined) return json({ sessions: [second] });
+            if (url === '/api/sessions' && method === undefined) return json({ sessions: listed });
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: first });
-            if (url === '/api/sessions/s1' && method === 'DELETE') return json({ deleted: true });
+            if (url === '/api/sessions/s1' && method === 'DELETE') {
+                listed = [second];
+
+                return json({ deleted: true });
+            }
             if (url === '/api/sessions/s2') return json({ session: second });
             return undefined;
         });

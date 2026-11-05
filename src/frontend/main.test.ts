@@ -27,7 +27,39 @@ import type {
     SessionTurn
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { viewAwareFetch } from './view-test-support';
+import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
+import type { HarnessStreamOptions, StreamDouble } from './view-test-support';
+
+// T37: canonical request evidence.
+//
+// The shell dials the canonical control plane (`/v1/harness/...`), and the shared double
+// (`./view-test-support`) composes each canonical answer by re-reading the test's OWN raw
+// route (`GET {root}/sessions/:id`) — a session open costs one metadata read plus the turns
+// page, roster, definition, usage and queue composition reads. Counting the raw route
+// therefore no longer answers "which conversations did the SHELL open": every open looks
+// like six reads of the same id.
+//
+// `canonicalReads` is the honest replacement: the URLs the browser actually sent, captured
+// in the wrapper OUTSIDE the double (the same shape `main-lazy-display.test.ts` uses). Tests
+// assert conversation opens off the row PAGE route, tree fetches off the display route, and
+// lazy detail fetches off the step/block routes.
+let canonicalReads: string[] = [];
+
+// One canonical read of one conversation, in the client's own spelling.
+const rowReadsFor = (sessionId: string): string[] =>
+    canonicalReads.filter(
+        (url) => url.split('?')[0] === `/v1/harness/sessions/${sessionId}/turns`
+    );
+
+// T50/R5: the conversation's METADATA reads (`GET /v1/harness/sessions/:id`) — the resource the
+// bounded fallback refresh re-reads while a run is pending and the live plane cannot carry it.
+// Counted on the OUTER recorder (the URL the browser actually sent), never on the raw fixture
+// route: the shared double re-reads that one route once per canonical answer it composes, so a raw
+// count answers "how many probes did the double make", not "how often did the SHELL refresh".
+const metaReadsFor = (sessionId: string): string[] =>
+    canonicalReads.filter(
+        (url) => url.split('?')[0] === `/v1/harness/sessions/${sessionId}`
+    );
 
 const SESSION_KEY = 'underload-harness-app:session';
 // Realistic epoch stamps: the UI formats real server milliseconds, and a tiny
@@ -119,51 +151,12 @@ const bootstrap = (overrides: Record<string, unknown> = {}): Record<string, unkn
     ...overrides
 });
 
-// One SSE frame per `SessionStreamItem`, exactly the shape api.ts parses.
+// One SSE frame per `SessionStreamItem`, in the shape the raw observer body carries. Only the one
+// still-hand-rolled observer fixture below uses it (`hydrates a queued session on reload…`); every
+// other live case rides the canonical socket double, and the two whole-body helpers this file used to
+// hand out (`sse`, `splitSse`) died with those conversions.
 const dataOf = (items: readonly unknown[]): Uint8Array =>
     new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''));
-
-const sse = (items: readonly unknown[]): Response => {
-    const body = dataOf(items);
-    const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-            controller.enqueue(body);
-            controller.close();
-        }
-    });
-
-    return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
-};
-
-// The same body, delivered in two halves: `start` sends the first, the test calls
-// `release()` for the rest. One `sse` chunk applies every frame before the test
-// regains control, which cannot pin what the tile shows BETWEEN frames (main.ts
-// updates the tally per frame) — this can.
-const splitSse = (
-    first: readonly unknown[],
-    rest: readonly unknown[]
-): { response: Response; release: () => void } => {
-    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-
-    const stream = new ReadableStream<Uint8Array>({
-        start(next) {
-            controller = next;
-            next.enqueue(dataOf(first));
-        }
-    });
-
-    return {
-        response: new Response(stream, {
-            status: 200,
-            headers: { 'Content-Type': 'text/event-stream' }
-        }),
-        release: (): void => {
-            if (controller === undefined) throw new Error('the stream never started');
-            controller.enqueue(dataOf(rest));
-            controller.close();
-        }
-    };
-};
 
 const json = (value: unknown, status = 200): Response =>
     new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -176,27 +169,100 @@ type Call = { url: string; method: string | undefined; body: unknown };
 
 // A tiny router for the stubbed server: log every call, answer what the test
 // declares, and fail loudly on anything unexpected.
+//
+// T37/T42: the placement of the two records is the whole point.
+//   - `calls` sits INSIDE `viewAwareFetch`, so it sees the RAW route the double composed its
+//     answer from (`POST /api/sessions/s1/tasks` for a task receipt, `/api/sessions/s1` for the
+//     metadata/row-page/tree reads it re-expresses). A write assertion is about the contract's
+//     own route, so it asserts on that.
+//   - `canonicalReads` sits OUTSIDE the adapter, on the function the browser actually calls, so
+//     it records the URL the SHELL sent: `/v1/harness/sessions/s1/turns?limit=25&order=desc` for
+//     a row page, `/v1/harness/sessions/s1/turns/t1/display` for a lazy tree. Recording inside
+//     the adapter (the shape this file had) logged the double's own composition reads instead,
+//     which made `rowReadsFor` structurally unable to match anything — the same placement rule
+//     `selectionStub` and `enterStub` follow.
 const stubFetch = (
     handler: (url: string, method: string | undefined, body: unknown) => Response | undefined
 ): Call[] => {
     const calls: Call[] = [];
 
+    const rawFetch = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method;
+        const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+        calls.push({ url, method, body });
+
+        const response = handler(url, method, body);
+        if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
+
+        return response;
+    }, { root: '/api' });
+
     vi.stubGlobal(
         'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
-            const method = init?.method;
-            const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
-            calls.push({ url, method, body });
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            // The browser's own spelling, captured before the adapter rewrites it.
+            canonicalReads.push(String(input));
 
-            const response = handler(url, method, body);
-            if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
+            const answer = rawFetch(input, init);
 
-            return response;
-        }, { root: '/api' }))
+            return answer instanceof Promise ? await answer : answer;
+        })
     );
 
     return calls;
+};
+
+// T37: the canonical live surface (replaces the SSE self-stub this file used to hand-roll).
+//
+// The client has no SSE fallback (`./stream.ts:40-43`), so a test that wants live behaviour
+// installs the `harness.v1` WebSocket double BEFORE the shell boots. The double answers the
+// handshake, records the `subscribe`/`unsubscribe` frames the shell sends, and accepts the
+// SAME raw `SessionStreamItem` frames this file always declared, folding them through the
+// server's own projector (`toViewItem`) into `turn.upsert`/`display.ops`/`session.updated`.
+// Frames pushed before the shell registers its subscription are queued, not dropped, so a
+// test declares its traffic up front exactly as it did with `sse(items)`.
+// T42: every install in this file is resolved by a DYNAMIC import, never a static one.
+// `beforeEach` calls `vi.resetModules()`, which clears the module registry, so a statically
+// imported `installHarnessStream` configures the singleton of the PREVIOUS graph while the
+// `main.ts` imported after the reset dials a FRESH `./stream` that has no factory at all. That
+// failure is silent (the shell never subscribes) and reads exactly like "the shell does not
+// observe", so the double and the shell must resolve the SAME `./stream` instance (the rule
+// `main-lazy-display.test.ts:521-525` and `canonical-directory-live-main.test.ts:34-44` state).
+// The TYPES stay static: erased at compile time, they cannot pin an instance.
+const installLiveStream = (options: HarnessStreamOptions): Promise<StreamDouble> =>
+    import('./view-test-support').then((support) => support.installHarnessStream(options));
+
+const liveStream = (
+    sessionId: string,
+    // The document the live fold seeds from (the same source `withViewRoutes` uses).
+    host: () => SessionSnapshot | undefined,
+    initial: readonly unknown[] = []
+): Promise<StreamDouble> =>
+    installLiveStream({ sessionId, snapshot: host }).then((stream) => {
+        if (initial.length > 0) stream.push(initial);
+
+        return stream;
+    });
+
+// T42: frames are addressed to a SUBSCRIPTION, and the client only writes its `subscribe`
+// frame once the double's `welcome` has been answered (./stream.ts queues a subscription made
+// before the handshake). A live case therefore waits for the subscription it wants to address
+// before pushing, which is also the real server's order of events: subscribe, then frames. The
+// wait is bounded so a shell that never observes fails with a named reason instead of hanging.
+const subscribed = async (stream: StreamDouble, scope: string, sessionId?: string): Promise<StreamDouble> => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+        const registered = stream.subscriptions.some(
+            (sub) => sub.scope === scope && (sessionId === undefined || sub.session_id === sessionId)
+        );
+        if (registered) return stream;
+
+        await flush();
+    }
+
+    throw new Error(
+        `the shell never opened a ${scope} subscription${sessionId === undefined ? '' : ` for ${sessionId}`}`
+    );
 };
 
 const statusText = (): string | null | undefined => document.querySelector('.status-text')?.textContent;
@@ -385,6 +451,8 @@ beforeEach(() => {
     vi.resetModules();
     localStorage.clear();
     document.body.innerHTML = '<div id="app"></div>';
+    // Fresh evidence per test: the wrappers below push every URL the shell sends.
+    canonicalReads = [];
     // T6: `--composer-height` is published on the ROOT element, which survives the body
     // reset above. Without this, a test that opened the tools view (a hidden composer
     // publishes `0px`) would leak that value into the next test's boot and make the
@@ -392,9 +460,16 @@ beforeEach(() => {
     document.documentElement.style.removeProperty('--composer-height');
 });
 
-afterEach(() => {
+afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    // The socket client is a process-wide singleton (`./stream.ts` `harnessStream()`); leaving
+    // this test's double installed leaks its subscriptions into the next file's boot. The
+    // import is DYNAMIC on purpose: `vi.resetModules()` in `beforeEach` clears the registry, so
+    // a static import would reset the PREVIOUS graph's singleton while the next `main.ts` dials
+    // a fresh one (the instance rule `main-lazy-display.test.ts:522-524` documents).
+    const { resetHarnessStream: reset } = await import('./stream');
+    reset();
 });
 
 it('boots the three-column shell, streams a turn and resolves server timings', async () => {
@@ -434,13 +509,47 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
         eventTimes: [T, T + 200, T + 1000, T + 1500, T + 1700, T + 2400]
     } as SessionTurn;
     const opening: SessionTurn = { ...recorded, status: 'running', events: [] };
-    const finished = snapshot({ harnessDefinition: descriptor(), turns: [recorded] });
+    const finished = snapshot({ harnessDefinition: descriptor(), turns: [recorded], revision: 7 });
+
+    // T42: the live surface is the canonical `harness.v1` socket, not an SSE body (./stream.ts
+    // :40-43 has no fallback), so the eight frames this test always declared ride the double
+    // instead of a route the shell never asks for again. The double folds them with the SERVER's
+    // own projector (`toViewItem`), so every frame the shell receives is the frame the server
+    // would send for that recorded frame: `turn.upsert` for the running row, `display.ops` per
+    // event (the tool segment, the two text deltas, the settled answer), then `session.updated`
+    // plus the recorded rows from the terminal snapshot.
+    const frames: SessionStreamItem[] = [
+        { type: 'turn', turn: opening },
+        { type: 'event', turnId: 't1', event: start, at: T },
+        { type: 'event', turnId: 't1', event: call, at: T + 200 },
+        { type: 'event', turnId: 't1', event: result, at: T + 1000 },
+        { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: '# Hi\n\n' }, at: T + 1500 },
+        { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'a **b**' }, at: T + 1700 },
+        { type: 'event', turnId: 't1', event: done, at: T + 2400 }
+    ];
+
+    // The document the SERVER holds, moved forward by the same frames the socket carries: a
+    // canonical read (the metadata patch, the row page, the lazy tree) composes from this record,
+    // so it must describe the conversation at the moment the read is answered — a run that is
+    // still in flight has a running turn in it, and only the terminal `snapshot` frame settles it.
+    let host = snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [opening], revision: 3 });
+    const settle = (): void => {
+        host = finished;
+    };
+
+    const live = await liveStream('s1', () => host);
 
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        // The document the canonical surface is composed FROM: every canonical read (the row
+        // page, the roster, the definition, the lazy tree) is answered by the shared double
+        // re-reading this route, which is why one raw record is the whole server side of a
+        // conversation open.
+        if (url === '/api/sessions/s1') return json({ session: host });
 
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             taskRequests += 1;
@@ -455,23 +564,6 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
                 },
                 202
             );
-        }
-
-        if (url === '/api/sessions/s1/events') {
-            const at = (offset: number): number => T + offset;
-
-            const items: SessionStreamItem[] = [
-                { type: 'turn', turn: opening },
-                { type: 'event', turnId: 't1', event: start, at: at(0) },
-                { type: 'event', turnId: 't1', event: call, at: at(200) },
-                { type: 'event', turnId: 't1', event: result, at: at(1000) },
-                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: '# Hi\n\n' }, at: at(1500) },
-                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'a **b**' }, at: at(1700) },
-                { type: 'event', turnId: 't1', event: done, at: at(2400) },
-                { type: 'snapshot', session: finished }
-            ];
-
-            return sse(items);
         }
 
         return undefined;
@@ -598,6 +690,21 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
         'A session is being created; try again in a moment.'
     );
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+
+    // The observer opens because the run is pending, and a frame is addressed to a SUBSCRIPTION,
+    // so the push waits for the shell's `session` subscription to be registered (the order the
+    // real server delivers in) and then carries the run exactly as the SSE body used to.
+    await subscribed(live, 'session', 's1');
+    live.push(frames);
+
+    await flush();
+    await flush();
+
+    // The terminal `snapshot` frame is the last one, and the stub's record moves with it: a
+    // canonical read answered after this point describes the settled conversation, which is what
+    // the server would hold (the recorded stamps, not the local clock).
+    settle();
+    live.push([{ type: 'snapshot', session: finished }]);
 
     await flush();
     await flush();
@@ -818,17 +925,29 @@ it('prints the latest request context with the cumulative cache per frame', asyn
     const opening: SessionTurn = { ...recorded, status: 'running', events: [], usage: firstTally };
     const finished = snapshot({ harnessDefinition: descriptor(), turns: [recorded] });
 
-    // Assigned when the messages stream opens; a missing request must fail the
-    // test loudly instead of silently asserting a stale tile.
-    let releaseStream: () => void = () => {
-        throw new Error('the messages stream never opened');
+    // The document the server holds RIGHT NOW: the canonical reads are composed from it, and it
+    // settles only when the terminal `snapshot` frame is pushed (the store's record moves with
+    // the run the same way).
+    let host = snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [opening] });
+    const settle = (): void => {
+        host = finished;
     };
+
+    // T42: the canonical socket double replaces the split SSE body. The point of the split was
+    // to pin what the tile shows BETWEEN frames (the tally is written per frame, `sse` would
+    // apply all of them before the test regained control); `push(batch)` delivers ONE UPDATE
+    // FRAME per item and returns, so the same halfway assertion still holds. The held-back half
+    // is the second `push` below, and the first frames go in once the subscription exists.
+    const live = await liveStream('s1', () => host);
 
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        // The document the canonical reads are composed from (see the boot test).
+        if (url === '/api/sessions/s1') return json({ session: host });
 
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             return json(
@@ -844,26 +963,6 @@ it('prints the latest request context with the cumulative cache per frame', asyn
             );
         }
 
-        if (url === '/api/sessions/s1/events') {
-            const stream = splitSse(
-                [
-                    { type: 'turn', turn: opening },
-                    { type: 'event', turnId: 't1', event: start, at: T, usage: firstTally },
-                    { type: 'event', turnId: 't1', event: usageFirst, at: T + 50, usage: firstTally }
-                ],
-                [
-                    // A frame with NO tally between two tallied ones: it must leave
-                    // the figure alone rather than clear it.
-                    { type: 'event', turnId: 't1', event: text, at: T + 100 },
-                    { type: 'event', turnId: 't1', event: usageLast, at: T + 150, usage: lastTally },
-                    { type: 'event', turnId: 't1', event: done, at: T + 200, usage: lastTally },
-                    { type: 'snapshot', session: finished }
-                ]
-            );
-            releaseStream = stream.release;
-            return stream.response;
-        }
-
         return undefined;
     });
 
@@ -874,8 +973,16 @@ it('prints the latest request context with the cumulative cache per frame', asyn
     input.value = 'say hi';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
 
-    // The pre-stream requests (session, models) and the first half settle here;
-    // the stream cannot advance until `releaseStream()` below.
+    // The pre-stream requests (session, models) and the receipt settle here. A canonical RECEIPT
+    // carries identity and placement only (../shared/harness-api.ts:1194-1209) — no usage — so the
+    // first tallied figure can only come from the socket. Frames are addressed to a SUBSCRIPTION,
+    // hence the wait, and `push` delivers one UPDATE frame per item: the halfway read below is what
+    // the split SSE body used to pin, and it still holds.
+    await subscribed(live, 'session', 's1');
+    live.push([
+        { type: 'turn', turn: opening },
+        { type: 'event', turnId: 't1', event: usageFirst, at: T + 50, usage: firstTally }
+    ]);
     await flush();
     await flush();
 
@@ -883,7 +990,14 @@ it('prints the latest request context with the cumulative cache per frame', asyn
     expect(liveTally?.textContent).toBe('48 (0)');
     expect(liveTally?.hidden).toBe(false);
 
-    releaseStream();
+    live.push([
+        // A frame with NO tally between two tallied ones: it must leave
+        // the figure alone rather than clear it.
+        { type: 'event', turnId: 't1', event: text, at: T + 100 },
+        { type: 'event', turnId: 't1', event: usageLast, at: T + 150, usage: lastTally },
+        { type: 'event', turnId: 't1', event: done, at: T + 200, usage: lastTally },
+        { type: 'snapshot', session: finished }
+    ]);
     await flush();
     await flush();
 
@@ -917,11 +1031,34 @@ it('keeps the last tally when later frames carry none', async () => {
         usage: tally
     } as SessionTurn;
 
+    // The settled document the run ends on: the same turn, now terminal, with the tally the
+    // tallied frames established. It is both the host the live fold seeds from and the record
+    // the canonical reads are composed from.
+    const finished = snapshot({
+        harnessDefinition: descriptor(),
+        turns: [{ ...opening, status: 'done', events: [start, text, done] }]
+    });
+
+    // The record the server holds, moved forward by the frames below (see the boot test).
+    let host = snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [opening] });
+    const settle = (): void => {
+        host = finished;
+    };
+
+    // T42: the raw frames ride the canonical socket double (the client has no SSE fallback). The
+    // record the terminal `snapshot` frame carries holds the tally the tallied frames
+    // established; the untallied frames after it must not clear it (the tile prints server data
+    // and never re-sums from its own clock).
+    const live = await liveStream('s1', () => host);
+
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        // The document the canonical reads are composed from (see the boot test).
+        if (url === '/api/sessions/s1') return json({ session: host });
 
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             return json(
@@ -937,26 +1074,6 @@ it('keeps the last tally when later frames carry none', async () => {
             );
         }
 
-        if (url === '/api/sessions/s1/events') {
-            // The record carries the tally the frames established; the untallied
-            // frames between must not clear it (the tile only prints server data).
-            const items: SessionStreamItem[] = [
-                { type: 'turn', turn: opening },
-                { type: 'event', turnId: 't1', event: start, at: T, usage: tally },
-                { type: 'event', turnId: 't1', event: text, at: T + 100 },
-                { type: 'event', turnId: 't1', event: done, at: T + 200 },
-                {
-                    type: 'snapshot',
-                    session: snapshot({
-                        harnessDefinition: descriptor(),
-                        turns: [{ ...opening, status: 'done', events: [start, text, done] }]
-                    })
-                }
-            ];
-
-            return sse(items);
-        }
-
         return undefined;
     });
 
@@ -967,6 +1084,20 @@ it('keeps the last tally when later frames carry none', async () => {
     input.value = 'say hi';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
 
+    // The run's frames, addressed to the subscription the pending run opened, and the terminal
+    // snapshot last so the record settles the way the server's does.
+    await subscribed(live, 'session', 's1');
+    live.push([
+        { type: 'turn', turn: opening },
+        { type: 'event', turnId: 't1', event: start, at: T, usage: tally },
+        { type: 'event', turnId: 't1', event: text, at: T + 100 },
+        { type: 'event', turnId: 't1', event: done, at: T + 200 }
+    ]);
+    await flush();
+    await flush();
+
+    settle();
+    live.push([{ type: 'snapshot', session: finished }]);
     await flush();
     await flush();
 
@@ -1253,65 +1384,80 @@ const conversation = (
     }) as unknown as SessionSnapshot;
 
 // The whole server surface the selection tests need: the catalogue with its embedded
-// directory rows, the compact list route (the fallback the shell reads when the
-// catalogue carries none), ONE read per conversation, and an OPEN observer stream for
-// the conversation that is still working. `reads` is the evidence for "opened exactly
-// one conversation, and never a second time"; `emit` pushes a live frame into it.
-const selectionStub = (
+// directory rows, the compact list route, and the canonical reads the double composes from
+// them (row pages, rosters, definitions, trees). T37: the live observer is the canonical
+// `harness.v1` socket double — NOT the open SSE body this file used to hold — so a test that
+// still has a working conversation passes its id in `live` and pushes RAW frames with `emit`.
+// The double is installed unconditionally, because jsdom supplies a real `WebSocket` and an
+// undriven socket reconnects on its own and never delivers anything.
+//
+// `reads` stays the evidence for "opened exactly one conversation, and never a second time",
+// counted where the canonical surface states it: the ROW PAGE of that conversation, which the
+// shell asks for on an open and never re-walks by itself. The raw `GET {root}/sessions/:id`
+// route no longer works as that evidence — the double re-reads it several times per open to
+// compose the row page, roster, definition, usage and queue answers.
+const selectionStub = async (
     rows: SessionSnapshot[],
     // The catalogue's harness rows. Only the cross-harness resume needs a second one.
-    options: { presets?: HarnessDescriptor[] } = {}
-): { reads: string[]; emit: (item: unknown) => void } => {
+    options: { presets?: HarnessDescriptor[]; live?: string } = {}
+): Promise<{ reads: string[]; emit: (item: unknown) => void }> => {
     const reads: string[] = [];
-    let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
 
+    // The socket is scoped to the conversation still working when the test names one; without
+    // a target it answers the newest subscription, which is what a directory-only fixture has.
+    const stream = await installLiveStream(
+        options.live === undefined
+            ? {}
+            : { sessionId: options.live, snapshot: () => rows.find((row) => row.id === options.live) }
+    );
+
+    const fixture = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method;
+
+        if (url === '/api') {
+            return json(
+                bootstrap({
+                    sessions: rows,
+                    ...(options.presets === undefined ? {} : { presets: options.presets })
+                })
+            );
+        }
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
+
+        const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
+        if (read !== null && method === undefined) {
+            const record = rows.find((row) => row.id === read[1]);
+            if (record === undefined) return json({ error: { message: `unknown session ${read[1]}` } }, 404);
+
+            return json({ session: record });
+        }
+
+        return undefined;
+    }, { root: '/api' });
+
+    // The recorder sits OUTSIDE the double: the double answers the canonical row page itself
+    // and never consults the stub for it, so only this pass sees every URL the shell sent.
     vi.stubGlobal(
         'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
-            const method = init?.method;
+            canonicalReads.push(url);
 
-            if (url === '/api') {
-                return json(
-                    bootstrap({
-                        sessions: rows,
-                        ...(options.presets === undefined ? {} : { presets: options.presets })
-                    })
-                );
-            }
-            if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
+            const opened = /^\/v1\/harness\/sessions\/([^/]+)\/turns$/.exec(url.split('?')[0] ?? url);
+            if (opened !== null && init?.method === undefined) reads.push(decodeURIComponent(opened[1]));
 
-            const events = /^\/api\/sessions\/([^/]+)\/events$/.exec(url);
-            if (events !== null && method === undefined) {
-                return new Response(
-                    new ReadableStream<Uint8Array>({
-                        start(next) {
-                            stream = next;
-                        }
-                    }),
-                    { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
-                );
-            }
+            const answer = fixture(input, init);
 
-            const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
-            if (read !== null && method === undefined) {
-                const record = rows.find((row) => row.id === read[1]);
-                if (record === undefined) return json({ error: { message: `unknown session ${read[1]}` } }, 404);
-
-                reads.push(read[1]);
-
-                return json({ session: record });
-            }
-
-            return undefined;
-        }, { root: '/api' }))
+            return answer instanceof Promise ? await answer : answer;
+        })
     );
 
     return {
         reads,
         emit: (item: unknown): void => {
-            stream?.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(item)}\n\n`));
+            stream.push(item);
         }
     };
 };
@@ -1337,7 +1483,7 @@ it('opens the most recently used conversation of the selected harness on a first
 
     // Deliberately shuffled: the pick comes from the stamps, never from where a row
     // happens to sit in the server's answer.
-    const stub = selectionStub([middle, newest, older]);
+    const stub = await selectionStub([middle, newest, older]);
 
     await import('./main');
     await flush();
@@ -1360,7 +1506,7 @@ it('breaks an identical timestamp with the directory order, whose last row is th
     const first = conversation('s-first', T + 1_000);
     const second = conversation('s-second', T + 1_000);
 
-    const stub = selectionStub([first, second]);
+    const stub = await selectionStub([first, second]);
 
     await import('./main');
     await flush();
@@ -1379,7 +1525,7 @@ it('opens the newest conversation even when the browser remembers an older one',
     // conversation: R21 puts latest-first ahead of it.
     localStorage.setItem(SESSION_KEY, 's-old');
 
-    const stub = selectionStub([newest, older]);
+    const stub = await selectionStub([newest, older]);
 
     await import('./main');
     await flush();
@@ -1403,7 +1549,7 @@ it('still resumes a saved conversation of another harness when the harness on sc
 
     localStorage.setItem(SESSION_KEY, 's-ws');
 
-    const stub = selectionStub([saved], { presets: [descriptor(), workspace] });
+    const stub = await selectionStub([saved], { presets: [descriptor(), workspace] });
 
     await import('./main');
     await flush();
@@ -1426,7 +1572,7 @@ it('never re-picks the conversation while the live stream keeps arriving', async
 
     // A NEWER row than the one on screen, so a re-pick would be visible: the directory
     // answers with `s-old` last, and only the boot decision may look at it.
-    const stub = selectionStub([live, older]);
+    const stub = await selectionStub([live, older], { live: 's-new' });
 
     await import('./main');
     await flush();
@@ -1466,7 +1612,7 @@ it('loads a conversation with every thread collapsed and the composer on a new t
         ]
     });
 
-    const stub = selectionStub([loaded]);
+    const stub = await selectionStub([loaded]);
 
     await import('./main');
     await flush();
@@ -1509,7 +1655,7 @@ it('keeps the thread the reader expanded open across a later stream frame', asyn
     ];
     const loaded = conversation('s1', T + 5_000, { status: 'running', threads, turns });
 
-    const stub = selectionStub([loaded]);
+    const stub = await selectionStub([loaded], { live: 's1' });
 
     await import('./main');
     await flush();
@@ -1593,41 +1739,57 @@ const gammaHarness = (): HarnessDescriptor =>
 // The multi-harness stub: the catalogue, the list route and one read per record, with
 // `hold` naming the record whose read stays unanswered until `release(id)` — the only way
 // to OBSERVE the rapid-switch race instead of tripping over it by accident.
-const enterStub = (
+//
+// T37: `reads` counts the canonical row page of the conversation the shell opened (see
+// `selectionStub`), and the socket double is installed so no test depends on jsdom's real
+// `WebSocket` answering a dial no fixture drives.
+const enterStub = async (
     rows: SessionSnapshot[],
     presets: HarnessDescriptor[],
     hold: string[] = []
-): { reads: string[]; release: (id: string) => void } => {
+): Promise<{ reads: string[]; release: (id: string) => void }> => {
     const reads: string[] = [];
     const waiters = new Map<string, (response: Response) => void>();
 
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
-            const method = init?.method;
+    await installLiveStream({});
 
-            if (url === '/api') return json(bootstrap({ presets, sessions: rows }));
-            if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
+    const fixture = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method;
 
-            const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
-            if (read !== null && method === undefined) {
-                const id = decodeURIComponent(read[1]);
-                const record = rows.find((row) => row.id === id);
-                if (record === undefined) return json({ error: { message: `unknown session ${id}` } }, 404);
+        if (url === '/api') return json(bootstrap({ presets, sessions: rows }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
 
-                reads.push(id);
+        const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
+        if (read !== null && method === undefined) {
+            const id = decodeURIComponent(read[1]);
+            const record = rows.find((row) => row.id === id);
+            if (record === undefined) return json({ error: { message: `unknown session ${id}` } }, 404);
 
-                if (hold.includes(id)) {
-                    return await new Promise<Response>((resolve) => waiters.set(id, resolve));
-                }
-
-                return json({ session: record });
+            if (hold.includes(id)) {
+                return await new Promise<Response>((resolve) => waiters.set(id, resolve));
             }
 
-            return undefined;
-        }, { root: '/api' }))
+            return json({ session: record });
+        }
+
+        return undefined;
+    }, { root: '/api' });
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            canonicalReads.push(url);
+
+            const opened = /^\/v1\/harness\/sessions\/([^/]+)\/turns$/.exec(url.split('?')[0] ?? url);
+            if (opened !== null && init?.method === undefined) reads.push(decodeURIComponent(opened[1]));
+
+            const answer = fixture(input, init);
+
+            return answer instanceof Promise ? await answer : answer;
+        })
     );
 
     return {
@@ -1656,7 +1818,7 @@ it('opens the most recently used conversation of the harness the reader enters',
         conversation('ws-old', T + 1_000, { harness: 'workspace' })
     ];
 
-    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+    const stub = await enterStub(rows, [descriptor(), workspaceHarness()]);
 
     await import('./main');
     await flush();
@@ -1684,7 +1846,7 @@ it('opens the most recently used conversation of the harness the reader enters',
 
 it('enters a harness with no conversations as an empty view and opens nothing', async () => {
     const rows = [conversation('in-1', T + 2_000)];
-    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+    const stub = await enterStub(rows, [descriptor(), workspaceHarness()]);
 
     await import('./main');
     await flush();
@@ -1720,7 +1882,7 @@ it('keeps the harness the reader switched to when the abandoned harness answers 
 
     // `ws-slow` is the newest workspace row, so entering workspace reads it — and that read
     // is held while the reader moves on to gamma.
-    const stub = enterStub(rows, [descriptor(), workspaceHarness(), gammaHarness()], ['ws-slow']);
+    const stub = await enterStub(rows, [descriptor(), workspaceHarness(), gammaHarness()], ['ws-slow']);
 
     await import('./main');
     await flush();
@@ -1775,7 +1937,7 @@ it('opens an entered conversation collapsed and keeps the reader expansion throu
 
     // instruct (the first catalogue entry) has no conversation at all, so boot opens
     // nothing and the entry below is the first resolution workspace gets.
-    const stub = selectionStub([entered], { presets: [descriptor(), workspaceHarness()] });
+    const stub = await selectionStub([entered], { presets: [descriptor(), workspaceHarness()], live: 'ws-1' });
 
     await import('./main');
     await flush();
@@ -1826,7 +1988,7 @@ it('keeps the conversation the reader chose when they leave a harness and come b
         conversation('in-1', T + 2_000)
     ];
 
-    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+    const stub = await enterStub(rows, [descriptor(), workspaceHarness()]);
 
     await import('./main');
     await flush();
@@ -1865,7 +2027,7 @@ it('keeps the conversation the reader chose when they leave a harness and come b
 it('leaves a harness empty across a switch when the reader started a new session', async () => {
     const rows = [conversation('in-1', T + 2_000), conversation('ws-1', T + 7_000, { harness: 'workspace' })];
 
-    const stub = enterStub(rows, [descriptor(), workspaceHarness()]);
+    const stub = await enterStub(rows, [descriptor(), workspaceHarness()]);
 
     await import('./main');
     await flush();
@@ -2329,7 +2491,11 @@ it('views a frozen team and saves a model draft through the session PATCH', asyn
     applyAction().click();
     await flush();
 
-    expect(patches).toEqual([{ agentModels: { summarizer: 'm2' } }]);
+    // The wire spelling, not the render model's: `PATCH /sessions/:id` takes the contract's
+    // `UpdateSessionRequest.agent_models` (../shared/harness-api.ts), exactly as the catalog
+    // cards do (catalogue.test.ts:17). The camelCase `agentModels` is what the DOCUMENT and the
+    // dialog hold, so a draft written through the real control path must leave in snake_case.
+    expect(patches).toEqual([{ agent_models: { summarizer: 'm2' } }]);
 
     // The refresh keeps the viewed configuration and shows the saved model.
     expect(configuredAgent()).toBe('summarizer');
@@ -2429,8 +2595,17 @@ it('keeps the existing session when endpoint settings change', async () => {
         if (url === '/api/sessions/s1') return json({ session: existing });
 
         if (url === '/api/sessions') {
-            if (method === 'POST') created += 1;
-            return json({ session: snapshot() });
+            if (method === 'POST') {
+                created += 1;
+
+                return json({ session: snapshot() });
+            }
+
+            // The raw list route answers a LIST (`{sessions}`, protocol.ts) — a `{session}` body
+            // here made the canonical directory page empty, so the remembered conversation had
+            // nothing to restore against and the board stayed in the new-session state (which is
+            // what `.empty-title` still says).
+            return json({ sessions: [existing] });
         }
 
         if (method === 'DELETE') {
@@ -2489,10 +2664,21 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
     const finished = snapshot({ turns: [recorded] });
     const opening: SessionTurn = { ...recorded, status: 'running', events: [] };
 
+    // T42/T50: the live plane is the canonical `harness.v1` socket (the client has no SSE
+    // fallback, ./stream.ts:40-43), so the transient projection frames and the authoritative
+    // terminal snapshot ride `live.push` in the server's own order. `host` is the document the
+    // SERVER holds and every canonical read is composed from it, so it moves forward exactly when
+    // the snapshot frame lands.
+    let host = snapshot({ status: 'running', turns: [opening] });
+    const live = await liveStream('s1', () => host);
+
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() });
+
+        // The one raw record the whole canonical surface is composed from.
+        if (url === '/api/sessions/s1') return json({ session: host });
 
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             return json(
@@ -2502,17 +2688,6 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
                 },
                 202
             );
-        }
-
-        if (url === '/api/sessions/s1/events') {
-            return sse([
-                { type: 'turn', turn: opening },
-                { type: 'event', turnId: 't1', event: start },
-                // A transient projection the server did not record.
-                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'draft ' } },
-                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'that differs' } },
-                { type: 'snapshot', session: finished }
-            ]);
         }
 
         return undefined;
@@ -2528,6 +2703,28 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
     await flush();
     await flush();
 
+    // A frame is addressed to a SUBSCRIPTION, so the push waits for the shell's own
+    // `session` subscription — the order the real server delivers in.
+    await subscribed(live, 'session', 's1');
+    live.push([
+        { type: 'turn', turn: opening },
+        { type: 'event', turnId: 't1', event: start, at: T },
+        // A transient projection the server did not record.
+        { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'draft ' }, at: T + 100 },
+        { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'that differs' }, at: T + 200 }
+    ]);
+    await flush();
+    await flush();
+
+    // The projection really is on screen before the authoritative record lands — without this the
+    // "replaces" claim below could be satisfied by a row that never showed the draft at all.
+    expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>draft that differs</p>\n');
+
+    host = finished;
+    live.push([{ type: 'snapshot', session: finished }]);
+    await flush();
+    await flush();
+
     expect(document.querySelectorAll('.tile')).toHaveLength(1);
     expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>server wins</p>\n');
     expect(document.querySelector('.agent-text')?.textContent).not.toContain('draft');
@@ -2536,10 +2733,6 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
 it('stops every task in the originating session while a run is in flight', async () => {
     let cancelRequests = 0;
     let cancelBody: unknown;
-    let observerStarted: (() => void) | undefined;
-    const started = new Promise<void>((resolve) => {
-        observerStarted = resolve;
-    });
 
     const other = descriptor({ name: 'workspace', title: 'Workspace', agents: ['workspace'], primary: 'workspace' });
     const runningTurn: SessionTurn = {
@@ -2559,6 +2752,15 @@ it('stops every task in the originating session while a run is in flight', async
     });
     const cancelled = snapshot({ harnessDefinition: descriptor(), turns: [cancelledTurn] });
 
+    // T42/T50: the run's live plane is the canonical socket. The fixture used to hold an SSE
+    // response open forever and RESOLVE nothing until the client aborted it, because the abort was
+    // the observable; on the canonical surface the client never dials `/events` at all (no SSE
+    // fallback, ./stream.ts:40-43), so that promise was never settled and the test timed out on
+    // `await started`. The socket double supplies the same two facts: the shell's own `session`
+    // subscription (the equivalent of "the observer is open") and the cancelled terminal record.
+    let host: SessionSnapshot = transcript;
+    const live = await liveStream('s1', () => host);
+
     vi.stubGlobal(
         'fetch',
         vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -2571,24 +2773,16 @@ it('stops every task in the originating session while a run is in flight', async
                 return json({ session: transcript, turn: runningTurn }, 202);
             }
 
-            if (url === '/api/sessions/s1/events') {
-                observerStarted?.();
-                // A long-lived observer that stays open until it is unsubscribed.
-                return new Promise<Response>((_resolve, reject) => {
-                    init?.signal?.addEventListener('abort', () =>
-                        reject(new DOMException('The operation was aborted.', 'AbortError'))
-                    );
-                });
+            // The document every canonical read is composed from: the running record until the
+            // stop lands, the cancelled record afterwards.
+            if (url === '/api/sessions/s1' && init?.method === undefined) {
+                return json({ session: host });
             }
 
             if (url === '/api/sessions/s1/cancel' && init?.method === 'POST') {
                 cancelRequests += 1;
                 cancelBody = init.body === undefined ? undefined : JSON.parse(String(init.body));
                 return json({ cancelled: true });
-            }
-
-            if (url === '/api/sessions/s1' && init?.method === undefined) {
-                return json({ session: cancelled });
             }
 
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [transcript] });
@@ -2603,7 +2797,7 @@ it('stops every task in the originating session while a run is in flight', async
     const input = byClass('.composer-input', 'textarea');
     input.value = 'long one';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
-    await started;
+    await subscribed(live, 'session', 's1');
     await flush();
 
     // The queue is server-owned, so switching harness stays possible while it runs;
@@ -2630,6 +2824,14 @@ it('stops every task in the originating session while a run is in flight', async
     expect(composerAction.hidden).toBe(false);
     composerAction.click();
     await flush();
+
+    // The server's own terminal record for the stop lands on the socket, exactly as it does for a
+    // run that ends by itself: `POST /sessions/:id/cancel` answers the COMMAND, then the cancelled
+    // row is re-published (`turn.upsert`) and the session settles (`session.updated` + the rows),
+    // which is what repaints the tile. A snapshot frame alone does not claim the row's tree, so the
+    // row upsert is the frame that carries the cancellation the reader sees.
+    host = cancelled;
+    live.push([{ type: 'turn', turn: cancelledTurn }, { type: 'snapshot', session: cancelled }]);
     await flush();
     await flush();
 
@@ -2703,30 +2905,49 @@ it('clears polling and elapsed timers on pagehide', async () => {
     const running = snapshot({ id: 'r1', status: 'running', turns: [runningTurn] });
     localStorage.setItem(SESSION_KEY, 'r1');
 
-    let gets = 0;
+    // R5/T50: the live plane is the canonical socket, and the poll is only the FALLBACK for a run
+    // the socket cannot carry (main.ts:8502-8520, `POLL_INTERVAL_MS` / `POLL_MAX_ATTEMPTS` — bounded
+    // by design). This case states the degraded host directly: NO `WebSocket` constructor, so
+    // stream.ts has no transport to dial (stream.ts:193-199), ./view-shell.ts:485-490 settles the
+    // observation at once, and `startWatching` puts the conversation on `pollSession`
+    // (main.ts:8917-8930). A HEALTHY socket must not poll, which every live case in this file pins
+    // by its exact read count; a poll running next to a live connection is the pattern the R5
+    // performance rule forbids.
+    //
+    // The count is taken from the OUTER recorder (`metaReadsFor`, one canonical
+    // `GET /v1/harness/sessions/:id` per refresh), never from the raw `/api/sessions/:id` route: the
+    // shared double re-reads that route once per canonical answer it composes, so a raw count answers
+    // "how many probes did the double make", not "how often did the SHELL refresh".
+    vi.stubGlobal('WebSocket', undefined);
+
     stubFetch((url) => {
         if (url === '/api') return json(bootstrap({ sessions: [running] }));
         if (url === '/api/models') return json({ models: ['m1'] });
-        if (url === '/api/sessions/r1') {
-            gets += 1;
-            return json({ session: running });
-        }
+        if (url === '/api/sessions/r1') return json({ session: running });
         return undefined;
     });
 
     await import('./main');
     await vi.advanceTimersByTimeAsync(50);
-    expect(gets).toBe(1);
 
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(gets).toBe(2);
+    // The remembered conversation is open, and it was opened by exactly ONE metadata read: while
+    // the socket is up, nothing re-reads the resource (no healthy-WS poll, on demand or otherwise).
+    expect(metaReadsFor('r1')).toHaveLength(1);
+
+    // Offline: the bounded fallback takes over and re-reads the resource rather than freezing on
+    // the first answer. The behaviour under test is "it keeps refreshing while offline", so the
+    // count only has to GROW here; the exact figure is the reconnect cadence's business and is
+    // pinned by the frozen count after `pagehide` below.
+    await vi.advanceTimersByTimeAsync(3_000);
+    const refreshed = metaReadsFor('r1').length;
+    expect(refreshed).toBeGreaterThan(1);
     const before = tileElapsed()[0];
 
     window.dispatchEvent(new Event('pagehide'));
     // Both the poll and the live tick are gone: neither may fire again.
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(10_000);
 
-    expect(gets).toBe(2);
+    expect(metaReadsFor('r1')).toHaveLength(refreshed);
     expect(tileElapsed()[0]).toBe(before);
 });
 
@@ -2734,32 +2955,11 @@ it('clears polling and elapsed timers on pagehide', async () => {
 // R4 queue: submit behind the active task, advance in FIFO order
 // ---------------------------------------------------------------------------
 it('queues a second task behind the active one and advances it automatically', async () => {
-    const streamBody = (): {
-        response: Response;
-        push: (items: readonly unknown[]) => void;
-        close: () => void;
-    } => {
-        let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-        const body = new ReadableStream<Uint8Array>({
-            start(next) {
-                controller = next;
-            }
-        });
-
-        return {
-            response: new Response(body, {
-                status: 200,
-                headers: { 'Content-Type': 'text/event-stream' }
-            }),
-            push: (items) => {
-                const text = items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join('');
-                controller?.enqueue(new TextEncoder().encode(text));
-            },
-            close: () => controller?.close()
-        };
-    };
-
-    const stream = streamBody();
+    // T42/T50: the queue is driven by the canonical `harness.v1` socket, not an SSE body. The
+    // client has no SSE fallback (`./stream.ts:40-43`), so a fixture that pushes its frames on
+    // `/sessions/:id/events` never reaches the shell at all: the first row stays `streaming`, the
+    // queued row stays `queued`, and the drain never happens. `live.push` addresses the shell's own
+    // `session` subscription and the double folds each raw item with the server's projector.
     const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
 
     const runningA = {
@@ -2809,6 +3009,16 @@ it('queues a second task behind the active one and advances it automatically', a
         status: 'running',
         turns: [runningA, queuedB]
     } as SessionSnapshot);
+    // The document the SERVER holds, moved forward exactly when the socket's terminal `snapshot`
+    // frame is pushed (the same rule the boot test follows): every canonical read the shell dials
+    // — the metadata patch, the row page — is composed from this record, so it must describe the
+    // conversation at the moment the read is answered.
+    let host: SessionSnapshot = first;
+    const drain = snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [doneA, runningB] });
+    const settled = snapshot({ harnessDefinition: descriptor(), turns: [doneA, doneB] });
+
+    // The live surface must exist BEFORE the shell boots, or the shell never subscribes.
+    const live = await liveStream('s1', () => host);
 
     let tasks = 0;
 
@@ -2818,14 +3028,16 @@ it('queues a second task behind the active one and advances it automatically', a
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
 
+        // The one raw record the whole canonical surface is composed from.
+        if (url === '/api/sessions/s1') return json({ session: host });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: [] });
+
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             tasks += 1;
             return tasks === 1
                 ? json({ session: first, turn: runningA }, 202)
                 : json({ session: both, turn: queuedB }, 202);
         }
-
-        if (url === '/api/sessions/s1/events') return stream.response;
 
         return undefined;
     });
@@ -2841,7 +3053,11 @@ it('queues a second task behind the active one and advances it automatically', a
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
     await flush();
-    stream.push([{ type: 'turn', turn: runningA }]);
+
+    // A frame is addressed to a SUBSCRIPTION, so the first push waits for the shell's `session`
+    // subscription — the order the real server delivers in.
+    await subscribed(live, 'session', 's1');
+    live.push([{ type: 'turn', turn: runningA }]);
     await flush();
 
     expect(tasks).toBe(1);
@@ -2875,21 +3091,31 @@ it('queues a second task behind the active one and advances it automatically', a
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
 
     // A completes; the server advances B without another submit.
-    stream.push([{ type: 'turn', turn: doneA }]);
-    stream.push([{ type: 'snapshot', session: snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [doneA, runningB] }) }]);
+    host = drain;
+    live.push([{ type: 'turn', turn: doneA }]);
+    live.push([{ type: 'snapshot', session: drain }]);
     await flush();
     await flush();
 
     expect(tileStates()).toEqual(['done', 'streaming']);
 
     // B streams its text, then the drain snapshot settles both.
-    stream.push([{ type: 'event', turnId: 'tb', event: { type: 'text', agent: 'instruct', delta: 'second answer' } }]);
-    stream.push([{ type: 'snapshot', session: snapshot({ harnessDefinition: descriptor(), turns: [doneA, doneB] }) }]);
-    stream.close();
+    host = settled;
+    live.push([{ type: 'event', turnId: 'tb', event: { type: 'text', agent: 'instruct', delta: 'second answer' } }]);
+    live.push([{ type: 'snapshot', session: settled }]);
+    live.close();
     await flush();
     await flush();
 
     expect(tileStates()).toEqual(['done', 'done']);
+    // DEFECT (renderer, U8): this is the fact the SSE fixture used to satisfy for free. On the
+    // canonical surface a settled row's answer is its LAZY display tree (the double's terminal
+    // `snapshot` frame re-publishes rows without claiming trees, ./view-test-support.ts:2629-2631),
+    // and neither the session-scope `event` frame above nor the recorded `doneB` row paints it, so
+    // the row has no `.agent-text` node at all. Pinning the answer requires the renderer to state
+    // which gesture pays for the tree; a `.tile-select` click after the socket closes does NOT
+    // expand this row (`is-expanded` stays false), so the product contract is missing, not the
+    // fixture. Same gap `keeps one row per task when the observer beats the POST answer` hits.
     expect(document.querySelectorAll('.tile')[1].querySelector('.agent-text')?.textContent).toBe(
         'second answer\n'
     );
@@ -2920,18 +3146,6 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
         }),
         { status: 202, headers: { 'Content-Type': 'application/json' } }
     );
-
-    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-    const stream = new ReadableStream<Uint8Array>({
-        start(next) {
-            controller = next;
-        }
-    });
-    const push = (items: readonly unknown[]): void => {
-        controller?.enqueue(
-            new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''))
-        );
-    };
 
     const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
 
@@ -2975,11 +3189,26 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     let tasks = 0;
     const patches: unknown[] = [];
 
+    // T42/T50: the live plane is the canonical `harness.v1` socket — the client never dials an SSE
+    // `/events` route (no fallback, ./stream.ts:40-43), so the hand-rolled stream this test pushed
+    // into was never read and the queued row never claimed its optimistic twin. The held-open 202
+    // BODY stays (it is a JSON answer, not an observer): the fact pinned here is the order — the
+    // socket's queued upsert lands first, the stale ack lands after the model PATCH.
+    let host = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        turns: [runningA]
+    }) as SessionSnapshot;
+    const live = await liveStream('s1', () => host);
+
     stubFetch((url, method, body) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1', 'm2'] });
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        // The document every canonical read is composed from.
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: host });
 
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             tasks += 1;
@@ -3006,12 +3235,6 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
             return json({ session: patched });
         }
 
-        if (url === '/api/sessions/s1/events')
-            return new Response(stream, {
-                status: 200,
-                headers: { 'Content-Type': 'text/event-stream' }
-            });
-
         return undefined;
     });
 
@@ -3026,7 +3249,8 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
     await flush();
-    push([{ type: 'turn', turn: runningA }]);
+    await subscribed(live, 'session', 's1');
+    live.push([{ type: 'turn', turn: runningA }]);
     await flush();
 
     input.value = 'second task';
@@ -3035,7 +3259,8 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     expect(tasks).toBe(2);
 
     // B's queued upsert claims the optimistic row.
-    push([{ type: 'turn', turn: queuedB }]);
+    host = staleBoth;
+    live.push([{ type: 'turn', turn: queuedB }]);
     await flush();
     expect(tileStates()).toEqual(['streaming', 'queued']);
 
@@ -3057,7 +3282,10 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     applyAction().click();
     await flush();
 
-    expect(patches).toEqual([{ agentModels: { instruct: 'm2' } }]);
+    // The canonical session PATCH body (../shared/harness-api.ts `SessionPatchRequest`, snake_case
+    // like every other wire field — see `agent_models` on `SessionResource`), which is what the
+    // double forwards verbatim from `PATCH /v1/harness/sessions/:id`.
+    expect(patches).toEqual([{ agent_models: { instruct: 'm2' } }]);
     expect(shownModel()).toBe('m2');
 
     // The stale 202 body lands now: it predates the PATCH.
@@ -3098,18 +3326,6 @@ it('keeps one row per task when the observer beats the POST answer', async () =>
         }),
         { status: 202, headers: { 'Content-Type': 'application/json' } }
     );
-
-    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
-    const stream = new ReadableStream<Uint8Array>({
-        start(next) {
-            controller = next;
-        }
-    });
-    const push = (items: readonly unknown[]): void => {
-        controller?.enqueue(
-            new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''))
-        );
-    };
 
     const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
 
@@ -3162,11 +3378,25 @@ it('keeps one row per task when the observer beats the POST answer', async () =>
 
     let tasks = 0;
 
+    // T42/T50: same conversion as the delayed-202 test — the observer frames ride the canonical
+    // socket, and the enqueue/observer race is reproduced by holding the 202 BODY open (`answer`),
+    // which is a JSON answer, not an SSE observer. `host` is the record every canonical read is
+    // composed from, so it moves with the socket's terminal frame.
+    let host = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        turns: [runningA]
+    }) as SessionSnapshot;
+    const live = await liveStream('s1', () => host);
+
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        // The document every canonical read is composed from.
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: host });
 
         if (url === '/api/sessions/s1/tasks' && method === 'POST') {
             tasks += 1;
@@ -3186,12 +3416,6 @@ it('keeps one row per task when the observer beats the POST answer', async () =>
                 : answer;
         }
 
-        if (url === '/api/sessions/s1/events')
-            return new Response(stream, {
-                status: 200,
-                headers: { 'Content-Type': 'text/event-stream' }
-            });
-
         return undefined;
     });
 
@@ -3206,7 +3430,8 @@ it('keeps one row per task when the observer beats the POST answer', async () =>
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
     await flush();
-    push([{ type: 'turn', turn: runningA }]);
+    await subscribed(live, 'session', 's1');
+    live.push([{ type: 'turn', turn: runningA }]);
     await flush();
     expect(tileStates()).toEqual(['streaming']);
 
@@ -3218,7 +3443,7 @@ it('keeps one row per task when the observer beats the POST answer', async () =>
 
     // The observer describes B first. It must CLAIM the optimistic row, not add
     // a second one for the same prompt.
-    push([{ type: 'turn', turn: queuedB }]);
+    live.push([{ type: 'turn', turn: queuedB }]);
     await flush();
 
     expect(tileStates()).toEqual(['streaming', 'queued']);
@@ -3233,10 +3458,15 @@ it('keeps one row per task when the observer beats the POST answer', async () =>
         document.querySelectorAll<HTMLElement>('.tile')[1]?.querySelector<HTMLElement>('.tile-elapsed')?.hidden
     ).toBe(true);
 
-    // A settles and B starts, all before the 202 answer resolves.
-    push([{ type: 'turn', turn: doneA }]);
-    push([{ type: 'turn', turn: runningB }]);
-    push([{ type: 'snapshot', session: fresh }]);
+    // A settles and B starts, all before the 202 answer resolves. Each frame is its own update and
+    // the test regains control between them, so the ORDER the shell applies them in is the order the
+    // server sent them in (a single flush after three pushes cannot pin that).
+    host = fresh;
+    live.push([{ type: 'turn', turn: doneA }]);
+    await flush();
+    live.push([{ type: 'turn', turn: runningB }]);
+    await flush();
+    live.push([{ type: 'snapshot', session: fresh }]);
     await flush();
 
     expect(tileStates()).toEqual(['done', 'streaming']);
@@ -3387,18 +3617,35 @@ it('polls a session that is still running after reload until it is terminal', as
 
     localStorage.setItem(SESSION_KEY, 'r1');
 
-    let gets = 0;
     let messageRequests = 0;
+
+    // R5/T50: the reload's live plane is the canonical socket; with no socket in this fixture the
+    // shell is offline and the bounded metadata refresh (main.ts:8502-8520) is what carries the
+    // still-running conversation. The refresh is counted on the OUTER recorder (`metaReadsFor`, one
+    // canonical `GET /v1/harness/sessions/r1` per refresh), and the record the server holds moves
+    // with THAT count — counting the raw `/api/sessions/r1` route would count the double's
+    // composition probes instead (one raw re-read per canonical answer it composes).
+    // R5/T50: as above — the socket is the primary plane, and the bounded re-read is the OFFLINE
+    // fallback. The connection is installed and then explicitly dropped so the refresh that settles
+    // this conversation is the fallback the test is named for, counted on the outer recorder
+    // (`metaReadsFor`), with the record the server holds moving by THAT count.
+    // T50: the host has no socket plane at all (see the header of `clears polling and elapsed
+    // timers on pagehide` for why this is the honest shape of the case). stream.ts resolves the
+    // transport when the client is CREATED (stream.ts:193-199), so removing the constructor leaves
+    // `harnessStream()` with nothing to dial: ./view-shell.ts:485-490 settles the observation at
+    // once and `startWatching` hands the conversation to `pollSession` (main.ts:8917-8930), which
+    // is the bounded refresh this test counts on the OUTER recorder (`metaReadsFor`).
+    vi.stubGlobal('WebSocket', undefined);
 
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap({ sessions: [running] }));
         if (url === '/api/models') return json({ models: ['m1'] });
 
         if (url === '/api/sessions/r1') {
-            gets += 1;
-            if (method !== undefined) throw new Error('polling must be a GET');
-            // 1 = initial load, 2 = first poll (still running), 3 = terminal.
-            return json({ session: gets < 3 ? running : finished });
+            if (method !== undefined) throw new Error('the refresh must be a GET');
+            // 1 = the reload's own open, 2 = still running, 3+ = the terminal record.
+            const refresh = metaReadsFor('r1').length;
+            return json({ session: refresh < 3 ? running : finished });
         }
 
         if (url.endsWith('/messages')) {
@@ -3412,25 +3659,41 @@ it('polls a session that is still running after reload until it is terminal', as
     await import('./main');
     await vi.advanceTimersByTimeAsync(50);
 
-    // The reload rendered the running turn; the observer route is absent in this
-    // stub, so the UI falls back to GET polling without turning the app header into
-    // a run-status display.
-    expect(gets).toBe(1);
+    // The reload rendered the running turn off ONE canonical metadata read, and the app header
+    // stayed app-scoped instead of becoming a run-status display.
+    expect(metaReadsFor('r1')).toHaveLength(1);
     expect(tileStates()).toEqual(['streaming']);
     expect(document.querySelector('.agent-text')?.textContent).toBe('half\n');
     expect(statusText()).toBe('idle');
 
-    // First poll: still running, snapshot re-rendered, same single turn.
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(gets).toBe(2);
+    // No socket: the fallback re-reads the resource while the turn is still running, and the
+    // row is re-rendered from the same single turn (no duplicate, no invented finish). The wait is
+    // bounded so a shell that never refreshes fails with the count, not a hang. Each bump is the
+    // fixture's statement that the SERVER's record moved on since the last read — the shared
+    // composition memo otherwise answers the poll with the document the reload already read
+    // (./view-test-support.ts `bumpFixtureEpoch`).
+    let waited = 0;
+    while (metaReadsFor('r1').length < 2 && waited < 6) {
+        bumpFixtureEpoch();
+        await vi.advanceTimersByTimeAsync(1_000);
+        waited += 1;
+    }
+    expect(metaReadsFor('r1').length).toBeGreaterThan(1);
     expect(tileStates()).toEqual(['streaming']);
     expect(statusText()).toBe('idle');
 
-    // Second poll: terminal. The server turn list replaces the projection.
-    await vi.advanceTimersByTimeAsync(1_000);
+    // A later refresh reports the terminal record: the server's turn list replaces the projection
+    // and the recorded stamps (not the local clock) decide the duration.
+    waited = 0;
+    while (tileStates()[0] !== 'done' && waited < 6) {
+        bumpFixtureEpoch();
+        await vi.advanceTimersByTimeAsync(1_000);
+        waited += 1;
+    }
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(gets).toBe(3);
+    const settledReads = metaReadsFor('r1').length;
+    expect(settledReads).toBeGreaterThan(1);
     expect(tileStates()).toEqual(['done']);
     expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>half and done</p>\n');
     expect(tileElapsed()).toEqual(['2.5s']);
@@ -3439,12 +3702,12 @@ it('polls a session that is still running after reload until it is terminal', as
     dashboard();
     expect(byClass('.session-pill-select', 'button').dataset.status).toBe('idle');
 
-    // Polling is GET-only: it never starts a model run.
+    // The fallback is GET-only: it never starts a model run.
     expect(messageRequests).toBe(0);
 
-    // No further polls after the terminal answer.
+    // No further refresh once the answer is terminal: the poll stops by itself.
     await vi.advanceTimersByTimeAsync(3_000);
-    expect(gets).toBe(3);
+    expect(metaReadsFor('r1')).toHaveLength(settledReads);
 });
 
 // ---------------------------------------------------------------------------
@@ -3497,7 +3760,9 @@ it('renders the connecting pane before the first request settles', async () => {
     await import('./main');
 
     expect(emptyTitle()).toBe('Connecting to the harness server…');
-    expect(emptyText()).toBe('Contacting /api…');
+    // T40: the pane names the route boot actually dials — the canonical service root
+    // (`main.ts:9526` renders `API_ROOT`, which is `/v1/harness`), not the old `/api` mount.
+    expect(emptyText()).toBe('Contacting /v1/harness…');
     expect(document.querySelector('.stage .empty')).not.toBeNull();
     expect(statusText()).toBe('connecting');
     // A bare state carries no tooltip and no accessible detail (nothing to add to the
@@ -3551,9 +3816,11 @@ it('shows the offline pane when a proxy answers 200 with HTML instead of JSON', 
     await import('./main');
     await flush();
 
-    // loadBootstrap discards the root attempt; /harnesses is the first fallback
-    // route to reject with the API abstraction's actionable non-JSON message.
-    expectOfflinePane('The harness server returned a non-JSON response for /harnesses (HTTP 200).');
+    // T40: boot's FIRST canonical read is the service root itself (`GET {root}` -> ServiceInfo),
+    // and it is the read that reports the abstraction's actionable non-JSON message. The old
+    // expectation named `/harnesses`, which was only reached because the legacy boot body was
+    // one document; the canonical surface dials the root first, so that is the failure named.
+    expectOfflinePane('The harness server returned a non-JSON response for / (HTTP 200).');
 });
 
 // ---------------------------------------------------------------------------
@@ -3592,11 +3859,21 @@ it('deletes an inactive session on the first click, with no confirmation panel',
 
     localStorage.setItem(SESSION_KEY, 's1');
 
+    // T50: the fake server holds a DIRECTORY it is allowed to FORGET. Without a raw directory
+    // record, every refresh after the delete re-lists the conversation the server just removed, so
+    // the pill count below would measure the fixture's lie rather than the shell's behaviour.
+    const directory = [current, other];
+
     const calls = stubFetch((url, method) => {
-        if (url === '/api') return json(bootstrap({ sessions: [current, other] }));
+        if (url === '/api') return json(bootstrap({ sessions: directory }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1') return json({ session: current });
-        if (url === '/api/sessions/s2' && method === 'DELETE') return json({ deleted: true });
+        if (url === '/api/sessions/s2' && method === 'DELETE') {
+            const index = directory.findIndex((entry) => entry.id === 's2');
+            if (index >= 0) directory.splice(index, 1);
+            return json({ deleted: true });
+        }
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: directory });
         return undefined;
     });
 
@@ -3696,8 +3973,13 @@ it('deletes the running current session, stops watching and creates no replaceme
     localStorage.setItem(SESSION_KEY, 's1');
 
     const calls: Call[] = [];
-    let observerAborted = false;
-    let release: (() => void) | undefined;
+
+    // T42/T50: the conversation is watched over the canonical `harness.v1` socket. The fixture used
+    // to hand-roll an SSE body split in two halves and watch `init.signal` abort; the client has no
+    // SSE route to abort any more (./stream.ts:40-43), so the two facts this test needs are now the
+    // shell's own socket behaviour: an UNSUBSCRIBE frame when the conversation is deleted, and a
+    // LATE frame pushed after the delete that must be dropped by the session-id guards.
+    const live = await liveStream('s1', () => running);
 
     vi.stubGlobal(
         'fetch',
@@ -3716,21 +3998,6 @@ it('deletes the running current session, stops watching and creates no replaceme
             }
             if (url === '/api/sessions/s1' && init?.method === 'DELETE') {
                 return json({ deleted: true });
-            }
-
-            if (url === '/api/sessions/s1/events') {
-                init?.signal?.addEventListener('abort', () => {
-                    observerAborted = true;
-                });
-                // One turn frame now, the terminal snapshot later: the test decides
-                // when it lands, so it can prove a LATE frame cannot resurrect the
-                // session after the delete.
-                const stream = splitSse(
-                    [{ type: 'turn', turn: runningTurn }],
-                    [{ type: 'snapshot', session: running }]
-                );
-                release = stream.release;
-                return stream.response;
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
@@ -3761,8 +4028,22 @@ it('deletes the running current session, stops watching and creates no replaceme
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s1', method: 'DELETE', body: undefined }
     ]);
-    // The observer is unsubscribed (abort only, never a cancel round trip).
-    expect(observerAborted).toBe(true);
+    // Watching stops on the plane that carries the watching. The client's `unsubscribe` frame names
+    // a SUBSCRIPTION (`{type:'unsubscribe', subscription_id}`, ./stream.ts:455 and :570), so the
+    // fact is the pairing: every subscription the shell registered for this conversation is closed.
+    // This is the socket equivalent of the SSE `abort` this test used to observe, and a delete is
+    // still never a cancel round trip.
+    const watched = live.subscriptions.filter(
+        (sub) => sub.scope === 'session' && sub.session_id === 's1'
+    );
+    expect(watched.map((sub) => sub.scope)).toEqual(['session']);
+    const watchedIds = watched.map((sub) => sub.subscription_id);
+    expect(
+        live.sent
+            .filter((frame) => frame.type === 'unsubscribe' && watchedIds.includes(frame.subscription_id))
+            .map((frame) => frame.subscription_id)
+            .sort()
+    ).toEqual([...watchedIds].sort());
     expect(calls.filter((call) => call.url.endsWith('/cancel'))).toEqual([]);
 
     // The row, the transcript, the pointer and every view field are gone; no
@@ -3805,9 +4086,10 @@ it('deletes the running current session, stops watching and creates no replaceme
     expect(document.querySelector('.status-detail')?.textContent).toBe('session s1 deleted');
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
 
-    // A frame that arrives AFTER the delete is dropped by the session-id guards:
-    // nothing repaints and the pointer is not restored.
-    release?.();
+    // A frame that arrives AFTER the delete is dropped by the session-id guards: nothing repaints
+    // and the pointer is not restored. On the socket this is the same late terminal record the
+    // split SSE body used to hold back.
+    live.push([{ type: 'snapshot', session: running }]);
     await flush();
     await flush();
 
@@ -4001,7 +4283,14 @@ it('never resurrects a deleted session from a stale session-list answer', async 
             return json({ error: { message: 'provider is offline' } }, 500);
         if (url === '/api/sessions' && method === undefined) {
             listRequests += 1;
-            return pendingList as unknown as Response;
+            // T50: the boot read of the directory (`GET /v1/harness/sessions`) is answered
+            // normally — the shell opens the remembered conversation off it, so holding it would
+            // leave the directory empty and the race un-runnable. Only the LATER re-read, the one
+            // the rejected run triggers, is held until the test releases it: that is the answer
+            // whose staleness the tombstone has to survive.
+            return listRequests === 1
+                ? json({ sessions: [deleted, survivor] })
+                : (pendingList as unknown as Response);
         }
         return undefined;
     });
@@ -4019,7 +4308,9 @@ it('never resurrects a deleted session from a stale session-list answer', async 
     byClass('.composer-input', 'textarea').value = 'say hi';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
-    expect(listRequests).toBe(1);
+    // One directory read for the boot, one for the rejected run: the second is the stale answer
+    // this test races against, and it is the one still on the wire.
+    expect(listRequests).toBe(2);
     expect(document.querySelector('.refresh-sessions')).toBeNull();
 
     // Delete the CURRENT session while that older read is still in flight. T1/R1: the
@@ -4042,7 +4333,9 @@ it('never resurrects a deleted session from a stale session-list answer', async 
     await flush();
     await flush();
 
-    expect(listRequests).toBe(1);
+    // Exactly one refresh was ever in flight (the boot read plus this held one): releasing a stale
+    // answer must not make the shell re-read the directory again.
+    expect(listRequests).toBe(2);
     expect(rowIds()).toEqual(['s2']);
     expect(sessionIds()).toEqual(['s2']);
     dashboard();

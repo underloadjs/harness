@@ -662,12 +662,14 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     await flush();
 
     // The complete live map travels: the summarizer's m1 is preserved, the edited
-    // member carries the new id.
+    // member carries the new id. T45: the SESSION PATCH body is the contract's spelling,
+    // snake_case `agent_models` (../shared/harness-api.ts:919), which is what
+    // main.ts:6429 sends — `agentModels` is the internal camelCase record, never the wire.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
         {
             url: '/api/sessions/s9',
             method: 'PATCH',
-            body: { agentModels: { instruct: 'm3', summarizer: 'm1' } }
+            body: { agent_models: { instruct: 'm3', summarizer: 'm1' } }
         }
     ]);
     // The frozen definition is historical: no harness PATCH races the edit. (T11: opening the
@@ -769,7 +771,11 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
         {
             url: '/api/sessions/s7',
             method: 'PATCH',
-            body: { agentModels: { instruct: 'm3', summarizer: 'm1' } }
+            // T45: the SESSION PATCH body is the contract's spelling — snake_case
+            // `agent_models` (../shared/harness-api.ts:918-923 `UpdateSessionRequest`), the
+            // same figure the sibling saved-session test pins above. `agentModels` is the
+            // internal camelCase record, never the wire.
+            body: { agent_models: { instruct: 'm3', summarizer: 'm1' } }
         }
     ]);
     // Nothing cancels or restarts the run: no cancel route. The composer's stop
