@@ -289,6 +289,15 @@ export type HarnessDescriptor = {
     // profile's identity sentence — its `guidelines` still apply — and it never
     // rewrites the trusted profile itself.
     agentInstructions?: Record<string, string>;
+    // Per-agent identity COLORS (R2): agent id → CSS hex color (`#rgb`, `#rgba`,
+    // `#rrggbb`, `#rrggbbaa`, either case). PRESENT ONLY WHEN the harness configures at
+    // least one, so every existing card keeps its exact shape. Like the two maps above
+    // it is the OVERRIDE map, not a resolved palette: a member it omits has no
+    // configured color, and the host falls back to its own derivation. Display-only —
+    // it never shapes a prompt or a request — and it is the value the library stores on
+    // `Agent.color` for that member, so the swatch a card paints and the swatch a
+    // session's agents carry are the same bytes.
+    agentColors?: Record<string, string>;
     // Shipped with the application vs created through POST /harnesses. Informational
     // only: every harness in the in-memory registry is an editable application copy
     // of a template or a client-created harness.
@@ -303,9 +312,11 @@ export type HarnessDescriptor = {
 // Body of POST /harnesses. A client selects trusted agents; it cannot supply a
 // provider, a model, or a tool list. It CAN pick the model id each selected agent
 // runs (`agentModels`, R9) — an id only, never a provider or credential, because
-// those come from the session settings — and it CAN record a per-agent instruction
+// those come from the session settings — it CAN record a per-agent instruction
 // override (`agentInstructions`, T3), which the registry validates against the
-// final member set and the server applies when it builds the agent.
+// final member set and the server applies when it builds the agent, and it CAN
+// record a per-agent display color (`agentColors`, R2), a validated CSS hex color
+// the registry applies the same way and projects onto the descriptor.
 export type CreateHarnessRequest = {
     name: string;
     title?: string;
@@ -314,6 +325,7 @@ export type CreateHarnessRequest = {
     subagents?: string[];
     agentModels?: Record<string, string>;
     agentInstructions?: Record<string, string>;
+    agentColors?: Record<string, string>;
 };
 
 // Body of PATCH /harnesses/:name. `name` is immutable; an omitted field keeps its
@@ -330,6 +342,10 @@ export type CreateHarnessRequest = {
 // instruction again, a value must be non-empty bounded text, and an omitted key
 // means "no override for that agent". A saved override never mutates the trusted
 // profile; it is stored on the harness and projected back on `HarnessDescriptor`.
+//
+// `agentColors` follows the same rules for display metadata (R2): `{}` clears every
+// color so every member falls back to the host's own swatch, and a value must be a
+// CSS hex color.
 export type UpdateHarnessRequest = {
     title?: string;
     description?: string;
@@ -337,6 +353,7 @@ export type UpdateHarnessRequest = {
     subagents?: string[];
     agentModels?: Record<string, string>;
     agentInstructions?: Record<string, string>;
+    agentColors?: Record<string, string>;
 };
 
 // Response of DELETE /harnesses/:name (T5).

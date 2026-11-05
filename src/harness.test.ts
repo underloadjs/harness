@@ -1535,3 +1535,64 @@ describe('executeTool', () => {
         );
     });
 });
+
+// Identity color (R2) through the harness registry.
+//
+// `harness.addAgent(name, configuration)` builds the brain from a FULL
+// `AgentConfiguration` (src/harness.ts:8315 spreads it), which is exactly how the
+// server binds an agent into an already-running session
+// (./server/sessions.ts `addSessionAgent` -> `agentConfigurationFromProfile`). So a
+// color configured for a member must arrive on that member's Agent by the same path
+// the construction loop uses, and a malformed color must fail BEFORE the roster moves.
+describe('harness agent identity colors', () => {
+    it('carries the configured color through the construction loop and through addAgent', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('first')]), { color: '#4ade80' }) },
+            presets: false
+        });
+
+        expect(writer.agents.writer.color).toBe('#4ade80');
+
+        // Registered after construction: the registry key names the agent, and the
+        // configuration's color still travels with it.
+        const late = writer.addAgent('late', {
+            model: 'merge/ds4-flash',
+            stream: scripted([answer('late answer')]),
+            color: ' #F97316 '
+        });
+
+        expect(late.name).toBe('late');
+        expect(late.color).toBe('#F97316');
+        expect(writer.agents.late.color).toBe('#F97316');
+        // The member that was configured without a color still carries no key, so a host
+        // can tell "uncolored" from "colored" for every roster entry.
+        expect(Object.hasOwn(writer.agents.writer, 'color')).toBe(true);
+
+        const uncolored = harness({
+            agents: { plain: brain(scripted([answer('plain')])) },
+            presets: false
+        });
+        expect(Object.hasOwn(uncolored.agents.plain, 'color')).toBe(false);
+    });
+
+    it('refuses an invalid color and leaves the roster untouched', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('first')])) },
+            presets: false
+        });
+
+        // The construction-time validation runs inside `addAgent`, so a bad swatch is a
+        // hard failure rather than an agent a later run would have to tolerate...
+        expect(() =>
+            writer.addAgent('late', {
+                model: 'merge/ds4-flash',
+                stream: scripted([answer('late answer')]),
+                color: 'tomato'
+            })
+        ).toThrow('Agent "late" has an invalid `color`: "tomato".');
+
+        // ...and it happens before the roster is written, so the harness keeps exactly the
+        // agents it had (`assertRosterIdle` + construction-first ordering).
+        expect(Object.keys(writer.agents)).toEqual(['writer']);
+    });
+});

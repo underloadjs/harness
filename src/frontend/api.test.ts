@@ -899,3 +899,74 @@ describe('session deletion', () => {
         await expect(module.deleteSession('s1')).rejects.toThrow('Unknown session "s1".');
     });
 });
+
+// T4/R2: the card/definition -> descriptor mapper. The rail and the configuration dialog
+// render ONE camelCase shape, and the identity-colour map is the third optional field of
+// the identified read (`agent_colors`, ../shared/harness-api.ts:459). Two facts the shell
+// depends on: a stated map arrives mapped and copied, and an unstated one stays ABSENT — a
+// fabricated `{}` would make every CARD claim "nothing is coloured", which is a different
+// statement than not publishing the field at all (../shared/harness-api.ts:422).
+describe('descriptor rows', () => {
+    // A contract CARD: identity and team, and nothing else. Typed as a plain record so a
+    // case can also read the field back off the object it handed in.
+    const card = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        name: 'painted',
+        title: 'Painted',
+        description: 'A harness with configured colours.',
+        requires_endpoint: true,
+        primary: 'instruct',
+        subagents: ['summarizer'],
+        agents: ['instruct', 'summarizer'],
+        tools: ['read'],
+        builtin: true,
+        definition_revision: 3,
+        ...overrides
+    });
+
+    it('maps agent_colors onto agentColors on an identified definition, copying the map', async () => {
+        const module = await import('./api');
+        const definition = card({
+            agent_colors: { instruct: '#ff6600', summarizer: '#4ade80' },
+            agent_models: { instruct: 'gpt-5' },
+            core_tools: ['task']
+        });
+        const view = module.descriptorOf(definition as never);
+
+        expect(view.agentColors).toEqual({ instruct: '#ff6600', summarizer: '#4ade80' });
+        // The rest of the row is unmoved by the new field.
+        expect(view.name).toBe('painted');
+        expect(view.agentModels).toEqual({ instruct: 'gpt-5' });
+        expect(view.coreTools).toEqual(['task']);
+
+        // A COPY, not the wire object: writing through the view cannot rewrite the response
+        // body another caller may still be holding.
+        (view.agentColors as Record<string, string>).instruct = '#000000';
+
+        expect(definition.agent_colors).toEqual({ instruct: '#ff6600', summarizer: '#4ade80' });
+        expect(view.agentColors).toEqual({ instruct: '#000000', summarizer: '#4ade80' });
+    });
+
+    it('leaves agentColors absent for a card row, and reads a null wire field as no colours', async () => {
+        const module = await import('./api');
+
+        // The common case: a CARD never publishes the field, and the mapper must not invent
+        // one. `contract.ts` already reads an absent map as "nothing configured".
+        expect(Object.prototype.hasOwnProperty.call(module.descriptorOf(card() as never), 'agentColors')).toBe(false);
+
+        // A JSON `null` is not a map. The mapper keeps the sibling behaviour (a non-undefined
+        // value spreads into an empty map), and the accessor the panes actually read turns that
+        // into the same "nothing configured" answer as an absent key — which is the fact that
+        // decides what gets painted, so that is what is pinned here.
+        const { agentColorsOf } = await import('./contract');
+        const nulled = module.descriptorOf(card({ agent_colors: null }) as never);
+
+        expect(agentColorsOf(nulled)).toEqual({});
+
+        // An EMPTY map IS information ("this definition states every member is uncoloured"),
+        // so it survives as an empty own map rather than vanishing.
+        const cleared = module.descriptorOf(card({ agent_colors: {} }) as never);
+
+        expect(Object.prototype.hasOwnProperty.call(cleared, 'agentColors')).toBe(true);
+        expect(cleared.agentColors).toEqual({});
+    });
+});

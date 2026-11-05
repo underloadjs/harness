@@ -33,7 +33,8 @@
 //   - metadata only (title/description) — keep the captured factory and every
 //     executable field, so demo stays the scripted fixture, flaky keeps testFlaky,
 //     and a live harness keeps the exact closure a session captured;
-//   - executable (primary/subagents/agentModels) — rebuild from the template:
+//   - executable (primary/subagents and the per-agent maps: agentModels,
+//     agentInstructions, agentColors) — rebuild from the template:
 //       'live'     → createProfiledHarness (unchanged behaviour);
 //       'scripted' → upgrade to a LIVE profiled harness and correct the descriptor
 //                    (requiresEndpoint, shared toolbox, environmentTools) so the
@@ -151,6 +152,17 @@ const MAX_INSTRUCTION_LENGTH = 8_000;
 // definition is often multi-line), every other control character is rejected.
 const INSTRUCTION_TEXT_PATTERN = /^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+$/;
 
+// Accepted per-agent identity COLOR (R2): a CSS hex color, 3/4/6/8 digits, either
+// case. This is deliberately the SAME expression the library validates at agent
+// construction (src/core/agent.ts `AGENT_COLOR_PATTERN`) and the same expression the
+// HTTP contract publishes (`harness.swagger.yaml` `agent_colors.pattern`): a color the
+// edge accepts is always one `agent()` accepts and a UI can always paint. The
+// duplication is only about the ERROR, not the rule — here a rejection must be a 400
+// that names the offending agent, while `agent()` names the agent it was configuring.
+// src/server/harnesses/registry.test.ts pins the two layers to one shared
+// accepted/rejected sample set so they cannot drift.
+const AGENT_COLOR_PATTERN = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
 // What a client may supply when creating a harness. No provider settings, tools,
 // or model: those are trusted/configured server-side. `agentInstructions` (T3) is
 // the one text-shaped field, and it is an OVERRIDE stored on this harness — the
@@ -168,6 +180,11 @@ export type HarnessRegistration = {
     // Per-agent instruction overrides (T3): agent id → instruction text. Optional;
     // an omitted member runs its trusted catalogue instruction.
     agentInstructions?: Readonly<Record<string, string>>;
+    // Per-agent identity colors (R2): agent id → CSS hex color. Optional, and
+    // display-only — it changes what a host paints, never what an agent runs. Values
+    // must be a hex color (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`) and keys must name
+    // a member, exactly like the two maps above.
+    agentColors?: Readonly<Record<string, string>>;
 };
 
 // What a client may change on an existing harness. `name` is immutable: a rename
@@ -186,6 +203,12 @@ export type HarnessPatch = {
     // Same REPLACE semantics as `agentModels` (T3): `{}` clears every instruction
     // override so every member runs its trusted instruction again.
     agentInstructions?: Readonly<Record<string, string>>;
+    // Same REPLACE semantics as the two maps above (R2): `{}` clears every color, so
+    // every member falls back to the host's own swatch. A color is display-only, but
+    // it is still EXECUTABLE in the registry's sense: the map is captured by the
+    // factory closure, so a stated map rebuilds the factory (see `update`) and an
+    // existing session keeps the colors it was built with.
+    agentColors?: Readonly<Record<string, string>>;
 };
 
 // A synchronous capture of everything a registry mutation can change: the entries
@@ -538,6 +561,73 @@ export const normalizeAgentInstructions = (
     return resolved;
 };
 
+// Validate one color override. Trimmed, then matched against the hex shape. A blank
+// value is a rejection rather than "no color", for the same reason a blank model id
+// and blank instruction are: a client that means "drop this swatch" must omit the key
+// (or send `{}`), so an accidental paste cannot silently discard a saved color while
+// the UI still paints the old one.
+const requireAgentColor = (value: unknown, agent: string): string => {
+    if (typeof value !== 'string') {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentColors.${agent}\` must be a CSS hex color string.`
+        );
+    }
+
+    const color = value.trim();
+
+    if (color.length === 0) {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentColors.${agent}\` cannot be empty. Omit the key to leave this agent uncolored.`
+        );
+    }
+
+    if (!AGENT_COLOR_PATTERN.test(color)) {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentColors.${agent}\` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received ${JSON.stringify(value)}.`
+        );
+    }
+
+    return color;
+};
+
+// Validate a per-agent color map against the FINAL member set (R2).
+//
+// The third map of the same shape, with the same two rules as `normalizeAgentModels`
+// and `normalizeAgentInstructions`: an entry for an agent this harness does not select
+// can never be painted, so it is a visible 400 rather than a stored no-op, and the
+// whole map is validated all-or-nothing. Exported for the same reason as the other
+// two: one place decides what a legal color is, so the wire message cannot drift
+// between the harness routes and any later caller that re-validates a color map.
+export const normalizeAgentColors = (
+    value: unknown,
+    members: readonly string[]
+): Record<string, string> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new HarnessRegistryError(
+            400,
+            '`agentColors` must be an object mapping agent ids to CSS hex colors.'
+        );
+    }
+
+    const resolved: Record<string, string> = {};
+
+    for (const [agent, color] of Object.entries(value as Record<string, unknown>)) {
+        if (!members.includes(agent)) {
+            throw new HarnessRegistryError(
+                400,
+                `\`agentColors\` names "${agent}", which is not a member of this harness. Members: ${members.join(', ')}.`
+            );
+        }
+
+        resolved[agent] = requireAgentColor(color, agent);
+    }
+
+    return resolved;
+};
+
 // Copy one template into an independent registry entry. Arrays and the model map
 // are copied so nothing a registry (or a caller holding list()[i]) does can reach
 // the shipped module constants. The factory is shared: it is immutable (a closure
@@ -558,23 +648,42 @@ const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
     ...(preset.agentInstructions === undefined
         ? {}
         : { agentInstructions: { ...preset.agentInstructions } }),
+    ...(preset.agentColors === undefined ? {} : { agentColors: { ...preset.agentColors } }),
+    // R7: a session template's invented agents are copied like the three maps above, so a
+    // registry entry (or an injected preset) that carries them never shares one mutable object
+    // with the caller. Harness DEFINITIONS declare none — the create/PATCH surface has no field
+    // for it — so in practice this key is absent on every registry entry.
+    ...(preset.customAgents === undefined ? {} : { customAgents: { ...preset.customAgents } }),
     editable: true
 });
 
 // Build the factory for a template's LIVE form. 'flaky' keeps its example-only
-// extra tool; everything else is the shared profiled harness. The model and
-// instruction maps are captured by the closure (via createProfiledHarness /
+// extra tool; everything else is the shared profiled harness. The model, instruction,
+// and color maps are captured by the closure (via createProfiledHarness /
 // agentsFromProfiles), which is what makes a later PATCH invisible to an existing
-// session.
+// session. `customAgents` (R7) is captured the same way, and it is the map that tells
+// `agentsFromProfiles` which members are session-defined rather than catalogue roles; a
+// harness-definition PATCH passes none (default `{}`), because a registry entry cannot
+// declare one — only a session's frozen record carries it, and `presetFromRecord` below is
+// the caller that hands it back.
 const liveFactory = (
     template: 'live' | 'flaky',
     primary: string,
     subagents: readonly string[],
     agentModels: Readonly<Record<string, string>>,
-    agentInstructions: Readonly<Record<string, string>> = {}
+    agentInstructions: Readonly<Record<string, string>> = {},
+    agentColors: Readonly<Record<string, string>> = {},
+    customAgents: Readonly<Record<string, string>> = {}
 ): HarnessPreset['create'] => {
     if (template === 'live') {
-        return createProfiledHarness(primary, subagents, agentModels, agentInstructions);
+        return createProfiledHarness(
+            primary,
+            subagents,
+            agentModels,
+            agentInstructions,
+            agentColors,
+            customAgents
+        );
     }
 
     return (settings, progress, report) =>
@@ -584,7 +693,9 @@ const liveFactory = (
                     [primary, ...subagents],
                     settings,
                     agentModels,
-                    agentInstructions
+                    agentInstructions,
+                    agentColors,
+                    customAgents
                 ),
                 primary,
                 subagents: [...subagents],
@@ -632,6 +743,17 @@ export const presetToRecord = (preset: HarnessPreset): HarnessPresetRecord => ({
       Object.keys(preset.agentInstructions).length === 0
         ? {}
         : { agentInstructions: { ...preset.agentInstructions } }),
+    // R2: same absent/empty equivalence — a harness with no colors writes no field, so
+    // every document saved before colors is byte-identical.
+    ...(preset.agentColors === undefined || Object.keys(preset.agentColors).length === 0
+        ? {}
+        : { agentColors: { ...preset.agentColors } }),
+    // R7: same absent/empty equivalence — a harness with no session-defined agents writes no
+    // field, so every document saved before R7 (and every harness DEFINITION, which never has
+    // any) is byte-identical.
+    ...(preset.customAgents === undefined || Object.keys(preset.customAgents).length === 0
+        ? {}
+        : { customAgents: { ...preset.customAgents } }),
     builtin: preset.builtin,
     editable: preset.editable,
     ...(preset.template === undefined ? {} : { template: preset.template }),
@@ -665,6 +787,20 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
       Object.keys(record.agentInstructions).length === 0
         ? {}
         : { agentInstructions: { ...record.agentInstructions } }),
+    // R2: part of the fixed key order, so a saved row that carries colors compares
+    // equal to the registry entry rebuilt from it (and one that carries none keeps the
+    // pre-R2 shape on both sides).
+    ...(record.agentColors === undefined || Object.keys(record.agentColors).length === 0
+        ? {}
+        : { agentColors: { ...record.agentColors } }),
+    // R7: same treatment for the session-defined agent map. This is the comparison that makes
+    // a session restore rebuild its factory (`./sessions.ts` `restoreSession` compares the
+    // registry entry against the session's frozen record), so a record that carries a custom
+    // agent NEVER matches an entry that does not — which is exactly the outcome that routes the
+    // rebuild through `presetFromRecord` and back through `agentsFromProfiles`.
+    ...(record.customAgents === undefined || Object.keys(record.customAgents).length === 0
+        ? {}
+        : { customAgents: { ...record.customAgents } }),
     builtin: record.builtin,
     editable: record.editable,
     ...(record.template === undefined ? {} : { template: record.template }),
@@ -712,7 +848,11 @@ export const presetFromRecord = (
             record.primary,
             record.subagents,
             record.agentModels ?? {},
-            record.agentInstructions ?? {}
+            record.agentInstructions ?? {},
+            record.agentColors ?? {},
+            // R7: the session's invented agents go back into the same closure the roster is
+            // built from, so a rebuilt member runs the same prompt and model it was bound with.
+            record.customAgents ?? {}
         );
     } else if (record.template === 'live') {
         create = liveFactory(
@@ -720,7 +860,9 @@ export const presetFromRecord = (
             record.primary,
             record.subagents,
             record.agentModels ?? {},
-            record.agentInstructions ?? {}
+            record.agentInstructions ?? {},
+            record.agentColors ?? {},
+            record.customAgents ?? {}
         );
     } else {
         if (fallback === undefined) {
@@ -740,7 +882,16 @@ export const presetFromRecord = (
             // definition. An injected preset that no longer carries it would
             // silently restore a different prompt, so the mismatch is an error.
             JSON.stringify(current.agentInstructions ?? {}) !==
-            JSON.stringify(record.agentInstructions ?? {})
+            JSON.stringify(record.agentInstructions ?? {}) ||
+            // R2: a saved color is part of the frozen definition too. An injected preset
+            // that no longer carries it would restore a differently painted harness, so
+            // the mismatch is an error rather than a silent repaint.
+            JSON.stringify(current.agentColors ?? {}) !== JSON.stringify(record.agentColors ?? {}) ||
+            // R7: a saved session-defined agent is part of the frozen roster in the strongest
+            // sense — an injected factory has no way to build a brain the catalogue does not
+            // know about, so a record that names one while the factory's preset does not would
+            // silently restore a team missing that member.
+            JSON.stringify(current.customAgents ?? {}) !== JSON.stringify(record.customAgents ?? {})
         ) {
             throw new Error(
                 `Harness "${record.name}" changed incompatibly while its session was saved; the frozen definition cannot be rebuilt.`
@@ -770,6 +921,12 @@ export const presetFromRecord = (
         ...(record.agentInstructions === undefined
             ? {}
             : { agentInstructions: { ...record.agentInstructions } }),
+        ...(record.agentColors === undefined ? {} : { agentColors: { ...record.agentColors } }),
+        // R7: the session-defined agent map is metadata the rebuilt entry must keep, or the
+        // NEXT session created from this preset (and the roster read of the restored one) would
+        // lose the member. Absent stays absent, so a pre-R7 record produces a preset with no
+        // key at all — the exact shape it had before this field existed.
+        ...(record.customAgents === undefined ? {} : { customAgents: { ...record.customAgents } }),
         builtin: record.builtin,
         editable: true,
         ...(record.template === undefined ? {} : { template: record.template }),
@@ -818,7 +975,15 @@ export const isLegacyShippedDefinition = (
         // A per-agent model map is a customisation, even when the team matches.
         Object.keys(record.agentModels ?? {}).length === 0 &&
         // T3: so is a saved instruction override — it is executable text, not prose.
-        Object.keys(record.agentInstructions ?? {}).length === 0
+        Object.keys(record.agentInstructions ?? {}).length === 0 &&
+        // R2: and so is a saved color. Shipped templates carry none, and a refresh would
+        // drop the row's map (the refresh replays prose only), so an operator who colored
+        // one member of a built-in keeps that decision instead of losing it to an upgrade.
+        Object.keys(record.agentColors ?? {}).length === 0 &&
+        // R7: and so is a saved session-defined agent (a registry row never has one, so this
+        // only ever fires on a document a foreign writer produced — where dropping the custom
+        // roster on a prose refresh would be a silent roster change).
+        Object.keys(record.customAgents ?? {}).length === 0
     );
 };
 
@@ -871,7 +1036,14 @@ export const restoreHarnessRegistry = (
                 ...(record.agentModels === undefined ? {} : { agentModels: { ...record.agentModels } }),
                 ...(record.agentInstructions === undefined
                     ? {}
-                    : { agentInstructions: { ...record.agentInstructions } })
+                    : { agentInstructions: { ...record.agentInstructions } }),
+                ...(record.agentColors === undefined ? {} : { agentColors: { ...record.agentColors } })
+                // R7: no `customAgents` half here, deliberately. `HarnessRegistration`
+                // (./registry.ts) declares no custom agents — they are session state, written
+                // only into a session's own frozen preset copy — so a replayed DEFINITION row
+                // rebuilds its factory with `{}`. A session that carries customs never takes
+                // this path: it rebuilds through `presetFromRecord` (./sessions.ts
+                // `restoreSession`), which does hand the map to the factory.
             });
             known.set(record.name, record);
             continue;
@@ -921,7 +1093,18 @@ export const restoreHarnessRegistry = (
                       // row replays them through the same patch that rebuilds the
                       // factory. `{}` is correct when the row has none: it clears
                       // overrides a newer template might ship.
-                      agentInstructions: { ...record.agentInstructions }
+                      agentInstructions: { ...record.agentInstructions },
+                      // R2: colors replay through the same patch for the same reason —
+                      // the map is captured by the factory, and `{}` is the explicit
+                      // "this row had none", which clears colors a newer template might
+                      // ship. A scripted/injected row keeps its captured factory, so it
+                      // stays metadata-only exactly like the two maps above.
+                      agentColors: { ...record.agentColors }
+                      // R7: `customAgents` is NOT part of `HarnessPatch`, for the same reason it is not part of
+                      // `HarnessRegistration`: a harness DEFINITION cannot declare one (only a session's frozen
+                      // preset copy carries them), so a definition row replays with none and the factory it
+                      // rebuilds needs no custom-agent map. A restored SESSION never takes this path: it rebuilds
+                      // through ./sessions.ts `restoreSession` -> `presetFromRecord`, which does pass the map.
                   }
                 : {})
         });
@@ -1057,6 +1240,15 @@ export const createHarnessRegistry = (
                 ? {}
                 : normalizeAgentInstructions(registration.agentInstructions, agents);
 
+        // Colors (R2) are validated against the same final member set: a swatch for an
+        // unselected agent could never be painted, so it is a 400 rather than a stored
+        // no-op. The value rule is the library's hex shape, so a saved harness can never
+        // hold a color `agent()` would reject.
+        const agentColors =
+            registration.agentColors === undefined
+                ? {}
+                : normalizeAgentColors(registration.agentColors, agents);
+
         const preset: HarnessPreset = {
             name,
             title:
@@ -1088,6 +1280,9 @@ export const createHarnessRegistry = (
             // closure captures it, so an existing session keeps the instruction its
             // agents were built with.
             agentInstructions,
+            // R2: same absent-vs-empty equivalence, and captured by the same factory
+            // closure, so an existing session keeps the colors its agents were built with.
+            agentColors,
             builtin: false,
             editable: true,
             // A created harness is a live profiled harness; later PATCHes treat
@@ -1095,7 +1290,7 @@ export const createHarnessRegistry = (
             template: 'live',
             // The factory closure captures the map, so a later PATCH builds a NEW
             // closure: an existing session keeps the models it was created with.
-            create: createProfiledHarness(primary, subagents, agentModels, agentInstructions)
+            create: createProfiledHarness(primary, subagents, agentModels, agentInstructions, agentColors)
         };
 
         entries.set(name, preset);
@@ -1179,6 +1374,20 @@ export const createHarnessRegistry = (
                 ? retainedInstructions
                 : normalizeAgentInstructions(patch.agentInstructions, agents);
 
+        // Colors (R2) follow the identical rule for the identical reason: a swatch for an
+        // agent this patch removed can never be painted, so it is dropped, and a stated
+        // map REPLACES the stored one (`{}` clears every color).
+        const retainedColors = Object.fromEntries(
+            Object.entries(current.agentColors ?? {}).filter(([agent]) =>
+                agents.includes(agent)
+            )
+        );
+
+        const agentColors =
+            patch.agentColors === undefined
+                ? retainedColors
+                : normalizeAgentColors(patch.agentColors, agents);
+
         // R20.1 template handling. A metadata-only patch keeps the exact factory
         // the entry already captured (demo's script, flaky's testFlaky, a live
         // closure). An executable patch rebuilds from the template:
@@ -1198,7 +1407,13 @@ export const createHarnessRegistry = (
             patch.primary !== undefined ||
             patch.subagents !== undefined ||
             patch.agentModels !== undefined ||
-            patch.agentInstructions !== undefined;
+            patch.agentInstructions !== undefined ||
+            // R2: a color is display-only, but it is still EXECUTABLE in this sense: the
+            // map is captured by the factory closure and reaches every `Agent` built from
+            // it, so a stated color must rebuild the factory (and, on the scripted demo,
+            // upgrade it to a live harness exactly like an instruction edit does). Keeping
+            // it metadata-only would store a swatch that no agent ever carries.
+            patch.agentColors !== undefined;
 
         const upgradedScripted = executable && template === 'scripted';
 
@@ -1222,7 +1437,8 @@ export const createHarnessRegistry = (
                   primary,
                   subagents,
                   agentModels,
-                  agentInstructions
+                  agentInstructions,
+                  agentColors
               )
             : current.create;
 
@@ -1244,6 +1460,9 @@ export const createHarnessRegistry = (
             // T3: stated explicitly (not inherited from `...current`) so a patch that
             // replaces or clears the map is what the new entry carries.
             agentInstructions,
+            // R2: same explicit statement — `{}` from a patch means "no colors", which
+            // `...current` would not produce on its own.
+            agentColors,
             ...(upgradedScripted
                 ? {
                       // The upgrade replaces the script with the live toolbox, which

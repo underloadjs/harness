@@ -87,6 +87,16 @@ export type ProviderSearch = {
     maxResults: number;
     apiKey: string;
     redact: (text: string) => string;
+    // Filters the caller asked for. Every adapter receives them; an adapter whose
+    // provider has no equivalent sends what it can and ignores the rest, so one
+    // argument surface works across providers rather than leaking one vendor's
+    // vocabulary into the tool.
+    includeDomains?: string[];
+    excludeDomains?: string[];
+    since?: string;
+    until?: string;
+    category?: string;
+    speed: 'balanced' | 'fast';
 };
 
 // The request shape `requestSearch` accepts. `body` is JSON; `headers` are added

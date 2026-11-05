@@ -68,7 +68,9 @@ describe('registration', () => {
         expect(writer.tools.fetch.visibility).toBe('core');
 
         const properties = (writer.tools.fetch.parameters as { properties: Record<string, unknown> }).properties;
-        expect(Object.keys(properties)).toEqual(['url', 'format']);
+        // `query` (section selection) and `offset` (paging) are always offered: they
+        // are arguments of the tool, not of a provider.
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset']);
     });
 
     it('offers the exa provider when the process environment has a key', () => {
@@ -78,7 +80,7 @@ describe('registration', () => {
         const writer = harness({ agents: { writer: idle() }, webfetch: true });
 
         const properties = (writer.tools.fetch.parameters as { properties: Record<string, unknown> }).properties;
-        expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset', 'provider']);
     });
 
     it('offers a native/linkup choice from a Linkup key alone', () => {
@@ -93,7 +95,7 @@ describe('registration', () => {
 
         // Exa is absent: a keyless hosted provider is not offered, so the enum
         // carries only what this harness can actually call.
-        expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset', 'provider']);
         expect(properties.provider.enum).toEqual(['native', 'linkup']);
         expect(writer.tools.fetch.description).toContain('linkup');
         expect(writer.tools.fetch.description).not.toContain('exa');
@@ -267,6 +269,10 @@ describe('live toolbox harness', () => {
             format: 'markdown',
             characters: 6,
             truncated: false,
+            // Always present now: a caller must be able to tell a complete page from
+            // a cut one, and where the next window starts.
+            offset: 0,
+            pageCharacters: 6,
             content: '# Page',
             title: 'Doc'
         });

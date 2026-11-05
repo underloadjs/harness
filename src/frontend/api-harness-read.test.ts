@@ -121,6 +121,36 @@ describe('getHarness', () => {
 
         await expect(getHarness('instruct')).rejects.toThrow('The harness store is unavailable.');
     });
+
+    it('publishes agent_colors for the colours the panes paint, and nothing for a definition that has none', async () => {
+        // T4/R2: `agent_colors` is only ever on the IDENTIFIED read (a card omits it,
+        // ../shared/harness-api.ts:422), and ./main.ts reads it through `descriptorOf` ->
+        // `contract.ts agentColorsOf`. Both halves of that chain live here: the wire body the
+        // route answers, and the row shape the panes actually render.
+        const stored = definition({ agent_colors: { instruct: '#ff6600', summarizer: '#4ade80' } });
+
+        serve((url) => (url === '/v1/harness/harnesses/instruct' ? json({ harness: stored }) : json({})));
+
+        const fetched = await getHarness('instruct');
+
+        expect(fetched?.agent_colors).toEqual({ instruct: '#ff6600', summarizer: '#4ade80' });
+
+        const { descriptorOf } = await import('./api');
+        const view = descriptorOf(fetched as HarnessDefinition);
+
+        expect(view.agentColors).toEqual({ instruct: '#ff6600', summarizer: '#4ade80' });
+
+        // An uncoloured definition keeps its pre-R2 shape: no key on the wire, no key on the
+        // row — which is what lets `agentColorsOf` answer "nothing configured" truthfully.
+        serve((url) => (url === '/v1/harness/harnesses/instruct' ? json({ harness: definition() }) : json({})));
+
+        const uncoloured = await getHarness('instruct');
+
+        expect(Object.prototype.hasOwnProperty.call(uncoloured ?? {}, 'agent_colors')).toBe(false);
+        expect(Object.prototype.hasOwnProperty.call(descriptorOf(uncoloured as HarnessDefinition), 'agentColors')).toBe(
+            false
+        );
+    });
 });
 
 describe('the instruction subroutes', () => {

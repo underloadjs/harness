@@ -435,20 +435,21 @@ export interface HarnessCard {
 /**
  * One member's instruction PROVENANCE AND LENGTH with no text, so a definition read stays constant-size however
  * long the prompts are. `source` names the layer that supplies the text the member runs: `harness` (this
- * definition overrides), `global` (a profile override), or `catalogue` (the trusted profile). The text is one
- * named subresource away.
+ * definition overrides), `global` (a profile override), `catalogue` (the trusted profile), or `session` (an
+ * agent THIS session defined, which no profile describes - a value only a session definition read can state).
+ * The text is one named subresource away.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface HarnessInstructionSummaryEntry {
     agent: string;
-    source: "catalogue" | "global" | "harness";
+    source: "catalogue" | "global" | "harness" | "session";
     overridden: boolean;
     chars: number;
 }
 
 /**
- * The identified read of one definition: a card plus the per-agent model overrides, the resolved core-tool set,
- * and the instruction summary.
+ * The identified read of one definition: a card plus the per-agent model overrides, the per-agent display
+ * colors, the resolved core-tool set, and the instruction summary.
  */
 export type HarnessDefinition = HarnessCard
     & {
@@ -456,13 +457,16 @@ export type HarnessDefinition = HarnessCard
     agent_models?: {
       [key: string]: string;
       };
+    agent_colors?: {
+      [key: string]: string;
+      };
     instruction_summary?: HarnessInstructionSummaryEntry[];
 };
 
 /**
- * Selection-only body. A client picks trusted agent names and may record per-agent model ids and instruction
- * overrides; it cannot supply a provider, a credential, a transport, or a tool list. Every override key must
- * name a member of the resulting definition.
+ * Selection-only body. A client picks trusted agent names and may record per-agent model ids, instruction
+ * overrides, and display colors; it cannot supply a provider, a credential, a transport, or a tool list. Every
+ * override key must name a member of the resulting definition.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateHarnessRequest {
@@ -477,12 +481,16 @@ export interface CreateHarnessRequest {
     agent_instructions?: {
       [key: string]: string;
       };
+    agent_colors?: {
+      [key: string]: string;
+      };
 }
 
 /**
- * An omitted field keeps its current value; the name is immutable. `agent_models` and `agent_instructions`
- * REPLACE the map they name (`{}` clears it), and an override for a member this patch removes is dropped rather
- * than rejected. Changing `primary` without `subagents` removes the new primary from the old allowlist.
+ * An omitted field keeps its current value; the name is immutable. `agent_models`, `agent_instructions` and
+ * `agent_colors` REPLACE the map they name (`{}` clears it), and an override for a member this patch removes is
+ * dropped rather than rejected. Changing `primary` without `subagents` removes the new primary from the old
+ * allowlist.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateHarnessRequest {
@@ -494,6 +502,9 @@ export interface UpdateHarnessRequest {
       [key: string]: string;
       };
     agent_instructions?: {
+      [key: string]: string;
+      };
+    agent_colors?: {
       [key: string]: string;
       };
 }
@@ -872,8 +883,10 @@ export interface DeleteSessionResult {
 
 /**
  * The harness definition this session captured at creation, which is the authority for its member set,
- * delegation allowlist, declared and core tools, and per-agent overrides. A saved session restores from this
- * record, so a later global edit cannot move it.
+ * delegation allowlist, declared and core tools, and per-agent overrides - including the per-agent
+ * `agent_colors` display map it inherits from `HarnessDefinition`, present only when the captured copy
+ * configured at least one color. A saved session restores from this record, so a later global edit cannot move
+ * it, and the swatches a client paints for this conversation come from here.
  */
 export type SessionDefinitionResource = HarnessDefinition
     & {
@@ -967,8 +980,15 @@ export interface SessionAgentResponse {
 }
 
 /**
- * Binds an existing trusted profile into this session. No implementation, tool list, or transport is accepted,
- * so nothing here can inject code.
+ * Adds one member to THIS session. No implementation, tool list, or transport is accepted, so nothing here can
+ * inject code. Two kinds of member, decided by `name`: when it spells a trusted catalogue profile the call
+ * BINDS that profile (its own instruction and guidelines, with `model`/`instruction` as this session's
+ * overrides); when it is not a catalogue profile the call CREATES A SESSION-DEFINED AGENT - an agent this
+ * conversation owns, whose prompt is exactly the `instruction` supplied here (a default identity sentence when
+ * none is supplied), whose model is `model` (the session model when absent), and which has no profile and no
+ * guideline layer. Both kinds are durable in the session record and are rebuilt with the same model and
+ * instruction when the server restarts, and both are removable again with `DELETE` while no conversation uses
+ * them.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateSessionAgentRequest {
@@ -992,7 +1012,9 @@ export interface UpdateSessionAgentRequest {
 
 /**
  * Receipt of a roster removal. It states what was detached rather than echoing the roster, because the roster
- * is one bounded read away and a client that removed a binding needs the roster anyway.
+ * is one bounded read away and a client that removed a binding needs the roster anyway. A member that still
+ * owns a conversation is NOT removed: the call answers 409 naming those conversation ids, and the roster keeps
+ * the member (its `deletable` row flag and the roster read state the same condition).
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface DeleteSessionAgentResult {

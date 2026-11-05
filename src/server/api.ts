@@ -1512,7 +1512,16 @@ export const createHarnessApi = ({
     const postHarness: Handler = async (ctx) => {
         const body = requireObjectBody<CreateHarnessRequest>(await ctx.body());
 
-        requireKnownFields(body, ['name', 'title', 'description', 'primary', 'subagents', 'agent_models', 'agent_instructions']);
+        requireKnownFields(body, [
+            'name',
+            'title',
+            'description',
+            'primary',
+            'subagents',
+            'agent_models',
+            'agent_instructions',
+            'agent_colors'
+        ]);
 
         if (typeof body.name !== 'string' || body.name.length === 0) {
             throw new HttpError(400, 'A harness definition requires a "name".');
@@ -1534,7 +1543,11 @@ export const createHarnessApi = ({
                 ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
                 // snake_case at the edge, camelCase in the domain (see NAMING above).
                 ...(body.agent_models === undefined ? {} : { agentModels: body.agent_models }),
-                ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions })
+                ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions }),
+                // R2: display colors ride the same edge. Membership and the hex shape are the
+                // registry's decision (`normalizeAgentColors`), which is where a 400 naming the
+                // agent comes from; this handler only moves bytes.
+                ...(body.agent_colors === undefined ? {} : { agentColors: body.agent_colors })
             })
         );
 
@@ -1556,7 +1569,15 @@ export const createHarnessApi = ({
     const patchHarness: Handler = async (ctx) => {
         const body = requireObjectBody<UpdateHarnessRequest>(await ctx.body());
 
-        requireKnownFields(body, ['title', 'description', 'primary', 'subagents', 'agent_models', 'agent_instructions']);
+        requireKnownFields(body, [
+            'title',
+            'description',
+            'primary',
+            'subagents',
+            'agent_models',
+            'agent_instructions',
+            'agent_colors'
+        ]);
 
         if (
             body.title === undefined &&
@@ -1564,7 +1585,8 @@ export const createHarnessApi = ({
             body.primary === undefined &&
             body.subagents === undefined &&
             body.agent_models === undefined &&
-            body.agent_instructions === undefined
+            body.agent_instructions === undefined &&
+            body.agent_colors === undefined
         ) {
             throw new HttpError(400, 'A patch must change at least one field.');
         }
@@ -1579,7 +1601,9 @@ export const createHarnessApi = ({
                 ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
                 // Present = REPLACE the map; `{}` is the explicit clear.
                 ...(body.agent_models === undefined ? {} : { agentModels: body.agent_models }),
-                ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions })
+                ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions }),
+                // R2: same replace semantics for the color map.
+                ...(body.agent_colors === undefined ? {} : { agentColors: body.agent_colors })
             })
         );
 
@@ -2627,9 +2651,14 @@ export const createHarnessApi = ({
         assertDurableRoster(record, 'bind an agent');
 
         // The store owns every semantic refusal and states it as a SessionError the dispatcher
-        // maps to its own status: 400 blank/identity mismatch/oversized instruction, 404 unknown
-        // profile, 409 already a member, roster full, retired profile, primary role, or a
-        // session with live/queued work.
+        // maps to its own status: 400 blank/identity mismatch/oversized instruction (and, R7, an
+        // unusable session-defined name), 409 already a member (including a case-only clash),
+        // roster full, retired profile, primary role, or a session with live/queued work.
+        //
+        // R7: a name that is NOT a catalogue profile is no longer a 404. It creates a
+        // SESSION-DEFINED agent — its own model and instruction, durable in the session's preset
+        // (`customAgents`) and rebuilt by `agentsFromProfiles` on the next start — which is what
+        // lets one conversation own an agent the harness definition never declared.
         await store.addSessionAgent(record.id, {
             name: body.name,
             profile: body.profile,
@@ -2676,8 +2705,10 @@ export const createHarnessApi = ({
         // from the registry entry fails to restore at all.
         assertDurableRoster(record, 'unbind an agent');
 
-        // `detachedThreads` is the receipt's one fact the roster read cannot reconstruct: how
-        // many host conversations the member owned and lost with it.
+        // R6: the store refuses a member that still owns a conversation (409 naming the thread
+        // ids), so a removal never deletes history behind the caller's back. `detachedThreads`
+        // stays on the receipt because the contract declares it, and it is 0 on every accepted
+        // removal — the conversations belong to the session, not to the agent.
         const { detachedThreads } = await store.removeSessionAgent(record.id, agentId);
 
         const revision = events.bumpRevision('session_agents', record.id);
@@ -2744,6 +2775,37 @@ export const createHarnessApi = ({
             throw new HttpError(404, `Agent "${agentId}" is not a member of session "${record.id}".`);
         }
 
+        const override = (record.preset.agentInstructions ?? {})[agentId];
+        const brains = record.harness.agents as Record<string, { instructions: readonly string[] }>;
+        const live = brains[agentId] === undefined ? undefined : brains[agentId]!.instructions.join('\n');
+
+        // R7: a SESSION-DEFINED member (./sessions.ts `addSessionAgent` with a name that is not a
+        // catalogue profile). It has no `AgentProfile`, so there is no shipped text to fall back
+        // on and no guideline block to report: the durable base in `preset.customAgents`, or the
+        // session override on top of it, IS the whole prompt. `source: 'session'` is the contract
+        // value for exactly that provenance, and the live brain's own text is reported when the
+        // roster exposes the brain (the same priority the profile branch below uses).
+        const custom = Object.prototype.hasOwnProperty.call(record.preset.customAgents ?? {}, agentId)
+            ? record.preset.customAgents![agentId]
+            : undefined;
+
+        if (custom !== undefined) {
+            const instruction = live ?? (typeof override === 'string' ? override : custom);
+
+            const response: SessionInstructionTextResponse = {
+                session_id: record.id,
+                agent_id: agentId,
+                source: 'session',
+                instruction,
+                // No trusted guidelines exist for an agent this conversation invented, and an
+                // empty list is the honest answer rather than another profile's rules.
+                guidelines: [],
+                chars: instruction.length
+            };
+
+            return json(200, response);
+        }
+
         // T19: the text this route reports is the text the session RUNS. The live brain holds
         // the system messages it was seeded with, so that is the source of truth; the profile
         // (which now carries the GLOBAL override) is only the fallback for a session whose
@@ -2751,9 +2813,6 @@ export const createHarnessApi = ({
         // from, which is how a client can tell a pre-edit session from a post-edit one instead
         // of being told about an override this conversation never ran.
         const profile = registry.agents().find((candidate) => candidate.name === agentId) ?? agentState.shipped(agentId);
-        const override = (record.preset.agentInstructions ?? {})[agentId];
-        const brains = record.harness.agents as Record<string, { instructions: readonly string[] }>;
-        const live = brains[agentId] === undefined ? undefined : brains[agentId]!.instructions.join('\n');
         const globalInstruction = agentState.overridesOf(agentId).instruction;
         const instruction = live ?? (typeof override === 'string' ? override : profile?.instruction ?? '');
 

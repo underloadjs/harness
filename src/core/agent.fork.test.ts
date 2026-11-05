@@ -26,6 +26,10 @@ import {
     agentBranchOf,
     forkAgent
 } from './branch';
+// The persistent-thread factory (core/thread.ts). A thread is the sibling clone path of
+// `fork()` — same brain, different conversation — so the identity-color contract is
+// pinned for BOTH in this file.
+import { createThreadAgent } from './thread';
 
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
@@ -325,5 +329,47 @@ describe('Agent.fork', () => {
         expect(() => source.fork({ label: 'x'.repeat(121) })).toThrow(
             'Branch label is 121 characters; the maximum is 120.'
         );
+    });
+
+    // Identity color (R2) on a clone. A branch and a thread are the SAME brain in
+    // another conversation: same name, same instructions, same transport. The swatch is
+    // part of that identity, so every clone path carries it and no clone path can
+    // quietly return a colorless agent a host would paint with a different color than
+    // its source. Pinned alongside the label because both are identity metadata that
+    // travels with the clone rather than with the transcript.
+    it('carries the source identity color into every branch and thread', () => {
+        const source = agent({ model: 'model-a', stream: fakeStream(), color: '#4ade80' });
+
+        // Public fork, labelled fork, nested fork, and the runtime autoanswer fork.
+        expect(source.fork().color).toBe('#4ade80');
+        expect(source.fork({ label: 'Research' }).color).toBe('#4ade80');
+        expect(source.fork().fork().color).toBe('#4ade80');
+        expect(
+            forkAgent(source, {
+                kind: 'autoanswer',
+                requestId: 'req-1',
+                callId: 'call-1',
+                sourceThreadId: '7'
+            }).color
+        ).toBe('#4ade80');
+
+        // A persistent thread is an independent conversation of the same brain.
+        const thread = createThreadAgent(source);
+        expect(thread.color).toBe('#4ade80');
+        expect(thread.name).toBe(source.name);
+
+        // A branch of a branch of a thread keeps it as well, which is what stops the
+        // swatch from drifting as the runtime nests work.
+        expect(thread.fork().color).toBe('#4ade80');
+    });
+
+    it('leaves the color key absent on every clone of an uncolored source', () => {
+        const source = agent({ model: 'model-a', stream: fakeStream() });
+
+        // Not `color: undefined` — the key is absent, exactly as on the source, so a
+        // host's "was a color configured?" test answers the same way everywhere.
+        expect(Object.hasOwn(source, 'color')).toBe(false);
+        expect(Object.hasOwn(source.fork(), 'color')).toBe(false);
+        expect(Object.hasOwn(createThreadAgent(source), 'color')).toBe(false);
     });
 });

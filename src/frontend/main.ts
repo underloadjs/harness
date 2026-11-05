@@ -231,6 +231,7 @@ import {
 import type { HarnessBootstrap } from './api';
 import type { SessionView as RenderSessionView, ThreadTranscriptPayload, TurnRowView } from './view-model';
 import {
+    agentColorsOf,
     agentInstructionsOf,
     agentModelsOf,
     agentsFromDescriptors,
@@ -249,6 +250,10 @@ import {
 import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentControl } from './ui/agent-control';
 import type { AgentControl } from './ui/agent-control';
+// T4/R1-R3: the ONE place that teaches the page who the team is and which identity wears
+// an explicit colour. Every surface (composer button, dialog badges, transcript tiles)
+// reads the module state configured here, so the shell must configure it BEFORE it paints.
+import { configureAgentColors, resetAgentColors } from './ui/agent-color';
 import { openAgentDialog } from './ui/agent-dialog';
 import type { AgentApplyResult, AgentConfigurationApply, AgentDialog } from './ui/agent-dialog';
 import { createTextCopyButton, openDialog } from './ui/dialog';
@@ -4842,6 +4847,14 @@ type Instance = {
     // override for a harness that has one. Same rule as `harnessInstructions`: undefined
     // means never read, and a failed read keeps the document-derived map.
     harnessModels?: Record<string, string>;
+    // T4/R2: the harness's per-agent identity COLOR map, read on the same explicit action
+    // (opening the configuration dialog, where `GET /harnesses/:name` is the only publisher
+    // of `agent_colors`). A definition CARD never states it, and a COMPILED view states it
+    // only when the conversation's frozen definition carries one, so this cache is the
+    // place an explicit colour lands for a live harness AND the place a future
+    // SESSION-level colour map would land. Same rule as `harnessModels`: undefined = never
+    // read, and a failed read keeps whatever this browser already had.
+    harnessColors?: Record<string, string>;
     // Tools toolRequest enabled for this session (SessionSnapshot.discoveredTools),
     // shown on the tools view's session note (R21.2 — there is no core dropdown any
     // more). Refreshed by the snapshot a core call triggers.
@@ -5355,6 +5368,11 @@ const replaceDescriptor = (updated: HarnessDescriptor): void => {
         // the cached copy (the merge in `agentViewOf` prefers the document per key, and a key
         // the document no longer names would still be readable from a stale cache).
         existing.harnessInstructions = agentInstructionsOf(updated);
+
+        // T4: the identical rule for the identical reason on the COLOUR map. A harness PATCH
+        // that clears a colour (`agent_colors: {}`) has to clear the cache as well, or the
+        // removed hex would keep painting this conversation's identities from a stale read.
+        existing.harnessColors = agentColorsOf(updated);
     }
 };
 
@@ -5834,6 +5852,10 @@ const renderHarnessChrome = (): void => {
     // state (R12).
     const hadAgentFocus = agentSlot.contains(document.activeElement);
     const view = agentViewOf(instance);
+    // T4: teach the palette THIS view's colours before the button is built — `createAgentControl`
+    // paints the primary's identity through the module state, so configuring afterwards would
+    // leave the previous conversation's hex on screen (R2/R4).
+    configureAgentColorsFor(view);
     const control = renderAgentControl(view, instance);
     agentSlot.replaceChildren(control.element);
 
@@ -5882,6 +5904,21 @@ const storedModelsOf = (display: HarnessDescriptor, instance: Instance): Record<
     ...(instance.harnessModels ?? {}),
     ...agentModelsOf(display)
 });
+
+// T4/R2: the per-agent identity COLOR map this browser believes is configured, with the
+// same precedence as the two above: whatever the DOCUMENT states wins per key (a frozen
+// definition that carries its own map, or an unredacted server), and the copy read on the
+// configuration dialog's explicit open (`instance.harnessColors`, ./api.ts `getHarness`)
+// fills the keys a definition CARD omits (../shared/harness-api.ts:422 `HarnessCard` has no
+// `agent_colors` — only the identified read publishes it).
+//
+// Unlike the model map, colors are NOT restated on a write: the shell never edits one, so
+// this is a read-only projection of display metadata. A member it omits is uncolored, and
+// ./ui/agent-color.ts derives that agent's tone deterministically (R3).
+const storedColorsOf = (display: HarnessDescriptor, instance: Instance): Record<string, string> => ({
+    ...(instance.harnessColors ?? {}),
+    ...agentColorsOf(display)
+});
 type AgentView = {
     display: HarnessDescriptor;
     members: string[];
@@ -5896,6 +5933,13 @@ type AgentView = {
     // first, else the trusted catalogue instruction (main.ts pairs it with
     // `agentLibrary`, exactly the way the dialog's textarea is seeded).
     instructions: Record<string, string>;
+    // T4/R2: the stored per-agent identity COLORS (explicit hexes only; an agent this map
+    // omits is uncolored and gets its deterministic palette tone). Every painted surface
+    // reads it through ./ui/agent-color.ts's module state, which `configureAgentColorsFor`
+    // below refreshes from THIS field — that is why the view carries it at all: the
+    // composer button, the dialog badges and the transcript tiles are three different
+    // components, and only this one map can keep them agreeing (R4).
+    colors: Record<string, string>;
     // The model a no-override choice resolves to (rendered as an id, never
     // "inherit"); '' means "not known", which the select states honestly.
     fallback: string;
@@ -5954,6 +5998,13 @@ const agentViewOf = (instance: Instance): AgentView => {
     // ships the map, or a frozen definition that carries it, needs no round trip at all.
     const instructions = storedInstructionsOf(display, instance);
 
+    // T4/R2: the explicit colors configured for THIS team. Read-only display metadata —
+    // nothing here is sent back on a write — and deliberately NOT filtered to `members`:
+    // a transcript tile can name an agent the definition no longer lists (a custom session
+    // agent, a member removed after the conversation ran), and its configured colour is
+    // still the colour the reader learned for it.
+    const colors = storedColorsOf(display, instance);
+
     // The actual model the no-override choice resolves to. For a new session it
     // is the typed model, else the server default (what mergeSettings applies to a
     // blank request).
@@ -6002,9 +6053,58 @@ const agentViewOf = (instance: Instance): AgentView => {
         editable,
         models,
         instructions,
+        colors,
         fallback,
         ...(hint === undefined ? {} : { hint })
     };
+};
+
+// ---------------------------------------------------------------------------
+// Agent identity colours (T4 / R1 + R2 + R3)
+// ---------------------------------------------------------------------------
+//
+// ./ui/agent-color.ts owns ONE module-level mapping, because the reader learns the team by
+// colour and every surface (the composer's agent button, the configuration dialog's roster
+// badges and `[+]` options, the transcript's tiles and thread labels) has to agree on it.
+// Those components call `paintAgentColor(host, name)` with no colour argument — they read
+// the configured state — so the SHELL is the only thing that can feed it. This is that
+// wiring, and the rule it has to obey is a sequencing rule: configure BEFORE the paint.
+//
+// Why `resetAgentColors()` runs first, and why that does not cost R1:
+//   - an explicit colour belongs to the ACTIVE view. Switching to a conversation whose
+//     harness colours `instruct` differently must drop the old hex rather than merge over
+//     it (`configureAgentColors` merges by design, so a partial payload can never
+//     un-learn a colour on its own);
+//   - the automatic tones are re-derived from scratch, from `roster` ORDER plus the pure
+//     hash/probe — no clock and no `Math.random` — so the same team painted from the same
+//     boot gives the same vector on every reload and on every re-configure. Boot always
+//     seeds the trusted library roster FIRST (see `boot`), which is what keeps a saved
+//     session's extra agents appending deterministically instead of shuffling the tones a
+//     reader already knows.
+//
+// The roster is the trusted catalogue PLUS this team, in that order: the library is the
+// stable part of the identity space, and a team member that is not in the catalogue (a
+// custom agent) lands after it.
+const configureAgentColorsFor = (view: AgentView): void => {
+    const roster = uniqueNames([
+        ...agentLibrary.map((agent) => agent.name),
+        ...view.members,
+        // An explicit colour for an agent OUTSIDE the member list still has to be taught to
+        // the palette (a tile for a removed member keeps the colour it wore), and it takes
+        // its auto slot in this same deterministic order.
+        ...Object.keys(view.colors)
+    ]);
+
+    resetAgentColors();
+    configureAgentColors({ roster, colors: view.colors });
+};
+
+// The boot seed: the trusted library roster, no explicit colours yet. Called once, before
+// anything can paint, so a surface that renders before the first conversation is resolved
+// still reads real tones rather than the neutral fallback.
+const configureBaselineAgentColors = (): void => {
+    resetAgentColors();
+    configureAgentColors({ roster: uniqueNames(agentLibrary.map((agent) => agent.name)), colors: {} });
 };
 
 // The model dropdown payload shared by the configuration panel inside the dialog.
@@ -6039,22 +6139,30 @@ const renderAgentControl = (view: AgentView, instance: Instance): AgentControl =
     });
 
 // Everything the dialog paints, derived from the same `AgentView`.
-const agentDialogOptionsOf = (view: AgentView, instance: Instance) => ({
-    members: view.members,
-    primary: view.primary,
-    agents: agentLibrary,
-    editable: view.editable,
-    models: agentModelSelectOf(view),
-    instructions: view.instructions,
-    // A selection that moves onto an agent the dialog-open walk never covered (a `[+]`
-    // addition) asks for its trusted preset text on that explicit action. A no-op once
-    // the row has text, so re-painting the same tab sends nothing.
-    onRequestPreset: (agent: string) => loadAgentPresetTexts(instance, [agent]),
-    activity: [...instance.activity],
-    ...(view.hint === undefined ? {} : { hint: view.hint }),
-    // T3: the one write path. The dialog never PATCHes on select or on edit.
-    onApply: (changes: AgentConfigurationApply) => applyAgentConfiguration(changes)
-});
+const agentDialogOptionsOf = (view: AgentView, instance: Instance) => {
+    // T4 safety net: this is the one funnel every dialog paint goes through (open AND
+    // refresh), so re-deriving the palette here guarantees the roster badges and the `[+]`
+    // options wear THIS view's colours even when the caller reached them without a chrome
+    // repaint. Idempotent: the same roster and the same map always produce the same vector.
+    configureAgentColorsFor(view);
+
+    return {
+        members: view.members,
+        primary: view.primary,
+        agents: agentLibrary,
+        editable: view.editable,
+        models: agentModelSelectOf(view),
+        instructions: view.instructions,
+        // A selection that moves onto an agent the dialog-open walk never covered (a `[+]`
+        // addition) asks for its trusted preset text on that explicit action. A no-op once
+        // the row has text, so re-painting the same tab sends nothing.
+        onRequestPreset: (agent: string) => loadAgentPresetTexts(instance, [agent]),
+        activity: [...instance.activity],
+        ...(view.hint === undefined ? {} : { hint: view.hint }),
+        // T3: the one write path. The dialog never PATCHes on select or on edit.
+        onApply: (changes: AgentConfigurationApply) => applyAgentConfiguration(changes)
+    };
+};
 
 // A cheap equality key for "does the open dialog need repainting?". It covers every
 // field the dialog renders that can change while it is open.
@@ -6070,6 +6178,11 @@ const agentDialogSignatureOf = (view: AgentView): string =>
         editable: view.editable,
         models: view.models,
         instructions: view.instructions,
+        // T4: an explicit colour is part of what the dialog PAINTS (every roster badge and
+        // every `[+]` option carries the identity tone), so a colour-only answer has to move
+        // the signature — otherwise the definition read that revealed a colour would repaint
+        // nothing and the badges would keep the automatic tones.
+        colors: view.colors,
         fallback: view.fallback,
         agents: agentLibrary.map((agent) => agent.name)
     });
@@ -6115,6 +6228,12 @@ const loadHarnessConfiguration = (instance: Instance): void => {
             const definition = descriptorOf(fetched);
             const models = agentModelsOf(definition);
 
+            // T4/R2: the identity colours THIS definition configures. The identified read is
+            // the only publisher of `agent_colors` (a card omits it), so for a harness with no
+            // conversation on screen this is the first moment the shell knows the explicit
+            // tones at all.
+            const colors = agentColorsOf(definition);
+
             // An unredacted definition states its own overrides, so the summary walk is not
             // needed at all; otherwise only the rows this definition supplies are fetched.
             const stated = agentInstructionsOf(definition);
@@ -6127,21 +6246,36 @@ const loadHarnessConfiguration = (instance: Instance): void => {
             // harness with no model override and no stored instruction answers with two empty
             // maps, which is exactly what an unread instance holds, so the early return is the
             // same rule T11 stated for the map alone.
+            //
+            // T4: colours are part of that equality. A definition that ONLY changed its colour
+            // map (or answered one for the first time) has to refresh, or the explicit tones
+            // would sit unread until the next unrelated frame.
             if (
                 sameStringMap(instance.harnessModels, models) &&
-                sameStringMap(instance.harnessInstructions, stored)
+                sameStringMap(instance.harnessInstructions, stored) &&
+                sameStringMap(instance.harnessColors, colors)
             ) {
                 return;
             }
 
             instance.harnessModels = models;
             instance.harnessInstructions = stored;
+            instance.harnessColors = colors;
             if (current !== instance) return;
 
             // `refreshAgentDialog` is signature-guarded: unchanged state repaints nothing,
             // and a changed map rebuilds the body the reader has not typed into yet (a draft
             // they ARE typing survives, because the dialog owns drafts separately).
-            refreshAgentDialog(agentViewOf(instance), instance);
+            const view = agentViewOf(instance);
+
+            // The colour map is now part of the view, so the shared palette is re-derived
+            // BEFORE anything repaints from it. `renderHarnessChrome` rebuilds the composer
+            // button (whose identity tone just changed) and ends in `refreshAgentDialog`; the
+            // extra refresh below is only for the branch where the TOOLS view owns the centre
+            // and that chrome paint returns early — the open dialog still has to follow.
+            configureAgentColorsFor(view);
+            renderHarnessChrome();
+            refreshAgentDialog(view, instance);
         })
         .catch(() => {
             // Stated, not swallowed: the dialog is still usable with the definition this
@@ -6333,6 +6467,12 @@ const closeAgentDialog = (): void => {
 // snapping (the draft is the truth about what the reader typed); `force` still
 // matters for the paths that write outside the dialog, and it is cheap to keep.
 const refreshAgentDialog = (view: AgentView, instance: Instance, force = false): void => {
+    // T4 safety net (see `agentDialogOptionsOf`): an open dialog's badges must follow the
+    // view the caller just derived, including a colour map that arrived from the definition
+    // read. Runs before the early returns on purpose, so a chrome repaint for a CLOSED
+    // dialog still keeps the module state pointed at the ACTIVE view.
+    configureAgentColorsFor(view);
+
     if (agentDialog === undefined || !agentDialog.isOpen) return;
 
     const signature = agentDialogSignatureOf(view);
@@ -8043,6 +8183,13 @@ const repaintPlane = (instance: Instance): void => {
     // `reconcileView` patches tiles in place and re-runs `syncDisplay`, which is how
     // a tree that arrived after the row got painted reaches the DOM without touching
     // the reader's expansion or scroll position.
+    //
+    // T4: the same palette re-derivation as `applyView`, because this is the paint that
+    // builds the AGENT SECTIONS of a tree opened lazily (the cold read path never goes
+    // through `applyView`). Guarded on the selected instance for the same reason: one
+    // page-wide mapping, owned by the conversation on screen.
+    if (current === instance) configureAgentColorsFor(agentViewOf(instance));
+
     instance.view.reconcileView(view, instance.sessionModel);
 
     if (current === instance) paintPanels();
@@ -8429,6 +8576,17 @@ const applyView = (instance: Instance, session: SessionView): void => {
     // No `labelSeeds` on this path: the projector sends each block's label, so a
     // deletion cannot renumber a surviving block by construction — the guarantee the
     // raw fold implements with seeds.
+    //
+    // T4/R2/R3: the shared identity palette is re-derived from THIS view immediately before
+    // the board paints. Every tile, agent section and thread label `ui/turns.ts` builds calls
+    // `paintAgentColor` with no colour argument, so the explicit colours of this
+    // conversation's own definition (its frozen map, plus anything the definition read
+    // cached) must already be the module state when the rows are built — otherwise opening a
+    // saved session would paint the tones of the conversation the reader just left. Scoped to
+    // the SELECTED instance on purpose: the mapping is one page-wide fact, and a background
+    // card applying a frame must not recolour the transcript on screen.
+    if (instance === current) configureAgentColorsFor(agentViewOf(instance));
+
     instance.view.reconcileView(session, session.model);
 
     // Persistent thread roster (R5/R7). Only an authoritative document updates it
@@ -10383,6 +10541,13 @@ const boot = async (): Promise<void> => {
             Array.isArray(data.agents) && data.agents.length > 0
                 ? data.agents
                 : agentsFromDescriptors(data.presets as unknown as readonly HarnessDescriptor[]);
+
+        // T4/R1: seed the identity palette with the trusted library roster, in catalogue
+        // order and with NO explicit colours, before anything can paint. Boot first, and the
+        // active view after it (every `configureAgentColorsFor` below), is what makes a saved
+        // session's custom agents append deterministically to the tones the reader already
+        // knows instead of re-shuffling the whole mapping on the first frame.
+        configureBaselineAgentColors();
 
         buildHarnesses();
         buildTools(data.tools as unknown as readonly ToolDescriptor[]);

@@ -927,6 +927,11 @@ export const frozenDescriptorOf = (definition: SessionDefinitionResource): Harne
         ...(card.coreTools === undefined ? {} : { coreTools: [...card.coreTools] }),
         ...(card.agentModels === undefined ? {} : { agentModels: { ...card.agentModels } }),
         ...(card.agentInstructions === undefined ? {} : { agentInstructions: { ...card.agentInstructions } }),
+        // T4/R2: the identity colours ride the same mapper, and dropping them here would be
+        // visible: this descriptor IS the team an archived conversation paints, so an
+        // explicit `agent_colors` map that stopped at the definition read would never reach
+        // the composer, the dialog badges or the transcript tiles.
+        ...(card.agentColors === undefined ? {} : { agentColors: { ...card.agentColors } }),
         builtin: card.builtin,
         editable: true
     };

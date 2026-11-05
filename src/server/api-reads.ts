@@ -934,6 +934,15 @@ export const sessionToolSourceOf = (
  * The live roster: what the session was BUILT with (the frozen definition) joined with
  * what it RUNS now (the running brains). Instruction TEXT is absent - it is one named
  * subresource away - so a roster read is constant-size however long the prompts are.
+ *
+ * R6 adds the removal guard to the row: `deletable` is false while the member owns a host
+ * conversation, because `DELETE /sessions/{id}/agents/{agent_id}` answers 409 on exactly that
+ * condition (./sessions.ts `removeSessionAgent`). Stating it here is what lets a client disable
+ * the button instead of discovering the rule with a failing call.
+ *
+ * R7 adds the session-defined members: a name in `preset.customAgents` was invented by THIS
+ * conversation, so its text has no catalogue provenance — the row reports
+ * `instruction_source: 'session'` for it and never asks the profile ladder about it.
  */
 export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext): SessionAgentBinding[] => {
     const definition = record.definition;
@@ -941,11 +950,34 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
     const brains = record.harness.agents as Record<string, { model: () => string; instructions: readonly string[] }>;
     const overrides = record.preset.agentInstructions ?? {};
 
+    // R6: the agents that own at least one independent conversation. One pass over the thread
+    // records for the whole roster (the runtime's own `removeAgent` backstop checks the same
+    // predicate per member, ./harness.ts), and `origin === 'host'` is the whole distinction: a
+    // member's DEFAULT conversation (`agent:<name>`) travels with it and never blocks a removal.
+    const threadUsers = new Set(
+        record.harness
+            .threads()
+            .filter((thread) => thread.origin === 'host')
+            .map((thread) => thread.agent)
+    );
+
+    // R7: the members this session invented (agent id → base instruction). Absent for every
+    // harness definition and every session saved before R7, which is what keeps the existing
+    // provenance ladder untouched for them.
+    const customs = record.preset.customAgents ?? {};
+
     return members.map((name) => {
         const brain = brains[name];
         const inherited = definition.agentModels?.[name];
         const instructionText = (brain?.instructions ?? []).join('\n');
-        const source = instructionSourceOf(name, overrides, record.preset.agentModels, context.agentState, instructionText);
+        const isCustom = Object.prototype.hasOwnProperty.call(customs, name);
+
+        // A custom member's text can only have come from this conversation, so the ladder below
+        // (harness override → global layer → shipped profile) is not asked: a custom name has no
+        // profile, and `overridesOf`/`effective` would answer for a profile that does not exist.
+        const source = isCustom
+            ? 'session'
+            : instructionSourceOf(name, overrides, record.preset.agentModels, context.agentState, instructionText);
 
         return {
             agent_id: name,
@@ -962,12 +994,24 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
             inherited_model: inherited ?? record.settings.model,
             instruction_source: source,
             instruction_chars: instructionText.length,
-            ...(source === 'harness' || source === 'session' ? { has_instruction_override: true } : {}),
+            // R7: for a session-defined member the flag states the narrower truth: this
+            // conversation re-wrote the agent's own base text (`PATCH …/instruction`). A profile
+            // member keeps the pre-existing rule, which keys off the override source.
+            ...(isCustom
+                ? overrides[name] === undefined
+                    ? {}
+                    : { has_instruction_override: true }
+                : source === 'harness' || source === 'session'
+                    ? { has_instruction_override: true }
+                    : {}),
             ...(brain === undefined ? {} : { guidelines_count: brain.instructions.length }),
             editable: true,
-            // The entry agent cannot be detached: every session needs an entry point.
-            deletable: name !== definition.primary,
-            restorable: source !== 'catalogue',
+            // The entry agent cannot be detached: every session needs an entry point. R6: neither
+            // can a member that still owns a conversation — its history would go with it.
+            deletable: name !== definition.primary && !threadUsers.has(name),
+            // A custom member always has a stated undo (`null` restores its stored base), and an
+            // inherited member has one as soon as its text is not the plain shipped profile.
+            restorable: isCustom ? true : source !== 'catalogue',
             ...(isAgentBusy(record, name) ? { busy: true } : {}),
             revision: context.hub.getRevision('session_agents', record.id)
         };
@@ -1052,6 +1096,14 @@ export const harnessDefinitionOf = (
     ...(Object.keys(preset.agentModels ?? {}).length === 0
         ? {}
         : { agent_models: { ...preset.agentModels } }),
+    // R2: the per-agent display colors, emitted under the same non-empty rule as
+    // `agent_models`, so an uncolored definition keeps its exact pre-R2 shape. This is
+    // the field the UI paints swatches from (`HarnessDescriptor.agentColors` in the
+    // internal model, `agent_colors` on the wire); a member it omits is uncolored and
+    // the host applies its own derivation.
+    ...(Object.keys(preset.agentColors ?? {}).length === 0
+        ? {}
+        : { agent_colors: { ...preset.agentColors } }),
     instruction_summary: summary
 });
 
@@ -1221,13 +1273,32 @@ export const agentProfileOf = (
     };
 };
 
-/** The frozen definition copy one session runs, with its source/current bookkeeping. */
+/**
+ * The frozen definition copy one session runs, with its source/current bookkeeping.
+ *
+ * The per-agent override maps it emits are the FROZEN ones, read off `record.definition`
+ * (the `HarnessDescriptor` captured at creation): `agent_models` (R9) and `agent_colors`
+ * (R2) appear only when the definition actually configured something, which is the same
+ * non-empty rule `harnessDefinitionOf` and `describeHarness` follow. That is what lets the
+ * saved-session UI paint the swatches this conversation was built with, rather than whatever
+ * the live registry entry says after a later recolor.
+ */
 export const sessionDefinitionOf = (
     record: SessionRecord,
     context: ReadContext,
     source: { current: boolean }
 ): SessionDefinitionResource => {
     const definition = record.definition;
+
+    // R7: the agents THIS session invented (name → base instruction). They are not catalogue
+    // profiles, so the provenance ladder below cannot answer anything about them, and the frozen
+    // `HarnessDescriptor` carries no field for them — the session's own preset copy is the only
+    // authority. Reading it here is what keeps the summary honest (and keeps it from throwing) for
+    // a roster that contains a member no profile defines.
+    const customs = record.preset.customAgents ?? {};
+    const sessionInstructions = record.preset.agentInstructions ?? {};
+    const brains = record.harness.agents as Record<string, { instructions: readonly string[] }>;
+    const definesCustomAgent = Object.keys(customs).length > 0;
 
     return {
         name: definition.name,
@@ -1244,7 +1315,19 @@ export const sessionDefinitionOf = (
         ...(definition.agentModels === undefined || Object.keys(definition.agentModels).length === 0
             ? {}
             : { agent_models: { ...definition.agentModels } }),
-        ...(definition.agentInstructions === undefined
+        // R2/R1: the frozen definition's per-agent display COLORS, emitted under the exact
+        // non-empty rule `harnessDefinitionOf` above and `describeHarness` use, so a session
+        // built from an uncolored definition keeps its pre-R2 wire shape (and a document
+        // saved before colors existed restores with no key at all). `record.definition` is the
+        // frozen `HarnessDescriptor`, whose `agentColors` map (./harnesses/descriptor.ts
+        // `describeHarness`) is copied from the same preset map that colored the agents this
+        // session was built with — so the swatch a saved-session UI reads here is byte-identical
+        // to the one the live conversation paints. A member the map omits has NO configured
+        // color, and the client applies its own derivation for it.
+        ...(definition.agentColors === undefined || Object.keys(definition.agentColors).length === 0
+            ? {}
+            : { agent_colors: { ...definition.agentColors } }),
+        ...(definition.agentInstructions === undefined && !definesCustomAgent
             ? {}
             : {
                   // T19: the provenance ladder matches ./toolbox.ts and the roster rows: a
@@ -1253,6 +1336,27 @@ export const sessionDefinitionOf = (
                   // definition runs, which is why it is taken from the effective profile rather
                   // than the catalogue constant.
                   instruction_summary: [...definition.agents].map((agent) => {
+                      // R7: a session-defined member answers from THIS conversation, not from the
+                      // ladder: `source: 'session'` states that the text is the agent's own base,
+                      // `overridden` reports whether a later `PATCH …/instruction` re-wrote that
+                      // base, and `chars` is the length of the text the live brain actually runs
+                      // (falling back to the stored base when the roster exposes no brain). A
+                      // custom name never resolves in `context.profiles`, so this branch also
+                      // removes the `effectiveInstruction === undefined` hole the ladder below has
+                      // for it.
+                      if (Object.prototype.hasOwnProperty.call(customs, agent)) {
+                          const live = brains[agent] === undefined
+                              ? undefined
+                              : brains[agent]!.instructions.join('\n');
+
+                          return {
+                              agent,
+                              source: 'session',
+                              overridden: Object.prototype.hasOwnProperty.call(sessionInstructions, agent),
+                              chars: live === undefined ? (customs[agent] ?? '').length : live.length
+                          };
+                      }
+
                       const harnessOverride = Object.prototype.hasOwnProperty.call(
                           definition.agentInstructions ?? {},
                           agent

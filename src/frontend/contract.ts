@@ -270,6 +270,66 @@ export const instructionsForMembers = (
     return result;
 };
 
+// Per-agent display COLOR map (`agentColors`), read defensively.
+//
+// T4/R2/R3: the third sibling of `agentModelsOf`/`agentInstructionsOf`. The map is
+// optional and present only when a definition actually configures something
+// (../server/protocol.ts:300 `HarnessDescriptor.agentColors`, wire spelling
+// `agent_colors`, ../shared/harness-api.ts:459); a member absent from it is
+// UNCOLORED, and the UI derives that agent's tone deterministically
+// (./ui/agent-color.ts `agentColorOf`).
+//
+// The server validates every entry as a CSS hex color before it stores one
+// (`harness.swagger.yaml` `agent_colors.pattern`, src/server/harnesses/registry.ts), but
+// this read stays defensive because the payload still arrives as JSON: an inherited key,
+// a non-string value, or a blank string is NOT a color and must never reach a CSS custom
+// property (a malformed value there would paint `undefined` and drop the block back to
+// the `:root` fallback). A blank entry is therefore dropped, exactly like a blank model
+// id above, and ./ui/agent-color.ts independently degrades an unusable hex to the
+// automatic palette tone.
+export const agentColorsOf = (source: {
+    agentColors?: Record<string, string>;
+}): Record<string, string> => {
+    const map = source.agentColors;
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) return {};
+
+    const result: Record<string, string> = {};
+    for (const [name, color] of Object.entries(map)) {
+        // OWN entries only: a key that resolves through the prototype is not a color this
+        // harness configured, and `Object.entries` alone would not prove otherwise for an
+        // object built outside JSON (a Proxy, a class instance off a test double).
+        // `Object.prototype.hasOwnProperty.call` rather than `Object.hasOwn`: the package's
+        // compile lib predates ES2022.
+        if (!Object.prototype.hasOwnProperty.call(map, name)) continue;
+
+        // A blank/whitespace value is "uncolored" — the palette owns that agent. The
+        // string is kept VERBATIM (not trimmed, not re-cased): what the reader configured
+        // is what the CSS gets, and the hex parser trims for itself.
+        if (typeof color !== 'string' || color.trim().length === 0) continue;
+
+        result[name] = color;
+    }
+
+    return result;
+};
+
+// Filter a color map down to a member list, preserving member order — the color sibling
+// of `modelsForMembers`/`instructionsForMembers`, for the same reason: a PATCH sends the
+// COMPLETE map because the server replaces the field it names (`{}` clears it), so a key
+// for a member this write removes must drop out rather than linger.
+export const colorsForMembers = (
+    colors: Readonly<Record<string, string>>,
+    members: readonly string[]
+): Record<string, string> => {
+    const result: Record<string, string> = {};
+    for (const member of members) {
+        const color = colors[member];
+        if (typeof color === 'string' && color.trim().length > 0) result[member] = color;
+    }
+
+    return result;
+};
+
 // A session may freeze the definition it started with (`harnessDefinition`). The
 // frontend renders that descriptor, never the live one, so an edited harness
 // cannot rewrite a conversation that is already on screen.

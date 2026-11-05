@@ -16,13 +16,24 @@
 //      instruction text, and still names the conversation (the `title` field this owner also
 //      fixed in `readSessionRecord`) and keeps the operator defaults (`globalSettings` in
 //      `readHarnessDatabase`).
+//   5. R6 — a saved session owns its history: an agent that still OWNS a conversation is not
+//      detached, the 409 names the conversations, the roster's `deletable` flag states the same
+//      condition, and an accepted removal detaches NO thread (`detached_threads: 0`).
+//   6. R7 — a session may invent an agent the catalogue never described: its own name, model and
+//      instruction, durable as `preset.customAgents` and rebuilt byte-identically by the second
+//      process, with `instruction_source: "session"` on every read and the base text as the
+//      honest undo of a `null` instruction patch.
 //
 // Cross-references:
 //   - ../harness.ts              — addAgent / removeAgent / setAgentInstruction and their gate
 //   - ./sessions.ts              — addSessionAgent / removeSessionAgent / setSessionAgentInstruction
 //   - ./api.ts                   — the three routes and their revisions/events
-//   - ./api-reads.ts             — `sessionAgentRowsOf` (`origin` from `record.sessionAgents`)
-//   - ./persistence.ts           — readSessionRecord (title, sessionAgents) / readHarnessDatabase
+//   - ./api-reads.ts             — `sessionAgentRowsOf` (`origin` from `record.sessionAgents`,
+//                                  `deletable` from host-thread ownership, `customAgents` provenance)
+//   - ./harnesses/toolbox.ts     — `agentConfigurationForCustom` / `customAgentInstruction` /
+//                                  `agentsFromProfiles` (the rebuild half of R7)
+//   - ./persistence.ts           — readSessionRecord (title, sessionAgents) / readPresetRecord
+//                                  (`customAgents`) / readHarnessDatabase
 //   - ./api-durable.test.ts      — the fixture shape this file reuses (real fs, no mocks)
 
 import { describe, expect, it } from 'vitest';
@@ -53,6 +64,13 @@ const API_DEFAULTS = { baseURL: SETTINGS.baseURL, model: SETTINGS.model, hasApiK
 // refuses anything else), and `instruct`'s shipped team does not contain it, so the bind is a
 // real change to the roster rather than a no-op.
 const BINDING = 'summarizer';
+
+// R7: an agent NO catalogue profile describes, which the session therefore defines for itself.
+// The name is deliberately not a profile id and not a case-variant of one, and the base text is
+// asserted byte for byte everywhere it surfaces (live brain, roster row, instruction route,
+// durable document, rebuilt brain).
+const CUSTOM = 'localizer';
+const CUSTOM_BASE = 'You rewrite copy for the target market.';
 
 const call = (
     api: ReturnType<typeof createHarnessApi>,
@@ -98,7 +116,7 @@ const readDocument = (root: string): Record<string, any> =>
 // ignores the saved team, and a template-less record needs its injected factory back). The
 // scripted `create` below is what the FIRST process runs; after a restart the record rebuilds the
 // same team through the real profiled factory, which is exactly the path under test.
-const narrowPreset = (): HarnessPreset => ({
+const narrowPreset = (agentColors?: Record<string, string>): HarnessPreset => ({
     name: 'instruct',
     title: 'Instruct',
     description: 'Single-role fixture for the session binding contract.',
@@ -110,6 +128,12 @@ const narrowPreset = (): HarnessPreset => ({
     tools: [],
     builtin: false,
     editable: true,
+    // R2: an optional per-agent COLOR map, so the binding case below can state a swatch for the
+    // member it binds without changing the shape every other case in this file reads. A seeded
+    // template is copied in as-is (`createHarnessRegistry` -> `copyTemplate`), because the
+    // "every key must name a member" rule is a create/PATCH rule; coloring an agent the roster
+    // does not yet contain is exactly the state a session-scoped bind resolves.
+    ...(agentColors === undefined ? {} : { agentColors }),
     create: (settings, progress) =>
         harness({
             agents: {
@@ -128,8 +152,8 @@ const narrowPreset = (): HarnessPreset => ({
         })
 });
 
-const openInMemory = () => {
-    const registry = createHarnessRegistry([narrowPreset()]);
+const openInMemory = (agentColors?: Record<string, string>) => {
+    const registry = createHarnessRegistry([narrowPreset(agentColors)]);
     const store = new SessionStore(SETTINGS, registry);
     const api = createHarnessApi({ store, defaults: API_DEFAULTS, registry });
 
@@ -253,6 +277,84 @@ describe('session agent bindings', () => {
         const definition = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${second}/definition`));
 
         expect(definition.body.definition.agents).not.toContain(BINDING);
+    });
+
+    // R2/R3: a binding composes the agent through the SAME `agentConfigurationFromProfile` the
+    // preset factory uses (./sessions.ts `addSessionAgent` -> ./harnesses/toolbox.ts), so the
+    // definition's swatch for that member must reach the live brain. Without it the UI would
+    // paint one agent two colors across a restart: rebuilt members get their color from
+    // `preset.agentColors` (./harnesses/registry.test.ts "colors that agent only, leaves the
+    // rest uncolored"), and a bound member gets it only from this argument.
+    //
+    // The binding RESPONSE is not where the color shows: the roster row keeps its exact pre-R2
+    // shape (a color is definition metadata, not a session-scoped override), so the two honest
+    // observations are the live agent and the frozen definition read.
+    it('paints a bound member with the color the frozen definition configures for it', async () => {
+        const { api, store } = openInMemory({ [BINDING]: '#22d3ee' });
+        const sessionId = await createSession(api);
+
+        // The definition read states the map from the moment the session exists, because the
+        // frozen descriptor carries it (./harnesses/descriptor.ts emits `agentColors` from the
+        // preset) — this is the field the saved-session UI paints swatches from.
+        const before = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(before.status).toBe(200);
+        expect(before.body.definition.agent_colors).toEqual({ [BINDING]: '#22d3ee' });
+
+        const bound = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, {
+                name: BINDING,
+                model: 'scripted/bound'
+            })
+        );
+
+        expect(bound.status).toBe(201);
+        // The receipt grows no color field: `POST /sessions/{id}/agents` keeps the row shape
+        // every other case in this file pins.
+        expect(Object.hasOwn(bound.body.agent, 'color')).toBe(false);
+
+        // The live brain carries the swatch, verbatim (stored trimmed, casing preserved), and the
+        // member the map omits — this fixture's primary — carries NO key at all.
+        const record = store.liveSession(sessionId);
+
+        expect(record.harness.agents[BINDING].color).toBe('#22d3ee');
+        expect(Object.hasOwn(record.harness.agents.instruct, 'color')).toBe(false);
+
+        // The map stays on the session's OWN preset copy, which is what `presetToRecord` persists
+        // and `presetFromRecord` replays (./persistence.ts) — so a member rebuilt after a restart
+        // gets the same swatch through `agentsFromProfiles`. The durable roster itself is pinned in
+        // the restart case below.
+        expect(record.preset.agentColors).toEqual({ [BINDING]: '#22d3ee' });
+
+        // The frozen definition read is unchanged by the bind: the roster grew, the swatch map did
+        // not, because a binding never writes a new `agentColors` entry (`applyBindingMaps` touches
+        // only the model and instruction maps).
+        const definition = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(definition.status).toBe(200);
+        expect(definition.body.definition.agent_colors).toEqual({ [BINDING]: '#22d3ee' });
+        expect(definition.body.definition.agents).toContain(BINDING);
+    });
+
+    it('leaves a member bound from an uncolored definition uncolored', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        const definition = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(definition.status).toBe(200);
+        expect(Object.hasOwn(definition.body.definition, 'agent_colors')).toBe(false);
+
+        const bound = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: BINDING })
+        );
+
+        expect(bound.status).toBe(201);
+        expect(bound.body.agent.agent_id).toBe(BINDING);
+
+        // No map, no swatch: the bound agent is built exactly as it was before R2, so the client
+        // keeps its own derivation for it (`agent.color === undefined`).
+        expect(Object.hasOwn(store.liveSession(sessionId).harness.agents[BINDING], 'color')).toBe(false);
     });
 
     it('replaces only the leading system block when a member already has committed history', async () => {
@@ -461,5 +563,481 @@ describe('session agent bindings', () => {
         expect(
             (await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: BINDING })).status
         ).toBe(201);
+    });
+
+    // -----------------------------------------------------------------------
+    // R7: a session owns its agents, so it may INVENT one the catalogue never described — its
+    // own name, model, and instruction — and that agent has to survive the three reads the
+    // contract exposes (roster row, instruction subresource, frozen definition read) AND a
+    // restart from disk. These cases pin each half, because the pre-R7 answer was a 404.
+    // -----------------------------------------------------------------------
+
+    it('defines a session agent no profile describes and states where its text comes from', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        const created = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, {
+                name: CUSTOM,
+                model: 'scripted/local',
+                instruction: CUSTOM_BASE
+            })
+        );
+
+        expect(created.status).toBe(201);
+
+        // The receipt is the contract's row, every field named. `origin: 'session'` because this
+        // conversation created the member; `instruction_source: 'session'` because NO profile
+        // describes it — the catalogue → global → harness ladder has no layer to answer for an
+        // agent with no profile, and `harness` would wrongly imply an override of something;
+        // `inherited_model` is still the session model, which is the creation baseline the
+        // override sits on.
+        const { revision, instruction_chars, guidelines_count, restorable, ...binding } = created.body.agent;
+
+        expect(binding).toEqual({
+            agent_id: CUSTOM,
+            profile: CUSTOM,
+            role: 'subagent',
+            origin: 'session',
+            model: 'scripted/local',
+            inherited_model: 'scripted/first',
+            instruction_source: 'session',
+            editable: true,
+            deletable: true
+        });
+        expect(typeof revision).toBe('number');
+        // A custom agent always has a stated undo: `null` restores the base it was created with.
+        expect(restorable).toBe(true);
+        // The base text VERBATIM — a custom agent has no guidelines appended, so the count is the
+        // caller's sentence and nothing else.
+        expect(instruction_chars).toBe(CUSTOM_BASE.length);
+        // One system message, which IS the whole prompt (`agent()` seeds one per instruction).
+        expect(guidelines_count).toBe(1);
+
+        const record = store.liveSession(sessionId);
+
+        expect(record.harness.agents[CUSTOM].instructions).toEqual([CUSTOM_BASE]);
+        expect(record.harness.agents[CUSTOM].model()).toBe('scripted/local');
+
+        // The durable half of the same write: the session's OWN preset copy carries the base
+        // (that is what `presetFromRecord` → `agentsFromProfiles` rebuilds from), and NO
+        // `agentInstructions` entry, which is why the row above says `session` and not `harness`.
+        expect(record.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+        expect(record.preset.agentInstructions).toBeUndefined();
+        expect(record.preset.subagents).toEqual([CUSTOM]);
+        expect(record.definition.agents).toEqual(['instruct', CUSTOM]);
+
+        // The instruction subresource states the same text, with no guideline layer.
+        const text = jsonOf(
+            await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}/instruction`)
+        );
+
+        expect(text.status).toBe(200);
+        expect(text.body).toEqual({
+            session_id: sessionId,
+            agent_id: CUSTOM,
+            source: 'session',
+            instruction: CUSTOM_BASE,
+            guidelines: [],
+            chars: CUSTOM_BASE.length
+        });
+
+        // The frozen definition read carries the member in its roster AND in its instruction
+        // summary, and does not throw for a name no profile describes (the summary's ladder
+        // resolves a profile, which this member does not have).
+        const definition = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(definition.status).toBe(200);
+        expect(definition.body.definition.agents).toEqual(['instruct', CUSTOM]);
+        expect(definition.body.definition.instruction_summary).toContainEqual({
+            agent: CUSTOM,
+            source: 'session',
+            overridden: false,
+            chars: CUSTOM_BASE.length
+        });
+
+        // "As many agents as it likes" means more than one, and an OMITTED instruction is not an
+        // error: the session mints a deterministic identity sentence for its own agent.
+        const second = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'ops-bot' })
+        );
+
+        expect(second.status).toBe(201);
+        expect(second.body.agent.model).toBe('scripted/first');
+        expect(store.liveSession(sessionId).harness.agents['ops-bot'].instructions).toEqual([
+            'You are the ops-bot agent.'
+        ]);
+
+        const roster = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(roster.status).toBe(200);
+        expect(roster.body.total).toBe(3);
+        expect(roster.body.agents.map((row: Record<string, any>) => row.agent_id)).toEqual([
+            'instruct',
+            CUSTOM,
+            'ops-bot'
+        ]);
+    });
+
+    it('re-instructs a session-defined agent and restores its own base with a null patch', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        expect(
+            (
+                await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, {
+                    name: CUSTOM,
+                    model: 'scripted/local',
+                    instruction: CUSTOM_BASE
+                })
+            ).status
+        ).toBe(201);
+
+        const override = 'Rewrite for the Japanese market.';
+
+        const patched = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`, {
+                instruction: override
+            })
+        );
+
+        expect(patched.status).toBe(200);
+        // The source stays `session` (there is no other layer this member could come from), and
+        // the override flag now states that the conversation re-wrote its own base text.
+        expect(patched.body.agent).toMatchObject({
+            agent_id: CUSTOM,
+            instruction_source: 'session',
+            has_instruction_override: true,
+            restorable: true,
+            instruction_chars: override.length
+        });
+
+        const live = store.liveSession(sessionId);
+
+        expect(live.harness.agents[CUSTOM].instructions).toEqual([override]);
+        // The base is NOT overwritten, so `null` below has something honest to restore, and the
+        // override is durable as the RAW text exactly like a profile member's.
+        expect(live.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+        expect(live.preset.agentInstructions).toEqual({ [CUSTOM]: override });
+
+        const text = jsonOf(
+            await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}/instruction`)
+        );
+
+        expect(text.body).toEqual({
+            session_id: sessionId,
+            agent_id: CUSTOM,
+            source: 'session',
+            instruction: override,
+            guidelines: [],
+            chars: override.length
+        });
+
+        const cleared = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}/instruction`, {
+                instruction: null
+            })
+        );
+
+        expect(cleared.status).toBe(200);
+        expect(cleared.body.source).toBe('session');
+        expect(cleared.body.instruction).toBe(CUSTOM_BASE);
+        expect(cleared.body.chars).toBe(CUSTOM_BASE.length);
+
+        const restored = store.liveSession(sessionId);
+
+        expect(restored.harness.agents[CUSTOM].instructions).toEqual([CUSTOM_BASE]);
+        // The override entry is gone (not blank), while the base survives: exactly the pair a
+        // restart replays as "the agent's own text".
+        expect(Object.hasOwn(restored.preset, 'agentInstructions')).toBe(false);
+        expect(restored.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+    });
+
+    // R2 for an invented member: the swatch comes from the same frozen `agentColors` map a
+    // rebuilt catalogue member reads, so a session-defined agent is painted identically before
+    // and after a restart (the roster row keeps its exact shape either way).
+    it('paints a session-defined agent with the color the definition configures for it', async () => {
+        const { api, store } = openInMemory({ [CUSTOM]: '#22d3ee' });
+        const sessionId = await createSession(api);
+
+        const created = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: CUSTOM })
+        );
+
+        expect(created.status).toBe(201);
+        expect(Object.hasOwn(created.body.agent, 'color')).toBe(false);
+        expect(store.liveSession(sessionId).harness.agents[CUSTOM].color).toBe('#22d3ee');
+
+        // And the roster row still carries no color field, exactly as for a profile binding.
+        const roster = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+        const row = roster.body.agents.find((entry: Record<string, any>) => entry.agent_id === CUSTOM);
+
+        expect(Object.hasOwn(row, 'color')).toBe(false);
+    });
+
+    it('restarts from disk with the session-defined agent, its model, and its exact instruction', async () => {
+        const root = tempRoot('custom-restart');
+        const persistence = new HarnessPersistence(root);
+        const registry = createHarnessRegistry([narrowPreset()]);
+        const store = new SessionStore(SETTINGS, registry, undefined, { persistence });
+        const api = createHarnessApi({ store, defaults: API_DEFAULTS, registry });
+
+        const sessionId = await createSession(api, 'Invented team');
+
+        expect(
+            (
+                await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, {
+                    name: CUSTOM,
+                    model: 'scripted/local',
+                    instruction: CUSTOM_BASE
+                })
+            ).status
+        ).toBe(201);
+
+        const override = 'Rewrite for the Japanese market.';
+
+        expect(
+            (
+                await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`, {
+                    instruction: override
+                })
+            ).status
+        ).toBe(200);
+
+        // Durable BEFORE the answer. `customAgents` is the one additive field R7 needs: the base
+        // text of an agent no profile describes, next to the override map and the roster lists
+        // every pre-R7 document already carried.
+        const stored = readDocument(root).sessions[0];
+
+        expect(stored.sessionAgents).toEqual([CUSTOM]);
+        expect(stored.preset.subagents).toEqual([CUSTOM]);
+        expect(stored.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+        expect(stored.preset.agentInstructions).toEqual({ [CUSTOM]: override });
+        expect(stored.definition.agents).toEqual(['instruct', CUSTOM]);
+
+        // ---- second process, opened through the validating reader -------------------------
+        const reopened = openOnDisk(root);
+
+        expect(reopened.restoreProblems).toEqual([]);
+
+        const roster = jsonOf(await call(reopened.api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+        const row = roster.body.agents.find((entry: Record<string, any>) => entry.agent_id === CUSTOM);
+
+        expect(row).toMatchObject({
+            agent_id: CUSTOM,
+            profile: CUSTOM,
+            origin: 'session',
+            role: 'subagent',
+            model: 'scripted/local',
+            instruction_source: 'session',
+            has_instruction_override: true,
+            deletable: true
+        });
+        expect(row.instruction_chars).toBe(override.length);
+
+        // The rebuilt brain runs the OVERRIDE on the same model, byte for byte:
+        // `agentsFromProfiles` resolves `agentInstructions[name] ?? customAgents[name]`, which is
+        // the same precedence the live PATCH applied. This is the proof that the durable map
+        // reached the factory rather than being dropped as prose.
+        const live = reopened.store.liveSession(sessionId);
+
+        expect(live.harness.agents[CUSTOM].instructions).toEqual([override]);
+        expect(live.harness.agents[CUSTOM].model()).toBe('scripted/local');
+        expect(live.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+
+        const text = jsonOf(
+            await call(reopened.api, 'GET', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}/instruction`)
+        );
+
+        expect(text.body.source).toBe('session');
+        expect(text.body.instruction).toBe(override);
+        expect(text.body.guidelines).toEqual([]);
+        expect(text.body.chars).toBe(override.length);
+
+        // The definition read after the restart still names the invented agent.
+        const definition = jsonOf(await call(reopened.api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(definition.body.definition.agents).toEqual(['instruct', CUSTOM]);
+        expect(definition.body.definition.instruction_summary).toContainEqual({
+            agent: CUSTOM,
+            source: 'session',
+            overridden: true,
+            chars: override.length
+        });
+
+        // The catalogue member the definition shipped is untouched: a round trip replaces the
+        // roster, it does not append to it.
+        expect(roster.body.total).toBe(2);
+        expect(roster.body.agents.map((entry: Record<string, any>) => entry.agent_id)).toEqual([
+            'instruct',
+            CUSTOM
+        ]);
+    });
+
+    // -----------------------------------------------------------------------
+    // R6: a saved session owns its history. An agent that still OWNS a conversation is not
+    // detached — the removal used to delete its host threads behind the caller's back, which
+    // threw away transcripts the request never named.
+    // -----------------------------------------------------------------------
+
+    it('refuses to detach an agent that still owns a conversation, then detaches it once the thread is gone', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        expect(
+            (
+                await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, {
+                    name: CUSTOM,
+                    instruction: CUSTOM_BASE
+                })
+            ).status
+        ).toBe(201);
+
+        const rowOf = (body: Record<string, any>) =>
+            (body.agents as Record<string, any>[]).find((row) => row.agent_id === CUSTOM);
+
+        // The member's own DEFAULT conversation (`agent:localizer`) is not what the guard counts:
+        // it is the agent's transcript, and it travels with the agent by definition.
+        const before = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(before.status).toBe(200);
+        expect(rowOf(before.body).deletable).toBe(true);
+
+        const thread = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/threads`, { agent: CUSTOM })
+        );
+
+        expect(thread.status).toBe(201);
+
+        const threadId = thread.body.thread.id as string;
+
+        // The roster states the guard before the client has to discover it with a failing call.
+        const guarded = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(rowOf(guarded.body).deletable).toBe(false);
+
+        const conflict = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`));
+
+        expect(conflict.status).toBe(409);
+        // The refusal names the agent, how many conversations it owns, WHICH ids, and the fix.
+        expect(conflict.body.error.message).toContain(`Agent "${CUSTOM}"`);
+        expect(conflict.body.error.message).toContain('1 conversation');
+        expect(conflict.body.error.message).toContain(threadId);
+        expect(conflict.body.error.message).toContain('Delete those threads before removing the agent');
+
+        // Nothing moved: the conversation is still addressable, and the member is still a row.
+        const threads = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/threads`));
+
+        expect(threads.body.items.map((row: Record<string, any>) => row.id)).toContain(threadId);
+        expect(store.liveSession(sessionId).harness.thread(threadId)).toBeDefined();
+
+        const still = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(still.body.total).toBe(2);
+        expect(rowOf(still.body).deletable).toBe(false);
+        expect(store.liveSession(sessionId).preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+
+        // Delete the conversation the caller DID name, and the removal is accepted — with no
+        // thread detached as a side effect.
+        const dropped = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/threads/${threadId}`));
+
+        expect(dropped.status).toBe(200);
+
+        const afterThread = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(rowOf(afterThread.body).deletable).toBe(true);
+
+        const removed = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`));
+        const removedRevision = removed.body.revision;
+
+        expect(removed.status).toBe(200);
+        expect(removed.body).toEqual({
+            deleted: true,
+            agent_id: CUSTOM,
+            session_id: sessionId,
+            // R6: an accepted removal never detaches anything, and the field stays because the
+            // contract declares it.
+            detached_threads: 0,
+            revision: removedRevision
+        });
+
+        const after = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(after.body.total).toBe(1);
+        expect(after.body.agents.map((row: Record<string, any>) => row.agent_id)).toEqual(['instruct']);
+        expect(store.liveSession(sessionId).harness.agents[CUSTOM]).toBeUndefined();
+
+        // R7: detaching also deletes the stored base, so a restart has nothing left to rebuild.
+        expect(Object.hasOwn(store.liveSession(sessionId).preset, 'customAgents')).toBe(false);
+    });
+
+    it('refuses an unusable session-defined name and keeps an unknown DELETE a 404', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        // R7 widened WHICH names are legal, not what a name may look like: the roster key is a
+        // delegation id, a runtime registry key, and a key of the session's durable maps at once.
+        const slash = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'ops/bot' })
+        );
+
+        expect(slash.status).toBe(400);
+        expect(slash.body.error.message).toContain('session-defined agent');
+
+        const control = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'ops\u0007bot' })
+        );
+
+        expect(control.status).toBe(400);
+
+        // `unknown` is the placeholder a client paints for "no agent at all", in any case.
+        for (const taken of ['unknown', 'UNKNOWN']) {
+            const refused = jsonOf(
+                await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: taken })
+            );
+
+            expect(refused.status).toBe(400);
+            expect(refused.body.error.message).toContain('placeholder');
+        }
+
+        // A case-only difference from an existing member is the same agent to every reader, and
+        // the runtime's roster would hold two keys for one delegation word.
+        expect(
+            (await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: CUSTOM })).status
+        ).toBe(201);
+
+        const clash = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'Localizer' })
+        );
+
+        expect(clash.status).toBe(409);
+        expect(clash.body.error.message).toContain('case');
+
+        // A catalogue profile spelled differently collides too: `Instruct` is not a profile id,
+        // and inventing a look-alike of the entry point would be a silent roster surprise.
+        const primaryClash = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'Instruct' })
+        );
+
+        expect(primaryClash.status).toBe(409);
+
+        // The roster every refusal left behind, exactly — and the one member that was accepted
+        // carries the deterministic default sentence, because no instruction was supplied.
+        const roster = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(roster.body.agents.map((row: Record<string, any>) => row.agent_id)).toEqual([
+            'instruct',
+            CUSTOM
+        ]);
+        expect(store.liveSession(sessionId).preset.customAgents).toEqual({
+            [CUSTOM]: `You are the ${CUSTOM} agent.`
+        });
+
+        // Only the POST gained a custom branch: DELETE of a name that was never a member is
+        // still a 404, and a member that IS one detaches.
+        expect((await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/never-was`)).status).toBe(404);
+        expect(
+            (await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`)).status
+        ).toBe(200);
     });
 });

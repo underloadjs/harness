@@ -314,6 +314,171 @@ describe('R3b durable harness database', () => {
         ]);
     });
 
+    // R2 identity colors — the third per-agent map, persisted and restored exactly like
+    // the two above, plus the half that matters most for a display field: a document
+    // written before colors exists must restore byte-identically, with NO `agentColors`
+    // key invented anywhere (a UI distinguishes "no configured color" from "an empty
+    // one", and only the absent key is the honest answer for an old row).
+    it('restores a saved color map and applies it to the rebuilt factory', async () => {
+        const root = tempRoot('colors');
+        const preset = liveScriptedPreset('one', 'persisted answer');
+
+        const first = runtimeOf(root, [preset]);
+        first.registry.create({
+            name: 'painted',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentColors: { research: '#4ade80', summarizer: '#f97316' }
+        });
+        await first.store.persistRegistry();
+
+        // It is in the durable document, not only in memory.
+        const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+            registry: { name: string; agentColors?: Record<string, string> }[];
+        };
+        expect(stored.registry.find((entry) => entry.name === 'painted')?.agentColors).toEqual({
+            research: '#4ade80',
+            summarizer: '#f97316'
+        });
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, [preset]);
+        const restored = second.registry.find('painted');
+
+        expect(restored?.agentColors).toEqual({ research: '#4ade80', summarizer: '#f97316' });
+        // The rebuilt factory still captures the map, so the NEXT session's agents carry
+        // the swatches the operator configured — the restart cannot quietly repaint them.
+        const rebuilt = restored!.create(SETTINGS, () => undefined);
+        expect(rebuilt.agents.research.color).toBe('#4ade80');
+        expect(rebuilt.agents.summarizer.color).toBe('#f97316');
+    });
+
+    it('restores a pre-color registry document unchanged', async () => {
+        const root = tempRoot('colors-legacy');
+        const preset = liveScriptedPreset('one', 'persisted answer');
+
+        const first = runtimeOf(root, [preset]);
+        first.registry.create({
+            name: 'unpainted',
+            primary: 'research',
+            subagents: ['summarizer'],
+            // An OVERRIDE the pre-R2 loader already understood: proves the new optional
+            // field is read alongside the old ones rather than replacing them.
+            agentModels: { summarizer: 'small/fast' }
+        });
+        await first.store.persistRegistry();
+
+        const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+            registry: { name: string; agentColors?: Record<string, string> }[];
+        };
+        const row = stored.registry.find((entry) => entry.name === 'unpainted')!;
+        // Absent, not `{}`: an uncolored harness writes no field at all.
+        expect(Object.hasOwn(row, 'agentColors')).toBe(false);
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, [preset]);
+        const restored = second.registry.find('unpainted')!;
+
+        // The ENTRY normalizes an absent map to `{}` (exactly what `agentModels` and
+        // `agentInstructions` do), while the durable row keeps the field absent. What must
+        // not happen is a stored color appearing where none was ever written.
+        expect(restored.agentColors).toEqual({});
+        expect(restored.agentModels).toEqual({ summarizer: 'small/fast' });
+        // And no agent of the rebuilt harness carries a color key.
+        const rebuilt = restored.create(SETTINGS, () => undefined);
+        expect(Object.hasOwn(rebuilt.agents.summarizer, 'color')).toBe(false);
+        expect(rebuilt.agents.summarizer.model()).toBe('small/fast');
+    });
+
+    it('keeps a frozen session descriptor color across a restart and a later recolor', async () => {
+        const root = tempRoot('colors-frozen');
+        const preset = liveScriptedPreset('one', 'persisted answer');
+
+        const first = runtimeOf(root, [preset]);
+        first.registry.create({
+            name: 'painted',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentColors: { summarizer: '#4ade80' }
+        });
+        await first.store.persistRegistry();
+
+        const created = await first.store.create('painted');
+        const frozen = first.store.get(created.id).harnessDefinition;
+        // The session's frozen copy carries the color the card held at creation time.
+        expect(frozen?.agentColors).toEqual({ summarizer: '#4ade80' });
+
+        // A later recolor of the registry entry, then a restart.
+        first.registry.update('painted', { agentColors: { summarizer: '#f97316' } });
+        await first.store.persistRegistry();
+        first.store.dispose();
+
+        const second = runtimeOf(root, [preset]);
+
+        expect(second.registry.find('painted')?.agentColors).toEqual({ summarizer: '#f97316' });
+
+        const restored = second.store.get(created.id);
+        // The FROZEN descriptor round-trips unchanged: `readDescriptor` restores the
+        // creation-time map, which is what keeps an existing conversation's palette
+        // stable while the definition moves on.
+        expect(restored.harnessDefinition).toEqual(frozen);
+        expect(restored.harnessDefinition?.agentColors).toEqual({ summarizer: '#4ade80' });
+    });
+
+    // ---------------------------------------------------------------------------
+    // R7: the session-defined agent map. A harness DEFINITION never carries one (the registry's
+    // create/PATCH surface exposes no field for it), so the writer that produces the value is a
+    // session's own frozen preset copy (./sessions.ts `applyBindingMaps` → `presetToRecord`).
+    // What the persistence layer owns is the READER: restore the map exactly (a restart rebuilds
+    // the invented agent from it), invent nothing for a document that predates the field, and
+    // refuse a stored value that is not text instead of silently producing a broken roster.
+    // ---------------------------------------------------------------------------
+    it('restores a stored custom agent map, adds nothing to a pre-R7 document, and refuses a non-string entry', async () => {
+        const root = tempRoot('custom-agents');
+        const first = runtimeOf(root, [liveScriptedPreset('one')]);
+        const sessionId = (await first.store.create('one')).id;
+
+        first.store.dispose();
+
+        const document = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+        const stored = document.sessions.find((entry: Record<string, any>) => entry.id === sessionId);
+
+        // Absent, not `{}`: a session with no invented agent writes no key anywhere, so the
+        // document is byte-identical to what an older build saved for the same conversation.
+        expect(Object.hasOwn(stored.preset, 'customAgents')).toBe(false);
+        expect(Object.hasOwn(document.registry[0], 'customAgents')).toBe(false);
+
+        // The shape a newer writer produces: one session-defined agent, named by its own base
+        // instruction. Stamped on both halves, because a foreign writer (or a hand-edited file)
+        // may put it on either, and the reader must accept both.
+        stored.preset.customAgents = { localizer: 'You rewrite copy for the target market.' };
+        document.registry[0].customAgents = {
+            localizer: 'You rewrite copy for the target market.'
+        };
+        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+
+        const loaded = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
+
+        expect(loaded.sessions.find((entry) => entry.id === sessionId)?.preset.customAgents).toEqual({
+            localizer: 'You rewrite copy for the target market.'
+        });
+        expect(loaded.registry.find((entry) => entry.name === 'one')?.customAgents).toEqual({
+            localizer: 'You rewrite copy for the target market.'
+        });
+
+        // A non-string entry is a broken document, refused with the path that names it.
+        const broken = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+        broken.sessions
+            .find((entry: Record<string, any>) => entry.id === sessionId)
+            .preset.customAgents = { localizer: 7 };
+
+        expect(() => readHarnessDatabase(broken)).toThrow(
+            /preset\.customAgents\.localizer must be a string\./
+        );
+    });
+
     it('preserves a queued backlog and marks a running turn interrupted without replaying it', async () => {
         const root = tempRoot('interrupted');
         const fixture = gatedPreset();

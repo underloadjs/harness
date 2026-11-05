@@ -51,17 +51,52 @@ import { HarnessError } from '../../util';
 // Per-request budget. One attempt (plus the Cloudflare UA retry), then reported.
 export const FETCH_TIMEOUT_MS = 15_000;
 
-// Response ceiling, in bytes (100 KiB). The body is read through a stream and
+// Response ceiling, in bytes (1 MiB). The body is read through a stream and
 // the budget is checked per chunk, so a host cannot force a full allocation.
 // Content-length is checked too, when the host sends it, and an advertised size
 // over this bound is rejected before the body is read at all. Network chunks are
 // not size-guaranteed, so the counter is checked after every chunk and the
 // reader is cancelled the moment the budget is crossed: bytes beyond the budget
 // are never consumed.
-export const MAX_RESPONSE_BYTES = 100 * 1024;
+//
+// WHY 1 MiB AND NOT THE OLD 100 KiB: the byte cap is a TRANSFER budget, but the
+// old 100 KiB was acting as a CONTENT budget. A measured run over the top ten
+// results of a real search found 5 of 8 pages unreadable purely because their
+// raw HTML was over 100 KiB — GitHub, a13n.dev, arxiv, a docs site and
+// Wikipedia — each costing a wasted model turn. Those pages convert to far less
+// text than their HTML weighs, so the cap was refusing content the tool could
+// have returned inside its own character bound. 1 MiB is 10x the old figure and
+// still refuses the pathological case (a 1.6 MiB Wikipedia article is readable
+// now; a 20 MiB HTML dump is not).
+export const MAX_RESPONSE_BYTES = 1024 * 1024;
 
-// Returned-content ceiling, in characters. A cut page sets `truncated`.
-export const MAX_CONTENT_CHARS = 24_000;
+// Returned-content ceiling, in characters (10x the previous 24,000). This is
+// what the model pays; MAX_RESPONSE_BYTES is what the process is exposed to.
+export const MAX_CONTENT_CHARS = 240_000;
+
+// The ceiling on the SERIALIZED tool result. The harness caps every model-facing
+// tool result at MODEL_TOOL_RESULT_BUDGET_BYTES (core/result-budget.ts) and
+// replaces an over-budget value with a generic envelope that DROPS this tool's
+// own metadata (url, title, contentType, characters, truncated, nextOffset).
+// So ./index bounds the content to fit inside that cap itself: the tool does the
+// truncating, keeps its shape, and reports `nextOffset` instead of being
+// silently re-wrapped by the harness. A 240,000-character page is therefore
+// reachable, but never in one result that the harness would flatten.
+export const MAX_RESULT_BYTES = 64 * 1024;
+
+// The fixed keys of a fetch result (provider, url, contentType, format,
+// characters, truncated, pageCharacters, offset, nextOffset, title) plus JSON
+// punctuation and escaping. Measured well under this; the fit loop is exact
+// regardless, so this only decides where the shrink starts.
+export const RESULT_OVERHEAD_BYTES = 2_048;
+
+// The content ceiling for ONE result, in UTF-8 BYTES: the harness cap minus the
+// object's own overhead. BYTES and not characters on purpose — the harness budget
+// this protects (core/result-budget.ts) is measured in bytes, so a page full of
+// multi-byte text carries FEWER characters than this number and the tool must not
+// claim otherwise. Exported because a test must assert the real bound rather than
+// re-derive the arithmetic.
+export const MAX_RESULT_CONTENT_BYTES = MAX_RESULT_BYTES - RESULT_OVERHEAD_BYTES;
 
 // A <title> is a label, not free text: anything longer is dropped.
 export const MAX_TITLE_CHARS = 300;
@@ -72,6 +107,18 @@ export const MAX_URL_CHARS = 2_048;
 // The content-type header is echoed into the result; a megabyte of parameters
 // would not be information.
 export const MAX_CONTENT_TYPE_CHARS = 200;
+
+// Redirect hops to follow by hand. Bounded so a host cannot park the tool in a
+// cycle for the whole 15 s budget.
+export const MAX_REDIRECTS = 5;
+
+// A `query` argument is a search phrase, not a document: anything longer is
+// almost certainly the model pasting the page back.
+export const MAX_QUERY_CHARS = 200;
+
+// Sections a `query` may return. Bounded so a one-word query against a huge
+// page cannot smuggle the whole document back past the character bound.
+export const MAX_QUERY_BLOCKS = 20;
 
 // The user agents. The first impersonates a browser (many hosts 403 an
 // unidentified client); the second is honest and is tried once when Cloudflare
@@ -110,6 +157,148 @@ const statusFailure = (status: number): HarnessError => {
 const oversizedResponse = (): HarnessError =>
     new HarnessError(`fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
 
+// ---------------------------------------------------------------------------
+// Charset
+// ---------------------------------------------------------------------------
+
+// The `charset` parameter of a Content-Type header, or undefined. The body was
+// previously decoded with a default-constructed TextDecoder, which is always
+// UTF-8, so a declared `charset=windows-1252` page came back as mojibake (a
+// probe of the bytes for "Café" in cp1252 returned "Caf"). The label is passed
+// straight to TextDecoder, which owns the WHATWG label table and its aliases;
+// an unrecognised label throws there and falls back to UTF-8 rather than
+// failing the fetch.
+export const charsetFrom = (contentType: string): string | undefined => {
+    const match = /(?:^|;)\s*charset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;\s]*))/i.exec(contentType);
+    const value = (match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+
+    return value.length > 0 ? value.slice(0, 64) : undefined;
+};
+
+// A decoder for one declared charset, UTF-8 on anything unusable. Never throws:
+// a hostile or malformed charset must degrade to the old behaviour, not lose the
+// page.
+export const decoderFor = (charset: string | undefined): TextDecoder => {
+    if (charset === undefined) return new TextDecoder();
+
+    try {
+        return new TextDecoder(charset.toLowerCase());
+    } catch {
+        return new TextDecoder();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Binary gate
+// ---------------------------------------------------------------------------
+
+// Extensions whose bytes are never readable as text. `fetch` is the STRUCTURED
+// CONTENT path: it returns text the model can read, cite and search. Anything
+// that is fundamentally a file — an image, video, audio, an archive, a font, an
+// office document, an executable — belongs to `download`, which hands over real
+// bytes. Refusing on the extension is a cheap pre-flight check that saves a
+// 15 s transfer and a 1 MiB read for a page that would only be rejected later by
+// the content-type gate anyway (or, worse, decoded as binary garbage when a
+// misconfigured host labels it `text/plain`).
+//
+// Deliberately absent: .md .txt .json .jsonl .yaml .yml .xml .csv .tsv .html
+// .htm .svg .tex .rtf — all text. `.svg` in particular is text and often carries
+// readable content, which is why `readableMime` already makes that exception.
+const BINARY_EXTENSIONS = new Set([
+    // images
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.apng', '.bmp', '.dib', '.tif', '.tiff', '.ico', '.cur', '.heic', '.heif', '.psd', '.xcf',
+    // video
+    '.mp4', '.m4v', '.mov', '.avi', '.mkv', '.webm', '.mpg', '.mpeg', '.wmv', '.flv', '.3gp',
+    // audio
+    '.mp3', '.m4a', '.aac', '.ogg', '.oga', '.opus', '.wav', '.flac', '.aiff', '.mid', '.midi',
+    // documents that are containers, not text
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp', '.epub',
+    // archives
+    '.zip', '.gz', '.tgz', '.bz2', '.xz', '.zst', '.7z', '.rar', '.tar', '.cab', '.iso', '.dmg',
+    // fonts
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+    // binaries
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.dat', '.class', '.jar', '.war', '.pyc', '.o', '.a', '.wasm', '.elf', '.msi', '.apk', '.deb', '.rpm'
+]);
+
+// The extension of a URL's last path segment, lowercased, or undefined when the
+// path has none. Query strings and fragments are already gone (the URL is parsed
+// before this runs), so `?download=1` cannot hide an extension.
+export const binaryExtension = (url: string): string | undefined => {
+    let pathname: string;
+
+    try {
+        pathname = new URL(url).pathname;
+    } catch {
+        return undefined;
+    }
+
+    const leaf = pathname.split('/').filter((segment) => segment.length > 0).pop() ?? '';
+    const dot = leaf.lastIndexOf('.');
+
+    if (dot <= 0) return undefined;
+
+    const extension = leaf.slice(dot).toLowerCase();
+
+    return BINARY_EXTENSIONS.has(extension) ? extension : undefined;
+};
+
+// ---------------------------------------------------------------------------
+// Redirect target validation (SSRF)
+// ---------------------------------------------------------------------------
+
+// Hosts that are never a public page. `fetch` follows redirects by default, so
+// before this check a public URL could 302 the harness to loopback or to a cloud
+// metadata endpoint and the response body came back as tool output. Measured: a
+// local server on 127.0.0.1 answered a fetch and its 404 was reported, which is
+// both an internal read and a port-open oracle.
+//
+// This validates the address form, not the route: an IP literal is checked
+// against the non-public ranges, and `localhost`/`.localhost` by name. A DNS name
+// that RESOLVES to a private address is not caught here, because the platform
+// fetch exposes no hook between a redirect and the connection — stated plainly
+// rather than oversold. Blocking IP literals plus loopback names closes the two
+// shapes that matter in practice (metadata endpoints and local services reached
+// through a redirect) without adding a DNS dependency to a zero-dependency tool.
+const PRIVATE_IPV4 = /^(?:10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.0\.0\.|192\.168\.|198\.1[89]\.|0\.)/;
+const PRIVATE_IPV6 = /^(?:(?:fe80|fc|fd)[0-9a-f:]*|::1?|::ffff:(?:7f00:1|0?0?0?0?0?1)(?::0)?|64:ff9b::)/i;
+
+export const isPrivateHost = (hostname: string): boolean => {
+    const host = hostname.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
+
+    if (host.length === 0) return true;
+    if (host === 'localhost' || host.endsWith('.localhost')) return true;
+
+    // IPv4 literal (including the dotted form a browser accepts).
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+        return PRIVATE_IPV4.test(host) || host.startsWith('100.64.');
+    }
+
+    // IPv6 literal: anything with a colon. Also covers the mapped IPv4 forms.
+    if (host.includes(':')) {
+        const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(host);
+        if (mapped !== null) return PRIVATE_IPV4.test(mapped[1]);
+
+        return PRIVATE_IPV6.test(host);
+    }
+
+    return false;
+};
+
+// A URL the tool may actually request: absolute http(s), no userinfo, bounded,
+// and not a private/loopback target. Returns the normalized URL, or undefined.
+// Used for the FIRST hop and for every redirect target.
+export const safeFetchUrl = (value: unknown): string | undefined => {
+    const normalized = fetchableUrl(value);
+    if (normalized === undefined) return undefined;
+
+    try {
+        return isPrivateHost(new URL(normalized).hostname) ? undefined : normalized;
+    } catch {
+        return undefined;
+    }
+};
+
 // Best-effort release of a body that is rejected before it is read (a failing
 // status, a declared size over the budget, or an unreadable content type).
 // Without it the connection stays busy downloading bytes the tool has already
@@ -135,13 +324,20 @@ const cancelBody = (response: Response): void => {
 // Same streaming budget as ../websearch/request's reader: chunk-by-chunk byte
 // counting, stream-cancel on overflow, and a TextDecoder that carries partial
 // multi-byte characters across chunk boundaries.
-const readBody = async (response: Response, failure: () => HarnessError): Promise<string> => {
+const readBody = async (
+    response: Response,
+    failure: () => HarnessError,
+    charset?: string
+): Promise<string> => {
     const stream = response.body;
 
     if (!stream || typeof stream.getReader !== 'function') {
         let body: string;
 
         try {
+            // `response.text()` uses the charset the platform can see; this path
+            // only runs on a runtime with no readable stream, and the byte check
+            // below still bounds it.
             body = await response.text();
         } catch {
             throw failure();
@@ -153,7 +349,7 @@ const readBody = async (response: Response, failure: () => HarnessError): Promis
     }
 
     const reader = stream.getReader();
-    const decoder = new TextDecoder();
+    const decoder = decoderFor(charset);
     const parts: string[] = [];
     let received = 0;
 
@@ -265,10 +461,32 @@ export type PageFetch = {
     url: string;
     contentType: string;
     body: string;
+    // Redirect hops actually taken, so a caller can report a long chain.
+    redirects: number;
+};
+
+// A redirect Location header resolved against the URL that produced it. A
+// relative Location is legal and common, so it is resolved rather than rejected;
+// the result still has to pass the same gate as the original target.
+const redirectTarget = (location: string | null, from: string): string | undefined => {
+    if (location === null || location.trim().length === 0) return undefined;
+
+    try {
+        return new URL(location.trim(), from).toString();
+    } catch {
+        return undefined;
+    }
 };
 
 // One bounded GET. `format` only steers the Accept header — the body is
 // returned raw and converted by the caller according to the actual content type.
+//
+// REDIRECTS ARE FOLLOWED BY HAND (D2). The platform default follows them
+// invisibly, which means a public URL can 302 the harness to `http://127.0.0.1/`
+// or to a cloud metadata IP and the body lands in the transcript. Measured: a
+// local server on 127.0.0.1 answered a fetch and its 404 came back as the tool's
+// own error. Following manually lets every hop be re-validated, keeps the
+// `redirects` count honest, and still reports the final URL.
 export const requestPage = async (url: string, format: 'markdown' | 'text' | 'html'): Promise<PageFetch> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -280,18 +498,26 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
             ? new HarnessError(`fetch timed out after ${FETCH_TIMEOUT_MS} ms.`)
             : new HarnessError('fetch could not be reached (network error).');
 
-    const send = async (userAgent: string): Promise<Response> => {
+    // A binary extension is a `download` job before a single byte is paid for.
+    const extension = binaryExtension(url);
+    if (extension !== undefined) {
+        throw new HarnessError(
+            `fetch does not read ${extension} files: use the \`download\` tool for binary content.`
+        );
+    }
+
+    const send = async (target: string, userAgent: string): Promise<Response> => {
         try {
-            return await fetch(url, {
+            return await fetch(target, {
                 method: 'GET',
                 headers: {
                     'user-agent': userAgent,
                     accept: acceptHeader(format),
                     'accept-language': 'en-US,en;q=0.9'
                 },
-                signal: controller.signal
-                // Redirects are followed (the default): a page legitimately moves,
-                // and `response.url` reports where it landed.
+                signal: controller.signal,
+                // Followed by hand so each hop is validated (see above).
+                redirect: 'manual'
             });
         } catch {
             throw networkFailure();
@@ -299,18 +525,64 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
     };
 
     try {
-        let response = await send(BROWSER_USER_AGENT);
+        let target = safeFetchUrl(url);
 
-        // The one retry: a Cloudflare challenge means the fake-browser UA was
-        // detected, so answer honestly and try once more.
-        if (isCloudflareChallenge(response)) {
-            try {
-                await response.body?.cancel();
-            } catch {
-                // The body may already be consumed; the retry is what matters.
+        if (target === undefined) {
+            throw new HarnessError(
+                'fetch refuses this URL: it is not a public absolute http(s) address (loopback and private addresses are not fetched).'
+            );
+        }
+
+        let response: Response | undefined;
+        let redirects = 0;
+
+        for (;;) {
+            response = await send(target, BROWSER_USER_AGENT);
+
+            // The one retry: a Cloudflare challenge means the fake-browser UA was
+            // detected, so answer honestly and try once more.
+            if (isCloudflareChallenge(response)) {
+                try {
+                    await response.body?.cancel();
+                } catch {
+                    // The body may already be consumed; the retry is what matters.
+                }
+
+                response = await send(target, HONEST_USER_AGENT);
             }
 
-            response = await send(HONEST_USER_AGENT);
+            // A 3xx is a hop, not an answer. Follow it while the target stays safe.
+            if (response.status >= 300 && response.status < 400) {
+                const next = redirectTarget(response.headers.get('location'), target);
+
+                try {
+                    await response.body?.cancel();
+                } catch {
+                    // A redirect body is rarely worth reading.
+                }
+
+                if (next === undefined) {
+                    throw new HarnessError(`fetch followed a redirect to an unusable location (HTTP ${response.status}).`);
+                }
+
+                const safe = safeFetchUrl(next);
+                if (safe === undefined) {
+                    throw new HarnessError(
+                        `fetch refused a redirect to a non-public address (HTTP ${response.status}).`
+                    );
+                }
+
+                redirects += 1;
+
+                if (redirects > MAX_REDIRECTS) {
+                    throw new HarnessError(`fetch stopped after ${MAX_REDIRECTS} redirects.`);
+                }
+
+                target = safe;
+                continue;
+            }
+
+            break;
         }
 
         if (!response.ok) {
@@ -337,12 +609,16 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
             // Cancel so the socket is not held for a body we will never read.
             cancelBody(response);
 
-            throw new HarnessError(`fetch does not support this content type (${mime || 'unknown'}).`);
+            throw new HarnessError(
+                `fetch does not support this content type (${mime || 'unknown'}): use the \`download\` tool for binary content.`
+            );
         }
 
-        const body = await readBody(response, networkFailure);
+        // The declared charset drives the decode (D4); a missing or unrecognised
+        // label falls back to UTF-8, which is the previous behaviour.
+        const body = await readBody(response, networkFailure, charsetFrom(contentType));
 
-        return { url: response.url || url, contentType, body };
+        return { url: response.url || target, contentType, body, redirects };
     } finally {
         // Clear before the controller goes out of scope so a completed fetch
         // never keeps the process alive for the rest of the budget.

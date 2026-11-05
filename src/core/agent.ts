@@ -98,6 +98,42 @@ const normalizeInstructions = (instruction: string | string[] | undefined): stri
     return [...instruction];
 };
 
+// Accepted identity-color spelling (R2): a CSS hex color, 3/4/6/8 digits, either
+// case. Nothing else: a named color (`red`), an `rgb()`/`hsl()` function, or an
+// emoji is a different rendering contract per host, while a hex literal is paintable
+// by every host and is what the server echoes on `HarnessDescriptor.agentColors` and
+// constrains in the HTTP contract (`harness.swagger.yaml` `agent_colors.pattern`).
+//
+// MIRRORING: the registry keeps its own copy of this expression
+// (src/server/harnesses/registry.ts `AGENT_COLOR_PATTERN`) only so its rejection can
+// be a 400 naming the agent; the two spellings are pinned to the SAME accepted and
+// rejected sample set by src/server/harnesses/registry.test.ts, which feeds every
+// value through BOTH `agent()` and `registry.create()`. A value that survives
+// construction is therefore always a value a UI can paint, and a value the HTTP edge
+// accepts is always one `agent()` will not reject.
+const AGENT_COLOR_PATTERN = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+// Validate the optional display color at construction. Trimmed first (a pasted value
+// often carries padding), then matched; the stored value keeps the author's casing,
+// because casing is presentation, not identity. `undefined` means "not configured"
+// and stays ABSENT on the agent (never `color: undefined`), so a host can test
+// `agent.color !== undefined` and fall back to its own derivation. An empty or
+// whitespace-only string is rejected rather than treated as absent, exactly like a
+// blank model id elsewhere: clearing means omitting the key.
+const requireAgentColor = (name: string, value: unknown): string | undefined => {
+    if (value === undefined) return undefined;
+
+    const color = typeof value === 'string' ? value.trim() : value;
+
+    if (typeof color !== 'string' || !AGENT_COLOR_PATTERN.test(color)) {
+        throw new HarnessError(
+            `Agent "${name}" has an invalid \`color\`: ${JSON.stringify(value)}. Use a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa).`
+        );
+    }
+
+    return color;
+};
+
 // Resolve the transport once, at construction. An explicit `stream` wins;
 // otherwise the provider block is wrapped in the built-in transport. Failing
 // here (rather than at the first prompt) means a misconfigured agent is caught
@@ -299,6 +335,12 @@ const createAgent = (
     if (!configuration.model) {
         throw new HarnessError('An agent requires a model.');
     }
+
+    // Identity color (R2) is validated with the other setup fields, before the
+    // transport is resolved, so a typo is a construction failure at the point of
+    // configuration rather than a broken swatch later. It is display-only: it
+    // never enters a request, a transcript, or a snapshot.
+    const color = requireAgentColor(configuration.name ?? 'agent', configuration.color);
 
     const transport = resolveStream(configuration);
     const instructions = normalizeInstructions(configuration.instruction);
@@ -752,7 +794,11 @@ const createAgent = (
                 model,
                 instruction: [...instructions],
                 stream: transport,
-                retry: retryPolicy
+                retry: retryPolicy,
+                // R2: the branch is the SAME identity as its source (same name, same
+                // instructions, same transport), so it carries the same swatch. A host
+                // that colored the source must not see a colorless child.
+                ...(self.color === undefined ? {} : { color: self.color })
             },
             materialized.messages
         );
@@ -786,6 +832,12 @@ const createAgent = (
 
         messages,
         instructions,
+
+        // Identity color (R2), present only when configured — see the `Agent.color`
+        // contract in ../types/index.ts. `self.color` is what the fork and thread
+        // factories below re-read, so a harness that rewrote `name` (the registry key
+        // rule, src/harness.ts) still hands the same swatch to every branch.
+        ...(color === undefined ? {} : { color }),
 
         model: ((value?: string) => {
             if (value === undefined) return model;
@@ -843,7 +895,10 @@ const createAgent = (
             stream: transport,
             // A thread is another conversation of the SAME brain, so it inherits the
             // retry policy (R1) rather than reverting to the default budget.
-            retry: retryPolicy
+            retry: retryPolicy,
+            // R2: and the same identity color, for the same reason — the UI paints one
+            // swatch per agent, and a thread is that agent's conversation, not a new agent.
+            ...(self.color === undefined ? {} : { color: self.color })
         })
     );
 

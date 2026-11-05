@@ -1406,7 +1406,15 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                               : { agent_models: entry.agent_models ?? entry.agentModels }),
                           ...(entry.agent_instructions === undefined && entry.agentInstructions === undefined
                               ? {}
-                              : { agent_instructions: entry.agent_instructions ?? entry.agentInstructions })
+                              : { agent_instructions: entry.agent_instructions ?? entry.agentInstructions }),
+                          // T4: the same passthrough rule for the identity-colour map
+                          // (`agent_colors`, ../shared/harness-api.ts:459). A real definition CARD omits that
+                          // field, so a fixture that states no colours is answered as a real card answers:
+                          // absent. A fixture that DOES state them models an unredacted server, and dropping
+                          // them would make the double deny the client a field its own source named.
+                          ...(entry.agent_colors === undefined && entry.agentColors === undefined
+                              ? {}
+                              : { agent_colors: entry.agent_colors ?? entry.agentColors })
                       }
                     : key === 'tools'
                       ? { ...entry, session_bound: entry.sessionBound ?? false }
@@ -1537,6 +1545,9 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             definition: Record<string, unknown>
         ): Promise<Record<string, unknown>> => {
             const models = definition.agent_models ?? definition.agentModels;
+            // T4: the per-agent identity colours, in either spelling (a fixture writes camelCase,
+            // the contract reads snake_case).
+            const colors = definition.agent_colors ?? definition.agentColors;
             const coreTools = definition.core_tools ?? definition.coreTools;
             const members = membersRaw(definition);
 
@@ -1553,6 +1564,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                 definition_revision: definition.definition_revision ?? definition.definitionRevision ?? 1,
                 ...(coreTools === undefined ? {} : { core_tools: coreTools }),
                 ...(models === undefined || typeof models !== 'object' ? {} : { agent_models: models }),
+                ...(colors === undefined || typeof colors !== 'object' ? {} : { agent_colors: colors }),
                 instruction_summary: await Promise.all(members.map((agent) => instructionRowOf(definition, agent)))
             };
         };
@@ -1591,8 +1603,10 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
                 if (legacy.agent_models !== undefined) legacy.agentModels = legacy.agent_models;
                 if (legacy.agent_instructions !== undefined) legacy.agentInstructions = legacy.agent_instructions;
+                if (legacy.agent_colors !== undefined) legacy.agentColors = legacy.agent_colors;
                 delete legacy.agent_models;
                 delete legacy.agent_instructions;
+                delete legacy.agent_colors;
 
                 const rawInit = context?.init ?? { method: 'PATCH' };
                 const response = await inner(`${root}/harnesses/${encodeURIComponent(name)}`, innerVerb, legacy, {
@@ -2341,7 +2355,13 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                     current: true,
                     ...(host?.discoveredTools === undefined ? {} : { discovered_tools: host.discoveredTools }),
                     ...(definition.agentModels === undefined ? {} : { agent_models: definition.agentModels }),
-                    ...(definition.agentInstructions === undefined ? {} : { agent_instructions: definition.agentInstructions })
+                    ...(definition.agentInstructions === undefined ? {} : { agent_instructions: definition.agentInstructions }),
+                    // T4: the identity-colour map rides the same re-expression. Without it a fixture that
+                    // colours its FROZEN definition would answer this route with the team but never the
+                    // colours, and a shell test could not tell that apart from a server that stored none.
+                    ...(definition.agentColors === undefined && definition.agent_colors === undefined
+                        ? {}
+                        : { agent_colors: definition.agent_colors ?? definition.agentColors })
                 }
             });
         }

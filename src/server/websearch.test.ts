@@ -307,7 +307,13 @@ describe('search catalogue', () => {
 
             expect(Object.keys((detail.tool.parameters as { properties: Record<string, unknown> }).properties)).toEqual([
                 'query',
-                'maxResults'
+                'maxResults',
+                'includeDomains',
+                'excludeDomains',
+                'since',
+                'until',
+                'category',
+                'speed'
             ]);
             // A configured entry has a real implementation, so the gate says it can run.
             expect(detail.tool.execution).toEqual({ scope: 'global', manual: true });

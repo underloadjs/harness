@@ -216,7 +216,7 @@ import { describeHarness } from './harnesses/descriptor';
 // added at runtime and a member a restart rebuilds cannot disagree about the prompt, the
 // model, or the provider transport. `effectiveAgentProfile`/`agentInstruction` are the two
 // halves of clearing an override back to the deployment's current text.
-import { agentConfigurationFromProfile } from './harnesses/toolbox';
+import { agentConfigurationForCustom, agentConfigurationFromProfile, customAgentInstruction } from './harnesses/toolbox';
 import { effectiveAgentProfile } from './harnesses/agent-state';
 import { agentInstruction, isAgentProfileName } from '../agents';
 import {
@@ -290,6 +290,22 @@ import { HarnessJournal } from './journal';
 import type { JournalEventRecord, JournalProblem } from './journal';
 
 const MAX_INPUT_LENGTH = 200_000;
+
+// R7: the name shape of a SESSION-DEFINED agent — one a conversation INVENTS instead of
+// selecting from the trusted catalogue (./harnesses/toolbox.ts `agentConfigurationForCustom`).
+// The name is simultaneously a delegation id, a runtime agent-registry key, a default-conversation
+// thread-id component (`agent:<name>`), and a key of the session's durable preset maps, so the
+// rule is deliberately conservative: an alphanumeric first character (which also keeps a name
+// like `__proto__` from landing on the PROTOTYPE of the runtime's plain-object agent map), then
+// letters, digits, space, `.`, `_` or `-`, at most 64 characters in total, and never a control
+// character. A catalogue profile id (`instruct`, `summarizer`, …) is lowercase-and-strict already,
+// so this pattern never widens what a PROFILE binding accepts.
+const CUSTOM_AGENT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/;
+
+// The one name a custom agent may never take: `unknown` (any case) is the placeholder the UI
+// paints for "no agent at all" (src/frontend/ui/agent-color.ts `UNNAMED_AGENT_PLACEHOLDER`), so
+// an agent literally named that would render as a lookup miss everywhere it appears.
+const CUSTOM_AGENT_RESERVED_NAME = 'unknown';
 
 // Maximum number of PENDING (queued, not yet started) tasks per session. The
 // active turn is not part of the queue, so a session can run one task with this
@@ -4587,10 +4603,26 @@ export class SessionStore {
     // rename would also silently change which profile the next build resolves. The store
     // therefore refuses the mismatch up front instead of creating a session that cannot load.
     //
+    // R7 EXCEPTION — A NAME THAT IS NOT A PROFILE AT ALL: the rule above is about a MISMATCH
+    // between two spellings, not about an invented identity. A roster key no profile describes
+    // (`localizer`, `ops-bot`, …) is now a SESSION-DEFINED agent: its base instruction is stored
+    // in `preset.customAgents`, `agentsFromProfiles` builds it from that entry instead of from a
+    // profile, and the same map makes the restart rebuild identical. An arbitrary name therefore
+    // survives a restart for exactly the same reason a profile binding does — the durable map
+    // states it — so the refusal stays reserved for the case that genuinely cannot resolve.
+    //
     // PROTECTED MEMBERS: the primary is never removable (it is the entry point, and
     // `harness.name`/`handle.agent` point at it), and `session.definition.primary` is never
     // replaced by a binding — promoting a member is a harness-definition edit
     // (`PATCH /harnesses/{name}`), not a session-scoped binding.
+    //
+    // R6 REMOVAL GUARD — A SAVED SESSION OWNS ITS HISTORY: an agent that still owns a host
+    // conversation is NOT detached (`removeSessionAgent` answers 409 naming the ids). Deleting a
+    // member used to delete those conversations behind the caller's back, which threw away
+    // transcripts the request never named; the user deletes the threads first and the roster
+    // second. `api-reads.sessionAgentRowsOf` reports the same predicate as the row's `deletable`
+    // flag, and ./harness.ts `removeAgent` states it a third time as the runtime's backstop, so
+    // no caller can strand a conversation from either side.
     //
     // WHY THE IDLE GATE IS TOTAL: these writes change structure the run loop reads (the
     // delegate allowlist, the per-request declaration list, the agent roster a snapshot
@@ -4666,10 +4698,18 @@ export class SessionStore {
     }
 
     // Rewrite the two metadata copies for one binding change. `removed` drops the member from
-    // the roster lists and from both override maps; `added` appends it (after the primary, so
-    // `[primary, ...subagents]` stays the documented derivation); `model`/`instruction` are the
-    // session-scoped overrides to record, or `undefined` to leave the map alone (`null` clears
-    // an existing entry).
+    // the roster lists and from BOTH override maps plus the session-defined agent map; `added`
+    // appends it (after the primary, so `[primary, ...subagents]` stays the documented
+    // derivation); `model`/`instruction` are the session-scoped overrides to record, or
+    // `undefined` to leave the map alone (`null` clears an existing entry).
+    //
+    // R7: `customInstruction` is the BASE text of a session-defined agent — the entry
+    // `agentsFromProfiles` rebuilds that member from (./harnesses/toolbox.ts). It is stated only
+    // when the member being ADDED is not a catalogue profile; a profile binding leaves it
+    // `undefined`, which keeps the map exactly as it was (so a bound profile member never
+    // appears in it, and a custom member's base survives a later instruction PATCH — the PATCH
+    // records the raw override in `agentInstructions`, and that map wins over the base by the
+    // documented precedence).
     private applyBindingMaps(
         session: Session,
         agent: string,
@@ -4678,6 +4718,7 @@ export class SessionStore {
             removed?: boolean;
             model?: string | null;
             instruction?: string | null;
+            customInstruction?: string;
         }
     ): void {
         const keep = (list: readonly string[]): string[] =>
@@ -4708,12 +4749,44 @@ export class SessionStore {
         const models = override(previous.agentModels, change.model);
         const instructions = override(previous.agentInstructions, change.instruction);
 
+        // R7: the session-defined agent map, rebuilt from the previous copy so an unrelated
+        // binding never drops another member's base text. `removed` deletes the key — that is
+        // what makes a detach final — and `customInstruction` is the only writer of a new entry.
+        const customs: Record<string, string> = { ...(previous.customAgents ?? {}) };
+
+        if (change.removed === true) delete customs[agent];
+
+        if (change.removed !== true && change.customInstruction !== undefined) {
+            customs[agent] = change.customInstruction;
+        }
+
+        // REBUILD, never inherit: the three override maps come ONLY from their computed values,
+        // so an emptied map actually leaves the preset instead of surviving as the previous copy
+        // through a `...previous` spread. Two real consequences of that stale-key hole, both in
+        // the durable half the contract promises:
+        //   - `PATCH …/instruction {instruction: null}` clears a session override, and a restart
+        //     must not silently re-apply it (the live brain says one thing, the record another);
+        //   - detaching a session-defined agent must take its stored base with it, so a restart
+        //     has nothing left to rebuild (R6/R7).
+        // Every other preset field is carried over unchanged, and the maps are re-written below
+        // exactly when they hold something.
+        const {
+            agentModels: _previousModels,
+            agentInstructions: _previousInstructions,
+            customAgents: _previousCustoms,
+            ...carried
+        } = previous;
+
         session.preset = {
-            ...previous,
+            ...carried,
             agents: withAgent(previous.agents),
             subagents: withAgent(previous.subagents),
             ...(Object.keys(models).length === 0 ? {} : { agentModels: models }),
-            ...(Object.keys(instructions).length === 0 ? {} : { agentInstructions: instructions })
+            ...(Object.keys(instructions).length === 0 ? {} : { agentInstructions: instructions }),
+            // Absent vs `{}` are the same statement ("this session defines no extra agent"), and
+            // the absent form is what keeps a pre-R7 document's preset byte-identical through a
+            // round trip (`presetToRecord` writes no field for an empty map).
+            ...(Object.keys(customs).length === 0 ? {} : { customAgents: customs })
         };
 
         const definition = session.definition;
@@ -4726,12 +4799,29 @@ export class SessionStore {
     }
 
     /**
-     * Bind a trusted profile into THIS session (`POST /sessions/{id}/agents`).
+     * Bind an agent into THIS session (`POST /sessions/{id}/agents`).
      *
      * Returns the roster binding id, the model it runs, and the instruction source the
      * contract reports, so the caller does not have to re-read the roster to answer 201.
      * A refusal mutates nothing: validation runs before the runtime call, and a failed
      * durable commit rewinds memory (see `rollbackBindingState`).
+     *
+     * R2: the composed configuration also inherits this definition's display color for the
+     * member, so a bound agent and the same agent rebuilt from the durable preset carry one
+     * swatch. Colors are definition metadata, not session state: the binding writes no new
+     * `agentColors` entry and the receipt keeps its exact pre-R2 shape.
+     *
+     * R7: the roster key decides which kind of member this is.
+     *   - it spells a trusted catalogue profile (`isAgentProfileName`) → the profile path,
+     *     unchanged, including the retired-profile 409 and the raw override recorded in
+     *     `agentInstructions`;
+     *   - anything else (a name this conversation invents) → a SESSION-DEFINED agent: its own
+     *     model plus its own instruction text, built by `agentConfigurationForCustom` with no
+     *     profile lookup and no guideline composition, and durable as a `preset.customAgents`
+     *     entry so `agentsFromProfiles` rebuilds the identical brain on the next start. The
+     *     roster is otherwise the same roster: the cap, the duplicate rule and the primary-role
+     *     refusal apply to both kinds, and a custom member is detachable exactly like a bound
+     *     profile member (R6 gates the removal on the conversations it owns).
      */
     async addSessionAgent(
         id: string,
@@ -4771,19 +4861,60 @@ export class SessionStore {
             );
         }
 
-        // Unknown profile id: the catalogue lists the known set, so a client can correct it.
-        if (!isAgentProfileName(name)) {
-            throw new SessionError(404, `Unknown agent profile "${name}".`);
-        }
+        // R7: two kinds of member, decided by whether the roster key spells a trusted profile.
+        // A profile id keeps the catalogue path byte-for-byte; anything else is a SESSION-DEFINED
+        // agent the caller invents here with its own model and instruction (it used to answer
+        // 404 `Unknown agent profile`, which is exactly what R7 replaced).
+        const isProfile = isAgentProfileName(name);
 
-        // A RETIRED profile is a deployment decision, not a bad request, and it is the exact
-        // 409 text `agentFromProfile` states for a new session that selects one: the profile is
-        // out of the selectable catalogue while existing sessions keep what they were built with.
-        if (effectiveAgentProfile(name) === undefined) {
-            throw new SessionError(
-                409,
-                `Agent "${name}" has been retired on this deployment, so it cannot be bound to a session. Existing sessions keep the agents they were built with.`
+        if (isProfile) {
+            // A RETIRED profile is a deployment decision, not a bad request, and it is the exact
+            // 409 text `agentFromProfile` states for a new session that selects one: the profile is
+            // out of the selectable catalogue while existing sessions keep what they were built with.
+            if (effectiveAgentProfile(name) === undefined) {
+                throw new SessionError(
+                    409,
+                    `Agent "${name}" has been retired on this deployment, so it cannot be bound to a session. Existing sessions keep the agents they were built with.`
+                );
+            }
+        } else {
+            // The custom name is validated BEFORE anything moves, because the same string becomes
+            // a delegation id, a runtime agent-registry key, a `agent:<name>` conversation id and
+            // a key of the session's durable preset maps in one step (see the module note on
+            // `CUSTOM_AGENT_NAME_PATTERN` for why the rule is this conservative).
+            if (!CUSTOM_AGENT_NAME_PATTERN.test(name)) {
+                throw new SessionError(
+                    400,
+                    `Agent "${name}" is not a trusted profile, so it would be a session-defined agent, and that name must start with a letter or digit and contain only letters, digits, spaces, ".", "_" or "-", at most 64 characters.`
+                );
+            }
+
+            // `unknown` (any case) is the placeholder a client paints for "no agent at all"
+            // (src/frontend/ui/agent-color.ts `UNNAMED_AGENT_PLACEHOLDER`), so a member literally
+            // named that would read back as a lookup miss on every surface that shows it.
+            if (name.toLowerCase() === CUSTOM_AGENT_RESERVED_NAME) {
+                throw new SessionError(
+                    400,
+                    `"${CUSTOM_AGENT_RESERVED_NAME}" is the placeholder id of an unknown agent, so it cannot name a session-defined agent.`
+                );
+            }
+
+            // Case-insensitive membership, which the exact-match duplicate check above cannot
+            // catch: the runtime's roster is a plain case-SENSITIVE object, so "Ops" next to
+            // "ops" would be two registry keys that every human reader (and every delegation
+            // sentence) treats as one agent. A profile member is caught here too — "Instruct" is
+            // not a profile id, and inventing a second entry point's near-twin would be a silent
+            // roster surprise rather than a new agent.
+            const clash = session.definition.agents.find(
+                (member) => member.toLowerCase() === name.toLowerCase()
             );
+
+            if (clash !== undefined) {
+                throw new SessionError(
+                    409,
+                    `Agent "${name}" differs only in case from the existing member "${clash}", so it cannot be added to session "${id}". A session roster is case-insensitive.`
+                );
+            }
         }
 
         const model = typeof input.model === 'string' && input.model.trim().length > 0
@@ -4810,10 +4941,45 @@ export class SessionStore {
             );
         }
 
+        // R7: the base instruction of a SESSION-DEFINED member — the caller's text, or the
+        // deterministic identity sentence when the caller named none. This one value is written
+        // three times over the agent's life (the live brain below, the durable
+        // `preset.customAgents` entry, and the text `agentsFromProfiles` rebuilds from that entry
+        // on the next start), so it is computed once here and passed to both halves.
+        // `customAgentInstruction` is the shared definition of that fallback
+        // (./harnesses/toolbox.ts), which is what makes the live and rebuilt prompts identical.
+        const baseInstruction = isProfile ? undefined : customAgentInstruction(name, instruction);
+
         // Composed from the trusted profile + this session's provider settings, i.e. the same
         // call the preset factory makes, so a bound member and a rebuilt member run byte-identical
         // prompts and the same transport.
-        const configuration = agentConfigurationFromProfile(profile, session.settings, model, instruction);
+        //
+        // R2: the 5th argument is the definition's own swatch for this member. The frozen preset
+        // map (./harnesses/types.ts `HarnessPreset.agentColors`) is what `agentsFromProfiles` feeds
+        // a rebuilt session, and what `describeHarness` projects onto the definition read, so a
+        // member bound at runtime must read the same map or the UI would paint one agent two
+        // different colors across a restart. Absent entry means "unconfigured": the composer
+        // omits the key and the client applies its own derivation, exactly as before.
+        //
+        // A session-defined member takes the sibling composer instead: same trusted transport, no
+        // profile lookup, no guidelines, and the instruction is the base text verbatim. Both
+        // builders receive the SAME swatch lookup, so a custom member is painted by the definition
+        // exactly like a profile one.
+        const configuration = isProfile
+            ? agentConfigurationFromProfile(
+                  profile,
+                  session.settings,
+                  model,
+                  instruction,
+                  session.preset.agentColors?.[name]
+              )
+            : agentConfigurationForCustom(
+                  name,
+                  session.settings,
+                  model,
+                  baseInstruction,
+                  session.preset.agentColors?.[name]
+              );
 
         const previous = this.captureBindingState(session);
 
@@ -4825,7 +4991,16 @@ export class SessionStore {
             throw new SessionError(409, messageOf(error));
         }
 
-        this.applyBindingMaps(session, name, { added: true, model, instruction: instruction ?? null });
+        // R7: a profile member records its RAW text override (or `null` for none) in
+        // `agentInstructions`, exactly as before. A custom member records NO override — the text
+        // it runs is its own BASE, durable in `customAgents` — which is also why the roster read
+        // reports `instruction_source: 'session'` for it rather than `'harness'`.
+        this.applyBindingMaps(session, name, {
+            added: true,
+            model,
+            instruction: isProfile ? (instruction ?? null) : null,
+            customInstruction: baseInstruction
+        });
         session.sessionAgents = [...previous.sessionAgents, name];
         session.updatedAt = Date.now();
 
@@ -4847,10 +5022,18 @@ export class SessionStore {
     /**
      * Detach one member of THIS session (`DELETE /sessions/{id}/agents/{agent_id}`).
      *
-     * `detachedThreads` is the number of host conversations owned by that member that went with
-     * it — the receipt the contract's `DeleteSessionAgentResult` states. History already written
-     * by the member is never rewritten: a delegated answer copied into another transcript stays,
-     * and every OTHER member's transcript is untouched.
+     * R6: an agent that still owns a conversation is NOT removed — the call answers 409 naming
+     * the member, how many conversations it owns, which ids they are, and the remedy (delete
+     * those threads first). Removing an agent used to delete its host conversations as a silent
+     * side effect, which threw away transcripts the caller never named; a saved session owns its
+     * history, so the user decides what goes.
+     *
+     * `detachedThreads` is therefore 0 on every accepted removal, and it stays in the receipt
+     * because the contract declares `detached_threads` (its schema description now states the
+     * guard). History already written by the member is never rewritten either way: a delegated
+     * answer copied into another transcript stays, and every OTHER member's transcript is
+     * untouched. The member's own DEFAULT conversation (`agent:<name>`) is not part of the guard:
+     * it is the agent's transcript, and the runtime removes it together with the agent.
      */
     async removeSessionAgent(
         id: string,
@@ -4873,33 +5056,37 @@ export class SessionStore {
             );
         }
 
+        // R6: the ownership gate. `origin === 'host'` is the whole distinction — a host thread is
+        // an independent conversation `harness.createThread` opened (and what the thread routes
+        // and the transcript editor address), while an `agent`-origin record is the member's
+        // implicit default conversation that belongs to it by definition. Only the first blocks,
+        // and NOTHING is deleted by a refusal: the roster, the threads, and the durable document
+        // all stay exactly as they were.
+        const owned = session.harness
+            .threads()
+            .filter((thread) => thread.origin === 'host' && thread.agent === agent);
+
+        if (owned.length > 0) {
+            throw new SessionError(
+                409,
+                `Agent "${agent}" still owns ${owned.length} conversation${owned.length === 1 ? '' : 's'} in session "${id}": ${owned.map((thread) => `"${thread.id}"`).join(', ')}. Delete those threads before removing the agent.`
+            );
+        }
+
         const previous = this.captureBindingState(session);
 
-        // Host threads owned by this member are detached first, through the runtime's own
-        // terminal-only rule. Every one is terminal here because the idle gate proved nothing is
-        // running, so a refusal below means an owned child of a run that has not settled — and
-        // then NOTHING has been removed yet.
-        const owned = session.harness.threads().filter((thread) => thread.agent === agent);
-
-        let detachedThreads = 0;
-
         try {
-            for (const thread of owned) {
-                session.harness.deleteThread(thread.id);
-                detachedThreads += 1;
-            }
-
+            // The runtime states the same host-thread rule as its own backstop (./harness.ts
+            // `removeAgent`), so a roster that moved between the gate above and this call still
+            // cannot strand a conversation. A refusal here means nothing was removed, so there is
+            // nothing to rewind: `previous` is only for the durable commit below.
             session.harness.removeAgent(agent);
         } catch (error) {
-            if (detachedThreads === 0) throw new SessionError(409, messageOf(error));
-
-            // Threads went and the roster did not: rewind the whole harness from the snapshot
-            // taken before this call, so a refusal cannot half-apply.
-            this.rollbackBindingState(session, previous);
-
             throw new SessionError(409, messageOf(error));
         }
 
+        // R7: `removed` also deletes this agent's `customAgents` entry, so detaching a
+        // session-defined member is final — a restart does not rebuild a brain nobody detached.
         this.applyBindingMaps(session, agent, { removed: true });
         session.sessionAgents = previous.sessionAgents.filter((entry) => entry !== agent);
         session.updatedAt = Date.now();
@@ -4908,21 +5095,17 @@ export class SessionStore {
             session.core = session.harness.snapshot();
             await this.persistOrThrow();
         } catch (error) {
+            // The document was never replaced, so a failed commit rewinds memory (roster lists,
+            // both override maps, the custom-agent map, and the harness) back to `previous`.
             this.rollbackBindingState(session, previous);
 
             throw error;
         }
 
-        // The invocation→thread joins of the detached conversations go with them, or a later
-        // deletion would try to purge agent results that this removal already dropped.
-        for (const thread of owned) {
-            const invocation = thread.invocationId;
-
-            if (invocation !== undefined) session.invocationThreads.delete(invocation);
-            if (thread.id !== undefined) session.lanes.delete(thread.id);
-        }
-
-        return { session: this.snapshot(session), detachedThreads };
+        // R6: no conversation goes with an accepted removal any more, so the receipt states zero
+        // detached threads; the invocation→thread joins and lane entries of the surviving
+        // conversations are untouched (they are only purged by `deleteThread`).
+        return { session: this.snapshot(session), detachedThreads: 0 };
     }
 
     /**
@@ -4934,6 +5117,12 @@ export class SessionStore {
      * catalogue second). Either way ONLY the leading system block changes — the member's
      * committed turns, and every other member's transcript, are untouched, and the change is
      * what a later `reset()` returns to, because the runtime also reseeds the agent's baseline.
+     *
+     * R7: for a SESSION-DEFINED member the same write applies to its own base text: `null`
+     * restores the instruction this session created the agent with (no profile, no guidelines),
+     * and a string overrides it while the base stays durable in `preset.customAgents`. The
+     * retired-profile 409 below is a catalogue rule only — a custom agent has no profile to
+     * retire.
      */
     async setSessionAgentInstruction(
         id: string,
@@ -4950,6 +5139,16 @@ export class SessionStore {
             throw new SessionError(404, `Agent "${agent}" is not a member of session "${id}".`);
         }
 
+        // R7: is this a SESSION-DEFINED member? A custom agent has no `AgentProfile` at all, so
+        // the whole catalogue ladder below (effective profile, retirement, guideline composition)
+        // is not about it: the text it runs is the base its author gave it
+        // (`preset.customAgents[name]`), or the session override layered on that base. `null`
+        // therefore restores the BASE, not a profile — which is the only honest undo for an agent
+        // this conversation invented.
+        const custom = Object.prototype.hasOwnProperty.call(session.preset.customAgents ?? {}, agent)
+            ? session.preset.customAgents![agent]
+            : undefined;
+
         // What the member runs after this call, and what the durable override records. They are
         // deliberately NOT the same string: the contract's `instruction` field is the
         // IDENTITY-SENTENCE override, while the agent's system message is the composed prompt
@@ -4957,9 +5156,9 @@ export class SessionStore {
         // that joins them (src/agents/index.ts:113), and it is the same call `agentFromProfile`
         // makes when a restart rebuilds this member — so composing here is what keeps the live
         // text and the restored text byte-identical instead of trading one guideline for a 500.
-        const profile = effectiveAgentProfile(agent);
+        const profile = custom === undefined ? effectiveAgentProfile(agent) : undefined;
 
-        if (profile === undefined) {
+        if (custom === undefined && profile === undefined) {
             // A retired profile has no current text to restore or compose against. The member
             // still runs the text it was seeded with, so the refusal must not pretend the
             // override is gone.
@@ -4983,7 +5182,9 @@ export class SessionStore {
             if (override.length === 0) {
                 throw new SessionError(
                     400,
-                    'An agent instruction must not be blank. Send null to restore the inherited profile text.'
+                    custom === undefined
+                        ? 'An agent instruction must not be blank. Send null to restore the inherited profile text.'
+                        : 'An agent instruction must not be blank. Send null to restore the instruction this session-created agent was given.'
                 );
             }
 
@@ -4998,7 +5199,16 @@ export class SessionStore {
         // `null` clears the session override, which means "run the deployment's current
         // effective profile text" — the global agent layer first, the shipped catalogue second
         // (`effectiveAgentProfile`), never the stale text this session happened to start with.
-        const liveText = agentInstruction(profile, override ?? undefined);
+        //
+        // R7: a session-defined member has no deployment text to fall back to, so `null` restores
+        // the BASE this conversation created it with. `customAgentInstruction` is the same helper
+        // `addSessionAgent` used to mint that base and the same one `agentsFromProfiles` uses to
+        // rebuild it (./harnesses/toolbox.ts), so the live prompt, the durable record, and the
+        // next start are one string — and no guideline block is invented for an agent that has no
+        // trusted profile to supply one.
+        const liveText = custom === undefined
+            ? agentInstruction(profile!, override ?? undefined)
+            : customAgentInstruction(agent, override ?? custom);
 
         const previous = this.captureBindingState(session);
 
@@ -5012,6 +5222,11 @@ export class SessionStore {
         // what `presetFromRecord` feeds back into `agentFromProfile` on the next build. Storing
         // the composed text here instead would bake today's guidelines into the record and make
         // a later guideline edit unreachable for this member.
+        //
+        // R7: a session-defined member takes the same route through the sibling branch of
+        // `agentsFromProfiles` — `agentInstructions[name] ?? customAgents[name]` — so the raw
+        // override recorded here is exactly what the rebuilt brain is seeded with, and clearing it
+        // (`null`) returns the rebuild to the stored base.
         this.applyBindingMaps(session, agent, { instruction: override });
 
         session.updatedAt = Date.now();

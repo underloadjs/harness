@@ -85,6 +85,38 @@ export type HarnessPreset = {
     // is validated, persisted on the registry entry, projected onto the descriptor,
     // and consumed by `agentInstruction()` when the agent is built.
     agentInstructions?: Readonly<Record<string, string>>;
+    // Per-agent identity COLORS (R2): agent id → CSS hex color (`#rgb`, `#rgba`,
+    // `#rrggbb`, `#rrggbbaa`, either case). Same replace/key-membership rules as
+    // `agentModels`, and the same capture rule: the factory closure holds the map, so
+    // a later PATCH cannot recolor what an existing session was built with.
+    //
+    // This one is DISPLAY-ONLY rather than prompt-shaping: nothing in the runtime or
+    // the transport reads it, and it never reaches a model request. It exists so the
+    // UI paints one stable, operator-chosen swatch per agent instead of hashing the
+    // agent's name, and it is projected onto `HarnessDescriptor.agentColors` (and
+    // therefore onto the contract's `agent_colors`) for exactly that. A member absent
+    // from the map is uncolored here, which is the host's cue to fall back to its own
+    // derivation; the value is validated against the hex shape at both the registry
+    // edge and `agent()` construction, so a stored color is always paintable.
+    agentColors?: Readonly<Record<string, string>>;
+    // SESSION-DEFINED agents (R7): agent id → the BASE instruction that agent runs. Absent /
+    // empty means "this template declares no custom agent", which is every harness DEFINITION
+    // and every session saved before R7.
+    //
+    // This map is SESSION state, not definition state: only a session's own frozen preset copy
+    // ever carries it (`SessionStore.addSessionAgent` writes it through `applyBindingMaps`, and
+    // `HarnessRegistration`/`HarnessPatch` deliberately expose no field for it, so
+    // `POST`/`PATCH /harnesses` can never declare one). A member named here is NOT a catalogue
+    // profile: it has no `AgentProfile`, no guidelines, and no global override layer, so the
+    // text stored here IS the whole system prompt. `agentsFromProfiles` reads this map FIRST —
+    // a name listed here is built by `agentConfigurationForCustom` instead of
+    // `agentConfigurationFromProfile`, which is what makes a session-scoped custom agent
+    // rebuild byte-identically after a restart (see ./toolbox.ts and ./registry.ts
+    // `presetFromRecord`).
+    //
+    // The same capture rule as the three maps above holds: the factory closure holds it, so a
+    // later registry PATCH cannot add or drop one of an existing conversation's agents.
+    customAgents?: Readonly<Record<string, string>>;
     // Shipped with the application (`true`) or registered by a client through
     // POST /harnesses (`false`). Informational provenance only: both are editable
     // application entries, and the registry never uses this to gate a mutation.

@@ -11,7 +11,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { agent, HarnessError } from '@underload/harness';
-import type { AgentStreamEvent, HarnessStream, HarnessStreamEvent } from '@underload/harness';
+import type {
+    AgentStreamEvent,
+    HarnessStream,
+    HarnessStreamEvent,
+    HarnessStreamRequest
+} from '@underload/harness';
 
 // A transport that replays a fixed event list. `onRequest` lets a test assert
 // what the agent actually sent.
@@ -391,5 +396,133 @@ describe('agent', () => {
                 provider: { baseURL: 'http://localhost:5500/providers/private/v1' }
             })
         ).not.toThrow();
+    });
+});
+
+// Identity color (R2) — the optional display swatch configured with the agent.
+//
+// Pinned contract (mirrored at the server edge in
+// src/server/harnesses/registry.test.ts `per-agent identity colors`, which feeds the
+// SAME accepted/rejected sample set through `registry.create()` so the two hex
+// spellings cannot drift):
+//   - a hex color is stored TRIMMED, with the author's casing, on `Agent.color`;
+//   - the accepted shape is `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`, either case, and
+//     nothing else — a named color, a functional color, a 5/9-digit hex, a bare hex,
+//     blank text, and a non-string are all `HarnessError`s naming the agent;
+//   - an uncolored agent carries NO `color` key at all (never `color: undefined`), so a
+//     host can test `agent.color !== undefined` and fall back to its own derivation;
+//   - the value is display-only: it never reaches the transport request, and it
+//     survives reset() and a model switch, because it belongs to the identity chosen at
+//     setup rather than to the conversation.
+describe('agent identity color', () => {
+    // Records exactly what the transport was called with, so the test can prove the
+    // color is absent from the wire payload rather than trusting the type.
+    const recordingStream = (seen: HarnessStreamRequest[]): HarnessStream =>
+        async function* stream(request) {
+            seen.push(request);
+            yield { type: 'text', delta: 'ok' };
+            yield done();
+        };
+
+    // The one construction path every case below shares: padded on purpose, because
+    // what is stored must be the TRIMMED author value, not a re-normalised one.
+    const colorOf = (color: string): string | undefined =>
+        agent({ name: 'writer', model: 'm', stream: transport, color }).color;
+
+    const refusal = (value: unknown, name = 'writer'): string => {
+        try {
+            agent({ name, model: 'm', stream: transport, color: value as never });
+        } catch (error) {
+            expect(error).toBeInstanceOf(HarnessError);
+
+            return (error as Error).message;
+        }
+
+        // Reaching this line is the failure: a value the contract rejects was accepted.
+        throw new Error(`expected ${JSON.stringify(value)} to be rejected`);
+    };
+
+    it('stores every accepted hex shape, trimmed, with its casing intact', () => {
+        expect(
+            ['  #abc  ', ' #abcd ', '  #aabbcc ', '#AABBCCDD  ', ' #ABC ', '\t#4ade80\n'].map(colorOf)
+        ).toEqual(['#abc', '#abcd', '#aabbcc', '#AABBCCDD', '#ABC', '#4ade80']);
+    });
+
+    it('carries no color key when none is configured', () => {
+        const brain = agent({ name: 'writer', model: 'm', stream: transport });
+
+        expect(Object.hasOwn(brain, 'color')).toBe(false);
+        expect(brain.color).toBeUndefined();
+    });
+
+    it('rejects anything that is not a CSS hex color, naming the agent', () => {
+        const use = (value: unknown): string =>
+            `Agent "writer" has an invalid \`color\`: ${JSON.stringify(value)}. Use a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa).`;
+
+        expect(refusal('red')).toBe(use('red'));
+        expect(refusal('rgb(74, 222, 128)')).toBe(use('rgb(74, 222, 128)'));
+        // Length is part of the shape: 5 and 9 digits are neither 3/4 nor 6/8.
+        expect(refusal('#abcde')).toBe(use('#abcde'));
+        expect(refusal('#aabbccdde')).toBe(use('#aabbccdde'));
+        // The `#` sigil is required, and so are hex digits only.
+        expect(refusal('aabbcc')).toBe(use('aabbcc'));
+        expect(refusal('#gggggg')).toBe(use('#gggggg'));
+        // Blank text is a visible mistake rather than "absent": clearing means omitting
+        // the key, so a pasted space cannot silently drop a configured swatch.
+        expect(refusal('')).toBe(use(''));
+        expect(refusal('   ')).toBe(use('   '));
+        // A non-string is refused with the value rendered, so the message names what the
+        // caller actually sent (a number is JSON-rendered bare, not quoted).
+        expect(refusal(7)).toBe('Agent "writer" has an invalid `color`: 7. Use a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa).');
+        // A standalone agent with no configured name keeps the same default label the
+        // missing-transport refusal uses.
+        expect(refusal('navy', 'agent')).toBe(
+            'Agent "agent" has an invalid `color`: "navy". Use a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa).'
+        );
+    });
+
+    it('never sends the color to the transport', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const brain = agent({
+            name: 'writer',
+            model: 'm',
+            instruction: 'You are a writer.',
+            color: '#4ade80',
+            stream: recordingStream(seen)
+        });
+
+        await collect(brain.stream('go'));
+
+        expect(seen).toHaveLength(1);
+        // The exact request the transport receives: identity metadata is not part of it.
+        expect(seen[0].model).toBe('m');
+        expect(seen[0].messages).toEqual([
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(Object.hasOwn(seen[0], 'color')).toBe(false);
+    });
+
+    it('keeps the color through reset() and a model switch', () => {        const brain = agent({
+            name: 'writer',
+            model: 'm',
+            instruction: 'You are a writer.',
+            color: '#4ade80',
+            stream: transport
+        });
+
+        brain.user('hello');
+        brain.model('other-model');
+
+        // The swatch is identity, not conversation or transport state: neither a model
+        // switch nor a reset touches it. (`reset()` restores the seeded transcript; the
+        // model accessor keeps whatever the caller last set, which is the pre-existing
+        // contract pinned by the other tests in this file.)
+        expect(brain.color).toBe('#4ade80');
+
+        brain.reset();
+
+        expect(brain.color).toBe('#4ade80');
+        expect(brain.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
     });
 });

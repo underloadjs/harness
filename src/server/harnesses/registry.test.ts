@@ -16,6 +16,7 @@
 // No provider and no network: constructing a preset never calls the transport.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { agent } from '../../harness';
 import type { HarnessProgress } from '../../harness';
 import type { HarnessPreset } from './types';
 import type { HarnessRegistry } from './registry';
@@ -24,7 +25,8 @@ import {
     isLegacyShippedDefinition,
     presetFromRecord,
     presetRecordEquals,
-    presetToRecord
+    presetToRecord,
+    restoreHarnessRegistry
 } from './registry';
 import { describeHarness } from './descriptor';
 import {
@@ -1365,5 +1367,492 @@ describe('an injected registry', () => {
         const created = registry.create({ name: 'fresh', primary: 'instruct' });
         expect(registry.list().map((entry) => entry.name)).toEqual(['scripted', 'fresh']);
         expect(created.create).not.toBe(scripted.create);
+    });
+});
+
+// Per-agent identity colors (R2) — the display-only sibling of `agentModels` and
+// `agentInstructions`.
+//
+// The contract, deliberately the same shape as the two maps above:
+//   - a map of selected agent id → CSS hex color is validated against the FINAL member
+//     set (an entry for an unselected agent could never be painted, so it is a 400 that
+//     names the agent rather than a stored no-op);
+//   - a stated map on PATCH REPLACES the stored one, `{}` clears every color, and a key
+//     for a member the same patch removed is dropped;
+//   - the map is captured by the factory closure, so an existing session keeps the
+//     swatches its agents were built with while the next session gets the new ones;
+//   - `describeHarness` emits it only when non-empty, and the durable record reads and
+//     replays it exactly like `agentModels`;
+//   - and the thing that makes it DIFFERENT from the other two: nothing it touches
+//     changes what an agent runs, which the instruction/model assertions below pin.
+describe('per-agent identity colors', () => {
+    // One table, three layers. The library pattern (src/core/agent.ts
+    // `AGENT_COLOR_PATTERN`), the registry pattern (registry.ts, same file) and the HTTP
+    // contract (`harness.swagger.yaml` `agent_colors.pattern`) must agree on exactly this
+    // set, or a stored color could be one a UI cannot paint.
+    const HEX_ACCEPTED = ['#abc', '#abcd', '#aabbcc', '#aabbccdd', '#ABC', '#4ADE80'];
+    const HEX_REJECTED = [
+        'red',
+        'rgb(74, 222, 128)',
+        '#',
+        '#ab',
+        '#abcde',
+        '#aabbccdde',
+        'aabbcc',
+        '#gggggg',
+        '#ff_000',
+        '',
+        '   '
+    ];
+
+    // The registry's refusal for one value: blank text and a malformed shape are stated
+    // differently on purpose (clearing is omitting the key, never storing an empty value).
+    const registryRefusal = (color: string): string =>
+        color.trim().length === 0
+            ? '`agentColors.instruct` cannot be empty. Omit the key to leave this agent uncolored.'
+            : `\`agentColors.instruct\` must be a CSS hex color (#rgb, #rgba, #rrggbb or #rrggbbaa). Received ${JSON.stringify(color)}.`;
+
+    it('colors that agent only, leaves the rest uncolored, and changes nothing about the prompt', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'painted',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentColors: { summarizer: '#4ade80' }
+        });
+
+        expect(preset.agentColors).toEqual({ summarizer: '#4ade80' });
+
+        const harness = preset.create(SETTINGS, progress);
+        // The colored member carries its swatch on the AGENT (R1: stable identity
+        // metadata, not only on the card), and the member the map omits carries NO key.
+        expect(harness.agents.summarizer.color).toBe('#4ade80');
+        expect(Object.hasOwn(harness.agents.research, 'color')).toBe(false);
+
+        // Display-only, proven: the same team with no colors at all runs byte-identical
+        // prompts and the same models. A color is not a prompt override.
+        const bare = registry.create({
+            name: 'unpainted',
+            primary: 'research',
+            subagents: ['summarizer']
+        }).create(SETTINGS, progress);
+
+        expect(harness.agents.summarizer.instructions).toEqual(bare.agents.summarizer.instructions);
+        expect(harness.agents.summarizer.model()).toBe(bare.agents.summarizer.model());
+        expect(harness.agents.research.model()).toBe('test-model');
+    });
+
+    it('accepts an override for the primary and trims the value', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'trimmed',
+            primary: 'instruct',
+            agentColors: { instruct: '  #4ADE80  ' }
+        });
+
+        expect(preset.agentColors).toEqual({ instruct: '#4ADE80' });
+        // The stored casing survives all the way to the agent the next session builds.
+        expect(preset.create(SETTINGS, progress).agents.instruct.color).toBe('#4ADE80');
+    });
+
+    it('validates the map shape, its keys, and its values', () => {
+        const registry = createHarnessRegistry();
+
+        // Not a plain object.
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', primary: 'instruct', agentColors: [] as never })
+            )
+        ).toEqual({
+            status: 400,
+            message: '`agentColors` must be an object mapping agent ids to CSS hex colors.'
+        });
+
+        // A key that is not a final member: a swatch for an agent this harness does not
+        // contain could never be painted.
+        expect(
+            registryError(() =>
+                registry.create({
+                    name: 'x',
+                    primary: 'instruct',
+                    agentColors: { summarizer: '#4ade80' }
+                })
+            )
+        ).toEqual({
+            status: 400,
+            message:
+                '`agentColors` names "summarizer", which is not a member of this harness. Members: instruct.'
+        });
+
+        // Values: a non-string, a blank string, and every malformed hex shape are 400s
+        // naming the agent, so the UI can point at the offending swatch.
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', primary: 'instruct', agentColors: { instruct: 7 as never } })
+            )
+        ).toEqual({
+            status: 400,
+            message: '`agentColors.instruct` must be a CSS hex color string.'
+        });
+
+        for (const color of HEX_REJECTED) {
+            expect(
+                registryError(() =>
+                    registry.create({ name: 'x', primary: 'instruct', agentColors: { instruct: color } })
+                )
+            ).toEqual({ status: 400, message: registryRefusal(color) });
+        }
+    });
+
+    it('accepts and rejects the same hex set as agent() construction', () => {
+        const registry = createHarnessRegistry();
+        const provider = { baseURL: 'http://provider.test/v1' };
+
+        expect(
+            HEX_ACCEPTED.map((color) => [
+                // Registry edge: stored verbatim (trimmed), and reported back.
+                registry.create({
+                    name: `both-ok-${HEX_ACCEPTED.indexOf(color)}`,
+                    primary: 'instruct',
+                    agentColors: { instruct: color }
+                }).agentColors,
+                // Library edge: the same value reaches the agent.
+                agent({ name: 'writer', model: 'm', provider, color }).color
+            ])
+        ).toEqual(HEX_ACCEPTED.map((color) => [{ instruct: color }, color]));
+
+        // Every value the registry refuses with a 400 is also a construction error in the
+        // library, so a document written by an older server can never hold a color the
+        // runtime would reject.
+        for (const color of HEX_REJECTED) {
+            expect(() => agent({ name: 'writer', model: 'm', provider, color })).toThrow(
+                `Agent "writer" has an invalid \`color\`: ${JSON.stringify(color)}.`
+            );
+        }
+    });
+
+    it('replaces the map on update, drops removed members, and clears on {}', () => {
+        const registry = createHarnessRegistry();
+        registry.create({
+            name: 'painted',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentColors: { research: '#4ade80', summarizer: '#f97316' }
+        });
+
+        // A stated map REPLACES: the member it omits is uncolored again.
+        const replaced = registry.update('painted', { agentColors: { summarizer: '#22d3ee' } });
+        expect(replaced.agentColors).toEqual({ summarizer: '#22d3ee' });
+
+        const rebuilt = replaced.create(SETTINGS, progress);
+        expect(rebuilt.agents.summarizer.color).toBe('#22d3ee');
+        expect(Object.hasOwn(rebuilt.agents.research, 'color')).toBe(false);
+
+        // Narrowing the team drops the swatch of the agent that left, so a later re-add
+        // cannot silently resurrect an old color.
+        const narrowed = registry.update('painted', { subagents: [] });
+        expect(narrowed.agentColors).toEqual({});
+
+        // An explicit empty map clears every color, and the rebuilt agents carry none.
+        registry.update('painted', { subagents: ['summarizer'], agentColors: { summarizer: '#22d3ee' } });
+        expect(registry.update('painted', { agentColors: {} }).agentColors).toEqual({});
+        expect(
+            Object.hasOwn(registry.find('painted')!.create(SETTINGS, progress).agents.summarizer, 'color')
+        ).toBe(false);
+    });
+
+    it('treats a color edit as executable and keeps a captured factory frozen', () => {
+        const registry = createHarnessRegistry();
+        const before = registry.create({
+            name: 'painted',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentColors: { summarizer: '#4ade80' }
+        });
+
+        // An existing session holds THIS preset object; recoloring the registry entry
+        // produces a NEW one, so the frozen copy still builds the old swatch.
+        registry.update('painted', { agentColors: { summarizer: '#f97316' } });
+
+        const after = registry.find('painted')!;
+        expect(after).not.toBe(before);
+        expect(before.agentColors).toEqual({ summarizer: '#4ade80' });
+        expect(after.agentColors).toEqual({ summarizer: '#f97316' });
+        expect(before.create(SETTINGS, progress).agents.summarizer.color).toBe('#4ade80');
+        expect(after.create(SETTINGS, progress).agents.summarizer.color).toBe('#f97316');
+
+        // A color patch is EXECUTABLE: it rebuilds the factory, so the next session's
+        // agents carry it. A metadata-only patch (title alone) keeps the captured closure.
+        const metadataOnly = registry.update('painted', { title: 'Renamed' });
+        expect(metadataOnly.create).toBe(after.create);
+        expect(metadataOnly.agentColors).toEqual({ summarizer: '#f97316' });
+    });
+
+    it('upgrades a scripted template the same way an instruction edit does', () => {
+        const registry = fixtureRegistry();
+        const recolored = registry.update('demo', { agentColors: { demo: '#4ade80' } });
+
+        // The rule is the T3 instruction rule, restated for colors: a patch that changes
+        // what the factory captures cannot keep the offline script.
+        expect(recolored.template).toBe('live');
+        expect(recolored.requiresEndpoint).toBe(true);
+        expect(recolored.tools).toEqual([...SHARED_TOOL_NAMES]);
+        expect(recolored.create(SETTINGS, progress).agents.demo.color).toBe('#4ade80');
+    });
+
+    it('projects the map onto the descriptor only when the harness colors something', () => {
+        const registry = createHarnessRegistry();
+
+        // An untouched built-in carries no key at all, so every existing card keeps its
+        // exact pre-R2 shape.
+        expect(describeHarness(registry.find('instruct')!).agentColors).toBeUndefined();
+
+        const colored = registry.create({
+            name: 'carded',
+            primary: 'instruct',
+            agentColors: { instruct: '#4ade80' }
+        });
+        expect(describeHarness(colored).agentColors).toEqual({ instruct: '#4ade80' });
+
+        // Clearing every color removes the field from the card again.
+        expect(
+            describeHarness(registry.update('carded', { agentColors: {} })).agentColors
+        ).toBeUndefined();
+
+        // The descriptor copy is not the preset's own object: a caller holding a card
+        // cannot repaint the registry entry through it.
+        const card = describeHarness(colored);
+        card.agentColors!.instruct = '#000000';
+        expect(colored.agentColors).toEqual({ instruct: '#4ade80' });
+    });
+
+    it('round-trips through a durable record and replays it on restore', () => {
+        const registry = createHarnessRegistry();
+        const created = registry.create({
+            name: 'saved',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentColors: { research: '#4ade80', summarizer: '#f97316' }
+        });
+
+        const record = presetToRecord(created);
+        expect(record.agentColors).toEqual({ research: '#4ade80', summarizer: '#f97316' });
+
+        // Rebuilding a preset from the record reproduces both the metadata and the
+        // colored agents, and the record of the rebuilt entry compares equal — which is
+        // what lets a restore skip an unmodified row.
+        const rebuilt = presetFromRecord(record);
+        expect(rebuilt.agentColors).toEqual({ research: '#4ade80', summarizer: '#f97316' });
+        expect(rebuilt.create(SETTINGS, progress).agents.research.color).toBe('#4ade80');
+        expect(presetRecordEquals(presetToRecord(rebuilt), record)).toBe(true);
+
+        // A harness with no colors writes NO field, so a document saved before R2 keeps
+        // its exact old byte shape (and a record without the field stays equal to itself).
+        const bare = presetToRecord(registry.create({ name: 'bare', primary: 'research' }));
+        expect(Object.hasOwn(bare, 'agentColors')).toBe(false);
+        expect(presetRecordEquals(bare, bare)).toBe(true);
+        expect(presetFromRecord({ ...bare, agentColors: undefined }).agentColors).toBeUndefined();
+
+        // Restore replays the row through `update()`, so the colors reach the rebuilt
+        // factory rather than being dropped as prose.
+        const replay = createHarnessRegistry();
+        restoreHarnessRegistry(replay, [record]);
+        expect(replay.find('saved')!.agentColors).toEqual({ research: '#4ade80', summarizer: '#f97316' });
+        expect(replay.find('saved')!.create(SETTINGS, progress).agents.summarizer.color).toBe('#f97316');
+    });
+
+    it('counts a saved color as a customisation of a built-in', () => {
+        // The shipped-default refresh replays PROSE only, so a row that carries a color
+        // must not be treated as an unmodified shipped default — the operator's swatch
+        // would otherwise vanish on the next restart.
+        const registry = createHarnessRegistry();
+        const record = presetToRecord(
+            registry.create({ name: 'colored', primary: 'research', subagents: ['summarizer'] })
+        );
+
+        // Same shape adjustment the instruction test above makes: the record is from THIS
+        // build, so `environmentTools` is pinned to the legacy row's value and the color
+        // map is the only variable under test.
+        const asShippedRow = {
+            ...record,
+            name: 'research',
+            environmentTools: [...(LEGACY_PRESET_DEFINITIONS.research.environmentTools ?? [])]
+        };
+
+        expect(
+            isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
+                ...asShippedRow,
+                agentColors: {}
+            })
+        ).toBe(true);
+
+        expect(
+            isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
+                ...asShippedRow,
+                agentColors: { research: '#4ade80' }
+            })
+        ).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R7: SESSION-DEFINED agents in the durable preset record.
+//
+// A harness DEFINITION never declares a custom agent — `HarnessRegistration`/`HarnessPatch` have
+// no field for it — so the only writer of `customAgents` is a session's own frozen preset copy
+// (./sessions.ts `applyBindingMaps`). The pieces a restore routes through must therefore hold
+// here:
+//   - `presetToRecord` writes the field ONLY when the map has an entry, so every document saved
+//     before R7 (and every harness definition) keeps its exact old byte shape, and
+//     `presetRecordEquals` does not treat an absent map as different from an empty one;
+//   - `presetFromRecord` hands the map to the factory, so the rebuilt harness really CREATES the
+//     invented brain (`agentsFromProfiles` → `agentConfigurationForCustom`: the stored base
+//     verbatim, no profile lookup, no guidelines) while the catalogue members beside it keep
+//     their trusted composed prompts;
+//   - a saved custom roster is a CUSTOMISATION of a built-in row (the shipped-default refresh
+//     replays prose only, so it must not silently drop the member), and an injected factory that
+//     cannot build the invented member is REFUSED rather than restored with the agent missing.
+// ---------------------------------------------------------------------------
+describe('session-defined agents in the durable preset record (R7)', () => {
+    const CUSTOM = 'localizer';
+    const CUSTOM_BASE = 'You rewrite copy for the target market.';
+
+    it('round-trips the custom agent map and rebuilds the invented agent from it', () => {
+        const registry = createHarnessRegistry();
+        const created = registry.create({
+            name: 'owned',
+            primary: 'research',
+            subagents: ['summarizer']
+        });
+
+        // The shape a SESSION writes: the invented name joins `agents`/`subagents`, its model
+        // joins `agentModels`, and its base text joins the new `customAgents` map.
+        const withCustom: HarnessPreset = {
+            ...created,
+            subagents: [...created.subagents, CUSTOM],
+            agents: [...created.agents, CUSTOM],
+            agentModels: { ...created.agentModels, [CUSTOM]: 'small/fast' },
+            agentColors: { ...created.agentColors, [CUSTOM]: '#22d3ee' },
+            customAgents: { [CUSTOM]: CUSTOM_BASE }
+        };
+
+        const record = presetToRecord(withCustom);
+
+        expect(record.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+        expect(record.agentModels).toEqual({ [CUSTOM]: 'small/fast' });
+        expect(record.agents).toEqual(['research', 'summarizer', CUSTOM]);
+
+        const rebuilt = presetFromRecord(record);
+
+        expect(rebuilt.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
+        expect(rebuilt.agents).toEqual(['research', 'summarizer', CUSTOM]);
+
+        const harness = rebuilt.create(SETTINGS, progress);
+
+        // All three members exist, including the one no profile describes.
+        expect(Object.keys(harness.agents).sort()).toEqual(
+            ['research', 'summarizer', CUSTOM].sort()
+        );
+        // THE point: the invented brain is built from its own stored text VERBATIM (no guideline
+        // block, because there is no trusted profile to supply one) on its own model, and the
+        // R2 swatch travels with it exactly like a catalogue member's.
+        expect(harness.agents[CUSTOM].instructions).toEqual([CUSTOM_BASE]);
+        expect(harness.agents[CUSTOM].model()).toBe('small/fast');
+        expect(harness.agents[CUSTOM].color).toBe('#22d3ee');
+        // A catalogue member beside it is untouched by the new branch: still the trusted prompt.
+        expect(harness.agents.research.instructions).toEqual([
+            agentInstruction(AGENT_PROFILES.research)
+        ]);
+        expect(harness.agents.summarizer.instructions).toEqual([
+            agentInstruction(AGENT_PROFILES.summarizer)
+        ]);
+
+        // The record of the rebuilt entry compares equal, which is what lets a restore skip an
+        // unmodified row (`./sessions.ts` `restoreSession` uses the same comparison to decide
+        // whether the frozen record or the live registry entry builds the harness).
+        expect(presetRecordEquals(presetToRecord(rebuilt), record)).toBe(true);
+    });
+
+    it('writes no field without custom agents and keeps a pre-R7 record equal', () => {
+        const registry = createHarnessRegistry();
+        const bare = presetToRecord(registry.create({ name: 'plain', primary: 'research' }));
+
+        // Absent, not `{}`: a document saved before R7 (or a harness definition) keeps its exact
+        // old byte shape, so a later reader cannot invent a roster member.
+        expect(Object.hasOwn(bare, 'customAgents')).toBe(false);
+        expect(presetRecordEquals(bare, bare)).toBe(true);
+        expect(presetFromRecord({ ...bare, customAgents: undefined }).customAgents).toBeUndefined();
+        expect(
+            Object.keys(presetFromRecord(bare).create(SETTINGS, progress).agents)
+        ).toEqual(['research']);
+
+        // Absent and empty are the same statement, so they compare equal to each other...
+        expect(presetRecordEquals(bare, { ...bare, customAgents: {} })).toBe(true);
+
+        // ...while a record that names an invented agent is a DIFFERENT roster. This is the
+        // comparison that routes a saved session with custom agents through `presetFromRecord`
+        // instead of the unchanged registry entry.
+        expect(presetRecordEquals(bare, { ...bare, customAgents: { [CUSTOM]: CUSTOM_BASE } })).toBe(
+            false
+        );
+    });
+
+    it('counts a saved custom agent as a customisation of a built-in', () => {
+        // The shipped-default refresh replays PROSE only, so a row carrying a custom roster must
+        // not be mistaken for an unmodified shipped default — the invented member would vanish on
+        // the next restart while its sessions still name it.
+        const registry = createHarnessRegistry();
+        const record = presetToRecord(
+            registry.create({ name: 'invented', primary: 'research', subagents: ['summarizer'] })
+        );
+        const asShippedRow = {
+            ...record,
+            name: 'research',
+            environmentTools: [...(LEGACY_PRESET_DEFINITIONS.research.environmentTools ?? [])]
+        };
+
+        expect(
+            isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
+                ...asShippedRow,
+                customAgents: {}
+            })
+        ).toBe(true);
+
+        expect(
+            isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
+                ...asShippedRow,
+                customAgents: { [CUSTOM]: CUSTOM_BASE }
+            })
+        ).toBe(false);
+    });
+
+    it('refuses an injected factory that cannot build the saved custom agent', () => {
+        // An injected preset (no `template`) rebuilds only from a factory the caller hands back,
+        // so a saved roster naming an agent that factory has no way to create is an ERROR, not a
+        // session that silently loses a member. (`assertDurableRoster` in ./api.ts is why a real
+        // session never gets here: a template-less binding is refused with 409 up front.)
+        const injected: HarnessPreset = {
+            name: 'injected',
+            title: 'Injected',
+            description: 'A host-supplied factory with no template hint.',
+            requiresEndpoint: false,
+            primary: 'instruct',
+            subagents: [],
+            agents: ['instruct'],
+            tools: [],
+            builtin: false,
+            editable: true,
+            create: () => {
+                throw new Error('never built in this case');
+            }
+        };
+
+        const record = presetToRecord(injected);
+
+        expect(presetFromRecord(record, injected).name).toBe('injected');
+
+        expect(() =>
+            presetFromRecord({ ...record, customAgents: { [CUSTOM]: CUSTOM_BASE } }, injected)
+        ).toThrow('changed incompatibly');
     });
 });

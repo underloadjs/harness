@@ -258,7 +258,16 @@ describe('execution', () => {
         // A single configured provider is not a choice: no `provider` argument is
         // offered, so the model cannot spend a turn naming the only legal value.
         const properties = (writer.tools.search.parameters as { properties: Record<string, unknown> }).properties;
-        expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+        expect(Object.keys(properties)).toEqual([
+            'query',
+            'maxResults',
+            'includeDomains',
+            'excludeDomains',
+            'since',
+            'until',
+            'category',
+            'speed'
+        ]);
 
         await writer('search the web');
 

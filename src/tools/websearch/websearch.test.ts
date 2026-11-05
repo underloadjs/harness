@@ -68,9 +68,20 @@ describe('key resolution', () => {
         expect(exa.visibility).toBe('core');
         expect(exa.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
 
-        // No provider property at all: one legal value is not a choice.
+        // No provider property at all: one legal value is not a choice. The
+        // provider filters ARE offered — they are not provider-specific arguments,
+        // they are the scoping every adapter maps onto its own wire fields.
         const properties = (exa.parameters as { properties: Record<string, unknown> }).properties;
-        expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+        expect(Object.keys(properties)).toEqual([
+            'query',
+            'maxResults',
+            'includeDomains',
+            'excludeDomains',
+            'since',
+            'until',
+            'category',
+            'speed'
+        ]);
         expect(exa.description).toContain('Exa');
         expect(exa.description).not.toContain('Tavily');
     });
@@ -89,7 +100,16 @@ describe('key resolution', () => {
         // One configured provider is not a choice, so the schema carries no
         // `provider` property at all.
         const properties = (linkup.parameters as { properties: Record<string, unknown> }).properties;
-        expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+        expect(Object.keys(properties)).toEqual([
+            'query',
+            'maxResults',
+            'includeDomains',
+            'excludeDomains',
+            'since',
+            'until',
+            'category',
+            'speed'
+        ]);
 
         // The description names only the provider this harness can call.
         expect(linkup.description).toContain('Search the web with Linkup');
@@ -885,12 +905,123 @@ describe('failures', () => {
 
         await vi.advanceTimersByTimeAsync(SEARCH_TIMEOUT_MS);
 
-        expect(failure).resolves.toMatchObject({
+        // Awaited, not fire-and-forget: an unawaited `.resolves` assertion is only
+        // passing because vitest auto-awaits hanging assertions today, and it fails
+        // outright on the next major.
+        await expect(failure).resolves.toMatchObject({
             message: `Exa search timed out after ${SEARCH_TIMEOUT_MS} ms.`
         });
-        await failure;
 
         // The finally block cleared the controller's timer.
         expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+// The filters are the reason a search tool is cheaper than a search plus a
+// post-filter in the model's context, so both halves are pinned: what goes on
+// the wire, and what comes back to the caller.
+describe('provider filters', () => {
+    const rows = json({
+        results: [{ title: 'A', url: 'https://example.com/a', highlights: ['one'] }]
+    });
+
+    it('sends the domain, date and category filters Exa documents', async () => {
+        const fetchMock = stubFetch(rows);
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        await tool({
+            query: 'q',
+            includeDomains: ['https://docs.example.com/', 'A.com'],
+            excludeDomains: ['forum.example'],
+            since: '2026-01-01',
+            until: '2026-06-30',
+            category: 'News'
+        });
+
+        const body = JSON.parse(String(fetchMock.mock.calls[0][1].body)) as Record<string, unknown>;
+
+        // Normalized: scheme stripped, trailing slash dropped, case folded.
+        expect(body.includeDomains).toEqual(['docs.example.com', 'a.com']);
+        expect(body.excludeDomains).toEqual(['forum.example']);
+        expect(body.startPublishedDate).toBe('2026-01-01');
+        expect(body.endPublishedDate).toBe('2026-06-30');
+        expect(body.category).toBe('news');
+        // Balanced is the default and keeps Exa's own mode.
+        expect(body.type).toBe('auto');
+    });
+
+    it('sends no filter keys at all when none were asked for', async () => {
+        // An absent key and an empty array are different requests to a provider,
+        // so the adapter must omit rather than send blanks.
+        const fetchMock = stubFetch(rows);
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        await tool({ query: 'q' });
+
+        const body = JSON.parse(String(fetchMock.mock.calls[0][1].body)) as Record<string, unknown>;
+
+        expect(Object.keys(body)).toEqual(['query', 'type', 'numResults', 'contents']);
+    });
+
+    it('maps speed to Exa lite mode', async () => {
+        const fetchMock = stubFetch(rows);
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        const result = await tool({ query: 'q', speed: 'fast' });
+
+        const body = JSON.parse(String(fetchMock.mock.calls[0][1].body)) as Record<string, unknown>;
+        expect(body.type).toBe('lite');
+        // The applied filter is echoed so an empty result set is interpretable.
+        expect(result.speed).toBe('fast');
+    });
+
+    it('maps the filters onto Tavily field names', async () => {
+        const fetchMock = stubFetch(
+            json({ results: [{ title: 'A', url: 'https://example.com/a', content: 'one' }] })
+        );
+        const tool = configured({ TAVILY_API_KEY: 'tavily-secret-key' });
+
+        await tool({ query: 'q', includeDomains: ['example.com'], since: '2026-01-01' });
+
+        const body = JSON.parse(String(fetchMock.mock.calls[0][1].body)) as Record<string, unknown>;
+
+        expect(body.include_domains).toEqual(['example.com']);
+        expect(body.start_date).toBe('2026-01-01');
+        expect(body.includeDomains).toBeUndefined();
+    });
+
+    it('rejects a malformed filter before paying for the request', async () => {
+        // A 400 from the provider would arrive as an opaque "Exa search failed";
+        // validating here names the argument instead.
+        let requests = 0;
+
+        stubFetch(async () => {
+            requests += 1;
+
+            return rows;
+        });
+
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        await expect(tool({ query: 'q', since: 'last tuesday' })).rejects.toThrow(/ISO-8601 date/);
+        await expect(tool({ query: 'q', since: '2026-06-01', until: '2026-01-01' })).rejects.toThrow(
+            /must not be earlier than/
+        );
+        await expect(tool({ query: 'q', includeDomains: [] })).rejects.toThrow(/array of 1-20 domains/);
+        await expect(tool({ query: 'q', speed: 'turbo' })).rejects.toThrow(/"balanced" or "fast"/);
+        expect(requests).toBe(0);
+    });
+
+    it('echoes the applied filters in the result', async () => {
+        stubFetch(rows);
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        const result = await tool({ query: 'q', includeDomains: ['example.com'], category: 'news' });
+
+        expect(result.includeDomains).toEqual(['example.com']);
+        expect(result.category).toBe('news');
+        // Filters that were not used stay absent, so the result does not grow.
+        expect(result.since).toBeUndefined();
+        expect(result.speed).toBeUndefined();
     });
 });

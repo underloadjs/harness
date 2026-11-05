@@ -367,9 +367,9 @@ paths:
       operationId: createHarness
       summary: Create a harness definition
       description: >-
-        Selection-only body: a client picks trusted agent names and may record per-agent model ids and
-        instruction overrides. It cannot supply a provider, a credential, a transport, or a tool list -
-        those are deployment-owned. The registry validates every member name against the trusted agent
+        Selection-only body: a client picks trusted agent names and may record per-agent model ids,
+        instruction overrides, and display colors. It cannot supply a provider, a credential, a transport, or a
+        tool list - those are deployment-owned. The registry validates every member name against the trusted agent
         catalogue and every override key against the resulting member set, so 400 (unknown member) and
         404 (unknown profile) are both possible before anything is written. A new definition is the
         inheritance source for sessions created AFTER it; no existing session changes.
@@ -391,6 +391,8 @@ paths:
                     researcher: merge/ds4-flash
                   agent_instructions:
                     editor: Tighten prose. Never restructure headings.
+                  agent_colors:
+                    editor: '#f97316'
       responses:
         '201':
           description: Created definition.
@@ -412,9 +414,9 @@ paths:
       operationId: getHarness
       summary: Read one harness definition
       description: >-
-        The identified read: the card plus `agent_models`, the resolved `core_tools` the definition's
-        runs will actually declare (which is runtime visibility, including `search` only when a provider
-        key exists), and `instruction_summary` - one entry per member stating whether an override
+        The identified read: the card plus `agent_models`, the per-agent `agent_colors` display map, and the
+        resolved `core_tools` the definition's runs will actually declare (runtime visibility, including
+        `search` only when a provider key exists), plus `instruction_summary` - one entry per member stating whether an override
         exists and how long it is, WITHOUT the text. Instruction text is a separate, explicitly named
         subresource, because a definition that embeds every member's system prompt is the single largest
         payload class this API removes.
@@ -432,9 +434,9 @@ paths:
       operationId: updateHarness
       summary: Change a harness definition
       description: >-
-        `harness_name` is immutable; an omitted field keeps its current value. `agent_models` and
-        `agent_instructions` REPLACE the map they name: `{}` clears it, every key must name a member of
-        the resulting definition (400 otherwise), and an override for a member the same patch removes is
+        `harness_name` is immutable; an omitted field keeps its current value. `agent_models`,
+        `agent_instructions` and `agent_colors` REPLACE the map they name: `{}` clears it, every key must name a
+        member of the resulting definition (400 otherwise), and an override for a member the same patch removes is
         dropped rather than rejected. Changing `primary` without `subagents` removes the new primary from
         the old allowlist. A PATCH produces a new immutable registry entry under the same name and
         raises its `revision`; the definition an existing session captured does not move.
@@ -949,12 +951,13 @@ paths:
       summary: Read the harness definition this session froze
       description: >-
         The definition captured at creation - the authority for this session's member set, delegation
-        allowlist, declared and core tools, and per-agent overrides - plus `source_revision`: the
-        `definition_revision` of the registry entry at capture time, which lets a client state "this
-        session runs an older copy" without fetching that copy. Instruction TEXT is omitted, exactly as
-        on a global definition read; `instruction_summary` gives per-member provenance and length, and
-        the effective text for a member of THIS session is the session agent instruction route, which
-        also accounts for session-level overrides. A later global edit cannot move this resource.
+        allowlist, declared and core tools, and per-agent overrides (`agent_models`, `agent_colors`,
+        `agent_instructions`) - plus `source_revision`: the `definition_revision` of the registry entry at
+        capture time, which lets a client state "this session runs an older copy" without fetching that copy.
+        Instruction TEXT is omitted, exactly as on a global definition read; `instruction_summary` gives
+        per-member provenance and length, and the effective text for a member of THIS session is the session
+        agent instruction route, which also accounts for session-level overrides. A later global edit cannot
+        move this resource.
       responses:
         '200':
           description: Frozen definition.
@@ -1270,19 +1273,22 @@ paths:
       operationId: createSessionAgent
       summary: Bind a trusted profile into this session
       description: >-
-        Creates a SESSION-LOCAL binding of an existing trusted profile, so `profile` must name a live
-        global agent (404 otherwise). A client selects and re-instructs a profile; it cannot supply an
-        implementation, a transport, a tool list, or a provider, which is why no route in this contract
-        can inject agent code. `model` must be a non-empty model id and `instruction` bounded non-empty
-        text; both are overrides recorded on the session and never on the profile. The binding exists in
-        this session only - the global catalogue and every other session are untouched - and it must not
-        collide with an existing roster key (409), because a session's agent keys are its delegation and
-        identity namespace. A 65th binding is 409 against the 64-binding roster budget. `role: subagent`
-        adds the binding to the primary's delegation allowlist for this session only; `role: primary`
-        re-targets the entry agent of subsequent unfocused submits and is refused with 409 while the
-        session is running. The new agent is immediately addressable by a task that names its thread. The
-        frozen definition is not rewritten: `origin: session` is what distinguishes a local binding from
-        an inherited member.
+        Creates a SESSION-LOCAL agent. When `name` spells a trusted profile the call binds that profile, so
+        `profile` must name a live global agent and a retired one is 409; when `name` is NOT a catalogue
+        profile the call defines a NEW agent for this conversation alone, whose instruction is the `instruction`
+        supplied here (a default identity sentence when it is omitted) and whose model is `model` (the session
+        model when absent). Either way a client cannot supply an implementation, a transport, a tool list, or a
+        provider, which is why no route in this contract can inject agent code. `model` must be a non-empty model
+        id and `instruction` bounded non-empty text; both are recorded on the session and never on the profile,
+        and a session-defined agent is durable in the session record so a restart rebuilds it unchanged. The
+        agent exists in this session only - the global catalogue and every other session are untouched - and it
+        must not collide with an existing roster key (409, including a case-only difference), because a session's
+        agent keys are its delegation and identity namespace. A 65th member is 409 against the 64-binding roster
+        budget. `role: subagent` adds the binding to the primary's delegation allowlist for this session only;
+        `role: primary` re-targets the entry agent of subsequent unfocused submits and is refused with 409 while
+        the session is running. The new agent is immediately addressable by a task that names its thread. The
+        frozen definition is not rewritten: `origin: session` is what distinguishes a local agent from an
+        inherited member.
       requestBody:
         required: true
         content:
@@ -1296,6 +1302,14 @@ paths:
                   name: editor
                   profile: editor
                   instruction: You tighten prose. Never restructure headings.
+                  role: subagent
+              session-defined:
+                summary: Define an agent this conversation owns, on its own model and instruction
+                value:
+                  name: localizer
+                  profile: localizer
+                  model: merge/ds4-flash
+                  instruction: You rewrite copy for the target market. Keep every product name verbatim.
                   role: subagent
       responses:
         '201':
@@ -1379,16 +1393,19 @@ paths:
       operationId: deleteSessionAgent
       summary: Remove one session agent binding
       description: >-
-        Precisely what it removes. For a session-created binding (`origin: session`) it removes the agent
-        from THIS session's roster: its default conversation is detached, it can no longer be targeted or
-        delegated to, and its transcript stops growing. Already-recorded turns keep the agent name they ran
+        Precisely what it removes. For a session-created agent (`origin: session`) it removes the agent
+        from THIS session's roster: its default conversation goes with it, it can no longer be targeted or
+        delegated to, and for a session-defined agent its stored instruction goes with it, so a restart does
+        not resurrect it. Already-recorded turns keep the agent name they ran
         with, because turn records are verbatim history and a delete must not rewrite them. For an
         inherited member (`origin: definition`) DELETE is 400 stating the alternative: clearing every
         session override with a `null` patch restores the inherited binding exactly, and an inherited
         member cannot be removed because its member set is frozen with the session and its delegation
         allowlist would become unresolvable. Nothing global changes in either case. A conversation still
         running or queued answers 409, matching thread deletion, so an agent cannot be pulled out from
-        under its own run.
+        under its own run. And an agent that OWNS a conversation answers 409 naming those conversation ids:
+        a removal never deletes a thread the caller did not name, so delete the conversations first (the
+        roster row's `deletable` flag states the same condition).
       responses:
         '200':
           description: Removal receipt.
@@ -1414,7 +1431,10 @@ paths:
         The instruction text this agent actually runs with, plus its guidelines and the `source` that
         supplied the text: `session`, `harness`, `global`, or `catalogue`, resolved in that order. This
         is the session-scoped answer, so it already accounts for a session override - unlike the global
-        definition's instruction route. It is the lazy surface behind a "show prompt" affordance: the
+        definition's instruction route. A session-defined agent (a name this conversation created that no
+        catalogue profile describes) answers `source: session` with an EMPTY `guidelines` list, because it
+        has no trusted profile to supply any; clearing its override with `PATCH …/agents/{id}` restores the
+        instruction this session created it with. It is the lazy surface behind a "show prompt" affordance: the
         roster and the session read never carry this text. A recorded conversation's actual system messages
         are a different thing and are served by the turn block detail route of kind `system`.
       responses:
@@ -2922,7 +2942,7 @@ components:
             unknown-field:
               value:
                 error:
-                  message: 'Unknown field "instructions". Allowed fields: name, title, description, primary, subagents, agent_models, agent_instructions.'
+                  message: 'Unknown field "instructions". Allowed fields: name, title, description, primary, subagents, agent_models, agent_instructions, agent_colors.'
             stale-cursor:
               value:
                 error:
@@ -3479,8 +3499,9 @@ components:
       description: >-
         One member's instruction PROVENANCE AND LENGTH with no text, so a definition read stays constant-size
         however long the prompts are. `source` names the layer that supplies the text the member runs:
-        `harness` (this definition overrides), `global` (a profile override), or `catalogue` (the trusted
-        profile). The text is one named subresource away.
+        `harness` (this definition overrides), `global` (a profile override), `catalogue` (the trusted
+        profile), or `session` (an agent THIS session defined, which no profile describes - a value only a
+        session definition read can state). The text is one named subresource away.
       required: [agent, source, overridden, chars]
       additionalProperties: false
       properties:
@@ -3488,10 +3509,12 @@ components:
           type: string
         source:
           type: string
-          enum: [catalogue, global, harness]
+          enum: [catalogue, global, harness, session]
         overridden:
           type: boolean
-          description: True when this definition itself carries an override for the member.
+          description: >-
+            True when this definition itself carries an override for the member; on a session read, true when
+            the session re-wrote a session-defined agent's own base text.
         chars:
           type: integer
           minimum: 0
@@ -3499,8 +3522,8 @@ components:
     HarnessDefinition:
       type: object
       description: >-
-        The identified read of one definition: a card plus the per-agent model overrides, the resolved
-        core-tool set, and the instruction summary.
+        The identified read of one definition: a card plus the per-agent model overrides, the per-agent
+        display colors, the resolved core-tool set, and the instruction summary.
       allOf:
         - $ref: '#/components/schemas/HarnessCard'
         - type: object
@@ -3522,6 +3545,17 @@ components:
                 record; the live map a session runs now is on the session resource.
               additionalProperties:
                 type: string
+            agent_colors:
+              type: object
+              description: >-
+                Per-agent display COLORS (agent name to CSS hex color), present only when this definition
+                configures at least one. A member absent from the map has no configured color, and the client
+                applies its own derivation for it. Display-only: it never shapes a prompt or a request, and the
+                value is the one stored on the agent the definition builds, so a swatch here and a swatch in a
+                session are the same bytes.
+              additionalProperties:
+                type: string
+                pattern: '^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$'
             instruction_summary:
               type: array
               description: One row per member, in `[primary, ...subagents]` order. No text.
@@ -3530,9 +3564,9 @@ components:
     CreateHarnessRequest:
       type: object
       description: >-
-        Selection-only body. A client picks trusted agent names and may record per-agent model ids and
-        instruction overrides; it cannot supply a provider, a credential, a transport, or a tool list. Every
-        override key must name a member of the resulting definition.
+        Selection-only body. A client picks trusted agent names and may record per-agent model ids,
+        instruction overrides, and display colors; it cannot supply a provider, a credential, a transport, or
+        a tool list. Every override key must name a member of the resulting definition.
       required: [name, primary]
       additionalProperties: false
       properties:
@@ -3566,11 +3600,21 @@ components:
           additionalProperties:
             type: string
             maxLength: 200000
+        agent_colors:
+          type: object
+          description: >-
+            Agent name to an optional per-agent display COLOR: a CSS hex color (`#rgb`, `#rgba`, `#rrggbb` or
+            `#rrggbbaa`, either case). Purely cosmetic - it changes what a client paints, never what the agent
+            runs - but it is validated like every other field, so a stored color is always one the agent accepts
+            and a client can render.
+          additionalProperties:
+            type: string
+            pattern: '^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$'
     UpdateHarnessRequest:
       type: object
       description: >-
-        An omitted field keeps its current value; the name is immutable. `agent_models` and
-        `agent_instructions` REPLACE the map they name (`{}` clears it), and an override for a member this
+        An omitted field keeps its current value; the name is immutable. `agent_models`, `agent_instructions`
+        and `agent_colors` REPLACE the map they name (`{}` clears it), and an override for a member this
         patch removes is dropped rather than rejected. Changing `primary` without `subagents` removes the new
         primary from the old allowlist.
       minProperties: 1
@@ -3599,6 +3643,14 @@ components:
           additionalProperties:
             type: string
             maxLength: 200000
+        agent_colors:
+          type: object
+          description: >-
+            Agent name to CSS hex color. `{}` clears every color, so every member falls back to the client's
+            own derivation.
+          additionalProperties:
+            type: string
+            pattern: '^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$'
     HarnessCardPage:
       description: Page of definition cards.
       allOf:
@@ -4281,8 +4333,10 @@ components:
       type: object
       description: >-
         The harness definition this session captured at creation, which is the authority for its member set,
-        delegation allowlist, declared and core tools, and per-agent overrides. A saved session restores from
-        this record, so a later global edit cannot move it.
+        delegation allowlist, declared and core tools, and per-agent overrides - including the per-agent
+        `agent_colors` display map it inherits from `HarnessDefinition`, present only when the captured copy
+        configured at least one color. A saved session restores from this record, so a later global edit
+        cannot move it, and the swatches a client paints for this conversation come from here.
       allOf:
         - $ref: '#/components/schemas/HarnessDefinition'
         - type: object
@@ -4405,7 +4459,9 @@ components:
           description: The session roster key, which is also the delegation and identity namespace name.
         profile:
           type: string
-          description: The trusted catalogue profile this binding resolves to. A session agent is always a BINDING of a profile, never an uploaded implementation.
+          description: >-
+            The catalogue profile this binding resolves to, which for a session-defined agent is its own name:
+            a name that is not in the trusted catalogue was created by THIS session and has no profile behind it.
         role:
           type: string
           enum: [primary, subagent]
@@ -4415,7 +4471,7 @@ components:
           enum: [definition, session]
           description: >-
             `definition` means inherited from the frozen definition (not removable, overrides restorable);
-            `session` means created through this API (removable).
+            `session` means created through this API (removable while no conversation uses it).
         model:
           type: string
           description: The model this agent runs NOW, after any session override.
@@ -4425,7 +4481,10 @@ components:
         instruction_source:
           type: string
           enum: [catalogue, global, harness, session]
-          description: Provenance of the effective text, so a client states where it came from instead of guessing.
+          description: >-
+            Provenance of the effective text, so a client states where it came from instead of guessing.
+            `session` names the one case with no profile at all: a session-defined agent, whose text this
+            conversation wrote (`harness`/`global`/`catalogue` are the layers a profile member can inherit).
         instruction_chars:
           type: integer
           minimum: 0
@@ -4442,7 +4501,10 @@ components:
           description: False only when the deployment froze session writes.
         deletable:
           type: boolean
-          description: True only for a binding whose `origin` is `session`, because an inherited member set is frozen with the session.
+          description: >-
+            False for the entry agent (every session needs one) and for a member that still owns a conversation,
+            because removing it would take that history with it; `DELETE …/agents/{id}` answers 409 on exactly
+            this condition. True for every other binding this conversation may detach.
         restorable:
           type: boolean
           description: >-
@@ -4491,8 +4553,15 @@ components:
     CreateSessionAgentRequest:
       type: object
       description: >-
-        Binds an existing trusted profile into this session. No implementation, tool list, or transport is
-        accepted, so nothing here can inject code.
+        Adds one member to THIS session. No implementation, tool list, or transport is accepted, so nothing here
+        can inject code. Two kinds of member, decided by `name`: when it spells a trusted catalogue profile the
+        call BINDS that profile (its own instruction and guidelines, with `model`/`instruction` as this session's
+        overrides); when it is not a catalogue profile the call CREATES A SESSION-DEFINED AGENT - an agent this
+        conversation owns, whose prompt is exactly the `instruction` supplied here (a default identity sentence
+        when none is supplied), whose model is `model` (the session model when absent), and which has no profile
+        and no guideline layer. Both kinds are durable in the session record and are rebuilt with the same model
+        and instruction when the server restarts, and both are removable again with `DELETE` while no conversation
+        uses them.
       required: [name, profile]
       additionalProperties: false
       properties:
@@ -4500,10 +4569,16 @@ components:
           type: string
           pattern: '^[a-z][a-z0-9_-]*$'
           maxLength: 64
-          description: The session roster key. Must not collide with an existing member (409).
+          description: >-
+            The session roster key. Must not collide with an existing member (409), including case-insensitively
+            (409) and including the `unknown` placeholder (400). A key that is not a catalogue profile name
+            declares a session-defined agent.
         profile:
           type: string
-          description: Must name a live global agent profile (404 otherwise).
+          description: >-
+            Must equal `name` (400 otherwise): the roster key is the identity a restart rebuilds. A name that
+            spells a catalogue profile binds that profile, and a retired profile is refused with 409; any other
+            name is a session-defined agent.
         model:
           type: string
           maxLength: 256
@@ -4511,7 +4586,11 @@ components:
         instruction:
           type: string
           maxLength: 200000
-          description: Optional non-empty override text. Never mutates the profile it overrides.
+          description: >-
+            Optional non-empty text. For a catalogue profile it overrides ONLY the identity sentence, never the
+            profile's guidelines, and `null`/omitted runs the trusted text; for a session-defined agent it IS the
+            agent's whole instruction (the session stores a default identity sentence when it is omitted). Never
+            mutates the profile it overrides.
         role:
           type: string
           enum: [primary, subagent]
@@ -4541,7 +4620,9 @@ components:
       type: object
       description: >-
         Receipt of a roster removal. It states what was detached rather than echoing the roster, because the
-        roster is one bounded read away and a client that removed a binding needs the roster anyway.
+        roster is one bounded read away and a client that removed a binding needs the roster anyway. A member
+        that still owns a conversation is NOT removed: the call answers 409 naming those conversation ids, and
+        the roster keeps the member (its `deletable` row flag and the roster read state the same condition).
       required: [deleted, agent_id, session_id, detached_threads, revision]
       additionalProperties: false
       properties:
@@ -4555,7 +4636,10 @@ components:
         detached_threads:
           type: integer
           minimum: 0
-          description: Conversations that belonged to this binding and stopped growing.
+          description: >-
+            Always 0 on an accepted removal: removing an agent never deletes the conversations it owns, which is
+            why a removal that would own one is refused with 409 instead. The field stays for clients that read
+            the receipt.
         revision:
           type: integer
           minimum: 0

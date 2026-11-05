@@ -1180,9 +1180,9 @@ export const submitTask = (id: string, submit: SubmitTaskInput): Promise<TaskRec
 // A definition card/definition as the rail and the configuration dialog render it.
 // The contract spells these rows snake_case and splits "card" from "identified
 // read"; the panes want ONE shape with camelCase conveniences, and they must not
-// crash on the fields the card omits (`agent_models`, `agent_instructions` and the
-// resolved core-tool set exist only on the identified read). Absent stays absent —
-// `contract.ts` already reads each of these defensively.
+// crash on the fields the card omits (`agent_models`, `agent_instructions`,
+// `agent_colors` and the resolved core-tool set exist only on the identified read).
+// Absent stays absent — `contract.ts` already reads each of these defensively.
 export type HarnessCardView = {
     name: string;
     title: string;
@@ -1196,6 +1196,10 @@ export type HarnessCardView = {
     definitionRevision: number;
     agentModels?: Record<string, string>;
     agentInstructions?: Record<string, string>;
+    // T4/R2: the per-agent identity COLORS this definition configures (`agent_colors`).
+    // Absent (not empty) when nothing is configured, exactly like the two maps above, so a
+    // `HarnessCard` row that never carries the field maps to a row that omits it.
+    agentColors?: Record<string, string>;
     coreTools?: string[];
     instructionSummary?: HarnessInstructionSummaryEntry[];
 };
@@ -1214,6 +1218,13 @@ export const descriptorOf = (card: HarnessCard | HarnessDefinition): HarnessCard
     ...('agent_models' in card && card.agent_models !== undefined ? { agentModels: { ...card.agent_models } } : {}),
     ...('agent_instructions' in card && card.agent_instructions !== undefined
         ? { agentInstructions: { ...card.agent_instructions } }
+        : {}),
+    // T4/R2: `agent_colors` -> `agentColors` (the contract's snake_case spelling of the same
+    // optional map, ../shared/harness-api.ts:459). A CARD never states it (the identified
+    // read is the only publisher), so the `in` guard above is what keeps an omitted field
+    // omitted here rather than inventing an empty map on every row.
+    ...('agent_colors' in card && card.agent_colors !== undefined
+        ? { agentColors: { ...card.agent_colors } }
         : {}),
     ...('core_tools' in card && card.core_tools !== undefined ? { coreTools: [...card.core_tools] } : {}),
     ...('instruction_summary' in card && card.instruction_summary !== undefined

@@ -12,6 +12,7 @@ import type {
     SessionTurn
 } from '../server/protocol';
 import {
+    agentColorsOf,
     agentInstructionsOf,
     agentModelsOf,
     agentsFromDescriptors,
@@ -19,6 +20,7 @@ import {
     builtinOf,
     callIdOf,
     canonicalHarnessName,
+    colorsForMembers,
     coreToolsOf,
     editableOf,
     eventTimesOf,
@@ -257,6 +259,73 @@ describe('per-agent instructions', () => {
         // A blank value is not an override, so it never reaches the request body.
         expect(instructionsForMembers({ instruct: '  ' }, ['instruct'])).toEqual({});
         expect(instructionsForMembers(current, [])).toEqual({});
+    });
+});
+
+// T4 (R2/R3): the identity-COLOUR accessors, the third sibling of the two above. What the
+// shell paints is `configured hex` when the map names the agent and the deterministic
+// palette tone when it does not, so the two facts this pins are exactly (a) which entries
+// count as a configured colour and (b) that a value is passed through untouched — a
+// re-cased or re-formatted hex would be a colour the reader did not choose.
+describe('per-agent identity colours', () => {
+    it('reads only non-blank string colours from a descriptor map', () => {
+        expect(
+            agentColorsOf(
+                descriptor({
+                    agentColors: { instruct: '#ff6600', helper: '', blank: '   ', bad: 7, missing: undefined }
+                })
+            )
+        ).toEqual({ instruct: '#ff6600' });
+        // A map-less descriptor is the normal "every agent gets its own derived tone" shape.
+        expect(agentColorsOf(descriptor())).toEqual({});
+    });
+
+    it('keeps the configured spelling verbatim, including case and surrounding space', () => {
+        // Not a typo: `agent-color.ts` trims and parses for itself, and its contract is that
+        // the CSS receives the CALLER's string. Normalising here would silently recolour a
+        // value the reader typed (and break the assertion its own tests pin).
+        expect(
+            agentColorsOf({
+                agentColors: { instruct: ' #F97316 ', summarizer: '#4ade80' }
+            } as never)
+        ).toEqual({ instruct: ' #F97316 ', summarizer: '#4ade80' });
+    });
+
+    it('refuses a malformed map instead of throwing at render time', () => {
+        expect(agentColorsOf({ agentColors: [] } as never)).toEqual({});
+        expect(agentColorsOf({ agentColors: null } as never)).toEqual({});
+        expect(agentColorsOf({ agentColors: 'instruct' } as never)).toEqual({});
+        expect(agentColorsOf({} as never)).toEqual({});
+    });
+
+    it('ignores a colour that resolves through the prototype, not as an own entry', () => {
+        // `Object.entries` enumerates own keys only, but the accessor states the rule so an
+        // object built outside JSON (a Proxy or a class instance off a double) cannot smuggle
+        // an inherited hex into a surface the harness never configured.
+        const inherited = Object.create({ legacy: '#000000' }) as Record<string, string>;
+        inherited.instruct = '#ff6600';
+
+        expect(agentColorsOf({ agentColors: inherited })).toEqual({ instruct: '#ff6600' });
+    });
+
+    it('filters a colour map to the resulting members and preserves member order', () => {
+        const current = { instruct: '#ff6600', helper: '#22d3ee', critic: '#a78bfa' };
+
+        // Removal drops the removed member's colour: the server REPLACES `agent_colors` with
+        // whatever a PATCH names, so the complete current map has to travel.
+        expect(colorsForMembers(current, ['instruct', 'critic'])).toEqual({
+            instruct: '#ff6600',
+            critic: '#a78bfa'
+        });
+        // Member order, not map order.
+        expect(Object.keys(colorsForMembers(current, ['critic', 'instruct']))).toEqual([
+            'critic',
+            'instruct'
+        ]);
+        // A blank value is not a colour, and a member the map omits stays uncoloured.
+        expect(colorsForMembers({ instruct: '  ' }, ['instruct'])).toEqual({});
+        expect(colorsForMembers(current, ['ghost'])).toEqual({});
+        expect(colorsForMembers(current, [])).toEqual({});
     });
 });
 

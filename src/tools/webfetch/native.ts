@@ -101,6 +101,19 @@ const COMMENTS = /<!--[\s\S]*?(?:-->|$)/g;
 // every later inline pass (a `<b>` inside code stays literal text).
 const PRE_OPEN = /<pre\b[^>]*>/i;
 
+// The wrapper elements a syntax highlighter puts INSIDE a <pre>, and the only
+// tags stripped there (D3). Measured: every code fence on a real docs page came
+// back as `<code><span class="line"><span style="color:#79B8FF">cd</span>…`, so
+// roughly 200 characters of styling noise was returned per line of actual code.
+//
+// Deliberately NARROW. A blanket `<[^>]*>` strip would corrupt the common
+// unescaped comparison inside a sample — `if (a<b && c>d)` — because `<b && c>`
+// looks like a tag. These names are the ones a highlighter emits and are very
+// unlikely to be a bare tag name in code; `b`, `i`, `a`, `p` are NOT stripped, so
+// `a<b` survives intact. In valid HTML a code sample escapes its angle brackets
+// anyway, so anything matching here was markup.
+const PRE_WRAPPER_TAGS = /<\/?(?:span|code|font|mark|kbd|samp|var|sub|sup)\b[^>]*>/gi;
+
 const extractPreBlocks = (html: string, fenced: boolean): { html: string; blocks: string[] } => {
     const blocks: string[] = [];
     let output = html;
@@ -115,7 +128,9 @@ const extractPreBlocks = (html: string, fenced: boolean): { html: string; blocks
         const end = closeIndex === -1 ? output.length : closeIndex;
         const raw = output.slice(afterOpen, end);
 
-        const decoded = decodeEntities(raw.replace(/<br\s*\/?>/gi, '\n')).replace(/^\r?\n/, '');
+        const decoded = decodeEntities(
+            raw.replace(PRE_WRAPPER_TAGS, '').replace(/<br\s*\/?>/gi, '\n')
+        ).replace(/^\r?\n/, '');
         const fence = fenced ? `\n\n\`\`\`\n${decoded}\n\`\`\`\n\n` : `\n\n${decoded}\n\n`;
 
         blocks.push(fence);
@@ -265,6 +280,10 @@ const convertHtmlToText = (html: string): { text: string; title?: string } => {
 // ---------------------------------------------------------------------------
 // Provider entry
 // ---------------------------------------------------------------------------
+//
+// Section selection for the optional `query` argument lives in ./sections: it
+// runs on converted content, so it serves the hosted providers too without
+// dragging this module's GET transport onto their call path.
 
 export type NativeFetch = (
     url: string,

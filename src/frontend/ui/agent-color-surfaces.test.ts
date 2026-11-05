@@ -1,4 +1,4 @@
-// Agent identity colour across every surface (T5/R4).
+// Agent identity colour across every surface (T5/R1/R3/R4).
 //
 // R4 asks for ONE fact the reader can rely on: an agent's colour is the same wherever
 // that agent is named — the composer's agent button (`Instruct` / `IT`), the roster
@@ -7,18 +7,25 @@
 // those hosts (ui/agent-control.ts, ui/agent-dialog.ts, ui/turns.ts), so the guarantee
 // is only real if a test walks all of them and compares the values actually painted.
 //
-// The assignment is RANDOM per page load (R4, on purpose), so every expectation here is
-// one of:
+// The assignment is DETERMINISTIC (R1: the same tones come back after a reload), but this
+// file still never asserts WHICH tone that is — "instruct is pink" is a fact about the
+// palette and the hash, not a surface contract, and it is pinned with exact values in
+// ui/agent-color.test.ts. What is pinned here is what only a cross-surface test can see:
 //   - CROSS-SURFACE EQUALITY for one agent (the real R4 claim),
 //   - PALETTE MEMBERSHIP (a painted value is one of the eight tones, never a stray),
 //   - DISTINCTNESS between two agents while the palette has free slots,
-//   - the EXACT neutral fallback for an unattributable surface (not random, so it is
+//   - the EXACT neutral fallback for an unattributable surface (not derived, so it is
 //     asserted as a literal),
-//   - IMMUTABILITY across a rebuild / re-open / live refresh (no colour flicker).
-// Nothing asserts "instruct is blue", because after R4 that is no longer a contract.
+//   - IMMUTABILITY across a rebuild / re-open / live refresh (no colour flicker),
+//   - RELOAD STABILITY: a fresh module state + the same roster paints the same vector
+//     (R1, the requirement the old per-page shuffle failed).
 //
-// The mapping's own rules (draw order, permutation, canonical-key stability, slot
-// exhaustion, painted custom properties) are pinned with seeded draws in
+// The roster is configured in `beforeEach` — that is what production does (main.ts calls
+// `configureAgentColors` with the boot roster, then again with the live session roster)
+// and it is what makes the vector below independent of which component painted first.
+//
+// The mapping's own rules (hash + forward probe, canonical-key stability, slot
+// exhaustion, explicit overrides, painted custom properties) are pinned in
 // ui/agent-color.test.ts. The CSS side — which property each label actually reads — is
 // pinned in ui/compact-control-style.test.ts and ui/thread-conversation-style.test.ts.
 //
@@ -26,7 +33,7 @@
 
 import type { AgentDescriptor, HarnessEvent } from '../../server/protocol';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { AGENT_PALETTE, UNKNOWN_AGENT_COLOR, reseedAgentColors } from './agent-color';
+import { AGENT_PALETTE, UNKNOWN_AGENT_COLOR, configureAgentColors, resetAgentColors } from './agent-color';
 import { createAgentControl } from './agent-control';
 import { openAgentDialog } from './agent-dialog';
 import type { AgentDialog, AgentDialogOptions } from './agent-dialog';
@@ -60,19 +67,10 @@ const agents: AgentDescriptor[] = [
     }
 ];
 
-// A fixed, realistic draw so a failure reproduces run to run; no assertion below depends
-// on WHICH tone it happens to hand out.
-const mulberry32 = (seed: number) => {
-    let state = seed >>> 0;
-
-    return (): number => {
-        state = (state + 0x6d2b79f5) >>> 0;
-        let mixed = state;
-        mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
-        mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
-        return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
-    };
-};
+// The roster handed to `configureAgentColors`: the same names, in the same order, on
+// every case (and again after the simulated reload), so the slot vector any assertion
+// reads is fixed by the roster rather than by the order the DOM happened to paint.
+const ROSTER = agents.map((agent) => agent.name);
 
 const PALETTE_COLORS = AGENT_PALETTE.map((tone) => tone.color);
 const PALETTE_LINES = AGENT_PALETTE.map((tone) => tone.line);
@@ -185,17 +183,52 @@ const threadTile = (turn: TurnHandle, agent: string): HTMLElement | null => {
     return scope?.querySelector<HTMLElement>(`.thread-row[data-agent="${agent}"] .thread-tile`) ?? null;
 };
 
+// One full "page load": a board with a primary run that delegates, plus the dialog open on
+// the same team. Every value is the custom property a real host now carries, so the record
+// is the whole page's identity colouring in one comparable object — used to prove a reload
+// reproduces it exactly (R1). A stale query reads `''` (unpainted) or `'<missing>'`, which
+// the palette-membership check below turns into a failure instead of a silent match.
+const paintPage = (): Record<string, string> => {
+    const board = mount();
+    const turn = stream(board);
+    openDialog(['instruct', 'research']);
+
+    const row = threadHost(turn, 'research');
+
+    return {
+        // The primary, on each host that names it.
+        composerPrimary: colorOn(composer('instruct')),
+        composerPrimaryLine: lineOn(composer('instruct')),
+        tile: colorOn(turn.element),
+        badgePrimary: colorOn(badge('instruct')),
+        badgePrimaryLine: lineOn(badge('instruct')),
+
+        // The delegated agent, on each host that names it.
+        composerDelegate: colorOn(composer('research')),
+        threadRow: colorOn(row),
+        threadRowLine: lineOn(row),
+        threadTile: colorOn(threadTile(turn, 'research')),
+        badgeDelegate: colorOn(badge('research'))
+    };
+};
+
 beforeEach(() => {
     document.body.innerHTML = '';
-    reseedAgentColors(mulberry32(20261104));
+    resetAgentColors();
+    configureAgentColors({ roster: ROSTER, colors: {} });
 });
 
-afterEach(() => {
+// Tears every painted surface down. `badge()` / `pickerOption()` query the DOCUMENT, so a
+// case that opens a second dialog must not leave the first dialog's tabs behind, or it
+// would read a stale node instead of the one it just painted.
+const clearSurfaces = (): void => {
     dialog?.close();
     dialog = undefined;
     for (const overlay of document.querySelectorAll('.dialog-overlay')) overlay.remove();
     document.body.innerHTML = '';
-});
+};
+
+afterEach(clearSurfaces);
 
 describe('one agent, one colour, everywhere (R4)', () => {
     it('paints the composer, the roster badge and the transcript blocks with one tone', () => {
@@ -361,6 +394,39 @@ describe('stability while the page lives', () => {
         openDialog(['instruct', 'research']).paintActivity(new Set<string>(['instruct', 'research']));
 
         expect(read()).toEqual(before);
+    });
+
+    it('paints the identical tones on a fresh page: the mapping survives a reload (R1)', () => {
+        const before = paintPage();
+
+        // The vector is real before it is stable: every host names one of the two agents
+        // and carries a genuine palette tone, so the comparison below cannot be won by a
+        // page that painted nothing.
+        expectPaletteTone(before.composerPrimary, before.composerPrimaryLine);
+        expectPaletteTone(before.threadRow, before.threadRowLine);
+        expect({ tile: before.tile, badgePrimary: before.badgePrimary }).toEqual({
+            tile: before.composerPrimary,
+            badgePrimary: before.composerPrimary
+        });
+        expect({
+            composerDelegate: before.composerDelegate,
+            threadTile: before.threadTile,
+            badgeDelegate: before.badgeDelegate
+        }).toEqual({
+            composerDelegate: before.threadRow,
+            threadTile: before.threadRow,
+            badgeDelegate: before.threadRow
+        });
+        expect(before.threadRow).not.toBe(before.composerPrimary);
+
+        // The reload: module state is gone, and boot configures the same roster in the
+        // same order (exactly what main.ts does on a fresh page). Under the old per-page
+        // draw this is where the team's colours changed on the reader.
+        clearSurfaces();
+        resetAgentColors();
+        configureAgentColors({ roster: ROSTER, colors: {} });
+
+        expect(paintPage()).toEqual(before);
     });
 
     it('gives a newly known identity its own tone without moving the ones already learned', () => {

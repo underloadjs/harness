@@ -122,6 +122,24 @@ export type HarnessPresetRecord = {
     // Per-agent instruction overrides (T3 editable configuration). Optional and
     // additive: a document without the field restores exactly as before.
     agentInstructions?: Record<string, string>;
+    // Per-agent identity colors (R2 display configuration). Optional and additive:
+    // a document without the field restores exactly as before, and the loader reads it
+    // with the same `readStringMap` shape as the two maps above. Like them it is part
+    // of the executable definition the factory is rebuilt from (the map is captured by
+    // the closure), so a saved swatch survives a restart instead of reverting to the
+    // host's derived color.
+    agentColors?: Record<string, string>;
+    // SESSION-DEFINED agents (R7): agent id → the base instruction that agent runs. Optional
+    // and additive: a document without the field restores exactly as before, and the loader
+    // reads it with the same `readStringMap` shape as the three override maps above. Like them
+    // it is part of the executable definition the factory is rebuilt from (the map is captured
+    // by the closure, and `agentsFromProfiles` consults it before any catalogue lookup), so an
+    // agent a session invented survives a restart instead of dropping out of the roster.
+    //
+    // A harness DEFINITION never writes this field — the registry's create/PATCH surface has no
+    // custom-agent input — so in practice it appears only inside a saved session's own
+    // `preset` copy (see ./sessions.ts `applyBindingMaps`).
+    customAgents?: Record<string, string>;
     builtin: boolean;
     editable: boolean;
     template?: 'live' | 'scripted' | 'flaky';
@@ -393,10 +411,10 @@ const requireStringArray = (value: unknown, label: string): string[] => {
     return [...(value as string[])];
 };
 
-// A string → string map (`agentModels`, and T3's `agentInstructions`). Both are
-// agent id → text maps restored the same way, so a malformed stored document
-// reports the same shape of error whichever field is broken. The reader itself is
-// `readStringMap` below, next to the other map readers.
+// A string → string map (`agentModels`, T3's `agentInstructions`, R2's `agentColors`, and R7's
+// `customAgents`). All four are agent id → text maps restored the same way, so a malformed
+// stored document reports the same shape of error whichever field is
+// broken. The reader itself is `readStringMap` below, next to the other map readers.
 
 // Frozen descriptor (`SessionSnapshot.harnessDefinition`). Validate the fields a
 // restored session and the UI rely on; agentModels/coreTools are optional.
@@ -408,6 +426,12 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
         record.agentInstructions === undefined
             ? undefined
             : readStringMap(record.agentInstructions, `${label}.agentInstructions`);
+
+    // R2: the per-agent swatches a session's frozen definition carried. Same optional,
+    // same reader: a pre-R2 definition restores with no `agentColors` key at all, and a
+    // colored one comes back byte-identical (the UI repaints the same agents).
+    const agentColors =
+        record.agentColors === undefined ? undefined : readStringMap(record.agentColors, `${label}.agentColors`);
 
     return {
         name: requireString(record.name, `${label}.name`),
@@ -423,6 +447,7 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
             : { coreTools: requireStringArray(record.coreTools, `${label}.coreTools`) }),
         ...(agentModels === undefined ? {} : { agentModels }),
         ...(agentInstructions === undefined ? {} : { agentInstructions }),
+        ...(agentColors === undefined ? {} : { agentColors }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`)
     };
@@ -506,6 +531,21 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
             ? undefined
             : readStringMap(record.agentInstructions, `${label}.agentInstructions`);
 
+    // R2: a saved color is executable state in the same sense — the factory closure
+    // captures the map, so `presetFromRecord` needs it to rebuild the harness the row
+    // described. Optional and additive: a document without the field restores with no
+    // `agentColors` key, exactly like the two maps above.
+    const agentColors =
+        record.agentColors === undefined ? undefined : readStringMap(record.agentColors, `${label}.agentColors`);
+
+    // R7: a session-defined agent map is executable state in the same sense — the factory
+    // closure captures it and `agentsFromProfiles` builds the listed members from it instead of
+    // from the catalogue. Optional and additive: a document without the field restores with no
+    // `customAgents` key, exactly like the three maps above, so every pre-R7 session comes back
+    // byte-identically.
+    const customAgents =
+        record.customAgents === undefined ? undefined : readStringMap(record.customAgents, `${label}.customAgents`);
+
     return {
         name: requireString(record.name, `${label}.name`),
         title: requireString(record.title, `${label}.title`),
@@ -520,6 +560,8 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
             : { environmentTools: requireStringArray(record.environmentTools, `${label}.environmentTools`) }),
         ...(agentModels === undefined ? {} : { agentModels }),
         ...(agentInstructions === undefined ? {} : { agentInstructions }),
+        ...(agentColors === undefined ? {} : { agentColors }),
+        ...(customAgents === undefined ? {} : { customAgents }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`),
         ...(template === undefined ? {} : { template }),
@@ -737,7 +779,10 @@ const readCounterMap = (value: unknown, label: string): Record<string, number> =
 };
 
 // Optional `{ key: string }` map (turn id -> invocation id / per-turn counters, and
-// the `agentModels` / `agentInstructions` override maps of a saved preset).
+// the `agentModels` / `agentInstructions` / `agentColors` override maps of a saved
+// preset). A stored color is read as plain text here: the hex SHAPE is enforced where
+// the value is authored (registry `normalizeAgentColors` and `agent()` construction),
+// and the loader's job is to refuse a document whose map is not a string map at all.
 const readStringMap = (value: unknown, label: string): Record<string, string> => {
     const record = requireRecord(value, label);
     const mapped: Record<string, string> = {};

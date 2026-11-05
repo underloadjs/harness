@@ -41,9 +41,17 @@ export const searchTavily = async (search: ProviderSearch): Promise<WebSearchMat
             query: search.query,
             // Set explicitly so the provider default cannot exceed the tool bound.
             max_results: search.maxResults,
+            // `basic` is already Tavily's cheap tier (`advanced` reranks and costs
+            // more), so `speed: "fast"` changes nothing here — stated rather than
+            // written as a no-op ternary that would read like a bug.
             search_depth: 'basic',
             include_answer: false,
-            include_raw_content: false
+            include_raw_content: false,
+            // Snake_case field names are Tavily's own. Sent only when supplied.
+            ...(search.includeDomains ? { include_domains: search.includeDomains } : {}),
+            ...(search.excludeDomains ? { exclude_domains: search.excludeDomains } : {}),
+            ...(search.since ? { start_date: search.since } : {}),
+            ...(search.until ? { end_date: search.until } : {})
         }
     });
 

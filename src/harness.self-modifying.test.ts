@@ -684,7 +684,10 @@ describe('self-modifying tool kernel', () => {
         const fetchProperties = (
             writer.tools.fetch.parameters as { properties: Record<string, unknown> }
         ).properties;
-        expect(Object.keys(fetchProperties)).toEqual(['url', 'format']);
+        // The harness supplies the dynamic provider surface over the compiled entry:
+        // keyless means no `provider` property, while `query` and `offset` are
+        // arguments of the tool itself and always belong to it.
+        expect(Object.keys(fetchProperties)).toEqual(['url', 'format', 'query', 'offset']);
 
         for (const record of [writer.toolSource('search'), writer.toolSource('fetch')]) {
             expect(record?.moduleText).not.toContain('test-exa-key');

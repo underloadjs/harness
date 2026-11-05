@@ -38,6 +38,40 @@ const UNCONFIGURED_PARAMETERS = {
             maximum: 20,
             description:
                 'How many results to return. Defaults to 5; larger values are clamped to 20.'
+        },
+        // The provider filters are part of the tool, not of a provider, so a
+        // keyless host lists them too: the listing describes the schema a host
+        // would run, and it must not drift from the configured one.
+        includeDomains: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 20,
+            description: 'Only return results from these domains (hostnames, no scheme). Up to 20.'
+        },
+        excludeDomains: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 20,
+            description: 'Never return results from these domains. Up to 20.'
+        },
+        since: {
+            type: 'string',
+            description: 'Only results published on or after this ISO-8601 date, e.g. "2026-01-01".'
+        },
+        until: {
+            type: 'string',
+            description: 'Only results published on or before this ISO-8601 date.'
+        },
+        category: {
+            type: 'string',
+            maxLength: 64,
+            description: 'Source category to favour, e.g. "news", "company", "publication" or "people".'
+        },
+        speed: {
+            type: 'string',
+            enum: ['balanced', 'fast'],
+            description:
+                '"fast" asks the provider for its low-latency, lower-cost mode (results come from its index rather than live page fetches). Defaults to "balanced".'
         }
     },
     required: ['query'],
@@ -96,9 +130,10 @@ describe('tool catalogue', () => {
             environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY']
         });
 
-        // Only a single key is configured, so no provider choice is offered.
+        // Only a single key is configured, so no provider choice is offered — but
+        // the filter arguments are, and they match the keyless listing above.
         const properties = (entry?.parameters as { properties: Record<string, unknown> }).properties;
-        expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+        expect(Object.keys(properties)).toEqual(Object.keys((UNCONFIGURED_PARAMETERS.properties as Record<string, unknown>)));
 
         // The credential lives in the tool closure; the catalogue is safe to log.
         expect(JSON.stringify(catalogue.entries)).not.toContain('exa-secret-key');
@@ -218,7 +253,7 @@ describe('tool catalogue', () => {
         expect(JSON.stringify(keyed.entries)).not.toContain('exa-secret-key');
         expect(
             Object.keys((keyed.find('fetch')?.parameters as { properties: Record<string, unknown> }).properties)
-        ).toEqual(['url', 'format', 'provider']);
+        ).toEqual(['url', 'format', 'query', 'offset', 'provider']);
     });
 
     it('reads the environment when built, not when the module was imported', () => {

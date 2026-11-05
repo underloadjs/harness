@@ -342,6 +342,15 @@ export type AgentConfiguration = {
     // Retries re-send ONLY the current model request; tools and the run are never
     // replayed.
     retry?: HarnessRetryConfiguration;
+    // Display-only identity color (R2): a CSS hex color `#rgb`, `#rgba`,
+    // `#rrggbb` or `#rrggbbaa`, case-insensitive. It NEVER reaches a model request
+    // or a transcript — a host (the harness UI) paints a stable swatch from it
+    // instead of deriving one from the agent's name. Surrounding whitespace is
+    // trimmed; anything that is not a hex color is a construction error
+    // (core/agent.ts `requireAgentColor`), so a typo fails at setup rather than
+    // rendering an unstyled agent. A fork and a persistent thread inherit it: both
+    // are the SAME identity, so they must keep the same swatch.
+    color?: string;
 };
 
 // Overload-style accessor so `agent.model()` reads and `agent.model('x')`
@@ -447,6 +456,20 @@ export type Agent = {
     readonly messages: HarnessMessage[];
     // The system messages this agent was seeded with, for reset().
     readonly instructions: readonly string[];
+    // Display-only identity color (R2), copied from `AgentConfiguration.color` and
+    // present exactly when one was configured (never `undefined` on the object, so
+    // `'color' in agent` is a reliable "explicitly configured" test for a host).
+    // Read-only like `messages`/`instructions`: it belongs to the identity chosen at
+    // setup, and a fork/thread clone carries the same value. Nothing in the runtime
+    // or the transport reads it.
+    //
+    // Cross-reference: the server configures it per member through
+    // `HarnessPreset.agentColors` (src/server/harnesses/types.ts), validates it in
+    // registry.ts `normalizeAgentColors`, reports it on
+    // `HarnessDescriptor.agentColors` / the contract's `agent_colors`
+    // (src/server/protocol.ts, src/shared/harness-api.ts), and hands it here in
+    // ./server/harnesses/toolbox.ts `agentConfigurationFromProfile`.
+    readonly color?: string;
     // Read or write the active model.
     model: AgentModelAccessor;
     // Append a message and return the agent for chaining.
@@ -1565,6 +1588,20 @@ export type WebSearchParameters = {
     // Which configured provider to use. Omitted = the first configured one
     // (Exa, then Tavily, then Linkup), so a single-key setup needs no decision.
     provider?: WebsearchProvider;
+    // Domain scoping. Without these the only way to restrict a search is to
+    // over-fetch and post-filter in the model's own context — the expensive way
+    // to do what one request argument does server-side.
+    includeDomains?: string[];
+    excludeDomains?: string[];
+    // ISO-8601 publication window, validated before the request is paid for.
+    since?: string;
+    until?: string;
+    // Source category the provider may favour ("news", "company", "publication").
+    category?: string;
+    // "fast" asks for the provider's low-latency, lower-cost index mode; the
+    // default "balanced" keeps the previous behaviour. A provider with no
+    // equivalent simply ignores it.
+    speed?: 'balanced' | 'fast';
 };
 
 // One normalized result. Every field is present (possibly empty) so the model
@@ -1584,6 +1621,15 @@ export type WebSearchResult = {
     // The count actually requested from the provider, after clamping.
     maxResults: number;
     results: WebSearchMatch[];
+    // The filters that were applied, echoed back. An empty result set means
+    // something different when a domain or date filter was in force, and without
+    // this a model cannot tell "nothing exists" from "my filter excluded it".
+    includeDomains?: string[];
+    excludeDomains?: string[];
+    since?: string;
+    until?: string;
+    category?: string;
+    speed?: 'balanced' | 'fast';
 };
 
 // ---------------------------------------------------------------------------
@@ -1634,6 +1680,18 @@ export type WebFetchParameters = {
     // accepted (and only offered in the schema) when that provider's key is
     // configured.
     provider?: WebFetchProvider;
+    // Optional section filter (the fetch+grep mode): a case-insensitive literal
+    // phrase, matched against section headings and text — NOT a regular
+    // expression, because the argument is a phrase a model types from memory and
+    // an unescaped `(` must not become a syntax error. When it matches, only those
+    // sections are returned instead of the whole document. It runs on converted
+    // content, so it works for every provider, all of which answer with
+    // heading-bearing text.
+    query?: string;
+    // Character offset to start reading at, for resuming a cut page with the
+    // `nextOffset` the result reported. Clamped to the page rather than rejected:
+    // reaching slightly past the end is a question with an answer, not an error.
+    offset?: number;
 };
 
 export type WebFetchResult = {
@@ -1643,14 +1701,35 @@ export type WebFetchResult = {
     // The response content-type header, verbatim (bounded).
     contentType: string;
     format: 'markdown' | 'text' | 'html';
-    // Characters of `content` returned, after the bound.
+    // Characters of `content` returned, after every bound.
     characters: number;
-    // True when the page content was cut at the character bound: more exists.
+    // True when content was cut and MORE EXISTS: computed against the source, so
+    // a page that ends exactly at a bound is not mistaken for a complete one.
     truncated: boolean;
     // The page content: converted text, untrusted data from the open web.
     content: string;
     // Page title when either source can provide one.
     title?: string;
+    // Characters the page holds in total (before any bound). Lets a caller tell a
+    // complete short page from a long one that was cut.
+    pageCharacters?: number;
+    // The offset this window started at, echoed back from the argument.
+    offset?: number;
+    // Character offset of the NEXT page of this page. Present only when
+    // `truncated` is true, so resuming is a fact from the tool rather than a
+    // guess about where the cut landed.
+    nextOffset?: number;
+    // Redirect hops followed, present only when the chain was not empty.
+    redirects?: number;
+    // Echoed back when the call used section selection, so a transcript reader
+    // can tell a filtered answer from a whole page.
+    query?: string;
+    // Sections returned / sections the page has / sections that matched in total
+    // (the last one exceeds `matches` when the block cap dropped some). Present
+    // only in query mode.
+    matches?: number;
+    totalSections?: number;
+    totalMatches?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -1676,6 +1755,12 @@ export type DownloadParameters = {
     // way (no path separators, no drive colon, at most 200 characters), so a
     // model-supplied value can never smuggle a path.
     name?: string;
+    // Optional destination for the saved copy, relative to the working directory.
+    // Absolute paths and `..` are REFUSED rather than normalized: the tool
+    // documents a session folder, and silently writing to /etc because a model
+    // guessed an absolute path is worse than an error. Omitted = the default
+    // .underload/downloads/ folder, where glob, grep and read can reach the file.
+    path?: string;
 };
 
 // The MODEL-FACING summary. Deliberately small (a few hundred bytes): the file
@@ -1704,6 +1789,20 @@ export type DownloadResult = {
     // Constant: the file's bytes are attached out of band. It exists so a
     // transcript reader can never mistake this JSON for a filename-only answer.
     media: 'attached';
+    // True when the bytes were also written to disk, so glob/grep/read can reach
+    // the file. False on a host with no writable filesystem — the download itself
+    // still succeeded and the bytes are still attached.
+    saved?: boolean;
+    // Where it was saved, RELATIVE to the working directory (what the file tools
+    // resolve against). Present only when `saved` is true.
+    path?: string;
+    // Why the disk copy failed, when it did. A short reason, never a stack.
+    saveError?: string;
+    // Whether the saved copy is actually searchable by `grep` (text MIME and
+    // within grep's own 1 MiB file limit). False means the file is addressable by
+    // path but a grep over it returns nothing — the model should use `read` on a
+    // text file or treat a media file as attached input instead.
+    searchable?: boolean;
     // The id the attachment travels under on this tool message. The progress
     // event's `media` descriptor and the tool message agree on it; only the
     // transport may re-suffix it (deterministically) when one tool block
@@ -2818,8 +2917,12 @@ export type Harness = {
     //     `subagents`, and the delegation allowlist, and its DEFAULT conversation is
     //     dropped with it (a host thread owned by that agent is not). Throws for an
     //     unknown agent, for the primary (the entry point is not removable — that is a
-    //     redefinition, not a binding change), and while its default conversation has
-    //     live or queued work. Committed history in OTHER agents is never rewritten: a
+    //     redefinition, not a binding change), while its default conversation has
+    //     live or queued work, and while it still OWNS a host thread — the host deletes
+    //     those conversations first, which is exactly the guard the server's session route
+    //     states as a 409 before calling this (./server/sessions.ts `removeSessionAgent`,
+    //     R6: a saved session's history is never removed behind the caller's back).
+    //     Committed history in OTHER agents is never rewritten: a
     //     delegated answer already copied into the primary's transcript stays.
     removeAgent: (name: string) => void;
     //   - `setAgentInstruction(name, instruction)` — replace the agent's leading system

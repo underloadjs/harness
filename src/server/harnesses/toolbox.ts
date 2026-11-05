@@ -266,11 +266,17 @@ export const providerOf = (settings: RunnerSettings) => ({
 // needs the same trusted composition without constructing a brain the runtime would
 // then throw away. `agentFromProfile` is exactly `agent()` over this value, so a fresh
 // session and a session-scoped binding can never compose a prompt differently.
+// `color` is the optional per-agent identity color (R2). It is already-validated hex
+// text here (the registry's `normalizeAgentColors` checked it on create/PATCH), and it
+// is attached to the configuration only when non-blank, so an uncolored member keeps
+// the byte-identical configuration it had before R2 — `agent()` stores it verbatim and
+// nothing else in the construction path reads it.
 export const agentConfigurationFromProfile = (
     name: string,
     settings: RunnerSettings,
     model?: string,
-    instruction?: string
+    instruction?: string,
+    color?: string
 ): AgentConfiguration => {
     // T19: the text comes from the EFFECTIVE profile — the trusted catalogue entry with the
     // global override layer merged (./agent-state.ts). The catalogue object itself stays
@@ -295,6 +301,11 @@ export const agentConfigurationFromProfile = (
 
     const override = model === undefined ? '' : model.trim();
 
+    // R2: a blank color means "not configured", exactly like a blank model id above,
+    // so the key is omitted rather than reaching `agent()` as `''` (which would be a
+    // construction error).
+    const swatch = color === undefined ? '' : color.trim();
+
     return {
         name,
         model: override.length > 0 ? override : settings.model,
@@ -302,7 +313,8 @@ export const agentConfigurationFromProfile = (
         // more specific decision); the profile's guidelines — global override or shipped —
         // are always composed below the identity sentence.
         instruction: agentInstruction(profile, instruction),
-        provider: providerOf(settings)
+        provider: providerOf(settings),
+        ...(swatch.length === 0 ? {} : { color: swatch })
     };
 };
 
@@ -310,28 +322,109 @@ export const agentFromProfile = (
     name: string,
     settings: RunnerSettings,
     model?: string,
-    instruction?: string
-): Agent => agent(agentConfigurationFromProfile(name, settings, model, instruction));
+    instruction?: string,
+    color?: string
+): Agent => agent(agentConfigurationFromProfile(name, settings, model, instruction, color));
+
+// The one sentence a session-defined agent runs when its author gave it no text (R7). Exported
+// because BOTH halves must mint it: `SessionStore.addSessionAgent` stores it as the agent's base
+// instruction, and `agentConfigurationForCustom` falls back to it when a stored base turned out
+// blank (a hand-edited document, or a caller that passed no text at all). One definition is what
+// keeps a live custom agent and a rebuilt one byte-identical.
+export const customAgentInstruction = (name: string, instruction?: string): string => {
+    const text = instruction === undefined ? '' : instruction.trim();
+
+    return text.length > 0 ? text : `You are the ${name} agent.`;
+};
+
+// Build the configuration of a SESSION-DEFINED agent (R7) — one this conversation invented
+// rather than one it selected from the trusted catalogue.
+//
+// THE DELIBERATE CONTRAST WITH `agentConfigurationFromProfile`:
+//   - NO profile lookup. A custom name has no `AgentProfile`, so `agentProfile(name)`/
+//     `effectiveAgentProfile(name)` would throw or report a retirement, and there is nothing for
+//     the global agent overlay to override;
+//   - NO guideline composition. `agentInstruction()` exists to append TRUSTED policy lines below
+//     an identity sentence; a client-authored agent has no trusted policy, so the stored text IS
+//     the whole system prompt (which is also why a blank stored base falls back to
+//     `customAgentInstruction` rather than to a profile that does not exist);
+//   - the SAME trusted transport as a profile member: the model id may come from the session map,
+//     but the provider, base URL and credential always come from `RunnerSettings`, and a blank
+//     model falls back to `settings.model`.
+//
+// `color` follows the R2 rule of the profile form above: trimmed, and the key is omitted when
+// blank, so an uncolored member keeps a configuration with no `color` key at all.
+export const agentConfigurationForCustom = (
+    name: string,
+    settings: RunnerSettings,
+    model?: string,
+    instruction?: string,
+    color?: string
+): AgentConfiguration => {
+    const override = model === undefined ? '' : model.trim();
+    const swatch = color === undefined ? '' : color.trim();
+
+    return {
+        name,
+        model: override.length > 0 ? override : settings.model,
+        instruction: customAgentInstruction(name, instruction),
+        provider: providerOf(settings),
+        ...(swatch.length === 0 ? {} : { color: swatch })
+    };
+};
 
 // Build the agent registry for a selected set. Order is the caller's: primary
 // first, then the allowlist, matching the descriptor's `agents` list. `agentModels`
 // is the validated override map from the harness registry; it is applied per agent
 // so one member can run a different model from its siblings. `agentInstructions`
 // (T3) is the parallel instruction override map, applied the same per-agent way.
+// `agentColors` (R2) is the third map of the same shape: agent id → validated hex
+// color, applied per agent as display metadata only. Each map defaults to `{}`, so a
+// caller that only has the first two keeps its exact old behavior.
+//
+// `customAgents` (R7) is the fourth map of that shape and the only one that changes WHICH
+// builder runs: a name listed here is a session-defined agent, so it is composed by
+// `agentConfigurationForCustom` (its own stored base text, unless the session later overrode
+// the text through `agentInstructions`) and NEVER through a catalogue lookup. Every other name
+// keeps the trusted-profile path byte-for-byte, so a template that declares no custom agent —
+// i.e. every harness definition and every document saved before R7 — builds exactly as before.
 export const agentsFromProfiles = (
     names: readonly string[],
     settings: RunnerSettings,
     agentModels: Readonly<Record<string, string>> = {},
-    agentInstructions: Readonly<Record<string, string>> = {}
+    agentInstructions: Readonly<Record<string, string>> = {},
+    agentColors: Readonly<Record<string, string>> = {},
+    customAgents: Readonly<Record<string, string>> = {}
 ): Record<string, Agent> => {
     const agents: Record<string, Agent> = {};
 
     for (const name of names) {
+        // `hasOwnProperty`, not a truthiness check: an agent whose stored base is the empty
+        // string is still a session-defined agent, and falling through to the catalogue here
+        // would answer 500 on restart for a name that has no profile.
+        if (Object.prototype.hasOwnProperty.call(customAgents, name)) {
+            agents[name] = agent(
+                agentConfigurationForCustom(
+                    name,
+                    settings,
+                    agentModels[name],
+                    // A later session-scoped instruction override wins over the base the agent
+                    // was invented with — the same precedence `setSessionAgentInstruction`
+                    // applies live, so a restart cannot revert the prompt.
+                    agentInstructions[name] ?? customAgents[name],
+                    agentColors[name]
+                )
+            );
+
+            continue;
+        }
+
         agents[name] = agentFromProfile(
             name,
             settings,
             agentModels[name],
-            agentInstructions[name]
+            agentInstructions[name],
+            agentColors[name]
         );
     }
 
@@ -346,13 +439,18 @@ export const agentsFromProfiles = (
 // The model and instruction maps are captured by the closure, not read at run
 // time: `update()` builds a NEW factory for the new maps, and a session created
 // before that keeps the closure (and therefore the models and instructions) it was
-// built with.
+// built with. The color map (R2) follows the same rule — it too must be frozen with
+// the harness a session is built from, so a later PATCH cannot repaint an existing
+// conversation's agents. The custom-agent map (R7) follows it for the same reason:
+// a session's invented roster is part of the team the factory builds.
 export const createProfiledHarness =
     (
         primary: string,
         subagents: readonly string[],
         agentModels: Readonly<Record<string, string>> = {},
-        agentInstructions: Readonly<Record<string, string>> = {}
+        agentInstructions: Readonly<Record<string, string>> = {},
+        agentColors: Readonly<Record<string, string>> = {},
+        customAgents: Readonly<Record<string, string>> = {}
     ) =>
     (
         settings: RunnerSettings,
@@ -365,7 +463,9 @@ export const createProfiledHarness =
                     [primary, ...subagents],
                     settings,
                     agentModels,
-                    agentInstructions
+                    agentInstructions,
+                    agentColors,
+                    customAgents
                 ),
                 primary,
                 subagents: [...subagents]

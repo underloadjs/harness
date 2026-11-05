@@ -192,6 +192,80 @@ type Invocation = {
     query: string;
     maxResults: number;
     provider: WebsearchProvider;
+    // Provider filters the model can actually name. Exa supports all of them;
+    // an adapter that does not is given them and ignores them (see each adapter).
+    includeDomains?: string[];
+    excludeDomains?: string[];
+    since?: string;
+    until?: string;
+    category?: string;
+    // 'fast' asks the provider for its low-latency/low-cost mode when it has one.
+    speed: 'balanced' | 'fast';
+};
+
+// A domain list is bounded hard: an unbounded array from a model is a context
+// and cost bomb, and Exa itself caps the list. Entries are trimmed and lowercased
+// so a stray space or case difference cannot silently widen or narrow a filter.
+const MAX_DOMAINS = 20;
+const MAX_DOMAIN_CHARS = 253;
+
+const readDomains = (value: unknown, name: string): string[] | undefined => {
+    if (value === undefined) return undefined;
+
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_DOMAINS) {
+        throw new HarnessError(`search ${name} must be an array of 1-${MAX_DOMAINS} domains.`);
+    }
+
+    const domains = value.map((entry) => {
+        if (typeof entry !== 'string') {
+            throw new HarnessError(`search ${name} entries must be strings.`);
+        }
+
+        const trimmed = entry.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+
+        if (trimmed.length === 0 || trimmed.length > MAX_DOMAIN_CHARS) {
+            throw new HarnessError(`search ${name} entries must be 1-${MAX_DOMAIN_CHARS} characters.`);
+        }
+
+        return trimmed;
+    });
+
+    return domains.length > 0 ? domains : undefined;
+};
+
+// A date filter is an ISO-8601 date or datetime, validated rather than passed
+// through: Exa rejects a malformed one with a 400 that would otherwise arrive as
+// an opaque "Exa search failed", costing the turn twice.
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+
+const readDate = (value: unknown, name: string): string | undefined => {
+    if (value === undefined) return undefined;
+
+    if (typeof value !== 'string' || !ISO_DATE.test(value.trim())) {
+        throw new HarnessError(`search ${name} must be an ISO-8601 date, for example "2026-01-01".`);
+    }
+
+    return value.trim();
+};
+
+const readCategory = (value: unknown): string | undefined => {
+    if (value === undefined) return undefined;
+
+    if (typeof value !== 'string' || value.trim().length === 0 || value.trim().length > 64) {
+        throw new HarnessError('search category must be a short string, for example "news" or "company".');
+    }
+
+    return value.trim().toLowerCase();
+};
+
+const readSpeed = (value: unknown): 'balanced' | 'fast' => {
+    if (value === undefined) return 'balanced';
+
+    if (value !== 'balanced' && value !== 'fast') {
+        throw new HarnessError('search speed must be "balanced" or "fast".');
+    }
+
+    return value;
 };
 
 const readMaxResults = (value: unknown): number => {
@@ -240,10 +314,23 @@ const readInvocation = (
         throw new HarnessError('search requires a non-empty query string.');
     }
 
+    const since = readDate(input?.since, 'since');
+    const until = readDate(input?.until, 'until');
+
+    if (since !== undefined && until !== undefined && until < since) {
+        throw new HarnessError('search "until" must not be earlier than "since".');
+    }
+
     return {
         query,
         maxResults: readMaxResults(input?.maxResults),
-        provider: readProvider(input?.provider, configured, fallback)
+        provider: readProvider(input?.provider, configured, fallback),
+        includeDomains: readDomains(input?.includeDomains, 'includeDomains'),
+        excludeDomains: readDomains(input?.excludeDomains, 'excludeDomains'),
+        since,
+        until,
+        category: readCategory(input?.category),
+        speed: readSpeed(input?.speed)
     };
 };
 
@@ -315,6 +402,46 @@ const metadataFor = (configured: readonly WebsearchProvider[]): WebSearchMetadat
                     maximum: MAX_RESULTS_LIMIT,
                     description: `How many results to return. Defaults to ${DEFAULT_MAX_RESULTS}; larger values are clamped to ${MAX_RESULTS_LIMIT}.`
                 },
+                // The filters the provider supports and the tool previously hid. A
+                // model that cannot name a domain or a date range has to over-fetch
+                // and post-filter in its own context, which is the expensive way to
+                // do what one request argument does server-side.
+                includeDomains: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    maxItems: 20,
+                    description: 'Only return results from these domains (hostnames, no scheme). Up to 20.'
+                },
+                excludeDomains: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    maxItems: 20,
+                    description: 'Never return results from these domains. Up to 20.'
+                },
+                // NOTE: "e.g.", never "for example", in these descriptions. A test
+                // asserts a Tavily-only harness's serialized schema does not contain
+                // the substring "exa" (a proxy for "no unconfigured provider is
+                // named"), and "example" contains it. Rephrasing here is cheaper than
+                // loosening that assertion, which is guarding something real.
+                since: {
+                    type: 'string',
+                    description: 'Only results published on or after this ISO-8601 date, e.g. "2026-01-01".'
+                },
+                until: {
+                    type: 'string',
+                    description: 'Only results published on or before this ISO-8601 date.'
+                },
+                category: {
+                    type: 'string',
+                    maxLength: 64,
+                    description: 'Source category to favour, e.g. "news", "company", "publication" or "people".'
+                },
+                speed: {
+                    type: 'string',
+                    enum: ['balanced', 'fast'],
+                    description:
+                        '"fast" asks the provider for its low-latency, lower-cost mode (results come from its index rather than live page fetches). Defaults to "balanced".'
+                },
                 ...(providerProperty ?? {})
             },
             required: ['query'],
@@ -377,7 +504,13 @@ export const createWebSearchTool = (
                     query: invocation.query,
                     maxResults: invocation.maxResults,
                     apiKey,
-                    redact
+                    redact,
+                    includeDomains: invocation.includeDomains,
+                    excludeDomains: invocation.excludeDomains,
+                    since: invocation.since,
+                    until: invocation.until,
+                    category: invocation.category,
+                    speed: invocation.speed
                 });
             } catch (error) {
                 // Adapters already emit sanitized HarnessErrors. Anything else is a
@@ -391,7 +524,16 @@ export const createWebSearchTool = (
                 provider: invocation.provider,
                 query: invocation.query,
                 maxResults: invocation.maxResults,
-                results
+                results,
+                // Echo the filters that were applied, so a model can tell "no results
+                // exist" from "my filter excluded everything" — the difference between
+                // retrying wider and giving up.
+                ...(invocation.includeDomains ? { includeDomains: invocation.includeDomains } : {}),
+                ...(invocation.excludeDomains ? { excludeDomains: invocation.excludeDomains } : {}),
+                ...(invocation.since ? { since: invocation.since } : {}),
+                ...(invocation.until ? { until: invocation.until } : {}),
+                ...(invocation.category ? { category: invocation.category } : {}),
+                ...(invocation.speed !== 'balanced' ? { speed: invocation.speed } : {})
             };
 
             return result;

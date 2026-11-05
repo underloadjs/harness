@@ -35,6 +35,7 @@ import type {
     DisplayState,
     HarnessUsage,
     PageMeta,
+    SessionDefinitionResource,
     SessionResponse,
     SessionSummaryPage,
     TaskReceipt,
@@ -353,6 +354,57 @@ describe('harness contract DTO shapes', () => {
         type TranscriptWriteFields = keyof UpdateThreadTranscriptRequest;
         const fields: TranscriptWriteFields[] = ['messages', 'if_revision'];
         expect(fields).toEqual(['messages', 'if_revision']);
+    });
+
+    // R2/R3: the frozen-definition read is the resource a SAVED session paints swatches from, so
+    // `agent_colors` has to be part of `SessionDefinitionResource`, not only of `HarnessDefinition`.
+    // The spec gets there through the schema's `allOf` branch, so the guard is a type probe: a
+    // future spec edit that drops the field, renames it, or changes its value shape fails to
+    // COMPILE here (this file is excluded from `npm run typecheck`, so `npx tsc` on it is the
+    // proving command).
+    it('carries the per-agent display colors on both definition reads', () => {
+        type CardColors = import('./harness-api').HarnessDefinition['agent_colors'];
+        type FrozenColors = import('./harness-api').SessionDefinitionResource['agent_colors'];
+
+        // The session copy names the SAME optional map (agent id -> hex string) as the global
+        // identified read; `Equal` is mutual assignability, so a rename or a narrowed value type
+        // on either side fails the declaration below.
+        const sameMapOnBothReads: Expect<Equal<FrozenColors, CardColors>> = true;
+
+        expect(sameMapOnBothReads).toBe(true);
+
+        // A wire-shaped frozen read that states colors is assignable, and the map keys are plain
+        // agent ids. Required fields are spelled out so a spec edit that makes one optional (or
+        // adds one) surfaces here rather than in a `Partial`.
+        const frozen: SessionDefinitionResource = {
+            name: 'painted',
+            title: 'Painted',
+            description: 'Two-member fixture with one configured swatch.',
+            requires_endpoint: false,
+            primary: 'research',
+            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
+            tools: ['timeNow'],
+            builtin: false,
+            definition_revision: 3,
+            agent_colors: { summarizer: '#4ade80' },
+            session_id: 'ses_1',
+            revision: 3,
+            frozen_at: 1762250000000,
+            source_revision: 3,
+            current_revision: 3,
+            current: true
+        };
+
+        // Byte-for-byte the map the server emits: `sessionDefinitionOf` (src/server/api-reads.ts)
+        // copies the frozen `HarnessDescriptor.agentColors` map, and OMITS the key entirely when
+        // that map is empty, so an uncolored session keeps the exact pre-R2 row.
+        expect(frozen.agent_colors).toEqual({ summarizer: '#4ade80' });
+
+        const uncolored: SessionDefinitionResource = { ...frozen };
+
+        delete uncolored.agent_colors;
+        expect(Object.hasOwn(uncolored, 'agent_colors')).toBe(false);
     });
 });
 

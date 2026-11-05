@@ -11,16 +11,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createWebFetchTool, WEB_FETCH_METADATA } from '@underload/harness';
 import type { Tool, WebFetchParameters, WebFetchResult } from '@underload/harness';
-// The native page budget lives here (100 KiB); the hosted providers answer
-// through ../websearch/request's own, larger JSON budget (512 KiB). Importing
-// both under distinct names pins the fact that they are two different policies.
+// The native page budget lives here (1 MiB); the hosted providers answer
+// through ../websearch/request's own JSON budget (512 KiB). Importing both under
+// distinct names pins the fact that they are two different policies.
 import { MAX_RESPONSE_BYTES as PROVIDER_MAX_RESPONSE_BYTES } from '../websearch/request';
 import {
     BROWSER_USER_AGENT,
     FETCH_TIMEOUT_MS,
     HONEST_USER_AGENT,
     MAX_CONTENT_CHARS,
-    MAX_RESPONSE_BYTES
+    MAX_RESPONSE_BYTES,
+    MAX_RESULT_BYTES,
+    MAX_RESULT_CONTENT_BYTES,
+    binaryExtension,
+    charsetFrom,
+    isPrivateHost,
+    safeFetchUrl
 } from './request';
 
 const call = async (
@@ -133,14 +139,14 @@ describe('factory and schema', () => {
         expect(WEB_FETCH_METADATA.parameters).toEqual(definition.parameters);
         expect(
             Object.keys((WEB_FETCH_METADATA.parameters as { properties: Record<string, unknown> }).properties)
-        ).toEqual(['url', 'format']);
+        ).toEqual(['url', 'format', 'query', 'offset']);
     });
 
     it('offers no provider property without a key', () => {
         const definition = keyless();
         const properties = (definition.parameters as { properties: Record<string, unknown> }).properties;
 
-        expect(Object.keys(properties)).toEqual(['url', 'format']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset']);
         expect(definition.description).not.toContain('exa');
         expect(definition.description).not.toContain('linkup');
     });
@@ -153,16 +159,75 @@ describe('factory and schema', () => {
 
         expect(definition.description).toContain(`bounded to ${MAX_RESPONSE_BYTES} bytes of body`);
         expect(definition.description).toContain(`${MAX_CONTENT_CHARS} characters`);
-        expect(definition.description).toContain('a non-text content type is rejected');
+        expect(definition.description).toContain('A non-text content type is rejected');
         expect(definition.description).toContain('use the `download` tool instead');
-        expect(MAX_RESPONSE_BYTES).toBe(100 * 1024);
+        // Raised 10x from 100 KiB. The byte cap was acting as a content cap: it
+        // refused pages whose converted text fitted the character bound easily
+        // (measured: 5 of the top 10 results of a real search were unreadable
+        // purely on raw HTML size — GitHub, a docs site, arxiv, and Wikipedia).
+        expect(MAX_RESPONSE_BYTES).toBe(1024 * 1024);
+        // Raised 10x from 24,000 characters.
+        expect(MAX_CONTENT_CHARS).toBe(240_000);
+    });
+
+    it('keeps one result inside the harness model-facing cap', async () => {
+        // The harness caps every tool result at 64 KiB and replaces an over-budget
+        // value with a generic envelope that drops url/title/truncated/nextOffset.
+        // fetch bounds itself to that cap so it keeps its own shape and stays
+        // resumable; MAX_CONTENT_CHARS is the per-PAGE bound, reached by paging.
+        expect(MAX_RESULT_BYTES).toBe(64 * 1024);
+        expect(MAX_RESULT_CONTENT_BYTES).toBeLessThan(MAX_CONTENT_CHARS);
+
+        stubFetch(() =>
+            response('x'.repeat(MAX_RESULT_CONTENT_BYTES + 10), { headers: { 'content-type': 'text/plain' } })
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/long' });
+
+        expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(result.truncated).toBe(true);
+        expect(result.nextOffset).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(result.pageCharacters).toBe(MAX_RESULT_CONTENT_BYTES + 10);
+    });
+
+    it('resumes a cut page from the offset it reported', async () => {
+        const page = 'x'.repeat(MAX_RESULT_CONTENT_BYTES) + 'TAILCONTENT';
+
+        stubFetch(() => response(page, { headers: { 'content-type': 'text/plain' } }));
+
+        const first = await call(keyless(), { url: 'https://example.com/page' });
+
+        expect(first.truncated).toBe(true);
+        expect(first.nextOffset).toBe(MAX_RESULT_CONTENT_BYTES);
+
+        const second = await call(keyless(), { url: 'https://example.com/page', offset: first.nextOffset });
+
+        expect(second.content).toBe('TAILCONTENT');
+        expect(second.offset).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(second.truncated).toBe(false);
+        expect(second.nextOffset).toBeUndefined();
+    });
+
+    it('reports truncation from the source, not from the slice (off-by-one)', async () => {
+        // A page ending exactly at the bound is complete; one cut at the bound is
+        // not. Both return the same character count, so only the source length
+        // distinguishes them.
+        stubFetch(() =>
+            response('y'.repeat(MAX_RESULT_CONTENT_BYTES), { headers: { 'content-type': 'text/plain' } })
+        );
+
+        const whole = await call(keyless(), { url: 'https://example.com/whole' });
+
+        expect(whole.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(whole.truncated).toBe(false);
+        expect(whole.nextOffset).toBeUndefined();
     });
 
     it('offers the provider choice when an Exa key exists', () => {
         const definition = withExa();
         const properties = (definition.parameters as { properties: Record<string, { enum?: string[] }> }).properties;
 
-        expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset', 'provider']);
         expect(properties.provider.enum).toEqual(['native', 'exa']);
         expect(definition.description).toContain('exa');
     });
@@ -171,7 +236,7 @@ describe('factory and schema', () => {
         const definition = withLinkup();
         const properties = (definition.parameters as { properties: Record<string, { enum?: string[] }> }).properties;
 
-        expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset', 'provider']);
         expect(properties.provider.enum).toEqual(['native', 'linkup']);
         expect(definition.description).toContain('linkup');
         expect(definition.description).not.toContain('exa');
@@ -212,7 +277,7 @@ describe('factory and schema', () => {
         const definition = createWebFetchTool({ env: { EXA_API_KEY: 'env-exa-key' }, exa: { apiKey: '' } });
         const properties = (definition.parameters as { properties: Record<string, unknown> }).properties;
 
-        expect(Object.keys(properties)).toEqual(['url', 'format']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset']);
     });
 
     it('treats an explicit blank linkup key as "off" as well', () => {
@@ -222,7 +287,7 @@ describe('factory and schema', () => {
         });
         const properties = (definition.parameters as { properties: Record<string, unknown> }).properties;
 
-        expect(Object.keys(properties)).toEqual(['url', 'format']);
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'query', 'offset']);
         expect(definition.description).not.toContain('linkup');
     });
 
@@ -435,14 +500,14 @@ if (a &lt; 2) log(a);</pre>
 
     it('refuses every non-text content type instead of returning mojibake', async () => {
         const cases: Array<{ mime: string; message: string }> = [
-            { mime: 'image/png', message: 'fetch does not support this content type (image/png).' },
-            { mime: 'application/pdf', message: 'fetch does not support this content type (application/pdf).' },
+            { mime: 'image/png', message: 'fetch does not support this content type (image/png): use the `download` tool' },
+            { mime: 'application/pdf', message: 'fetch does not support this content type (application/pdf): use the `download` tool' },
             {
                 mime: 'application/octet-stream',
-                message: 'fetch does not support this content type (application/octet-stream).'
+                message: 'fetch does not support this content type (application/octet-stream): use the `download` tool'
             },
-            { mime: 'audio/mpeg', message: 'fetch does not support this content type (audio/mpeg).' },
-            { mime: 'video/mp4', message: 'fetch does not support this content type (video/mp4).' }
+            { mime: 'audio/mpeg', message: 'fetch does not support this content type (audio/mpeg): use the `download` tool' },
+            { mime: 'video/mp4', message: 'fetch does not support this content type (video/mp4): use the `download` tool' }
         ];
 
         for (const { mime, message } of cases) {
@@ -497,7 +562,7 @@ if (a &lt; 2) log(a);</pre>
         const counters = { produced: 0, cancelled: false };
 
         // No content-length header at all, so only the per-chunk counter can catch
-        // this. Chunks are 64 KiB: two of them (131,072 bytes) cross the 100 KiB
+        // this. Chunks are 64 KiB, so 17 of them (1,114,112 bytes) cross the 1 MiB
         // budget, and the network does not guarantee any particular chunk size.
         stubFetch(
             async () =>
@@ -513,24 +578,31 @@ if (a &lt; 2) log(a);</pre>
 
         // The reader was cancelled: the host must not keep sending after the cap.
         expect(counters.cancelled).toBe(true);
-        // And it stopped with the chunk that crossed the budget — no third chunk is
-        // consumed on the way to the error.
-        expect(counters.produced).toBe(2);
+        // And it stopped with the chunk that crossed the budget — no further chunk
+        // is consumed on the way to the error.
+        expect(counters.produced).toBe(17);
     });
 
     it('accepts a body that is exactly at the byte budget', async () => {
-        // The bound rejects strictly larger, never equal: 1 KiB + 99 KiB is exactly
-        // MAX_RESPONSE_BYTES, so both chunks must be delivered.
-        const first = 'a'.repeat(1024);
-        const second = 'b'.repeat(MAX_RESPONSE_BYTES - 1024);
+        // The bound rejects strictly larger, never equal: two chunks summing to
+        // exactly MAX_RESPONSE_BYTES must both be delivered. (The old test carried
+        // character assertions under a byte-budget name, so the byte boundary
+        // itself was never pinned; the content bound is pinned separately below.)
+        const first = 'a'.repeat(512 * 1024);
+        const second = 'b'.repeat(MAX_RESPONSE_BYTES - first.length);
 
         stubFetch(() => response(streamOf([first, second]), { headers: { 'content-type': 'text/plain' } }));
 
         const result = await call(keyless(), { url: 'https://example.com/exact' });
 
+        // Accepted, not rejected — and the result is still bounded by the harness
+        // cap, with the rest of the page reachable by offset.
         expect(result.truncated).toBe(true);
-        expect(result.characters).toBe(MAX_CONTENT_CHARS);
-        expect(result.content).toBe(first + 'b'.repeat(MAX_CONTENT_CHARS - first.length));
+        expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(result.pageCharacters).toBe(MAX_RESPONSE_BYTES);
+        // The first 512 KiB of the body is all 'a', so the first result window is
+        // all 'a' too; the rest of the megabyte is reachable by offset.
+        expect(result.content).toBe('a'.repeat(MAX_RESULT_CONTENT_BYTES));
     });
 
     it('bounds the returned content and flags truncation', async () => {
@@ -539,8 +611,10 @@ if (a &lt; 2) log(a);</pre>
         const result = await call(keyless(), { url: 'https://example.com' });
 
         expect(result.truncated).toBe(true);
-        expect(result.characters).toBe(MAX_CONTENT_CHARS);
-        expect(result.content).toHaveLength(MAX_CONTENT_CHARS);
+        expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(result.content).toHaveLength(MAX_RESULT_CONTENT_BYTES);
+        // The page is bigger than one result, and the tool says so.
+        expect(result.pageCharacters).toBe(MAX_CONTENT_CHARS + 500);
     });
 
     it('times out with one fixed sentence', async () => {
@@ -641,6 +715,8 @@ describe('linkup provider', () => {
 
         // The whole result, exactly: Linkup renders markdown and sends no title,
         // so `title` is absent and the content type is the converted document.
+        // `offset`/`pageCharacters` are always present: a caller must be able to
+        // tell a complete page from a cut one without inferring it from the size.
         expect(result).toEqual({
             provider: 'linkup',
             url: 'https://example.com/page',
@@ -648,7 +724,9 @@ describe('linkup provider', () => {
             format: 'markdown',
             characters: markdown.length,
             truncated: false,
-            content: markdown
+            content: markdown,
+            offset: 0,
+            pageCharacters: markdown.length
         });
     });
 
@@ -687,7 +765,7 @@ describe('linkup provider', () => {
 
     it('keeps the hosted provider byte budget at 512 KiB', async () => {
         // The hosted adapters answer through ../websearch/request's JSON budget,
-        // which the 100 KiB native page bound deliberately did not change.
+        // which the native page bound deliberately did not change.
         expect(PROVIDER_MAX_RESPONSE_BYTES).toBe(512 * 1024);
 
         stubFetch(() =>
@@ -711,7 +789,198 @@ describe('linkup provider', () => {
         const prefix = '[redacted] then [redacted] ';
 
         expect(result.truncated).toBe(true);
-        expect(result.characters).toBe(MAX_CONTENT_CHARS);
-        expect(result.content).toBe(prefix + 'x'.repeat(MAX_CONTENT_CHARS - prefix.length));
+        // One RESULT is capped by the harness model-facing budget, not by
+        // MAX_CONTENT_CHARS: the page is bounded at 240,000 characters and reached
+        // by paging with `offset`, while a single return stays inside 64 KiB so the
+        // harness never replaces this tool's envelope with its generic one.
+        expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        expect(result.content).toBe(prefix + 'x'.repeat(MAX_RESULT_CONTENT_BYTES - prefix.length));
+        expect(result.pageCharacters).toBe(MAX_CONTENT_CHARS + prefix.length);
+        expect(result.nextOffset).toBe(MAX_RESULT_CONTENT_BYTES);
+    });
+
+});
+
+describe('fetch: content shape and safety (defect fixes)', () => {
+    it('refuses a binary extension before any transfer, pointing at download', async () => {
+        // `fetch` is the structured-content path; a file is `download`'s job. The
+        // refusal is on the URL, so no request is made at all.
+        let requests = 0;
+
+        stubFetch(() => {
+            requests += 1;
+
+            return response('<p>should never be read</p>');
+        });
+
+        for (const url of [
+            'https://example.com/a.png',
+            'https://example.com/b.PDF',
+            'https://example.com/c.zip',
+            'https://example.com/d.mp4'
+        ]) {
+            await expect(call(keyless(), { url })).rejects.toThrow(/use the `download` tool for binary content/);
+        }
+
+        expect(requests).toBe(0);
+
+        // Text extensions and extensionless pages still fetch.
+        stubFetch(() => response('<p>fine</p>'));
+        for (const url of ['https://example.com/a.md', 'https://example.com/b.svg', 'https://example.com/page']) {
+            const result = await call(keyless(), { url });
+            expect(result.url).toBe(url);
+        }
+    });
+
+    it('refuses a private or loopback target instead of reading the host', async () => {
+        // Measured on the old implementation: a local server on 127.0.0.1 answered
+        // a fetch and returned its own 404, which is both an internal read and a
+        // port-open oracle.
+        for (const url of [
+            'http://127.0.0.1:8765/x',
+            'http://localhost/x',
+            'http://169.254.169.254/latest/meta-data/',
+            'http://10.0.0.5/x',
+            'http://[::1]/x'
+        ]) {
+            await expect(call(keyless(), { url })).rejects.toThrow(/not a public absolute http\(s\) address/);
+        }
+
+        expect(isPrivateHost('127.0.0.1')).toBe(true);
+        expect(isPrivateHost('192.168.1.1')).toBe(true);
+        expect(isPrivateHost('::1')).toBe(true);
+        expect(isPrivateHost('example.com')).toBe(false);
+        expect(isPrivateHost('93.184.216.34')).toBe(false);
+        expect(safeFetchUrl('http://127.0.0.1/')).toBeUndefined();
+        expect(safeFetchUrl('https://example.com/')).toBe('https://example.com/');
+    });
+
+    it('refuses a redirect that lands on a private address', async () => {
+        stubFetch(() =>
+            response(null, {
+                status: 302,
+                headers: { location: 'http://127.0.0.1/internal' }
+            })
+        );
+
+        await expect(call(keyless(), { url: 'https://example.com/jump' })).rejects.toThrow(
+            /refused a redirect to a non-public address/
+        );
+    });
+
+    it('follows a redirect to a public host and reports the hop', async () => {
+        let hop = 0;
+
+        stubFetch(() => {
+            hop += 1;
+
+            return hop === 1
+                ? response(null, { status: 301, headers: { location: 'https://final.example/moved' } })
+                : response('<p>moved content</p>', { url: 'https://final.example/moved' });
+        });
+
+        const result = await call(keyless(), { url: 'https://example.com/moved' });
+
+        expect(result.url).toBe('https://final.example/moved');
+        expect(result.redirects).toBe(1);
+        expect(result.content).toContain('moved content');
+    });
+
+    it('decodes a declared charset instead of assuming UTF-8', async () => {
+        // 0xe9 is e-acute in windows-1252. The old decoder was always UTF-8, so
+        // this byte came back as U+FFFD.
+        const cp1252 = new Uint8Array([0x3c, 0x68, 0x31, 0x3e, 0x43, 0x61, 0x66, 0xe9, 0x3c, 0x2f, 0x68, 0x31, 0x3e]);
+
+        stubFetch(() => new Response(cp1252, { status: 200, headers: { 'content-type': 'text/html; charset=windows-1252' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/latin' });
+
+        // The h1 became a markdown heading, and the 0xe9 decoded to e-acute rather
+        // than to the replacement character UTF-8 decoding produced.
+        expect(result.content).toBe('# Caf\u00e9');
+        expect(charsetFrom('text/html; charset=windows-1252')).toBe('windows-1252');
+        expect(charsetFrom('text/html; charset="utf-8"')).toBe('utf-8');
+        expect(charsetFrom('text/html')).toBeUndefined();
+        // An unrecognised label must not lose the page.
+        expect(charsetFrom('text/html; charset=totally-made-up')).toBe('totally-made-up');
+    });
+
+    it('strips highlighter markup inside code fences', async () => {
+        // Measured on a real docs page: every fence came back as
+        // `<code><span class="line"><span style="color:#79B8FF">cd</span>...`,
+        // ~200 characters of styling noise per line of actual code.
+        stubFetch(() =>
+            html(
+                '<pre><code class="language-ts"><span class="line"><span style="color:#79B8FF">cd</span> scripts</span></code></pre>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/code' });
+
+        expect(result.content).toContain('cd scripts');
+        expect(result.content).not.toContain('<span');
+        expect(result.content).not.toContain('style=');
+    });
+
+    it('keeps an unescaped comparison inside a code fence intact', async () => {
+        // The narrow strip list exists for exactly this: a blanket tag strip would
+        // eat `<b && c>` from `if (a<b && c>d)`.
+        stubFetch(() => html('<pre><code>if (a&lt;b &amp;&amp; c&gt;d) {}</code></pre>'));
+
+        const result = await call(keyless(), { url: 'https://example.com/compare' });
+
+        expect(result.content).toContain('if (a<b && c>d) {}');
+    });
+
+    it('returns only matching sections when query is given', async () => {
+        stubFetch(() =>
+            html(
+                '<h1>Manual</h1><p>Intro prose.</p>' +
+                    '<h2>Installation</h2><p>Run npm install.</p>' +
+                    '<h2>Usage</h2><p>Call the tool.</p>' +
+                    '<h2>Security</h2><p>Rotate the token.</p>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/manual', query: 'install' });
+
+        expect(result.query).toBe('install');
+        expect(result.matches).toBe(1);
+        expect(result.totalSections).toBe(4);
+        expect(result.content).toContain('Run npm install.');
+        expect(result.content).not.toContain('Rotate the token.');
+        expect(result.content).toContain('## Installation');
+    });
+
+    it('reports no match instead of silently returning the whole page', async () => {
+        stubFetch(() => html('<h2>Usage</h2><p>Call the tool.</p>'));
+
+        await expect(call(keyless(), { url: 'https://example.com/manual', query: 'zzz-nothing' })).rejects.toThrow(
+            /found no section matching/
+        );
+    });
+
+    it('treats query as a literal phrase, not a regular expression', async () => {
+        // An unescaped `(` from a model must not become a syntax error.
+        stubFetch(() => html('<h2>Notes (draft)</h2><p>Body.</p>'));
+
+        const result = await call(keyless(), { url: 'https://example.com/n', query: 'Notes (draft)' });
+
+        expect(result.matches).toBe(1);
+    });
+
+    it('rejects an unknown argument rather than ignoring it', async () => {
+        // The schema says additionalProperties:false and core/schema-validation.ts
+        // enforces that on the model path, so a hallucinated argument must fail.
+        const { resolveToolParameters } = await import('@underload/harness');
+        const definition = withHosted();
+
+        expect(() =>
+            resolveToolParameters(
+                definition.parameters as Record<string, unknown>,
+                { url: 'https://example.com/', bogus: 1 },
+                'model'
+            )
+        ).toThrow(/must not include the additional property "bogus"/);
     });
 });

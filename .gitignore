@@ -38,3 +38,9 @@ Thumbs.db
 
 # Agent scratch space (see root AGENTS.md) - never commit
 /Temp/
+
+# Where the `download` tool saves fetched files when the harness runs with this
+# directory as its working directory (tools/webdownload saves to
+# .underload/downloads so glob/grep/read can reach the bytes). Runtime output,
+# produced by the agent, never source.
+.underload/

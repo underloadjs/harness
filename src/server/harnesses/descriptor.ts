@@ -66,6 +66,12 @@ export const describeAgents = (profiles: readonly AgentProfile[]): AgentDescript
 // `agentModels` (R9) is emitted only when at least one agent has an override, so
 // every existing card keeps its exact descriptor shape. It is the OVERRIDE map,
 // not the effective one: an agent it omits uses the session's model.
+//
+// `agentColors` (R2) follows the identical rule for the identical reason: the map of
+// explicitly configured swatches, emitted only when the harness configures at least
+// one. A member it omits has NO configured color, and the host applies its own
+// derivation for that one — which is why this is the override map and never a
+// "resolved palette".
 export const describeHarness = (
     preset: HarnessPreset,
     catalogue?: DescriptorCatalogue
@@ -103,6 +109,13 @@ export const describeHarness = (
         // instruction, and the UI pairs the two to show what an agent really runs.
         ...(Object.keys(preset.agentInstructions ?? {}).length > 0
             ? { agentInstructions: { ...preset.agentInstructions } }
+            : {}),
+        // R2: the per-agent COLOR map, emitted under the same non-empty rule as the two
+        // maps above, so an uncolored card keeps its exact pre-R2 shape. It is the
+        // explicit override map, not a resolved palette: a member it omits has no
+        // configured color, and the host applies its own derivation for that one.
+        ...(Object.keys(preset.agentColors ?? {}).length > 0
+            ? { agentColors: { ...preset.agentColors } }
             : {}),
         builtin: preset.builtin,
         editable: preset.editable
