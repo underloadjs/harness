@@ -238,9 +238,10 @@ describe('session agent bindings', () => {
         expect(roster.body.total).toBe(before.body.total + 1);
         expect(roster.body.agents.map((row: Record<string, any>) => row.agent_id)).toContain(BINDING);
 
-        // The instruction subresource states the text this member ACTUALLY runs: the override
-        // plus the profile's trusted guidelines, composed by the one function that joins them
-        // (`agentInstruction`, src/agents/index.ts:113) — the same composition a restart replays.
+        // The instruction subresource states the text this member ACTUALLY runs. Since T6 a
+        // stored override IS that complete text — verbatim, with no guideline block appended
+        // — which is what `agentInstruction` (src/agents/index.ts) now returns, and the same
+        // composition a restart replays.
         const instruction = jsonOf(
             await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents/${BINDING}/instruction`)
         );
@@ -250,6 +251,10 @@ describe('session agent bindings', () => {
         expect(instruction.body.instruction).toBe(
             agentInstruction(profile, 'Compress the answer into one paragraph.')
         );
+
+        // The contract, spelled out: exactly the operator's sentence, nothing appended.
+        expect(instruction.body.instruction).toBe('Compress the answer into one paragraph.');
+        expect(instruction.body.instruction).not.toContain('Guidelines:');
         expect(instruction.body.source).toBe('harness');
         expect(instruction.body.chars).toBe(instruction.body.instruction.length);
 
@@ -385,12 +390,15 @@ describe('session agent bindings', () => {
 
         // The leading block is exactly one message now, and every message after it is byte for
         // byte what was there before: no reset, no reseed of the conversation. The stored text is
-        // the COMPOSED prompt (override + the profile's trusted guidelines), because
-        // `agentInstruction` is the single place that joins them and a restart feeds the raw
-        // override through the same call — live and rebuilt must agree character for character.
+        // what the agent runs, and since T6 an override IS the complete text (no guideline block
+        // appended), because the box that produced it holds the whole effective prompt. The one
+        // helper that decides this is `agentInstruction` (src/agents/index.ts) — the same call a
+        // restart feeds the raw override through, so live and rebuilt agree character for
+        // character.
         const composed = agentInstruction(effectiveAgentProfile(primary)!, 'Answer in exactly two sentences.');
 
         expect(brain.instructions).toEqual([composed]);
+        expect(brain.instructions).toEqual(['Answer in exactly two sentences.']);
         expect(brain.messages[0]).toEqual({ role: 'system', content: composed });
         expect(brain.messages.length).toBe(history.length - seededInstructionLength + 1);
         expect(JSON.parse(JSON.stringify(brain.messages.slice(1)))).toEqual(history.slice(seededInstructionLength));
@@ -516,6 +524,10 @@ describe('session agent bindings', () => {
         expect(live.instructions).toEqual([
             agentInstruction(effectiveAgentProfile(BINDING)!, 'Compress the answer into one paragraph.')
         ]);
+
+        // T6 spelled out: the rebuild seeds the stored text VERBATIM. A restart must not
+        // re-grow the guideline block a full-prompt edit removed.
+        expect(live.instructions).toEqual(['Compress the answer into one paragraph.']);
 
         // The exact restored roster. `inherited_model` is still the session's own model (the
         // binding did not rewrite the creation-time baseline), and the original member is still

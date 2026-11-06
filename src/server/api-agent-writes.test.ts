@@ -393,8 +393,16 @@ describe('durable agent decisions across a restart', () => {
 
         expect(after.status).toBe(201);
 
-        const shippedPrompt = agentInstruction(agentProfile('instruct'));
-        const operatorPrompt = agentInstruction(agentProfile('instruct'), 'The operator instruction.');
+        // The two prompts, spelled out rather than re-derived from the helper under test:
+        // the existing session keeps the shipped composition, and the new one runs the
+        // OPERATOR's identity sentence with the profile's guidelines composed underneath —
+        // because a `PATCH /agents/{id}` rewrites the PROFILE's `instruction` field, and an
+        // un-overridden profile still gets the guideline block (T6 leaves that default alone;
+        // only a harness/session instruction override skips it).
+        const guidelinesBlock = (guidelines: readonly string[]) =>
+            `Guidelines:\n${guidelines.map((line) => `- ${line}`).join('\n')}`;
+        const shippedPrompt = `${agentProfile('instruct').instruction}\n\n${guidelinesBlock(agentProfile('instruct').guidelines)}`;
+        const operatorPrompt = `The operator instruction.\n\n${guidelinesBlock(agentProfile('instruct').guidelines)}`;
 
         const existing = await call(runtime, 'GET', `${MOUNT}/sessions/${beforeId}/agents/instruct/instruction`);
         const fresh = await call(runtime, 'GET', `${MOUNT}/sessions/${afterId}/agents/instruct/instruction`);

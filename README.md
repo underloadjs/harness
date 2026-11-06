@@ -2362,7 +2362,10 @@ system prompt (identity line, blank line, `Guidelines:` bullets) because several
 OpenAI-compatible gateways accept a single system turn — seeding two `system`
 messages used to drop the guidelines on those models — so the definition a UI renders
 and the prompt a model receives are the same text. A client can select an agent id; it
-can never supply instruction text.
+can never supply instruction text. That join is the **default**: when a harness or session
+stores an instruction override, `agentInstruction()` returns it verbatim as the complete
+prompt and appends no guideline block, because the override is edited as one box holding
+the whole effective prompt.
 
 Guidelines carry **policy, not an inventory**. Every request already declares its
 callable tools with name, description, and schema (`offerDeclarations` in
@@ -2580,9 +2583,10 @@ validated like `agentModels` (keys must be final members; values trimmed, non-em
 at most 8000 characters, and free of control characters other than tab/newline/CR, so
 multi-line prose is legal) and REPLACED wholesale on `PATCH`, so `{}` clears every
 override and an agent the map omits runs its trusted `GET /api/agents` instruction.
-The override replaces only the profile's identity sentence: its `guidelines` still
-compose into the system message, and the shipped profile in `src/agents` is never
-rewritten. An instruction edit is EXECUTABLE, so it rebuilds the harness factory and
+A stored value IS the member's **complete prompt**: `agentInstruction(profile, override)`
+returns it verbatim, so the profile's `guidelines` are the default an un-overridden
+member runs on and are never appended underneath an override, and the shipped profile in
+`src/agents` is never rewritten. An instruction edit is EXECUTABLE, so it rebuilds the harness factory and
 is persisted with the registry row; a saved session keeps the instructions its agents
 were built with (its system messages are already in the transcript), which is why
 `PATCH /api/sessions/:id` still accepts `agentModels` only. The browser's agent dialog

@@ -3,10 +3,10 @@
 // This file pins the redesigned three-column frontend and the behaviours the
 // change is for:
 //   - R1: the harness rail lists the server catalogue and offers a create action;
-//   - R2: a horizontal agent row labels primary/secondary, the trailing + opens a
-//     trusted preset picker, selecting a member promotes it, and a saved session
-//     freezes its team (editing is locked; R7 removed the in-row notice/link, so
-//     the Sessions rail's own New session is the way to an editable team);
+//   - R2: the agent configuration is ONE dialog opened from the composer's single button. A
+//     harness template's save PATCHes `/harnesses/:name`; since T7b (R5/R6/R7) a SAVED
+//     conversation edits its own team, prompts and models through `/sessions/{id}/agents...`,
+//     keeps its entry agent fixed, and can gain an agent the catalogue never advertised;
 //   - R3 (as amended by R21.2 and T3/R1): sessions are filtered to the selected
 //     harness and rendered as PILLS under its title; the right rail is the scratch board
 //     alone — no tool list and no session list;
@@ -785,16 +785,20 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // Empty field, no pending work: the action is gone again (R10).
     expect(composerAction.hidden).toBe(true);
     expect(composerAction.dataset.action).toBe('none');
-    // A session exists now, so the TEAM and the INSTRUCTIONS are frozen: editing them
-    // needs the rail's own New session. R7 removed the in-row lock notice and its
-    // link; T3/R3 locks both editors and states the reason ON the controls, with no
-    // explanation paragraph inside the dialog.
-    expect(instructionBox().disabled).toBe(true);
+    // T7b (R5/R6): a session exists, and it is NOT a lock — the conversation edits its own team
+    // and its own prompts, so both editors are live and `[+]` offers another member. What the
+    // conversation cannot change is its entry agent (R5), and R3 still states every restriction
+    // ON the control, with no explanation paragraph inside the dialog.
+    expect(instructionBox().disabled).toBe(false);
     expect(memberToggle().disabled).toBe(true);
     expect(dialogNote()).toBeNull();
-    expect(teamLockReason()).toBe(
-        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
+    expect(instructionBox().getAttribute('title')).toBe(
+        'The instruction this agent runs in this conversation.'
     );
+    // The member viewed here is the primary, so its removal is impossible for the structural
+    // reason — and R7 makes this session's `[+]` a name field as well as a catalogue picker.
+    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
+    expect(teamLockReason()).toBe('Add an agent to the team, or name a new one.');
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
     // R1 (T3) + R4 (T9): the create action is the compact `+` beside the cycler. Its
@@ -1239,19 +1243,23 @@ it('restores a remembered session with its frozen team and server timings', asyn
     // pane is detached while the chat owns the stage — tools-tab.test.ts pins the
     // text). What matters here is that no right-rail core dropdown came back.
     expect(document.querySelector('.core-tools')).toBeNull();
-    // T3/R3: a frozen team locks the promotion, the instruction editor and the team
-    // controls, each stating the real reason on the control itself. The explanation
-    // paragraph is gone, and so is the `[+]` route: a saved conversation adds nobody.
-    expect(instructionBox().disabled).toBe(true);
+    // T7b (R5/R6): restoring a conversation does NOT lock its configuration. The instruction
+    // editor and the team controls are live (they edit THIS conversation), each restriction that
+    // does exist is stated on the control itself, and the explanation paragraph stays gone. What
+    // a saved conversation cannot do is move its entry agent (R5).
+    expect(instructionBox().disabled).toBe(false);
     expect(memberToggle().disabled).toBe(true);
     expect(promoteToggle().disabled).toBe(true);
-    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);
     expect(dialogNote()).toBeNull();
     expect(applyAction().textContent).toBe('Save configuration');
     expect(applyAction().disabled).toBe(true);
-    expect(teamLockReason()).toBe(
-        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
+    expect(instructionBox().getAttribute('title')).toBe(
+        'The instruction this agent runs in this conversation.'
     );
+    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
+    expect(promoteToggle().title).toBe('The primary agent is fixed for a saved conversation.');
+    expect(teamLockReason()).toBe('Add an agent to the team, or name a new one.');
     // The frozen roster is THIS conversation's team, and only it.
     expect(agentEntries()).toEqual(['instruct', 'summarizer']);
     // R7: the frozen team is visible through its disabled controls.
@@ -2209,10 +2217,14 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     byClass('.agent-dialog-add', 'button').click();
     byClass('.agent-dialog-add-option[data-agent="summarizer"]', 'button').click();
     expect(configuredAgent()).toBe('summarizer');
-    expect(instructionBox().value).toBe('Compress notes into at most two sentences.');
-    expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-guideline')].map((node) => node.textContent)
-    ).toEqual(['Keep names and numbers.']);
+    // R4 (T7a): the added member's box holds the FULL prompt the agent runs — its identity
+    // sentence AND its guideline block — and there is no second read-only reference to compare it
+    // against (the `.agent-detail` element this assertion used to read is gone).
+    expect(instructionBox().value).toBe(
+        'Compress notes into at most two sentences.\n\nGuidelines:\n- Keep names and numbers.'
+    );
+    expect(document.querySelector('.agent-detail')).toBeNull();
+    expect(document.querySelector('.agent-dialog-revert')).toBeNull();
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
 
     selectConfigured('instruct');
@@ -2416,7 +2428,7 @@ it('drops a removed member from the roster and offers it back through the add pi
     expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
 });
 
-it('views a frozen team and saves a model draft through the session PATCH', async () => {
+it('views a saved conversation’s team and saves a model draft through the session PATCH', async () => {
     const frozen = descriptor({
         agents: ['instruct', 'summarizer'],
         primary: 'instruct',
@@ -2468,10 +2480,15 @@ it('views a frozen team and saves a model draft through the session PATCH', asyn
     selectConfigured('summarizer');
     await flush();
 
+    // T7b (R2/R5/R6): the conversation's prompts and team are its own to edit, and VIEWING another
+    // member is not a team change, so the strip reaches every member and nothing here is locked by
+    // the session. The one thing the conversation cannot do is move its entry agent, and a
+    // promotion cannot be armed at all.
     expect(configuredAgent()).toBe('summarizer');
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(instructionBox().disabled).toBe(true);
-    expect(memberToggle().disabled).toBe(true);
+    expect(instructionBox().disabled).toBe(false);
+    expect(memberToggle().disabled).toBe(false);
+    expect(promoteToggle().disabled).toBe(true);
     // No team change was attempted, and the action cannot promote here.
     expect(patches).toEqual([]);
     expect(applyAction().textContent).toBe('Save configuration');
@@ -2501,6 +2518,118 @@ it('views a frozen team and saves a model draft through the session PATCH', asyn
     expect(configuredAgent()).toBe('summarizer');
     expect(agentRoles()).toEqual(['primary', 'secondary']);
     expect(byClass('.agent-model-select', 'select').value).toBe('m2');
+});
+
+it('adds a member to a saved conversation through its own roster, never the harness template', async () => {
+    // T7b (R5/R7): the same `[+]` press that PATCHes `/harnesses/:name` in a template context is a
+    // `POST /sessions/{id}/agents` here, and the conversation's roster is the thing that grows.
+    // The shared double answers the create AND the reads that follow from one state, so the tab on
+    // screen after the save is evidence the roster moved — not evidence the client redrew it.
+    const frozen = descriptor({
+        agents: ['instruct'],
+        primary: 'instruct',
+        subagents: []
+    });
+    const saved = snapshot({ id: 's1', harnessDefinition: frozen } as Partial<SessionSnapshot>);
+
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ presets: [descriptor()], sessions: [saved] }));
+        if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: saved });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: [saved] });
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // A one-member team: `[+]` still offers the trusted library, and picking one is a local draft.
+    addAgent('summarizer');
+    expect(agentEntries()).toEqual(['instruct', 'summarizer']);
+    expect(calls.filter((call) => call.method === 'POST' && call.url.startsWith('/api/sessions/'))).toEqual([]);
+
+    applyAction().click();
+    await flush();
+    await flush();
+    await flush();
+
+    // Exactly one roster write, on the conversation, with the profile named — and no template write
+    // of any kind (a conversation's team is not the template's team). `/api/models` is POSTed by
+    // the catalogue read, so the filter is scoped to the session surface.
+    expect(calls.filter((call) => call.method === 'POST' && call.url.startsWith('/api/sessions/'))).toEqual([
+        {
+            url: '/api/sessions/s1/agents',
+            method: 'POST',
+            body: { name: 'summarizer', profile: 'summarizer' }
+        }
+    ]);
+    expect(calls.filter((call) => call.method === 'PATCH' && call.url.startsWith('/api/harnesses'))).toEqual([]);
+    expect(calls.filter((call) => call.method === 'PATCH' && call.url === '/api/sessions/s1')).toEqual([]);
+
+    // The added member is still on the strip after the refresh, and the save states its scope.
+    expect(agentEntries()).toEqual(['instruct', 'summarizer']);
+    expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
+        'agent configuration saved · applies to this conversation'
+    );
+    expect(byClass('.status', 'span').dataset.state).toBe('idle');
+});
+
+it('blocks removing an agent a conversation in the session runs, with the reason on the control', async () => {
+    // T7b (R6): `instance.threads` is the shell's live host-thread roster, and a member that owns
+    // one cannot be detached (src/server/sessions.ts:5059-5074 answers 409 on exactly that
+    // condition). The control says so, and the reason is repeated as a visible note because a
+    // disabled control's tooltip is not reachable.
+    const frozen = descriptor({
+        agents: ['instruct', 'summarizer'],
+        primary: 'instruct',
+        subagents: ['summarizer']
+    });
+    const saved = snapshot({
+        id: 's1',
+        harnessDefinition: frozen,
+        threads: [
+            { id: 'thread-2', agent: 'summarizer', origin: 'host', status: 'idle', sequence: 2, label: 'SU2' }
+        ]
+    } as Partial<SessionSnapshot>);
+
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ presets: [frozen], sessions: [saved] }));
+        if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: saved });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: [saved] });
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The primary is removable in principle (no thread names it) and the secondary is not.
+    openAgents();
+    expect(memberToggle().disabled).toBe(true);
+    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
+
+    selectConfigured('summarizer');
+    expect(memberToggle().disabled).toBe(true);
+    expect(memberToggle().title).toBe(
+        'This agent is used by a conversation in this session; delete that conversation before removing the agent.'
+    );
+    expect(byClass('.agent-dialog-inuse', 'p').textContent).toBe(
+        'This agent is in use by a conversation and cannot be removed.'
+    );
+
+    // A press of a disabled control drafts nothing, so a save cannot be armed and no DELETE can
+    // race the conversation that owns the member.
+    byClass('.agent-dialog-remove', 'button').click();
+    expect(applyAction().disabled).toBe(true);
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
 });
 
 it('filters the session strip to the selected harness and opens within it', async () => {
@@ -3944,7 +4073,10 @@ it('deletes an inactive session on the first click, with no confirmation panel',
     expect(document.querySelector('.harness-note')?.textContent).toBe('');
     expect(document.querySelector<HTMLElement>('.harness-note')?.hidden).toBe(true);
     openAgents();
-    expect(instructionBox().disabled).toBe(true);
+    // T7b (R5/R6): deleting ANOTHER conversation changes nothing about this one — and this one's
+    // own configuration is editable, because a saved conversation owns its team and prompts. The
+    // delete drafted nothing, so the save action is still asleep.
+    expect(instructionBox().disabled).toBe(false);
     expect(applyAction().disabled).toBe(true);
     // No session was created: a delete is not a submit.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);

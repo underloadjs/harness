@@ -4,10 +4,12 @@
 // ------------
 // ONE strip of clickable tabs lists the agents THIS conversation/harness actually has
 // — the team members, primary first, exactly as the server reports them. Selecting a
-// tab shows THAT agent's configuration: its instruction (editable), its model
-// (editable) and its trusted preset instruction (read-only reference). Nothing else
-// is listed: an agent the team does not select has no configuration here yet, so it
-// gets its own tab through the `[+]` control instead.
+// tab shows THAT agent's configuration: ONE editable instruction box holding the FULL
+// effective instruction (R4: no read-only "preset" block and no revert control — the
+// box is the whole truth) and ONE model dropdown. Nothing else is listed: an agent the
+// team does not select has no configuration here yet, so it gets its own tab through
+// the `[+]` control instead — and in a session (`allowCustom`) the reader can also type
+// a brand-new agent name (R7) and get a tab the same way.
 //
 // Selecting a tab is a VIEW change. It never promotes and never writes: making an
 // agent the primary is an explicit control (`Make primary`) inside its own panel, so
@@ -32,27 +34,34 @@
 //
 // The baseline maps (`options.models.models`, `options.instructions`) are the
 // server's answer, so an editor always opens on the TRUTH, and the diff against it
-// is what `changesOf()` reports to `onApply`. An explicit '' in a draft means
-// "clear the override" (use the resolved default model / the trusted preset
-// instruction), which is how a saved override is reverted.
+// is what `changesOf()` reports to `onApply`. An explicit '' in a draft means "clear
+// it" (use the resolved default model / drop the stored instruction so the agent runs
+// its default instruction again), which is how a saved value is reverted — by the
+// box's own text, not by a dedicated control.
 //
-// The trusted PRESET text a baseline falls back to is a second source, and it is NOT
-// in the boot page: `GET /agents` rows are summaries with no prompt
-// (../shared/harness-api.ts:552-563), so main.ts folds the identified profile read
-// (`GET /agents/:id`, ./api.ts `getAgent`) into `options.agents` before this dialog
-// ever renders a fallback (./main.ts `loadAgentPresetTexts`). A tab that shows an
-// agent that walk never covered — an agent added through `[+]` — asks for its text
-// through `onRequestPreset`, so the read rides an explicit selection and never a
-// render. A row still empty after that means the server genuinely has no prompt to
-// show (a retired profile 404s), which is the honest blank, not a silent one.
+// The DEFAULT text a baseline falls back to is the FULL composed prompt
+// (./agents.ts `agentDefaultInstructionOf`), whose identity sentence comes from the
+// library row. That row is a second source and it is NOT in the boot page: `GET
+// /agents` rows are summaries with no prompt (../shared/harness-api.ts:552-563), so
+// main.ts folds the identified profile read (`GET /agents/:id`, ./api.ts `getAgent`)
+// into `options.agents` before this dialog ever renders a fallback (./main.ts
+// `loadAgentPresetTexts`). A tab that shows an agent that walk never covered — an
+// agent added through `[+]` — asks for its text through `onRequestPreset`, so the read
+// rides an explicit selection and never a render. A row still empty after that means
+// the server genuinely has no prompt to show (a retired profile 404s), which is the
+// honest blank, not a silent one. A name the reader typed (R7) never asks at all: the
+// server has nothing to say about an agent it has never heard of, so its box starts
+// empty by design.
 //
 // THE ROSTER (who has a tab)
 // --------------------------
 // `rosterOf()` is the saved team PLUS the drafted adds MINUS the drafted removals.
-// It is the only listing in the dialog, and `[+]` offers exactly the catalogue agents
-// missing from it. Removing a member drops its tab immediately (the roster shown is
-// the roster the save would produce); the draft still carries `member: false` so the
-// delta is honest, and re-adding it through `[+]` cancels the removal.
+// It is the only listing in the dialog. `[+]` offers the catalogue agents missing from
+// it, and in a session (`allowCustom`) also a form that turns a typed name into a tab
+// (R7); a catalogue-only host (a harness template) still lists only agents the server
+// advertises. Removing a member drops its tab immediately (the roster shown is the
+// roster the save would produce); the draft still carries `member: false` so the delta
+// is honest, and re-adding it through `[+]` cancels the removal.
 //
 // TRANSACTIONAL APPLY
 // -------------------
@@ -64,11 +73,20 @@
 //
 // HONEST RESTRICTIONS
 // -------------------
-// `editable` is the TEAM lock (a saved conversation's frozen team, an in-flight run,
-// a session being created). It gates `[+]`, `Make primary`, `Remove from team` and
-// the instruction editor. Models keep their own flag inside `models` (a saved session
-// edits its live model map), so the dialog offers model editing exactly where the
-// server does.
+// `editable` is the TEAM lock (an in-flight run, a session being created). It gates
+// `[+]`, `Make primary`, `Remove from team` and the instruction editor. Models keep
+// their own flag inside `models` (a saved session edits its live model map), so the
+// dialog offers model editing exactly where the server does.
+//
+// `scope` says WHERE a save lands — 'session' edits this conversation's own agents and
+// instructions, 'harness' edits the template new sessions start from (R5). It changes
+// the copy only: the shell owns which route a save takes. `canPromote: false` (a saved
+// conversation's entry agent is fixed) disables `Make primary` AND makes an armed
+// promotion impossible, so the action can never promise "Save & set primary" somewhere
+// that cannot promote. `threadAgents` names the agents a conversation in this session
+// already runs, and one of those cannot be removed (R6): its control is disabled WITH
+// the reason, and the reason is repeated as a visible note under the actions because a
+// tooltip on a disabled control is not reachable.
 //
 // R3 removed the lock EXPLANATION paragraph: the restriction is stated where it
 // bites — the footer's one short line says what Save can actually do here, and every
@@ -89,7 +107,7 @@
 // Cross-references:
 //   - src/frontend/main.ts             open/refresh/close lifecycle + onApply PATCH
 //   - src/frontend/ui/agent-control.ts the composer button that opens this dialog
-//   - src/frontend/ui/agents.ts        createAgentModelSelect/createAgentPresetDetail
+//   - src/frontend/ui/agents.ts        createAgentModelSelect/agentDefaultInstructionOf
 //   - src/frontend/ui/agent-color.ts   paintAgentColor — R4 paints every roster badge
 //                                      and every `[+]` option with that agent's tone, so
 //                                      a badge, the composer button and the transcript
@@ -102,9 +120,9 @@
 import type { AgentDescriptor } from '../../server/protocol';
 import {
     UNKNOWN_MODEL_LABEL,
+    agentDefaultInstructionOf,
     agentDetailsOf,
     createAgentModelSelect,
-    createAgentPresetDetail,
     displayTitleOf
 } from './agents';
 import type { AgentModelSelect } from './agents';
@@ -129,12 +147,13 @@ export type AgentConfigurationApply = {
     // Model choices the reader touched: agent id → model id, or '' for "use the
     // resolved default" (delete the override).
     models: Record<string, string>;
-    // Instruction choices the reader touched: agent id → text, or '' for "revert to
-    // the trusted preset instruction".
+    // Instruction choices the reader touched: agent id → the full text the agent
+    // should run, or '' for "no stored instruction", which lets the agent fall back to
+    // the default instruction its library row describes (R4: one box, cleared by hand).
     instructions: Record<string, string>;
-    // Explicit membership changes. `add` comes from `[+]`, `remove` from
-    // `Remove from team`; `add` never removes anyone, and a promoted agent is never
-    // in `remove`.
+    // Explicit membership changes. `add` comes from `[+]` (a catalogue pick or a name
+    // typed in a session), `remove` from `Remove from team`; `add` never removes
+    // anyone, and a promoted agent is never in `remove`.
     add: string[];
     remove: string[];
 };
@@ -151,20 +170,38 @@ export type AgentDialogOptions = {
     members: readonly string[];
     primary: string;
     // The trusted agent library from GET /agents (or the boot fallback), with each
-    // row's preset text filled in by the identified profile read — see the header
-    // note for why the page alone is not enough.
+    // row's default-instruction text filled in by the identified profile read — see
+    // the header note for why the page alone is not enough.
     agents: readonly AgentDescriptor[];
     // TEAM + instruction editing. Models carry their own flag inside `models`.
     editable: boolean;
     models: AgentModelSelect;
-    // The stored per-agent INSTRUCTION OVERRIDES (the textarea's baseline). A member
-    // absent here runs its trusted preset instruction, which is the text the editor
-    // is seeded with.
+    // The stored per-agent INSTRUCTION text (the textarea's baseline). A member
+    // absent here is seeded with its default instruction — the full prompt the server
+    // composes, identity sentence plus guidelines (./agents.ts
+    // `agentDefaultInstructionOf`).
     instructions: Readonly<Record<string, string>>;
-    // Asks main.ts for the trusted preset text of an agent this dialog is about to
+    // R5: WHERE a save lands, which decides only the copy the reader is shown.
+    // 'session' edits this conversation's own agents and instructions; 'harness' (the
+    // default, so every existing caller keeps its old wording) edits the template.
+    scope?: 'session' | 'harness';
+    // R7: offer a "New agent" name field in the `[+]` picker, so a session can gain an
+    // agent the catalogue never advertised. False (the default) keeps the picker
+    // catalogue-only, which is what a harness template needs.
+    allowCustom?: boolean;
+    // Whether `Make primary` may be armed at all. A saved conversation's entry agent is
+    // fixed, so its shell passes false and the action can never offer a promotion the
+    // session cannot perform. Defaults to true.
+    canPromote?: boolean;
+    // R6: agents a conversation in this session already runs. Each of those keeps its
+    // tab but cannot be removed, and the control says why. Defaults to empty, so a
+    // harness (which has no threads) is unaffected.
+    threadAgents?: readonly string[];
+    // Asks main.ts for the trusted instruction text of an agent this dialog is about to
     // show (see the header note). Optional: a caller that has no such read (a test, a
     // host without the agent route) simply keeps the library text it was given. The
-    // answer arrives through `update()`, so this never writes anything.
+    // answer arrives through `update()`, so this never writes anything. Never called
+    // for a name the reader typed, because the server has no row for it.
     onRequestPreset?: (agent: string) => void;
     activity?: readonly string[];
     // The real reason the team/instructions are locked. Used as the accessible
@@ -183,7 +220,7 @@ export type AgentDialog = {
     update(next: AgentDialogOptions): void;
     // Repaint ONLY the activity state on the existing tabs. Used for live event
     // frames: rebuilding the whole dialog for every `start`/`done` would throw away
-    // the caret and collapse open details mid-interaction.
+    // the caret and close an add picker the reader is typing in mid-interaction.
     paintActivity(active: ReadonlySet<string>): void;
 };
 
@@ -203,7 +240,8 @@ const el = <K extends keyof HTMLElementTagNameMap>(
 type AgentDraft = {
     // Model id, or '' for the resolved default (clear the override).
     model?: string;
-    // Instruction text, or '' to revert to the trusted preset instruction.
+    // Instruction text exactly as typed, or '' for "no stored instruction", which lets
+    // the agent fall back to the default instruction its library row describes.
     instruction?: string;
     // Explicit membership: true adds the agent, false removes it.
     member?: boolean;
@@ -240,17 +278,55 @@ const titleOf = (agents: readonly AgentDescriptor[], name: string): string => {
     return title.length > 0 ? title : 'Agent';
 };
 
+// T7b (R7): the label for an agent ON THIS TEAM.
+//
+// A session's roster can name an agent the catalogue has never advertised — the reader typed
+// that name into the `[+]` form, and the conversation now runs it. `agentDetailsOf`'s neutral
+// fallback ('Agent', ./agents.ts:161-171) exists to keep an UNKNOWN id out of visible text (R3),
+// and for a member it points at nothing: the id IS the identity the reader chose, and rendering
+// 'Agent' makes a real teammate read like a failed lookup (two of them are indistinguishable).
+// So a rostered name with no library row is displayed as written, and a name that is NOT on the
+// roster keeps the neutral fallback exactly as before — `[+]` options, a promotion target, or a
+// stale `selected` after a refresh have no team entry to justify showing their id.
+const memberTitleOf = (options: AgentDialogOptions, state: DialogState, name: string): string =>
+    options.agents.some((agent) => agent.name === name) || !rosterOf(options, state).includes(name)
+        ? titleOf(options.agents, name)
+        : name;
+
+// ---------------------------------------------------------------------------
+// Optional capability flags (R5/R6/R7). Each defaults to the behaviour a caller
+// written before that rule expects — a harness template, an in-flight run, an older
+// test fixture — so adding the flags changed no existing call site. Reading them
+// through these helpers keeps every rule below a plain boolean instead of a repeated
+// `options.x === undefined ? … : …` chain.
+// ---------------------------------------------------------------------------
+// R5: 'session' edits this conversation, 'harness' (default) edits the template.
+const isSessionScope = (options: AgentDialogOptions): boolean => options.scope === 'session';
+
+// R7: a session may gain an agent the catalogue never advertised.
+const allowsCustomAgent = (options: AgentDialogOptions): boolean => options.allowCustom === true;
+
+// R6/R5: a saved conversation's entry agent is fixed; everything else may promote.
+const mayPromote = (options: AgentDialogOptions): boolean => options.canPromote !== false;
+
+// R6: an agent some conversation in this session already runs. Ids compare exactly,
+// because the roster, `primary` and `threadAgents` are all server-side agent ids.
+const usedByThread = (options: AgentDialogOptions, name: string): boolean =>
+    (options.threadAgents ?? []).includes(name);
+
 // The modal header names the agent being configured, because that is what the tab
 // strip — and therefore the whole dialog — is about.
 const dialogTitle = (options: AgentDialogOptions, state: DialogState): string =>
-    `Agents · ${titleOf(options.agents, state.selected)}`;
+    `Agents · ${memberTitleOf(options, state, state.selected)}`;
 
 // The roster: the agents with a badge. Saved members first, in the exact order the
 // server reports them (a saved conversation can name an agent the catalogue no longer
 // advertises, so members come from `options.members`, never from the library), then
-// the drafted additions in the order they were added — and only while the catalogue
-// still advertises them, because an agent the server stopped offering cannot be
-// joined (and `[+]` would not offer it again). A drafted removal drops the badge now,
+// the drafted additions in the order they were added. A catalogue-only dialog (a
+// harness template) drops an addition the server stopped offering, because such an
+// agent cannot be joined and `[+]` would not offer it again; a session
+// (`allowCustom`) keeps it, because the reader typed that name and the session accepts
+// agents the catalogue has never heard of (R7). A drafted removal drops the badge now,
 // because the list on screen is the list a save would produce.
 const rosterOf = (options: AgentDialogOptions, state: DialogState): string[] => {
     const roster: string[] = [];
@@ -263,7 +339,9 @@ const rosterOf = (options: AgentDialogOptions, state: DialogState): string[] => 
     for (const [name, draft] of state.drafts) {
         if (draft.member !== true) continue;
         if (options.members.includes(name)) continue;
-        if (!options.agents.some((agent) => agent.name === name)) continue;
+        if (!allowsCustomAgent(options) && !options.agents.some((agent) => agent.name === name)) {
+            continue;
+        }
         if (!roster.includes(name)) roster.push(name);
     }
 
@@ -292,27 +370,30 @@ const addableOf = (options: AgentDialogOptions, state: DialogState): string[] =>
 const isDraftedAddition = (options: AgentDialogOptions, state: DialogState, name: string): boolean =>
     !options.members.includes(name) && state.drafts.get(name)?.member === true;
 
-// Does this agent currently carry a STORED override (as opposed to a draft one)?
-const hasStoredOverride = (options: AgentDialogOptions, name: string): boolean =>
-    (options.instructions[name] ?? '').trim().length > 0;
-
-// The instruction the textarea starts from: the saved override when this harness has
-// one, otherwise the trusted preset text. An absent override is therefore NOT an
-// empty box — the reader edits the words the agent actually runs. The preset side of
-// that pair is the library row main.ts filled from `GET /agents/:id`
-// (./main.ts `loadAgentPresetTexts`); a row that is still empty after that read names
-// a profile this server no longer publishes, and the blank is the truth.
+// The instruction the textarea starts from: the text this scope saved for the agent,
+// otherwise that agent's DEFAULT instruction — the full prompt the server composes
+// (identity sentence plus its `Guidelines:` block), not the identity alone (R4). The
+// default side of that pair is the library row main.ts filled from `GET /agents/:id`
+// (./main.ts `loadAgentPresetTexts`); a row that is still empty after that read names a
+// profile this server no longer publishes, and the blank is the truth. A name the
+// reader typed has no row at all, so its box honestly starts empty.
 const baselineInstructionOf = (options: AgentDialogOptions, name: string): string => {
-    const override = (options.instructions[name] ?? '').trim();
+    // A stored value that is only whitespace is "nothing saved": falling through keeps
+    // the box showing the words the agent actually runs instead of an empty one. The
+    // saved text is used VERBATIM (never trimmed) so a save round-trips byte-identical.
+    const stored = options.instructions[name] ?? '';
 
-    return override.length > 0 ? override : agentDetailsOf(options.agents, name).instruction;
+    return stored.trim().length > 0
+        ? stored
+        : agentDefaultInstructionOf(agentDetailsOf(options.agents, name));
 };
 
 // The promotion this dialog's action represents: the agent armed by `Make primary`,
-// and only while the team is editable. `undefined` means "no promotion" — the tab
+// and only while the team is editable AND the scope can promote at all (R5/R6: a saved
+// conversation's entry agent is fixed). `undefined` means "no promotion" — the tab
 // selection itself never promotes (R3).
 const promotionOf = (options: AgentDialogOptions, state: DialogState): string | undefined =>
-    options.editable ? state.promote : undefined;
+    options.editable && mayPromote(options) ? state.promote : undefined;
 
 // Is there anything worth sending? Computed from the DELTA the action would actually
 // produce (plus an armed promotion), so "pending" can never disagree with the request:
@@ -390,7 +471,8 @@ const editDraft = (
 
 // The single line that states what this dialog can do right now. R3: it is the ONLY
 // explanation of a lock — the paragraph above the editors is gone, and a locked
-// control carries its own reason.
+// control carries its own reason. R5: when a save IS possible the line says where it
+// lands, because "Saves" alone no longer answers that question in a conversation.
 const footerNoteOf = (options: AgentDialogOptions, state: DialogState): string => {
     if (!options.editable) {
         return options.models.editable
@@ -401,10 +483,19 @@ const footerNoteOf = (options: AgentDialogOptions, state: DialogState): string =
     const promoted = promotionOf(options, state);
 
     if (promoted !== undefined) {
-        return `Saves this harness and makes ${titleOf(options.agents, promoted)} the primary.`;
+        // Sessions normally cannot arm a promotion (`canPromote: false`), so the
+        // session wording is the honest fallback for a host that does allow one — it
+        // must never claim a harness write the reader did not make.
+        return `Saves ${isSessionScope(options) ? 'on this conversation' : 'this harness'} and makes ${memberTitleOf(
+            options,
+            state,
+            promoted
+        )} the primary.`;
     }
 
-    return 'Saves on this harness · new sessions run what you save here.';
+    return isSessionScope(options)
+        ? 'Saves on this conversation · only this session’s agents and instructions change.'
+        : 'Saves on this harness template · new sessions start with these agents and instructions.';
 };
 
 // Re-arm the action after a draft edit WITHOUT rebuilding the body: a rebuild on
@@ -421,7 +512,7 @@ const syncAction = (options: AgentDialogOptions, state: DialogState): void => {
         ? 'Saving…'
         : pending
           ? 'Save this configuration' +
-            (promoted === undefined ? '' : ` and make ${titleOf(options.agents, promoted)} the primary`) +
+            (promoted === undefined ? '' : ` and make ${memberTitleOf(options, state, promoted)} the primary`) +
             '. Closing the dialog saves nothing.'
           : 'Nothing has changed yet.';
 };
@@ -442,8 +533,8 @@ const focusTab = (root: HTMLElement, name = ''): void => {
 
 // Move the view onto one agent. Selection is a VIEW change: nothing is sent and nobody
 // is promoted (R3), which is also what makes it the right moment to ask for that
-// agent's trusted preset text — the reader chose it explicitly, so the read is paid for
-// by a click or an arrow key, never by a render. `onRequestPreset` is a no-op for an
+// agent's default instruction text — the reader chose it explicitly, so the read is paid
+// for by a click or an arrow key, never by a render. `onRequestPreset` is a no-op for an
 // agent whose library row already carries text, so re-selecting a tab is free.
 const selectMemberTab = (options: AgentDialogOptions, state: DialogState, member: string): void => {
     if (member === '' || state.selected === member) return;
@@ -473,13 +564,18 @@ const createAddControl = (options: AgentDialogOptions, state: DialogState): HTML
         return add;
     }
 
-    if (addable.length === 0) {
+    // An exhausted catalogue would normally close the picker, but in a session the
+    // reader can still gain an agent the server never advertised (R7), so `[+]` stays
+    // live and the picker opens on the name form alone.
+    if (addable.length === 0 && !allowsCustomAgent(options)) {
         add.disabled = true;
         add.title = 'Every agent the server offers is already on this team.';
         return add;
     }
 
-    add.title = 'Add an agent to the team.';
+    add.title = allowsCustomAgent(options)
+        ? 'Add an agent to the team, or name a new one.'
+        : 'Add an agent to the team.';
     add.addEventListener('click', () => {
         state.adding = !state.adding;
         state.paint(state.adding ? 'add-first' : 'add');
@@ -488,8 +584,129 @@ const createAddControl = (options: AgentDialogOptions, state: DialogState): HTML
     return add;
 };
 
-// The picker: the agents WITHOUT a tab, one button each. Picking one only DRAFTS the
-// membership and moves the view to it — nothing is sent until the action.
+// ---------------------------------------------------------------------------
+// R7: a session can run agents the catalogue never advertised, so its `[+]` panel also
+// takes a typed name. The id contract is the server's own: every agent-name field in
+// ../server/harness.swagger.yaml (lines 816/1735/2885/2896/3461/4401) is
+// `pattern: '^[a-z][a-z0-9_-]*$'`, so the form validates exactly that client-side and a
+// typo is caught before a save round-trip instead of coming back as a 400.
+// ---------------------------------------------------------------------------
+const CUSTOM_AGENT_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/;
+
+// The one reserved id. `unknown` is what the transcript, the event stream and
+// ./ui/agent-control.ts print for an agent nobody can identify, so a reader-created
+// agent with that name would make two different facts share one label.
+const RESERVED_AGENT_NAME = 'unknown';
+
+// The typed name's verdict, or '' when the name is usable. An empty field is also '' —
+// the panel must not scold a form the reader has not filled in yet. Agent ids are
+// case-sensitive on the server, but a name that differs from an existing one only by
+// case would still read as the same word (and the pattern already rejects capitals), so
+// the collision check folds case against the roster AND the primary, which a drafted
+// removal may have just taken off the strip.
+const customAgentNameError = (
+    options: AgentDialogOptions,
+    state: DialogState,
+    typed: string
+): string => {
+    const name = typed.trim();
+
+    if (name === '') return '';
+
+    if (!CUSTOM_AGENT_NAME_PATTERN.test(name)) {
+        return 'Use a lowercase name that starts with a letter and continues with letters, digits, "-" or "_".';
+    }
+
+    if (name.toLowerCase() === RESERVED_AGENT_NAME) {
+        return '"unknown" is the reserved name for an agent the server cannot identify.';
+    }
+
+    const taken = [...rosterOf(options, state), options.primary].some(
+        (member) => member.toLowerCase() === name.toLowerCase()
+    );
+
+    if (taken) return `An agent named ${name} is already on this team.`;
+
+    return '';
+};
+
+// The "New agent" half of the `[+]` panel. Like a catalogue pick it only DRAFTS the
+// membership and moves the view: nothing is sent until the action, and dismissal drops
+// it. It never calls `onRequestPreset`, because the server has no row to read for a name
+// nobody published — that agent's instruction box honestly starts empty.
+const createCustomAgentForm = (options: AgentDialogOptions, state: DialogState): HTMLElement => {
+    const form = el('div', 'agent-dialog-add-custom');
+
+    const name = el('input', 'agent-dialog-add-input field-input');
+    name.type = 'text';
+    name.setAttribute('aria-label', 'New agent name');
+    name.placeholder = 'New agent name';
+    // The server caps an agent name at 64 characters; the attribute stops the reader
+    // where the contract does instead of rejecting a long word on save.
+    name.maxLength = 64;
+    name.title = 'Lowercase letters, digits, "-" and "_", starting with a letter.';
+
+    // Announced, not a paragraph the reader has to hunt for, and only ever filled when
+    // the typed name is actually unusable.
+    const error = el('p', 'agent-dialog-add-error', '');
+    error.setAttribute('role', 'status');
+
+    const create = el('button', 'agent-dialog-add-create', 'Create agent');
+    create.type = 'button';
+    create.title = 'Add this agent to the team. Its instruction is empty until you write one.';
+
+    // Stays ENABLED even when the name is unusable: a press is what shows the reason,
+    // and a disabled button would swallow it (a tooltip on a disabled control is not
+    // reachable). The verdict is written straight into the live nodes, so no repaint
+    // moves the caret mid-word.
+    const show = (message: string): void => {
+        error.textContent = message;
+        create.setAttribute('aria-disabled', message.length > 0 ? 'true' : 'false');
+    };
+
+    name.addEventListener('input', () => {
+        show(customAgentNameError(options, state, name.value));
+    });
+
+    const submitName = (): void => {
+        const trimmed = name.value.trim();
+        const message = customAgentNameError(options, state, trimmed);
+
+        show(message);
+
+        // Nothing typed, or an unusable name: the panel keeps the reason and drafts
+        // nobody.
+        if (trimmed === '' || message !== '') return;
+
+        editDraft(state, trimmed, (draft) => {
+            draft.member = true;
+        });
+        state.selected = trimmed;
+        state.adding = false;
+        state.paint(`tab:${trimmed}`);
+    };
+
+    create.addEventListener('click', submitName);
+
+    // Enter in the field is the same press. The dialog body is a plain <div>, so this
+    // is a keydown handler rather than a form submit, and `preventDefault` stops Enter
+    // reaching the dialog's own key handling (Escape/Tab trapping, ui/dialog.ts).
+    name.addEventListener('keydown', (event: Event) => {
+        const keyboard = event as KeyboardEvent;
+        if (keyboard.key !== 'Enter') return;
+
+        keyboard.preventDefault();
+        submitName();
+    });
+
+    form.append(el('p', 'agent-dialog-add-custom-label', 'New agent'), name, create, error);
+
+    return form;
+};
+
+// The picker: the agents WITHOUT a tab, one button each, and in a session the "New
+// agent" form after them. Picking one only DRAFTS the membership and moves the view to
+// it — nothing is sent until the action.
 const createAddPicker = (options: AgentDialogOptions, state: DialogState): HTMLElement | undefined => {
     if (!state.adding) return undefined;
 
@@ -515,7 +732,7 @@ const createAddPicker = (options: AgentDialogOptions, state: DialogState): HTMLE
             state.selected = name;
             state.adding = false;
             // An agent added here was never part of the definition the dialog-open walk
-            // covered, so its trusted preset text is asked for by this same press
+            // covered, so its trusted instruction text is asked for by this same press
             // (see `selectMemberTab` for why a selection is the right moment).
             options.onRequestPreset?.(name);
             state.paint(`tab:${name}`);
@@ -524,12 +741,34 @@ const createAddPicker = (options: AgentDialogOptions, state: DialogState): HTMLE
         list.append(option);
     }
 
+    // R7: the name form comes last, so the agents the server already offers stay the
+    // first thing a reader sees. A locked team cannot gain an agent at all, and a
+    // harness template only accepts catalogue agents, so neither gets the form.
+    if (allowsCustomAgent(options) && options.editable) {
+        list.append(createCustomAgentForm(options, state));
+    }
+
     return list;
 };
+
+// R6: an agent some conversation in this session already runs cannot be taken off the
+// team (its transcript names it). The primary is exempt because its own, stronger
+// reason already disables the control, and a locked team is already fully explained by
+// the lock hint — so this says exactly when the THREAD reason is the reason, and the
+// disabled control's tooltip and the visible note below can never disagree.
+const isRemovalBlockedByThread = (
+    options: AgentDialogOptions,
+    name: string,
+    isPrimary: boolean
+): boolean => options.editable && !isPrimary && usedByThread(options, name);
 
 // The two explicit membership controls inside the selected agent's panel. R3: the
 // tab strip selects WHAT you view; these change WHO is on the team, and each one
 // states its effect instead of leaving a disabled control unexplained.
+//
+// R5/R6 add two more reasons the reader must be told about, in the order the reason
+// actually applies: a saved conversation's entry agent is fixed (`canPromote: false`),
+// and an agent some conversation already runs cannot be removed at all (`threadAgents`).
 const createMembershipActions = (
     options: AgentDialogOptions,
     state: DialogState,
@@ -546,7 +785,7 @@ const createMembershipActions = (
     promote.dataset.agent = name;
 
     const armed = promotionOf(options, state) === name;
-    const promotable = options.editable && !isPrimary;
+    const promotable = options.editable && mayPromote(options) && !isPrimary;
 
     // A toggle keeps ONE name and changes state: screen readers announce
     // "Make primary, pressed", the accent paints the same fact, and the action's label
@@ -558,12 +797,18 @@ const createMembershipActions = (
     promote.setAttribute('aria-pressed', armed ? 'true' : 'false');
     promote.title = !options.editable
         ? (options.hint ?? 'The agent team is locked here.')
-        : isPrimary
-          ? 'The primary agent is already the primary.'
-          : armed
-            ? `Cancel the promotion, so ${label} stays a team member without leading the team.`
-            : `Make ${label} the primary agent when you save.`;
+        : !mayPromote(options)
+          ? // R5: a saved conversation keeps the entry agent it started with, so the
+            // control is not merely busy — it has nothing to do here.
+            'The primary agent is fixed for a saved conversation.'
+          : isPrimary
+            ? 'The primary agent is already the primary.'
+            : armed
+              ? `Cancel the promotion, so ${label} stays a team member without leading the team.`
+              : `Make ${label} the primary agent when you save.`;
     promote.addEventListener('click', () => {
+        if (!promotable) return;
+
         state.promote = armed ? undefined : name;
         state.result = undefined;
         state.paint('action:promote');
@@ -575,18 +820,27 @@ const createMembershipActions = (
     remove.dataset.agent = name;
     remove.textContent = 'Remove from team';
 
+    // R6: the exact condition the note below repeats (see `isRemovalBlockedByThread`).
+    const blockedByThread = isRemovalBlockedByThread(options, name, isPrimary);
+
     // The primary always stays, so its control is disabled WITH the reason instead of
     // silently missing. For a drafted addition the label is the same and the effect
     // cancels the add.
-    remove.disabled = !options.editable || isPrimary;
+    remove.disabled = !options.editable || isPrimary || blockedByThread;
     remove.title = !options.editable
         ? (options.hint ?? 'The agent team is locked here.')
         : isPrimary
           ? 'The primary agent is always part of the team.'
-          : isMember
-            ? `Take ${label} off the team when you save.`
-            : `Cancel the add, so ${label} never joins this team.`;
+          : blockedByThread
+            ? // The action the reader has to take lives outside this dialog (delete the
+              // conversation), so the reason names it instead of just refusing.
+              'This agent is used by a conversation in this session; delete that conversation before removing the agent.'
+            : isMember
+              ? `Take ${label} off the team when you save.`
+              : `Cancel the add, so ${label} never joins this team.`;
     remove.addEventListener('click', () => {
+        if (remove.disabled) return;
+
         editDraft(state, name, (draft) => {
             draft.member = false;
         });
@@ -620,8 +874,11 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
 
     if (state.promote !== undefined && !roster.includes(state.promote)) state.promote = undefined;
 
-    const descriptor = agentDetailsOf(options.agents, selected);
-    const label = displayTitleOf(descriptor);
+    // The viewed agent's visible name: the library title when the catalogue describes it, and the
+    // name the reader typed for a member this conversation invented (T7b, `memberTitleOf`). The
+    // SAME string feeds the panel's aria-labels and the model select, so the header, the tab and
+    // the editor can never name two different owners for one configuration.
+    const label = memberTitleOf(options, state, selected);
     const isMember = options.members.includes(selected);
     const isPrimary = selected === options.primary;
     const isAdded = isDraftedAddition(options, state, selected);
@@ -641,7 +898,7 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     const activity = new Set(options.activity ?? []);
 
     for (const member of roster) {
-        const title = displayTitleOf(agentDetailsOf(options.agents, member));
+        const title = memberTitleOf(options, state, member);
         const active = member === selected;
 
         const tab = el('button', 'agent-dialog-tab agent-dialog-agent');
@@ -732,7 +989,14 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
 
     chooser.append(tabs, createAddControl(options, state));
 
-    if (state.adding && options.editable && addable.length > 0) {
+    // A session's picker also opens when the catalogue is exhausted, because the
+    // "New agent" form is still something to offer there (R7). A catalogue-only host has
+    // nothing left to add, so it renders no empty group.
+    if (
+        state.adding &&
+        options.editable &&
+        (addable.length > 0 || allowsCustomAgent(options))
+    ) {
         const picker = createAddPicker(options, state);
         if (picker !== undefined) chooser.append(picker);
     }
@@ -770,6 +1034,10 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     config.append(createAgentModelSelect(selected, label, models));
 
     // Instruction -----------------------------------------------------------
+    // R4: exactly ONE instruction control, holding the FULL instruction the agent runs
+    // (identity plus its guidelines when nothing has been saved). The read-only "preset"
+    // block and the revert control are gone: the box's own text is the whole truth, and
+    // clearing it is how the default comes back.
     const instructionLocked = !options.editable;
 
     config.append(el('p', 'agent-dialog-label', 'Instruction'));
@@ -778,20 +1046,21 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     instruction.setAttribute('aria-label', `Instruction for ${label}`);
     instruction.rows = 8;
     instruction.spellcheck = false;
-    instruction.value =
-        draft.instruction === undefined ? baselineInstructionOf(options, selected) : draft.instruction;
+    instruction.placeholder = 'Describe what this agent should do.';
+    instruction.value = draft.instruction ?? baselineInstructionOf(options, selected);
     // A locked instruction is shown as disabled text, never as an editable box whose
     // typing would be silently thrown away. The reason lives on the control (R3: no
     // explanation paragraph), and the text stays readable.
     instruction.disabled = instructionLocked;
-    // R3: the reason lives ON the control (no explanation paragraph). The instruction
-    // gets its own sentence rather than the generic team hint, because it names the
-    // actual cause for THIS field and says where the edit does work.
+    // R3: the reason lives ON the control (no explanation paragraph), and R5: the
+    // unlocked sentence names the scope a save actually writes, because "saved" alone no
+    // longer says where. The locked branch is only ever a run/submit in flight — a saved
+    // conversation edits its own instructions now, so it never reaches here.
     instruction.title = instructionLocked
-        ? 'A saved conversation runs the instructions it was created with. Edit them on the harness to use them in a new session.'
-        : hasStoredOverride(options, selected)
-          ? 'This harness overrides the preset instruction. Clear the text to run the preset instruction again.'
-          : 'Saved on this harness and used by new sessions. The trusted preset instruction itself is never changed.';
+        ? 'Wait for the current run to finish before changing this instruction.'
+        : isSessionScope(options)
+          ? 'The instruction this agent runs in this conversation.'
+          : 'The instruction this agent runs. Saved on this harness template for new sessions.';
 
     // Typing only updates the draft and re-arms the action: a full repaint here would
     // move the caret and interrupt the reader.
@@ -804,31 +1073,24 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
 
     config.append(instruction);
 
-    // Reverting a saved override is an explicit affordance, not a hidden gesture.
-    if (!instructionLocked && hasStoredOverride(options, selected)) {
-        const revert = el('button', 'agent-dialog-revert', 'Use the preset instruction');
-        revert.type = 'button';
-        revert.title = `Clear this harness’s override so ${label} runs its trusted preset instruction again.`;
-        revert.addEventListener('click', () => {
-            editDraft(state, selected, (entry) => {
-                entry.instruction = '';
-            });
-            state.paint('revert');
-        });
-
-        config.append(revert);
-    }
-
-    // Trusted reference -----------------------------------------------------
-    // What the server actually ships for this agent, so an override can be compared
-    // with the preset it replaces. Same builder the preset picker uses.
-    config.append(createAgentPresetDetail(descriptor, `Preset instruction for ${label}`));
-
     // Membership ------------------------------------------------------------
     // R3: no checkbox and no prose. `[+]` adds, this row removes, and a promotion is
     // armed explicitly. Conservative by construction: viewing a tab never changes the
     // team, and the primary can never be removed.
     config.append(createMembershipActions(options, state, selected, label, isPrimary, isMember));
+
+    // R6: the thread reason repeated where it is visible. A disabled button's `title` is
+    // not reachable by keyboard or by a screen reader in reading order, so the panel
+    // states the block itself — and names the action that lifts it.
+    if (isRemovalBlockedByThread(options, selected, isPrimary)) {
+        config.append(
+            el(
+                'p',
+                'agent-dialog-field-note agent-dialog-inuse',
+                'This agent is in use by a conversation and cannot be removed.'
+            )
+        );
+    }
 
     // An added agent is not on the team until the action runs, so the panel says so
     // rather than reading as saved state.
@@ -869,7 +1131,7 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
           ? 'Save this configuration' +
             (promotionOf(options, state) === undefined
                 ? ''
-                : ` and make ${titleOf(options.agents, promotionOf(options, state) as string)} the primary`) +
+                : ` and make ${memberTitleOf(options, state, promotionOf(options, state) as string)} the primary`) +
             '. Closing the dialog saves nothing.'
           : 'Nothing has changed yet.';
 
@@ -958,6 +1220,10 @@ const focusKeyOf = (root: HTMLElement): string | undefined => {
     const option = active.closest<HTMLElement>('.agent-dialog-add-option');
     if (option !== null) return `add:${option.dataset.agent ?? ''}`;
 
+    // R7: the custom-name field. The typed value lives on the node itself, so the key
+    // only has to land the caret back inside that field (no per-character state).
+    if (active.closest<HTMLElement>('.agent-dialog-add-input') !== null) return 'add-input';
+
     const action = active.closest<HTMLElement>('.agent-dialog-action');
     if (action !== null) return `action:${action.dataset.action ?? ''}`;
 
@@ -970,17 +1236,14 @@ const focusKeyOf = (root: HTMLElement): string | undefined => {
         }`;
     }
 
-    if (active.classList.contains('agent-dialog-revert')) return 'revert';
-
     const apply = active.closest<HTMLButtonElement>('.agent-dialog-apply');
     if (apply !== null) return `apply:${apply.dataset.agent ?? ''}`;
 
     const model = active.closest<HTMLSelectElement>('.agent-model-select');
     if (model !== null) return `model:${model.getAttribute('aria-label') ?? ''}`;
 
-    const summary = active.closest<HTMLElement>('summary');
-    if (summary !== null && summary.parentElement?.classList.contains('agent-detail')) return 'preset';
-
+    // R4: no `revert` and no read-only `preset` details any more — the instruction box
+    // above is the only instruction control, so those keys can never be produced.
     return undefined;
 };
 
@@ -995,8 +1258,9 @@ const targetOf = (root: HTMLElement, key: string): HTMLElement | null => {
         return root.querySelector<HTMLElement>('.agent-dialog-add');
     }
 
-    if (key === 'revert') return root.querySelector<HTMLButtonElement>('.agent-dialog-revert');
-    if (key === 'preset') return root.querySelector<HTMLElement>('.agent-detail summary');
+    // R7: the custom-name field, so a live refresh while the picker is open keeps the
+    // reader in the box they are typing in.
+    if (key === 'add-input') return root.querySelector<HTMLElement>('.agent-dialog-add-input');
     if (key === 'roster') return root.querySelector<HTMLElement>('.agent-dialog-tab[aria-selected="true"]');
 
     const separator = key.indexOf(':');
@@ -1058,9 +1322,14 @@ const targetOf = (root: HTMLElement, key: string): HTMLElement | null => {
 };
 
 const focusByKey = (root: HTMLElement, key: string): void => {
-    // The picker's first option is where `[+]` focus goes when the list opens.
+    // The picker's first option is where `[+]` focus goes when the list opens. A session
+    // whose catalogue is already exhausted has no option, so its name field is the
+    // control the reader came for (R7).
     if (key === 'add-first') {
-        root.querySelector<HTMLElement>('.agent-dialog-add-option')?.focus();
+        (
+            root.querySelector<HTMLElement>('.agent-dialog-add-option') ??
+            root.querySelector<HTMLElement>('.agent-dialog-add-input')
+        )?.focus();
         return;
     }
 
@@ -1168,8 +1437,15 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
                 state.promote = undefined;
             }
 
-            // An open picker with nothing left to add would render an empty group.
-            if (state.adding && addableOf(next, state).length === 0) state.adding = false;
+            // An open picker with nothing left to add would render an empty group — but
+            // a session's picker still has the name form, so it stays open (R7).
+            if (
+                state.adding &&
+                !allowsCustomAgent(next) &&
+                addableOf(next, state).length === 0
+            ) {
+                state.adding = false;
+            }
 
             paint();
         },

@@ -514,8 +514,9 @@ paths:
       description: >-
         The recorded or inherited instruction for exactly one member of this definition. Resolution
         order is the harness override, then the global profile override, then the trusted catalogue, and
-        `source` states which one supplied the text. `guidelines` are included because an instruction
-        override replaces only the identity sentence and never the rules appended after it. A member
+        `source` states which one supplied the text. A harness override IS the member's complete prompt,
+        so `guidelines` are reported as the profile's rules for clients that compose the default text of
+        an un-overridden member; they are never appended underneath a stored override. A member
         outside the definition's member set is 404, which is how a client learns membership rather than
         reading an empty string.
       responses:
@@ -3595,8 +3596,9 @@ components:
         agent_instructions:
           type: object
           description: >-
-            Agent name to instruction OVERRIDE text. The override replaces only the profile's identity
-            sentence; its guidelines still apply, and the trusted profile itself is never rewritten.
+            Agent name to instruction text. A stored value IS that member's COMPLETE prompt, so
+            `GET /agents`'s `guidelines` are the default for an un-overridden member and are never
+            appended underneath an override; the trusted profile itself is never rewritten.
           additionalProperties:
             type: string
             maxLength: 200000
@@ -4587,10 +4589,11 @@ components:
           type: string
           maxLength: 200000
           description: >-
-            Optional non-empty text. For a catalogue profile it overrides ONLY the identity sentence, never the
-            profile's guidelines, and `null`/omitted runs the trusted text; for a session-defined agent it IS the
-            agent's whole instruction (the session stores a default identity sentence when it is omitted). Never
-            mutates the profile it overrides.
+            Optional non-empty text that IS the agent's complete prompt: for a catalogue profile it replaces
+            the whole composed instruction, so the profile's guidelines are NOT appended underneath it, and
+            `null`/omitted runs the trusted text (identity sentence plus its guidelines); for a session-defined
+            agent it IS the agent's whole instruction either way (the session stores a default identity sentence
+            when it is omitted). Never mutates the profile it overrides.
         role:
           type: string
           enum: [primary, subagent]

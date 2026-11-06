@@ -346,10 +346,12 @@ export const customAgentInstruction = (name: string, instruction?: string): stri
 //   - NO profile lookup. A custom name has no `AgentProfile`, so `agentProfile(name)`/
 //     `effectiveAgentProfile(name)` would throw or report a retirement, and there is nothing for
 //     the global agent overlay to override;
-//   - NO guideline composition. `agentInstruction()` exists to append TRUSTED policy lines below
-//     an identity sentence; a client-authored agent has no trusted policy, so the stored text IS
-//     the whole system prompt (which is also why a blank stored base falls back to
-//     `customAgentInstruction` rather than to a profile that does not exist);
+//   - NO guideline composition. `agentInstruction()` appends the TRUSTED policy lines only when
+//     a profile supplies the prompt; a client-authored agent has no trusted policy, so the stored text
+//     IS the whole system prompt (which is also why a blank stored base falls back to
+//     `customAgentInstruction` rather than to a profile that does not exist). Since T6 this is the
+//     same rule a profile member follows when it has an override, and it is what makes a session that
+//     edits one instruction box behave identically for both kinds of member;
 //   - the SAME trusted transport as a profile member: the model id may come from the session map,
 //     but the provider, base URL and credential always come from `RunnerSettings`, and a blank
 //     model falls back to `settings.model`.

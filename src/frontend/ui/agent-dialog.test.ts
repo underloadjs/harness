@@ -1,4 +1,4 @@
-// Agent configuration dialog (T3/R3) — module contract.
+// Agent configuration dialog (T3/R3 + T7a/R4-R7) — module contract.
 //
 // composer-agent-control.test.ts and main.test.ts exercise this dialog through the
 // live shell (real fetch stubs, PATCH bodies). This file pins the DIALOG ITSELF,
@@ -19,15 +19,25 @@
 //   - a live `update()` refreshes untouched fields from the server, keeps a touched
 //     one, and restores focus (including the caret);
 //   - the badges are keyboard-operable (one tab stop, arrows move the selection);
-//   - a frozen saved session locks the roster and the instruction WITH the reason on
-//     each control, and keeps models live;
+//   - a run in flight locks the roster and the instruction WITH the reason on each
+//     control, and keeps models live;
 //   - `paintActivity()` paints rings without rebuilding the body;
 //   - the optional `onRequestPreset` read rides an EXPLICIT selection only (a badge
 //     click, an arrow move, a `[+]` pick), never a render, never a re-selection, and
 //     never a write;
-//   - the instruction editor is seeded from the stored override, else from the trusted
-//     text on the `options.agents` row, and the read-only preset detail keeps showing
-//     that library text even while an override is being edited.
+//   - R4: the instruction editor is ONE editable box holding the FULL effective
+//     instruction — the stored text when this scope has one, otherwise the agent's
+//     default instruction (identity plus its `Guidelines:` block). The read-only
+//     "Preset instruction for X" block, the "Use the preset instruction" revert and
+//     every preset word are gone by construction, asserted below;
+//   - R5: `scope` changes only the copy — the session wording for the box and the
+//     footer, the harness wording for a harness template;
+//   - R7: in a session (`allowCustom`) the `[+]` panel also creates an agent by typed
+//     name, which gets a badge and an empty editable instruction; a catalogue-only
+//     dialog never offers that form;
+//   - R6: an agent a conversation already runs keeps its badge but cannot be removed,
+//     and the reason is visible rather than tooltip-only; a saved conversation's fixed
+//     entry agent (`canPromote: false`) cannot be made primary.
 //
 // Every assertion names the exact expected value — see the deterministic rule.
 
@@ -181,6 +191,39 @@ const pickerOptions = (): [string, string][] =>
         option.textContent ?? ''
     ]);
 
+// ---------------------------------------------------------------------------
+// R7: the "New agent" half of the `[+]` panel.
+// ---------------------------------------------------------------------------
+const customInput = (): HTMLInputElement => byClass('.agent-dialog-add-input', 'input');
+const createAgentButton = (): HTMLButtonElement => byClass('.agent-dialog-add-create', 'button');
+const customError = (): HTMLParagraphElement => byClass('.agent-dialog-add-error', 'p');
+
+// Typing means the field's OWN event, because the live verdict is written on `input`;
+// assigning `.value` alone would skip the handler the product depends on.
+const typeAgentName = (text: string): void => {
+    const input = customInput();
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+};
+
+const clickCreate = (): void => {
+    createAgentButton().click();
+};
+
+const pressEnterInNameField = (): void => {
+    customInput().dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+    );
+};
+
+// The panel's own words: the footer's scope promise and every inline note (the drafted
+// "joins when you save" line and the R6 in-use line share the note class).
+const footerNote = (): string => byClass('.agent-dialog-footer-note', 'p').textContent ?? '';
+const fieldNotes = (): (string | null)[] =>
+    [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map(
+        (node) => node.textContent
+    );
+
 const typeInstruction = (text: string): void => {
     const box = instructionBox();
     box.value = text;
@@ -214,7 +257,10 @@ describe('the roster strip', () => {
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
         expect(tabsOf()).toEqual([
             ['instruct', 'primary', true, 'Instruct', 'm1'],
-            ['legacy', 'secondary', false, 'Agent', 'm1']
+            // T7b: a rostered member the catalogue does not describe is named by its id — it IS a
+            // member of this team (`legacy` may be a profile the server dropped or an agent a
+            // session invented), and 'Agent' would make two of them indistinguishable.
+            ['legacy', 'secondary', false, 'legacy', 'm1']
         ]);
 
         // R3: no dropdown, no duplicate Team section, no explanation paragraph, and no
@@ -266,14 +312,14 @@ describe('the roster strip', () => {
         // Every visible piece moved to the selected agent...
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Researcher');
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
-        expect(instructionBox().value).toBe('Investigate.');
+        // R4: the ONE box carries the FULL effective instruction, guidelines included,
+        // because that is the prompt the agent actually runs.
+        expect(instructionBox().value).toBe('Investigate.\n\nGuidelines:\n- Cite sources.');
         expect(modelSelect().getAttribute('aria-label')).toBe('Model for Researcher');
-        // ...and the trusted guidelines are still shown as the preset reference.
-        expect(
-            [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-guideline')].map(
-                (node) => node.textContent
-            )
-        ).toEqual(['Cite sources.']);
+        // R4: the read-only reference block is gone, so the guidelines appear exactly
+        // once on screen — inside the editable box.
+        expect(document.querySelector('.agent-detail')).toBeNull();
+        expect(document.querySelector('.agent-guidelines')).toBeNull();
 
         // R3: selecting a badge is a view change AND not a promotion. The action stays
         // disabled, so reading a teammate's prompt cannot arm a promotion.
@@ -283,22 +329,36 @@ describe('the roster strip', () => {
         expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
     });
 
-    it('keeps a stored override as the editor baseline and offers the revert', () => {
+    it('seeds the stored text verbatim and offers no revert control (R4)', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(
             base({ instructions: { research: 'Investigate twice.' }, onApply: apply.onApply })
         );
 
         selectAgent('research');
+
+        // The stored text wins the box byte for byte, and the control says where a save
+        // would write it (R5: harness scope wording).
         expect(instructionBox().value).toBe('Investigate twice.');
-        expect(byClass('.agent-dialog-revert', 'button').textContent).toBe('Use the preset instruction');
+        expect(instructionBox().disabled).toBe(false);
+        expect(instructionBox().title).toBe(
+            'The instruction this agent runs. Saved on this harness template for new sessions.'
+        );
 
-        byClass('.agent-dialog-revert', 'button').click();
+        // R4: no dedicated revert affordance anywhere. Clearing the box IS the revert,
+        // and the empty value still round-trips as '' so the shell can delete the entry.
+        expect(document.querySelector('.agent-dialog-revert')).toBeNull();
 
-        // The revert is a draft until the action runs: an empty box means "the preset
-        // instruction again", and nothing has been sent yet.
+        typeInstruction('');
         expect(instructionBox().value).toBe('');
         expect(apply.calls).toEqual([]);
+
+        applyButton().click();
+        await flush();
+
+        expect(apply.calls).toEqual([
+            { agent: 'research', models: {}, instructions: { research: '' }, add: [], remove: [] }
+        ]);
     });
 });
 
@@ -616,7 +676,7 @@ describe('the preset read (onRequestPreset)', () => {
         selectAgent('research');
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Researcher');
         expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
-        expect(instructionBox().value).toBe('Investigate.');
+        expect(instructionBox().value).toBe('Investigate.\n\nGuidelines:\n- Cite sources.');
 
         byClass('.agent-dialog-tab[data-agent="research"]', 'button').focus();
         pressKey('ArrowRight');
@@ -672,8 +732,8 @@ describe('the preset read (onRequestPreset)', () => {
         selectAgent('instruct');
 
         expect(byClass('.agent-dialog-error', 'p').textContent).toBe('');
-        expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
-            'Saves on this harness · new sessions run what you save here.'
+        expect(footerNote()).toBe(
+            'Saves on this harness template · new sessions start with these agents and instructions.'
         );
         expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
         expect(addButton().getAttribute('aria-expanded')).toBe('false');
@@ -686,7 +746,7 @@ describe('the preset read (onRequestPreset)', () => {
     });
 });
 
-describe('the instruction seed and the trusted preset detail', () => {
+describe('the one instruction editor (R4/R5)', () => {
     // A library row whose text is reachable ONLY through `options.agents` (the boot
     // summary carries no prompt), with an id and a display title that differ by case —
     // so a seed reading the wrong source, or an ask passing the title, fails visibly.
@@ -707,7 +767,7 @@ describe('the instruction seed and the trusted preset detail', () => {
         }
     ];
 
-    it('seeds the editor with the trusted library text when the harness has no override', () => {
+    it('seeds the box with the agent default instruction when nothing is stored', () => {
         const preset = presetOf();
 
         dialog = openAgentDialog(
@@ -721,39 +781,30 @@ describe('the instruction seed and the trusted preset detail', () => {
 
         selectAgent('summarizer');
 
-        // The absent override is NOT an empty box: the reader edits the words the agent
-        // actually runs, which is the library row's instruction.
+        // Nothing stored is NOT an empty box: the reader edits the whole prompt the
+        // agent runs, which is the library identity sentence PLUS its guidelines.
         expect(preset.calls).toEqual(['summarizer']);
-        expect(instructionBox().value).toBe('Summarize the transcript in five bullets.');
+        expect(instructionBox().value).toBe(
+            'Summarize the transcript in five bullets.\n\n' +
+                'Guidelines:\n' +
+                '- Name every source.\n' +
+                '- Never invent a quote.'
+        );
         expect(instructionBox().getAttribute('aria-label')).toBe('Instruction for Summarizer');
         expect(instructionBox().disabled).toBe(false);
+        expect(instructionBox().placeholder).toBe('Describe what this agent should do.');
         expect(instructionBox().title).toBe(
-            'Saved on this harness and used by new sessions. The trusted preset instruction itself is never changed.'
+            'The instruction this agent runs. Saved on this harness template for new sessions.'
         );
 
-        // The same text is the read-only reference, so the editor and the reference can
-        // never disagree about what a baseline means.
-        const detail = byClass('.agent-detail', 'details');
-        expect(detail.open).toBe(false);
-        expect(byClass('.agent-detail-summary', 'summary').textContent).toBe(
-            'Preset instruction for Summarizer'
-        );
-        expect(byClass('.agent-instruction', 'p').textContent).toBe(
-            'Summarize the transcript in five bullets.'
-        );
-        expect(
-            [...byClass('.agent-detail-body', 'div').querySelectorAll<HTMLElement>('p')].map(
-                (node) => node.textContent
-            )
-        ).toEqual(['Summarize the transcript in five bullets.', 'guidelines']);
-        expect(
-            [...document.querySelectorAll<HTMLElement>('ul.agent-guidelines .agent-guideline')].map(
-                (node) => node.textContent
-            )
-        ).toEqual(['Name every source.', 'Never invent a quote.']);
+        // R4: there is no second copy of that text anywhere. One editor, one truth.
+        expect(document.querySelector('.agent-detail')).toBeNull();
+        expect(document.querySelector('.agent-instruction')).toBeNull();
+        expect(document.querySelector('.agent-guidelines')).toBeNull();
+        expect(document.querySelectorAll('.agent-dialog-instruction')).toHaveLength(1);
     });
 
-    it('seeds the stored override and keeps the library text in the read-only preset detail', () => {
+    it('seeds the stored text and never repeats the library text (R4)', () => {
         const apply = applyOf();
         const { onApply } = applySpyOf(apply);
         const preset = presetOf();
@@ -770,42 +821,26 @@ describe('the instruction seed and the trusted preset detail', () => {
 
         selectAgent('summarizer');
 
-        // A stored override wins the editor, and the ask still rides the selection.
+        // A stored value wins the box verbatim, and the read still rides the selection.
         expect(preset.calls).toEqual(['summarizer']);
         expect(instructionBox().value).toBe('Override text.');
         expect(instructionBox().title).toBe(
-            'This harness overrides the preset instruction. Clear the text to run the preset instruction again.'
+            'The instruction this agent runs. Saved on this harness template for new sessions.'
         );
-        expect(byClass('.agent-dialog-revert', 'button').textContent).toBe('Use the preset instruction');
 
-        // The trusted reference never follows the override: it is the comparison the
-        // reader needs against the text this harness replaces, collapsed by default.
-        const detail = byClass('.agent-detail', 'details');
-        expect(detail.open).toBe(false);
-        expect(byClass('.agent-detail-summary', 'summary').textContent).toBe(
-            'Preset instruction for Summarizer'
-        );
-        expect(byClass('.agent-instruction', 'p').textContent).toBe(
-            'Summarize the transcript in five bullets.'
-        );
-        expect(
-            [...byClass('.agent-detail-body', 'div').querySelectorAll<HTMLElement>('p')].map(
-                (node) => node.textContent
-            )
-        ).toEqual(['Summarize the transcript in five bullets.', 'guidelines']);
-        expect(
-            [...document.querySelectorAll<HTMLElement>('ul.agent-guidelines .agent-guideline')].map(
-                (node) => node.textContent
-            )
-        ).toEqual(['Name every source.', 'Never invent a quote.']);
+        // R4: the library text is not shown alongside it, so the editor can never
+        // contradict a second, read-only copy of "the real prompt".
+        expect(document.body.textContent).not.toContain('Summarize the transcript in five bullets.');
+        expect(document.querySelector('.agent-detail')).toBeNull();
+        expect(document.querySelector('.agent-dialog-revert')).toBeNull();
 
-        // Reading the reference and asking for the preset are both view-only.
+        // Reading the box and asking for the library text are both view-only.
         expect(onApply).toHaveBeenCalledTimes(0);
         expect(apply.calls).toEqual([]);
         expect(applyButton().disabled).toBe(true);
     });
 
-    it('seeds the honest blank for a member the catalogue no longer advertises', () => {
+    it('seeds the honest blank for an agent the library does not advertise', () => {
         const preset = presetOf();
 
         dialog = openAgentDialog(
@@ -817,15 +852,13 @@ describe('the instruction seed and the trusted preset detail', () => {
         // The ask still uses the id, even though no row exists to display it.
         expect(preset.calls).toEqual(['legacy']);
         expect(instructionBox().value).toBe('');
-        expect(byClass('.agent-detail-summary', 'summary').textContent).toBe(
-            'Preset instruction for Agent'
-        );
-        expect(byClass('.agent-instruction', 'p').textContent).toBe(
-            'This server does not advertise an instruction for this agent.'
-        );
+        expect(instructionBox().placeholder).toBe('Describe what this agent should do.');
+        expect(instructionBox().disabled).toBe(false);
 
-        // A row with no guidelines renders no list at all (not an empty one).
-        expect(document.querySelector('ul.agent-guidelines')).toBeNull();
+        // R4: with no reference block there is no "this server does not advertise…"
+        // sentence either. The empty editable box is the whole statement.
+        expect(document.querySelector('.agent-detail')).toBeNull();
+        expect(document.body.textContent).not.toContain('does not advertise');
     });
 });
 
@@ -1218,7 +1251,7 @@ describe('live refresh while open', () => {
 });
 
 describe('honest restrictions and lifecycle', () => {
-    it('locks the instruction and the roster in a saved session and keeps models live', async () => {
+    it('locks the instruction and the roster while a run is in flight and keeps models live', async () => {
         const apply = applyOf();
         const hint =
             'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
@@ -1245,7 +1278,7 @@ describe('honest restrictions and lifecycle', () => {
         // Every locked control carries the real reason instead of a paragraph.
         expect(instructionBox().disabled).toBe(true);
         expect(instructionBox().title).toBe(
-            'A saved conversation runs the instructions it was created with. Edit them on the harness to use them in a new session.'
+            'Wait for the current run to finish before changing this instruction.'
         );
         expect(addButton().disabled).toBe(true);
         expect(addButton().title).toBe(hint);
@@ -1290,7 +1323,7 @@ describe('honest restrictions and lifecycle', () => {
         // Viewing is not an edit, so the mid-run lock leaves the roster and the model
         // area reachable while the team controls state the reason.
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
-        expect(instructionBox().value).toBe('Investigate.');
+        expect(instructionBox().value).toBe('Investigate.\n\nGuidelines:\n- Cite sources.');
         expect(removeButton().title).toBe('Wait for the current run to finish before switching agents.');
         expect(apply.calls).toEqual([]);
     });
@@ -1355,5 +1388,363 @@ describe('honest restrictions and lifecycle', () => {
         dialog.close();
         dialog.update(base({ primary: 'research' }));
         expect(document.querySelector('.dialog')).toBeNull();
+    });
+});
+
+// R5: a saved conversation is a first-class configuration surface. The dialog's model
+// (drafts, apply, roster) is identical for both scopes; what differs is the copy that
+// states WHERE a save lands, plus the two capability flags the shell passes
+// (`allowCustom`, `canPromote`). Every string below is asserted exactly.
+describe('the session scope (R5)', () => {
+    it('names this conversation as the place a save lands, and keeps the box editable', () => {
+        dialog = openAgentDialog(base({ scope: 'session', allowCustom: true, canPromote: false }));
+
+        // The team is editable in a session, so the instruction is editable too: this is
+        // the whole point of R5 (the harness definition is only a template).
+        expect(instructionBox().disabled).toBe(false);
+        expect(instructionBox().title).toBe('The instruction this agent runs in this conversation.');
+        expect(footerNote()).toBe(
+            'Saves on this conversation · only this session’s agents and instructions change.'
+        );
+
+        typeInstruction('Answer in three words.');
+        expect(applyButton().disabled).toBe(false);
+        expect(applyButton().textContent).toBe('Save configuration');
+    });
+
+    it('keeps the harness-template wording when the caller does not name a scope', () => {
+        // Default `scope` is 'harness', so every pre-R5 caller keeps its old promises.
+        dialog = openAgentDialog(base());
+
+        expect(instructionBox().title).toBe(
+            'The instruction this agent runs. Saved on this harness template for new sessions.'
+        );
+        expect(footerNote()).toBe(
+            'Saves on this harness template · new sessions start with these agents and instructions.'
+        );
+    });
+
+    it('shows the run-in-flight wording instead whenever the team is locked', () => {
+        // The lock outranks the scope: `editable: false` now only ever means a run or a
+        // session creation, so the instruction names THAT cause, not the harness.
+        dialog = openAgentDialog(
+            base({
+                scope: 'session',
+                allowCustom: true,
+                canPromote: false,
+                editable: false,
+                hint: 'Wait for the current run to finish before switching agents.'
+            })
+        );
+
+        expect(instructionBox().disabled).toBe(true);
+        expect(instructionBox().title).toBe(
+            'Wait for the current run to finish before changing this instruction.'
+        );
+        expect(footerNote()).toBe(
+            'Models only here · this conversation keeps the team and instructions it started with.'
+        );
+    });
+});
+
+// R7: a session can gain an agent the catalogue never advertised. The name form lives in
+// the `[+]` panel, validates the server's own id contract before it will draft anything,
+// and produces an ordinary drafted tab — same `new` chip, same local-until-save rules,
+// and no wasted read for a profile the server has never heard of.
+describe('a custom agent in a session (R7)', () => {
+    const session = (overrides: Partial<AgentDialogOptions> = {}): AgentDialogOptions =>
+        base({ scope: 'session', allowCustom: true, canPromote: false, ...overrides });
+
+    it('creates a badge from a typed name with an empty editable instruction', async () => {
+        const apply = applyOf();
+        const preset = presetOf();
+        dialog = openAgentDialog(
+            session({ onApply: apply.onApply, onRequestPreset: preset.onRequestPreset })
+        );
+
+        openPicker();
+        typeAgentName('note-taker');
+        // A usable name carries no verdict at all: the sentence only ever states a problem.
+        expect(customError().textContent).toBe('');
+
+        clickCreate();
+
+        // The picker closes and the new agent is the viewed badge, marked as a draft.
+        expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research', 'note-taker']);
+        expect(
+            document.querySelector<HTMLElement>('.agent-dialog-tab[data-agent="note-taker"]')
+                ?.dataset.added
+        ).toBe('true');
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('note-taker');
+
+        // T7b (R7): the reader's OWN name is the label. A session-defined member has no library
+        // row, and the neutral fallback that hides an unknown id from visible text (R3) would make
+        // two invented agents read as one 'Agent'; for a team member the id IS the identity, so the
+        // tab, the header and the panel all say what was typed. The instruction stays an honest
+        // EMPTY box: the server has no default for a name nobody published.
+        expect(
+            document.querySelector<HTMLElement>(
+                '.agent-dialog-tab[data-agent="note-taker"] .agent-dialog-agent-name'
+            )?.textContent
+        ).toBe('note-taker');
+        expect(
+            document.querySelector<HTMLElement>('.agent-dialog-tab[data-agent="note-taker"]')?.getAttribute(
+                'aria-label'
+            )
+        ).toBe('Configure note-taker · subagent');
+        expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · note-taker');
+        expect(instructionBox().value).toBe('');
+        expect(instructionBox().disabled).toBe(false);
+        expect(instructionBox().placeholder).toBe('Describe what this agent should do.');
+        expect(instructionBox().getAttribute('aria-label')).toBe('Instruction for note-taker');
+        // The membership row names the same agent, so nothing on screen calls it 'Agent'. It is
+        // still a DRAFTED addition at this point, which is what the control's sentence says.
+        expect(removeButton().title).toBe('Cancel the add, so note-taker never joins this team.');
+        expect(
+            document.querySelector<HTMLElement>('.agent-dialog-field-note')?.textContent
+        ).toBe('note-taker joins the team when you save · nothing is sent yet.');
+
+        // No preset read: `GET /agents/:id` for an unpublished name can only 404.
+        expect(preset.calls).toEqual([]);
+        expect(preset.onRequestPreset).toHaveBeenCalledTimes(0);
+
+        // The draft is local until the action, exactly like a catalogue pick.
+        typeInstruction('Take verbatim notes.');
+        expect(apply.calls).toEqual([]);
+
+        applyButton().click();
+        await flush();
+
+        expect(apply.calls).toEqual([
+            {
+                agent: 'note-taker',
+                models: {},
+                instructions: { 'note-taker': 'Take verbatim notes.' },
+                add: ['note-taker'],
+                remove: []
+            }
+        ]);
+    });
+
+    it('accepts Enter in the name field as the create press', () => {
+        dialog = openAgentDialog(session());
+
+        openPicker();
+        typeAgentName('auditor');
+        pressEnterInNameField();
+
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research', 'auditor']);
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('auditor');
+    });
+
+    // T7b: the boundary of the member-title rule. A name ON the roster is the reader's own naming
+    // act, so it is displayed (the rule the test above pins); a name that is not on any roster has
+    // no team entry to justify showing an id, and keeps the neutral word ui/agents.ts defines.
+    it('labels a name that is not on the team with the neutral fallback, not its id', () => {
+        dialog = openAgentDialog(session({ members: [], primary: 'ghost' }));
+
+        // Nothing is rostered, so the tab strip is empty and the panel describes an agent this
+        // dialog only knows by an id it never saw on a library row.
+        expect(document.querySelector('.agent-dialog-tab')).toBeNull();
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('ghost');
+        expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Agent');
+        expect(instructionBox().getAttribute('aria-label')).toBe('Instruction for Agent');
+    });
+
+    it('refuses every name the server would reject, and drafts nothing', () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(session({ onApply: apply.onApply }));
+
+        const refused: [string, string][] = [
+            // The contract is `^[a-z][a-z0-9_-]*$`: no capitals, no spaces, no leading
+            // digit, no other punctuation.
+            ['Notes', 'Use a lowercase name that starts with a letter and continues with letters, digits, "-" or "_".'],
+            ['note taker', 'Use a lowercase name that starts with a letter and continues with letters, digits, "-" or "_".'],
+            ['9lives', 'Use a lowercase name that starts with a letter and continues with letters, digits, "-" or "_".'],
+            ['notes!', 'Use a lowercase name that starts with a letter and continues with letters, digits, "-" or "_".'],
+            // `unknown` matches the pattern but is the reserved id for an unreadable agent.
+            ['unknown', '"unknown" is the reserved name for an agent the server cannot identify.'],
+            // A member and the primary are both collisions, and case does not save you.
+            ['research', 'An agent named research is already on this team.'],
+            ['instruct', 'An agent named instruct is already on this team.']
+        ];
+
+        openPicker();
+
+        for (const [typed, reason] of refused) {
+            typeAgentName(typed);
+            clickCreate();
+
+            expect(customError().textContent).toBe(reason);
+            // Nothing was drafted and nothing was viewed, so the strip is untouched.
+            expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research']);
+            expect(apply.calls).toEqual([]);
+        }
+
+        // A name that only differs by case from a member still collides, and the reason
+        // quotes the name the reader typed.
+        expect(applyButton().disabled).toBe(true);
+    });
+
+    it('pressing create with nothing typed says nothing and adds nobody', () => {
+        dialog = openAgentDialog(session());
+
+        openPicker();
+        clickCreate();
+
+        expect(customError().textContent).toBe('');
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research']);
+        expect(applyButton().disabled).toBe(true);
+    });
+
+    it('still offers the form after the catalogue is exhausted', () => {
+        // All three advertised agents are already on the team. Without R7 that closes
+        // `[+]`; a session can still gain an unpublished agent, so it must not.
+        dialog = openAgentDialog(session({ members: ['instruct', 'research', 'reviewer'] }));
+
+        expect(addButton().disabled).toBe(false);
+        expect(addButton().title).toBe('Add an agent to the team, or name a new one.');
+
+        openPicker();
+
+        expect(pickerOptions()).toEqual([]);
+        expect(customInput().getAttribute('aria-label')).toBe('New agent name');
+        expect(customInput().placeholder).toBe('New agent name');
+        expect(customInput().maxLength).toBe(64);
+        expect(createAgentButton().textContent).toBe('Create agent');
+
+        typeAgentName('auditor');
+        clickCreate();
+
+        expect(tabsOf().map((tab) => tab[0])).toEqual([
+            'instruct',
+            'research',
+            'reviewer',
+            'auditor'
+        ]);
+    });
+
+    it('offers no name field where a typed name is not allowed', () => {
+        // The default (a harness template) is catalogue-only: the server validates its
+        // agent names against the published profiles, so a typed name would 400.
+        dialog = openAgentDialog(base());
+
+        openPicker();
+
+        expect(pickerOptions()).toEqual([['reviewer', 'Reviewer']]);
+        expect(document.querySelector('.agent-dialog-add-custom')).toBeNull();
+        expect(document.querySelector('.agent-dialog-add-input')).toBeNull();
+        expect(document.querySelector('.agent-dialog-add-create')).toBeNull();
+        expect(addButton().title).toBe('Add an agent to the team.');
+    });
+});
+
+// R6: an agent some conversation in this session already runs keeps its badge — the
+// transcript names it — but cannot be taken off the team. The reason is visible, because
+// a tooltip on a disabled button is not reachable.
+describe('an agent a conversation already runs (R6)', () => {
+    it('disables the removal with the reason and shows it under the actions', () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(
+            base({ scope: 'session', allowCustom: true, canPromote: false, threadAgents: ['research'], onApply: apply.onApply })
+        );
+
+        selectAgent('research');
+
+        expect(removeButton().disabled).toBe(true);
+        expect(removeButton().title).toBe(
+            'This agent is used by a conversation in this session; delete that conversation before removing the agent.'
+        );
+        expect(fieldNotes()).toEqual([
+            'This agent is in use by a conversation and cannot be removed.'
+        ]);
+
+        // A press on the disabled control cannot draft a removal, so there is nothing to
+        // save and the roster keeps its badge.
+        removeButton().click();
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research']);
+        expect(apply.calls).toEqual([]);
+        expect(applyButton().disabled).toBe(true);
+    });
+
+    it('leaves an agent no conversation runs removable', () => {
+        dialog = openAgentDialog(
+            base({ scope: 'session', allowCustom: true, canPromote: false, threadAgents: ['research'] })
+        );
+
+        // `reviewer` is not in `threadAgents`, so it keeps the ordinary add flow: the tab
+        // is drafted, and cancelling the add is offered with its own sentence.
+        openPicker();
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
+
+        expect(removeButton().disabled).toBe(false);
+        expect(removeButton().title).toBe('Cancel the add, so Reviewer never joins this team.');
+        expect(fieldNotes()).toEqual([
+            'Reviewer joins the team when you save · nothing is sent yet.'
+        ]);
+    });
+
+    it('states the primary reason for the primary, not the thread reason', () => {
+        // The entry agent is always running SOME conversation, so both rules apply to it.
+        // The stronger one (the primary always stays) wins, and the note stays hidden so
+        // the panel never states two reasons for one disabled control.
+        dialog = openAgentDialog(
+            base({ scope: 'session', allowCustom: true, canPromote: false, threadAgents: ['instruct', 'research'] })
+        );
+
+        expect(removeButton().disabled).toBe(true);
+        expect(removeButton().title).toBe('The primary agent is always part of the team.');
+        expect(fieldNotes()).toEqual([]);
+    });
+});
+
+// R5/R6: a saved conversation's entry agent is fixed, so `Make primary` has nothing to
+// do there and must not arm a promotion the shell cannot write.
+describe('a fixed entry agent (R5 canPromote)', () => {
+    it('disables Make primary with the reason and never arms a promotion', () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(
+            base({ scope: 'session', allowCustom: true, canPromote: false, onApply: apply.onApply })
+        );
+
+        selectAgent('research');
+
+        expect(promoteButton().disabled).toBe(true);
+        expect(promoteButton().title).toBe(
+            'The primary agent is fixed for a saved conversation.'
+        );
+        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+
+        // Even a forced press cannot arm it, so the action keeps its plain label and
+        // stays disabled: a disabled button can never falsely promise a promotion.
+        promoteButton().click();
+        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+        expect(applyButton().textContent).toBe('Save configuration');
+        expect(applyButton().disabled).toBe(true);
+        expect(apply.calls).toEqual([]);
+        expect(footerNote()).toBe(
+            'Saves on this conversation · only this session’s agents and instructions change.'
+        );
+    });
+
+    it('keeps the promotion available for a harness template (default canPromote)', async () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(base({ onApply: apply.onApply }));
+
+        selectAgent('research');
+
+        expect(promoteButton().disabled).toBe(false);
+        expect(promoteButton().title).toBe('Make Researcher the primary agent when you save.');
+
+        promoteButton().click();
+        expect(applyButton().textContent).toBe('Save & set primary');
+
+        applyButton().click();
+        await flush();
+
+        expect(apply.calls).toEqual([
+            { agent: 'research', primary: 'research', models: {}, instructions: {}, add: [], remove: [] }
+        ]);
     });
 });

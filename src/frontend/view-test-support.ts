@@ -1184,6 +1184,158 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
     // (the harness PATCH handlers do exactly that) is re-read on the next answer.
     const definitionCache = new Map<string, Record<string, unknown>>();
 
+    // T7b (R5/R6/R7): the session roster this double serves.
+    //
+    // WHY A STORE IS NEEDED: a shell fixture declares ONE raw record per conversation (the
+    // `{session}` body behind `GET {root}/sessions/:id`), and the members a conversation binds or
+    // invents for itself live in state that record has never carried (`record.definition.agents`
+    // growing, `record.preset.customAgents`, `record.sessionAgents`, src/server/sessions.ts
+    // :5038-5091). A test that POSTs a member and then re-reads the definition or the roster must
+    // be answered with the NEW team, or the double would confirm the write with one route and deny
+    // it with the next. So each conversation gets a small overlay here — additions, removals,
+    // per-agent instruction overrides and per-agent models — and every session-agent route, plus
+    // the frozen-definition read, composes from it.
+    //
+    // A fixture that declares one of these routes itself never touches this store (offer-first,
+    // the adapter's standing rule), so a test stays free to stage its own roster or its own 409.
+    type SessionAgentEntry = {
+        name: string;
+        profile: string;
+        // 'bound' = a trusted catalogue profile this conversation joined (its own shipped text);
+        // 'custom' = an agent the reader invented, whose whole prompt is the sentence it was
+        // created with (../shared/harness-api.ts:982-1000).
+        kind: 'bound' | 'custom';
+        model?: string;
+        instruction?: string;
+    };
+
+    type SessionAgentOverlay = {
+        added: SessionAgentEntry[];
+        removed: string[];
+        // One agent's session-level prompt. A key that is DELETED is the contract's `null` patch:
+        // the agent inherits again (../shared/harness-api.ts:1002-1011).
+        instructions: Record<string, string>;
+        models: Record<string, string>;
+    };
+
+    const sessionAgentWrites = new Map<string, SessionAgentOverlay>();
+
+    const sessionAgentOverlayOf = (id: string): SessionAgentOverlay => {
+        const known = sessionAgentWrites.get(id);
+
+        if (known !== undefined) return known;
+
+        const created: SessionAgentOverlay = { added: [], removed: [], instructions: {}, models: {} };
+        sessionAgentWrites.set(id, created);
+
+        return created;
+    };
+
+    // The roster one conversation reports: its frozen definition's team, minus anything it
+    // detached, plus anything it bound or invented — in the server's own order (definition members
+    // first, this session's additions after, see src/server/api-session-agents.test.ts:687-691).
+    const sessionMembersOf = (definition: Record<string, unknown>, overlay: SessionAgentOverlay): string[] => {
+        const listed = Array.isArray(definition.agents)
+            ? (definition.agents as string[])
+            : [String(definition.primary ?? ''), ...((definition.subagents as string[] | undefined) ?? [])];
+        const names: string[] = [];
+
+        for (const name of [...listed, ...overlay.added.map((entry) => entry.name)]) {
+            if (typeof name !== 'string' || name.length === 0) continue;
+            if (overlay.removed.includes(name)) continue;
+            if (!names.includes(name)) names.push(name);
+        }
+
+        return names;
+    };
+
+    // The prompt the SERVER composes for a profile nobody overrode: the identity sentence plus one
+    // `Guidelines:` block of `- ` bullets (src/agents/index.ts:148 `agentInstruction`), which is
+    // the exact text a live brain reports on `GET .../agents/:agent/instruction`. Kept in step with
+    // ./ui/agents.ts `agentDefaultInstructionOf`, because the dialog box and the double's answer
+    // have to agree or a session test cannot tell "the shell showed the live text" apart from
+    // "the shell composed a fallback itself".
+    const sessionAgentPromptOf = (identity: string, guidelines: readonly string[]): string => {
+        const base = identity.trim();
+        const rules = guidelines.map((line) => line.trim()).filter((line) => line.length > 0);
+
+        if (rules.length === 0) return base;
+
+        return `${base}\n\nGuidelines:\n${rules.map((line) => `- ${line}`).join('\n')}`;
+    };
+
+    // One roster row. The shell reads `agent_id` here and the text from the subresource, so the
+    // length/guideline figures stay an honest approximation of metadata this double does not
+    // author — while the fields a CLIENT actually branches on (`role`, `origin`, `deletable`)
+    // carry the server's real conditions (src/server/api-reads.ts:969-1014).
+    const sessionBindingOf = (
+        host: Record<string, unknown>,
+        overlay: SessionAgentOverlay,
+        name: string,
+        definition: Record<string, unknown>
+    ): Record<string, unknown> => {
+        const primary = String(definition.primary ?? '');
+        const threadUsers = new Set(
+            ((host.threads ?? []) as Record<string, unknown>[])
+                .filter((thread) => thread.origin === 'host')
+                .map((thread) => String(thread.agent ?? ''))
+        );
+        const added = overlay.added.find((entry) => entry.name === name);
+        const frozenModels = (definition.agentModels ?? definition.agent_models ?? {}) as Record<string, string>;
+        const liveModels = (host.agentModels ?? {}) as Record<string, string>;
+        const sessionModel = String(host.model ?? '');
+        const override = overlay.instructions[name];
+        const custom = added?.kind === 'custom';
+        const stored = (definition.agentInstructions ?? definition.agent_instructions ?? {}) as Record<
+            string,
+            string
+        >;
+
+        return {
+            agent_id: name,
+            profile: added?.profile ?? name,
+            role: name === primary ? 'primary' : 'subagent',
+            origin: added !== undefined ? 'session' : 'definition',
+            // The live brain's model first (this conversation's choice), then the creation
+            // baseline, then the session settings model (`inherited_model`, the field that exists
+            // to state that difference).
+            model: overlay.models[name] ?? liveModels[name] ?? frozenModels[name] ?? sessionModel,
+            inherited_model: frozenModels[name] ?? sessionModel,
+            // Provenance, in the server's order: an invented name has no profile to inherit from,
+            // so its text can only have come from this conversation
+            // (src/server/api-reads.ts:973-980).
+            instruction_source: custom
+                ? 'session'
+                : override !== undefined || typeof stored[name] === 'string'
+                  ? 'harness'
+                  : 'catalogue',
+            instruction_chars: (override ?? added?.instruction ?? stored[name] ?? '').length,
+            ...(override !== undefined || (custom && added?.instruction !== undefined)
+                ? { has_instruction_override: true }
+                : {}),
+            editable: true,
+            // R6: the entry point and any member that still owns a conversation cannot detach.
+            deletable: name !== primary && !threadUsers.has(name),
+            restorable: true,
+            revision: host.revision ?? 1
+        };
+    };
+
+    // The binding PATCH body, applied to the overlay with the contract's three states: an omitted
+    // field is no change, a string REPLACES the whole field, an explicit `null` clears this
+    // session's override (../shared/harness-api.ts:1002-1011).
+    const applySessionAgentPatch = (overlay: SessionAgentOverlay, agent: string, body: unknown): void => {
+        const input = (typeof body === 'string' ? JSON.parse(body) : (body ?? {})) as Record<string, unknown>;
+
+        if (input.instruction === null) delete overlay.instructions[agent];
+        else if (typeof input.instruction === 'string') overlay.instructions[agent] = input.instruction;
+
+        if (input.model === null) delete overlay.models[agent];
+        else if (typeof input.model === 'string' && input.model.trim().length > 0) {
+            overlay.models[agent] = input.model.trim();
+        }
+    };
+
     const canonicalRoutes = async (
         sub: string,
         method?: string,
@@ -1498,6 +1650,48 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                 source: harnessOverride ? 'harness' : 'catalogue',
                 overridden: harnessOverride,
                 chars: text.length
+            };
+        };
+
+        // T7b (R6): ONE member's EFFECTIVE prompt in THIS conversation — the same ladder
+        // src/server/api.ts:2770-2835 climbs: this session's override, then the definition's
+        // stored text, then the profile's shipped prompt composed with its guidelines (the live
+        // brain's own system message). Answering with the identity ALONE would make the double
+        // claim a shorter prompt than the one the agent runs, and the shell's one instruction box
+        // would look like it had appended the guideline layer itself.
+        const sessionInstructionTextOf = async (
+            overlay: SessionAgentOverlay,
+            agent: string,
+            definition: Record<string, unknown>
+        ): Promise<{ instruction: string; guidelines: string[]; source: string }> => {
+            const added = overlay.added.find((entry) => entry.name === agent);
+            const override = overlay.instructions[agent];
+
+            // A session-defined agent has no profile and therefore no guideline layer: the text
+            // this conversation gave it IS the whole prompt.
+            if (added !== undefined && added.kind === 'custom') {
+                return {
+                    instruction: override ?? added.instruction ?? `You are the ${agent} agent.`,
+                    guidelines: [],
+                    source: 'session'
+                };
+            }
+
+            if (override !== undefined) return { instruction: override, guidelines: [], source: 'harness' };
+
+            const stored = storedInstructionsRaw(definition)[agent];
+
+            if (typeof stored === 'string' && stored.trim().length > 0) {
+                return { instruction: stored, guidelines: [], source: 'harness' };
+            }
+
+            const profile = (await trustedProfilesOf())[agent];
+            const guidelines = Array.isArray(profile?.guidelines) ? (profile.guidelines as string[]) : [];
+
+            return {
+                instruction: sessionAgentPromptOf(String(profile?.instruction ?? ''), guidelines),
+                guidelines,
+                source: 'catalogue'
             };
         };
 
@@ -2335,15 +2529,45 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
             const definition = (host?.harnessDefinition ?? {}) as Record<string, unknown>;
 
+            // T7b (R5/R7): the roster a conversation builds for ITSELF is part of its own frozen
+            // definition on the real server — `addSessionAgent` appends the name to
+            // `record.definition.agents` and a detach removes it again (src/server/sessions.ts
+            // :5048-5091; src/server/api-session-agents.test.ts:341/663 pins the read). So the
+            // double answers with the same fold: whatever this conversation bound or invented is
+            // listed, whatever it detached is gone. Without it, the shell would POST a member and
+            // the next definition read would deny that the team ever changed.
+            const rosterId = decodeURIComponent(definitionMatch[1]);
+            const overlay = sessionAgentOverlayOf(rosterId);
+            const members = sessionMembersOf(definition, overlay);
+            const primary = String(definition.primary ?? members[0] ?? '');
+            const frozenModels = definition.agentModels ?? definition.agent_models;
+            const frozenInstructions = storedInstructionsRaw(definition);
+            const foldedModels: Record<string, string> = {
+                ...(frozenModels !== undefined && typeof frozenModels === 'object'
+                    ? (frozenModels as Record<string, string>)
+                    : {}),
+                ...overlay.models
+            };
+            const foldedInstructions: Record<string, string> = { ...frozenInstructions };
+
+            for (const entry of overlay.added) {
+                // A session-defined member's whole prompt is the sentence it was created with, or
+                // this conversation's rewrite of it (src/server/api.ts:2788-2807) — the definition
+                // read names the member, so it states the member's text too.
+                const text = overlay.instructions[entry.name] ?? entry.instruction;
+
+                if (typeof text === 'string' && text.trim().length > 0) foldedInstructions[entry.name] = text;
+            }
+
             return jsonOf({
                 definition: {
                     name: definition.name ?? host?.harness ?? '',
                     title: definition.title ?? '',
                     description: definition.description ?? '',
                     requires_endpoint: definition.requiresEndpoint ?? false,
-                    primary: definition.primary ?? '',
-                    subagents: definition.subagents ?? [],
-                    agents: definition.agents ?? [],
+                    primary,
+                    subagents: members.filter((name) => name !== primary),
+                    agents: members,
                     tools: definition.tools ?? [],
                     builtin: definition.builtin ?? false,
                     definition_revision: 1,
@@ -2354,8 +2578,8 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                     current_revision: 1,
                     current: true,
                     ...(host?.discoveredTools === undefined ? {} : { discovered_tools: host.discoveredTools }),
-                    ...(definition.agentModels === undefined ? {} : { agent_models: definition.agentModels }),
-                    ...(definition.agentInstructions === undefined ? {} : { agent_instructions: definition.agentInstructions }),
+                    ...(Object.keys(foldedModels).length === 0 ? {} : { agent_models: foldedModels }),
+                    ...(Object.keys(foldedInstructions).length === 0 ? {} : { agent_instructions: foldedInstructions }),
                     // T4: the identity-colour map rides the same re-expression. Without it a fixture that
                     // colours its FROZEN definition would answer this route with the team but never the
                     // colours, and a shell test could not tell that apart from a server that stored none.
@@ -2364,6 +2588,235 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                         : { agent_colors: definition.agent_colors ?? definition.agentColors })
                 }
             });
+        }
+
+        // -------------------------------------------------------------------
+        // T7b (R5/R6/R7): the session roster and its per-agent instruction subresource.
+        //
+        // `GET /sessions/{id}/agents` states the live roster WITHOUT any prompt
+        // (../shared/harness-api.ts:938-972); the instruction subresource states ONE member's
+        // COMPLETE text (../shared/harness-api.ts:1028-1039); create answers one binding and a
+        // delete answers a receipt — NONE of them states the whole team. That is why the shell
+        // re-reads the definition after a roster write (./main.ts `refreshSessionDefinition`),
+        // and why every route here composes from ONE per-conversation overlay
+        // (`sessionAgentWrites`, declared with `definitionCache`): an added member appears in the
+        // roster, in the definition and in its own instruction read, and a removed one vanishes
+        // from all three.
+        //
+        // The refusals are the SERVER's, answered rather than invented per test: a member that
+        // owns a HOST conversation cannot be detached (409 naming the ids, nothing moves) and the
+        // primary never can at all (src/server/sessions.ts:5052-5074).
+        //
+        // Offer-first as everywhere in this adapter: a fixture that declares one of these routes
+        // itself stays authoritative — its own status and body — which is how a test stages a
+        // refusal the composed answer would never produce.
+        const agentsListMatch = bare.match(/^\/sessions\/([^/]+)\/agents$/);
+
+        if (agentsListMatch !== null) {
+            const sessionId = decodeURIComponent(agentsListMatch[1]);
+            const direct = await offer();
+
+            if (direct !== undefined) return direct;
+
+            const host = await hostEx(sessionId);
+
+            if (host === undefined) return jsonOf({ error: { message: `Unknown session ${sessionId}` } }, 404);
+
+            const definition = (host.harnessDefinition ?? {}) as Record<string, unknown>;
+            const overlay = sessionAgentOverlayOf(sessionId);
+
+            if (verb === 'POST') {
+                const input = (typeof body === 'string' ? JSON.parse(body) : (body ?? {})) as Record<
+                    string,
+                    unknown
+                >;
+                const name = String(input.name ?? '').trim();
+
+                if (name.length === 0) return jsonOf({ error: { message: 'A session agent needs a name.' } }, 400);
+
+                if (sessionMembersOf(definition, overlay).includes(name)) {
+                    return jsonOf(
+                        { error: { message: `Agent "${name}" is already a member of session "${sessionId}".` } },
+                        409
+                    );
+                }
+
+                // A name the trusted catalogue carries BINDS that profile (its own shipped text,
+                // with `model`/`instruction` as this session's overrides); any other name CREATES a
+                // session-defined agent whose whole prompt is the `instruction` supplied, falling
+                // back to the deterministic identity sentence the store mints for its own agent
+                // (src/server/sessions.ts `addSessionAgent`, pinned by
+                // src/server/api-session-agents.test.ts:671-691).
+                const known = (await trustedProfilesOf())[name] !== undefined;
+
+                overlay.added.push({
+                    name,
+                    profile: String(input.profile ?? name),
+                    kind: known ? 'bound' : 'custom',
+                    ...(typeof input.model === 'string' && input.model.trim().length > 0
+                        ? { model: input.model.trim() }
+                        : {}),
+                    ...(typeof input.instruction === 'string' && input.instruction.trim().length > 0
+                        ? { instruction: input.instruction }
+                        : {})
+                });
+
+                // The create's instruction is ALSO this session's stored text for the member: a
+                // bound profile gets it as a `preset.agentInstructions` entry (`instruction_source:
+                // 'harness'`, src/server/api-session-agents.test.ts:226), and a session-defined one
+                // gets it as its base (`customAgents`, src/server/sessions.ts). Recording it the
+                // same way here is what lets a later `null` patch restore it.
+                if (typeof input.instruction === 'string' && input.instruction.trim().length > 0) {
+                    overlay.instructions[name] = input.instruction;
+                }
+
+                return jsonOf({ agent: sessionBindingOf(host, overlay, name, definition) }, 201);
+            }
+
+            if (verb !== 'GET') {
+                return jsonOf({ error: { message: `Unsupported ${verb} /sessions/:id/agents` } }, 405);
+            }
+
+            const roster = sessionMembersOf(definition, overlay);
+
+            return jsonOf({
+                session_id: sessionId,
+                total: roster.length,
+                agents: roster.map((name) => sessionBindingOf(host, overlay, name, definition)),
+                revision: host.revision ?? 1
+            });
+        }
+
+        const sessionAgentInstructionMatch = bare.match(/^\/sessions\/([^/]+)\/agents\/([^/]+)\/instruction$/);
+
+        if (sessionAgentInstructionMatch !== null) {
+            const sessionId = decodeURIComponent(sessionAgentInstructionMatch[1]);
+            const agent = decodeURIComponent(sessionAgentInstructionMatch[2]);
+            const direct = await offer();
+
+            if (direct !== undefined) return direct;
+
+            const host = await hostEx(sessionId);
+
+            if (host === undefined) return jsonOf({ error: { message: `Unknown session ${sessionId}` } }, 404);
+
+            const definition = (host.harnessDefinition ?? {}) as Record<string, unknown>;
+            const overlay = sessionAgentOverlayOf(sessionId);
+
+            if (!sessionMembersOf(definition, overlay).includes(agent)) {
+                return jsonOf(
+                    { error: { message: `Agent "${agent}" is not a member of session "${sessionId}".` } },
+                    404
+                );
+            }
+
+            // `PATCH .../instruction` writes the SAME field the binding patch writes, with the
+            // contract's three states: omitted = no change, a string REPLACES the whole prompt, an
+            // explicit `null` restores what the binding inherits
+            // (../shared/harness-api.ts:1002-1011). The answer is the read re-run, which is what
+            // src/server/api.ts:2752-2768 does.
+            if (verb === 'PATCH') {
+                applySessionAgentPatch(overlay, agent, body);
+            } else if (verb !== 'GET') {
+                return jsonOf(
+                    { error: { message: `Unsupported ${verb} /sessions/:id/agents/:agent/instruction` } },
+                    405
+                );
+            }
+
+            const text = await sessionInstructionTextOf(overlay, agent, definition);
+
+            return jsonOf({
+                session_id: sessionId,
+                agent_id: agent,
+                source: text.source,
+                instruction: text.instruction,
+                guidelines: text.guidelines,
+                chars: text.instruction.length
+            });
+        }
+
+        const sessionAgentMatch = bare.match(/^\/sessions\/([^/]+)\/agents\/([^/]+)$/);
+
+        if (sessionAgentMatch !== null) {
+            const sessionId = decodeURIComponent(sessionAgentMatch[1]);
+            const agent = decodeURIComponent(sessionAgentMatch[2]);
+            const direct = await offer();
+
+            if (direct !== undefined) return direct;
+
+            const host = await hostEx(sessionId);
+
+            if (host === undefined) return jsonOf({ error: { message: `Unknown session ${sessionId}` } }, 404);
+
+            const definition = (host.harnessDefinition ?? {}) as Record<string, unknown>;
+            const overlay = sessionAgentOverlayOf(sessionId);
+            const primary = String(definition.primary ?? '');
+
+            if (!sessionMembersOf(definition, overlay).includes(agent)) {
+                return jsonOf(
+                    { error: { message: `Agent "${agent}" is not a member of session "${sessionId}".` } },
+                    404
+                );
+            }
+
+            if (verb === 'DELETE') {
+                // The server's own refusals, in its own order (src/server/sessions.ts:5052-5074).
+                if (agent === primary) {
+                    return jsonOf(
+                        {
+                            error: {
+                                message: `Agent "${agent}" is the primary agent of session "${sessionId}" and cannot be detached; every session needs an entry point.`
+                            }
+                        },
+                        409
+                    );
+                }
+
+                const owned = ((host.threads ?? []) as Record<string, unknown>[]).filter(
+                    (thread) => thread.origin === 'host' && String(thread.agent ?? '') === agent
+                );
+
+                if (owned.length > 0) {
+                    const ids = owned.map((thread) => `"${String(thread.id ?? '')}"`).join(', ');
+
+                    return jsonOf(
+                        {
+                            error: {
+                                message: `Agent "${agent}" still owns ${owned.length} conversation${
+                                    owned.length === 1 ? '' : 's'
+                                } in session "${sessionId}": ${ids}. Delete those threads before removing the agent.`
+                            }
+                        },
+                        409
+                    );
+                }
+
+                overlay.removed.push(agent);
+                overlay.added = overlay.added.filter((entry) => entry.name !== agent);
+                delete overlay.instructions[agent];
+                delete overlay.models[agent];
+
+                // A receipt, not the roster: the contract states what detached and leaves the
+                // bounded roster read to the client (../shared/harness-api.ts:1013-1026).
+                return jsonOf({
+                    deleted: true,
+                    agent_id: agent,
+                    session_id: sessionId,
+                    detached_threads: 0,
+                    revision: host.revision ?? 1
+                });
+            }
+
+            if (verb === 'PATCH') {
+                applySessionAgentPatch(overlay, agent, body);
+
+                return jsonOf({ agent: sessionBindingOf(host, overlay, agent, definition) });
+            }
+
+            if (verb === 'GET') return jsonOf({ agent: sessionBindingOf(host, overlay, agent, definition) });
+
+            return jsonOf({ error: { message: `Unsupported ${verb} /sessions/:id/agents/:agent` } }, 405);
         }
 
         // The server-computed usage fold. Composed from the same host document as every other

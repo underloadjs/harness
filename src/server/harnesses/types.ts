@@ -81,7 +81,10 @@ export type HarnessPreset = {
     // same capture rule: the factory closure holds the map, so a later PATCH cannot
     // rewrite what an existing session was built with. A member absent from the map
     // runs the trusted `AgentProfile.instruction`; the profile itself is never
-    // mutated. This is what makes the UI's instruction editor a REAL edit: the text
+    // mutated. Since T6 the stored value IS that member's COMPLETE prompt (the UI
+    // edits one box holding the full effective instruction), so `AgentProfile.guidelines`
+    // are the default for an un-overridden member rather than policy appended below an
+    // override. This is what makes the UI's instruction editor a REAL edit: the text
     // is validated, persisted on the registry entry, projected onto the descriptor,
     // and consumed by `agentInstruction()` when the agent is built.
     agentInstructions?: Readonly<Record<string, string>>;

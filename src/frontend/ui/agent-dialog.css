@@ -162,6 +162,65 @@
     border-color: var(--accent);
 }
 
+/* R7: the "New agent" half of the `[+]` panel, offered only where the scope accepts an
+   agent the catalogue never advertised (a session). It takes its own row inside the list
+   — `flex-basis: 100%` plus the dashed top border — so a typed name can never read as
+   one more catalogue option. */
+.agent-dialog-add-custom {
+    display: flex;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+}
+
+.agent-dialog-add-custom-label {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+}
+
+/* `field-input` paints the frame; this only sizes the field, and the cap matches the
+   64-character name contract the input enforces. */
+.agent-dialog-add-input {
+    flex: 1 1 160px;
+    max-width: 260px;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+/* The create press is a LOCAL draft like an option pick, so it borrows the secondary
+   button shape (`.agent-dialog-revert`) instead of competing with `Save configuration`. */
+.agent-dialog-add-create {
+    padding: 4px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    cursor: pointer;
+}
+
+.agent-dialog-add-create:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* The name verdict, `role=status`: announced when a press or a keystroke changes it, and
+   it never takes width away from the field it describes. */
+.agent-dialog-add-error {
+    margin: 0;
+    flex: 1 1 100%;
+    color: var(--danger);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
 /* The configuration panel for the selected agent. */
 .agent-dialog-config {
     padding: 12px;

@@ -539,7 +539,7 @@ it('clears the accessible status diagnostic when the state resets', async () => 
     expect(document.querySelector('.status-detail')?.textContent).toBe('');
 });
 
-it('edits a saved session’s live models through PATCH /sessions/:id and keeps its team frozen', async () => {
+it('edits a saved session’s live models through PATCH /sessions/:id and keeps its entry agent fixed', async () => {
     const frozen = descriptor({ agentModels: { instruct: 'm2' } });
     const saved = snapshot({
         id: 's9',
@@ -594,12 +594,13 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     await flush();
     await flush();
 
-    // The TEAM and the INSTRUCTIONS are still frozen: the roster controls and the
-    // instruction editor are disabled with the real reason on each of them, `[+]`
-    // cannot add, and the action cannot promote. R7: there is no lock notice and no
-    // in-row "New session" link. T3/R1: a saved session prints NO header note at all —
-    // since T9 the CYCLER beside the title is what names the conversation on screen, and
-    // the dashboard behind the title keeps its own New session action, which stays usable.
+    // T7b (R5/R6): a saved conversation edits its OWN team, prompts and models, so NOTHING here
+    // is locked because a session is open — only the entry agent is fixed (R5) and the primary can
+    // never leave the team. R3's rule is unchanged: every restriction is stated ON the control and
+    // there is no explanation paragraph. R7: the `[+]` of a session also takes a typed name.
+    // T3/R1: a saved session still prints NO header note — since T9 the CYCLER beside the title is
+    // what names the conversation on screen, and the dashboard behind the title keeps its own New
+    // session action, which stays usable.
     expect(document.querySelector('.harness-note')?.textContent).toBe('');
     expect(document.querySelector<HTMLElement>('.harness-note')?.hidden).toBe(true);
     byClass('.harness-title-button', 'button').click();
@@ -609,15 +610,25 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     byClass('.dialog-close', 'button').click();
     await flush();
     openDeck();
-    const frozenReason =
-        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
-    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(true);
+    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(false);
     expect(byClass('.agent-dialog-instruction', 'textarea').title).toBe(
-        'A saved conversation runs the instructions it was created with. Edit them on the harness to use them in a new session.'
+        'The instruction this agent runs in this conversation.'
     );
     expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
-    expect(byClass('.agent-dialog-remove', 'button').title).toBe(frozenReason);
-    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-remove', 'button').title).toBe(
+        'The primary agent is always part of the team.'
+    );
+    // R5: the entry agent of a saved conversation cannot move, so the control states that reason
+    // instead of arming a promotion the session would refuse.
+    expect(byClass('.agent-dialog-promote', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-promote', 'button').title).toBe(
+        'The primary agent is fixed for a saved conversation.'
+    );
+    // R7: a session gains agents the catalogue never advertised, so `[+]` is live here.
+    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);
+    expect(byClass('.agent-dialog-add', 'button').title).toBe(
+        'Add an agent to the team, or name a new one.'
+    );
     // R3: the explanation paragraph is gone; the frozen roster is the saved team, and
     // a nonmember never appears in it.
     expect(document.querySelector('.agent-dialog-note')).toBeNull();

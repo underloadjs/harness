@@ -5149,13 +5149,13 @@ export class SessionStore {
             ? session.preset.customAgents![agent]
             : undefined;
 
-        // What the member runs after this call, and what the durable override records. They are
-        // deliberately NOT the same string: the contract's `instruction` field is the
-        // IDENTITY-SENTENCE override, while the agent's system message is the composed prompt
-        // (override + the profile's trusted guidelines). `agentInstruction` is the single place
-        // that joins them (src/agents/index.ts:113), and it is the same call `agentFromProfile`
-        // makes when a restart rebuilds this member — so composing here is what keeps the live
-        // text and the restored text byte-identical instead of trading one guideline for a 500.
+        // What the member runs after this call. Since T6 the override a caller sends IS the
+        // agent's complete system prompt, so the live text and the durable override are the
+        // SAME string whenever an override stands. They still differ in one case: `null`
+        // restores a profile member's trusted prompt, which `agentInstruction` composes from
+        // the effective profile's identity sentence plus its guidelines (src/agents/index.ts).
+        // Composing here rather than trusting the request text is what keeps this write and
+        // `agentFromProfile`'s rebuild of the same member byte-identical after a restart.
         const profile = custom === undefined ? effectiveAgentProfile(agent) : undefined;
 
         if (custom === undefined && profile === undefined) {
@@ -5199,6 +5199,8 @@ export class SessionStore {
         // `null` clears the session override, which means "run the deployment's current
         // effective profile text" — the global agent layer first, the shipped catalogue second
         // (`effectiveAgentProfile`), never the stale text this session happened to start with.
+        // T6 is why this is the ONLY undo: a saved override is the complete prompt, so nothing
+        // re-adds the profile's guidelines underneath it.
         //
         // R7: a session-defined member has no deployment text to fall back to, so `null` restores
         // the BASE this conversation created it with. `customAgentInstruction` is the same helper
@@ -5219,9 +5221,12 @@ export class SessionStore {
         }
 
         // The durable half: the session's own preset copy carries the RAW override, which is
-        // what `presetFromRecord` feeds back into `agentFromProfile` on the next build. Storing
-        // the composed text here instead would bake today's guidelines into the record and make
-        // a later guideline edit unreachable for this member.
+        // what `presetFromRecord` feeds back into `agentFromProfile` on the next build. Since T6
+        // that stored text IS the member's whole prompt, so the record and the live system
+        // message agree character for character. The guideline block is stored only implicitly —
+        // as part of an override the operator copied out of the full-prompt box — and a member
+        // with NO override re-reads the deployment's effective profile at rebuild time, which is
+        // what keeps a later guideline edit reaching it.
         //
         // R7: a session-defined member takes the same route through the sibling branch of
         // `agentsFromProfiles` — `agentInstructions[name] ?? customAgents[name]` — so the raw

@@ -87,7 +87,9 @@ export const isAgentProfileName = (name: string): name is AgentProfileName =>
 // Build THE system prompt for an agent: one string holding the identity sentence
 // and, below it, one composed guidelines block. A single helper means a guideline
 // added to a profile reaches the runtime automatically — the definitions ARE the
-// prompt, not documentation that can drift from it.
+// prompt, not documentation that can drift from it. The one exception is an explicit
+// `instructionOverride` (T6, documented on the function below): saved text is the
+// complete prompt, so the guidelines are what an UN-overridden member runs on.
 //
 // WHY ONE STRING AND NOT `[instruction, guidelines]`
 // --------------------------------------------------

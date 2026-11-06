@@ -3443,8 +3443,8 @@ describe('harness registry writes over HTTP', () => {
             { agent: 'summarizer', source: 'harness', overridden: true, chars: 21 }
         ]);
 
-        // The route the configuration dialog reads: the stored override plus the trusted guidelines
-        // that still ride below it.
+        // The route the configuration dialog reads: the stored text (which since T6 IS the
+        // agent's whole prompt) plus the profile's guideline RULES, reported separately.
         const text = await call(
             runtime,
             'GET',
@@ -3455,14 +3455,16 @@ describe('harness registry writes over HTTP', () => {
         expect(text.body.guidelines).toEqual(SUMMARIZER_GUIDELINES);
         expect(text.body.chars).toBe('Condense to one line.'.length);
 
-        // A session built with it runs the override for that member; the primary keeps its trusted
-        // profile, and the store proves the words reached the AGENT rather than only the card.
+        // A session built with it runs the override VERBATIM for that member (T6: a stored
+        // override is the complete prompt, so no guideline block rides below it); the primary
+        // keeps its trusted composed profile, and the store proves the words reached the
+        // AGENT rather than only the card.
         const session = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'voiced' });
         const sessionId = session.body.session.id as string;
         const agents = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdAgents(sessionId));
         expect(agents.body.agents.map((row: any) => [row.agent_id, row.instruction_source, row.instruction_chars])).toEqual([
             ['research', 'catalogue', joinedPrompt(RESEARCH_IDENTITY, RESEARCH_GUIDELINES).length],
-            ['summarizer', 'harness', joinedPrompt('Condense to one line.', SUMMARIZER_GUIDELINES).length]
+            ['summarizer', 'harness', 'Condense to one line.'.length]
         ]);
 
         const researchInstruction = await call(
@@ -3491,9 +3493,12 @@ describe('harness registry writes over HTTP', () => {
             'GET',
             HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdInstruction(next.body.session.id, 'research')
         );
-        expect(nextInstruction.body.instruction).toBe(
-            joinedPrompt('Ask before acting.', RESEARCH_GUIDELINES)
-        );
+        expect(nextInstruction.body.instruction).toBe('Ask before acting.');
+
+        // The T6 contract, from the wire rather than the helper: a stored override reaches
+        // the agent as the complete prompt, with no guideline section appended underneath.
+        expect(nextInstruction.body.instruction).not.toContain('Guidelines:');
+        expect(nextInstruction.body.chars).toBe('Ask before acting.'.length);
 
         // `{}` clears every override and the summary goes back to the catalogue rows.
         const cleared = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('voiced'), {

@@ -3284,8 +3284,10 @@ composes the profile into ONE system prompt — `` `${instruction}\n\nGuidelines
 because several OpenAI-compatible gateways accept only a single system turn, so an
 `[instruction, guidelines]` pair used to seed two `system` messages and silently lost
 the policy on those models. The application builds agents with
-`agent({ model, instruction: agentInstruction(profile), provider })`.
-Nothing in a profile is secret, and a client cannot supply one.
+`agent({ model, instruction: agentInstruction(profile), provider })`. That join is the
+DEFAULT only: with an explicit `instructionOverride` (T6) `agentInstruction()` returns the
+stored text verbatim as the complete prompt, so the guidelines never double up under an
+operator's edited box. Nothing in a profile is secret, and a client cannot supply one.
 
 `src/harnesses/registry.ts` is the in-memory harness registry shared by the store and
 the dispatcher:
@@ -3344,11 +3346,13 @@ the dispatcher:
   override). It is EXECUTABLE state: `update()` rebuilds the factory (an instruction
   patch on the scripted demo therefore upgrades it to a live harness, exactly like a
   model patch), it is persisted in the registry record, and `agentInstruction(profile,
-  override)` applies it to the identity sentence ONLY — the profile's `guidelines`
-  still compose, and the trusted profile in `src/agents` is never rewritten. A member
-  the map omits runs the trusted `GET /agents` instruction, which is why the
-  descriptor carries the OVERRIDE map and the UI pairs the two to show what an agent
-  actually runs. Sessions are deliberately NOT part of this contract: a running
+  override)` returns the stored text VERBATIM as the COMPLETE prompt (T6) — the profile's
+  `guidelines` are the default an UN-overridden member runs on and are never appended
+  underneath an override, and the trusted profile in `src/agents` is never rewritten. A
+  member the map omits runs the trusted `GET /agents` instruction, which is why the
+  descriptor carries the OVERRIDE map and the UI edits one box holding the full effective
+  prompt (composed from `instruction` + `guidelines` when there is no override). Sessions
+  are deliberately NOT part of this contract: a running
   conversation's system messages are already seeded, so `PATCH /sessions/:id` still
   accepts `agentModels` only and the frozen `harnessDefinition` records the overrides
   the conversation was built with;

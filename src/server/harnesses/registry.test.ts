@@ -1006,15 +1006,17 @@ describe('per-agent model overrides', () => {
 //
 // WHY EVERY ASSERTION BELOW EXPECTS A ONE-ENTRY `instructions` ARRAY
 // ------------------------------------------------------------------
-// `agentInstruction()` (src/agents/index.ts) returns ONE string: the identity
-// paragraph, a BLANK line, then `Guidelines:` with one `- ` bullet per guideline in
-// profile order. `agent({ instruction })` seeds one `system` message per array entry
-// (src/core/agent.ts `normalizeInstructions`), so the old two-entry value put TWO
-// system messages at the head of every transcript — and several OpenAI-compatible
-// gateways accept only ONE system turn (or keep just the first/last), silently
-// dropping the guidelines. A profile-built agent therefore seeds exactly ONE system
-// message, which is what the whole-array `toEqual([<joined prompt>])` assertions below
-// pin from the harness side: one entry, exact text, nothing appended after it.
+// `agentInstruction()` (src/agents/index.ts) returns ONE string: for a profile that
+// is NOT overridden, the identity paragraph, a BLANK line, then `Guidelines:` with
+// one `- ` bullet per guideline in profile order; for an OVERRIDDEN member (T6), the
+// stored text verbatim and nothing else. `agent({ instruction })` seeds one `system`
+// message per array entry (src/core/agent.ts `normalizeInstructions`), so the old
+// two-entry value put TWO system messages at the head of every transcript — and
+// several OpenAI-compatible gateways accept only ONE system turn (or keep just the
+// first/last), silently dropping the guidelines. A profile-built agent therefore seeds
+// exactly ONE system message, which is what the whole-array
+// `toEqual([<the one prompt>])` assertions below pin from the harness side: one entry,
+// exact text, nothing appended after it.
 describe('per-agent instruction overrides', () => {
     // The summarizer's own shipped text, so the assertions below name the exact
     // words an agent is seeded with rather than re-deriving them from the helper.
@@ -1027,19 +1029,22 @@ describe('per-agent instruction overrides', () => {
     // The complete one-message prompt for the un-overridden summarizer.
     const TRUSTED_SUMMARIZER_PROMPT = `${TRUSTED_SUMMARIZER_INSTRUCTION}\n\n${TRUSTED_GUIDELINES}`;
 
-    // An override swaps ONLY the identity paragraph, so every summarizer override
-    // below runs the operator's sentence above the unchanged trusted policy block.
-    const summarizerPrompt = (instruction: string) => `${instruction}\n\n${TRUSTED_GUIDELINES}`;
+    // T6: an override IS the agent's complete prompt, so an overridden summarizer runs
+    // the stored sentence verbatim — the trusted policy block above belongs to the
+    // UN-overridden default and is never appended underneath operator text. The helper
+    // stays as the one place that names this distinction at every call site.
+    const summarizerPrompt = (instruction: string) => instruction;
 
     // The trusted guideline block of a long shared-policy role, rendered exactly as
     // src/agents/index.ts renders it (header plus one `- ` bullet per entry, in
     // declared order). Built from the shipped profile data instead of duplicating
     // ~1.3kB of shared policy prose in this file; `readonly` because
-    // `AgentProfile.guidelines` is a readonly tuple.
+    // `AgentProfile.guidelines` is a readonly tuple. Used below to prove an override's
+    // prompt contains NONE of it (the duplication the full-prompt editor removed).
     const guidelinesBlock = (guidelines: readonly string[]) =>
         `Guidelines:\n${guidelines.map((line) => `- ${line}`).join('\n')}`;
 
-    it('applies an override to that agent only and keeps the trusted guidelines', () => {
+    it('applies an override to that agent only, verbatim, as its whole prompt', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'voiced',
@@ -1052,11 +1057,11 @@ describe('per-agent instruction overrides', () => {
 
         const harness = preset.create(SETTINGS, progress);
 
-        // The override replaces ONLY the identity sentence; the policy lines stay,
-        // which is what keeps a saved configuration from dropping shared rules. The
-        // whole prompt is ONE array entry, because the sections are joined where they
-        // are composed — two entries would be two `system` messages, and a gateway
-        // that accepts one system turn would keep only the identity paragraph.
+        // The override is the entire system message: the operator's sentence, with the
+        // profile's trusted bullets NOT appended (the box that produced this text already
+        // holds them, so appending duplicated them). The whole prompt is ONE array entry,
+        // because a prompt is seeded as one `system` message — two entries would be two
+        // turns, and a gateway that accepts one system turn would keep only the first.
         expect(harness.agents.summarizer.instructions).toEqual([
             summarizerPrompt('Condense to one line.')
         ]);
@@ -1103,13 +1108,18 @@ describe('per-agent instruction overrides', () => {
         });
 
         const harness = preset.create(SETTINGS, progress);
-        // The trimmed prose is the identity paragraph of the ONE system message, and
-        // the trusted block still follows it after the single blank line the join rule
-        // requires. Blank lines inside the override are legal; they never push the
-        // guidelines out of the message or split it into a second entry.
+        // The trimmed prose is the ENTIRE system message. Blank lines inside the override
+        // are legal and are preserved verbatim; they no longer "push the guidelines out"
+        // because nothing is appended after the operator's text (T6).
         expect(harness.agents.instruct.instructions).toEqual([
-            `Lead with the answer.\n\nThen show the evidence.\n\n${guidelinesBlock(AGENT_PROFILES.instruct.guidelines)}`
+            'Lead with the answer.\n\nThen show the evidence.'
         ]);
+
+        // The duplication guard: the profile's trusted block is absent, not appended a
+        // second time below text that already stands on its own.
+        expect(harness.agents.instruct.instructions[0]).not.toContain(
+            guidelinesBlock(AGENT_PROFILES.instruct.guidelines)
+        );
     });
 
     it('validates the map shape, its keys, and its values', () => {
@@ -1205,8 +1215,8 @@ describe('per-agent instruction overrides', () => {
 
         const rebuilt = replaced.create(SETTINGS, progress);
         // Both sides of the swap are one-message prompts: the dropped member is back on
-        // its trusted joined prompt, the kept member on the override above its trusted
-        // guideline block.
+        // its trusted composed prompt, the kept member on its override verbatim (which,
+        // per T6, is the whole prompt).
         expect(rebuilt.agents.research.instructions).toEqual([
             agentInstruction(AGENT_PROFILES.research)
         ]);
@@ -1279,8 +1289,9 @@ describe('per-agent instruction overrides', () => {
             primary: 'instruct',
             agentInstructions: { instruct: 'Lead with the answer.' }
         });
-        // The OVERRIDE map, not the effective text: a UI pairs this with the trusted
-        // `GET /agents` instruction to show what an agent actually runs.
+        // The OVERRIDE map, not the catalogue: a member listed here runs exactly this text,
+        // and a member the map omits runs the trusted `GET /agents` prompt the UI composes
+        // from `instruction` plus `guidelines` (T6).
         expect(describeHarness(mapped).agentInstructions).toEqual({ instruct: 'Lead with the answer.' });
     });
 

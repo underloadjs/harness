@@ -29,6 +29,10 @@
 // accepts only a single system turn still gets the complete prompt) — the runtime
 // composition lives in `agentInstruction()` so "guidelines affect the prompt" is a
 // single, testable path rather than per-preset string concatenation.
+//
+// T6: that composition is the DEFAULT prompt. When a caller passes an explicit
+// override, `agentInstruction()` returns it verbatim and adds no guideline block,
+// because the editor holds the full effective text the agent is meant to read.
 export type AgentProfile = {
     // Stable registry id. A harness selects agents by this name, and a session
     // records the names it was built with.

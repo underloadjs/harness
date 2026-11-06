@@ -285,9 +285,10 @@ export type HarnessDescriptor = {
     // instruction text. PRESENT ONLY WHEN the harness actually overrides something,
     // so every existing card keeps its exact shape. Like `agentModels` it is the
     // OVERRIDE map, not the effective text: an agent it omits runs the trusted
-    // catalogue instruction from `GET /agents`. The override replaces only the
-    // profile's identity sentence — its `guidelines` still apply — and it never
-    // rewrites the trusted profile itself.
+    // catalogue instruction from `GET /agents`. Since T6 the stored value IS the agent's
+    // COMPLETE prompt — the operator edits one box holding the full effective text — so
+    // `GET /agents`'s `guidelines` are the default for an un-overridden member and are
+    // never appended below an override. It still never rewrites the trusted profile.
     agentInstructions?: Record<string, string>;
     // Per-agent identity COLORS (R2): agent id → CSS hex color (`#rgb`, `#rgba`,
     // `#rrggbb`, `#rrggbbaa`, either case). PRESENT ONLY WHEN the harness configures at

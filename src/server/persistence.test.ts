@@ -306,11 +306,11 @@ describe('R3b durable harness database', () => {
         const restored = second.registry.find('voiced');
 
         expect(restored?.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
-        // The override replaces ONLY the identity sentence, and both sections live in
-        // ONE entry: `agentInstruction()` joins them into a single string so the
-        // rebuilt factory seeds one system message (../agents/index.ts).
+        // T6: the override IS the whole prompt, so the rebuilt factory seeds exactly the
+        // stored text as ONE system message — the shipped guideline block is NOT appended
+        // underneath it (../agents/index.ts).
         expect(restored?.create(SETTINGS, () => undefined).agents.summarizer.instructions).toEqual([
-            'Condense to one line.\n\nGuidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+            'Condense to one line.'
         ]);
     });
 

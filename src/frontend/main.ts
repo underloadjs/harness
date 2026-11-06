@@ -221,6 +221,16 @@ import {
     // configuration dialog needs that text, exactly as `getTool` is asked for when a
     // tool is opened (T50).
     getAgent,
+    // T7b (R5/R6/R7): the SESSION-scoped roster surface. A saved conversation owns its own
+    // members, their models and their complete prompts, and these are the only routes that
+    // read or write them (`GET/POST /sessions/{id}/agents`,
+    // `PATCH/DELETE /sessions/{id}/agents/{agent}`, plus the per-agent instruction read used
+    // to seed the dialog's one box with the LIVE text).
+    createSessionAgent,
+    deleteSessionAgent,
+    getSessionAgentInstruction,
+    listSessionAgents,
+    updateSessionAgent,
     updateSession,
     // T50: the identified catalogue read (argument schema + execution scope) and the row
     // mapper it shares with the page. A `ToolSummary` row has no schema; this is the read
@@ -5889,10 +5899,18 @@ const renderHarnessChrome = (): void => {
 // Both the dialog's seed and every harness PATCH restate THIS map, and that is the whole
 // point of keeping it in one place: the server REPLACES `agentInstructions`, so restating
 // only the fields one frame happened to carry would silently wipe another member's override.
-const storedInstructionsOf = (display: HarnessDescriptor, instance: Instance): Record<string, string> => ({
-    ...(instance.harnessInstructions ?? {}),
-    ...agentInstructionsOf(display)
-});
+// T7b (R6): the precedence FLIPS for a saved conversation. A session's `harnessInstructions`
+// cache is not a second-hand copy of the template — it is the roster read's LIVE text, fetched
+// per member from `GET /sessions/{id}/agents/{agent}/instruction` (./api.ts
+// `getSessionAgentInstruction`), and it is what this conversation actually runs. The frozen
+// definition's `agent_instructions` map is the CREATION-TIME text: still the fallback for a
+// member the read has not answered for (a legacy server with no roster route, or a first paint
+// before the read lands), but it must never overwrite text this conversation saved afterwards.
+// Without a session the rule is unchanged: the document states the stored map, so it wins.
+const storedInstructionsOf = (display: HarnessDescriptor, instance: Instance): Record<string, string> =>
+    instance.sessionId === undefined
+        ? { ...(instance.harnessInstructions ?? {}), ...agentInstructionsOf(display) }
+        : { ...agentInstructionsOf(display), ...(instance.harnessInstructions ?? {}) };
 
 // T32: the same precedence for the per-agent MODEL map, and for the same reason. A card
 // omits `agent_models` (../shared/harness-api.ts:418-419), so the only complete view of
@@ -5924,8 +5942,10 @@ type AgentView = {
     members: string[];
     primary: string;
     locked: boolean;
-    // TEAM editing (promotion/add/remove). A saved session freezes the team; models
-    // stay live through `models.editable` below (R2).
+    // TEAM editing (promotion/add/remove) plus the instruction editor. R5/R6 (T7b): a saved
+    // session is NOT locked any more — it edits its OWN team, models and prompts. Only an
+    // in-flight run or a session-creating submit locks the controls, because those windows
+    // race the roster the next request runs.
     editable: boolean;
     // Per-member EFFECTIVE model (override or session/global fallback).
     models: Record<string, string>;
@@ -5940,6 +5960,20 @@ type AgentView = {
     // composer button, the dialog badges and the transcript tiles are three different
     // components, and only this one map can keep them agreeing (R4).
     colors: Record<string, string>;
+    // R5/R6/R7 (T7b): what the DIALOG is allowed to do, derived once here so the composer
+    // button, the dialog and the write path can never disagree about the scope.
+    //   - `scope` is where a save lands: 'session' edits THIS conversation's roster,
+    //     models and prompts; 'harness' edits the template new sessions start from.
+    //   - `allowCustom` offers the `[+]` "New agent" name field (R7) — only a session
+    //     accepts an agent the catalogue never advertised.
+    //   - `canPromote` is false for a saved conversation: its entry agent is fixed
+    //     server-side, so the control must not arm a promotion that cannot be written.
+    //   - `threadAgents` names the agents a conversation in this session already runs
+    //     (R6); each keeps its tab but cannot be removed.
+    scope: 'session' | 'harness';
+    allowCustom: boolean;
+    canPromote: boolean;
+    threadAgents: string[];
     // The model a no-override choice resolves to (rendered as an id, never
     // "inherit"); '' means "not known", which the select states honestly.
     fallback: string;
@@ -5951,10 +5985,19 @@ const agentViewOf = (instance: Instance): AgentView => {
     const display = instance.frozen ?? instance.descriptor;
     const members = membersOf(display);
     const locked = instance.sessionId !== undefined;
-    // R21.1: the harness itself is always editable; only a saved session (frozen
-    // team), an in-flight run, or a submit that is currently creating/answering a
-    // session locks the team.
-    const editable = !locked && !running && !submitting;
+    // T7b (R5/R6): a saved conversation is no longer locked for TEAM/instruction edits — it
+    // owns its own roster, models and prompts through `POST/PATCH/DELETE
+    // /sessions/{id}/agents...`, and a save there never touches the harness template. Only an
+    // in-flight run, or a submit that is creating/answering a session, is a real lock, because
+    // those windows race the roster the next request will run. `locked` stays: it is the scope
+    // switch (which route, which copy), not the edit gate.
+    const editable = !running && !submitting;
+    // R6: which agents this session's conversations actually run. The runtime roster omits an
+    // agent's DEFAULT conversation (`origin: 'agent'`, ui/threads.ts:58-62), so whatever is
+    // listed here is an independent thread, and the server refuses to detach exactly those
+    // members (../server/api-reads.ts:953-1011 sets `deletable: false` on the same condition).
+    // A harness template has no threads at all, so nothing is in use.
+    const threadAgents = locked ? uniqueNames(instance.threads.map((thread) => thread.agent)) : [];
 
     // Effective model per member.
     //
@@ -5984,18 +6027,16 @@ const agentViewOf = (instance: Instance): AgentView => {
         if (model !== undefined && model.length > 0) models[name] = model;
     }
 
-    // Per-agent INSTRUCTION overrides (T3). The harness's stored map is the only
-    // source: a member absent from it runs the trusted preset instruction, which is
-    // what the dialog's textarea is seeded with. A saved conversation reads its
-    // FROZEN definition here, so the text on screen is the text that conversation
-    // actually runs — and editing it is refused, because a system message already
-    // seeded into a running transcript cannot be rewritten without rebuilding the
-    // conversation (see the `hint` below and the dialog's locked instruction note).
-    // T11: a COMPILED view no longer carries that map at all (instruction text does not
-    // belong in every view frame, ../server/protocol.ts:655-663). Whatever the explicit
-    // dialog-open read produced (`instance.harnessInstructions`, ./api.ts `getHarness`)
-    // fills the gap, and a field the DOCUMENT does state still wins — an older server that
-    // ships the map, or a frozen definition that carries it, needs no round trip at all.
+    // Per-agent INSTRUCTION text (T3, R4/T7b). ONE box, and THIS map is what seeds it: a
+    // member absent from it falls back to the default prompt the catalogue composes (./ui/
+    // agents.ts `agentDefaultInstructionOf`), which is the same full text the server runs.
+    //
+    // T11: a COMPILED view no longer carries instruction text at all (it would ride every
+    // frame, ../server/protocol.ts:655-663), so the explicit dialog-open read fills the gap
+    // (`instance.harnessInstructions`). Which source wins is the scope question, and
+    // `storedInstructionsOf` above states it: a harness template's stored map, or a saved
+    // conversation's LIVE per-agent roster text (R6 — a session's prompt is its own, and
+    // editing it is now a supported write, not a refusal).
     const instructions = storedInstructionsOf(display, instance);
 
     // T4/R2: the explicit colors configured for THIS team. Read-only display metadata —
@@ -6034,16 +6075,19 @@ const agentViewOf = (instance: Instance): AgentView => {
         : defaultSessionModel();
 
     // The hint names the ACTUAL cause instead of claiming "locked" for a busy run.
-    // T3: it also has to cover the instruction editor, which is locked for the same
-    // three reasons, so a saved conversation's message says what is frozen rather
-    // than guessing at a team-only restriction.
-    const hint = locked
-        ? 'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
-        : running
-          ? 'Wait for the current run to finish before switching agents.'
-          : submitting
-            ? 'A session is being created; try again in a moment.'
-            : undefined;
+    // T7b (R5): the sentence states the SCOPE a save writes, and only names a lock when
+    // something really is locked. A saved conversation is no longer described as frozen — it
+    // edits its own agents, models and prompts, and the sentence says so the reader cannot
+    // send a change to the template by accident. T3's rule still holds: the same string is the
+    // accessible reason on every locked control, so it must name the actual cause (a run, a
+    // session being created) rather than a stale "saved conversations are read-only" claim.
+    const hint = running
+        ? 'Wait for the current run to finish before changing the agents or instructions.'
+        : submitting
+          ? 'A session is being created; try again in a moment.'
+          : locked
+            ? 'Edits here change this conversation only. The harness template stays as it is.'
+            : 'Edits here change the harness template used by new sessions.';
 
     return {
         display,
@@ -6055,7 +6099,15 @@ const agentViewOf = (instance: Instance): AgentView => {
         instructions,
         colors,
         fallback,
-        ...(hint === undefined ? {} : { hint })
+        scope: locked ? 'session' : 'harness',
+        // R7: only a session can gain an agent the catalogue never advertised; R5: only a
+        // template (no session) can move its entry agent, because a saved conversation's
+        // primary is fixed server-side (../shared/harness-api.ts `CreateSessionAgentRequest`
+        // cannot demote the entry point).
+        allowCustom: locked,
+        canPromote: !locked,
+        threadAgents,
+        hint
     };
 };
 
@@ -6153,9 +6205,18 @@ const agentDialogOptionsOf = (view: AgentView, instance: Instance) => {
         editable: view.editable,
         models: agentModelSelectOf(view),
         instructions: view.instructions,
-        // A selection that moves onto an agent the dialog-open walk never covered (a `[+]`
-        // addition) asks for its trusted preset text on that explicit action. A no-op once
-        // the row has text, so re-painting the same tab sends nothing.
+        // R5/R6/R7: the capability flags the dialog renders from — where a save lands, whether
+        // `[+]` may take a typed name, whether `Make primary` exists here, and which members
+        // a conversation already runs. Derived in `agentViewOf` so the composer's tooltip, the
+        // dialog's controls and `applyAgentConfiguration`'s writes all read ONE answer.
+        scope: view.scope,
+        allowCustom: view.allowCustom,
+        canPromote: view.canPromote,
+        threadAgents: view.threadAgents,
+        // A selection that moves onto an agent the catalog detail walk never covered (a `[+]`
+        // addition) asks for its default text on that explicit action. A no-op once
+        // the row has text, for a name the catalogue does not carry (a custom session agent),
+        // and on re-painting the same tab.
         onRequestPreset: (agent: string) => loadAgentPresetTexts(instance, [agent]),
         activity: [...instance.activity],
         ...(view.hint === undefined ? {} : { hint: view.hint }),
@@ -6184,6 +6245,14 @@ const agentDialogSignatureOf = (view: AgentView): string =>
         // nothing and the badges would keep the automatic tones.
         colors: view.colors,
         fallback: view.fallback,
+        // T7b (R5/R6/R7): the dialog's SHAPE depends on the scope flags, and in a session the
+        // removal controls depend on which members a conversation runs. A thread appearing or
+        // going away has to move the signature, or an open dialog would keep offering a `Remove
+        // from team` press the server is about to refuse with 409.
+        scope: view.scope,
+        allowCustom: view.allowCustom,
+        canPromote: view.canPromote,
+        threadAgents: view.threadAgents,
         agents: agentLibrary.map((agent) => agent.name)
     });
 
@@ -6213,12 +6282,32 @@ const agentDialogSignatureOf = (view: AgentView): string =>
 const loadHarnessConfiguration = (instance: Instance): void => {
     const name = instance.descriptor.name;
 
-    // The preset instruction text is asked for alongside the definition read, from the
-    // member list already in hand (the FROZEN definition for a saved conversation, so
-    // the tabs on screen are the ones filled). It is a separate read because the two
-    // answers are different facts: this one states what each member runs when the
-    // harness does NOT override it. See `loadAgentPresetTexts`.
+    // The catalogue DEFAULT text is asked for alongside the configuration read, from the
+    // member list already in hand (the FROZEN definition for a saved conversation, so the tabs
+    // on screen are the ones filled). It stays a separate read because it answers a different
+    // fact: what each member runs when NOTHING has been saved for it — the full prompt the
+    // server composes (./ui/agents.ts `agentDefaultInstructionOf`), which is what the dialog's
+    // one box falls back to. Names the catalogue does not carry (a custom session agent,
+    // R7) are skipped by the helper itself: there is no row to fill. See `loadAgentPresetTexts`.
     loadAgentPresetTexts(instance, membersOf(instance.frozen ?? instance.descriptor));
+
+    // T7b (R6): a saved conversation does NOT edit the template's stored prompts. Its own
+    // roster, models and complete prompts live under `GET /sessions/{id}/agents...`, so the
+    // harness definition is not read at all here — `GET /harnesses/:name` would answer the
+    // template's text, which is precisely the wrong question for this conversation.
+    const sessionId = instance.sessionId;
+
+    if (sessionId !== undefined) {
+        void loadSessionConfiguration(instance, sessionId).catch(() => {
+            // Stated, not swallowed: the dialog stays usable from the definition this browser
+            // was given (the frozen `agent_instructions` map), and the next open asks again.
+        });
+
+        // T4: the colour half of the template read, and ONLY that half.
+        loadHarnessColors(instance, sessionId);
+
+        return;
+    }
 
     void getHarness(name)
         .then(async (fetched) => {
@@ -6281,6 +6370,167 @@ const loadHarnessConfiguration = (instance: Instance): void => {
             // Stated, not swallowed: the dialog is still usable with the definition this
             // browser was given, and the next open asks again.
         });
+};
+
+// Colours are the one template fact a saved conversation still asks for, and the reason is
+// T4's rule, not a shortcut: `GET /harnesses/:name` is the ONLY publisher of `agent_colors` (a
+// card omits the field, ../shared/harness-api.ts:422), while a frozen copy carries the map only
+// when the conversation was created after the swatch existed. A session whose frozen definition
+// states colours needs no read at all — `storedColorsOf` gives the DOCUMENT precedence per key,
+// so the conversation's own copy wins either way. What must not happen is the other loss: an
+// older conversation (or an archived harness with no card left) silently dropping a colour the
+// server still configures for that member.
+const loadHarnessColors = (instance: Instance, sessionId: string): void => {
+    const name = instance.descriptor.name;
+
+    void getHarness(name)
+        .then((fetched) => {
+            // No card, or a card that names a different harness (an archived conversation): keep
+            // the colours this browser already has.
+            if (fetched === undefined || fetched.name !== name) return;
+            if (instance.sessionId !== sessionId) return;
+
+            const colors = agentColorsOf(descriptorOf(fetched));
+
+            if (sameStringMap(instance.harnessColors, colors)) return;
+
+            instance.harnessColors = colors;
+            if (current !== instance) return;
+
+            const view = agentViewOf(instance);
+
+            configureAgentColorsFor(view);
+            renderHarnessChrome();
+            refreshAgentDialog(view, instance);
+        })
+        .catch(() => {
+            // The palette keeps the deterministic automatic tones, which is the honest reading of
+            // "this browser has not been told a colour for these agents".
+        });
+};
+
+// T7b (R6): the LIVE configuration of ONE saved conversation, in the same explicit-open window
+// as the definition read above (never from a render, a hydrate, a poll or a stream frame).
+//
+// WHY THE ROSTER READ FIRST: `GET /sessions/{id}/agents` is the route that states who this
+// conversation actually has — the frozen definition's members PLUS every agent it bound itself
+// (a catalogue profile via `[+]`, or a name the reader typed, R7). The instruction subresource
+// is 404 for a name that is not on that roster, so the roster is both the member list and the
+// bound for how many text reads follow (the roster budget caps it, ../shared/harness-api.ts:963).
+//
+// WHY ONE TEXT READ PER MEMBER: a `SessionAgentBinding` carries provenance and length but NO
+// prompt (../shared/harness-api.ts:938-960), and the text a session runs is not the template's
+// — since T6 a stored override IS the complete prompt, so the box must show exactly this answer
+// and nothing composed from the harness map. A read that fails leaves that one member out,
+// which is honest: `storedInstructionsOf` then falls back to the definition's text for it.
+const loadSessionConfiguration = async (instance: Instance, sessionId: string): Promise<void> => {
+    const list = await listSessionAgents(sessionId);
+
+    // The reader left this conversation while the roster was in flight: painting would describe
+    // a chat that is not on screen.
+    if (instance.sessionId !== sessionId) return;
+
+    const entries = await Promise.all(
+        list.agents.map(async (binding): Promise<[string, string] | undefined> => {
+            try {
+                const text = await getSessionAgentInstruction(sessionId, binding.agent_id);
+
+                return [binding.agent_id, text.instruction];
+            } catch {
+                return undefined;
+            }
+        })
+    );
+
+    const stored = Object.fromEntries(entries.filter((entry): entry is [string, string] => entry !== undefined));
+
+    // Nothing moved: no repaint, and no caret loss for a reader already typing.
+    if (sameStringMap(instance.harnessInstructions, stored)) return;
+
+    instance.harnessInstructions = stored;
+
+    if (current !== instance) return;
+
+    const view = agentViewOf(instance);
+
+    // Same funnel as the template read above: the palette is re-derived BEFORE anything paints
+    // from it (T4), the composer button follows the roster, and the open dialog re-seeds every
+    // box with the text this conversation actually runs.
+    configureAgentColorsFor(view);
+    renderHarnessChrome();
+    refreshAgentDialog(view, instance);
+};
+
+// T7b (R5/R6/R7): the roster WRITE path's refresh, on its own.
+//
+// Neither `POST` nor `DELETE /sessions/{id}/agents` answers a roster — a create answers one
+// `SessionAgentBinding` and a delete answers a receipt naming what detached
+// (../shared/harness-api.ts:974-1026). Two reads DO state it:
+//
+//   - `GET /sessions/{id}/definition` — the member set (the definition's team plus every name
+//     this conversation bound or invented, minus what it detached) and the toolbox. Installed
+//     through `frozenDefinitions`, which is the map every later document re-derives THIS
+//     conversation's team from (`frozenTeamOf`, T46/T50 above); the two promise caches are
+//     replaced in the same step, because `readFrozenDefinition`/`discoveredToolsOf` dedupe per
+//     conversation and would otherwise hand the next hydrate a team that no longer exists.
+//   - `getView` + `applyView` — the live snapshot: the thread roster (which is what
+//     `view.threadAgents` reads, R6) and the effective per-agent model map, reconciled by exactly
+//     the code `openSession` uses (its stale guard keeps a live frame that moved past this answer
+//     in front).
+//
+// Both run BEFORE the surviving members' prompts and models are written, for two reasons: the
+// writes are addressed by member name, so the NEW team has to be in hand; and a later document
+// re-read would regress the model map the model PATCH is about to install (the PATCH answer is
+// the newest authority for that field, R2).
+//
+// A failed read keeps what this browser has: the write itself already happened, and the honest
+// fallback is the team as last stated rather than an emptied roster.
+const refreshSessionRoster = async (instance: Instance, sessionId: string): Promise<void> => {
+    // ./view-api.ts `readDefinition` is this route's existing shell accessor (the same one
+    // `hydrateSessionDefinition` and `readFrozenDefinition` use), so no second import is needed.
+    const definition = await readDefinition(sessionId).catch(() => undefined);
+
+    if (definition !== undefined && instance.sessionId === sessionId) {
+        const frozen = frozenDescriptorOf(definition);
+
+        if (frozen !== undefined) {
+            const discovered = Array.isArray(definition.discovered_tools) ? [...definition.discovered_tools] : [];
+
+            frozenDefinitions.set(sessionId, frozen);
+            frozenReads.set(sessionId, Promise.resolve(frozen));
+            discoveredReads.set(sessionId, Promise.resolve(discovered));
+
+            instance.frozen = frozen;
+            instance.discovered = discovered;
+        }
+    }
+
+    if (instance.sessionId !== sessionId) return;
+
+    try {
+        applyView(instance, await getView(sessionId));
+    } catch {
+        // A freshness read that fails cannot invalidate the write the server already accepted.
+    }
+};
+
+// T7b (R4/R6): repaint a saved conversation after a session write — the live per-agent prompt
+// text, then ONE repaint funnel. `renderHarnessChrome` re-derives the view, calls
+// `configureAgentColorsFor` (T4: a brand-new member wears its deterministic tone immediately)
+// and refreshes the open dialog; the trailing `refreshAgentDialog` covers the branch where the
+// Tools view owns the centre and that chrome paint returns early. Forced, because a roster write
+// can leave the derived state looking identical to the reader (a NEW tab is not a change in any
+// map this browser cached) while the team on screen has in fact moved.
+const refreshSessionConfiguration = async (instance: Instance, sessionId: string): Promise<void> => {
+    await loadSessionConfiguration(instance, sessionId).catch(() => undefined);
+
+    if (instance.sessionId !== sessionId || current !== instance) return;
+
+    const view = agentViewOf(instance);
+
+    configureAgentColorsFor(view);
+    renderHarnessChrome();
+    refreshAgentDialog(view, instance, true);
 };
 
 // Two override maps are the same server state when every key and value matches. `undefined`
@@ -6503,11 +6753,10 @@ const forceRefreshAgentDialog = (): void => {
 //     a promotion and a model/instruction edit can never land as two partially
 //     applied writes, and the demoted old primary survives as a secondary exactly
 //     once (no stale duplicate).
-//   - A SAVED SESSION — the team and the instructions are frozen (a conversation
-//     runs the definition it was created with), so only the live model map is
-//     writable, through PATCH /sessions/:id. Anything else in the draft is refused
-//     with the reason, and the dialog keeps the drafts so the reader can start a new
-//     session and save them there.
+//   - A SAVED SESSION (T7b, R5/R6/R7) — the conversation's OWN team, prompts and live
+//     models, written through `POST/PATCH/DELETE /sessions/{id}/agents...`. The harness
+//     template is never touched, so nothing this reader does can change the sessions the
+//     NEXT person starts. See `applySessionConfiguration` for the order and the guards.
 //
 // The return value is what the dialog renders: `applied: false` never closes it and
 // never clears a draft.
@@ -6530,67 +6779,15 @@ const applyAgentConfiguration = async (
         return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
     }
 
-    // --- saved session: live models only ----------------------------------
+    // --- a saved conversation: its own team, prompts and models ------------
+    // T7b (R5/R6/R7): a saved conversation owns its roster, its complete prompts and its live
+    // models, so every draft lands on `POST/PATCH/DELETE /sessions/{id}/agents...` and NOTHING
+    // is written to the harness template. A models-only draft keeps the pre-T7b path (R2),
+    // including its wording, because that write is the one thing allowed mid-run.
     const sessionId = instance.sessionId;
 
     if (sessionId !== undefined) {
-        if (busy) {
-            return {
-                applied: false,
-                message:
-                    'This conversation keeps the team it was created with · save on the harness to use it in a new session.'
-            };
-        }
-
-        // T5 safeguard: instruction deltas are forbidden here for the same reason the
-        // team is — a saved conversation runs the system prompt it was created with,
-        // and PATCH /sessions/:id has no instruction field to write. Today the dialog
-        // cannot produce such a draft (its editor is rendered disabled while locked),
-        // so this branch is a guard against a future/stale caller: refusing beats
-        // dropping the delta and reporting the save as applied.
-        if (Object.keys(changes.instructions).length > 0) {
-            return {
-                applied: false,
-                message:
-                    'This conversation keeps the instructions it was created with · save on the harness to use them in a new session.'
-            };
-        }
-
-        const drafted = Object.entries(changes.models);
-
-        if (drafted.length === 0) {
-            return { applied: false, message: 'Nothing changed.' };
-        }
-
-        // The session PATCH MERGES, so the body is the complete live map (the
-        // server's answer wins over the frozen overrides for members the patch does
-        // not name). A "use the default" choice becomes that resolved id rather than
-        // a deleted key: deleting here would leave the agent on the model it already
-        // runs, which is the opposite of what the reader picked.
-        const next = modelsForMembers(
-            { ...agentModelsOf(display), ...(instance.sessionModels ?? {}) },
-            members
-        );
-
-        for (const [name, model] of drafted) {
-            if (!members.includes(name)) continue;
-
-            const value = model.trim();
-            const resolved = view.fallback.trim();
-
-            if (value.length === 0) {
-                if (resolved.length > 0) next[name] = resolved;
-                else delete next[name];
-            } else {
-                next[name] = value;
-            }
-        }
-
-        if (Object.keys(next).length === 0) {
-            return { applied: false, message: 'No model is available to select here yet.' };
-        }
-
-        return await patchSessionModels(instance, sessionId, next);
+        return await applySessionConfiguration(instance, sessionId, view, changes);
     }
 
     // --- editing the harness itself --------------------------------------
@@ -6619,9 +6816,9 @@ const applyAgentConfiguration = async (
 
     if (!nextMembers.includes(primary)) return { applied: false, message: 'A harness needs a primary agent.' };
 
-    // Merge the deltas onto the stored maps. An explicit '' clears a key, which is
-    // how the dialog reverts one agent to the default model or to the trusted preset
-    // instruction without a second protocol verb.
+    // Merge the deltas onto the stored maps. An explicit '' clears a key, which is how the dialog
+    // drops an agent's stored prompt (R4: the one box, cleared by hand) or chooses the default
+    // model, without a second protocol verb.
     const models = { ...agentModelsOf(display) };
 
     for (const [name, model] of Object.entries(changes.models)) {
@@ -6661,6 +6858,197 @@ const applyAgentConfiguration = async (
     }
 
     return await patchAgents(primary, nextMembers, nextModels, nextInstructions);
+};
+
+// ---------------------------------------------------------------------------
+// The saved conversation's own write path (T7b / R5 + R6 + R7)
+// ---------------------------------------------------------------------------
+//
+// One explicit apply from the dialog, in the order the SERVER needs it:
+//
+//   removals → additions → roster refresh → surviving members' prompts → models → refresh
+//
+// WHY THAT ORDER: a removal is the one write the server may REFUSE (409 while a host
+// conversation runs that member, ../server/sessions.ts `removeSessionAgent`, mirrored by the
+// binding's `deletable: false`, ../server/api-reads.ts:1009-1011), so it goes first: a blocked
+// save then costs exactly one request and the roster has not moved. Additions follow, and only
+// after the roster is re-read (step 3) can the surviving members' prompts be addressed by name —
+// a create receipt states ONE binding, not the team (../shared/harness-api.ts:974-1026).
+//
+// WHY EACH BODY LOOKS THE WAY IT DOES:
+//   - an added member carries its model and its complete prompt in the CREATE, so a `[+]` pick
+//     with a typed instruction is one request, not three (../shared/harness-api.ts:982-1000 —
+//     a catalogue name BINDS that profile, any other name CREATES a session-defined agent whose
+//     whole prompt is the `instruction` supplied, defaulting to the session model and an
+//     identity sentence);
+//   - a prompt is sent VERBATIM. Since T6 an instruction override IS the complete system prompt
+//     (the guidelines are defaults, not an appended layer), so the text in the box is exactly
+//     what the agent runs;
+//   - a CLEARED box sends `null`, which restores the inherited prompt. An empty string would
+//     store a prompt of nothing, and an omitted field would change nothing at all
+//     (../shared/harness-api.ts:1002-1011: omitted = no change, string = replace, null = clear);
+//   - the model map is restated COMPLETE against the FINAL member list, because the session
+//     PATCH replaces the field it names.
+//
+// A rejected write leaves the dialog open with every draft (the dialog's own rule) but still
+// re-reads the conversation: an earlier write in the same sequence may have landed, and the
+// roster on screen must then say so.
+const applySessionConfiguration = async (
+    instance: Instance,
+    sessionId: string,
+    view: AgentView,
+    changes: AgentConfigurationApply
+): Promise<AgentApplyResult> => {
+    const existing = view.members;
+    const removals = changes.remove.filter((name) => existing.includes(name));
+    const additions = changes.add.filter((name) => !existing.includes(name));
+    const prompts = Object.entries(changes.instructions);
+    const drafted = Object.entries(changes.models);
+    const teamWork = removals.length > 0 || additions.length > 0 || prompts.length > 0;
+    // Only a roster write moves the member set; a prompt or model save re-reads nothing but the
+    // text it just wrote (the model PATCH answer is already the newest authority for its field).
+    const rosterMoved = removals.length > 0 || additions.length > 0;
+
+    // R5: a saved conversation keeps the entry agent it started with — `canPromote: false`
+    // already disables the control, so this is the guard against a stale or foreign caller
+    // rather than the reader's normal path.
+    if (changes.primary !== undefined && changes.primary !== view.primary) {
+        return { applied: false, message: 'The primary agent is fixed for a saved conversation.' };
+    }
+
+    if (!teamWork && drafted.length === 0) return { applied: false, message: 'Nothing changed.' };
+
+    // A roster or prompt write decides who runs the NEXT request, so it is refused while a run
+    // is in flight (the tiles are still moving) or while a submit is creating this session (the
+    // freeze has not landed). A models-only draft is NOT refused: R2 keeps the live map editable
+    // mid-run, and the harness path's own message names the same two windows.
+    if (teamWork && (running || submitting || creatingSessions > 0)) {
+        return {
+            applied: false,
+            message: running
+                ? 'Wait for the current run to finish before saving agents.'
+                : 'A session is being created · save again once it exists.'
+        };
+    }
+
+    // The whole sequence is one single-flight unit: a harness PATCH or a second session save
+    // that interleaved two roster writes would report a team that never existed.
+    if (savingAgents) {
+        return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
+    }
+
+    savingAgents = true;
+
+    // R3/R5: the pill says what is being written, and (unlike a template save) that it lands on
+    // THIS conversation. The models-only case keeps R2's wording, because that save really is
+    // "the next request" and nothing else.
+    const label = teamWork ? 'agent configuration' : 'agent models';
+    const saved = teamWork
+        ? 'agent configuration saved · applies to this conversation'
+        : 'agent models saved · next request';
+
+    setStatus('saving', `saving ${label}`);
+
+    try {
+        // 1. Removals.
+        for (const name of removals) await deleteSessionAgent(sessionId, name);
+
+        // 2. Additions, each carrying its own model and complete prompt.
+        for (const name of additions) {
+            const model = (changes.models[name] ?? '').trim();
+            const instruction = (changes.instructions[name] ?? '').trim();
+
+            await createSessionAgent(sessionId, {
+                name,
+                profile: name,
+                ...(model.length === 0 ? {} : { model }),
+                ...(instruction.length === 0 ? {} : { instruction })
+            });
+        }
+
+        // 3. The roster the writes produced, BEFORE anything is addressed by member name.
+        if (rosterMoved) await refreshSessionRoster(instance, sessionId);
+
+        // 4. Prompts for the members that were ALREADY on this team (an added member's text
+        //    travelled with its create, so restating it here would be a second write of the
+        //    same bytes).
+        for (const [name, text] of prompts) {
+            if (!existing.includes(name)) continue;
+
+            const instruction = text.trim();
+
+            await updateSessionAgent(sessionId, name, {
+                instruction: instruction.length > 0 ? instruction : null
+            });
+        }
+
+        // 5. Models, built from the REFRESHED roster so a member added one request ago is on the
+        //    list its key belongs to and a removed one is off it (`modelsForMembers` filters to
+        //    the final set because the PATCH replaces the whole field).
+        if (drafted.length > 0) {
+            const live = agentViewOf(instance);
+            const next = modelsForMembers(
+                { ...agentModelsOf(live.display), ...(instance.sessionModels ?? {}) },
+                live.members
+            );
+
+            for (const [name, model] of drafted) {
+                if (!live.members.includes(name)) continue;
+
+                const value = model.trim();
+                const resolved = live.fallback.trim();
+
+                // A "use the default" choice becomes the resolved id rather than a deleted key:
+                // deleting here would leave the agent on the model it already runs (R2).
+                if (value.length === 0) {
+                    if (resolved.length > 0) next[name] = resolved;
+                    else delete next[name];
+                } else {
+                    next[name] = value;
+                }
+            }
+
+            if (Object.keys(next).length === 0) {
+                return { applied: false, message: 'No model is available to select here yet.' };
+            }
+
+            // `held` tells the helper the guard is already taken by this sequence, so it neither
+            // refuses the call nor releases the flag early.
+            const result = await patchSessionModels(instance, sessionId, next, {
+                held: true,
+                label,
+                status: saved,
+                result: saved
+            });
+
+            // The PATCH answer states the MODEL map and nothing else: it cannot say what the
+            // prompts or the roster look like now. So the conversation is re-read either way —
+            // a successful save has to paint the saved prompt in the box, and a refused one has
+            // to paint the roster the earlier writes of this sequence produced.
+            if (instance.sessionId === sessionId) await refreshSessionConfiguration(instance, sessionId);
+
+            return result;
+        }
+
+        // 6. No model write: this function owns the refresh and the honest status line.
+        await refreshSessionConfiguration(instance, sessionId);
+        setStatus('idle', saved);
+
+        return { applied: true, message: saved };
+    } catch (error) {
+        const message = messageOf(error);
+
+        setStatus('error', `${label}: ${message}`);
+
+        // Written, then re-read: steps 1-4 may have applied part of the draft, and the roster on
+        // screen is a claim about the server, not about what this browser wanted.
+        if (rosterMoved) await refreshSessionRoster(instance, sessionId);
+        await refreshSessionConfiguration(instance, sessionId);
+
+        return { applied: false, message };
+    } finally {
+        savingAgents = false;
+    }
 };
 
 // Send the complete team on every change: `primary` plus every other member as
@@ -6777,24 +7165,42 @@ const patchAgents = async (
 // the same way — but ONLY the model fields and the directory row. The transcript is
 // deliberately NOT rehydrated: a run may be streaming into this view, and replaying
 // an answer that is a moment behind the stream would roll the tiles back.
+//
+// T7b (R5/R6): `write` lets a FULL session save (roster + prompts + models from one apply)
+// reuse this PATCH instead of inventing a second one. `held: true` says the caller already
+// owns `savingAgents` across the whole sequence — releasing it here would let another write
+// interleave between two session mutations — and `label`/`status`/`result` state the save in
+// the scope it actually has: a template-shaped save says "applies to new sessions", a
+// conversation-shaped one says "applies to this conversation". Absent `write` this is exactly
+// the models-only save it always was, copy included.
 const patchSessionModels = async (
     instance: Instance,
     id: string,
-    models: Readonly<Record<string, string>>
+    models: Readonly<Record<string, string>>,
+    write?: { held?: boolean; label?: string; status?: string; result?: string }
 ): Promise<AgentApplyResult> => {
-    if (savingAgents) {
+    // A full save holds the guard for the whole sequence; a models-only draft takes it here.
+    const held = write?.held === true;
+
+    if (!held) {
         // A second change while one PATCH is in flight is dropped, not queued. The
         // dialog keeps its draft and shows the reason; nothing on screen claims a
         // write that never happened.
-        return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
+        if (savingAgents) {
+            return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
+        }
+
+        savingAgents = true;
     }
 
-    savingAgents = true;
+    const label = write?.label ?? 'agent models';
+    const savedStatus = write?.status ?? 'agent models saved · next request';
+    const savedResult = write?.result ?? 'Models saved · the next request uses them.';
 
     // The pill carries the CONFIG operation (app-scoped action feedback), never the
     // session's run state — that lives on the tiles (R1). R3: the visible word is
     // `saving`; the target is tooltip detail.
-    setStatus('saving', 'saving agent models');
+    setStatus('saving', `saving ${label}`);
 
     try {
         const session = await updateView(id, { agentModels: { ...models } });
@@ -6820,15 +7226,15 @@ const patchSessionModels = async (
         // The save is a CONFIG action, so its result is app-scoped feedback. It says
         // "next request" for a running session too: the run's own progress belongs
         // to the tiles, never to the header (R1).
-        setStatus('idle', 'agent models saved · next request');
+        setStatus('idle', savedStatus);
 
-        return { applied: true, message: 'Models saved · the next request uses them.' };
+        return { applied: true, message: savedResult };
     } catch (error) {
         // Errors are shown even mid-run: a rejected model is something the reader
         // must see, and the streaming turn keeps its tiles either way. The row/dialog
         // is redrawn from the last confirmed map so it cannot pretend the change stuck.
         const message = messageOf(error);
-        setStatus('error', `agent models: ${message}`);
+        setStatus('error', `${label}: ${message}`);
 
         if (current === instance) {
             renderHarnessChrome();
@@ -6837,7 +7243,7 @@ const patchSessionModels = async (
 
         return { applied: false, message };
     } finally {
-        savingAgents = false;
+        if (!held) savingAgents = false;
     }
 };
 
@@ -8790,6 +9196,13 @@ const reconcileDeletedThread = (
     // Same app-facing effect as the normal document path: the selected view paints
     // the current instance's derived panels (or hides empty hosts).
     if (current === instance) paintPanels();
+
+    // T7b (R6): this is the one roster change that lands AFTER `applyView` already painted (the
+    // tombstone filter above runs after it), and `view.threadAgents` is part of the dialog's
+    // signature — an open `Agents` panel must stop offering `Remove from team` for a member the
+    // conversation no longer runs, and start offering it again when a thread goes away. An
+    // unchanged roster is a no-op inside `refreshAgentDialog`.
+    if (current === instance) refreshAgentDialog(agentViewOf(instance), instance);
 };
 
 const deleteThreadForSession = async (
@@ -9537,6 +9950,17 @@ const openSession = async (
     const loadsFresh = target.sessionId !== id;
 
     target.sessionId = id;
+    // T7b (R6): the per-agent TEXT and COLOUR caches belong to a conversation, not to a harness.
+    // `loadHarnessConfiguration` refills them on the next explicit dialog open (a session reads
+    // its own live roster, a template reads `GET /harnesses/:name`), but a stale map kept on the
+    // card in between is what would seed the first paint with ANOTHER conversation's prompts.
+    // Only a genuine LOAD clears them: re-opening the same conversation must not throw away text
+    // this browser already holds.
+    if (loadsFresh) {
+        target.harnessInstructions = undefined;
+        target.harnessColors = undefined;
+        target.harnessModels = undefined;
+    }
     // N3: an answer card from the conversation being left cannot follow the
     // reader here; binding expires it before the new transcript is drawn.
     target.view.bindSession(id);
@@ -9607,6 +10031,12 @@ const newSession = (): void => {
     instance.sessionModels = undefined;
     instance.sessionModel = undefined;
     instance.discovered = undefined;
+    // T7b (R6): the text/colour/model caches described the conversation being left. Without a
+    // session this card edits the harness TEMPLATE again, and those maps are refilled by the
+    // next explicit dialog open — so the honest state here is "not read yet".
+    instance.harnessInstructions = undefined;
+    instance.harnessColors = undefined;
+    instance.harnessModels = undefined;
     // A new conversation has no pending work and no server records; the queue
     // belongs to the previous session and keeps running there.
     instance.pending = false;
@@ -9815,6 +10245,12 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     instance.discovered = Array.isArray(session.discoveredTools)
         ? [...session.discoveredTools]
         : undefined;
+    // T7b (R6): this card now points at a CONVERSATION, so the template's stored prompts,
+    // colours and overrides are no longer what its agent dialog edits. Cleared rather than
+    // carried: the next open reads this session's own roster (`loadSessionConfiguration`).
+    instance.harnessInstructions = undefined;
+    instance.harnessColors = undefined;
+    instance.harnessModels = undefined;
     // A fresh session has no turns and no pending work; clear any stale queue state
     // from the conversation this card used to point at — including the compiled
     // document, the view store's addressed tree and any expanded panel, all of which

@@ -11,8 +11,8 @@
 //   - R11: pressing the button opens the shared modal (never a cycle, never a
 //     chevron popover);
 //   - R12: the dialog selects a different primary, changes every agent's model, shows
-//     the server instructions, and is honest about a frozen saved-session team while
-//     models/instructions stay reachable;
+//     the instructions, and (T7b/R5) states the SCOPE a save writes: a saved conversation
+//     edits its own team, prompts and live models, and only its entry agent is fixed.
 //   - R13: closing restores focus to the composer button and a live rebuild keeps the
 //     open dialog (and the control the reader was using) in place.
 
@@ -490,17 +490,16 @@ it('shows every agent instruction and guideline inside the dialog', async () => 
 
     byClass('.agent-control-button', 'button').click();
 
-    // T3 R1: the configured agent's instruction is an EDITOR seeded with the trusted
-    // text, and the preset's own words stay available for comparison through the
-    // existing read-only markup (`.agent-detail` / `.agent-instruction`).
+    // R4 (T7a/T7b): the configured agent's instruction is ONE editable box holding the FULL text
+    // the agent runs. `instruct` has no stored override and no guideline rules, so its default is
+    // its identity sentence alone — the same composition the server ships
+    // (./ui/agents.ts `agentDefaultInstructionOf`).
     const box = byClass('.agent-dialog-instruction', 'textarea');
     expect(box.value).toBe('Answer directly.');
-    expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-instruction')].map(
-            (node) => node.textContent
-        )
-    ).toEqual(['Answer directly.']);
-    // No stored override yet, so there is nothing to revert.
+    expect(box.disabled).toBe(false);
+    // The read-only preset reference (`.agent-detail`) and the revert control are GONE: the box's
+    // own text is the whole truth, and clearing it by hand is how the default comes back.
+    expect(document.querySelector('.agent-detail')).toBeNull();
     expect(document.querySelector('.agent-dialog-revert')).toBeNull();
 
     // Typing is local. This stub answers ONLY the boot and model requests (it throws
@@ -510,21 +509,19 @@ it('shows every agent instruction and guideline inside the dialog', async () => 
     expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
 
     // R3: the strip reaches every trusted agent the team selects — including one the
-    // reader did not open the dialog for, whose guidelines the preset reference still
-    // lists.
+    // reader did not open the dialog for, whose guideline rules are part of ITS default prompt.
     byClass('.agent-dialog-tab[data-agent="workspace"]', 'button').click();
 
-    expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Write code.');
-    expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-guideline')].map((node) => node.textContent)
-    ).toEqual(['Keep diffs small.']);
+    expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe(
+        'Write code.\n\nGuidelines:\n- Keep diffs small.'
+    );
 
     // And the draft the reader typed for Instruct is still there when they go back.
     byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
     expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer in one sentence.');
 });
 
-it('keeps a saved session’s team and instructions locked while models stay reachable', async () => {
+it('keeps a saved conversation editable and states the scope a save writes', async () => {
     const session = snapshot({ harnessDefinition: descriptor() } as Partial<SessionSnapshot>);
     localStorage.setItem(SESSION_KEY, 's1');
 
@@ -554,43 +551,53 @@ it('keeps a saved session’s team and instructions locked while models stay rea
     await flush();
 
     const button = byClass('.agent-control-button', 'button');
-    // The compact button is NEVER disabled: the dialog is still the way to inspect
-    // the configuration and edit this conversation's live models.
+    // The compact button is NEVER disabled, and since T7b (R5) a saved conversation is not a lock
+    // either: it edits its own team, prompts and live models. The tooltip states where a save
+    // lands, which is the fact the reader can act on.
     expect(button.disabled).toBe(false);
-    expect(button.title).toBe(
-        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
-    );
+    expect(button.title).toBe('Edits here change this conversation only. The harness template stays as it is.');
 
     button.click();
 
-    // R3: the restriction is stated where it bites, not in a paragraph. The frozen
-    // roster is the team this conversation started with (no nonmember appears), the
-    // instruction editor and the team controls are disabled with the real reason, and
-    // `[+]` cannot add.
+    // R3: the restriction is stated where it bites, not in a paragraph. The roster is the team this
+    // conversation started with (no nonmember appears), and every editor is ENABLED because the
+    // conversation owns its own configuration.
     expect(document.querySelector('.agent-dialog-note')).toBeNull();
     expect(
         [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => tab.dataset.agent)
     ).toEqual(['instruct', 'research', 'workspace']);
 
-    const frozenReason =
-        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
-    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(true);
-    expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer directly.');
-    expect(byClass('.agent-dialog-instruction', 'textarea').title).toBe(
-        'A saved conversation runs the instructions it was created with. Edit them on the harness to use them in a new session.'
-    );
-    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
-    expect(byClass('.agent-dialog-remove', 'button').title).toBe(frozenReason);
-    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(true);
+    const instruction = byClass('.agent-dialog-instruction', 'textarea');
 
-    // The action cannot promote here, and it is disabled until a live model is
-    // drafted — so a disabled button can never claim a promotion this server refuses.
+    // R6: the box is editable, and its text is this conversation's OWN prompt for the member —
+    // read live from `GET /sessions/s1/agents/instruct/instruction`, which for an unoverridden
+    // member is the full default composition (identity only here: this profile ships no rules).
+    expect(instruction.disabled).toBe(false);
+    expect(instruction.value).toBe('Answer directly.');
+    expect(instruction.title).toBe('The instruction this agent runs in this conversation.');
+
+    // R6: a member this conversation runs is removable — the primary excepted, for the structural
+    // reason — and R7: `[+]` offers a typed name as well as the catalogue.
+    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-remove', 'button').title).toBe(
+        'The primary agent is always part of the team.'
+    );
+    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);
+    expect(byClass('.agent-dialog-add', 'button').title).toBe(
+        'Add an agent to the team, or name a new one.'
+    );
+
+    // R5: the entry agent of a saved conversation is FIXED, so `Make primary` carries that reason
+    // and the action can never promise a promotion this session cannot write.
+    expect(byClass('.agent-dialog-promote', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-promote', 'button').title).toBe(
+        'The primary agent is fixed for a saved conversation.'
+    );
     const apply = byClass('.agent-dialog-apply', 'button');
     expect(apply.textContent).toBe('Save configuration');
     expect(apply.disabled).toBe(true);
 
-    // R2: the model map is live even in a saved session, and the strip reaches
-    // every member's configuration.
+    // R2: the model map is still live, and the strip reaches every member's configuration.
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
     expect(byClass('.agent-model-select', 'select').title).toBe(
         'Model for Instruct. Applies to the next request in this session.'
@@ -730,17 +737,30 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
     await flush();
 
     byClass('.agent-control-button', 'button').click();
-    const firstSelect = byClass<HTMLSelectElement>(
-        '.agent-model-select[aria-label="Model for Instruct"]',
-        'select'
-    );
+
+    // T7b (R6): opening a conversation's dialog is the explicit action that reads THIS
+    // conversation's live per-agent prompts (`GET /sessions/s1/agents`, then one text read per
+    // member), and that answer repaints the body once. The reads are awaited here so the node
+    // captured below is the one the reader would actually be standing on once the conversation's
+    // own configuration has landed; each hop is a separate request through the canonical adapter.
+    await flush();
+    await flush();
+    await flush();
+    await flush();
+
+    // `byClass`'s tag parameter IS the element type (its `K` is the tag NAME), so the helper
+    // infers `HTMLSelectElement` instead of passing one as a type argument.
+    const selectIn = () =>
+        byClass('.agent-model-select[aria-label="Model for Instruct"]', 'select');
+
+    const firstSelect = selectIn();
     firstSelect.focus();
     expect(document.activeElement).toBe(firstSelect);
 
-    const pushSnapshot = async (updatedAt: number): Promise<void> => {
+    const pushSnapshot = async (updatedAt: number, status: 'idle' | 'running' = 'idle'): Promise<void> => {
         session = snapshot({
             harnessDefinition: descriptor(),
-            status: 'idle',
+            status,
             updatedAt
         });
         // Frames pushed before the shell registered its subscription are queued by the double,
@@ -750,11 +770,25 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
         await flush();
     };
 
-    // Identical agent state: the dialog stays open and the SAME node keeps focus (a
-    // rebuild would have replaced it and dropped focus onto the close button).
+    // The frame that SETTLES the run is a real configuration change since T7b (R5): while a run is
+    // in flight the team and the instruction editor are locked, and a saved conversation's own
+    // editors wake up the moment it stops. `editable` is part of the dialog's signature, so this
+    // rebuild is the correct answer — the reader must not keep typing into a box whose write the
+    // shell would refuse.
     await pushSnapshot(10);
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
-    expect(document.activeElement).toBe(firstSelect);
+
+    // Identical agent state after that: the dialog stays open, the SAME node keeps focus, and no
+    // frame rebuilds the body under the reader (a rebuild would replace this node and hand focus
+    // to the close button).
+    const settled = selectIn();
+    settled.focus();
+    expect(document.activeElement).toBe(settled);
+
+    await pushSnapshot(11);
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+    expect(document.activeElement).toBe(settled);
+    expect(selectIn()).toBe(settled);
 
     // Lifecycle: a new conversation dismisses the dialog rather than carrying it into
     // an empty session.

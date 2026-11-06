@@ -21,6 +21,11 @@
 // guidelines. The composition is therefore joined at the single place that builds it
 // (src/agents/index.ts), which is what the `agentInstruction` block below pins: one
 // string, one `Guidelines:` section, a blank line as the identity/rules split.
+//
+// T6 NARROWS THAT RULE TO THE TRUSTED DEFAULT: an explicit `instructionOverride` is
+// the complete prompt and is returned verbatim, with no guideline block appended, so
+// the box the operator edits (one textarea holding the full effective instruction)
+// round-trips without duplicating the guidelines.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -331,19 +336,51 @@ describe('agentInstruction', () => {
         ).toBe('You are bare.');
     });
 
-    // T3 editable configuration. The override is the harness-level text a saved
-    // configuration carries; it replaces ONLY the identity sentence so the shared
-    // policy lines can never be dropped by an edit.
-    it('replaces the identity sentence with a harness override', () => {
-        expect(agentInstruction(summarizer, 'Condense to one line.')).toBe(
-            'Condense to one line.\n\n' +
-            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
-        );
+    // T6 EDITABLE CONFIGURATION — AN OVERRIDE IS THE COMPLETE PROMPT. The text an
+    // operator saves comes back out of the one instruction box that displays the FULL
+    // effective prompt, so it already holds every line the agent is meant to read.
+    // Appending `profile.guidelines` underneath it rendered them twice (and rendered an
+    // edited bullet two ways). A profile's guidelines are therefore the DEFAULT an
+    // un-overridden member runs on, not policy that survives an override.
+    it('returns a harness override verbatim as the whole instruction', () => {
+        // Trimmed, then nothing else: no `Guidelines:` header, no bullets, no blank line.
+        expect(agentInstruction(summarizer, 'Condense to one line.')).toBe('Condense to one line.');
 
-        // Same rule for a role with the full shared policy: the override swaps the
-        // first paragraph and the whole guideline block survives untouched.
-        expect(agentInstruction(instruct, 'Lead with the answer.')).toBe(
-            `Lead with the answer.\n\n${guidelinesBlock(instruct.guidelines)}`
+        // Surrounding whitespace and a trailing newline are the only things removed.
+        expect(agentInstruction(summarizer, '  Condense to one line.\n ')).toBe('Condense to one line.');
+
+        // The same rule for a role whose shipped prompt is 1.3kB of shared policy: the
+        // override replaces all of it, so no trusted bullet survives into the prompt.
+        expect(agentInstruction(instruct, 'Lead with the answer.')).toBe('Lead with the answer.');
+        expect(agentInstruction(instruct, 'Lead with the answer.')).not.toContain('Guidelines:');
+    });
+
+    it('does not duplicate the guidelines an override already states', () => {
+        // The exact shape the box sends back: identity, the operator's own guideline
+        // block, and no second block appended by the server.
+        const full = 'You compress notes.\n\nGuidelines:\n- Keep names, numbers, and conclusions.';
+
+        expect(agentInstruction(summarizer, full)).toBe(full);
+
+        // One header in the text the model receives — under the old append rule this
+        // prompt carried two `Guidelines:` sections.
+        expect(agentInstruction(summarizer, full).split('Guidelines:')).toHaveLength(2);
+    });
+
+    it('composes the Guidelines section into the default whenever the profile has guidelines', () => {
+        // Exact whole-string expectation for every shipped profile: identity, one blank
+        // line, then the block. No profile here is guideline-free, so the default always
+        // carries the section.
+        for (const profile of agentProfiles()) {
+            expect(agentInstruction(profile)).toBe(
+                `${profile.instruction.trim()}\n\n${guidelinesBlock(profile.guidelines)}`
+            );
+        }
+
+        // The same rule spelled out for one fixture, so a reworded fixture is a diff here.
+        expect(agentInstruction(summarizer)).toBe(
+            'You compress technical notes into at most two sentences.\n\n' +
+            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
         );
     });
 
@@ -353,6 +390,14 @@ describe('agentInstruction', () => {
         // reach the runtime with an empty prompt by this path.
         expect(agentInstruction(summarizer, undefined)).toBe(agentInstruction(summarizer));
         expect(agentInstruction(summarizer, '   \n ')).toBe(agentInstruction(summarizer));
+
+        // "Blank means default" still means the DEFAULT is the composed prompt: the
+        // guideline block survives exactly as it does with no override at all.
+        for (const blank of [undefined, '', '   \n ']) {
+            expect(agentInstruction(instruct, blank)).toBe(
+                `${IDENTITY.instruct}\n\n${guidelinesBlock(instruct.guidelines)}`
+            );
+        }
     });
 
     it('applies an override to a guideline-free profile without adding a block', () => {
@@ -368,5 +413,17 @@ describe('agentInstruction', () => {
                 '  You are edited.  '
             )
         ).toBe('You are edited.');
+
+        // And its un-overridden default is the trimmed identity sentence alone, which is
+        // the one case where a prompt has no guideline section to begin with.
+        expect(
+            agentInstruction({
+                name: 'bare',
+                title: 'Bare',
+                description: 'No rules.',
+                instruction: ' You are bare. ',
+                guidelines: []
+            })
+        ).toBe('You are bare.');
     });
 });

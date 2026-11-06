@@ -1,9 +1,16 @@
-// Agent row and preset picker: roles, promotion, duplicate prevention, removal
-// and the frozen-session lock. The component is stateless — these tests assert the
-// callbacks it reports, which is exactly what main.ts sends to PATCH.
+// Agent row and the trusted agent picker: roles, promotion, duplicate prevention,
+// removal and the frozen-session lock. The component is stateless — these tests assert
+// the callbacks it reports, which is exactly what main.ts sends to PATCH.
+//
+// `agentDefaultInstructionOf` is pinned here too: it is the one composition rule the
+// shared dialog seeds its instruction box with (R4), so the frontend and the server
+// (../../agents/index.ts `agentInstruction`) must produce the SAME prompt text.
 
-import type { AgentDescriptor } from '../contract';
-import { createAgentRow } from './agents';
+// `AgentDescriptor` lives in the server protocol; ./agents.ts imports it from there.
+// (../contract only re-declares it for its own helpers, so pointing at the protocol
+// keeps this file typechecking like ui/agent-dialog.test.ts does.)
+import type { AgentDescriptor } from '../../server/protocol';
+import { agentDefaultInstructionOf, agentDetailsOf, createAgentRow } from './agents';
 import type { AgentRowOptions } from './agents';
 
 const agents: AgentDescriptor[] = [
@@ -89,7 +96,7 @@ describe('createAgentRow', () => {
     it('labels an unknown member neutrally instead of exposing its slug', () => {
         const { element } = mount({ members: ['ghost'], primary: 'ghost' });
 
-        // F4/R3: a member without preset details reads a neutral word; the slug is
+        // F4/R3: a member without library details reads a neutral word; the slug is
         // still the tile's `data-agent` (internal identity).
         expect(element.querySelector<HTMLElement>('.agent-tile-name')?.textContent).toBe('Agent');
         expect(element.querySelector<HTMLElement>('.agent-tile')?.dataset.agent).toBe('ghost');
@@ -106,7 +113,7 @@ describe('createAgentRow', () => {
         expect(options.onSelectPrimary).toHaveBeenCalledTimes(1);
     });
 
-    it('opens the trusted preset picker with read-only details and no duplicate add', () => {
+    it('opens the agent picker with the default instruction and no duplicate add', () => {
         const { element, options } = mount();
         const add = element.querySelector<HTMLButtonElement>('.agent-add');
         const picker = element.querySelector<HTMLElement>('.agent-picker');
@@ -118,9 +125,16 @@ describe('createAgentRow', () => {
         expect(picker?.hidden).toBe(false);
         expect(add?.getAttribute('aria-expanded')).toBe('true');
 
+        // R4 copy: the picker names what it offers and promises the edit that follows —
+        // no "preset", and no claim that instructions are read-only.
+        expect(picker?.getAttribute('aria-label')).toBe('Add an existing agent');
+        expect(element.querySelector('.agent-picker-hint')?.textContent).toBe(
+            'Choose an existing agent. You can edit its instruction after adding.'
+        );
+
         const options_ = [...element.querySelectorAll<HTMLElement>('.agent-option')];
         expect(options_.map((option) => option.dataset.agent)).toEqual(['instruct', 'summarizer']);
-        // R3/R5: ONE visible label per preset (the single-word display title). The
+        // R3/R5: ONE visible label per agent (the single-word display title). The
         // slug stays on `data-agent` for the callback and is never rendered text.
         expect(options_.map((option) => option.querySelector('.agent-option-title')?.textContent)).toEqual([
             'Instruct',
@@ -138,7 +152,7 @@ describe('createAgentRow', () => {
         );
         // Summarizer declares no guidelines: no empty list is rendered.
         expect(options_[1].querySelector('.agent-guidelines')).toBeNull();
-        expect(options_[1].querySelector('.agent-detail-summary')?.textContent).toBe('preset details');
+        expect(options_[1].querySelector('.agent-detail-summary')?.textContent).toBe('default instruction');
 
         options_[0].querySelector<HTMLButtonElement>('.agent-option-add')?.click();
         expect(options.onAdd).not.toHaveBeenCalled();
@@ -148,7 +162,7 @@ describe('createAgentRow', () => {
         expect(picker?.hidden).toBe(true);
     });
 
-    it('never renders a raw id when a preset descriptor has no title', () => {
+    it('never renders a raw id when an advertised agent has no title', () => {
         const { element } = mount({
             agents: [
                 { name: 'mystery', title: '', description: 'No title.', instruction: '', guidelines: [] }
@@ -198,7 +212,7 @@ describe('createAgentRow', () => {
         ]);
     });
 
-    it('renders a neutral fallback title for a member the preset library does not know', () => {
+    it('renders a neutral fallback title for a member the agent library does not know', () => {
         const { element } = mount({ members: ['instruct', 'legacy-helper'] });
 
         const tile = element.querySelector<HTMLElement>('.agent-tile[data-agent="legacy-helper"]');
@@ -499,7 +513,7 @@ describe('agent card deck', () => {
 
         // The strips are real buttons carrying the agent's human name, so an edge
         // identifies its agent. The front card offers no strip (nothing to reveal).
-        // `workspace` is not in this file's preset fixture, so it reads the neutral
+        // `workspace` is not in this file's agent fixture, so it reads the neutral
         // fallback title (F4/R3) — never the slug.
         expect(
             handleList(element).map((handle) => [handle.dataset.agent, handle.hidden, handle.textContent, handle.getAttribute('aria-label')])
@@ -728,5 +742,93 @@ describe('agent card deck', () => {
 
         removeButtons(element)[1].click();
         expect(options.onRemove).toHaveBeenCalledWith('summarizer');
+    });
+});
+
+// R4: the one composition rule the shared agent dialog seeds its EDITABLE instruction
+// box with. It must match the server's own prompt builder
+// (../../agents/index.ts `agentInstruction`) exactly — identity sentence, a blank line,
+// then `Guidelines:` with one `- ` bullet per non-blank guideline in array order — or
+// the box would show words the agent never runs.
+describe('agentDefaultInstructionOf', () => {
+    it('joins the identity sentence and the guidelines into the full prompt', () => {
+        const instruction = agentDefaultInstructionOf({
+            name: 'summarizer',
+            title: 'Summarizer',
+            description: 'Condenses notes.',
+            instruction: '  You compress technical notes.  ',
+            guidelines: [' Keep names, numbers, and conclusions. ', '', 'Drop preamble and repetition.']
+        });
+
+        // Identity is trimmed, the blank guideline is dropped, and the two surviving
+        // rules keep their order — the same output the runtime sends as one system turn.
+        expect(instruction).toBe(
+            'You compress technical notes.\n\n' +
+                'Guidelines:\n' +
+                '- Keep names, numbers, and conclusions.\n' +
+                '- Drop preamble and repetition.'
+        );
+    });
+
+    it('returns the identity sentence alone when the agent declares no guidelines', () => {
+        expect(
+            agentDefaultInstructionOf({
+                name: 'instruct',
+                title: 'Instruct',
+                description: 'General agent.',
+                instruction: ' Answer directly. ',
+                guidelines: []
+            })
+        ).toBe('Answer directly.');
+    });
+
+    it('treats a guideline list of blanks as no guidelines at all', () => {
+        // A stray `- ` bullet inside the joined prompt is the failure mode: an empty
+        // rule must never survive into the text the reader then edits and saves.
+        expect(
+            agentDefaultInstructionOf({
+                name: 'instruct',
+                title: 'Instruct',
+                description: 'General agent.',
+                instruction: 'Answer directly.',
+                guidelines: ['   ', '']
+            })
+        ).toBe('Answer directly.');
+    });
+
+    it('is the honest empty string for an agent the library does not advertise', () => {
+        // The dialog's seed for a name the reader typed (R7) or a retired profile: no
+        // row, therefore no default text, therefore an empty editable box.
+        expect(agentDefaultInstructionOf(undefined)).toBe('');
+        expect(agentDefaultInstructionOf(agentDetailsOf(agents, 'legacy-helper'))).toBe('');
+    });
+
+    it('describes an unknown agent without the removed preset wording (R4)', () => {
+        expect(agentDetailsOf(agents, 'legacy-helper')).toEqual({
+            name: 'legacy-helper',
+            title: 'Agent',
+            description: 'No details are available for this agent.',
+            instruction: '',
+            guidelines: []
+        });
+    });
+});
+
+// R4: the picker copy. It offers agents the server advertises and promises the edit that
+// follows, and it says plainly when there is nothing to offer.
+describe('agent picker copy', () => {
+    it('says so plainly when the server advertises no agents', () => {
+        const { element } = mount({ agents: [] });
+
+        element.querySelector<HTMLButtonElement>('.agent-add')?.click();
+
+        expect(
+            [...element.querySelectorAll<HTMLElement>('.agent-picker-hint')].map((node) => node.textContent)
+        ).toEqual([
+            'Choose an existing agent. You can edit its instruction after adding.',
+            'The server did not advertise any agents.'
+        ]);
+        // The word is gone from the surface, not just rephrased around.
+        expect(element.textContent).not.toContain('preset');
     });
 });
