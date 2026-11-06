@@ -133,7 +133,7 @@ describe('lazy preset tools', () => {
             'nextByte',
             '256 KiB budget measured on the SERIALIZED JSON',
             'EBINARY',
-            'maxLines 1200'
+            'maxLines 5000'
         ]) {
             expect(presetTools.read.description).toContain(phrase);
         }
@@ -181,7 +181,7 @@ describe('lazy preset tools', () => {
                                         minimum: 1,
                                         maximum: 20_000,
                                         description:
-                                            'Maximum lines to return. Defaults to 1200 and is capped at 20000.'
+                                            'Maximum lines to return. Defaults to 5000 and is capped at 20000.'
                                     }
                                 },
                                 required: ['path'],

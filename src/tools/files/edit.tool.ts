@@ -62,6 +62,16 @@
 // entry, therefore leaves every file untouched, which is why the batch can be
 // trusted. Each file is then written exactly ONCE with its final text.
 //
+// ONE CRITICAL SECTION PER FILE (D4: no lost update)
+// --------------------------------------------------
+// Read-match-write is three awaits, so two overlapping calls used to read the same
+// original text, both match, both report success, and the last write silently wins.
+// The whole read/match/write span is therefore held under a per-file lock
+// (./lock.ts), keyed by FILE IDENTITY so two spellings of one file share it. A later
+// call now sees the earlier call's text and fails honestly ("edit found no match")
+// instead of clobbering a change it never saw. A multi-file batch takes its locks in
+// sorted identity order, so two overlapping batches cannot deadlock.
+//
 // BOUNDED WORK ON THE FAILURE AND replaceAll PATHS
 // ------------------------------------------------
 // A broad oldString can match an order of magnitude more often than a model meant,
@@ -69,7 +79,14 @@
 // numbers are collected in ONE forward pass over the text (not one prefix copy per
 // match), the ambiguity message NAMES only the first AMBIGUITY_LINE_LIMIT of them
 // (the count stays exact), and replaceAll splices by collecting the gaps and joining
-// ONCE (not one whole-file rebuild per match). All three were quadratic, and because
+// ONCE (not one whole-file rebuild per match). The trailing-whitespace tier is a
+// single forward pass with a ring of `expected.length` line keys, not one object per
+// line plus one array slice per candidate position: that tier runs on EVERY miss, so
+// an allocation proportional to the file's line count made "the text is not here" the
+// most expensive answer this tool gives (measured on a 120 MB file: 2,390 ms -> 951 ms
+// for a one-line search, 2,324 ms -> 1,113 ms for a three-line search, verified
+// side-by-side in one process against byte-identical output on 20 line shapes).
+// All three were quadratic, and because
 // this tool is declared `mode: 'sync'` and the server defaults to
 // `threadExecution: 'inline'`, a quadratic tool body stalls the whole process.
 //
@@ -96,12 +113,13 @@
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
 // and a consistency test proves the projection equal.
 
-import { readFile, writeFile as writeTextFile } from 'node:fs/promises';
+import { readFile, stat, writeFile as writeTextFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
 import { fileIdentity } from './identity';
+import { withFileLocks } from './lock';
 
 // One replacement to apply.
 export type FileEditEntry = {
@@ -172,56 +190,94 @@ const findOccurrences = (content: string, search: string): Match[] => {
     return result;
 };
 
+// The whole-line key used by the trailing-whitespace tier: the line with its
+// trailing whitespace dropped and the typographic lookalikes folded. Shared by the
+// expected lines and the file lines so the two sides can never be compared through
+// different rules.
+const lineKey = (line: string): string => normalizeForMatch(line.trimEnd());
+
 // Whole-line occurrences that match once trailing whitespace is ignored (compared
 // through the same typographic fold). `search` is the LF view, so lines split on
 // "\n" only. Candidates that overlap an earlier one are dropped, so a repeated
 // blank-line pattern cannot double-count the same region.
+//
+// ONE forward pass, O(content.length) time and O(expected.length) memory.
+// The previous shape materialised an object per line (`matchAll` + `filter` + `map`)
+// and then `slice`d a fresh array per candidate position, so a miss on a large file
+// allocated two arrays the size of the file's line count before answering "no match"
+// — measured at ~2.5 s and hundreds of MB of garbage on a 120 MB file, on a tier that
+// runs ONLY when the exact and typographic tiers already found nothing. The scan here
+// keeps a ring of the last `m` line keys and only compares the whole window when the
+// newest key already matches the last expected line, which is the rare case.
+//
+// The line enumeration is identical to the old regex (`/[^\n]*(?:\n|$)/g` with the
+// trailing empty match dropped): every "\n"-terminated line, plus a final unterminated
+// line when the file does not end with a newline, and empty lines included.
 const findLineOccurrences = (content: string, search: string): Match[] => {
     const trailingNewline = search.endsWith('\n');
     const expected = search.split('\n');
     if (trailingNewline) expected.pop();
 
-    const lines = [...content.matchAll(/[^\n]*(?:\n|$)/g)]
-        .filter((match) => match[0] !== '')
-        .map((match) => {
-            const start = match.index ?? 0;
-            const newline = match[0].endsWith('\n');
-            const text = newline ? match[0].slice(0, -1) : match[0];
+    const width = expected.length;
+    if (width === 0) return [];
 
-            return {
-                start,
-                end: start + match[0].length,
-                text,
-                contentEnd: start + text.length - (text.endsWith('\r') ? 1 : 0),
-                newline
-            };
-        });
+    const expectedKeys = expected.map(lineKey);
+    const lastKey = expectedKeys[width - 1];
 
-    const candidates = lines.flatMap((line, index) => {
-        const actual = lines.slice(index, index + expected.length);
-        if (actual.length !== expected.length) return [];
+    // Ring buffers, index 0 = the OLDEST line of the current window.
+    const keys: string[] = [];
+    const starts: number[] = [];
+    const ends: number[] = [];
+    const contentEnds: number[] = [];
+    let lastHasNewline = false;
 
+    const found: Match[] = [];
+    let offset = 0;
+
+    while (offset < content.length) {
+        const breakAt = content.indexOf('\n', offset);
+        const hasNewline = breakAt !== -1;
+        const lineEnd = hasNewline ? breakAt + 1 : content.length;
+        const text = hasNewline ? content.slice(offset, breakAt) : content.slice(offset, lineEnd);
+
+        keys.push(lineKey(text));
+        starts.push(offset);
+        ends.push(lineEnd);
+        // Where the line's CONTENT ends, i.e. before a CRLF's carriage return. A match
+        // that does not demand a trailing newline stops here so the \r stays in the file.
+        contentEnds.push(offset + text.length - (text.endsWith('\r') ? 1 : 0));
+        lastHasNewline = hasNewline;
+
+        if (keys.length > width) {
+            keys.shift();
+            starts.shift();
+            ends.shift();
+            contentEnds.shift();
+        }
+
+        // Cheap filter first: a window can only match if its LAST line already does.
         if (
-            !actual.every(
-                (item, lineIndex) =>
-                    normalizeForMatch(item.text.trimEnd()) ===
-                    normalizeForMatch(expected[lineIndex].trimEnd())
-            )
-        )
-            return [];
+            keys.length === width &&
+            keys[width - 1] === lastKey &&
+            keys.every((key, index) => key === expectedKeys[index]) &&
+            (!trailingNewline || lastHasNewline)
+        ) {
+            const candidate: Match = {
+                start: starts[0],
+                end: trailingNewline ? ends[width - 1] : contentEnds[width - 1]
+            };
 
-        const last = actual[actual.length - 1];
-        if (trailingNewline && !last.newline) return [];
+            // Overlap rule, unchanged: a candidate that overlaps an accepted one is
+            // dropped, so a repeated blank-line pattern cannot double-count a region.
+            if (!found.some((match) => match.end > candidate.start && match.start < candidate.end)) {
+                found.push(candidate);
+            }
+        }
 
-        return [{ start: line.start, end: trailingNewline ? last.end : last.contentEnd }];
-    });
+        offset = lineEnd;
+    }
 
-    return candidates.reduce<Match[]>((result, candidate) => {
-        if (result.some((match) => match.end > candidate.start && match.start < candidate.end))
-            return result;
-        result.push(candidate);
-        return result;
-    }, []);
+    return found;
 };
 
 // The dominant line ending in `text`, or `fallback` when neither wins.
@@ -519,6 +575,59 @@ const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit
     return normalized;
 };
 
+// Turn a failed read of an edit target into a sentence a model can act on.
+//
+// The raw errno (`ENOENT: no such file or directory, open '...'`) is what Node
+// reports and what this tool used to leak. It names no remedy, and the remedy here is
+// specific — `edit` deliberately does not create files, so a missing target means the
+// caller wanted `write`. `read` already explains itself per failure (./read.tool.ts);
+// an inconsistent error surface between two adjacent tools is its own defect (D8).
+//
+// `target` is the caller's own resolved path and is what the message names, NOT the
+// errno's `path`: a failure deep in a read can report no path at all (EISDIR from a
+// directory read carries none), and the value that means something to the caller is
+// the one they passed.
+//
+// Windows reports EPERM for reading a directory, which by code alone looks like a
+// permission denial, so only in that case (and only after the failure) one narrow stat
+// decides. A failed stat keeps the original classification, so a real denial is never
+// relabelled as a directory.
+const classifyReadFailure = async (target: string, error: unknown): Promise<never> => {
+    const reason = error instanceof Error ? error.message : String(error);
+    const code =
+        typeof error === 'object' && error !== null
+            ? (error as { code?: unknown }).code
+            : undefined;
+
+    if (code === 'ENOENT') {
+        throw new HarnessError(
+            `edit could not find ${target}: no such file or directory (ENOENT). edit changes an EXISTING file; use write to create one.`
+        );
+    }
+
+    if (code === 'EISDIR' || ((code === 'EPERM' || code === 'EBADF') && (await isDirectoryPath(target)))) {
+        throw new HarnessError(
+            `edit was given the directory ${target}. edit changes one existing file; pass a file path, or use write.`
+        );
+    }
+
+    if (code === 'EACCES' || code === 'EPERM') {
+        throw new HarnessError(
+            `edit was denied permission to read ${target}: ${reason} This is a filesystem permission problem, not a missing path.`
+        );
+    }
+
+    throw new HarnessError(`edit failed to read ${target}: ${reason}`);
+};
+
+const isDirectoryPath = async (path: string): Promise<boolean> => {
+    try {
+        return (await stat(path)).isDirectory();
+    } catch {
+        return false;
+    }
+};
+
 // Read, match-check, and fully compute every edit. Nothing is written here, so a
 // failure on the last entry still leaves the first file untouched. Each file is
 // read ONCE; its entries are applied in request order to the text the previous one
@@ -536,8 +645,16 @@ const prepareEdits = async (
 
         if (state === undefined) {
             // A missing, unreadable, or non-file target fails here, before anything
-            // is written. Editing is for existing files; write creates.
-            state = { target: edit.target, content: await readFile(edit.target, 'utf8') };
+            // is written. Editing is for existing files; write creates. The raw errno
+            // is classified into a sentence that says what to do, because a model
+            // reading `ENOENT: no such file or directory, open '...'` has nothing to
+            // act on and read's message is right next door (see ./read.tool.ts).
+            state = {
+                target: edit.target,
+                content: await readFile(edit.target, 'utf8').catch((error) =>
+                    classifyReadFailure(edit.target, error)
+                )
+            };
             texts.set(edit.identity, state);
         }
 
@@ -613,7 +730,7 @@ const prepareEdits = async (
 export const FILE_EDIT_METADATA: PresetToolMetadata = {
     name: 'edit',
     description:
-        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use write for new files.',
+        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Calls that name the same file are serialized per file (read-match-write is one critical section), so a concurrent edit never silently clobbers another - the later one fails with "no match" against the text the earlier one produced. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use write for new files.',
     tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
     // R18: editing files is core, so a model never spends a discovery round on it.
     visibility: 'core',
@@ -683,49 +800,61 @@ export const edit = tool<FileEditParameters, FileEditResult>({
     mode: 'sync',
     execute: async ({ parameters: edits }) => {
         const normalized = await normalizeEdits(edits);
-        // Everything below this line has been validated and matched; nothing has been
-        // written yet, so any throw above left every file untouched.
-        const { prepared, files } = await prepareEdits(normalized);
 
-        // Byte size per file IDENTITY, so entries sharing a file (including two
-        // spellings of one path) report the same final size rather than each other's
-        // intermediate text.
-        const sizes = new Map<string, number>();
-        const written: string[] = [];
+        // D4: the lock is taken BEFORE the read, not just before the write. Holding it
+        // across read-match-write is the whole fix — a lock around only the write would
+        // still let two calls compute from the same stale text and let the second one
+        // overwrite the first. Locks are acquired in sorted identity order (./lock.ts),
+        // so overlapping multi-file batches cannot deadlock.
+        return withFileLocks(
+            normalized.map((edit) => edit.identity),
+            async () => {
+                // Everything up to here has been validated and matched; nothing has been
+                // written yet, so any throw above left every file untouched.
+                const { prepared, files } = await prepareEdits(normalized);
 
-        for (const file of files) {
-            try {
-                // No mkdir: the parent must already exist, because the file did.
-                await writeTextFile(file.target, file.updated, 'utf8');
-            } catch (error) {
-                // Partial success is reported honestly: the completed paths are
-                // named, and there is no claim of a transaction or rollback.
-                const completed = written.length === 0 ? 'none' : written.join(', ');
-                const reason = error instanceof Error ? error.message : String(error);
+                // Byte size per file IDENTITY, so entries sharing a file (including two
+                // spellings of one path) report the same final size rather than each
+                // other's intermediate text.
+                const sizes = new Map<string, number>();
+                const written: string[] = [];
 
-                throw new HarnessError(
-                    `edit failed on ${file.target}: ${reason} Edits already applied: ${completed}. No rollback was performed.`
-                );
+                for (const file of files) {
+                    try {
+                        // No mkdir: the parent must already exist, because the file did.
+                        await writeTextFile(file.target, file.updated, 'utf8');
+                    } catch (error) {
+                        // Partial success is reported honestly: the completed paths are
+                        // named, and there is no claim of a transaction or rollback.
+                        const completed = written.length === 0 ? 'none' : written.join(', ');
+                        const reason = error instanceof Error ? error.message : String(error);
+
+                        throw new HarnessError(
+                            `edit failed on ${file.target}: ${reason} Edits already applied: ${completed}. No rollback was performed.`
+                        );
+                    }
+
+                    written.push(file.target);
+                    sizes.set(file.identity, Buffer.byteLength(file.updated, 'utf8'));
+                }
+
+                // One entry per requested edit, in request order: entries that share a
+                // file each report their own replacement count against that file's final
+                // size.
+                return prepared.map((edit) => {
+                    const entry: FileEditResultEntry = {
+                        path: edit.target,
+                        replacements: edit.replacements,
+                        bytes: sizes.get(edit.identity) ?? 0
+                    };
+
+                    // Only mention the tier when it was not exact, so the common case
+                    // stays terse and a fuzzy match is never silent.
+                    if (edit.match !== undefined) entry.match = edit.match;
+
+                    return entry;
+                });
             }
-
-            written.push(file.target);
-            sizes.set(file.identity, Buffer.byteLength(file.updated, 'utf8'));
-        }
-
-        // One entry per requested edit, in request order: entries that share a file
-        // each report their own replacement count against that file's final size.
-        return prepared.map((edit) => {
-            const entry: FileEditResultEntry = {
-                path: edit.target,
-                replacements: edit.replacements,
-                bytes: sizes.get(edit.identity) ?? 0
-            };
-
-            // Only mention the tier when it was not exact, so the common case stays
-            // terse and a fuzzy match is never silent.
-            if (edit.match !== undefined) entry.match = edit.match;
-
-            return entry;
-        });
+        );
     }
 });

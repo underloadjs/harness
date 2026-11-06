@@ -34,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
 import { HarnessError } from '../../util';
 import { edit } from './edit.tool';
+import { write } from './write.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
@@ -182,6 +183,154 @@ describe('edit', () => {
             )
         );
         await expect(readTextFile(path, 'utf8')).resolves.toBe('nothing here\n');
+    });
+
+    // ---------------------------------------------------------------------
+    // The two fallback tiers. They run ONLY when the tier above found nothing, and
+    // the trailing-whitespace finder was rewritten from a per-line object/array
+    // allocation to a single forward pass, so its edge cases are pinned here rather
+    // than assumed: the window, the overlap rule, empty lines, a file with no final
+    // newline, and CRLF content-end handling.
+    // ---------------------------------------------------------------------
+
+    it('prefers the exact tier and reports no match tier', async () => {
+        // The file holds ASCII quotes and no trailing whitespace, so an exact copy
+        // matches at tier 1 and the result carries no `match` field at all.
+        const path = await seed('tiers/exact.txt', 'say "hello" world\n');
+
+        const result = await edit([{ path, oldString: 'say "hello"', newString: 'say "hi"' }]);
+
+        expect(result).toEqual([{
+            path,
+            replacements: 1,
+            bytes: Buffer.byteLength('say "hi" world\n', 'utf8')
+        }]);
+    });
+
+    it('matches typographic lookalikes and names the tier', async () => {
+        // The file has curly quotes; the caller retyped ASCII ones. Tier 1 finds
+        // nothing, tier 2 folds them, and the result must SAY the match was not exact.
+        const path = await seed('tiers/curly.txt', 'say \u201Chello\u201D world\n');
+
+        const result = await edit([{ path, oldString: 'say "hello"', newString: 'say "hi"' }]);
+
+        expect(result).toEqual([
+            {
+                path,
+                replacements: 1,
+                bytes: Buffer.byteLength('say "hi" world\n', 'utf8'),
+                match: 'typographic'
+            }
+        ]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('say "hi" world\n');
+    });
+
+    it('ignores trailing whitespace and names the tier', async () => {
+        const path = await seed('tiers/trailing.txt', 'alpha   \nbeta\t\ngamma\n');
+
+        const result = await edit([
+            { path, oldString: 'alpha\nbeta\ngamma', newString: 'ONE\nTWO\nTHREE' }
+        ]);
+
+        expect(result[0].match).toBe('trailing-whitespace');
+        // The replacement is written as given; the file's trailing whitespace lived
+        // inside the matched region, so it goes away with it.
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('ONE\nTWO\nTHREE\n');
+    });
+
+    it('finds a trailing-whitespace window in the middle of many lines', async () => {
+        // Exercises the sliding window: the match starts at line 402 of 800, so a
+        // one-pass scan must still align the window and report the right offsets.
+        const before = Array.from({ length: 401 }, (_, index) => `filler ${index}\n`).join('');
+        const path = await seed('tiers/middle.txt', `${before}target one  \ntarget two\ntarget three \ntail\n`);
+
+        const result = await edit([
+            { path, oldString: 'target one\ntarget two\ntarget three', newString: 'REPLACED' }
+        ]);
+
+        expect(result[0].match).toBe('trailing-whitespace');
+        await expect(readTextFile(path, 'utf8')).resolves.toBe(`${before}REPLACED\ntail\n`);
+    });
+
+    it('matches a window containing empty lines', async () => {
+        // The old regex enumeration included empty lines, and the rewrite must too:
+        // dropping them would shift every window and miss this match entirely.
+        const path = await seed('tiers/empty-lines.txt', 'a\n\n\nb   \nc\n');
+
+        const result = await edit([{ path, oldString: 'a\n\n\nb\nc', newString: 'X' }]);
+
+        expect(result[0].match).toBe('trailing-whitespace');
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('X\n');
+    });
+
+    it('matches a final line that has no newline', async () => {
+        // A file not ending in "\n" still contributes an unterminated last line, and a
+        // search WITHOUT a trailing newline must be able to end there. Both lines carry
+        // trailing spaces so the exact tier cannot match and tier 3 is the only route.
+        const path = await seed('tiers/no-final-newline.txt', 'head   \ntail   ');
+
+        const result = await edit([{ path, oldString: 'head\ntail', newString: 'done' }]);
+
+        expect(result[0].match).toBe('trailing-whitespace');
+        // The unterminated last line stays unterminated: the replacement ends the file.
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('done');
+    });
+
+    it('keeps the carriage return when a CRLF window is matched without a trailing newline', async () => {
+        // The tier compares the LF view, so a match that does NOT demand a trailing
+        // newline must stop before the "\r"; otherwise the file's endings would be
+        // silently rewritten. The replacement's own lines still take the region's CRLF.
+        const path = await seed('tiers/crlf.txt', 'one\r\ntwo   \r\nthree\r\n');
+
+        const result = await edit([{ path, oldString: 'one\ntwo\nthree', newString: 'A\nB\nC' }]);
+
+        expect(result[0].match).toBe('trailing-whitespace');
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('A\r\nB\r\nC\r\n');
+    });
+
+    it('never forgives indentation on the trailing-whitespace tier', async () => {
+        // Leading whitespace is NOT ignored: a wrong-indent oldString simply does not
+        // match, which is the failure mode the flexible replacers got wrong.
+        const path = await seed('tiers/indent.txt', '    alpha\n    beta\n');
+
+        await expect(
+            edit([{ path, oldString: 'alpha\nbeta', newString: 'X' }])
+        ).rejects.toThrow('edit found no match for oldString');
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('    alpha\n    beta\n');
+    });
+
+    it('does not double-count overlapping trailing-whitespace candidates', async () => {
+        // A two-line search matches at line 1, then again at line 2 (overlapping the
+        // first), then again at line 3. The overlap rule keeps only the first and third,
+        // so replaceAll rewrites two DISJOINT regions and the middle line survives once.
+        const path = await seed('tiers/overlap.txt', 'x\ny   \nx\ny\n');
+
+        const result = await edit([{ path, oldString: 'x\ny\nx', newString: 'M', replaceAll: true }]);
+
+        expect(result[0].match).toBe('trailing-whitespace');
+        expect(result[0].replacements).toBe(1);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('M\ny\n');
+    });
+
+    it('answers a miss on a large file in one pass', async () => {
+        // The performance regression this pins. The tier used to build an object per
+        // line and a fresh array slice per candidate position, so a MISS on a big file
+        // allocated two arrays the size of the line count before answering. A miss must
+        // now cost roughly the linear scan it is.
+        const lines = 120_000;
+        const body = Array.from({ length: lines }, (_, index) => `line ${index} const value = compute(a, b);\n`).join('');
+        const path = await seed('tiers/big-miss.txt', body);
+
+        const started = Date.now();
+        // Nothing matches, so all three tiers run and the whole file is walked.
+        await expect(
+            edit([{ path, oldString: 'a string that is not in this file at all', newString: 'x' }])
+        ).rejects.toThrow('edit found no match for oldString');
+        const elapsed = Date.now() - started;
+
+        // Generous on a fast machine, and still an order of magnitude below the ~2.5 s
+        // the allocating version measured on a comparable file.
+        expect(elapsed).toBeLessThan(1500);
     });
 
     it('leaves every earlier file untouched when a later edit does not match', async () => {
@@ -349,11 +498,76 @@ describe('edit', () => {
         );
     });
 
-    it('does not create a file that is missing', async () => {
+    it('does not create a file that is missing, and says what to use instead', async () => {
         const path = join(workdir, 'absent', 'new.txt');
 
-        await expect(edit([{ path, oldString: 'a', newString: 'b' }])).rejects.toThrow();
+        // D8: the raw errno (`ENOENT: no such file or directory, open '...'`) named no
+        // remedy. `edit` deliberately never creates, so the answer is always `write`,
+        // and the message must say so.
+        await expect(edit([{ path, oldString: 'a', newString: 'b' }])).rejects.toThrow(
+            new RegExp(`edit could not find ${escapeRegExp(path)}: no such file or directory \\(ENOENT\\)\\. edit changes an EXISTING file; use write to create one\\.$`)
+        );
         await expect(readTextFile(path, 'utf8')).rejects.toThrow();
+    });
+
+    it('names a directory target as a directory rather than a permission problem', async () => {
+        // Windows reports EPERM for reading a directory, which by code alone looks like
+        // a denial. One stat after the failure decides, and the message names the tool
+        // that can take a directory.
+        const directory = join(workdir, 'a-directory');
+        await mkdir(directory, { recursive: true });
+
+        await expect(edit([{ path: directory, oldString: 'a', newString: 'b' }])).rejects.toThrow(
+            new RegExp(`edit was given the directory ${escapeRegExp(directory)}`)
+        );
+    });
+
+    it('serializes concurrent edits of one file so neither update is lost', async () => {
+        // D4, the regression this pins. Read-match-write is three awaits, so before the
+        // per-file lock (./lock.ts) all three calls read `VERSION-0`, all three matched,
+        // all three reported success, and the file ended at whichever write landed last
+        // — an answer nobody asked for. With the lock the later calls see the earlier
+        // call's text, so exactly one applies and the rest fail honestly.
+        const path = await seed('race.txt', 'VERSION-0\n');
+
+        const texts = ['VERSION-A', 'VERSION-B', 'VERSION-C'];
+        const results = await Promise.allSettled(
+            texts.map((newString) => edit([{ path, oldString: 'VERSION-0', newString }]))
+        );
+
+        const applied = results
+            .map((outcome, index) => ({ outcome, index }))
+            .filter(({ outcome }) => outcome.status === 'fulfilled');
+        const rejected = results.filter(
+            (outcome) => outcome.status === 'rejected' && /edit found no match/.test(String(outcome.reason))
+        );
+
+        // Exactly one caller may claim success, and every other one must say why it
+        // did not — never a silent third answer.
+        expect(applied).toHaveLength(1);
+        expect(rejected).toHaveLength(2);
+
+        // The file holds the edit that was reported as applied, whichever one that was
+        // (asserting the winner's own text keeps this independent of arrival order).
+        await expect(readTextFile(path, 'utf8')).resolves.toBe(`${texts[applied[0].index]}\n`);
+    });
+
+    it('serializes a concurrent write and edit of one file', async () => {
+        // The same lock covers `write`, so a write and an edit of one path cannot both
+        // claim success against text the other one overwrote.
+        const path = await seed('race-write.txt', 'ONE\n');
+
+        const [written, edited] = await Promise.allSettled([
+            write([{ path, content: 'FROM-WRITE\n' }]),
+            edit([{ path, oldString: 'ONE', newString: 'FROM-EDIT' }])
+        ]);
+
+        expect(written.status).toBe('fulfilled');
+        expect(edited.status === 'fulfilled' || /edit found no match/.test(String(edited.reason))).toBe(true);
+
+        const text = await readTextFile(path, 'utf8');
+        // Whichever ran first, the file holds ONE complete result rather than a mix.
+        expect(['FROM-WRITE\n', 'FROM-EDIT\n']).toContain(text);
     });
 
     it('declares a single "edits" array property of { path, oldString, newString, replaceAll? }', () => {

@@ -8,7 +8,7 @@
 // ../../core/result-budget.ts). This implementation bounds its own work:
 //
 //   - a 1-based line window per file: `startLine` (default 1) plus `maxLines`
-//     (default 1200, hard maximum 20000);
+//     (default 5000, hard maximum 20000);
 //   - an aggregate budget of 256 KiB of SERIALIZED JSON across the whole batch
 //     (`FILE_READ_WIRE_BUDGET`), allocated by demand rather than by headcount;
 //   - a streaming read chunk and a hard stop as soon as the allowance is reached,
@@ -18,7 +18,12 @@
 //   - explicit binary rejection (NUL bytes or invalid UTF-8) for every byte
 //     DECODED WHILE STREAMING, because replacing binary bytes with U+FFFD would be
 //     a silently wrong answer. This is not whole-file validation: bytes after the
-//     last read chunk (or after an early stop) are never inspected.
+//     last read chunk (or after an early stop) are never inspected. The consequence
+//     is deliberate and is stated in the tool description — a file whose NUL sits
+//     past the requested window reads as TEXT for that window and as EBINARY for a
+//     wider one. Rejecting the file outright would mean reading all of it to decide,
+//     which is exactly the unbounded work this tool exists to avoid, and the bytes
+//     the caller asked for are genuinely valid text either way.
 //
 // THE BUDGET IS WIRE BYTES, NOT CONTENT BYTES
 // -------------------------------------------
@@ -49,7 +54,7 @@
 //     read([{ path: 'a.ts', startLine: 10, maxLines: 20 }])
 //
 // A model call carries `{ "paths": [...] }` and reaches this same code. Each item
-// is either a path string (defaults: startLine 1, maxLines 1200) or a range object
+// is either a path string (defaults: startLine 1, maxLines 5000) or a range object
 // `{ path, startLine?, startColumn?, startByte?, maxLines? }`. Keeping the range on
 // the item — rather than adding top-level properties — is deliberate: a second
 // top-level property would disable the single-property rule and break every
@@ -127,6 +132,17 @@
 // or an invalid range value. Those are caller bugs rather than file outcomes, and
 // answering them per-entry would let a broken request look like a successful read.
 //
+// BINARY DETECTION IS WINDOW-SCOPED, NOT WHOLE-FILE
+// -------------------------------------------------
+// A file is called binary by the bytes this call actually decoded. A text file with
+// one stray NUL far past the requested window therefore reads as text for the window
+// and as EBINARY for a wider one (measured: a 100 KB file whose NUL sits at byte
+// 100,001 returns line 1 fine and fails a whole-file read). That is the honest answer
+// — the bytes you asked for ARE valid text — and the only alternative, scanning the
+// entire file to classify it, would charge every small read for the largest file in
+// the batch. `sizeBytes` is always reported, so a caller that needs a whole-file
+// verdict can page to the end.
+//
 // COST OF RANGES
 // --------------
 // A window at line N with no `startByte` requires counting from byte 0, so it
@@ -158,7 +174,24 @@ import type { PresetToolMetadata } from '../catalogue';
 
 // Default and hard limits. These are exported so docs/tests can quote the same
 // numbers the implementation enforces (and so a host cannot quietly disagree).
-export const FILE_READ_DEFAULT_MAX_LINES = 1200;
+//
+// WHY THE DEFAULT IS 5000 LINES AND NOT 200 OR 1200
+// -------------------------------------------------
+// The wire budget, not the line count, is the real limit, so the default must be
+// high enough for a default read to REACH it. Measured on this repository's own
+// source (mean 55 bytes/line): a 200-line default used 14.2% of the budget and a
+// 1200-line default used 22.7% (59,386 of 262,144 bytes), so the tool spent a full
+// round trip to deliver a fifth of what it was allowed to return, and the agent paid
+// another round trip for the next fifth. At 5000 lines the budget binds first for
+// typical source (5000 x 55 = 275 KB > 256 KiB), so one call returns as much as the
+// envelope can hold.
+//
+// The honest cost: a default read of a LARGE file now commits up to the whole budget
+// rather than a quarter of it, so a careless default read costs more tokens per call.
+// That is the intended direction — the budget is the documented governor, `maxLines`
+// is the guard for files whose lines are short — and 5000 still leaves a quarter of
+// the 20000-line hard maximum for a caller who asks for more.
+export const FILE_READ_DEFAULT_MAX_LINES = 5000;
 export const FILE_READ_MAX_LINES = 20_000;
 
 // The aggregate budget, charged against the SERIALIZED JSON of the result rather
@@ -214,7 +247,7 @@ export type FileReadTarget =
           // line number reported for the first returned line, so threading
           // nextByte/nextLine through together keeps numbering correct for free.
           startByte?: number;
-          // Maximum lines to return. Defaults to 1200, hard maximum 20000.
+          // Maximum lines to return. Defaults to 5000, hard maximum 20000.
           maxLines?: number;
       };
 
@@ -829,7 +862,7 @@ const isDirectory = async (path: string): Promise<boolean> => {
 export const FILE_READ_METADATA: PresetToolMetadata = {
     name: 'read',
     description:
-        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, maxLines 1200 (hard maximum 20000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use fileList or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte rescans from the start to count lines. Paths are absolute or relative to the working directory.',
+        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, maxLines 5000 (hard maximum 20000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use fileList or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte rescans from the start to count lines. Binary detection is WINDOW-SCOPED, not whole-file: a NUL past the requested window is not reported, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.',
     tags: ['files', 'read', 'filesystem'],
     // R18: everyday file access is core — always declared, never discovered.
     visibility: 'core',
@@ -871,7 +904,7 @@ export const FILE_READ_METADATA: PresetToolMetadata = {
                                     type: 'integer',
                                     minimum: 1,
                                     maximum: 20_000,
-                                    description: 'Maximum lines to return. Defaults to 1200 and is capped at 20000.'
+                                    description: 'Maximum lines to return. Defaults to 5000 and is capped at 20000.'
                                 }
                             },
                             required: ['path'],

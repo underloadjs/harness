@@ -45,6 +45,17 @@
 // for lone surrogates; that is documented behavior of the encoding, not a NUL
 // binary marker).
 //
+// ONE CRITICAL SECTION PER FILE (D4: no lost update)
+// --------------------------------------------------
+// A write racing a concurrent `edit` on the same path used to interleave: the edit
+// read the pre-write text, matched, and wrote it back over the write's content (or
+// vice versa), and BOTH calls reported success. Each write therefore runs under the
+// same per-file lock `edit` takes (./lock.ts), keyed by FILE IDENTITY so a Windows
+// case alias or a symlink alias queues behind the real file rather than racing it.
+// Locks for a multi-file batch are taken in sorted identity order, so two overlapping
+// batches cannot deadlock. This orders calls inside ONE process; it makes no claim
+// about another process or another worker thread, and never did.
+//
 // FAILURE SEMANTICS (honest, not transactional)
 // ---------------------------------------------
 // Writes are sequential. A filesystem error on file N may leave files 1..N-1
@@ -69,6 +80,7 @@ import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
 import { fileIdentity } from './identity';
+import { withFileLocks } from './lock';
 
 // One file to write.
 export type FileWriteEntry = {
@@ -96,6 +108,9 @@ export type FileWriteResult = FileWriteResultEntry[];
 // the write loop needs and the loop itself cannot fail on shape.
 type PreparedWrite = {
     target: string;
+    // Canonical identity (./identity.ts), kept so the lock key matches the one `edit`
+    // takes for the same file — two spellings of one file must share one lock.
+    identity: string;
     content: string;
 };
 
@@ -168,7 +183,7 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
         }
 
         seen.add(identity);
-        prepared.push({ target, content });
+        prepared.push({ target, identity, content });
     }
 
     return prepared;
@@ -180,7 +195,7 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
 export const WRITE_METADATA: PresetToolMetadata = {
     name: 'write',
     description:
-        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. A write error part-way through is reported with the paths already completed: there is no rollback.',
+        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. A write error part-way through is reported with the paths already completed: there is no rollback.',
     tags: ['files', 'write', 'filesystem'],
     // R18: writing files is core, like the rest of the everyday file set.
     visibility: 'core',
@@ -232,29 +247,39 @@ export const write = tool<FileWriteParameters, FileWriteResult>({
     ...WRITE_METADATA,
     execute: async ({ parameters: files }) => {
         const prepared = await prepareWrites(files);
-        const written: FileWriteResultEntry[] = [];
 
-        for (const { target, content } of prepared) {
-            try {
-                // Agents write into directories that do not exist yet far more
-                // often than not; failing on that wastes a round trip.
-                await mkdir(dirname(target), { recursive: true });
-                await writeTextFile(target, content, 'utf8');
-            } catch (error) {
-                // Partial success is reported honestly: the completed paths are
-                // named so the caller can tell what exists now, and there is no
-                // claim of a transaction or rollback (there is neither).
-                const completed = written.length === 0 ? 'none' : written.map((entry) => entry.path).join(', ');
-                const reason = error instanceof Error ? error.message : String(error);
+        // D4: hold every target's lock across the whole batch, in sorted identity
+        // order (./lock.ts deduplicates and sorts), so a concurrent `edit` on any of
+        // these files cannot read a half-updated view of one of them.
+        return withFileLocks(
+            prepared.map((entry) => entry.identity),
+            async () => {
+                const written: FileWriteResultEntry[] = [];
 
-                throw new HarnessError(
-                    `write failed on ${target}: ${reason} Writes already completed: ${completed}. No rollback was performed.`
-                );
+                for (const { target, content } of prepared) {
+                    try {
+                        // Agents write into directories that do not exist yet far more
+                        // often than not; failing on that wastes a round trip.
+                        await mkdir(dirname(target), { recursive: true });
+                        await writeTextFile(target, content, 'utf8');
+                    } catch (error) {
+                        // Partial success is reported honestly: the completed paths are
+                        // named so the caller can tell what exists now, and there is no
+                        // claim of a transaction or rollback (there is neither).
+                        const completed =
+                            written.length === 0 ? 'none' : written.map((entry) => entry.path).join(', ');
+                        const reason = error instanceof Error ? error.message : String(error);
+
+                        throw new HarnessError(
+                            `write failed on ${target}: ${reason} Writes already completed: ${completed}. No rollback was performed.`
+                        );
+                    }
+
+                    written.push({ path: target, bytes: Buffer.byteLength(content, 'utf8') });
+                }
+
+                return written;
             }
-
-            written.push({ path: target, bytes: Buffer.byteLength(content, 'utf8') });
-        }
-
-        return written;
+        );
     }
 });

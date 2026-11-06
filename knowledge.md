@@ -944,9 +944,9 @@ searchable remainder (`fileList`, `syntax`, `shell`, `gitDiff`, `download`) wait
 | Export | Call | Result |
 |---|---|---|
 | `syntax` | `({ code, language: string })` — validated free name: `javascript`/`js`, `typescript`/`ts`, `tsx`, `jsx`, `json`, `python`/`py`/`python3` (trimmed, case-folded, a leading dot allowed) | `boolean`; an unsupported language, a non-string `code`, a missing interpreter, and a cancelled or timed-out Python run are all ERRORS, never a verdict |
-| `read` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }`; a missing path keeps its entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes); a malformed request, directory, binary, or other I/O error rejects the call |
-| `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected |
-| `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; exact-first matching (typographic and trailing-whitespace fallbacks, line endings preserved), all preflighted before the first write |
+| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }`; defaults `startLine 1`, `maxLines 5000` (max 20000); the 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap. A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call. Binary detection is window-scoped, not whole-file |
+| `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path |
+| `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks, line endings preserved), all preflighted before the first write, each file written once. `match` names a fallback tier. Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call fails with "no match" instead of clobbering the other's change |
 | `fileList` | `(paths?)` legacy string/string[] or `({ paths?, offset?, limit? })`; defaults to `["."]` | `{ entries: string[], truncated, nextOffset, offset, limit, bytes, contentBudget }` — ONE page of `dir/entry`, directories end with `/`; non-recursive |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — names only; the old `content` property is gone and the schema rejects it |
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }` (required `pattern`; 1 KiB snippet per line, 64 KiB aggregate) |
@@ -981,28 +981,37 @@ Implementation notes worth keeping:
   `edits`), so the single-property rule hands `execute` the array itself. That is
   what makes `read(['a', 'b'])` and a model call carrying
   `{ "paths": ["a", "b"] }` the same code path. `read` keeps that property while
-  allowing range objects as ITEMS (`{ path, startLine?, startColumn?, maxLines? }`);
-  per-file windows are not a second top-level property.
-- **`read` is bounded by default.** 200 lines per file (`maxLines`, hard max
-  5000) from a 1-based `startLine`, plus a fixed 64 KiB aggregate UTF-8 content
-  budget split fairly across the batch. It streams 64 KiB chunks and stops at the
-  cap, so a huge file or giant line is never read wholesale. `content` is raw text
-  (line 1 is `startLine`); a truncated entry reports `nextLine`/`nextColumn`, where
-  `nextColumn` is a 0-based byte offset inside the line (non-zero only for a line cut
-  mid-line) and can be passed back as `startColumn`. A NUL or invalid UTF-8 sequence
-  in the chunks DECODED WHILE STREAMING rejects the call as binary; this is not
-  whole-file validation, since bytes after the last read chunk are never inspected.
-  A call accepts at most 100 paths so metadata cannot grow without bound either.
-  A path that does not exist is DATA, not a failed call: it keeps its ordered slot as
+  allowing range objects as ITEMS (`{ path, startLine?, startColumn?, startByte?,
+  maxLines? }`); per-file windows are not a second top-level property.
+- **`read` is bounded by default.** 5000 lines per file (`maxLines`, hard max
+  20000) from a 1-based `startLine`, plus a fixed 256 KiB aggregate budget measured on
+  the SERIALIZED result (`FILE_READ_WIRE_BUDGET`), allocated by DEMAND: every readable
+  file gets an equal share, files needing less hand the difference back to the files
+  actually cut, and the passes are capped. The default is sized so the BUDGET binds
+  before the line count on typical source — a 200-line default used 14.2% of the
+  envelope and a 1200-line default 22.7%, so a call spent a round trip to return a
+  fifth of what it was allowed. It streams 64 KiB chunks and stops at the cap, so a
+  huge file or giant line is never read wholesale. `content` is raw text
+  (line 1 is `startLine`); a truncated entry reports `nextLine`/`nextColumn`/`nextByte`,
+  where `nextColumn` is a 0-based byte offset inside the line (non-zero only for a line
+  cut mid-line). `startByte = nextByte` resumes by SEEKING with no line counting, which
+  is the O(window) way to walk a large file; a line-based window at line N rescans from
+  byte 0. A NUL or invalid UTF-8 sequence in the chunks DECODED WHILE STREAMING rejects
+  that ENTRY as binary; this is not whole-file validation, since bytes after the last
+  read chunk are never inspected, so one file can read as text for a narrow window and
+  as `EBINARY` for a wide one. A call accepts at most 100 paths so metadata cannot grow
+  without bound either.
+  A path that cannot be read is DATA, not a failed call: it keeps its ordered slot as
   an entry with empty `content`, `endLine = startLine - 1`, `bytes: 0`, and
-  `error: { code: 'ENOENT', message }`, and it consumes no content budget (the split
-  is computed across files that actually exist, see `execute`'s two phases), so the
-  readable files are still returned in full. Every other failure — a malformed
-  request or range, a directory, binary content, any other I/O error — still rejects
-  the whole call.
-  Ranges/continuations rescan from byte 0 to count lines: bounded memory, but a deep
-  offset costs time proportional to the skipped prefix. `contentBudget` labels the
-  cap honestly: content bytes, not the JSON envelope.
+  `error: { code, message }` — `ENOENT`, `EISDIR`, `EACCES`/`EPERM`, `EBINARY`, or
+  `EIO` — and it consumes no budget (the split is computed across files that actually
+  opened, see `execute`'s two phases), so the readable files are still returned in
+  full. Only a malformed REQUEST rejects the whole call.
+  `wireBytes` is the exact serialized length of the response and always satisfies
+  `wireBytes <= contentBudget`, which is what keeps the continuation fields alive
+  through the harness's own cap (`MODEL_TOOL_RESULT_BUDGET_BYTES`, held equal to
+  `FILE_READ_WIRE_BUDGET` by an assertion in `read.test.ts` rather than an import, so
+  the preset compiles with no captured dependency).
 - **`write` / `edit` preflight everything.** Every entry is shape-checked,
   every target must be unique **by real file identity** (`tools/files/identity.ts`:
   `realpath`, plus the nearest existing ancestor for a file that does not exist yet,
@@ -1011,6 +1020,17 @@ Implementation notes worth keeping:
   is read and match-checked before the first byte is written, so one bad entry leaves
   every file untouched. A filesystem error during the write phase names the completed
   paths: there is **no transaction and no rollback**.
+- **`write` / `edit` hold one critical section per file** (`tools/files/lock.ts`,
+  keyed by that same file identity). Read-match-write is three awaits, so two
+  overlapping calls used to read one original text, both match, both report success,
+  and the last write silently won (measured: `VERSION-0` plus three concurrent edits
+  ended at `VERSION-C` with all three claiming to have applied). With the lock the
+  later call sees the earlier call's text and fails honestly with "no match". A
+  multi-file batch acquires its locks **deduplicated and sorted by identity** and
+  releases in reverse, so two batches naming overlapping files cannot deadlock. The
+  map entry is dropped when the last holder leaves, so the key set does not grow with
+  the number of files the process has touched. This is per-process, per-event-loop
+  only: it orders nothing against another process or worker thread, and claims not to.
 - **`edit` is exact-first and guarded (opencode v2 matching).** Matching runs a
   three-tier cascade on an LF view of the file: exact bytes, then typographic
   quote/dash/space folding, then trailing-whitespace-ignoring whole-line matching —
@@ -1019,9 +1039,12 @@ Implementation notes worth keeping:
   re-joined with the matched region's endings); an oldString/newString pair that
   differs only in `\r` applies to the exact bytes. `oldString` must appear exactly
   once or `replaceAll: true` must be passed; a match whose replacement equals the
-  file text is rejected, not reported as applied. A missing file is an error (use
-  `write` for new files), and the result reports `replacements` and the new
-  byte size.
+  file text is rejected, not reported as applied. A missing file is an error that says
+  so and names `write` (the raw errno used to leak as `ENOENT: no such file or
+  directory, open '...'`, which named no remedy); a directory target is classified as
+  a directory rather than a permission denial, which matters because Windows reports
+  EPERM for both. The result reports `replacements`, the new byte size, and `match`
+  when a fallback tier was used.
 - **`fileList` takes a directory array and returns ONE PAGE.** `fileList(['src', 'task'])`
   returns one flat list whose entries are prefixed with their directory (`src/a.ts`,
   `src/nested/`, `task/b.ts`); directories keep the trailing `/`. It stays

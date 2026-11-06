@@ -70,10 +70,15 @@ const withWire = (result: FileReadResult) => ({
     wireBytes: expect.any(Number)
 });
 
-// The 1300-line fixture is generated rather than pasted; the assertions below spell
-// out the exact slice expected for each window. 1300 exceeds the 1200-line default
-// so the default window is actually exercised.
-const LINES_1300 = Array.from({ length: 1300 }, (_, index) => `line ${index + 1}\n`).join('');
+// The line fixtures are generated rather than pasted; the assertions below spell out
+// the exact slice expected for each window. `lines.txt` is 1300 lines, which is
+// INSIDE the 5000-line default so the EOF/past-EOF windows are reachable; the default
+// window itself is exercised against `many-lines.txt`, which exceeds it.
+const linesUpTo = (count: number): string =>
+    Array.from({ length: count }, (_, index) => `line ${index + 1}\n`).join('');
+
+const LINES_1300 = linesUpTo(1300);
+const LINES_5100 = linesUpTo(5100);
 
 beforeAll(async () => {
     await mkdir(TEMP_ROOT, { recursive: true });
@@ -88,6 +93,7 @@ beforeAll(async () => {
     await seed('empty.txt', '');
     await seed('utf8.txt', 'h\u00e9llo\n'); // 7 UTF-8 bytes, 6 code points
     await seed('lines.txt', LINES_1300);
+    await seed('many-lines.txt', LINES_5100);
 
     // Lines that fit the 256 KiB wire budget, so a giant line is returned whole
     // rather than cut — the size the OLD 64 KiB budget could not hold.
@@ -266,25 +272,46 @@ describe('read', () => {
         });
     });
 
-    it('defaults to the first 1200 lines and reports the continuation', async () => {
-        const first1200 = Array.from({ length: 1200 }, (_, index) => `line ${index + 1}\n`).join('');
-        const bytes = Buffer.byteLength(first1200, 'utf8');
+    it('defaults to the first 5000 lines and reports the continuation', async () => {
+        const first5000 = linesUpTo(5000);
+        const bytes = Buffer.byteLength(first5000, 'utf8');
 
-        const result = await read([join(workdir, 'lines.txt')]);
+        const result = await read([join(workdir, 'many-lines.txt')]);
         const entry = result.files[0];
 
-        expect(entry.content).toBe(first1200);
+        expect(entry.content).toBe(first5000);
         expect(entry.startLine).toBe(1);
-        expect(entry.endLine).toBe(1200);
+        expect(entry.endLine).toBe(5000);
         expect(entry.bytes).toBe(bytes);
         expect(entry.truncated).toBe(true);
-        expect(entry.nextLine).toBe(1201);
+        expect(entry.nextLine).toBe(5001);
         expect(entry.nextColumn).toBe(0);
         // The whole file is reported, so a caller can see how much is left.
-        expect(entry.sizeBytes).toBe(Buffer.byteLength(LINES_1300, 'utf8'));
-        // nextByte is the absolute offset of line 1201, i.e. exactly the bytes read.
+        expect(entry.sizeBytes).toBe(Buffer.byteLength(LINES_5100, 'utf8'));
+        // nextByte is the absolute offset of line 5001, i.e. exactly the bytes read.
         expect(entry.nextByte).toBe(bytes);
         expect(result.truncated).toBe(true);
+    });
+
+    it('fills the wire budget with a default read of typical source', async () => {
+        // The utilization contract (improvement #3). A 200-line default used 14.2% of
+        // the budget and a 1200-line default used 22.7%, so the tool spent a round trip
+        // to deliver a fifth of what the envelope allowed. Lines sized like this
+        // repository's own source (mean ~55 bytes) must now reach the budget, which is
+        // what makes `maxLines` a guard rather than the effective limit.
+        const path = await seed(
+            'sized.txt',
+            Array.from({ length: 20_000 }, (_, index) => `line ${index} const value = compute(a, b); // note ${index}\n`).join('')
+        );
+
+        const result = await read([path]);
+        const entry = result.files[0];
+
+        expect(entry.truncated).toBe(true);
+        // Budget-bound, not line-bound: fewer than the 5000-line default came back.
+        expect(entry.endLine).toBeLessThan(FILE_READ_DEFAULT_MAX_LINES);
+        expect(result.wireBytes / FILE_READ_WIRE_BUDGET).toBeGreaterThan(0.8);
+        expect(result.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
     });
 
     it('applies an exact 1-based startLine/maxLines window', async () => {
@@ -739,7 +766,7 @@ describe('read', () => {
                                         type: 'integer',
                                         minimum: 1,
                                         maximum: 20_000,
-                                        description: 'Maximum lines to return. Defaults to 1200 and is capped at 20000.'
+                                        description: 'Maximum lines to return. Defaults to 5000 and is capped at 20000.'
                                     }
                                 },
                                 required: ['path'],
@@ -758,7 +785,7 @@ describe('read', () => {
     });
 
     it('publishes the documented default and hard caps', () => {
-        expect(FILE_READ_DEFAULT_MAX_LINES).toBe(1200);
+        expect(FILE_READ_DEFAULT_MAX_LINES).toBe(5000);
         expect(FILE_READ_MAX_LINES).toBe(20_000);
         expect(FILE_READ_MAX_TARGETS).toBe(100);
         // read's budget must never exceed the harness wire cap, or a full-budget read

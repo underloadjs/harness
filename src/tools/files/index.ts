@@ -75,9 +75,11 @@
 // constants (FILE_LIST_CONTENT_BUDGET, FILE_GREP_CONTENT_BUDGET, …) are imported from
 // the entry file itself by the implementation and its focused tests.
 //
-// Four private helpers sit beside the tools and are shared by the batch:
+// Five private helpers sit beside the tools and are shared by the batch:
 //   - ./identity       — one canonical key per real file, so duplicate targets (Windows
 //     case aliases, symlink aliases, aliased roots) cannot slip through;
+//   - ./lock           — the per-file async mutex write and edit share, so two calls
+//     that name one file serialize instead of one silently overwriting the other;
 //   - ./search         — the pattern/root/candidate plumbing both search presets walk,
 //     so glob and grep cannot drift apart: brace expansion and `!` negation, the root
 //     error boundary, the per-root coverage counters, and the bounded-concurrency read

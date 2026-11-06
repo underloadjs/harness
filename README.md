@@ -434,7 +434,7 @@ implementation has two entry points: a direct call, and a call from the model.
 
 ```ts
 // The preset's real shape: one array property, so `execute` receives the array
-// itself. Items may be strings or `{ path, startLine?, startColumn?, maxLines? }`.
+// itself. Items may be strings or `{ path, startLine?, startColumn?, startByte?, maxLines? }`.
 const read = tool<FileReadParameters, FileReadResult>({
     description: 'Read a bounded window of UTF-8 text files.',
     tags: ['files', 'read'],
@@ -447,7 +447,8 @@ const read = tool<FileReadParameters, FileReadResult>({
 });
 
 // { files: [{ path, content, startLine, endLine, truncated,
-//             nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }
+//             nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }],
+//   truncated, bytes, wireBytes, contentBudget, skipped }
 await read(['package.json']);                // no harness, no agent
 harness({ tools: { read } });                // the model calls read
 ```
@@ -841,7 +842,7 @@ import {
 
 await syntax({ code: 'def f():\n    pass', language: 'python' });  // true
 await syntax({ code: 'const a: number = 1;', language: 'ts' });     // true (typescript, tsx, jsx and json too)
-await read(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, contentBudget }
+await read(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, wireBytes, contentBudget, skipped }
 await write([{ path: 'notes.md', content: '# Notes' }]);            // [{ path, bytes }]
 await fileList(['src', 'task']);                                    // { entries: ['src/a.ts', 'src/nested/', 'task/b.ts', ...], truncated, nextOffset, offset, limit, bytes, contentBudget }
 await fileList({ paths: ['src'], offset: 200, limit: 100 });        // page 2 of the same list
@@ -901,34 +902,44 @@ await write([{ path: 'a.ts', content: 'a' }, { path: 'b.ts', content: 'b' }]);
 await edit([{ path: 'a.ts', oldString: 'a', newString: 'b' }]);
 ```
 
-**`read` is bounded by default.** Each result window returns at most 200 lines
-(`maxLines`, hard maximum 5000) starting at `startLine` (1-based, default 1). The
-whole batch shares a fixed 64 KiB UTF-8 **content** budget, split fairly between the
-requested files; reading streams in 64 KiB chunks and stops at the cap, so a huge
-file or a single giant line is never loaded wholesale. `content` is raw text whose
+**`read` is bounded by default.** Each result window returns at most 5000 lines
+(`maxLines`, hard maximum 20000) starting at `startLine` (1-based, default 1). The
+whole batch shares a fixed 256 KiB budget measured on the **serialized JSON** result
+(escaping included), allocated by **demand** rather than by headcount: a file that
+needs less than its share hands the difference back to the files that were actually
+cut. Reading streams in 64 KiB chunks and stops at the cap, so a huge file or a
+single giant line is never loaded wholesale. Because the budget is measured on the
+form the harness delivers it in, `wireBytes <= contentBudget` always holds and a
+full-budget read survives the harness's own wire cap with its continuation fields
+intact — the failure this design removed was a 64 KiB content budget next to a 64 KiB
+wire cap, which meant a full read was *always* over the cap and got replaced by an
+envelope that destroyed `nextLine`/`nextColumn`. `content` is raw text whose
 first line is `startLine` — line numbering is metadata, not a prefix, so a model can
-still copy exact text into `edit`. A truncated entry reports `nextLine` and
+still copy exact text into `edit`. A truncated entry reports `nextLine`,
 `nextColumn` (a 0-based UTF-8 byte offset within that line, normally 0; non-zero
-only when a giant line was cut mid-line), and `{ path, startLine: nextLine,
-startColumn: nextColumn }` resumes exactly there. Binary rejection is based on the
-bytes DECODED WHILE STREAMING: a NUL or invalid UTF-8 sequence in a chunk that was
-read rejects the call instead of returning replacement characters. It is not
-whole-file validation — bytes after the last read chunk (for example far past a
-truncated window) are never inspected. A call accepts at most 100 paths, which
-bounds the metadata side of the response as well as the content. The budget covers
-content bytes, not JSON escaping; `contentBudget` reports the fixed cap and `bytes`
-reports what the response consumed. Because line numbers require counting from the
-beginning, a deep `startLine`/`startColumn` rescan the file from byte 0 each time:
-memory stays bounded, but the skipped prefix costs time.
+only when a giant line was cut mid-line) and `nextByte` (the absolute file offset).
+`{ path, startLine: nextLine, startColumn: nextColumn }` resumes there by counting;
+`{ path, startByte: nextByte, startLine: nextLine }` resumes by **seeking**, which is
+how a large file should be walked, because a line-based window at line N must count
+from byte 0 and therefore costs time proportional to the skipped prefix. Binary
+rejection is based on the bytes DECODED WHILE STREAMING: a NUL or invalid UTF-8
+sequence in a chunk that was read rejects that ENTRY as binary instead of returning
+replacement characters. It is not whole-file validation — bytes after the last read
+chunk (for example far past a truncated window) are never inspected, so one file can
+read as text for a narrow window and as `EBINARY` for a wide one. A call accepts at
+most 100 paths, which bounds the metadata side of the response as well as the
+content. `bytes` reports raw content bytes, `wireBytes` the exact serialized length,
+and `contentBudget` the cap this call was subject to.
 
-A path that does **not exist** is a per-entry result, not a failed call: it keeps its
+A path that cannot be read is a per-entry result, not a failed call: it keeps its
 ordered position with empty `content`, `bytes` 0, the empty-window range
-(`endLine = startLine - 1`), and `error: { code: 'ENOENT', message }`, while every
-other requested file is still read. A missing entry consumes **no** content budget,
-so it cannot shrink the window of a file that does exist. Everything else — a
-malformed request, a range error, a directory, binary bytes in a chunk that was
-read, or any other filesystem error — rejects the whole call, so a partial answer
-can never look complete.
+(`endLine = startLine - 1`), and `error: { code, message }` — `ENOENT`, `EISDIR` (a
+directory; use `glob` or `fileList`), `EACCES`/`EPERM` (a real denial), `EBINARY`, or
+`EIO` — while every other requested file is still read. A failed entry consumes
+**no** budget, so it cannot shrink the window of a file that does exist. Only a
+malformed REQUEST (bad path, bad range, empty or oversized array) rejects the whole
+call, before any disk access, because a broken request must not look like a
+successful read.
 
 `write` and `edit` validate **every** entry (shape, non-empty strings, no
 NUL, unique target file) before the first write, and `edit` also reads and
@@ -938,13 +949,19 @@ Uniqueness is by **real file identity**, not spelling: on Windows `notes.txt` an
 names one file twice is rejected before anything is written (Linux keeps `a.ts` and
 `A.ts` as two files). A filesystem error part-way through the write phase is reported
 with the paths already completed: there is **no transaction and no rollback**.
+Read-match-write is held as **one critical section per file** (`tools/files/lock.ts`,
+keyed by that same file identity), so two calls that name one file cannot both report
+success while one silently overwrites the other — the later call sees the earlier
+call's text and fails with "no match". A multi-file batch takes its locks in sorted
+identity order, so overlapping batches cannot deadlock. This orders calls inside one
+process; it makes no claim about another process or worker thread.
 
 | Tool | Signatures | Result |
 |---|---|---|
 | `syntax` | `({ code, language: string })` — any name, validated at run time | `true` when the snippet parses and `false` when it does not. Parsers: `javascript` (a classic script, so no `import`/`export` or top-level await) and its `js` alias, `typescript`/`ts`, `tsx`, `jsx` (syntax diagnostics only — a type error still parses), `json` (strict; one leading BOM is ignored), and `python`/`py`/`python3`. Any other language is an ERROR that lists the supported set, never a verdict |
-| `read` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files, truncated, bytes, contentBudget }`; one window per path, ordered; a missing path is an entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes), while a malformed request, directory, binary, or other I/O error rejects the whole call |
-| `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
-| `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted |
+| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files, truncated, bytes, wireBytes, contentBudget, skipped }`; one window per path, ordered, default 5000 lines; an unreadable path keeps its slot with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call |
+| `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected; serialized per file against a concurrent `edit` |
+| `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted; read-match-write is one per-file critical section |
 | `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — NAMES only, capped at 100; there is no `content` property any more |
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }`; caps at 100 matches and 64 KiB of match text, matching time-bounded |
