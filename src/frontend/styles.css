@@ -392,9 +392,21 @@ summary::-webkit-details-marker {
 
 /* Three-column shell --------------------------------------------------- */
 
+/* The rails are the shell's only fixed tracks, so both widths are custom properties:
+   a seam handle (`ui/rail-resize.ts`) writes one inline property on this element while
+   it is dragged, and the fallbacks here are the defaults — the widths the page paints
+   with no drag, which is also what a reload repaints because nothing about a drag is
+   stored. They must match the `fallback` figures in that module. The two `6px` tracks
+   are the seams themselves: they cost the chat 12px and buy the pointer a real edge to
+   grab, which an overlay painted on top of a rail never quite is. */
 .shell {
     display: grid;
-    grid-template-columns: 248px minmax(0, 1fr) 320px;
+    grid-template-columns:
+        var(--rail-left-width, 248px)
+        6px
+        minmax(0, 1fr)
+        6px
+        var(--rail-right-width, 320px);
     flex: 1;
     min-height: 0;
 }
@@ -416,6 +428,73 @@ summary::-webkit-details-marker {
 .rail-right {
     border-left: 1px solid var(--border);
     background: var(--bg-bar);
+}
+
+/* Rail seams: the drag handles between the chat and each rail ------------- */
+
+/* A seam is a grid item, not a rail decoration: it carries the bar's own background so
+   the rail reads as one surface, and it is `z-index: 1` so its widened hit area
+   (`::before`, 5px of overhang on each side) stays above the surfaces it overlaps — a
+   rail's padding and the transcript's outer margin, never a control. Nothing is set on
+   the rail itself: the TRACK is what sizes a grid item, so the handle drives the custom
+   property the track reads. */
+.rail-resizer {
+    position: relative;
+    z-index: 1;
+    cursor: col-resize;
+    /* A finger on this strip drags the rail. Without it the touch pans the page instead
+       and the pointer sequence dies on the first move. */
+    touch-action: none;
+    background: var(--bg-bar);
+    border: 0;
+    margin: 0;
+    padding: 0;
+}
+
+.rail-resizer::before {
+    content: '';
+    position: absolute;
+    inset: 0 -5px;
+}
+
+/* The grip is a 2px line along the seam's divider edge (the rail's own 1px border sits
+   directly against it), lit on hover and for the whole drag — the handle cannot be
+   hovered once the pointer leaves it, hence the state class. */
+.rail-resizer::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: transparent;
+    transition: background 120ms ease;
+}
+
+/* Each seam's divider is on the side facing its rail: the left rail carries its
+   `border-right`, the right rail its `border-left`. */
+.rail-resizer-left::after {
+    left: 0;
+}
+
+.rail-resizer-right::after {
+    right: 0;
+}
+
+.rail-resizer:hover::after,
+.rail-resizer.is-resizing::after {
+    background: var(--accent);
+}
+
+.rail-resizer:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+/* While a seam is dragged the pointer is usually nowhere near the handle, so the cursor
+   and the text-selection lock live on <body> for the duration of the drag. */
+body.is-resizing-rail {
+    cursor: col-resize;
+    user-select: none;
 }
 
 .rail-head {
@@ -6041,8 +6120,18 @@ summary::-webkit-details-marker {
 /* Tablet: keep the chat widest, move the right rail under it as a strip. */
 @media (max-width: 1180px) {
     .shell {
-        grid-template-columns: 216px minmax(0, 1fr);
+        /* The left seam keeps its track — the harness rail is still a column, so it is
+           still resizable — and the right seam loses one, because the scratch board is
+           a full-width strip here and has no vertical edge to pull. */
+        grid-template-columns:
+            var(--rail-left-width, 216px)
+            6px
+            minmax(0, 1fr);
         grid-template-rows: minmax(0, 1fr) auto;
+    }
+
+    .rail-resizer-right {
+        display: none;
     }
 
     .rail-right {
@@ -6151,6 +6240,14 @@ summary::-webkit-details-marker {
        stay in the DOM; display is the only thing that changes). */
     .rail-left,
     .rail-right {
+        display: none;
+    }
+
+    /* Both rails are fixed-width off-canvas drawers at this width, so there is no seam
+       to drag: the handles take no track and the shell's single column is the chat.
+       Written as its own rule — the group above is the rails' collapse, and the drag
+       handles are a separate concern (they are permanent grid children). */
+    .rail-resizer {
         display: none;
     }
 
@@ -6977,10 +7074,13 @@ summary::-webkit-details-marker {
 /* ===========================================================================
    T22: the ONE current tail block (R23) — ui/turns.ts `createContextBarSurface`
 
-   The strip says what a turn was made of; the block the reader is actually reading
-   still has to appear, exactly once, at the TAIL of that strip. `ui/turns.ts` mounts
-   one `.context-bar-tail` inside each section's own `.context-bar-host` (so a
-   delegated conversation's thinking can never print inside its caller's block).
+   The strip says what a turn was made of; the block the reader is actually reading still has to
+   appear, exactly once, AFTER the content that precedes it. `ui/turns.ts` mints one
+   `.context-bar-tail` per section surface (so a delegated conversation's thinking can never print
+   inside its caller's block) and, while it prints a thinking window or a recorded call, keeps it
+   as the LAST child of that section's own `.agent-flow` — below the newest assistant response,
+   which is what T27 (R2) asked for. A body that prints nothing stays parked in the section's
+   `.context-bar-host`, which owns the teardown.
 
    T23 widened WHAT may print there: the server's designation (`TurnSection.tail`) names
    the newest block of ANY kind — a thinking window, an answer, or a recorded CALL — and a
@@ -6990,22 +7090,33 @@ summary::-webkit-details-marker {
 
    Two rules below are load-bearing for that contract and are pinned by
    `ui/context-bar-style.test.ts`:
-     - the attribute selector `[data-superseded='true']` sets `display: none` — every OLDER prose window is a
-       segment the reader clicks (its exact bytes come from the block route), so it
-       must not stay printed as a stale preview. `[hidden]` already covers the common
-       case; this states the SAME rule in the vocabulary of the decision, so a change
-       to the base `[hidden]` rule cannot silently bring the wall of previews back.
+     - the attribute selector `[data-superseded='true']` sets `display: none` — every prose block
+       older than the NEWEST response is a segment the reader clicks (its exact bytes come from
+       the block route), so it must not stay printed as a stale preview. `[hidden]` already
+       covers the common case; this states the SAME rule in the vocabulary of the decision, so a
+       change to the base `[hidden]` rule cannot silently bring the wall of previews back.
      - the tail body is `white-space: pre-wrap` in the mono face: reasoning is scratch
        space and renders as plain text, and a long round scrolls inside its own box
        instead of pushing the rest of the transcript off the page.
 
-   `data-truncated` is the honest label, not decoration: the display wire bounds
-   reasoning text at `DISPLAY_NODE_PREVIEW_CHARS` (src/shared/turn-display.ts:134), so
-   until the server designates the tail block as a full-text carrier the body IS a
-   preview, and the caption line states the exact recorded length beside it.
+   `data-truncated` is the WIRE's honest label, not decoration: a legacy producer still bounds a
+   node's text at `DISPLAY_NODE_PREVIEW_CHARS` (src/shared/turn-display.ts:134), and the box then
+   shows those bytes. T27 (R1b) removed the RENDER-side window from a thinking body — the scroll
+   box holds everything the wire delivered — so a designated (whole) thinking tail reports
+   `data-truncated="false"` and `data-shown-chars` equal to `data-chars` and its caption states
+   the length alone, while a body the PRODUCER bounded still reports `data-shown-chars` short of
+   `data-chars` with `data-truncated="true"`, because the box cannot paint bytes it was not given.
    ======================================================================== */
 
 .context-bar-tail {
+    /* R1a (T27): ONE shared content-viewport height for BOTH tail kinds, declared here so the
+       token travels with the block that uses it. `.context-bar-tail-body` reads it and the tool
+       panes lay themselves out inside it, so a running turn's `grep · ok · 42ms` block and its
+       thinking block are the same size instead of one being a 14rem stub under a 28rem call.
+       28rem is the scale the tool already rendered at (a 14rem args pane + an 14rem result pane
+       + their labels and the 8px gap ≈ 30rem, capped by the old 22rem body) — the thinking body
+       grows to that height rather than the call shrinking to the old preview box. */
+    --context-tail-body-height: 28rem;
     display: block;
     margin-top: 4px;
     padding: 8px 10px;
@@ -7017,6 +7128,15 @@ summary::-webkit-details-marker {
     border-radius: var(--radius-sm);
     background: var(--bg-deep);
 }
+
+/* T27 (R2): the tail block is no longer the strip host's last child. While it PRINTS a tool or
+   thinking body it is a child of the section's OWN `.agent-flow` — after the section's prose and
+   immediately before the `.agent-pending` status line, which `renderPending` keeps re-appending
+   as the flow's last child (ui/turns.ts `ContextBarSurface.placeTail`) — so the newest assistant
+   response reads ABOVE the block that followed it without the tail being bounced past the status
+   line on a pending-only frame. It is still exactly ONE element per section, moved rather than
+   duplicated, and an `assistant` tail (which paints nothing) stays parked in
+   `.context-bar-host`. */
 
 .context-bar-tail[data-kind='assistant'] {
     border-left-color: var(--text);
@@ -7048,6 +7168,23 @@ summary::-webkit-details-marker {
 
 .context-bar-tail-caption {
     margin: 0 0 6px;
+    /* R1a: the caption is the only row in this block whose height is CONTENT-driven, and a
+       settled call's line ("read · ok · 1.3s · 8,000 characters · args 3,900 + result 4,100 ·
+       1 panel · 1 media") wraps exactly where a thinking line ("thinking · 591 characters") does
+       not — in a narrow delegated card it can reach three lines. The row is therefore a FIXED
+       two-line box: `min-height` reserves the height so a one-line thinking caption does not
+       make its block shorter, and `max-height` + `overflow: hidden` stop a three-line call
+       caption from growing the block past the thinking one. Both figures are the same token
+       (10px x `line-height` 1.3 x 2), so the two kinds' OUTER boxes match whatever the width.
+       Nothing about the state is colour-only or lost: the caption's own figures ride the
+       element (`data-state`/`data-duration`/`data-chars`/`data-args-chars`/`data-result-chars`),
+       and every segment still carries the same facts in words through `aria-label`/`title`. */
+    line-height: 1.3;
+    min-height: 2.6em;
+    max-height: 2.6em;
+    /* Clip, do not scroll: this line is a label, and a label with its own scrollbar would read
+       as another content pane. */
+    overflow: hidden;
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10px;
@@ -7055,16 +7192,19 @@ summary::-webkit-details-marker {
     overflow-wrap: anywhere;
 }
 
-/* T26 (R26): the prose body is the CURRENT window of the block, not its first lines.
-   `ui/turns.ts` paints `ContextTail.renderText` — the latest `CONTEXT_TAIL_PREVIEW_CHARS`
-   characters (the same bound the display contract already publishes, no new number) — and
-   marks the box `data-follow='latest'`, scrolling it to the bottom so a thinking window that
-   is still streaming reads as TEXT THAT MOVES rather than a static opening sentence. The
-   height bound below stays as the outer safety rail: a window is short by construction, and a
-   host with a bigger line-height still cannot grow the tile without limit. */
+/* T27 (R1b + R1a): the body is a FIXED-height viewport, the same one for a thinking window and
+   for a recorded call (`--context-tail-body-height`, declared on `.context-bar-tail` above).
+   R1b removed the render-side window from thinking text — the box now holds the WHOLE round and
+   the reader scrolls it, which is why the caption stopped saying "showing X of Y". R1a makes the
+   two kinds equal so the block under a running turn stops changing size every round.
+   `max-height` repeats the token: an element with no layout (a stripped webview) still cannot
+   grow past it, and the box keeps its own scrollbar either way.
+   `data-follow='latest'` (ui/turns.ts `followLatest`) still aims the scroll at the newest byte,
+   so a streaming round reads as text that MOVES rather than a static opening sentence. */
 .context-bar-tail-body {
     margin: 0;
-    max-height: 22rem;
+    height: var(--context-tail-body-height);
+    max-height: var(--context-tail-body-height);
     overflow: auto;
     color: var(--text);
     font-family: var(--mono);
@@ -7116,6 +7256,50 @@ summary::-webkit-details-marker {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+}
+
+/* R1a (T27): the current call's two recorded panes lay out INSIDE the same fixed-height
+   viewport the thinking body gets (`--context-tail-body-height`), so a call and a thinking
+   round are the same height from the outside — the screenshot's `grep · ok · 42ms` block is the
+   scale both keep. The request keeps its natural height up to a cap, the response takes every
+   pixel that is left, and each field still scrolls in its OWN box: `overflow: hidden` on the
+   shared box means the panes own the scrollbars, so a huge result can never push the request the
+   reader aimed at off screen (the rule the base pane rule above already states). */
+.context-bar-tail[data-kind='tool'] .context-bar-tail-body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* A flex item's automatic minimum size is its CONTENT size, which would push this fixed viewport
+   open instead of scrolling inside it; `min-height: 0` is what makes the scroll real. */
+.context-bar-tail[data-kind='tool'] .context-bar-tail-pane {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+/* The request: natural height, `flex: 0 0 auto` so it is never squeezed, and the 12rem cap below
+   so a long argument list cannot eat the response's half of the box. */
+.context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] {
+    flex: 0 0 auto;
+}
+
+.context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] .context-bar-tail-pane-body {
+    max-height: 12rem;
+}
+
+/* The response: fills whatever the request left and scrolls its complete recorded bytes. The
+   base pane cap is lifted here on purpose — this is the field that grows, and the box it lives in
+   is already bounded by the shared token. */
+.context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='result'] {
+    flex: 1 1 auto;
+}
+
+.context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='result'] .context-bar-tail-pane-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
 }
 
 /* A stated absence is an ANSWER, not a blank: no arguments were recorded for this call, or

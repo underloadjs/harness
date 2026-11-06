@@ -1,34 +1,25 @@
 import { defineConfig } from 'vitest/config';
-import { fileURLToPath } from 'node:url';
 
-// Library/server/shared specifiers resolve to their source entries, so `vitest run`
-// is build-free and a test can never drift into reaching for `dist/`.
+// Resolution contract (why there is no `resolve.alias` block here):
 //
-// The library root (`@underload/harness`) deliberately stays aliased to
-// `src/harness.ts`: that is the stable published library entry the existing tests
-// import, and the application layers (`src/server`, `src/frontend`) are tested
-// through their own specifiers below.
-const packageEntry = fileURLToPath(new URL('./src/harness.ts', import.meta.url));
-const nodeRoot = fileURLToPath(new URL('./src/index.ts', import.meta.url));
-const serverEntry = fileURLToPath(new URL('./src/server/index.ts', import.meta.url));
-const frontendEntry = fileURLToPath(new URL('./src/frontend/index.ts', import.meta.url));
-const sharedEntry = fileURLToPath(new URL('./src/shared/index.ts', import.meta.url));
-
+// `@underload/harness` and every published subpath resolve through the package
+// manifest, because ../package.json maps the `development` condition (the one
+// Vite/Vitest/vite-node select in dev + test mode) onto the raw TypeScript entries
+// under src/. `dist/` is the npm distribution bundle only, so a test can never
+// drift into asserting a stale build — the same specifier a consumer writes,
+// evaluated against the source that is actually being edited.
+//
+// Aliasing them here instead would shadow that map and let the manifest and the
+// suite drift apart (the aliases used to point the bare name at `src/harness.ts`
+// while the published root is the Node root `src/index.ts`). The mirrors of this
+// map are: ../package.json `exports.development`, and ../tsconfig.json `paths` for
+// editors/`tsc`. src/structure.test.ts pins all three.
+//
 // Node environment: the harness builds and executes underload programs, and the
 // preset tools touch the filesystem and spawn processes, so tests exercise real
 // Node APIs rather than a DOM. The browser client has its own jsdom config at
 // src/frontend/vitest.config.ts and is excluded here.
 export default defineConfig({
-    resolve: {
-        alias: [
-            { find: /^@underload\/harness$/, replacement: packageEntry },
-            // The Node root and the subpaths a consumer would import.
-            { find: /^@underload\/harness\/root$/, replacement: nodeRoot },
-            { find: /^@underload\/harness\/server$/, replacement: serverEntry },
-            { find: /^@underload\/harness\/frontend$/, replacement: frontendEntry },
-            { find: /^@underload\/harness\/shared$/, replacement: sharedEntry }
-        ]
-    },
     test: {
         environment: 'node',
         globals: true,

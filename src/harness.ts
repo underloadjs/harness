@@ -386,6 +386,7 @@ import type {
     HarnessRunOptions,
     HarnessSnapshot,
     HarnessStateChangeReason,
+    HarnessStopReason,
     HarnessStreamTool,
     HarnessThread,
     HarnessThreadCreateOptions,
@@ -532,6 +533,41 @@ const cloneBranchRecord = (record: HarnessBranchRecord): HarnessBranchRecord => 
     ...(record.error !== undefined ? { error: { ...record.error } } : {})
 });
 
+// A tool call whose arguments are NOT a JSON object is not executable, whatever
+// the stop reason said. Two shapes reach this point:
+//
+//   - generation stopped at its output-token ceiling mid-call, so the string is
+//     cut off (`{"command":"echo 0123456…` with no closing quote);
+//   - the model emitted valid JSON of the wrong shape (`[1,2]`, `42`, `"text"`).
+//
+// Both are reported to the model as a rejection it can correct, and both are
+// repaired on the wire by the transport (`transport/openai.ts`) so the broken
+// text cannot poison every later request on the thread. `null` counts as a
+// malformed payload here even though the gateway tolerates it: no registered
+// tool takes a `null` parameter set, so executing it would be a silent `{}`.
+//
+// It throws a SyntaxError on purpose. Every caller already funnels a throw here
+// into its "received malformed JSON arguments" branch, so all three dispatch
+// paths (an ordinary tool, threadFork, actionRequest) reject the call the same
+// way with no extra branching, and the run keeps going instead of ending.
+const assertToolArgumentsAreAnObject = (call: HarnessToolCall): void => {
+    if (call.arguments.trim().length === 0) return;
+
+    // A throw out of JSON.parse is left to propagate as-is: its message already
+    // names the position the text broke at ("Unterminated string in JSON at
+    // position 32450"), which is exactly what the model needs to see.
+    const parsed: unknown = JSON.parse(call.arguments);
+
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        const shown = call.arguments.slice(0, 120);
+        throw new SyntaxError(
+            `arguments must be a JSON object; the model sent \`${shown}${
+                call.arguments.length > 120 ? '…' : ''
+            }\`.`
+        );
+    }
+};
+
 // Parse + schema-validate one model tool call. Shared by the ordinary launch path
 // and the two branch controls, so malformed arguments produce the same error
 // wording everywhere. The caller converts a throw into a readable tool result.
@@ -539,6 +575,8 @@ const parseToolCallArguments = (
     schema: Record<string, unknown> | undefined,
     call: HarnessToolCall
 ): unknown => {
+    assertToolArgumentsAreAnObject(call);
+
     const parsed: unknown = call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
     return resolveToolParameters(schema, parsed, 'model');
 };
@@ -5145,7 +5183,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         run: RunState,
         call: HarnessToolCall,
         offered?: ReadonlyMap<string, Tool>,
-        batch?: Set<string>
+        batch?: Set<string>,
+        // Why the model stopped generating. It distinguishes a call the model
+        // wrote badly from a call the OUTPUT CEILING cut off mid-JSON, and that
+        // difference is worth telling the model: "your reply hit the token limit
+        // and the arguments were truncated" is fixable (send less text, or build
+        // the payload instead of pasting it), while "malformed JSON at position
+        // 32450" on its own reads like a syntax slip.
+        stopReason?: HarnessStopReason
     ): Promise<void> => {
         // ABORT BOUNDARY (R10): no call starts into a cancelled run.
         throwIfAborted(run);
@@ -5330,7 +5375,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const info = toErrorInfo(error);
             await fail(
                 error instanceof SyntaxError
-                    ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}`
+                    ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}${
+                          stopReason === 'length'
+                              ? ` The model's reply reached its output-token limit, so this call's arguments were cut off mid-JSON and cannot be executed. Re-issue it with a much shorter payload (generate the long value inside the tool rather than writing it out).`
+                              : ''
+                      }`
                     : `Tool "${call.name}" received arguments that do not match its schema: ${info.message}`
             );
             return;
@@ -6738,7 +6787,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 for (const call of message.toolCalls) {
                     throwIfAborted(run);
-                    await launchToolCall(run, call, offered, syncBatch);
+                    await launchToolCall(run, call, offered, syncBatch, message.stopReason);
                 }
 
                 // R3/F1: close this request's output AFTER its tool_call frames (a

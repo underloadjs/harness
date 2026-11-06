@@ -122,9 +122,12 @@ export const DISPLAY_PANEL_TITLE_CHARS = 120;
 /** First readable line of a panel, so the board shows SOMETHING without a fetch. */
 export const DISPLAY_PANEL_PREVIEW_CHARS = 240;
 
-/** Collapsed text for a prose node that is NOT its section's current tail block (T9,
- *  R1/R3; T23, R23). A node streams in full while the server designates it the tail
- *  (`TurnSection.tail`), and the instant a later block takes the tail the projector
+/** Collapsed text for a prose node that is neither its section's current tail block nor
+ *  its newest ANSWER (T9, R1/R3; T23, R23; T1, R2). A node streams in full while the server
+ *  designates it the tail (`TurnSection.tail`), and an answer KEEPS its whole text while a
+ *  later thinking window or call holds the tail — the newest answer is a second full
+ *  carrier (`turn-projector.ts` `isFullCarrier`), because the board prints that response
+ *  above the current block. The instant a NEWER answer takes the tail the projector
  *  rewrites it to a preview of this size — for a thinking window AND for an answer, so
  *  "no historical full-text replay" is one rule, not two. T26 (R26): the preview keeps the
  *  LATEST `DISPLAY_NODE_PREVIEW_CHARS` characters behind a leading `…`, not the opening ones,
@@ -148,7 +151,10 @@ export const DISPLAY_NODE_PREVIEW_CHARS = 320;
 // holds while the UI claims it is printing the block the reader is looking at. The size is
 // paid for ONCE per section (one designated block at a time, every older payload dropped in
 // the frame that replaced it, and no re-send per delta — ../server/turn-projector.ts
-// `tailStampOf`), never once per frame.
+// `tailStampOf`), never once per frame. R2 (T1) adds a second whole prose body per section
+// — the newest answer, beside the current tail block — and it costs no traffic of its own:
+// that answer already streamed to the client whole while it held the tail, and only the one
+// transition patch bounds it again.
 
 
 /** Panels summarized per step. `TOOL_UI_LIMITS.panels` allows 32 panels of up to 64
@@ -709,13 +715,18 @@ export type DisplayStep = {
  * `node:remove` ops — it only exists so a reloaded client can style an in-flight
  * attempt the same way a live one looks.
  *
- * T9 text bounding (R1/R3), narrowed by T23 (R23): `text` is the WHOLE answer only
- * while the server designates this node its section's CURRENT tail block
- * (`TurnSection.tail`). Any later block — a newer answer, a thinking window, a tool
- * call — takes the tail, and the projector then sends one `node:set` patch carrying a
+ * T9 text bounding (R1/R3), narrowed by T23 (R23) and by T1 (R2): `text` is the WHOLE
+ * answer while the server designates this node its section's CURRENT tail block
+ * (`TurnSection.tail`) — AND while it is the section's NEWEST recorded answer even after a
+ * later thinking window or tool call takes the tail, which is what lets the board keep an
+ * intermediate response readable above that block. Any later ANSWER takes the tail, and the
+ * projector then sends one `node:set` patch carrying a
  * `DISPLAY_NODE_PREVIEW_CHARS` preview, the exact `chars`, and `redacted: true` — that
  * is how "no historical full-text replay on reconnect" is enforced on BOTH the live
- * stream and a cold view, with no client-side rule about which node is last.
+ * stream and a cold view, with no client-side rule about which node is last. The reader
+ * needs no second designation for the newest answer: `section.nodes` is display order, so
+ * the last `kind: 'text'` node IS it, and its `redacted` marker is absent by the same rule
+ * that keeps the tail's marker absent.
  */
 export type DisplayTextNode = {
     kind: 'text';
@@ -745,7 +756,9 @@ export type DisplayReasoningNode = {
      *  whole, and its `redacted` marker is absent. The moment a later block takes the
      *  tail the projector replaces this with `DISPLAY_NODE_PREVIEW_CHARS` bounded text
      *  and stamps `redacted: true`, so a historical window is never a full body and is
-     *  still one click away on its lazy detail route. */
+     *  still one click away on its lazy detail route. (R2, T1 gives the second full
+     *  carrier to `DisplayTextNode` only: a superseded ANSWER stays whole, a superseded
+     *  think window does not.) */
     text: string;
     /** Server-computed share of the turn's tokens for the think chip
      *  (../frontend/ui/tools.ts:907 formatThinkShare behavior); absent when no usage is known. */
@@ -818,14 +831,20 @@ export type DisplayNodePatch = {
 // would be re-doing the compilation this wire removed (and the historical pile of think
 // chips is what that produced), and a live frame would disagree with a reloaded one.
 //
-// WHY IT STAYS COMPACT: exactly one full body per section at a time, and supersession
+// WHY IT STAYS COMPACT: one designated body per section at a time, and supersession
 // DROPS the previous one — prose by rewriting the node to a preview (`redacted: true`),
 // a tool by omitting `args`/`result` from the descriptor that moves away. The payload
 // never repeats per token: prose streams through `node:append`, and a tool's payload
-// moves only when the recorded bytes move (the call, then the result).
+// moves only when the recorded bytes move (the call, then the result). R2 (T1) keeps ONE
+// extra whole prose body per section — the newest ANSWER, so the response above the
+// current block stays readable — and it is free for the same reason: those bytes already
+// streamed while it held the tail, and it is bounded again by the very patch that a newer
+// answer's own frame already owes.
 //
 // Cross-references:
 //   - ./turn-projector.ts `resolveTail`/`syncTail` — the one implementation
+//   - ./turn-projector.ts `isFullCarrier`          — who may travel whole (the tail, and
+//     the newest answer: R2, T1), on the op stream and in the compiled document alike
 //   - ../frontend/view-context.ts `contextTailOf`  — the renderer's reader of this
 //   - ../frontend/ui/turns.ts `paintTail`          — the body it paints under the strip
 
@@ -837,7 +856,10 @@ export type DisplayNodePatch = {
 export type DisplayTailKind = 'reasoning' | 'assistant' | 'tool';
 
 /**
- * The ONE block this section displays in full, resolved and re-stamped by the server.
+ * The ONE block this section displays as its CURRENT body, resolved and re-stamped by the
+ * server. (R2, T1: this section's newest ANSWER is a second full-text carrier on the node
+ * itself, so a whole body is not proof of a designation — the designation is, and it never
+ * moves because of that second carrier.)
  *
  * A POINTER plus the block's own full payload — never a copy of the tree:
  *   - `reasoning` / `assistant` -> the body is the node's `text`, which is COMPLETE
@@ -941,6 +963,14 @@ export type TurnSection = {
      * `DISPLAY_NODE_PREVIEW_CHARS` node preview at most, and its exact bytes on one
      * lazy click. The projector re-stamps this field the moment the newest block
      * changes, and the superseded payload is dropped in the same frame.
+     *
+     * R2 (T1) is the one exception to "every earlier block", and it is NOT a second
+     * designation: this section's newest `kind: 'text'` node keeps its whole `text` on the
+     * wire even while a later reasoning window or call holds this tail, so the board can
+     * keep the assistant response visible above the current block. An answer only goes
+     * preview-sized when a NEWER answer supersedes it (or once it is hidden), and
+     * `redacted` is absent on it by exactly that rule — no new field, and no change to how
+     * this pointer is resolved or stamped.
      */
     tail?: DisplayTail;
     /** Display order. Empty for a freshly opened section. */

@@ -23,14 +23,21 @@
         "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
         "types": ["node", "vitest/globals"],
         // Tests import the package by name, never by relative path. Mirror the
-        // vitest aliases here so the same specifier resolves for editors and for
-        // any typecheck that includes test files. The bare name stays the library
-        // entry (`src/harness.ts`); the application layers are published
-        // subpaths (`./server`, `./frontend`, `./shared`) and resolve to their src
-        // barrels so the source tree and the published map agree.
+        // package.json `exports.development` targets here (the entries Vite/Vitest
+        // resolve) so the same specifier means the same FILE for editors, for
+        // `tsc --noEmit`, and for the suite. `paths` is required because the
+        // published `types` conditions deliberately stay on `dist/*.d.ts`: a
+        // NodeNext consumer must get the emitted declarations (src/*.ts uses
+        // extensionless relative specifiers that NodeNext rejects), so TS would
+        // otherwise typecheck the suite against a stale build.
+        // The bare name is the Node root (`src/index.ts`), exactly what
+        // `exports["."]` publishes for a Node host; the library-only graph is
+        // `src/harness.ts`, reached through it.
         "paths": {
-            "@underload/harness": ["./src/harness.ts"],
+            "@underload/harness": ["./src/index.ts"],
             "@underload/harness/server": ["./src/server/index.ts"],
+            "@underload/harness/worker": ["./src/server/workers/lane-worker.ts"],
+            "@underload/harness/io-worker": ["./src/server/workers/io-worker.ts"],
             "@underload/harness/frontend": ["./src/frontend/index.ts"],
             "@underload/harness/shared": ["./src/shared/index.ts"]
         }

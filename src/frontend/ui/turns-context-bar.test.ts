@@ -304,8 +304,79 @@ describe('one bar per turn', () => {
         // the ONLY content surface on screen, so the tail element is hidden, not deleted —
         // the element is reused, which is how a long run cannot accumulate bodies.
         expect(tile().querySelector<HTMLElement>('.context-bar-tail')?.hidden).toBe(true);
+        // T27 (R2): while it prints NOTHING the reused element stays parked in the strip's host,
+        // which is what keeps the surface's teardown in charge of removing it.
+        expect(
+            tile().querySelector<HTMLElement>('.context-bar-tail')?.parentElement?.classList.contains('context-bar-host')
+        ).toBe(true);
         // The user's prompt is preserved on its own surface, never folded into the bar.
         expect(tile().querySelector('.context-bar-host')?.contains(tile().querySelector('.turn-prompt') as Node)).toBe(false);
+    });
+
+    it('mounts the one tail block in the SECTION flow, and leaves only the strip in the host (R2)', () => {
+        const view = documentOf([summary()], {
+            t1: [
+                rootSection({
+                    context: CONTEXT,
+                    nodes: [
+                        toolStep(),
+                        { kind: 'reasoning', id: '3', text: 'the thinking window that owns the body', chars: 40 } as never
+                    ],
+                    // Designated producer: the server names the thinking window the current
+                    // block, so its body prints while a newer response arrives afterwards.
+                    tail: { kind: 'reasoning', nodeId: '3', blockId: '0-reasoning-3', chars: 200, truncated: false } as never
+                })
+            ]
+        });
+        const { board, tile } = mount();
+        board.upsertView(summary(), view).renderDisplay((view.displays as Record<string, TurnDisplay>).t1);
+
+        const host = tile().querySelector<HTMLElement>('.context-bar-host') as HTMLElement;
+        const flow = tile().querySelector<HTMLElement>('.agent-flow') as HTMLElement;
+        const tail = tile().querySelector<HTMLElement>('.context-bar-tail') as HTMLElement;
+
+        // The strip never moves: its host carries the bar and nothing else (R2 kept the strip
+        // where T11 mounted it and moved only the body).
+        expect(host.querySelectorAll('.context-bar')).toHaveLength(1);
+        expect(host.querySelectorAll('.context-bar-tail')).toHaveLength(0);
+        // The body is the section flow's LAST child, so it reads BELOW the flow's prose.
+        expect(flow.lastElementChild).toBe(tail);
+        expect(tail.dataset.kind).toBe('reasoning');
+        // Still exactly one body in the whole tile.
+        expect(tile().querySelectorAll('.context-bar-tail')).toHaveLength(1);
+
+        // A later frame that appends prose only (the thinking block it prints does not change,
+        // so the content pass early-returns) has to move the SAME element below the new reply.
+        frame(board, view, 't1', [
+            {
+                op: 'node:insert',
+                turnId: 't1',
+                sectionId: 't1:0',
+                node: { kind: 'text', id: '5', text: 'the newest response', chars: 19 } as never
+            }
+        ]);
+
+        expect(tail.parentElement).toBe(flow);
+        expect(flow.lastElementChild).toBe(tail);
+        expect(tile().querySelectorAll('.context-bar-tail')).toHaveLength(1);
+        expect(tile().querySelector<HTMLElement>('.agent-text')?.hidden).toBe(false);
+
+        // And when the designation finally moves to that response, the block withdraws and the
+        // reused element parks back in the strip's host: the answer text in the flow is the
+        // only content surface, still ONE tail element.
+        frame(board, view, 't1', [
+            {
+                op: 'tail:set',
+                turnId: 't1',
+                sectionId: 't1:0',
+                tail: { kind: 'assistant', nodeId: '5', chars: 19, truncated: false } as never
+            }
+        ]);
+
+        expect(tail.parentElement).toBe(host);
+        expect(tail.hidden).toBe(true);
+        expect(tile().querySelectorAll('.context-bar-tail')).toHaveLength(1);
+        expect(tile().querySelector<HTMLElement>('.agent-text')?.hidden).toBe(false);
     });
 
     it('draws hundreds of segments and still asks the server for nothing', () => {

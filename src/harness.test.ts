@@ -704,6 +704,112 @@ describe('harness', () => {
         expect((entry.messages[2] as { content: string }).content).toContain('malformed JSON arguments');
     });
 
+    // A generation cut at its output-token ceiling stops in the middle of a tool
+    // call's arguments, so the harness receives a truncated string. Executing it
+    // is impossible, and replaying it is what used to poison the whole thread.
+    const callToolStopped = (
+        id: string,
+        name: string,
+        args: string,
+        stopReason: 'length' | 'tool_calls'
+    ): HarnessStreamEvent[] => [
+        { type: 'done', stopReason, toolCalls: [{ id, name, arguments: args }] }
+    ];
+
+    it('names the output-token limit when a length-stopped call is truncated', async () => {
+        let executed = false;
+        const search = tool({
+            description: 'Search.',
+            tags: ['search'],
+            visibility: 'core',
+            execute: () => {
+                executed = true;
+                return 'found';
+            }
+        });
+
+        const entry = brain(
+            scripted([
+                callToolStopped('c1', 'search', '{"q":"once upon', 'length'),
+                answer('recovered')
+            ])
+        );
+        const writer = harness({ agents: { writer: entry }, tools: { search } });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('recovered');
+        expect(executed).toBe(false);
+
+        const content = (entry.messages[2] as { content: string }).content;
+        expect(content).toContain('malformed JSON arguments');
+        // The actionable half: the model cannot fix what it does not know was cut.
+        expect(content).toContain('output-token limit');
+    });
+
+    it('does not blame the token limit when the model simply wrote bad JSON', async () => {
+        const search = tool({
+            description: 'Search.',
+            tags: ['search'],
+            visibility: 'core',
+            execute: () => 'found'
+        });
+
+        const entry = brain(scripted([callTool('c1', 'search', '{"q":', 'length'), answer('ok')]));
+        const writer = harness({ agents: { writer: entry }, tools: { search } });
+
+        await writer('go');
+
+        const content = (entry.messages[2] as { content: string }).content;
+        expect(content).toContain('malformed JSON arguments');
+        expect(content).not.toContain('output-token limit');
+    });
+
+    it('rejects a well-formed call whose arguments are not an object', async () => {
+        let executed = false;
+        const search = tool({
+            description: 'Search.',
+            tags: ['search'],
+            visibility: 'core',
+            execute: () => {
+                executed = true;
+                return 'found';
+            }
+        });
+
+        // Valid JSON every one of these, and none of them a parameter object.
+        for (const args of ['[1,2]', '42', '"a query"', 'null', 'true']) {
+            executed = false;
+            const entry = brain(scripted([callTool('c1', 'search', args), answer('ok')]));
+            const writer = harness({ agents: { writer: entry }, tools: { search } });
+
+            await writer('go');
+
+            expect(executed).toBe(false);
+            expect((entry.messages[2] as { content: string }).content).toContain(
+                'must be a JSON object'
+            );
+        }
+    });
+
+    it('still runs a call whose arguments are an empty object or blank', async () => {
+        const search = tool({
+            description: 'Search.',
+            tags: ['search'],
+            visibility: 'core',
+            execute: () => 'found'
+        });
+
+        for (const args of ['{}', '']) {
+            const entry = brain(scripted([callTool('c1', 'search', args), answer('ok')]));
+            const writer = harness({ agents: { writer: entry }, tools: { search } });
+
+            await writer('go');
+
+            expect((entry.messages[2] as { content: string }).content).toBe('found');
+        }
+    });
+
     it('turns a throwing tool into a recoverable tool result', async () => {
         const search = tool({
             description: 'Search.',

@@ -18,12 +18,16 @@
 //     text from a screen reader);
 //   - forced colors keeps a per-segment boundary, because a colour-only difference is the
 //     one thing that mode guarantees to erase;
-//   - T22 (R23): the ONE current content block sits at the tail of the strip, printed as
-//     pre-wrapped text in its own scroll box, and BOTH withdrawal rules hide it — the
-//     element's `hidden` and the decision's own `[data-superseded]` attribute;
+//   - T22 (R23): the ONE current content block, printed as pre-wrapped text in its own scroll
+//     box, and BOTH withdrawal rules hide it — the element's `hidden` and the decision's own
+//     `[data-superseded]` attribute; T27 (R2) moved WHERE it prints (the section's flow, below
+//     the newest response) while the strip stays in its host;
 //   - T23 (R23): when the designated block is a recorded CALL, the body is its complete
 //     recorded request and response in one labelled pane each — in the strip's own tool tones,
-//     each pane scrolling on its own, with a stated absence in the segment dialog's vocabulary.
+//     each pane scrolling on its own, with a stated absence in the segment dialog's vocabulary;
+//   - T27 (R1a/R1b): ONE shared body-height token for both tail kinds, the thinking body
+//     windowed by nothing (its box scrolls the whole round), and the call's two panes laid out
+//     inside that same viewport.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/context-bar-style.test.ts
 
@@ -153,7 +157,8 @@ it('puts the figures at the right of the bar, with the unit and without the labe
 });
 
 // T22 (R23): the strip says what a turn was made of; the block the reader is actually
-// reading still has to appear — exactly once, at the tail of that strip. Two of these
+// reading still has to appear — exactly once, AFTER the content that precedes it (T27, R2: the
+// section's own flow, below the newest response). Two of these
 // rules are load-bearing for "one body, nothing stale": the tail prints as pre-wrapped
 // text in its own scroll box, and BOTH withdrawal paths are hidden (`[hidden]` for the
 // element, `[data-superseded]` for the decision), so a change to the base rule cannot
@@ -248,6 +253,81 @@ it('prints the designated call in the strip tones, one bounded pane per recorded
     expect(note).toContain('font-family: var(--mono);');
     expect(detailNote).toContain('color: var(--muted);');
     expect(detailNote).toContain('font-family: var(--mono);');
+});
+
+it('gives the recorded call and the thinking tail the SAME body height (R1a)', () => {
+    // R1a is one NUMBER, declared once on the block and read by the one body rule BOTH kinds
+    // share. There is no second height to change, so a call and a thinking window rendered in
+    // the same running turn cannot drift apart.
+    const tail = blockOf('.context-bar-tail {');
+
+    expect(tail).toContain('--context-tail-body-height: 28rem;');
+
+    const body = blockOf('.context-bar-tail-body {');
+
+    expect(body).toContain('height: var(--context-tail-body-height);');
+    expect(body).toContain('max-height: var(--context-tail-body-height);');
+    // R1b: the whole thinking body is in the DOM, so the box has to be able to scroll it.
+    expect(body).toContain('overflow: auto;');
+
+    // The caption is the block's only content-sized row, and a settled call's longest line wraps
+    // to three lines in a narrow delegated card where a thinking line takes one. The row is a
+    // FIXED two-line box — `min-height` so a short caption cannot make its block shorter,
+    // `max-height` + `overflow: hidden` so a long one cannot make it taller — which is what makes
+    // the OUTER boxes of the two kinds match rather than only their scroll boxes.
+    const caption = blockOf('.context-bar-tail-caption {');
+
+    expect(caption).toContain('line-height: 1.3;');
+    expect(caption).toContain('min-height: 2.6em;');
+    expect(caption).toContain('max-height: 2.6em;');
+    expect(caption).toContain('overflow: hidden;');
+    // One rule for both kinds: no per-kind caption override may exist, or the two blocks drift
+    // apart again the moment one tone adds a clause.
+    expect(css).not.toContain(".context-bar-tail[data-kind='tool'] .context-bar-tail-caption");
+    expect(css).not.toContain(".context-bar-tail[data-kind='reasoning'] .context-bar-tail-caption");
+
+    // The thinking kind adds no height of its own — the shared rule IS its height. A second
+    // `.context-bar-tail[data-kind='reasoning'] .context-bar-tail-body` rule is exactly the
+    // way this contract breaks, so it is pinned out of the stylesheet.
+    expect(css).not.toContain(".context-bar-tail[data-kind='reasoning'] .context-bar-tail-body");
+
+    // The call lays its two panes out INSIDE that same viewport: it inherits the token from the
+    // base rule (so it declares no height itself) and hands the scrolling to the panes.
+    const toolBody = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-body {");
+
+    expect(toolBody).toContain('display: flex;');
+    expect(toolBody).toContain('flex-direction: column;');
+    expect(toolBody).toContain('overflow: hidden;');
+    expect(toolBody).not.toContain('height:');
+
+    // A flex item's automatic minimum is its content size, which would push the fixed viewport
+    // open instead of scrolling inside it.
+    const pane = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane {");
+
+    expect(pane).toContain('display: flex;');
+    expect(pane).toContain('flex-direction: column;');
+    expect(pane).toContain('min-height: 0;');
+
+    // The request keeps its natural height up to a cap; the response takes the rest. Together
+    // they fill the shared 28rem viewport exactly, so the two kinds are the same size and the
+    // call is no smaller than the block it had before.
+    const argsPane = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] {");
+
+    expect(argsPane).toContain('flex: 0 0 auto;');
+
+    const argsBody = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] .context-bar-tail-pane-body {");
+
+    expect(argsBody).toContain('max-height: 12rem;');
+
+    const resultPane = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='result'] {");
+
+    expect(resultPane).toContain('flex: 1 1 auto;');
+
+    const resultBody = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='result'] .context-bar-tail-pane-body {");
+
+    expect(resultBody).toContain('flex: 1 1 auto;');
+    expect(resultBody).toContain('min-height: 0;');
+    expect(resultBody).toContain('max-height: none;');
 });
 
 it('keeps every segment bounded under forced colors', () => {

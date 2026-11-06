@@ -13,9 +13,9 @@
 // The rules pinned here, in order:
 //   1. a thinking window streams IN FULL on the wire while it is the newest block, however far
 //      past `DISPLAY_NODE_PREVIEW_CHARS` it runs (the requirement the old server-side 320 bound
-//      left unmet), and the PANE paints its LATEST `CONTEXT_TAIL_PREVIEW_CHARS` characters, so
-//      the reader watches the newest text move instead of a static opening line (T26, R26);
-//      the caption states the exact recorded length beside how much of it is on screen;
+//      left unmet), and the PANE paints every one of those characters (T27, R1b): the body is no
+//      alone and the box scrolls — still aimed at the newest byte by `data-follow='latest'`,
+//      which is the T26/R26 half that survives;
 //   2. the call that follows becomes the tail: its complete recorded arguments print, the
 //      thinking window is withdrawn, and the bytes are the ones the step's own bounded
 //      `argsPreview` cannot hold;
@@ -153,15 +153,20 @@ const tailState = (scope: Element): Record<string, unknown> | undefined => {
 
     return {
         hidden: tail.hidden,
+        // T27 (R2): WHERE the reused element sits is part of the rendered picture, so the live
+        // run and the reload are compared on it too — a tail that printed under the strip in one
+        // path and in the flow in the other is a different board, whatever the parity test's
+        // text content happens to say.
+        parent: tail.parentElement?.classList.contains('context-bar-host') ? 'host' : 'flow',
         kind: tail.dataset.kind,
         nodeId: tail.dataset.nodeId,
         blockId: tail.dataset.blockId,
         chars: tail.dataset.chars,
         truncated: tail.dataset.truncated,
-        // T26 (R26): the WIRE's state (`truncated`, from the server designation) and the
-        // PANE's state (`shownChars` / `renderBounded`) are different facts, and this file
-        // proves the live path keeps them different: the wire carries the whole streamed
-        // window, while the pane paints its latest `CONTEXT_TAIL_PREVIEW_CHARS`.
+        // T26 (R26) / T27 (R1b): the WIRE's state (`truncated`, from the server designation) and
+        // the PANE's state (`shownChars` / `renderBounded`) are separate facts, and this file
+        // proves what each one reports. T27 (R1b) collapsed the pair for a thinking tail: the
+        // wire carries the whole round AND the pane paints all of it (`renderBounded: false`).
         shownChars: tail.dataset.shownChars,
         renderBounded: tail.dataset.renderBounded,
         state: tail.dataset.state,
@@ -236,7 +241,7 @@ afterEach(() => {
 });
 
 describe('the server-designated tail, rendered by the real tile', () => {
-    it('streams a thinking window past the node bound and shows its LATEST lines (R26)', () => {
+    it('streams a thinking window past the node bound and shows ALL of it (R1b)', () => {
         // The loaders are spies, so "printing the current block costs nothing" is measured,
         // not assumed.
         const loadBlockDetail = vi.fn();
@@ -254,24 +259,25 @@ describe('the server-designated tail, rendered by the real tile', () => {
         frame(board, view, projector.apply(turn.events[1], timeOf(1), 1));
 
         const thinkingChars = DISPLAY_NODE_PREVIEW_CHARS + 90;
-        const windowChars = 320;
 
         expect(tailState(tile())).toMatchObject({
             hidden: false,
             kind: 'reasoning',
-            // The wire body is whole (T23/T25), and the PANE is still a window (T26): the two
-            // facts are stated separately rather than one of them silently overriding the other.
+            // T27 (R1b): the wire body is whole (T23/T25) AND the pane paints it whole. The
+            // render-side window that T26 (R26) put on a thinking body is gone — the box
+            // scrolls — so the wire's truth and the pane's truth collapse into one figure.
             truncated: 'false',
             chars: String(thinkingChars),
-            shownChars: String(windowChars),
-            renderBounded: 'true',
+            shownChars: String(thinkingChars),
+            renderBounded: 'false',
             follow: 'latest',
-            caption: `thinking · showing ${windowChars} of ${thinkingChars.toLocaleString('en-US')} characters — click the segment for the exact text`
+            caption: `thinking · ${thinkingChars.toLocaleString('en-US')} characters`
         });
         expect(tails(tile())).toHaveLength(1);
-        // The LAST 320 characters of what the model streamed — not a 320-character stub of its
-        // opening, which is exactly the body that used to sit there unchanged.
-        expect((tailState(tile()) as { body: string }).body).toBe(`…${'a'.repeat(windowChars)}`);
+        // EVERY streamed character, from the first `a` on, with no `…` marker in front of it.
+        expect((tailState(tile()) as { body: string }).body).toBe('a'.repeat(thinkingChars));
+        expect((tailState(tile()) as { body: string }).body).not.toContain('…');
+        expect(tails(tile())[0]?.querySelector('.context-bar-tail-caption')?.textContent).not.toContain('showing');
         expect(tile().querySelectorAll('.tool.think')).toHaveLength(0);
 
         // delta 2: the SAME element grows, the designation is not re-sent per token, and the
@@ -281,11 +287,12 @@ describe('the server-designated tail, rendered by the real tile', () => {
         expect(grown.filter((op) => op.op === 'tail:set')).toHaveLength(0);
         frame(board, view, grown);
 
-        expect((tailState(tile()) as { body: string }).body).toBe(`…${'a'.repeat(200)}${'b'.repeat(120)}`);
+        expect((tailState(tile()) as { body: string }).body).toBe(`${'a'.repeat(410)}${'b'.repeat(120)}`);
         expect(tailState(tile())).toMatchObject({
             chars: String(thinkingChars + 120),
-            shownChars: String(windowChars),
-            renderBounded: 'true'
+            shownChars: String(thinkingChars + 120),
+            renderBounded: 'false',
+            caption: `thinking · ${(thinkingChars + 120).toLocaleString('en-US')} characters`
         });
 
         expect(loadBlockDetail).not.toHaveBeenCalled();
@@ -404,6 +411,42 @@ describe('the server-designated tail, rendered by the real tile', () => {
         expect(tails(tile())).toHaveLength(1);
         // And every earlier window stayed compact in the same document the stream produced.
         expect(tile().textContent).not.toContain('RESULT-MIDDLE-9f3c');
+    });
+
+    it('keeps an intermediate response printed ABOVE the call body that follows it (R2)', () => {
+        // The same rule, end to end: a real projector frame designates the CALL, and the tile
+        // still shows the reply the model wrote just before it — above the call body, in the
+        // section's own flow. Nothing here hand-writes a node or a designation.
+        const turnEvents: HarnessEvent[] = [
+            { type: 'start', agent: AGENT, model: 'scripted/test' },
+            { type: 'text', agent: AGENT, delta: 'first I will read the notes' },
+            { type: 'tool_call', agent: AGENT, call: { id: 'call-1', name: 'read', arguments: CALL_ARGS } }
+        ];
+        const turn = recordOf(turnEvents);
+        const projector = createTurnProjector(turn, CONTEXT);
+        const { board, view, tile } = mount();
+
+        board.upsertView(projector.summary(), view);
+
+        for (let index = 0; index < turnEvents.length; index += 1)
+            frame(board, view, projector.apply(turnEvents[index], timeOf(index), index));
+
+        // The newest block IS the call, so the call owns the tail body — and the response that
+        // came before it is still the newest RESPONSE, so it prints.
+        expect(tailState(tile())).toMatchObject({ hidden: false, kind: 'tool', state: 'running' });
+        expect(pane(tile(), 'args')).toBe(CALL_ARGS);
+        expect(proseState(tile())).toEqual([{ nodeId: 'n1', hidden: false }]);
+
+        // Document order is the visual contract: prose first, then the ONE tail block, and the
+        // block is a child of the same flow rather than of the strip's host.
+        const children = Array.from((tile().querySelector('.agent-flow')?.children ?? []) as HTMLCollectionOf<HTMLElement>);
+
+        expect(children.map((node) => (node.classList.contains('context-bar-tail') ? 'tail' : node.classList.contains('agent-text') ? 'prose' : 'other'))).toEqual([
+            'prose',
+            'tail'
+        ]);
+        expect(children[1].querySelector('.context-bar-tail-body')?.textContent).toContain('ARGS-MIDDLE-4c1d');
+        expect(tails(tile())).toHaveLength(1);
     });
 
     it('paints the same board from the cold document a reload receives', () => {

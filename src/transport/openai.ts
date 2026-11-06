@@ -247,6 +247,43 @@ const allowsVideoFor = (url: string): boolean => {
     }
 };
 
+// The provider's contract for `function.arguments` is "a JSON string holding an
+// OBJECT". Measured against the local gateway, anything else is not merely
+// ignored, it fails the WHOLE request with `500 {"error":"Internal Server
+// Error"}`:
+//
+//   {"a":1}  {}  null  ""        -> 200
+//   [1,2]    42   true  "str"    -> 500   (valid JSON, not an object)
+//   {"a":"x  {"command":"ec      -> 500   (unterminated)
+//
+// The second row is the dangerous one, because a truncated generation produces
+// it: a request cut at its output-token ceiling can stop in the middle of a
+// tool call's arguments, and `core/agent.ts` commits exactly what arrived. The
+// transcript keeps that raw text on purpose (`core/snapshot.ts` calls it "a
+// replayable fact", and the UI shows what the model actually sent), so without
+// this guard every LATER request replays the broken string and the thread is
+// stuck failing on a message it can no longer change. Repair at the wire
+// boundary, where the provider's requirement lives, instead of rewriting the
+// recorded history.
+//
+// An empty/blank string is tolerated by the gateway but is not an object, so it
+// is normalized too: one rule, one shape, no provider-specific exception.
+const wireArguments = (raw: string): string => {
+    try {
+        const parsed: unknown = JSON.parse(raw);
+
+        // A plain object and nothing else: `null` and arrays are objects to
+        // `typeof`, and the gateway rejects the array anyway.
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            return raw;
+        }
+    } catch {
+        // Not JSON at all: fall through to the placeholder.
+    }
+
+    return '{}';
+};
+
 // Map an internal transcript entry onto the provider payload. The internal shape
 // is uniform (strings, explicit tool ids); the wire shape is not.
 //
@@ -267,7 +304,7 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
                 wire.tool_calls = message.toolCalls.map((call) => ({
                     id: call.id,
                     type: 'function',
-                    function: { name: call.name, arguments: call.arguments }
+                    function: { name: call.name, arguments: wireArguments(call.arguments) }
                 }));
             }
 

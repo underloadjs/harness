@@ -100,10 +100,14 @@ it('caps every level at its parent width instead of widening the grid track', ()
     expect(log).toContain('max-width: 1180px');
     expect(log).toContain('margin: 0 auto');
 
-    // The three-column shell itself is unchanged: the fix must not steal width
-    // from the rails.
-    expect(blockOf('.shell {')).toContain(
-        'grid-template-columns: 248px minmax(0, 1fr) 320px'
+    // The three-column shell itself is unchanged in shape: the fix must not steal width
+    // from the rails. The two rail tracks are custom properties now (the draggable
+    // seams in ui/rail-resize.ts), but their fallbacks are still 248px and 320px and the
+    // chat is still the `minmax(0, 1fr)` track between them. Whitespace is normalised so
+    // the track list may be written across lines.
+    const shellTracks = blockOf('.shell {').replace(/\s+/g, ' ');
+    expect(shellTracks).toContain(
+        'grid-template-columns: var(--rail-left-width, 248px) 6px minmax(0, 1fr) 6px var(--rail-right-width, 320px);'
     );
 });
 
@@ -138,7 +142,12 @@ it('keeps the rails responsive and the nested indentation intact', () => {
 
     // Tablet: the right rail is still the two-column strip under the chat.
     const tablet = blockOf('@media (max-width: 1180px)');
-    expect(tablet).toContain('grid-template-columns: 216px minmax(0, 1fr)');
+    // Normalised: the shell's tracks are written one per line, and the strip's own
+    // single-track rule (`grid-template-columns: minmax(0, 1fr)`) must not be mistaken
+    // for the shell's — so the shell's left rail track is named explicitly.
+    expect(tablet.replace(/\s+/g, ' ')).toContain(
+        'grid-template-columns: var(--rail-left-width, 216px) 6px minmax(0, 1fr);'
+    );
     expect(tablet).toContain('.rail-right {\n        grid-column: 1 / -1;');
 
     // Nesting still indents one step per level, including the narrow-screen step.

@@ -9,8 +9,13 @@
 //   - `user`, `system`, a `notice` (wake / error / answered / the pending line) and an
 //     `action` question are NOT eligible, so nothing that is not model content can erase the
 //     block the reader is looking at;
-//   - exactly one full body per section, root and delegate independent, and a superseded
+//   - one designated body per section, root and delegate independent, and a superseded
 //     payload is DROPPED from the compiled view in the frame that replaced it;
+//   - R2 (T1) adds exactly one more whole body: the section's NEWEST ANSWER keeps its full
+//     text even while a later reasoning window or call holds the tail, so the board can print
+//     that response above the current block. An answer goes preview-sized only when a NEWER
+//     ANSWER supersedes it, and no extra body is re-sent on a frame that did not move the
+//     designation;
 //   - the designation is re-sent when it moves, never once per token, and never for a block
 //     that did not change.
 //
@@ -294,6 +299,310 @@ describe('the designation, block by block', () => {
     });
 });
 
+// R2 (T1), the SERVER half: a running turn shows the newest assistant response ABOVE the block
+// that currently holds the tail (the tool call or the reasoning window), so the newest
+// `kind: 'text'` node of every section must travel as a full-text carrier EVEN THOUGH a later
+// node holds `TurnSection.tail`. The browser reads that carrier off `section.nodes` order and
+// the absence of `redacted` — there is no second designation and no new wire field
+// (../server/turn-projector.ts `isFullCarrier`).
+describe('the newest answer is a second full carrier', () => {
+    // Every body below is deliberately LONGER than `DISPLAY_NODE_PREVIEW_CHARS`, so "full" and
+    // "preview" are distinguishable and no assertion passes by accident of a short string.
+    const long = 'a'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 80);
+    const longB = 'b'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 80);
+    const preview = (letter: string) => `\u2026${letter.repeat(DISPLAY_NODE_PREVIEW_CHARS - 1)}`;
+
+    it('carries an answer whole while it IS the tail (the rule this one inherits)', () => {
+        const result = fold([starts(), say(long)]);
+
+        expect(result.display().sections[0].nodes).toEqual([{ kind: 'text', id: 'n1', text: long, committed: false, chars: long.length }]);
+        expect(tailOf(result.display())).toEqual({
+            kind: 'assistant',
+            nodeId: 'n1',
+            blockId: '0-assistant-1',
+            chars: long.length,
+            truncated: false
+        });
+    });
+
+    it('keeps the answer full and unredacted when a thinking window takes the tail', () => {
+        const window = 'a newer window of thinking';
+        const result = fold([starts(), say(long), think(window)]);
+
+        // The designation moved to the window; the answer did NOT become a preview, and the
+        // window itself is still the whole body the reader is looking at.
+        expect(result.display().sections[0].nodes[0]).toEqual({
+            kind: 'text',
+            id: 'n1',
+            text: long,
+            committed: false,
+            chars: long.length
+        });
+        expect(result.display().sections[0].nodes[1]).toEqual({ kind: 'reasoning', id: 'n2', text: window, chars: window.length });
+        expect(tailOf(result.display())).toEqual({
+            kind: 'reasoning',
+            nodeId: 'n2',
+            blockId: '0-reasoning-2',
+            chars: window.length,
+            truncated: false
+        });
+
+        // Not one patch touched the answer's body across the whole round: the bytes it streamed
+        // while it held the tail ARE its wire copy, forever, until an answer replaces them.
+        expect(flatten(result.ops).filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([]);
+    });
+
+    it('keeps the answer full and unredacted when a tool call takes the tail', () => {
+        const args = JSON.stringify({ path: 'notes.md', body: 'x'.repeat(400) });
+        const result = fold([starts(), say(long), toolCall('call-1', 'read', args)]);
+
+        expect(result.display().sections[0].nodes[0]).toEqual({
+            kind: 'text',
+            id: 'n1',
+            text: long,
+            committed: false,
+            chars: long.length
+        });
+        // The call is the designated body, with its complete recorded request — the answer above
+        // it is displayed by the SECOND carrier rule, not by this designation.
+        expect(tailOf(result.display())).toEqual({
+            kind: 'tool',
+            nodeId: '2',
+            blockId: '0-tool-2',
+            chars: args.length,
+            truncated: false,
+            args
+        });
+        expect(flatten(result.ops).filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([]);
+    });
+
+    it('bounds the older answer in the very frame a NEWER answer takes the tail', () => {
+        const result = fold([
+            starts(),
+            say(long),
+            toolCall('call-1', 'read', '{}'),
+            toolResult('read', 'r', 'call-1', { outcome: 'completed' }),
+            say(longB)
+        ]);
+
+        // R2's carrier slot holds ONE node: the superseded answer is hidden by the newer one
+        // client-side, so it goes back to being history — bounded, exact length, marker set —
+        // and it happens in the frame the newer answer is recorded, not one frame earlier.
+        expect(result.display().sections[0].nodes[0]).toEqual({
+            kind: 'text',
+            id: 'n1',
+            text: preview('a'),
+            committed: false,
+            chars: long.length,
+            redacted: true
+        });
+        expect(result.display().sections[0].nodes[2]).toEqual({
+            kind: 'text',
+            id: 'n4',
+            text: longB,
+            committed: false,
+            chars: longB.length
+        });
+        expect(tailOf(result.display())).toEqual({
+            kind: 'assistant',
+            nodeId: 'n4',
+            blockId: '0-assistant-4',
+            chars: longB.length,
+            truncated: false
+        });
+
+        // The preview is the tail of the recorded text (T26), and the op stream says so once.
+        expect(flatten(result.ops).filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([
+            {
+                op: 'node:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                nodeId: 'n1',
+                patch: { text: preview('a'), chars: long.length, redacted: true }
+            }
+        ]);
+    });
+
+    it('still bounds every non-text block it always bounded, and pays nothing extra per frame', () => {
+        const window = 'q'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 80);
+        const result = fold([starts(), say(long), think(window), toolCall('call-1', 'read', '{}')]);
+
+        // A thinking window is NOT a second carrier: it loses its body the moment the call takes
+        // the tail, exactly as it did before R2.
+        expect(result.display().sections[0].nodes[1]).toEqual({
+            kind: 'reasoning',
+            id: 'n2',
+            text: preview('q'),
+            chars: window.length,
+            redacted: true
+        });
+        // The answer survives BOTH supersessions whole.
+        expect(result.display().sections[0].nodes[0]).toEqual({
+            kind: 'text',
+            id: 'n1',
+            text: long,
+            committed: false,
+            chars: long.length
+        });
+
+        // Across the whole round the frame-end pass emits exactly one body patch — the window's.
+        // The new carrier costs no traffic of its own, because its bytes already streamed while
+        // it held the tail and nothing about it moved (`tailStampOf` still gates the pass).
+        expect(flatten(result.ops).filter((op) => op.op === 'node:set').map((op) => (op as { nodeId: string }).nodeId)).toEqual([
+            'n2'
+        ]);
+    });
+
+    it('lands the same second carrier on a cold reload of the same record', () => {
+        const events = [starts(), say(long), toolCall('call-1', 'read', '{}')];
+        const live = fold(events);
+
+        live.settle('done');
+
+        const cold = projectTurn(
+            turnOf({ status: 'done', updatedAt: 5_000, events: [...events], eventTimes: events.map((_event, index) => timeOf(index)) }),
+            SOURCED
+        );
+
+        // Hydration reads the whole `TurnDisplay`, not the ops: the reloaded document carries the
+        // answer in full beside the settled call it designates, so a reload cannot show a stub the
+        // live stream never sent.
+        expect(cold.display).toEqual(live.display());
+        expect(cold.display.sections[0].nodes[0]).toEqual({ kind: 'text', id: 'n1', text: long, committed: false, chars: long.length });
+        expect(cold.display.sections[0].tail).toMatchObject({ kind: 'tool', nodeId: '2' });
+    });
+});
+
+// P3 (the review of R2): the newest answer is now read from a PER-SECTION CACHE
+// (`SectionRecord.latestTextNodeId`) instead of a backward scan per prose node per projection,
+// so correctness depends on EVERY site that adds or removes a node keeping that cache exact.
+// Each case below is one of those sites; none of them may cost the answer its whole body, and
+// the removal site must hand the status BACK rather than leave a preview behind.
+describe('the second carrier survives every node mutation the fold makes', () => {
+    const answer = 'a'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 40);
+
+    const answerOf = (display: TurnDisplay) => display.sections[0].nodes.find((node) => node.kind === 'text');
+
+    const whole = (committed: boolean) => ({
+        kind: 'text',
+        id: 'n1',
+        text: answer,
+        committed,
+        chars: answer.length
+    });
+
+    it('across a step append (`pushStep` appends a row, never prose)', () => {
+        expect(answerOf(fold([starts(), say(answer), toolCall('call-1', 'read', '{}')]).display())).toEqual(whole(false));
+    });
+
+    it('across the pending line arriving AND being removed (`syncPendingLine`, both directions)', () => {
+        // The wake notice and the composed pending line JOIN the array; the settled call then
+        // drains the snapshot, and `syncPendingLine`'s filter takes the pending node back OUT —
+        // the one removal that runs on an ordinary frame. It must not leave the carrier cache
+        // naming a node that no longer exists (that would cost the surviving answer its body).
+        // The prune is keyed to a call the record actually opened, so the call is recorded here.
+        const display = fold([
+            starts(),
+            say(answer),
+            { type: 'wakeup', agent: 'one', pending: [{ callId: 'call-9', name: 'watch', elapsedMs: 1_200 }] } as HarnessEvent,
+            toolCall('call-9', 'watch', '{}'),
+            toolResult('watch', 'it finished', 'call-9', { outcome: 'completed' })
+        ]).display();
+
+        // The pending line is gone, the wake notice and the row are not, and the answer that
+        // predates all three is still whole.
+        expect(display.sections[0].nodes.map((node) => [node.kind, node.id])).toEqual([
+            ['text', 'n1'],
+            ['notice', 'n2'],
+            ['tool', '3']
+        ]);
+        expect(answerOf(display)).toEqual(whole(false));
+    });
+    it('across a discarded attempt that removes the newest answer (`discardAttempt` re-derives)', () => {
+        const second = 'b'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 40);
+        const result = fold([
+            starts(),
+            say(answer),
+            { type: 'attempt_commit', agent: 'one', attempt: 1, maxAttempts: 3 } as HarnessEvent,
+            think('a committed window'),
+            { type: 'attempt_commit', agent: 'one', attempt: 2, maxAttempts: 3 } as HarnessEvent,
+            say(second),
+            {
+                type: 'retry',
+                agent: 'one',
+                attempt: 3,
+                maxAttempts: 3,
+                delayMs: 0,
+                error: { message: 'upstream 500' }
+            } as HarnessEvent
+        ]);
+
+        // The retry erases `n5` but NOT the thinking window that now holds the tail, so the
+        // surviving answer regains carrier status by RULE 2 alone: bounded when `n5` superseded
+        // it, restored when the discard re-derives the newest answer. A stale cache would leave
+        // the middle preview in place and never send the third patch.
+        expect(flatten(result.ops).filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([
+            { op: 'node:set', turnId: 'turn-1', sectionId: 'turn-1:0', nodeId: 'n1', patch: { committed: true } },
+            {
+                op: 'node:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                nodeId: 'n1',
+                patch: { text: `\u2026${'a'.repeat(319)}`, chars: answer.length, redacted: true }
+            },
+            {
+                op: 'node:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                nodeId: 'n1',
+                patch: { text: answer, chars: answer.length, unredacted: true }
+            }
+        ]);
+        // The erased node is gone and the DESIGNATED body is the surviving think window — the
+        // answer above it is whole because of the cache, not because of the tail.
+        expect(result.display().sections[0].nodes.map((node) => [node.kind, node.id])).toEqual([
+            ['text', 'n1'],
+            ['reasoning', 'n3']
+        ]);
+        expect(tailOf(result.display())).toMatchObject({ kind: 'reasoning', nodeId: 'n3' });
+        expect(answerOf(result.display())).toEqual(whole(true));
+    });
+});
+
+// P3's shape, pinned as traffic instead of a stopwatch: 200 calls settled AFTER the newest
+// answer used to make every projection walk 400 rows per prose node. The answer must stay whole
+// through all of them while costing the wire NOTHING for those frames — a cached read, not a
+// re-send, and not a re-scan.
+describe('a long call run after the newest answer', () => {
+    it('keeps that answer whole with no body traffic for it across 400 later frames', () => {
+        const answer = 'a'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 40);
+        const events: HarnessEvent[] = [starts(), say(answer)];
+
+        for (let index = 0; index < 200; index += 1) {
+            events.push(toolCall(`call-${index}`, 'read', `{"n":${index}}`));
+            events.push(toolResult('read', `body ${index}`, `call-${index}`, { outcome: 'completed' }));
+        }
+
+        const result = fold(events);
+        const document = result.display();
+
+        expect(document.sections[0].nodes[0]).toEqual({ kind: 'text', id: 'n1', text: answer, committed: false, chars: answer.length });
+        expect(document.sections[0].nodes).toHaveLength(201);
+        expect(document.sections[0].tail).toMatchObject({ kind: 'tool', nodeId: '400', result: 'body 199' });
+
+        // The answer travelled exactly once (its own delta): 400 call frames moved the
+        // designation 400 times and never re-sent or re-bounded that body.
+        const ops = flatten(result.ops);
+
+        expect(ops.filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([]);
+        expect(ops.filter((op) => op.op === 'node:append' && op.nodeId === 'n1')).toHaveLength(1);
+        expect(ops.filter((op) => op.op === 'tail:set')).toHaveLength(401);
+
+        // And reading the compiled document is a pure, repeatable projection of that cache.
+        expect(result.display()).toEqual(document);
+    });
+});
+
 describe('what may never take the tail', () => {
     it('excludes the system instructions and the user prompt, and still prints them as segments', () => {
         const result = fold([starts()]);
@@ -391,6 +700,38 @@ describe('root and delegate are independent', () => {
         expect(tailOf(display, 1)).toMatchObject({ kind: 'tool', nodeId: '5', args: '{"q":"x"}' });
         // A delegated section's payload never lands on its caller's row, and vice versa.
         expect(display.sections[0].tail).not.toHaveProperty('args');
+    });
+
+    it('gives each section its own second full carrier, independently (R2, T1)', () => {
+        const callerAnswer = 'a'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 40);
+        const calleeAnswer = 'b'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 40);
+        const display = fold([
+            { type: 'start', agent: 'one', model: 'gpt-x', thread: { id: 'inv-root' } },
+            say(callerAnswer),
+            toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })),
+            { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread },
+            { type: 'text', agent: 'two', delta: calleeAnswer, thread: childThread },
+            { type: 'tool_call', agent: 'two', thread: childThread, call: { id: 'call-9', name: 'grep', arguments: '{"q":"x"}' } }
+        ]).display();
+
+        // Both sections are sitting on a CALL, so NEITHER answer is the designated tail — and
+        // each section still carries ITS OWN newest answer whole. The rule is per
+        // `SectionRecord`, so a callee's body never satisfies the caller's carrier slot.
+        expect(display.sections.map((section) => section.tail?.kind)).toEqual(['tool', 'tool']);
+        expect(display.sections[0].nodes[0]).toEqual({
+            kind: 'text',
+            id: 'n1',
+            text: callerAnswer,
+            committed: false,
+            chars: callerAnswer.length
+        });
+        expect(display.sections[1].nodes[0]).toEqual({
+            kind: 'text',
+            id: 'n4',
+            text: calleeAnswer,
+            committed: false,
+            chars: calleeAnswer.length
+        });
     });
 
     it('lands the same two designations on a cold reload of the same record', () => {
@@ -516,7 +857,7 @@ describe('live, cold and settled agree', () => {
 });
 
 describe('a discarded attempt hands the tail back exactly', () => {
-    it('restores the body the wire had bounded, with the marker withdrawn', () => {
+    it('never bounds an answer a call superseded, so the retry that hands the tail back has nothing to restore', () => {
         const first = 'a'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 60);
         const result = fold([
             starts(),
@@ -534,16 +875,79 @@ describe('a discarded attempt hands the tail back exactly', () => {
             } as HarnessEvent
         ]);
 
-        // The retry erased the block that held the tail, so the committed answer IS the
-        // newest eligible node again — and the live wire copy must match the cold document,
-        // which carries it whole. One addressed patch, stated, not inferred.
-        expect(flatten(result.ops)[flatten(result.ops).length - 2]).toEqual({
-            op: 'node:set',
+        // R2 (T1): this answer was superseded by a THINKING WINDOW and a CALL, never by another
+        // answer, so the wire never bounded it — and there is no restore patch to make, because
+        // the body the retry hands back is the body the client still holds. (The only patch this
+        // stream ever sends for `n1` is its `committed` flag.)
+        expect(flatten(result.ops).filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([
+            { op: 'node:set', turnId: 'turn-1', sectionId: 'turn-1:0', nodeId: 'n1', patch: { committed: true } }
+        ]);
+
+        // The designation still moves back, and it is still the last op of the frame that erased
+        // the block that held it: a client never holds a tail naming a node it has not received.
+        const ops = flatten(result.ops);
+
+        expect(ops[ops.length - 1]).toEqual({
+            op: 'tail:set',
             turnId: 'turn-1',
             sectionId: 'turn-1:0',
-            nodeId: 'n1',
-            patch: { text: first, chars: first.length, unredacted: true }
+            tail: { kind: 'assistant', nodeId: 'n1', blockId: '0-assistant-1', chars: first.length, truncated: false }
         });
+        expect(tailOf(result.display())).toMatchObject({ kind: 'assistant', nodeId: 'n1', truncated: false });
+
+        const node = result.display().sections[0].nodes[0] as { text: string; chars?: number; redacted?: boolean };
+
+        expect(node.text).toBe(first);
+        expect(node.redacted).toBeUndefined();
+    });
+
+    it('restores a body the wire HAD bounded, with the marker withdrawn', () => {
+        // The only supersession that bounds an answer is a newer ANSWER (R2, T1), so this is the
+        // sequence that exercises the restore: `first` loses its body when `second` takes the
+        // tail, and gets it back verbatim when the retry erases `second`.
+        const first = 'a'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 60);
+        const second = 'b'.repeat(DISPLAY_NODE_PREVIEW_CHARS + 60);
+        const result = fold([
+            starts(),
+            say(first),
+            { type: 'attempt_commit', agent: 'one', attempt: 1, maxAttempts: 3 } as HarnessEvent,
+            think('a fresh attempt'),
+            say(second),
+            {
+                type: 'retry',
+                agent: 'one',
+                attempt: 2,
+                maxAttempts: 3,
+                delayMs: 0,
+                error: { message: 'upstream 500' }
+            } as HarnessEvent
+        ]);
+
+        // Bounded once, in the frame the newer answer was recorded — not in the frame the thinking
+        // window took the tail (R2 keeps `n1` whole through that one).
+        expect(result.ops[3].filter((op) => op.op === 'node:set')).toEqual([]);
+        expect(result.ops[4].filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([
+            {
+                op: 'node:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                nodeId: 'n1',
+                patch: { text: `\u2026${'a'.repeat(319)}`, chars: first.length, redacted: true }
+            }
+        ]);
+
+        // The retry erased the block that held the tail, so the committed answer IS the newest
+        // eligible node again — and the live wire copy must match the cold document, which
+        // carries it whole. One addressed patch, stated, not inferred.
+        expect(result.ops[5].filter((op) => op.op === 'node:set' && op.nodeId === 'n1')).toEqual([
+            {
+                op: 'node:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                nodeId: 'n1',
+                patch: { text: first, chars: first.length, unredacted: true }
+            }
+        ]);
         expect(tailOf(result.display())).toMatchObject({ kind: 'assistant', nodeId: 'n1', truncated: false });
 
         const node = result.display().sections[0].nodes[0] as { text: string; chars?: number; redacted?: boolean };

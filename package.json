@@ -3,46 +3,54 @@
     "version": "1.0.2",
     "description": "Standard underload harness. Ease to build and execute.",
     "type": "module",
-    "main": "./dist/underload-harness.mjs",
-    "module": "./dist/underload-harness.mjs",
-    "types": "./dist/index.d.ts",
+    "main": "./src/index.ts",
+    "module": "./src/index.ts",
+    "types": "./src/index.ts",
     "exports": {
         ".": {
             "browser": {
                 "types": "./dist/browser.d.ts",
+                "development": "./src/browser.ts",
                 "default": "./dist/underload-harness.browser.mjs"
             },
             "types": "./dist/index.d.ts",
+            "development": "./src/index.ts",
             "node": "./dist/underload-harness.mjs",
             "import": "./dist/underload-harness.mjs",
             "default": "./dist/underload-harness.mjs"
         },
         "./server": {
             "types": "./dist/server/index.d.ts",
+            "development": "./src/server/index.ts",
             "import": "./dist/underload-harness.server.mjs",
             "default": "./dist/underload-harness.server.mjs"
         },
         "./worker": {
             "types": "./dist/server/workers/lane-worker.d.ts",
+            "development": "./src/server/workers/lane-worker.ts",
             "import": "./dist/underload-harness.worker.mjs",
             "default": "./dist/underload-harness.worker.mjs"
         },
         "./io-worker": {
             "types": "./dist/server/workers/io-worker.d.ts",
+            "development": "./src/server/workers/io-worker.ts",
             "import": "./dist/underload-harness.io-worker.mjs",
             "default": "./dist/underload-harness.io-worker.mjs"
         },
         "./frontend": {
             "browser": {
                 "types": "./dist/frontend/index.d.ts",
+                "development": "./src/frontend/index.ts",
                 "default": "./dist/underload-harness.frontend.mjs"
             },
             "types": "./dist/frontend/index.d.ts",
+            "development": "./src/frontend/index.ts",
             "import": "./dist/underload-harness.frontend.mjs",
             "default": "./dist/underload-harness.frontend.mjs"
         },
         "./shared": {
             "types": "./dist/shared/index.d.ts",
+            "development": "./src/shared/index.ts",
             "import": "./dist/underload-harness.shared.mjs",
             "default": "./dist/underload-harness.shared.mjs"
         },

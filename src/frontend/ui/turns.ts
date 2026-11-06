@@ -1299,23 +1299,38 @@ type ContextBarSurface = {
     /** True when this section's segments, not step cards, are its tool surface. */
     driven: () => boolean;
     /**
-     * Paint — or hide — the section's ONE current content body, mounted inside this host
-     * directly after the strip (T22/T23, R23).
+     * Paint — or hide — the section's ONE current content body (T22/T23, R23).
      *
      * A `reasoning` tail and a `tool` tail paint here: the thinking window because the chip
      * that used to hold it is gone, and the call because R23 makes a recorded call a block
      * like any other — its complete recorded request, plus its complete recorded result once
      * the call settles. An `assistant` tail paints NOTHING: its full text is the section's
-     * designated answer node, and the flow already renders that in the `.agent-text` block
-     * that sits immediately below this host, so printing it twice would duplicate the answer.
+     * designated answer node, and the flow already renders that in its `.agent-text` block, so
+     * printing it twice would duplicate the answer.
      * Every body carries the SERVER's figures (`data-chars`, `data-truncated`, and for a call
      * `data-state`/`data-duration`/`data-args-chars`/`data-result-chars`), so a bounded
      * payload says so instead of letting a prefix read as the whole block. T26 (R26) adds the
-     * PANE's own pair, `data-shown-chars` / `data-render-bounded`: a prose body paints its
+     * PANE's own pair, `data-shown-chars` / `data-render-bounded`: an answer body paints its
      * latest window (not its first lines), and the element states exactly how many recorded
-     * characters that window is, beside the exact whole length.
+     * characters that window is, beside the exact whole length. T27 (R1b) removes that window
+     * for a thinking body — it is the whole text the wire delivered, inside a scroll box — so a
+     * thinking tail on the designated-carrier path reports `shownChars === chars` and
+     * `data-render-bounded="false"`; a producer that bounded the wire bytes still reports them
+     * honestly, because the pane cannot paint what did not arrive.
+     *
+     * WHERE the element ends up is a separate call (see `placeTail`), because a frame that only
+     * appends a new text node has to reposition the block even when this one early-returns.
      */
     setTail: (tail: ContextTail | undefined) => void;
+    /**
+     * Re-assert the tail block's position: in the section's own flow (T27, R2), underneath the
+     * newest assistant response and immediately BEFORE `pending` when that status line is one of
+     * the flow's children. No-op when the element is ALREADY in that seat — which matters,
+     * because a pending-only frame repaints the status line without changing the printed block,
+     * and a needless detach/re-append would reset the panes' scroll offsets mid-call. No-op while
+     * the element prints nothing, which is when it stays parked inside `host`.
+     */
+    placeTail: (flow: HTMLElement | undefined, pending?: HTMLElement) => void;
     /** Repaint the dialog this surface owns from the section's current metadata. */
     refresh: () => void;
     /** Close the dialog this surface owns WITHOUT destroying the strip (a sibling section's
@@ -5674,11 +5689,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
          * section discard close, the RIGHT dialog; a click still shows one segment at a time,
          * because `openSegment` replaces whichever strip in this tile the reader had open.
          *
-         * T22 (R23) adds a fourth owned surface inside the SAME host: this section's ONE
-         * current tail body, mounted directly after the strip. It is owned per section for
-         * exactly the reason the strip is — a delegated conversation's thinking must never
-         * print inside its caller's block, and one host can only ever hold one body, so a
-         * long run cannot accumulate the pile of stale think chips the strip replaced.
+         * T22 (R23) adds a fourth owned surface: this section's ONE current tail body, minted
+         * in the SAME host. It is owned per section for exactly the reason the strip is — a
+         * delegated conversation's thinking must never print inside its caller's block, and one
+         * surface can only ever hold one body, so a long run cannot accumulate the pile of stale
+         * think chips the strip replaced. T27 (R2) MOVES that element to the end of the
+         * section's own flow while it is printing (see `placeTail`), so a running turn reads
+         * "newest assistant response, then the block that followed it"; the strip itself never
+         * leaves this host, and a body that prints nothing is parked back here for teardown.
          */
         const createContextBarSurface = (host: HTMLElement): ContextBarSurface => {
             let model: ContextBarModel | undefined;
@@ -5687,9 +5705,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // refresh it and a teardown can close it — never so that a second one can stack.
             let detail: { dialog: BlockDetailDialog; fingerprint: string } | undefined;
 
-             // --- the current tail body (T22, R23; widened by T23) ----------------------
-            // Minted once per surface and re-appended after the strip, so the element that
-            // prints the newest block is ALWAYS the element right after the graph.
+             // --- the current tail body (T22, R23; widened by T23; moved by T27, R2) ------
+            // Minted once per surface, so the element that prints the newest block is ONE
+            // reused node for the life of the strip and a long run can never pile up bodies.
+            //
+            // T27 (R2) changes WHERE that element lives while it is printing: a `tool` or
+            // `reasoning` body is re-inserted in this section's own flow (`.agent-flow`), after
+            // its prose and immediately before the pending status line, so the newest assistant
+            // response reads ABOVE the block that follows it instead of under the strip. The
+            // strip stays in `.context-bar-host`; only the tail block moves, and it is still the
+            // one and only reused element (see `placeTail`).
             const tail = document.createElement('div');
             tail.className = 'context-bar-tail';
             tail.hidden = true;
@@ -5707,6 +5732,23 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // frame of the round, so this key is what makes a repaint of unchanged state cost
             // no DOM work at all.
             let tailKey: string | undefined;
+
+            /**
+             * Park the reused element back in the strip's host (T27, R2).
+             *
+             * That is where it belongs while it prints NOTHING: the host owns the surface's
+             * teardown (`host.replaceChildren()` in `sync`/`destroy`), and a tail left inside
+             * the section flow would survive a destroy of the strip and keep printing the
+             * previous section's block. `clearTail` runs before every one of those teardowns,
+             * so parking there is enough to keep "destroyed surface = no visible tail" true.
+             */
+            const parkTail = (): void => {
+                // Unmounted stays unmounted (a section the bar never described must not gain a
+                // tail element at all), and an element already in the host needs no move.
+                if (tail.parentElement === null || tail.parentElement === host) return;
+
+                host.append(tail);
+            };
 
             const clearTail = (): void => {
                 tailKey = undefined;
@@ -5732,6 +5774,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // `data-follow` on an empty box would make a cold-rendered section and a
                 // live-cleared one report different state for the same "no body" answer.
                 delete tailBody.dataset.follow;
+                // T27 (R2): a body that prints nothing goes back to the strip's host, where the
+                // surface's teardown can remove it. This is also what keeps "a section the bar
+                // never described has NO tail element mounted" true after a mode flip.
+                parkTail();
             };
 
             /**
@@ -5802,19 +5848,24 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
              * Print the section's current block, or hide the body.
              *
              * An `assistant` tail deliberately prints NOTHING here: its full text is the
-             * section's designated answer node, and the flow already renders that in the
-             * `.agent-text` block immediately below this host — the existing full-answer
-             * surface R23 points at. A thinking window and a recorded call DO need a body
-             * minted at the tail of the strip, because the think chip and the tool card that
-             * used to hold them are the wall this bar replaced.
+             * section's designated answer node, and the flow already renders that in its own
+             * `.agent-text` block — the existing full-answer surface R23 points at. A thinking
+             * window and a recorded call DO need a body minted for them, because the think chip
+             * and the tool card that used to hold them are the wall this bar replaced.
              *
-             * WHAT "the whole block" means on screen (T26, R26): a recorded call prints its
-             * complete recorded request and response, byte for byte, with the scroll aimed at
-             * the newest byte. A PROSE body prints its LATEST window
-             * (`ContextTail.renderText`, `CONTEXT_TAIL_PREVIEW_CHARS` wide) so a streaming
-             * thinking window visibly moves instead of holding its first lines; the exact
-             * recorded length stays on `data-chars`, the painted length on `data-shown-chars`,
-             * and the complete bytes are one segment click away in ./context-detail.ts.
+             * WHAT "the whole block" means on screen: a recorded call prints its complete
+             * recorded request and response, byte for byte, with each pane's scroll aimed at
+             * the newest byte. A thinking body prints the WHOLE text (T27, R1b) inside a
+             * fixed-height scroll box, so nothing is cut and nothing is hidden behind a
+             * `… showing X of Y` caption. An answer body keeps the T26 (R26) latest-window
+             * preview (`ContextTail.renderText`, `CONTEXT_TAIL_PREVIEW_CHARS` wide) because it
+             * prints inline, not in a box. Either way the exact recorded length stays on
+             * `data-chars`, the painted length on `data-shown-chars`, and the complete bytes are
+             * one segment click away in ./context-detail.ts.
+             *
+             * This function paints CONTENT only. Position belongs to `placeTail`, which the
+             * caller runs on every content pass — a frame that only appended a new text node
+             * never reaches here (same `tailKey`), and it still has to move the block.
              */
             const paintTail = (next: ContextTail | undefined): void => {
                 if (next === undefined || next.kind === 'assistant') {
@@ -5873,10 +5924,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     delete tail.dataset.media;
                     // Plain text, never Markdown — the think chip's rule verbatim: scratch
                     // space can contain anything the model wrote, and this path parses no HTML.
-                    // T26 (R26): the painted string is the LATEST window of the body
-                    // (`renderText`), never its first lines, and the box follows it to the
-                    // bottom — which is what makes a growing thinking window visibly scroll
-                    // instead of sitting there showing the same opening sentence.
+                    // T27 (R1b): the painted string is the WHOLE body (`renderText` is
+                    // `ContextTail.text` for a thinking tail, windowed by nothing), inside the
+                    // fixed-height scroll box styles.css gives it. `followLatest` still aims the
+                    // box at the newest byte, which is the T26 (R26) half that survives: a round
+                    // that is streaming reads as text that MOVES, not an opening sentence.
                     tailBody.textContent = next.renderText;
                     followLatest(tailBody);
 
@@ -5903,6 +5955,58 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         kind?.hasResult === true ? 'empty-result' : 'no-result'
                     )
                 );
+            };
+
+            /**
+             * Put the tail block where the reader sees it: after this section's prose and BEFORE
+             * its pending status line — i.e. directly below the newest assistant response
+             * (T27, R2; pending seat from the T27 review).
+             *
+             * Two decisions live here and both are load-bearing:
+             *
+             *  - WHERE. `entry.section.flow` is where the section's prose is appended, so the
+             *    tail goes there. `renderPending` re-appends `.agent-pending` as the flow's LAST
+             *    child on every snapshot, so the tail's own seat is immediately BEFORE that
+             *    line: claiming "last child" outright would win the slot back from the status
+             *    line every frame and trade one wrong order for another.
+             *
+             *  - WHETHER to touch the DOM at all. A status-only frame re-renders `pending` while
+             *    the printed block is byte-identical, so `paintTail` early-returns on the same
+             *    `tailKey` and `followLatest` never runs again — and a detach/re-append here
+             *    would drop the tool/thinking pane's scroll offset mid-call, jumping the reader
+             *    back to the top of the result they were reading. Both position checks below
+             *    therefore ask "is the element ALREADY in this exact seat" (immediately before
+             *    the pending line, or last when there is none) rather than "is it last".
+             *
+             * `applyEntryContent` still calls this on EVERY content pass, and deliberately not
+             * from inside `paintTail`: a new text node appended after the tail has to move the
+             * tail even when the block it prints did not change one byte. One `insertBefore` /
+             * `append` of the SAME element is the whole move, so a section still holds exactly
+             * ONE tail element however many rounds stream past.
+             *
+             * A hidden tail (an `assistant` designation, a call with no designated payload, a
+             * cleared body) stays parked in the strip's host, which is where `clearTail` put it:
+             * it paints nothing, and the host owns the teardown that removes it.
+             */
+            const placeTail = (flow: HTMLElement | undefined, pending?: HTMLElement): void => {
+                if (tail.hidden || flow === undefined) return;
+
+                // Only a status line ACTUALLY attached to this flow is an anchor: a stale
+                // reference (the snapshot drained, or the row was rebuilt under us) must not
+                // place the tail outside the document.
+                const anchor = pending !== undefined && pending.parentElement === flow ? pending : null;
+
+                if (anchor !== null) {
+                    if (tail.parentElement === flow && tail.nextElementSibling === anchor) return;
+
+                    flow.insertBefore(tail, anchor);
+
+                    return;
+                }
+
+                if (tail.parentElement === flow && flow.lastElementChild === tail) return;
+
+                flow.append(tail);
             };
 
             /** True when the bar, not the chip wall, is this section's tool surface. */
@@ -6000,9 +6104,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     host.append(bar.element);
                 }
 
-                // The tail body is ALWAYS the host's last child, so the newest block reads as
-                // the tail of the strip instead of a chip left under older content (R23).
-                if (host.lastElementChild !== tail) host.append(tail);
+                // T27 (R2): the tail block is mounted here only the FIRST time, or after a
+                // teardown emptied the host. While it PRINTS a tool/reasoning body it lives at
+                // the end of the section's own flow (`placeTail`, driven by `applyEntryContent`
+                // immediately after this pass); yanking it back on every `sync` would reorder
+                // the same element twice per frame for no visible difference.
+                if (tail.parentElement === null) host.append(tail);
 
                 bar.setModel(next);
                 host.hidden = false;
@@ -6063,6 +6170,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // R23: the ops path repaints the body straight from an addressed node when a
                 // frame arrives without a tree, so `paintTail` is part of the surface contract.
                 setTail: paintTail,
+                // T27 (R2): painting and positioning are SEPARATE calls, because a frame that
+                // changes only the flow's newest text node must still move the block.
+                placeTail,
                 refresh,
                 closeDetail,
                 destroy
@@ -6668,11 +6778,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry: ThreadEntry,
             node: DisplayReasoningNode
         ): CompiledHandle | undefined => {
-            // T22 (R23): a bar-described section prints its thinking at the TAIL of the
-            // strip, one window at a time — not as a chip per round. The tail body is owned
-            // by the section's bar surface and is repainted from the server's order by
-            // `applyEntryContent`, which runs after this paint, so a hydration render, an
-            // ops frame and a reconnect all land on the same single body.
+            // T22 (R23): a bar-described section prints its thinking as the section's single
+            // tail body, one window at a time — not as a chip per round. T27 (R2) puts that body
+            // at the END of this flow, below the newest response; the body element is owned by
+            // the section's bar surface and is repainted AND positioned by `applyEntryContent`,
+            // which runs after this paint, so a hydration render, an ops frame and a reconnect
+            // all land on the same single body in the same place.
             if (entry.contextBar?.driven() === true) {
                 const tailHandle: CompiledHandle = {
                     kind: 'tail',
@@ -6805,11 +6916,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
          *
          * Two surfaces are narrowed, and only while the section is bar-described
          * (`driven()`), so a pre-T9 record keeps the historical flow untouched:
-         *   - the strip's OWN tail body (this section's current thinking window or current
-         *     call, printed directly after the graph - `surface.setTail`; a call whole, prose
-         *     as its latest window per T26/R26), and
-         *   - the flow's prose blocks: the current answer prints, every earlier window is
-         *     hidden because the segment plus its lazy detail is how it is represented now.
+         *   - the surface's ONE tail body (this section's current thinking window or current
+         *     call, printed whole — `surface.setTail`), and
+         *   - the flow's prose blocks: the NEWEST assistant response prints, every earlier one
+         *     is hidden because the segment plus its lazy detail is how it is represented now.
+         *
+         * T27 (R2) changed both halves of that last bullet. The newest response used to print
+         * only while the designation named it, so an intermediate reply vanished the moment the
+         * next thinking window or call took the tail; it now stays printed while it is the
+         * newest response. And the body is positioned in the same pass (`surface.placeTail`), so
+         * the block always reads BELOW the reply that came before it instead of pinned under the
+         * strip — repositioned even on a frame where `paintTail` early-returns unchanged.
          */
         const applyEntryContent = (entry: ThreadEntry, section: TurnSection | undefined): void => {
             const surface = entry.contextBar;
@@ -6822,15 +6939,24 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const tail = driven ? contextTailOf(source) : undefined;
 
             surface.setTail(tail);
+            // R2 (ordering): the ONE tail block sits in this section's own flow, after its
+            // prose. `entry.section.flow` is the element the section's nodes are appended into
+            // (the tile's `.agent-flow` for the root flow, the delegated card's own for a nested
+            // one), which is what puts the tool/thinking body below the newest response on every
+            // path: hydration, an ops frame, a drain, a reconnect. The pending status line is
+            // handed over as the seat anchor because `renderPending` keeps re-appending it as
+            // the flow's last child (turns.ts `renderPending`), and the tail must not be bounced
+            // past it — that re-insertion is what would reset the panes' scroll mid-call.
+            surface.placeTail(driven ? entry.section.flow : undefined, driven ? entry.section.pending : undefined);
 
             for (const key of compiledSectionKeys(entry.key)) {
                 const handle = compiledHandles.get(key);
                 if (handle === undefined || handle.kind !== 'text') continue;
 
-                // The tail IS the answer the reader is looking at, so its block prints; any
-                // other prose node of this section is history and prints nothing (its segment
-                // plus the lazy block detail is how it is represented now).
-                const visible = driven ? contextTailShowsProse(tail, handle.nodeId) : true;
+                // The newest response of this section prints, whichever block owns the tail (R2);
+                // any other prose node is history and prints nothing (its segment plus the lazy
+                // block detail is how it is represented now).
+                const visible = driven ? contextTailShowsProse(source, handle.nodeId) : true;
 
                 handle.node.dataset.tailState = visible ? 'current' : 'superseded';
                 // `hidden` is the base rule (`[hidden] { display: none !important }`), and

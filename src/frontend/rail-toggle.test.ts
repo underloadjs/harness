@@ -216,6 +216,47 @@ it('opens the scratch drawer from a floating button that reports its state', asy
     expect(document.querySelector('#rail-right')).not.toBeNull();
 });
 
+it('mounts one draggable seam on each inner edge of the chat column', async () => {
+    const shell = await boot();
+
+    // The seams are grid children BETWEEN the chat and each rail — never children of a
+    // rail (a rail is a scroll box, and only a track sibling can change the track that
+    // sizes it) and never a wrapper around one (main.test.ts pins the three columns as
+    // direct shell children).
+    expect([...shell.children].map((node) => node.className)).toEqual([
+        'rail rail-left',
+        'rail-resizer rail-resizer-left',
+        'center',
+        'rail-resizer rail-resizer-right',
+        'rail rail-right',
+        'scratch-fab',
+        'rail-backdrop'
+    ]);
+
+    const seam = document.querySelector<HTMLElement>('.rail-resizer-left');
+    if (seam === null) throw new Error('missing left seam');
+    expect(seam.getAttribute('role')).toBe('separator');
+    expect(seam.getAttribute('aria-label')).toBe('Resize the harnesses panel');
+    expect(seam.tabIndex).toBe(0);
+
+    // Dragging it writes the SHELL's track, and leaves the rail's own style alone.
+    seam.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, clientX: 248, button: 0, pointerType: 'mouse' })
+    );
+    document.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: 360 }));
+    document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, clientX: 360 }));
+
+    expect(shell.style.getPropertyValue('--rail-left-width')).toBe('360px');
+    expect(document.querySelector('#rail-left')?.hasAttribute('style')).toBe(false);
+
+    // The right seam is independent: one drag moves one track.
+    expect(shell.style.getPropertyValue('--rail-right-width')).toBe('');
+
+    // A reload is the reset (nothing is stored), and the shell's own persisted settings
+    // never hear about the width.
+    expect(JSON.stringify(Object.keys(localStorage))).not.toContain('rail');
+});
+
 it('keeps the two phone rails exclusive and dismisses the scratch drawer like the other', async () => {
     const shell = await boot();
     const backdrop = document.querySelector<HTMLElement>('.rail-backdrop');
@@ -768,12 +809,19 @@ it('stops the drawer animation for reduced motion', () => {
 
 it('leaves the tablet and desktop shells untouched', () => {
     // The 1180px block still lays the right rail out as a strip under the chat; it must
-    // not hide either rail (that is phone-only), and T3/R3 did not move it.
+    // not hide either RAIL (that is phone-only), and T3/R3 did not move it. The one
+    // thing it does hide is the right SEAM — a strip has no vertical edge to drag — so
+    // the collapse is pinned to the rails by their own selectors, not to any
+    // `display: none` in the block.
     const tablet = blockOf('@media (max-width: 1180px)');
     expect(tablet).toContain('.rail-right {\n        grid-column: 1 / -1;');
-    expect(tablet).not.toContain('display: none');
+    expect(tablet).not.toContain('.rail-left {\n        display: none;');
+    expect(tablet).not.toContain('.rail-right {\n        display: none;');
+    expect(tablet.replace(/\s+/g, ' ')).toContain('.rail-resizer-right { display: none; }');
 
-    // Base shell is still the three-column grid, so a closed phone state cannot
-    // leak into a desktop layout.
-    expect(blockOf('.shell {')).toContain('grid-template-columns: 248px minmax(0, 1fr) 320px');
+    // Base shell is still the three-column grid (plus the two seam tracks), so a closed
+    // phone state cannot leak into a desktop layout.
+    expect(blockOf('.shell {').replace(/\s+/g, ' ')).toContain(
+        'grid-template-columns: var(--rail-left-width, 248px) 6px minmax(0, 1fr) 6px var(--rail-right-width, 320px);'
+    );
 });

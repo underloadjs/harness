@@ -685,16 +685,19 @@ export type ContextTail = {
      */
     text: string;
     /**
-     * The PROSE body actually painted: the LATEST `shownChars` characters of `text` behind a
-     * leading `…` when anything is missing (T26, R26) — never its first lines. Empty for a
-     * tool, whose panes print the recorded bytes whole.
+     * The PROSE body actually painted (T27, R1b): a `reasoning` tail paints the wire's text
+     * WHOLE inside its own scroll box — no render window, no leading `…` — and an `assistant`
+     * tail paints the LATEST `shownChars` characters of `text` behind a leading `…` when
+     * anything is missing (T26, R26), never its first lines. Empty for a tool, whose panes
+     * print the recorded bytes whole.
      */
     renderText: string;
     /**
      * EXACT characters of the recorded block that are on screen. `chars` when the body fits
-     * whole; the wire payload's length when the server bounded it; the render window's length
-     * when the pane caps a long prose body. The caption's "showing N of M" reads from here, so
-     * a front-bounded wire body and a render-capped one are stated the same way.
+     * whole — the normal case for a thinking tail, whose box is windowed by nothing (R1b) —
+     * the wire payload's length when the server bounded it, or the render window's length when
+     * an answer's pane caps a long prose body. The caption's "showing N of M" reads from here,
+     * so a front-bounded wire body and a render-capped one are stated the same way.
      */
     shownChars: number;
     /** EXACT recorded characters of the block (invariant 5) — never `text.length`. */
@@ -780,6 +783,52 @@ const proseIsBounded = (node: DisplayTextNode | DisplayReasoningNode, chars: num
     node.redacted === true || chars > text.length;
 
 /**
+ * The PROSE body a tail paints, plus the two figures that describe it honestly.
+ *
+ * T27 (R1b): a THINKING tail is no longer windowed. Its pane is a fixed-height scroll box
+ * (styles.css `.context-bar-tail-body`, height `--context-tail-body-height`) that holds the
+ * whole round, so the reader scrolls the round instead of being shown "320 of 1,234
+ * characters" behind a leading `…`: `renderText` is the node's text EXACTLY as the wire
+ * delivered it, with no render-side cut and no marker of our own.
+ *
+ * Honesty is still derived from what actually arrived (T27 review, P2). A producer that
+ * bounded the wire text — `redacted: true`, or a `chars` figure larger than the text it sent
+ * — has fewer characters in the box than the record holds, so `shownChars` is what the pane
+ * can paint and `truncated` stays true, and the caption keeps its "showing N of M … click the
+ * segment" pointer instead of over-claiming. On the designated-carrier path the server sends
+ * the tail whole, `node.text.length === chars`, so the tail reports `shownChars === chars` and
+ * `truncated: false` and the line reads `thinking · N characters` with no "showing" clause —
+ * which is the case the requirement is about.
+ *
+ * An ANSWER tail keeps T26 (R26) unchanged: it prints in the flow's `.agent-text` block, not
+ * in a scroll box of its own, so its preview stays the LATEST window and the caption keeps
+ * stating the cut. `contextTextSuffixOf` and `CONTEXT_TAIL_PREVIEW_CHARS` stay live for it.
+ */
+const proseRenderOf = (
+    kind: ContextTailKind,
+    node: DisplayTextNode | DisplayReasoningNode,
+    chars: number
+): { renderText: string; shownChars: number; truncated: boolean } => {
+    if (kind === 'reasoning') {
+        const body = node.text;
+
+        return {
+            renderText: body,
+            shownChars: Math.min(chars, body.length),
+            truncated: proseIsBounded(node, chars, body)
+        };
+    }
+
+    const render = contextTextSuffixOf(node.text);
+
+    return {
+        renderText: render.text,
+        shownChars: Math.min(chars, render.shown),
+        truncated: proseIsBounded(node, chars, node.text)
+    };
+};
+
+/**
  * Build the tail from the server's designation (R23) — the normal path for any
  * server-produced section.
  *
@@ -850,21 +899,21 @@ const designatedTailOf = (section: TurnSection, designation: DisplayTail): Conte
     const prose = node as DisplayTextNode | DisplayReasoningNode;
     const chars = exactCharsOf(segment?.chars ?? prose.chars ?? designation.chars, prose.text.length);
 
-    // T26 (R26): the pane paints the LATEST suffix of the wire body. A designated carrier's
-    // text IS the whole recorded window, so live and reload slice the same bytes the same way;
-    // a body the wire already bounded keeps the end of what the wire sent, and `shownChars`
-    // states how much of the record that is.
-    const render = contextTextSuffixOf(prose.text);
+    // T26 (R26) for an answer / T27 (R1b) for thinking: the pane paints the whole recorded
+    // window for a designated carrier either way, and the two kinds differ only in what the
+    // render does with it (see `proseRenderOf`). A designated carrier's text IS the whole
+    // recorded window, so live and reload paint the same bytes.
+    const render = proseRenderOf(designation.kind, prose, chars);
 
     return {
         kind: designation.kind,
         nodeId: prose.id,
         blockId: designation.blockId,
         text: prose.text,
-        renderText: render.text,
-        shownChars: Math.min(chars, render.shown),
+        renderText: render.renderText,
+        shownChars: render.shownChars,
         chars,
-        truncated: proseIsBounded(prose, chars, prose.text),
+        truncated: render.truncated,
         designated: true
     };
 };
@@ -895,17 +944,19 @@ const legacyTailOf = (section: TurnSection): ContextTail | undefined => {
         const prose = node as DisplayTextNode | DisplayReasoningNode;
         const segment = lastBlockOfKind(section, kind);
         const chars = exactCharsOf(segment?.chars ?? prose.chars, prose.text.length);
-        const render = contextTextSuffixOf(prose.text);
+        // Same render rule as the designated path (T27, R1b): thinking whole in its scroll box,
+        // answer as its latest window. The figures come from this producer's own bytes.
+        const render = proseRenderOf(kind, prose, chars);
 
         return {
             kind,
             nodeId: prose.id,
             blockId: segment?.id,
             text: prose.text,
-            renderText: render.text,
-            shownChars: Math.min(chars, render.shown),
+            renderText: render.renderText,
+            shownChars: render.shownChars,
             chars,
-            truncated: proseIsBounded(prose, chars, prose.text),
+            truncated: render.truncated,
             designated: false
         };
     }
@@ -966,9 +1017,16 @@ export const contextTailCaptionOf = (tail: ContextTail): string => {
 
     if (tail.kind !== 'tool') {
         // Whole means WHOLE: every recorded character is on screen. Anything else states the
-        // exact number painted — whether the wire sent a bounded body or the pane capped a
-        // whole one at `CONTEXT_TAIL_PREVIEW_CHARS` (T26, R26). `shownChars` is the one figure
-        // both cases agree on, so the line can never claim more than the reader is looking at.
+        // exact number painted — the wire sent a bounded body, or an ANSWER pane capped a whole
+        // one at `CONTEXT_TAIL_PREVIEW_CHARS` (T26, R26). `shownChars` is the one figure both
+        // cases agree on, so the line can never claim more than the reader is looking at.
+        //
+        // T27 (R1b): a `reasoning` tail reaches the whole branch whenever the wire sent the
+        // block whole — the designated-carrier case, and the only one the live server produces
+        // — because the pane no longer caps it, so the line reads `thinking · N characters` with
+        // no "showing X of Y" and no pointer clause. A producer that DID bound the wire text
+        // still lands here honestly (T27 review, P2): the pane shows the fewer bytes it was
+        // given, and the caption says so and points at the segment.
         if (tail.shownChars >= tail.chars) return `${label} · ${formatContextCharCount(tail.chars)} characters`;
 
         return (
@@ -1010,13 +1068,45 @@ export const contextTailCaptionOf = (tail: ContextTail): string => {
 };
 
 /**
- * True when a prose node of this section may print its body: R23 allows exactly ONE, the
- * tail, and only when that tail IS prose. A section that has not been described by the bar
- * (no `context` array — `available: false` upstream) is NOT narrowed here: its caller keeps
- * the historical flow rendering, which is the compatibility rule in rule 4.
+ * The id of this section's NEWEST `kind: 'text'` node, in the server's recorded order, or
+ * undefined when the section has printed no prose at all (T27, R2).
+ *
+ * An order read, not a re-derivation: the projector appends nodes in recorded order, so the
+ * last text node IS the assistant response the reader is looking at right now — an
+ * intermediate reply issued before a tool call, or the committed final answer. Indexed walk
+ * from the end (no copy), the same shape `legacyTailOf` uses, because a long section is
+ * exactly the case where a per-frame array clone would cost.
  */
-export const contextTailShowsProse = (tail: ContextTail | undefined, nodeId: string): boolean =>
-    tail !== undefined && tail.kind === 'assistant' && tail.nodeId === nodeId;
+export const contextLatestTextNodeIdOf = (section: TurnSection | undefined): string | undefined => {
+    const nodes = section?.nodes;
+    if (!Array.isArray(nodes)) return undefined;
+
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+        const node = nodes[index];
+        if (node !== null && node !== undefined && node.kind === 'text') return node.id;
+    }
+
+    return undefined;
+};
+
+/**
+ * True when this prose node prints its body while the section is bar-described (T27, R2).
+ *
+ * The rule moved. R23 printed a prose block ONLY when the server's designation named it, so an
+ * INTERMEDIATE assistant response vanished the moment the next thinking window or recorded call
+ * took the tail, and a running turn read as a bare strip over a tool pane with no reply above
+ * it. The newest assistant response now stays printed for as long as it is the newest response,
+ * whichever block owns the tail, and the tail block itself is painted BELOW it in the same flow
+ * (./ui/turns.ts `ContextBarSurface.placeTail`). Every older response is history: it prints
+ * nothing and its exact bytes stay one segment click away, which is the part of R23 that stood.
+ *
+ * `tail` left the signature on purpose — the answer's visibility is a fact about the section's
+ * recorded order, not about which block the tail is currently printing. A section the bar never
+ * described (`available: false`) is NOT narrowed here: its caller keeps the historical flow
+ * rendering, which is the compatibility rule in rule 4.
+ */
+export const contextTailShowsProse = (section: TurnSection | undefined, nodeId: string): boolean =>
+    contextLatestTextNodeIdOf(section) === nodeId;
 
 // ---------------------------------------------------------------------------
 // Geometry: TWO dimensions (T26, R27) — width from recorded time, height from

@@ -526,6 +526,23 @@ type SectionRecord = {
     // `section.tail` because `chars` moves every delta and deliberately does NOT
     // re-publish the descriptor (the exact figure rides `context:set`).
     tailStamp?: string;
+    // R2 (T1): this section's NEWEST `kind:'text'` node id — the second full-text carrier
+    // (`isFullCarrier`) — cached so no projection has to walk the array per node (P3):
+    // `display()` maps EVERY node and `insertNode` projects the node it appends, so a
+    // per-node backward scan would cost O(prose x nodes) on a long call run after the last
+    // answer. Reads are O(1); the scan runs only where the value can actually change.
+    //
+    // INVARIANT: always `latestTextNodeIdOf(record)`. Maintained at every site that can move
+    // it, and documented at the ones that cannot:
+    //   - `insertNode` — nodes only append at the end, so an appended ANSWER IS the newest
+    //     one (written there, before the wire copy of that insert);
+    //   - `pushStep` / `syncPendingLine`'s push — append a step / a `notice`, never prose;
+    //   - `discardAttempt` — its filter CAN drop the carrier, so it re-derives after running
+    //     (one scan per discarded attempt, not per node);
+    //   - `syncPendingLine`'s removal filter — drops only `PENDING_NODE_ID`, which is never a
+    //     text node id (`n<eventIndex>`), so it cannot invalidate the cache;
+    //   - `newSection` starts `nodes: []`, so `undefined` IS the derived value at creation.
+    latestTextNodeId?: string;
     // This invocation's authoritative pending snapshot (turns.ts:4287).
     pendingCalls: Map<string, HarnessPendingTool>;
     started: boolean;
@@ -1060,8 +1077,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // The copy target is the LAST committed prose node of this attempt (a pointer,
         // so the prose is carried once rather than duplicated). R23 (T23): bounding the
         // prose this commit superseded is no longer done here — the tail designation
-        // (`syncTails`, at the end of the frame) owns which body is whole, so an answer a
-        // later CALL superseded is compact too instead of riding every later frame.
+        // (`syncTails`, at the end of the frame) owns which body is whole. R2 (T1) then
+        // narrowed what that pass bounds: an answer a later CALL or thinking window
+        // superseded stays whole (the board prints it above that block), and only an answer
+        // a NEWER ANSWER superseded goes compact — so a stream of short answers costs one
+        // preview patch each time the designation actually moves.
         for (let position = record.section.nodes.length - 1; position >= 0; position -= 1) {
             const node = record.section.nodes[position];
 
@@ -1091,6 +1111,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         for (const nodeId of window.nodeIds) steps.delete(nodeId);
 
         record.section.nodes = record.section.nodes.filter((node) => !window.nodeIds.includes(node.id));
+
+        // A discarded attempt is the ONE removal that can erase this section's newest answer, so
+        // the R2 (T1) carrier is re-derived here (P3): the backward scan stays off the per-node
+        // projection and runs once per discarded attempt instead.
+        record.latestTextNodeId = latestTextNodeIdOf(record);
+
         stepCount = Math.max(0, stepCount - window.stepIds.length);
 
         // A call of a FAILED attempt never executed, so its id is deliberately NOT
@@ -1132,6 +1158,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         if (text === undefined) {
             if (existing === undefined) return;
 
+            // Only the `pending` node leaves the array here, and a text node id is always
+            // `n<eventIndex>`, so the R2 (T1) carrier cache cannot be naming this node.
             record.section.nodes = record.section.nodes.filter((node) => node.id !== PENDING_NODE_ID);
             ops.push({ op: 'node:remove', turnId: turn.id, sectionId: record.section.id, nodeId: PENDING_NODE_ID });
 
@@ -1140,6 +1168,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
         if (existing === undefined) {
             const node: DisplayNode = { kind: 'notice', id: PENDING_NODE_ID, tone: 'info', text };
+            // A notice is never a carrier, so the cache is untouched by this append too.
             record.section.nodes.push(node);
             ops.push({ op: 'node:insert', turnId: turn.id, sectionId: record.section.id, node });
 
@@ -1194,6 +1223,13 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
     const insertNode = (record: SectionRecord, node: DisplayNode, ops: TurnDisplayOp[], attemptOwned: boolean): void => {
         record.section.nodes.push(node);
+
+        // R2 (T1) carrier cache, maintained at the append (P3): nodes only ever join the END of
+        // this array, so an appended ANSWER is by definition the section's newest one — written
+        // BEFORE the wire copy below, so the inserted node is projected as a full carrier exactly
+        // as a re-scan would have. A reasoning window or a notice changes nothing.
+        if (node.kind === 'text') record.latestTextNodeId = node.id;
+
         // The INTERNAL node keeps the exact text; the inserted copy is the bounded wire
         // shape (../shared/turn-display.ts `TurnDisplay`), so ops and a cold view agree.
         ops.push({ op: 'node:insert', turnId: turn.id, sectionId: record.section.id, node: wireNodeOf(record, node) });
@@ -1222,6 +1258,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         const entry: StepRecord = { step, sectionKey: record.key, openingIndex: index };
 
         steps.set(step.id, entry);
+        // A step joins the END of the node array and is never prose (a `tool` row or an
+        // `action` card), so the R2 (T1) carrier cache (`record.latestTextNodeId`) stays exact.
         record.section.nodes.push(step);
         ops.push({ op: 'step:set', turnId: turn.id, sectionId: record.section.id, step: copyValue(step) });
         stepCount += 1;
@@ -1501,11 +1539,13 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     //
     // The internal node keeps the FULL recorded text, because `chars` and the lazy
     // block detail must have exact bytes to be about. Only the copy that leaves the
-    // process is truncated, and only for the ONE block the server designates as the
-    // section's tail is the wire copy allowed to hold a whole body (R23, T23): a
-    // thinking window, an answer, or a tool call. `TurnSection.tail` is that
-    // designation, so the rule lives in one place and a live frame, a rebuild and a
-    // cold reload agree by construction.
+    // process is truncated, and only the blocks named by `isFullCarrier` are allowed to
+    // hold a whole body: the ONE block the server designates as the section's tail
+    // (R23, T23 — a thinking window, an answer, or a tool call) and, since R2 (T1), the
+    // section's newest recorded ANSWER as well, so the board can keep an intermediate
+    // assistant response readable above the block that currently holds the tail.
+    // `TurnSection.tail` is still the single designation and `isFullCarrier` is still the
+    // single rule, so a live frame, a rebuild and a cold reload agree by construction.
     // -----------------------------------------------------------------------
 
     /**
@@ -1640,8 +1680,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 nodeId: node.id,
                 ...(blockId === undefined ? {} : { blockId }),
                 chars: Number.isFinite(stated) ? Math.max(0, Math.trunc(stated)) : prose.text.length,
-                // A designated prose body is whole BY CONSTRUCTION (the tail node is the
-                // only node whose text is never bounded), so this never claims a preview
+                // A designated prose body is whole BY CONSTRUCTION (`isFullCarrier` always
+                // clears this node's bound), so this never claims a preview
                 // that the wire does not carry.
                 truncated: false
             };
@@ -1667,8 +1707,66 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         return `tool:${tail.nodeId}:${tail.blockId ?? ''}:${tail.args?.length ?? -1}:${tail.result?.length ?? -1}`;
     };
 
-    const isFullCarrier = (record: SectionRecord, node: DisplayNode): boolean =>
-        (node.kind === 'text' || node.kind === 'reasoning') && record.section.tail?.nodeId === node.id;
+    /**
+     * The section's newest RECORDED ANSWER, by display order (R2, T1) — the ONE derivation of
+     * the second carrier.
+     *
+     * "Newest" is an order read of the same array `resolveTail` walks — the LAST
+     * `kind === 'text'` node — not a timestamp, not `answerNodeId` (that pointer names the
+     * last COMMITTED prose and is deliberately not moved by a discard). Nodes only append to
+     * the end of `section.nodes` (`insertNode`/`pushStep`) or leave it by filter
+     * (`discardAttempt`/`syncPendingLine`), so a backwards scan IS the recorded order and it
+     * stops at the first text node it meets.
+     *
+     * COMPLEXITY (P3): this scan is NOT a per-node read. Its value lives on the record
+     * (`SectionRecord.latestTextNodeId`, a per-section cache maintained at the append and
+     * re-derived at the one removal that can move it), so `isFullCarrier` — which the wire
+     * copy calls for EVERY node of EVERY pass — stays O(1) and a call run with thousands of
+     * rows after the last answer costs O(nodes) per pass instead of O(prose x nodes).
+     */
+    const latestTextNodeIdOf = (record: SectionRecord): string | undefined => {
+        const nodes = record.section.nodes;
+
+        for (let position = nodes.length - 1; position >= 0; position -= 1) {
+            if (nodes[position].kind === 'text') return nodes[position].id;
+        }
+
+        return undefined;
+    };
+
+    /**
+     * Which nodes the wire copy may print with a WHOLE body, and which ones
+     * `moveTailBodies` therefore never bounds (one rule, both directions).
+     *
+     * Carriers:
+     *   1. the designated tail, when that tail is prose — a reasoning window or an answer
+     *      (R23, T23); a `tool` tail carries its payload on the descriptor instead, and a
+     *      `notice`/`action`/`user` node is not prose at all, so the kind gate stays;
+     *   2. ALWAYS the section's newest recorded answer, even while a later `reasoning`
+     *      window or `tool` call holds the tail (R2, T1). That is what lets the board keep
+     *      the assistant response visible ABOVE the current block instead of a
+     *      `DISPLAY_NODE_PREVIEW_CHARS` stub: the browser already knows which node it is
+     *      (`section.nodes` order), so no wire field and no second designation is needed.
+     *
+     * Carrier 2 supersedes in exactly the way carrier 1 does: recording a newer `text`
+     * node makes it both the tail and the newest answer, and the older answer goes back to
+     * being history — one `node:set` preview patch, in the same frame, emitted only when
+     * the designation actually moved (`tailStampOf`). A reasoning window is NOT a second
+     * carrier: R2 is about the assistant response, and a historical think chip stays one
+     * lazy click away.
+     *
+     * COMPLEXITY (P3): O(1). The newest answer is read from the per-section cache
+     * (`SectionRecord.latestTextNodeId`), never re-scanned here, because this predicate runs
+     * for EVERY node of EVERY projection (`wireNodeOf`, from both the op stream and
+     * `display()`).
+     */
+    const isFullCarrier = (record: SectionRecord, node: DisplayNode): boolean => {
+        if (node.kind !== 'text' && node.kind !== 'reasoning') return false;
+
+        if (record.section.tail?.nodeId === node.id) return true;
+
+        return node.kind === 'text' && record.latestTextNodeId === node.id;
+    };
 
     const wireNodeOf = (record: SectionRecord, node: DisplayNode): DisplayNode => {
         if (node.kind !== 'text' && node.kind !== 'reasoning') return copyValue(node);
@@ -1676,8 +1774,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         const wire = copyValue(node) as DisplayTextNode | DisplayReasoningNode;
         const chars = node.text.length;
 
-        // A bounded node states its exact length and says so; the designated carrier
-        // carries the whole text, so its length IS the count. The `redacted` marker is
+        // A bounded node states its exact length and says so; a full carrier (`isFullCarrier`
+        // — the designated tail, or this section's newest answer) carries the whole text, so
+        // its length IS the count. The `redacted` marker is
         // dropped here on purpose: a node printed in full must never claim to be a
         // preview, and one printed as a preview must never claim to be whole. A preview is
         // cut from the END (T26, R26), so the newest lines are the ones that survive the bound.
@@ -1703,18 +1802,36 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
      * restored: one patch carrying the full recorded text and `unredacted: true`, so a
      * live client cannot keep a preview the cold document no longer shows.
      *
+     * "Gained it back" is `isFullCarrier`, i.e. the designated tail OR this section's
+     * newest answer (R2, T1): an answer that is merely superseded by a later thinking
+     * window or call keeps its whole body on the wire, so the board can still print it
+     * above the current block. Only an answer that a NEWER ANSWER replaced is bounded —
+     * which is the same frame in which that newer answer took the tail, so this pass still
+     * emits nothing at all unless the designation moved.
+     *
      * Nodes at or below the bound need no patch either way — their text is already the
      * whole content — which is what keeps a stream of short windows free of churn.
      * `ops` is omitted by the read path, which only needs the same decision, not the
      * traffic.
      */
     const moveTailBodies = (record: SectionRecord, next: DisplayTail | undefined, ops?: TurnDisplayOp[]): void => {
+        // Read BEFORE the loop mutates anything: the newest answer is decided from the array as
+        // the fold wrote it, and one value serves the WHOLE pass (P3 — no per-node lookup).
+        // (The stored node always keeps its EXACT text — only the wire copy is bounded, see
+        // `wireNodeOf` — so a carrier that was previewed once can always be restored verbatim;
+        // nothing here has to reconstruct a lost body.)
+        const answerId = record.latestTextNodeId;
+
         for (const node of record.section.nodes) {
             if (node.kind !== 'text' && node.kind !== 'reasoning') continue;
 
-            const over = node.text.length > DISPLAY_NODE_PREVIEW_CHARS;
+            // `next` is compared explicitly rather than through `isFullCarrier`, because
+            // `syncTails` calls this BEFORE it republishes `record.section.tail` — the field
+            // still names the PREVIOUS designation here.
+            const carrier =
+                (next !== undefined && next.nodeId === node.id) || (node.kind === 'text' && node.id === answerId);
 
-            if (next !== undefined && next.nodeId === node.id) {
+            if (carrier) {
                 if (node.redacted !== true) continue;
 
                 delete node.redacted;
@@ -1729,6 +1846,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                 continue;
             }
+
+            const over = node.text.length > DISPLAY_NODE_PREVIEW_CHARS;
 
             if (!over || node.redacted === true) continue;
 
@@ -1755,6 +1874,16 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
      * frame (a call that settles in ANOTHER section moves that section's tail, not the
      * routed one). Sections with an unchanged stamp emit nothing, so a long round costs
      * one `tail:set` for its first delta and none for the other 499.
+     *
+     * The second full carrier (R2, T1) needs NO stamp of its own, and that is load-bearing
+     * for compactness: `section.nodes` only grows at the end, so a node becomes the newest
+     * ANSWER only by being recorded last — which is exactly when it also takes the tail and
+     * moves this stamp. It stops being the newest answer only when a later answer is
+     * recorded (tail moves again) or when it is removed by `discardAttempt`, whose nodes are
+     * always the tail-end of the recorded order (a window is opened and closed in order, so
+     * the last ELIGIBLE node is inside it) — again a moving stamp. It therefore never goes
+     * whole or partial on a frame this pass skipped, and no full body is ever re-sent per
+     * delta.
      */
     const syncTails = (ops: TurnDisplayOp[]): void => {
         for (const record of sections) {
@@ -1949,7 +2078,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 // from the frame-end tail pass, at the moment a newer block takes the tail
                 // — which is when the body stops being displayed and the exact length moves
                 // to the segment. A reconnect therefore replays only the CURRENT window in
-                // full, never a historical one.
+                // full, never a historical one (and, since R2/T1, the newest ANSWER beside
+                // it — that body streamed whole here too, so it costs no extra traffic).
                 ops.push({
                     op: 'node:append',
                     turnId: turn.id,
@@ -1973,9 +2103,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 // Text before a call is finished text: close the writer so the call is
                 // a node of its own and post-tool prose starts a fresh block. The prose
                 // that just closed loses its body in THIS frame's tail pass (the call is
-                // the newest block now, so the prose becomes history: bounded, with its
-                // exact length on its segment) — R23 keeps that one rule for every kind
-                // of supersession instead of repeating it per handler.
+                // the newest block now, so a thinking window becomes history: bounded, with
+                // its exact length on its segment) — R23 keeps that one rule for every kind
+                // of supersession instead of repeating it per handler. An ANSWER is the
+                // exception R2 (T1) put in `isFullCarrier`, not here: it stays whole because
+                // no newer answer replaced it, so the board can keep it above this call.
                 closeWriters(record);
 
                 const step: DisplayStep = {
@@ -2720,7 +2852,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // pass below names this turn's last eligible block (so a turn that ends on a
         // thinking window, on an answer, or on a call shows THAT in full, live and after a
         // reload) and bounds every older body, which is what stops a settled turn from
-        // replaying a superseded payload forever.
+        // replaying a superseded payload forever. The one older body that keeps its whole
+        // text is the newest ANSWER (R2, T1) — a settled transcript still shows the last
+        // response the model gave, above whatever it ended on.
         for (const record of sections) {
             record.pendingCalls.clear();
             syncPendingLine(record, ops);
@@ -2751,8 +2885,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
         // The wire copy is built here, from the exact recorded text: the block the
         // section designates as its tail (T23, R23) stays whole — an answer, a thinking
-        // window, or the current call's recorded request/response — and everything else
-        // arrives bounded with its exact `chars` beside it. `record.section.tail` is the
+        // window, or the current call's recorded request/response — and so does this
+        // section's newest answer whenever a later block holds the tail (R2, T1:
+        // `isFullCarrier` is the one rule for the op stream AND for this read), while
+        // everything older arrives bounded with its exact `chars` beside it. The carrier is a
+        // per-section cached read (`record.latestTextNodeId`), so this map costs O(nodes) per
+        // section, not O(prose x nodes) (P3). `record.section.tail` is the
         // designation the op stream just published, so this is the SAME projection the
         // stream delivered, which is why a reload paints what the stream painted.
         return {

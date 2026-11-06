@@ -1836,7 +1836,12 @@ Recoverable failures become tool results the model can read:
 - unknown tool → result listing the declared tools and pointing at toolRequest;
 - undiscovered tool → result naming tags that would enable it (it does not run);
 - malformed JSON arguments → result naming the parse failure (the tool is not
-  executed);
+  executed). A call whose arguments parse but are **not a JSON object** (`[1,2]`,
+  `42`, `"text"`, `null`) is rejected the same way: every tool is declared with an
+  object schema, so nothing downstream can bind it. When the request stopped with
+  `stopReason: 'length'`, the result also says the reply hit its output-token
+  limit, because that is the usual cause — generation was cut off mid-JSON and the
+  model needs to know the payload was truncated, not mistyped;
 - throwing/rejecting tool (including a runtime-compiled module) → result with the
   error message. `throw undefined` / `Promise.reject(undefined)` are still
   failures: the scheduler records a `failed` flag independently of the payload.
@@ -2027,6 +2032,12 @@ const stream = openAICompatible({
 - Maps internal messages to the wire format: assistant `toolCalls` become
   `tool_calls[{ id, type: 'function', function: { name, arguments } }]`, and
   `role: 'tool'` becomes `{ role: 'tool', tool_call_id, content }`.
+- `function.arguments` is normalized to a JSON **object** on the wire. A provider
+  rejects a non-object or unparseable value with a bare
+  `500 {"error":"Internal Server Error"}` for the whole request, so a tool call
+  truncated by the output-token ceiling would otherwise fail every later request
+  that replays it. The transcript keeps the raw text (it is what the model sent,
+  and the UI shows it); only the payload is repaired, to `'{}'`.
 - `reasoning` on an assistant message is **dropped** from the payload: local
   replay data, and several providers reject unknown message fields.
 - Tool declarations default `parameters` to `{ type: 'object', properties: {} }`.
@@ -2168,7 +2179,9 @@ other metrics.
 ```
 
 `HarnessToolCall` is `{ id, name, arguments }` where `arguments` stays a raw JSON
-string — malformed JSON is the harness's problem to report, not a parse crash. The
+string — malformed JSON is the harness's problem to report, not a parse crash, and
+it is retained verbatim so a restored transcript replays what the model actually
+sent (the transport repairs it at the wire boundary, see `openAICompatible`). The
 `id` is non-empty and unique across the conversation; the runtime rejects a
 duplicate/reused id before it launches or persists the call.
 
@@ -2620,6 +2633,18 @@ as their own entries.
   rail. The rails stay in the DOM — CSS only hides them — so their content and
   state survive a toggle, and wider layouts ignore the state and show both rails
   permanently. `src/frontend/rail-toggle.test.ts` pins the DOM of this contract.
+  Above the phone breakpoint each rail is **resizable**. A `role="separator"` seam sits in
+  its own 6px grid track between the rail and the chat (`src/frontend/ui/rail-resize.ts`),
+  and a drag writes `--rail-left-width` / `--rail-right-width` on `.shell` — the two
+  custom properties `.shell { grid-template-columns }` reads — never a `width` on the
+  rail, because a grid item is sized by its track. No width is stored anywhere: a reload,
+  like a double-click on a seam, returns the stylesheet's 248px / 320px, and the chat
+  keeps a 320px floor so a rail can never be pulled over the transcript. Both seams are
+  hidden on a phone (the rails are fixed-width drawers there) and only the right one on a
+  tablet (the scratch board is a full-width strip). A drag re-runs the reflow a window
+  resize does (`main.ts` `reflowLayout`), so the composer's grown height, the scratch
+  button's anchor and the notched routing label re-measure against the new chat width.
+  `src/frontend/ui/rail-resize.test.ts` pins the drag, keyboard, clamp and reset.
 
 ### API
 

@@ -3,9 +3,14 @@
 // What this file pins (all deterministic, all read from the source tree):
 //   1. the application tree lives under src/ (frontend + server + shared) and the
 //      old top-level folders are gone;
-//   2. package.json publishes every entry with an EXPLICIT `types` target per
-//      condition (no implicit `.d.ts` sibling resolution) and keeps the library
-//      root stable;
+//   2. package.json resolves SOURCE FIRST for a dev/test host: `main`/`module`/
+//      `types` are `./src/index.ts` and every published subpath declares a
+//      `development` condition onto its raw `./src/*.ts` entry, placed BEFORE the
+//      runtime conditions. The `types` conditions intentionally stay on explicit
+//      `./dist/*.d.ts` targets (no implicit `.d.ts` sibling resolution) because a
+//      NodeNext consumer cannot read `src/*.ts` — its relative specifiers are
+//      extensionless. `dist/` is therefore the npm-distribution bundle ONLY: no
+//      workspace run evaluates a stale build (items 8-9 below are the proofs);
 //   3. the frontend and server launches are separate — `dev:frontend` is Vite
 //      only, `dev:server` is the explicit standalone API, and the @underload/service
 //      gateway still owns the normal listener (imports bind nothing);
@@ -15,13 +20,24 @@
 //   5. the client barrel contains neither the app shell nor a stylesheet;
 //   6. importing the Node root binds no listener and re-exports the whole surface;
 //   7. the @underload/service endpoint modules keep the folder/name contract the
-//      loader discovers (`endpoint/` + `service-route*.ts` default export).
+//      loader discovers (`endpoint/` + `service-route*.ts` default export);
+//   8. Vite's OWN resolver maps all six published specifiers to the `src/*.ts`
+//      development entries and never to `dist/`, so the manifest conditions (not a
+//      hand-written alias table) are what make `vitest run` build-free;
+//   9. ../tsconfig.json `paths` mirror those same `development` targets file for
+//      file, so editors, `tsc --noEmit` and the suite all mean the same module.
 //
 // Cross-references:
+//   - ../package.json             — "exports" / "files" / "main|module|types" asserted below
+//   - ../tsconfig.json            — `paths`, asserted as a mirror of `exports.development`
+//   - ../vitest.config.ts         — deliberately has NO `resolve.alias` block; it
+//     relies on the `development` condition asserted here
+//   - ../scripts/check-package-types.mjs — the built-package check that enforces the
+//     same rule for a published consumer (F3: every subpath needs a `./src/*.ts`
+//     `development` target)
 //   - ../tsconfig.build.json — emits dist/<entry>.d.ts for these entries
 //   - ../vite.config.ts       — the six library entries (browser root, then index/
 //     server/frontend/shared plus the `worker` lane-worker executable)
-//   - ../package.json        — "exports" asserted below
 //   - ./server/service-start.test.ts — the end-to-end proof that the real service
 //     gateway serves /v1/harness from the moved endpoint folder
 
@@ -39,6 +55,62 @@ const PACKAGE_ROOT = path.resolve(SRC, '..');
 const readText = (relativePath: string): string =>
     fs.readFileSync(path.join(PACKAGE_ROOT, relativePath), 'utf8');
 
+// Removes JSONC comment SYNTAX only: `//` runs to the end of the line and `/* */`
+// blocks, but never inside a string literal.
+//
+// Why not the plain regex pair: ../tsconfig.json comments legitimately contain
+// `dist/*.d.ts` and `src/*.ts`, and `/\*[\s\S]*?\*\/` reads the `/*` inside
+// `dist/*.d.ts` as a block-comment opener, swallowing every `paths` entry up to the
+// `*/` of the `"**/*.ts"` glob (i.e. exactly the block this file asserts on). The
+// same pair also mangles the `"**/*.test.ts"` globs in ../tsconfig.build.json.
+const stripJsonComments = (text: string): string => {
+    let out = '';
+    let inString = false;
+
+    for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        const next = text[index + 1];
+
+        if (inString) {
+            // Inside a string only `\x` escapes are structural, so a `//` (a URL, a
+            // glob) is copied verbatim.
+            out += char;
+            if (char === '\\') {
+                out += next ?? '';
+                index += 1;
+            } else if (char === '"') {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (char === '"') {
+            inString = true;
+            out += char;
+        } else if (char === '/' && next === '/') {
+            // Line comment: skip to the newline and keep it, so a parse error still
+            // reports the original line number.
+            while (index < text.length && text[index] !== '\n') index += 1;
+            out += '\n';
+        } else if (char === '/' && next === '*') {
+            // Block comment: skip through the closing `*/`, keeping only its newlines
+            // (same reason: line numbers must survive).
+            index += 2;
+            const end = text.indexOf('*/', index);
+            out += (end === -1 ? text.slice(index) : text.slice(index, end)).replace(/[^\n]/g, '');
+            index = end === -1 ? text.length : end + 1;
+        } else {
+            out += char;
+        }
+    }
+
+    return out;
+};
+
+// tsconfig files are JSONC; comments are stripped before parsing.
+const readConfig = (relativePath: string): Record<string, any> =>
+    JSON.parse(stripJsonComments(readText(relativePath))) as Record<string, any>;
+
 // Ordered list of `export * from '<specifier>'` targets in a barrel. Explicit
 // named re-exports (`export { ... }`) are intentionally ignored: this asserts the
 // layer composition, not every symbol.
@@ -54,6 +126,58 @@ type PackageManifest = {
 };
 
 const manifest = JSON.parse(readText('package.json')) as PackageManifest;
+
+// One flattened row per string target of the exports map. `condition` keeps the
+// dotted path from the subpath (root `browser.types` => `..browser.types`), so a
+// test can classify a target by its FINAL condition key while `subpath` says which
+// published entry it belongs to.
+type ExportTarget = { subpath: string; condition: string; target: string };
+
+const flattenExportTargets = (exportsMap: unknown): ExportTarget[] => {
+    const targets: ExportTarget[] = [];
+    const walk = (subpath: string, condition: string, value: unknown): void => {
+        if (typeof value === 'string') {
+            targets.push({ subpath, condition, target: value });
+            return;
+        }
+        for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+            walk(subpath, `${condition}.${key}`, nested);
+        }
+    };
+    for (const [subpath, value] of Object.entries(exportsMap as Record<string, unknown>)) {
+        walk(subpath, subpath, value);
+    }
+    return targets;
+};
+
+const exportTargets: ExportTarget[] = flattenExportTargets(manifest.exports);
+
+// The two declared condition families. Everything that is neither is a published
+// RUNTIME condition (`node` / `import` / `default`, including the ones nested under
+// the `browser` group) and must be a dist bundle.
+const isTypesCondition = (condition: string): boolean => condition.endsWith('types');
+const isDevelopmentCondition = (condition: string): boolean => condition.endsWith('development');
+
+// `development` targets grouped by subpath, in declaration order. Root and
+// ./frontend declare the condition twice (top level + inside `browser`); a missing
+// entry means that subpath silently falls back to the bundle in a dev/test run.
+const developmentTargetsBySubpath: Record<string, string[]> = {};
+for (const { subpath, condition, target } of exportTargets) {
+    if (!isDevelopmentCondition(condition)) continue;
+    (developmentTargetsBySubpath[subpath] ??= []).push(target);
+}
+
+// The six published code specifiers, in the order the manifest declares them, with
+// the single source file each one must resolve to. `./package.json` is a manifest
+// re-export, not a code entry, so it is not part of this table.
+const PUBLISHED_SPECIFIERS = [
+    { subpath: '.', specifier: '@underload/harness', source: './src/index.ts' },
+    { subpath: './server', specifier: '@underload/harness/server', source: './src/server/index.ts' },
+    { subpath: './worker', specifier: '@underload/harness/worker', source: './src/server/workers/lane-worker.ts' },
+    { subpath: './io-worker', specifier: '@underload/harness/io-worker', source: './src/server/workers/io-worker.ts' },
+    { subpath: './frontend', specifier: '@underload/harness/frontend', source: './src/frontend/index.ts' },
+    { subpath: './shared', specifier: '@underload/harness/shared', source: './src/shared/index.ts' }
+] as const;
 
 describe('package layout', () => {
     it('keeps the application tree under src/ and removes the old top-level folders', () => {
@@ -99,24 +223,34 @@ describe('package layout', () => {
     });
 
     it('publishes every entry with environment-matched types', () => {
-        // Exact map: every condition declares `types` explicitly (no implicit `.d.ts`
-        // sibling resolution), and the ROOT resolves its TYPES by environment too —
-        // `browser` first (so a browser consumer gets dist/browser.d.ts), then the
-        // Node/`types` path. A single unconditional root `types` would shadow the
-        // browser condition and hand a browser consumer the Node server surface.
+        // Exact map. Two rules hold at once:
+        //   - every condition declares `types` explicitly (no implicit `.d.ts`
+        //     sibling resolution), and the ROOT resolves its TYPES by environment
+        //     too — `browser` first (so a browser consumer gets dist/browser.d.ts),
+        //     then the Node/`types` path. A single unconditional root `types` would
+        //     shadow the browser condition and hand a browser consumer the Node
+        //     server surface;
+        //   - every published subpath declares `development` BEFORE the runtime
+        //     conditions, pointing at the raw `src/*.ts` entry. Vite/Vitest/vite-node
+        //     select `development` in dev + test mode, so a workspace run evaluates
+        //     the source being edited; `node`/`import`/`default` (the dist bundles)
+        //     are what an installed production consumer gets.
         expect(manifest.exports).toEqual({
             '.': {
                 browser: {
                     types: './dist/browser.d.ts',
+                    development: './src/browser.ts',
                     default: './dist/underload-harness.browser.mjs'
                 },
                 types: './dist/index.d.ts',
+                development: './src/index.ts',
                 node: './dist/underload-harness.mjs',
                 import: './dist/underload-harness.mjs',
                 default: './dist/underload-harness.mjs'
             },
             './server': {
                 types: './dist/server/index.d.ts',
+                development: './src/server/index.ts',
                 import: './dist/underload-harness.server.mjs',
                 default: './dist/underload-harness.server.mjs'
             },
@@ -125,6 +259,7 @@ describe('package layout', () => {
             // ./../vite.config.ts emits it as a library entry named `worker`.
             './worker': {
                 types: './dist/server/workers/lane-worker.d.ts',
+                development: './src/server/workers/lane-worker.ts',
                 import: './dist/underload-harness.worker.mjs',
                 default: './dist/underload-harness.worker.mjs'
             },
@@ -135,36 +270,58 @@ describe('package layout', () => {
             // as the library entry keyed `io-worker`; renaming either side breaks the resolver.
             './io-worker': {
                 types: './dist/server/workers/io-worker.d.ts',
+                development: './src/server/workers/io-worker.ts',
                 import: './dist/underload-harness.io-worker.mjs',
                 default: './dist/underload-harness.io-worker.mjs'
             },
             './frontend': {
                 browser: {
                     types: './dist/frontend/index.d.ts',
+                    development: './src/frontend/index.ts',
                     default: './dist/underload-harness.frontend.mjs'
                 },
                 types: './dist/frontend/index.d.ts',
+                development: './src/frontend/index.ts',
                 import: './dist/underload-harness.frontend.mjs',
                 default: './dist/underload-harness.frontend.mjs'
             },
             './shared': {
                 types: './dist/shared/index.d.ts',
+                development: './src/shared/index.ts',
                 import: './dist/underload-harness.shared.mjs',
                 default: './dist/underload-harness.shared.mjs'
             },
             './package.json': './package.json'
         });
 
-        // The stable library/Node-root filenames the `main`/`module` fields promise.
-        expect(manifest.main).toBe('./dist/underload-harness.mjs');
-        expect(manifest.module).toBe('./dist/underload-harness.mjs');
-        expect(manifest.types).toBe('./dist/index.d.ts');
+        // The library/Node root is resolved from SOURCE by a dev/test host: `main`,
+        // `module` and `types` all name `src/index.ts` (the field a bundler or `tsc`
+        // reads when it has no `exports` support), while the published runtime
+        // conditions above still hand an installed consumer the dist bundle.
+        expect(manifest.main).toBe('./src/index.ts');
+        expect(manifest.module).toBe('./src/index.ts');
+        expect(manifest.types).toBe('./src/index.ts');
+
+        // Source-first coverage: every published CODE subpath carries a
+        // `development` target (../scripts/check-package-types.mjs:239-247 fails the
+        // release for the same omission). `./package.json` is a manifest re-export and
+        // intentionally has none.
+        expect(Object.keys(developmentTargetsBySubpath)).toEqual([
+            '.',
+            './server',
+            './worker',
+            './io-worker',
+            './frontend',
+            './shared'
+        ]);
     });
 
     it('publishes only targets inside "files", each with a matching extension', () => {
         // Publish coverage: an export target outside `files` is a 404 after install,
-        // and a `types` target that is not `.d.ts` (or a runtime target that is not
-        // `.mjs`) cannot resolve for a consumer.
+        // and each condition family has its own target rule — a `types` target must be
+        // an emitted `.d.ts`, a `development` target must be a real `src/*.ts` file, and
+        // a runtime target must be a bundled `.mjs`. Anything else cannot resolve for a
+        // consumer (or, for `development`, cannot be edited).
         const files = manifest.files ?? [];
         // Production self-modification needs the editable source tree beside
         // dist: the runtime compiler reads these files rather than compiled
@@ -182,27 +339,177 @@ describe('package layout', () => {
             '!src/**/.vite/**'
         ]);
 
-        const targets: { subpath: string; condition: string; target: string }[] = [];
-        const walk = (subpath: string, condition: string, value: unknown): void => {
-            if (typeof value === 'string') {
-                targets.push({ subpath, condition, target: value });
-                return;
-            }
-            for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-                walk(subpath, `${condition}.${key}`, nested);
-            }
-        };
-        for (const [subpath, value] of Object.entries(manifest.exports)) walk(subpath, subpath, value);
+        // Rows come from the module-level walk shared with the resolution tests.
+        const published = exportTargets.filter(({ subpath }) => subpath !== './package.json');
+        // 31 = root 8 (browser.types/development/default, types, development, node,
+        // import, default) + ./server 4 (types/development/import/default) + ./worker 4
+        // (T5 lane-worker executable) + ./io-worker 4 (D4 IO-worker executable) +
+        // ./frontend 7 (browser.types/development/default + types/development/import/
+        // default) + ./shared 4.
+        expect(published.length).toBe(31);
 
-        const published = targets.filter(({ subpath }) => subpath !== './package.json');
-        // 23 = root 6 (browser.types/default, types, node, import, default) + ./server 3
-        // + ./worker 3 (T5 lane-worker executable) + ./io-worker 3 (D4 IO-worker executable)
-        // + ./frontend 5 + ./shared 3.
-        expect(published.length).toBe(23);
-        for (const { condition, target } of published) {
-            expect(target.startsWith('./dist/')).toBe(true);
-            expect(target.endsWith(condition.endsWith('types') ? '.d.ts' : '.mjs')).toBe(true);
+        // Family 1 — `types`: the emitted declarations. A NodeNext consumer cannot
+        // read `src/*.ts` (its relative specifiers are extensionless), so these stay
+        // under dist/ even though the dev/test runtime does not.
+        const typeTargets = published.filter(({ condition }) => isTypesCondition(condition));
+        expect(typeTargets.map(({ target }) => target)).toEqual([
+            './dist/browser.d.ts',
+            './dist/index.d.ts',
+            './dist/server/index.d.ts',
+            './dist/server/workers/lane-worker.d.ts',
+            './dist/server/workers/io-worker.d.ts',
+            './dist/frontend/index.d.ts',
+            './dist/frontend/index.d.ts',
+            './dist/shared/index.d.ts'
+        ]);
+
+        // Family 2 — `development`: raw TypeScript entries, the dev/test answer. They
+        // must exist on disk, because the point of source-first resolution is that the
+        // file being edited IS the file a workspace run evaluates.
+        const developmentTargets = published.filter(({ condition }) => isDevelopmentCondition(condition));
+        expect(developmentTargets.map(({ target }) => target)).toEqual([
+            './src/browser.ts',
+            './src/index.ts',
+            './src/server/index.ts',
+            './src/server/workers/lane-worker.ts',
+            './src/server/workers/io-worker.ts',
+            './src/frontend/index.ts',
+            './src/frontend/index.ts',
+            './src/shared/index.ts'
+        ]);
+        for (const { target } of developmentTargets) {
+            expect(fs.existsSync(path.join(PACKAGE_ROOT, target))).toBe(true);
         }
+
+        // Family 3 — every remaining condition is a published RUNTIME target, and an
+        // installed host only ever loads the bundled `.mjs` inside `files`.
+        const runtimeTargets = published.filter(
+            ({ condition }) => !isTypesCondition(condition) && !isDevelopmentCondition(condition)
+        );
+        expect(runtimeTargets.map(({ target }) => target)).toEqual([
+            './dist/underload-harness.browser.mjs',
+            './dist/underload-harness.mjs',
+            './dist/underload-harness.mjs',
+            './dist/underload-harness.mjs',
+            './dist/underload-harness.server.mjs',
+            './dist/underload-harness.server.mjs',
+            './dist/underload-harness.worker.mjs',
+            './dist/underload-harness.worker.mjs',
+            './dist/underload-harness.io-worker.mjs',
+            './dist/underload-harness.io-worker.mjs',
+            './dist/underload-harness.frontend.mjs',
+            './dist/underload-harness.frontend.mjs',
+            './dist/underload-harness.frontend.mjs',
+            './dist/underload-harness.shared.mjs',
+            './dist/underload-harness.shared.mjs'
+        ]);
+
+        // Exact per-family counts, 8 types + 8 development + 15 runtime = 31. The
+        // prefix/extension rule of each family (dist/.d.ts, src/.ts, dist/.mjs) is
+        // already pinned by the three full-list assertions above.
+        expect([typeTargets.length, developmentTargets.length, runtimeTargets.length]).toEqual([8, 8, 15]);
+    });
+
+    it('resolves every published specifier to source, never to dist, for a dev/test host', async () => {
+        // The build-free claim in ../vitest.config.ts is only true because of the
+        // `development` conditions asserted above, so the proof goes through Vite's OWN
+        // resolver instead of a re-implementation: `createServer` runs in dev mode, where
+        // Vite selects `development` ahead of `node`/`import`/`default`. `ssr: true`
+        // matches the node test environment of ./vitest.config.ts (the client chain would
+        // answer `src/browser.ts` for the root — a different, also-source file).
+        //
+        // `configFile: false` keeps the probe about manifest conditions only, and
+        // `cacheDir` points at the repository root Temp/ (AGENTS.md scratch policy) so a
+        // nested dev server can never disturb the optimize-deps cache of the suite that is
+        // running this file.
+        const { createServer } = await import('vite');
+        const scratch = path.join(
+            fileURLToPath(new URL('../../../../Temp/', import.meta.url)),
+            `harness-resolution-${process.pid}-${Date.now()}`
+        );
+        // Absolute ids come back with platform separators; normalizing both sides keeps
+        // the comparison an exact string equality.
+        const toPosix = (value: string): string => value.replace(/\\/g, '/');
+
+        const server = await createServer({
+            configFile: false,
+            root: PACKAGE_ROOT,
+            cacheDir: scratch,
+            logLevel: 'silent'
+        });
+
+        try {
+            const resolvedIds: Record<string, string> = {};
+            const expectedIds: Record<string, string> = {};
+            for (const { specifier, source } of PUBLISHED_SPECIFIERS) {
+                const resolved = await server.pluginContainer.resolveId(specifier, undefined, { ssr: true });
+                // An unresolved specifier is recorded as 'undefined', so the exact
+                // comparison below fails instead of skipping the assertion.
+                resolvedIds[specifier] = resolved ? toPosix(resolved.id) : 'undefined';
+                expectedIds[specifier] = toPosix(path.join(PACKAGE_ROOT, source));
+            }
+
+            expect(resolvedIds).toEqual(expectedIds);
+
+            // Belt for the headline rule: no published specifier may reach the bundle.
+            expect(Object.values(resolvedIds).some((id) => id.includes('/dist/'))).toBe(false);
+        } finally {
+            await server.close();
+            fs.rmSync(scratch, { recursive: true, force: true });
+        }
+    });
+
+    it('keeps tsconfig paths and the package development targets on the same files', () => {
+        // Three mirrors of one specifier map: package.json `exports.*.development`
+        // (Vite / Vitest / vite-node), ../tsconfig.json `paths` (editors and
+        // `tsc --noEmit`), and the real files on disk. They must name the SAME file or a
+        // test silently typechecks one module while executing another. `paths` is needed
+        // at all because the published `types` conditions stay on `dist/*.d.ts`, which a
+        // workspace run must not be typed against.
+        const paths = readConfig('tsconfig.json').compilerOptions.paths as Record<string, string[]>;
+
+        // Exact key set: the six published specifiers, no stale alias left behind.
+        expect(Object.keys(paths).sort()).toEqual([
+            '@underload/harness',
+            '@underload/harness/frontend',
+            '@underload/harness/io-worker',
+            '@underload/harness/server',
+            '@underload/harness/shared',
+            '@underload/harness/worker'
+        ]);
+
+        // Exact per-subpath declaration multiset, in manifest order. This is also the
+        // "every subpath carries one" proof: a subpath without a `development` target
+        // would be missing from this object.
+        expect(developmentTargetsBySubpath).toEqual({
+            '.': ['./src/browser.ts', './src/index.ts'],
+            './server': ['./src/server/index.ts'],
+            './worker': ['./src/server/workers/lane-worker.ts'],
+            './io-worker': ['./src/server/workers/io-worker.ts'],
+            './frontend': ['./src/frontend/index.ts', './src/frontend/index.ts'],
+            './shared': ['./src/shared/index.ts']
+        });
+
+        for (const { subpath, specifier, source } of PUBLISHED_SPECIFIERS) {
+            // The top-level (non-`browser`) declaration of the condition is the entry a
+            // host resolves by bare name; `paths` mirrors exactly that one.
+            const topLevel = exportTargets
+                .filter(({ subpath: row, condition }) => row === subpath && condition === `${subpath}.development`)
+                .map(({ target }) => target);
+
+            expect(topLevel).toEqual([source]);
+            expect(paths[specifier]).toEqual(topLevel);
+        }
+
+        // The nested `browser` declarations are the other half of the mirror: the
+        // browser-safe roots, never the Node server surface.
+        const browserDevelopment = exportTargets
+            .filter(({ condition }) => condition.endsWith('browser.development'))
+            .map(({ subpath, target }) => `${subpath} -> ${target}`);
+        expect(browserDevelopment).toEqual([
+            '. -> ./src/browser.ts',
+            './frontend -> ./src/frontend/index.ts'
+        ]);
     });
 
     it('splits the frontend and server launches without starting one from the other', () => {
@@ -595,14 +902,6 @@ describe('service discovery contract', () => {
 });
 
 describe('declaration build', () => {
-    // tsconfig files are JSONC; comments are stripped before parsing.
-    const readConfig = (relativePath: string): Record<string, any> =>
-        JSON.parse(
-            readText(relativePath)
-                .replace(/\/\*[\s\S]*?\*\//g, '')
-                .replace(/^\s*\/\/.*$/gm, '')
-        ) as Record<string, any>;
-
     it('emits the inner tree without the root entries, then the entries separately', () => {
         // Why the split: tsc references an inferred type through the shortest
         // re-export path. With `src/index.ts` in the inner program, `Tool` in

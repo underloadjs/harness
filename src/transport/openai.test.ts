@@ -178,6 +178,59 @@ describe('openAICompatible', () => {
         expect(JSON.stringify(body)).not.toContain('let me look');
     });
 
+    // The provider answers a non-object `function.arguments` with a bare
+    // `500 Internal Server Error` for the WHOLE request, so a tool call that a
+    // token-capped generation cut off mid-JSON would otherwise fail every later
+    // request on the thread. The transcript keeps the broken text (it is what the
+    // model actually sent, and the UI shows it); the wire gets a valid object.
+    it('replaces non-object tool-call arguments with {} on the wire', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        const broken = ['{"q":"once upon', '[1,2]', '42', '"a query"', 'null', 'true', ''];
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: broken.map((args, index) => ({
+                    role: 'assistant' as const,
+                    content: '',
+                    toolCalls: [{ id: `c${index}`, name: 'search', arguments: args }]
+                }))
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages.map((m: { tool_calls: [{ function: { arguments: string } }] }) =>
+            m.tool_calls[0].function.arguments
+        )).toEqual(broken.map(() => '{}'));
+    });
+
+    it('passes object tool-call arguments through byte-for-byte', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        const intact = ['{"q":"news"}', '{}', '{"a":{"b":[1,2]}}'];
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: intact.map((args, index) => ({
+                    role: 'assistant' as const,
+                    content: '',
+                    toolCalls: [{ id: `c${index}`, name: 'search', arguments: args }]
+                }))
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(
+            body.messages.map((m: { tool_calls: [{ function: { arguments: string } }] }) =>
+                m.tool_calls[0].function.arguments
+            )
+        ).toEqual(intact);
+    });
+
     it('resolves a getter api key per request', async () => {
         const fetchMock = stubFetch(['data: [DONE]\n\n']);
 

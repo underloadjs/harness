@@ -41,6 +41,7 @@ import {
     contextBarToneOf,
     contextBlockCharsOf,
     contextBlockDurationOf,
+    contextLatestTextNodeIdOf,
     contextSegmentLabelOf,
     contextSegmentTitleOf,
     contextTailCaptionOf,
@@ -546,7 +547,7 @@ describe('contextTailOf', () => {
     const answerBlock = (chars: number) =>
         prompt({ id: '0-assistant-5', kind: 'assistant', name: 'answer', chars, at: undefined });
 
-    it('names the last reasoning window as the tail and marks the wire text as a preview', () => {
+    it('paints a thinking tail from the WHOLE wire text, and states a bounded body honestly (R1b)', () => {
         // Thinking IS the newest block, so it is the one body the section prints. This
         // fixture sends NO `section.tail`, which is the pre-T23 producer: the fallback reads
         // the recorded order itself and reports `designated: false`.
@@ -557,28 +558,41 @@ describe('contextTailOf', () => {
             // exact `chars`, which is the same invariant-5 number.
             blockId: undefined,
             text: preview,
-            // T26 (R26): 40 characters fit the window, so the painted body is the wire text
-            // verbatim — the suffix rule adds no marker to a body it did not have to cut.
+            // T27 (R1b): the thinking pane is a scroll box, so it paints the body the wire
+            // delivered with NO render-side window and NO leading `…` of our own. This producer
+            // bounded the wire itself (40 characters of a 1,234-character round, `redacted`),
+            // and T27 (review, P2) keeps the pair honest rather than claiming the record: the
+            // pane shows 40, the block is 1,234, and the caption says so and points at the
+            // segment. The whole-text case — the one the live server produces — is the test
+            // below, where the two figures agree and the clause disappears.
             renderText: preview,
             shownChars: preview.length,
             chars: 1_234,
             truncated: true,
             designated: false
         });
+
+        // The pointer clause survives exactly where it is owed: nothing about the R1b box may
+        // let a 40-character body read as a 1,234-character one.
+        expect(contextTailCaptionOf(contextTailOf(flowOf([thinking()], [prompt()]))!)).toBe(
+            `thinking · showing ${preview.length} of 1,234 characters — click the segment for the exact text`
+        );
     });
 
-    it('paints the LATEST window of a prose body longer than the bound (R26)', () => {
-        // A designated carrier streams the WHOLE text, so this is exactly what a live thinking
-        // window looks like: 530 recorded characters, 320 of them painted, and the 320 are the
-        // NEWEST. The old behaviour kept the first 320, which is the static-text complaint.
+    it('paints the LATEST window of an ANSWER body longer than the bound (R26 kept)', () => {
+        // The rule R26 established survives on the surface it was always about: an answer
+        // prints INLINE in the flow, so an over-long one keeps its newest 320 characters and
+        // its caption admits the cut. T27 (R1b) moved only the thinking body, which now lives
+        // in a scroll box and is windowed by nothing (see the pair of tests below).
         const streamed = `${'head-'.repeat(10)}${'t'.repeat(480)}`;
 
         expect(streamed.length).toBe(530);
 
         const tail = contextTailOf(
-            flowOf([{ kind: 'reasoning', id: '3', text: streamed, chars: streamed.length } as never], [think({ chars: streamed.length })])
+            flowOf([{ kind: 'text', id: '5', text: streamed, chars: streamed.length, committed: true } as never], [think({ chars: streamed.length })])
         );
 
+        expect(tail?.kind).toBe('assistant');
         expect(tail?.truncated).toBe(false);
         expect(tail?.chars).toBe(530);
         expect(tail?.shownChars).toBe(CONTEXT_TAIL_PREVIEW_CHARS);
@@ -587,8 +601,35 @@ describe('contextTailOf', () => {
         expect(tail?.text).toBe(streamed);
         // And the caption states the window, not the whole.
         expect(contextTailCaptionOf(tail!)).toBe(
-            `thinking · showing ${CONTEXT_TAIL_PREVIEW_CHARS} of 530 characters — click the segment for the exact text`
+            `answer · showing ${CONTEXT_TAIL_PREVIEW_CHARS} of 530 characters — click the segment for the exact text`
         );
+    });
+
+    it('paints a thinking body past the bound WHOLE, with no marker and no window (R1b)', () => {
+        // The exact 530-character case above, as THINKING: nothing is cut, so the pane shows
+        // the opening `head-` the R26 window used to drop, `shownChars` equals the recorded
+        // `chars`, and the caption states the length alone — the user's "showing x of y"
+        // complaint, answered at the model layer rather than in the stylesheet.
+        const streamed = `${'head-'.repeat(10)}${'t'.repeat(480)}`;
+
+        const tail = contextTailOf(
+            flowOf([{ kind: 'reasoning', id: '3', text: streamed, chars: streamed.length } as never], [think({ chars: streamed.length })])
+        );
+
+        expect(tail).toEqual({
+            kind: 'reasoning',
+            nodeId: '3',
+            blockId: '0-reasoning-3',
+            text: streamed,
+            renderText: streamed,
+            shownChars: 530,
+            chars: 530,
+            truncated: false,
+            designated: false
+        });
+        expect(tail?.renderText).toContain('head-');
+        expect(tail?.renderText).not.toContain(CONTEXT_TEXT_ELLIPSIS);
+        expect(contextTailCaptionOf(tail!)).toBe('thinking · 530 characters');
     });
 
     it('takes the exact figure and the provenance id from the section context list', () => {
@@ -596,7 +637,13 @@ describe('contextTailOf', () => {
 
         expect(tail?.blockId).toBe('0-reasoning-3');
         expect(tail?.chars).toBe(2_048);
+        // `truncated` is the WIRE's fact (T27 review, P2): this producer sent a 40-character
+        // preview of a 2,048-character window and marked it `redacted`, so the box holds fewer
+        // characters than the record and the tail says so. R1b removed only the renderer's OWN
+        // window — it never let the pane claim bytes that did not arrive.
         expect(tail?.truncated).toBe(true);
+        expect(tail?.shownChars).toBe(preview.length);
+        expect(tail?.renderText).toBe(preview);
     });
 
     it('names the current answer as the assistant tail and says it is whole', () => {
@@ -837,8 +884,10 @@ describe('contextTailOf, from the server designation', () => {
             designated: true
         });
 
-        // A prose designation whose node the wire bounded is still reported honestly: the
-        // server's marker wins, because that is what the bytes on screen ARE.
+        // A prose designation whose node the wire bounded is still painted from the wire's own
+        // bytes with no render window of ours on top (T27, R1b) — and the figures stay honest
+        // about how much that was (T27 review, P2): 9 characters painted of a recorded 900,
+        // `truncated` true, so the caption keeps its segment pointer.
         const bounded = contextTailOf(
             flowOf(
                 [{ kind: 'reasoning', id: '3', text: 'a preview', chars: 900, redacted: true } as never],
@@ -847,7 +896,30 @@ describe('contextTailOf, from the server designation', () => {
             )
         );
 
-        expect(bounded).toMatchObject({ truncated: true, chars: 900, designated: true });
+        expect(bounded).toMatchObject({
+            truncated: true,
+            chars: 900,
+            shownChars: 9,
+            renderText: 'a preview',
+            designated: true
+        });
+        expect(contextTailCaptionOf(bounded as never)).toBe(
+            'thinking · showing 9 of 900 characters — click the segment for the exact text'
+        );
+
+        // The same shortness WITHOUT the wire's own marker: a `chars` figure bigger than the
+        // text the producer sent is the same fact stated differently, and it reads the same
+        // way. A WHOLE body — the case above, and every designated carrier the live server
+        // sends — still reports `truncated: false`, `shownChars === chars`, and no clause.
+        const shortWithoutMarker = contextTailOf(
+            flowOf(
+                [{ kind: 'reasoning', id: '3', text: 'a preview', chars: 900 } as never],
+                [prompt(), think({ id: '0-reasoning-3', chars: 900 })],
+                { tail: { kind: 'reasoning', nodeId: '3', blockId: '0-reasoning-3', chars: 900, truncated: false } }
+            )
+        );
+
+        expect(shortWithoutMarker).toMatchObject({ truncated: true, chars: 900, shownChars: 9, renderText: 'a preview' });
     });
 
     it('falls back to the recorded order when the designation names a node that is gone', () => {
@@ -871,15 +943,17 @@ describe('contextTailOf, from the server designation', () => {
         // The two stated exceptions (R23): a section whose only recorded text is the prompt
         // and its instructions has NO body at all, however long either one is.
         expect(contextTailOf(flowOf([], [prompt({ chars: 90_000 }), prompt({ id: '0-system-instructions', kind: 'system', name: 'instructions', chars: 4_000 })]))).toBeUndefined();
-        // And the prose of a designated answer still owns the flow block, not this body.
-        const tail = contextTailOf(
-            flowOf([{ kind: 'text', id: '5', text: 'the answer', chars: 10, committed: true } as never], [prompt()], {
-                tail: { kind: 'assistant', nodeId: '5', chars: 10, truncated: false }
-            })
+        // And the prose of a designated answer still owns the flow block, not this body. R2
+        // states the rule by POSITION, not by designation: the section's newest response is
+        // the one that prints, whatever block the tail currently paints.
+        const answerSection = flowOf(
+            [{ kind: 'text', id: '5', text: 'the answer', chars: 10, committed: true } as never],
+            [prompt()],
+            { tail: { kind: 'assistant', nodeId: '5', chars: 10, truncated: false } }
         );
 
-        expect(contextTailShowsProse(tail, '5')).toBe(true);
-        expect(contextTailShowsProse(tail, '3')).toBe(false);
+        expect(contextTailShowsProse(answerSection, '5')).toBe(true);
+        expect(contextTailShowsProse(answerSection, '3')).toBe(false);
     });
 });
 
@@ -887,6 +961,14 @@ describe('contextTailCaptionOf', () => {
     // A hand-written tail now states BOTH figures, which is exactly the pair the caption
     // reports (T26, R26): `chars` is the invariant-5 recorded length, `shownChars` is the
     // length the PANE paints — whether the wire bounded it or the render window did.
+    //
+    // T27 (R1b + review P2) note: these fixtures are hand-built and the caption function itself
+    // is unchanged, so a `reasoning` tail here may state any pair. What `contextTailOf` can
+    // actually PRODUCE for a thinking tail is pinned in its own describes above: a whole
+    // (designated-carrier) body gives `shownChars === chars`, `truncated: false` and the plain
+    // `thinking · N characters` line, and a body the PRODUCER bounded gives
+    // `shownChars = text.length < chars`, `truncated: true` and the clause below — because the
+    // scroll box cannot paint bytes that never arrived.
     const preview = 'a bounded preview of the thinking window';
     const wholeText = 'every character of this window, streamed in full';
 
@@ -952,16 +1034,60 @@ describe('contextTailCaptionOf', () => {
 });
 
 describe('contextTailShowsProse', () => {
-    it('prints the tail answer and nothing else, while an undefined tail prints nothing', () => {
-        const tail = contextTailOf({
-            ...section('t1:0', [prompt()]),
-            nodes: [{ kind: 'text', id: '5', text: 'a', chars: 1, committed: true }]
-        } as never);
+    // T27 (R2): the rule is POSITIONAL now. The section's NEWEST `kind: 'text'` node prints —
+    // whether the tail is an answer, a thinking window or a recorded call — and every older
+    // response prints nothing. `contextTailOf` no longer decides it, which is why the argument
+    // is the section rather than the tail.
+    const flowOf = (nodes: never[], overrides: Record<string, unknown> = {}) =>
+        ({ ...section('t1:0', [prompt()]), nodes, ...overrides }) as never;
 
-        expect(contextTailShowsProse(tail, '5')).toBe(true);
-        // An earlier window of the SAME section is a segment now (R23).
-        expect(contextTailShowsProse(tail, '2')).toBe(false);
-        // A thinking tail owns the body, so no prose block prints beside it.
+    const text = (id: string): never =>
+        ({ kind: 'text', id, text: 'a', chars: 1, committed: true }) as never;
+
+    const reasoning = (id: string): never => ({ kind: 'reasoning', id, text: 't', chars: 1 }) as never;
+
+    const step = (id: string): never =>
+        ({ kind: 'tool', id, turnId: 't1', sectionId: 't1:0', callId: `call-${id}`, name: 'read', state: 'ok', detail: { stepId: id, hasResult: true, truncated: true } }) as never;
+
+    it('names the section\'s newest text node, and nothing else', () => {
+        expect(contextLatestTextNodeIdOf(flowOf([reasoning('3'), text('5'), text('7')]))).toBe('7');
+        // A notice or a recorded call after it does not move the answer: neither is a response.
+        expect(contextLatestTextNodeIdOf(flowOf([text('5'), step('7'), reasoning('8')]))).toBe('5');
+        expect(contextLatestTextNodeIdOf(flowOf([reasoning('3'), step('7')]))).toBeUndefined();
+        expect(contextLatestTextNodeIdOf(flowOf([]))).toBeUndefined();
+        expect(contextLatestTextNodeIdOf(undefined)).toBeUndefined();
+    });
+
+    it('keeps the newest response printed while an older one withdraws', () => {
+        const flow = flowOf([text('2'), reasoning('3'), text('5')]);
+
+        expect(contextTailShowsProse(flow, '5')).toBe(true);
+        // An earlier response of the SAME section is a segment now (R23 kept this half).
+        expect(contextTailShowsProse(flow, '2')).toBe(false);
+        // A reasoning node is never addressed this way: its body is the tail block.
+        expect(contextTailShowsProse(flow, '3')).toBe(false);
+    });
+
+    it('prints the intermediate response above a thinking or call tail (R2)', () => {
+        // The defect this replaced: R23 hid the reply the moment a newer block took the tail,
+        // so a running turn read as a bare strip over a tool pane with no reply above it.
+        const thinkingTail = flowOf([text('5'), reasoning('8')], {
+            tail: { kind: 'reasoning', nodeId: '8', blockId: '0-reasoning-8', chars: 1, truncated: false }
+        });
+
+        expect(contextTailShowsProse(thinkingTail, '5')).toBe(true);
+
+        const callTail = flowOf([text('5'), step('7')], {
+            tail: { kind: 'tool', nodeId: '7', blockId: '0-tool-7', chars: 4, truncated: false, args: 'args', result: 'here' }
+        });
+
+        expect(contextTailShowsProse(callTail, '5')).toBe(true);
+        // And the answer is still the newest response when the designation names an older one.
+        expect(contextTailShowsProse(flowOf([text('5'), text('9')]), '9')).toBe(true);
+    });
+
+    it('prints nothing for a section with no response, or no section at all', () => {
+        expect(contextTailShowsProse(flowOf([reasoning('3')]), '5')).toBe(false);
         expect(contextTailShowsProse(undefined, '5')).toBe(false);
     });
 });

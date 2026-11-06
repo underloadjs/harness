@@ -1349,10 +1349,10 @@ describe('context bar (R6/R8)', () => {
             { type: 'attempt_commit', agent: 'one', attempt: 1, maxAttempts: 2 } as HarnessEvent
         ]);
 
-        // A prose window closed by a tool call is no longer the section's newest block, so
-        // it is bounded in THAT frame — one patch, exact length, and the marker the client
-        // needs (no length comparison to infer it). The order within the frame is the
-        // contract: the new block's own ops first, then the body it superseded, then the
+        // A prose window closed by a tool call is no longer the section's newest block, but R2
+        // (T1) keeps an ANSWER whole until a newer answer replaces it, so nothing bounds `n1` in
+        // this frame: the frame carries the call's own ops and the designation, and no body patch.
+        // The order within the frame is still the contract: the new block's own ops first, then the
         // designation, so a client never holds a tail naming a node it has not received.
         expect(result.ops[2]).toEqual([
             { op: 'step:set', turnId: 'turn-1', sectionId: 'turn-1:0', step: expect.objectContaining({ id: '2', name: 'read' }) },
@@ -1361,6 +1361,37 @@ describe('context bar (R6/R8)', () => {
                 turnId: 'turn-1',
                 sectionId: 'turn-1:0',
                 block: expect.objectContaining({ id: '0-tool-2', kind: 'tool', chars: 2, argsChars: 2, state: 'running' })
+            },
+            {
+                op: 'tail:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                tail: { kind: 'tool', nodeId: '2', blockId: '0-tool-2', chars: 2, truncated: false, args: '{}' }
+            }
+        ]);
+
+        // The redaction is paid for exactly once, in the frame the NEWER answer is recorded: that
+        // answer's own ops, then the body it superseded, then the designation.
+        expect(result.ops[4]).toEqual([
+            {
+                op: 'node:insert',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                node: { kind: 'text', id: 'n4', text: '', committed: false, chars: 0 }
+            },
+            {
+                op: 'context:add',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                block: expect.objectContaining({ id: '0-assistant-4', kind: 'assistant', chars: 0 })
+            },
+            { op: 'node:append', turnId: 'turn-1', sectionId: 'turn-1:0', nodeId: 'n4', delta: 'b'.repeat(400) },
+            {
+                op: 'context:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                blockId: '0-assistant-4',
+                patch: { chars: 400 }
             },
             {
                 op: 'node:set',
@@ -1373,7 +1404,7 @@ describe('context bar (R6/R8)', () => {
                 op: 'tail:set',
                 turnId: 'turn-1',
                 sectionId: 'turn-1:0',
-                tail: { kind: 'tool', nodeId: '2', blockId: '0-tool-2', chars: 2, truncated: false, args: '{}' }
+                tail: { kind: 'assistant', nodeId: 'n4', blockId: '0-assistant-4', chars: 400, truncated: false }
             }
         ]);
 

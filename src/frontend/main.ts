@@ -24,6 +24,9 @@
 //   - left rail  — harnesses (built-ins and user-created) plus the create form and
 //                  the `left` tool-panel host. The endpoint/model settings are NOT
 //                  here any more (R4/T4): they open from the top-right status pill;
+//                  the rail's width is the reader's: a `role="separator"` seam on its
+//                  inner edge drags it (ui/rail-resize.ts) and nothing is saved, so a
+//                  reload is back to the stylesheet default;
 //   - centre     — the selected harness title with the compact SESSION CYCLER and its `+`
 //                  beside it (T9: one pill names the conversation on screen and steps to
 //                  the next one, and the `+` starts a fresh conversation; the saved-
@@ -40,7 +43,8 @@
 //                  shared modal. There is no tab strip (R3);
 //   - right rail — the tool-contributed SCRATCH BOARD (primary panel host), and nothing
 //                  else since T3/R1 moved the session directory out of it (T9 keeps that
-//                  directory in the title dialog). On a
+//                  directory in the title dialog). It is resizable from its own seam,
+//                  like the left rail. On a
 //                  phone it opens from the floating `.scratch-fab` (T3/R3), and since T8
 //                  it opens in the SAME left-hand sidebar slot as the harness drawer: the
 //                  phone has one sidebar, showing whichever trigger was pressed last.
@@ -330,6 +334,10 @@ import { looksLikeJson, prettyJson } from './ui/markdown';
 import { createPayloadViewer, paintCodeBlock } from './ui/tools';
 import { applyPanels, createPanelHost, mediaOfTurns, panelKeyOf, mediaOfSummaries } from './ui/panels';
 import type { PanelMedia, PanelSummarySource } from './ui/panels';
+// The two draggable seams between the chat column and the rails (styles.css
+// `.rail-resizer`). They drive the shell's outer grid tracks and store nothing, so a
+// reload repaints the stylesheet's default rail widths.
+import { createRailResizers } from './ui/rail-resize';
 import type { FilePreviewReader, FilePreviewResult, FilePreviewResolver } from './ui/file-preview';
 // The preview dialog owns the basename-resolution RULES (exact-name filter,
 // shallowest-first order); the shell below only supplies the `glob` round-trip.
@@ -4692,7 +4700,12 @@ chipObserver.observe(input, { childList: true, subtree: true });
 // changes the wrap width — and possibly the cap itself when the 860px breakpoint is
 // crossed — without a keystroke, so the last inline height would clip the text.
 // Re-measure; the browser resizes the element before this listener runs.
-window.addEventListener('resize', () => {
+//
+// Named, not inlined, because a rail drag reflows the SAME column: the seams below
+// change the chat's width without a window resize, and everything measured against it
+// (the composer's grown height, the scratch button's anchor, the notched label) has to
+// be re-read the same way.
+const reflowLayout = (): void => {
     autoGrow();
     // R3 (T3): explicit, not merely via `autoGrow`, so the scratch button's anchor is
     // refreshed even in a host where the composer has no editable content to grow.
@@ -4703,7 +4716,9 @@ window.addEventListener('resize', () => {
     // only signal for that swap, so the label has to be re-measured here or it drifts
     // off the text column the moment the pill shrinks.
     paintComposerTarget();
-});
+};
+
+window.addEventListener('resize', reflowLayout);
 
 
 // Tool-panel hosts (R21.3). Three named locations, one renderer:
@@ -4754,6 +4769,19 @@ rightRail.append(scratchSection);
 const railBackdrop = el('div', 'rail-backdrop');
 railBackdrop.setAttribute('aria-hidden', 'true');
 
+// The two seams (user request: "the left and right panel bars should be draggable").
+// They are grid children, NOT children of a rail: a rail is a scroll box, so a handle
+// inside it would slide away with the content, and only a track sibling can change the
+// track the rail is sized by. Each one writes `--rail-left-width` / `--rail-right-width`
+// on `shell` while dragged; CSS owns the layout and the fallbacks, nothing is saved, so
+// a reload (or a double-click on a seam) is back to the default widths.
+const railResizers = createRailResizers({
+    shell,
+    // Dragging a rail reflows the chat column without a window resize, so the composer
+    // and everything measured off it re-read their geometry exactly as they do on resize.
+    onWidthChange: reflowLayout
+});
+
 // R3 (T3): the scratch FAB is mounted in the shell but is NOT a grid item — CSS makes it
 // `position: fixed`, so it takes no track and cannot disturb the three-column layout.
 // T8 changed the stacking decision: the button is painted ABOVE the backdrop (2) and both
@@ -4762,7 +4790,7 @@ railBackdrop.setAttribute('aria-hidden', 'true');
 // drawers in the single sidebar slot instead of the press being swallowed as an outside
 // dismiss. DOM order still puts it before the backdrop; the layering is CSS's, and the
 // backdrop keeps its own click handler for every other outside press.
-shell.append(leftRail, center, rightRail, scratchFab, railBackdrop);
+shell.append(leftRail, railResizers.left, center, railResizers.right, rightRail, scratchFab, railBackdrop);
 app.append(topbar, shell);
 
 // Which phone rail is expanded, if any. Desktop/tablet ignore it entirely (their

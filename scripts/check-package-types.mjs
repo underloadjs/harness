@@ -11,6 +11,11 @@
 //       (`customConditions: ["browser"]`) must resolve `dist/browser.d.ts` — client
 //       API present, Node server API absent — while a Node consumer resolves
 //       `dist/index.d.ts` and sees both.
+//   F3  the dev/test CONDITION must resolve SOURCE, not the bundle: every published
+//       subpath declares a `development` target under `./src/*.ts`, so a workspace
+//       test run, a Vite dev server, and a consuming app in dev mode all evaluate the
+//       module being edited instead of a stale `dist/` (raw `.ts` entries are also
+//       what a bundler tree shakes per module). `dist/` stays npm-distribution only.
 //
 // The consumers import the package BY NAME from a copied, published shape of the
 // package (package.json + `files` contents) inside a scratch `node_modules`, so the
@@ -202,10 +207,44 @@ if (missingDependencies.length > 0) {
     );
 }
 
+// 1d. Condition-family extension rule.
+//
+// `development` (the condition Vite/Vitest/vite-node select in dev + test mode) must
+// resolve to the RAW TypeScript entry under `src/`: that is what makes a workspace
+// test, a dev server, or a consuming app evaluate the module being edited instead of
+// a stale bundle, and per-module `.ts` entries are what let a bundler tree shake.
+// Every other condition is the published npm contract, which is bundle-only: `types`
+// points at the emitted `.d.ts` (a NodeNext consumer cannot read src/*.ts, whose
+// relative specifiers are extensionless) and the runtime conditions point at the
+// emitted `.mjs`. So `dist/` stays the distribution artifact and nothing else.
+const isSourceCondition = (condition) => condition.endsWith('development');
+const isTypesCondition = (condition) => condition.endsWith('types');
+
 for (const { subpath, condition, target } of targets) {
     if (isManifestSubpath(subpath)) continue;
-    if (condition.endsWith('types') && !target.endsWith('.d.ts')) fail(`${condition} must point at a .d.ts: ${target}`);
-    if (!condition.endsWith('types') && !target.endsWith('.mjs')) fail(`${condition} must point at a .mjs: ${target}`);
+    if (isTypesCondition(condition)) {
+        if (!target.endsWith('.d.ts')) fail(`${condition} must point at a .d.ts: ${target}`);
+        continue;
+    }
+    if (isSourceCondition(condition)) {
+        if (!target.startsWith('./src/') || !target.endsWith('.ts')) {
+            fail(`${condition} must point at a raw ./src/*.ts entry: ${target}`);
+        }
+        continue;
+    }
+    if (!target.endsWith('.mjs')) fail(`${condition} must point at a .mjs: ${target}`);
+}
+
+// 1e. Every published subpath must offer its source entry. A subpath without a
+// `development` target silently falls back to the bundle in dev/test runs, which is
+// the drift this check exists to prevent (a stale `dist/` answering the tests).
+const subpaths = new Set(targets.filter(({ subpath }) => !isManifestSubpath(subpath)).map(({ subpath }) => subpath));
+const sourceSubpaths = new Set(
+    targets.filter(({ condition }) => isSourceCondition(condition)).map(({ subpath }) => subpath)
+);
+const withoutSource = [...subpaths].filter((subpath) => !sourceSubpaths.has(subpath));
+if (withoutSource.length > 0) {
+    fail(`export subpath(s) with no ./src/*.ts "development" target: ${withoutSource.join(', ')}`);
 }
 
 // 2. The built declarations must already be in their fixed state.
