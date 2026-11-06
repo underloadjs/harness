@@ -1489,7 +1489,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "shell",
     metadata: {
         name: "shell",
-        description: "Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown. `timeoutMs` bounds the run (integer milliseconds, 1-600000, default 120000); a command that exceeds it is killed together with its process tree on a best-effort basis and the result reports `timedOut: true`. Output is capped at 128 KiB of stdout and 16 KiB of stderr, with `truncated: true` when either cap was applied, and an aborted run reports `aborted: true`.",
+        description: "Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown. On Windows (cmd.exe) a multi-line command is chained with `&&` before it runs, because cmd.exe would otherwise execute ONLY its first line and discard the rest; a failing line stops the ones after it. `timeoutMs` bounds the run (integer milliseconds, 1-600000, default 120000); a command still running when it fires is killed together with its process tree on a best-effort basis - `taskkill /T` cannot reach detached, `start`-spawned, or reparented descendants, so those may survive holding ports and CPU - and the result reports `timedOut: true` with `exitCode: -1`; a run that finished on its own is never reported as timed out. Cancelling the run reports `aborted: true`. stdin is closed by default so a command that reads it gets EOF at once instead of hanging, and `input` feeds it instead. Output is capped at 128 KiB of stdout and 16 KiB of stderr, keeping the BEGINNING and the END with an in-band `[... N bytes omitted ...]` marker, because build and test output is read from the end: `stdoutTruncated`/`stderrTruncated` say which stream was cut, `stdoutBytes`/`stderrBytes` give each stream true size, `stdoutDroppedBytes`/`stderrDroppedBytes` what the marker replaced, and `outputPath` names a file holding the complete output whenever either stream was cut (`saveOutput: false` skips it). `durationMs` reports how long the run took and `exitSignal` the signal a kill produced.",
         tags: [
             "shell",
             "command",
@@ -1500,7 +1500,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             properties: {
                 command: {
                     type: "string",
-                    description: "Shell command to run, e.g. \"git status --short\"."
+                    description: "Shell command to run, e.g. \"git status --short\". On Windows, newline-separated lines are chained with `&&`; on POSIX they run as written."
                 },
                 cwd: {
                     type: "string",
@@ -1511,7 +1511,15 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     minimum: 1,
                     maximum: 600000,
                     default: 120000,
-                    description: "Wall-clock limit in milliseconds, 1-600000. Defaults to 120000 (2 minutes); the process tree is killed when it is exceeded."
+                    description: "Wall-clock limit in milliseconds, 1-600000. Defaults to 120000 (2 minutes); the process tree is killed when it is exceeded and the run already finished is not reported as timed out."
+                },
+                input: {
+                    type: "string",
+                    description: "Bytes fed to stdin, then EOF. Omit it and stdin is closed, so a command that reads stdin does not block until the timeout."
+                },
+                saveOutput: {
+                    type: "boolean",
+                    description: "When a stream is cut, also write the complete output to a file and report it as `outputPath`. Defaults to true; false keeps the result in memory only."
                 }
             },
             required: [

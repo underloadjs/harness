@@ -3,28 +3,38 @@
 // What this pins, exactly:
 //   - ordinary small commands return the real exit code and exact captured text;
 //   - a non-zero exit stays DATA (it is not thrown);
-//   - stdout/stderr are capped at 128 KiB / 16 KiB with an explicit `truncated`
-//     flag, and the tail is dropped;
-//   - UTF-8 split across stream chunks is decoded intact (the old `text += chunk`
-//     concatenation corrupted it);
+//   - stdout/stderr are capped at 128 KiB / 16 KiB, keeping the BEGINNING AND THE
+//     END with an in-band omission marker, and each stream reports its own flag,
+//     true byte size, and dropped byte count;
+//   - a cut stream is teed whole to `outputPath` so grep/read can recover the
+//     middle, and `saveOutput: false` skips the file;
+//   - a multi-line command runs EVERY line on Windows (cmd.exe would otherwise
+//     execute only the first and discard the rest, silently losing `exit 9`);
+//   - stdin is closed by default (a command that reads it gets EOF instead of
+//     hanging to the timeout) and `input` feeds it;
+//   - a run that finished on its own is never reported as `timedOut`, even when the
+//     timer fires in the same event-loop batch as its exit;
+//   - UTF-8 split across stream chunks is decoded intact;
 //   - a timeout and an AbortSignal both terminate the run and report
 //     `timedOut`/`aborted` with exitCode -1;
 //   - spawn/setup failures (a missing cwd here) reject instead of being reported
-//     as a command result; blank commands and invalid timeout values are refused.
+//     as a command result; blank commands and invalid timeout/option values are
+//     refused.
 //
 // Every command is a real child process running `node -e …`, so the assertions
 // describe the actual shell and stream behaviour rather than a mock. Fixtures are
 // unnecessary: the commands print fixed strings.
 
 import { afterAll, describe, expect, it } from 'vitest';
-import { access, rm } from 'node:fs/promises';
+import { access, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
     COMMAND_DEFAULT_TIMEOUT_MS,
     COMMAND_MAX_TIMEOUT_MS,
     shell,
-    type CommandRunParameters
+    type CommandRunParameters,
+    type CommandRunResult
 } from './shell.tool';
 import { COMMAND_STDERR_MAX_BYTES, COMMAND_STDOUT_MAX_BYTES } from './boundedText';
 import { HarnessError } from '../../util';
@@ -67,40 +77,77 @@ afterAll(async () => {
 const executeWithSignal = (parameters: CommandRunParameters, signal: AbortSignal) =>
     shell.execute({ parameters, signal } as unknown as Parameters<typeof shell.execute>[0]);
 
+// The result shape minus the two timing fields, which no assertion can pin to an
+// exact number. `toEqual` on the whole object is what keeps a new field from
+// appearing silently; these two are checked by range instead.
+const settled = (result: CommandRunResult): Omit<CommandRunResult, 'durationMs' | 'linesChained'> => {
+    const { durationMs: _durationMs, linesChained: _linesChained, ...rest } = result;
+
+    return rest;
+};
+
 describe('shell', () => {
     it('returns the exact result for a small command', async () => {
-        await expect(shell({ command: 'node -e "process.stdout.write(\'hello\')"' })).resolves.toEqual({
+        const result = await shell({ command: 'node -e "process.stdout.write(\'hello\')"' });
+
+        expect(settled(result)).toEqual({
             exitCode: 0,
             stdout: 'hello',
             stderr: '',
             truncated: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutBytes: 5,
+            stderrBytes: 0,
+            stdoutDroppedBytes: 0,
+            stderrDroppedBytes: 0,
+            outputPath: null,
             timedOut: false,
-            aborted: false
+            aborted: false,
+            exitSignal: null
         });
+
+        expect(result.durationMs).toBeGreaterThanOrEqual(0);
+        expect(result.linesChained).toBe(0);
     });
 
     it('captures stderr separately from stdout', async () => {
-        await expect(
-            shell({ command: 'node -e "process.stderr.write(\'boom\')"' })
-        ).resolves.toEqual({
+        const result = await shell({ command: 'node -e "process.stderr.write(\'boom\')"' });
+
+        expect(settled(result)).toEqual({
             exitCode: 0,
             stdout: '',
             stderr: 'boom',
             truncated: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutBytes: 0,
+            stderrBytes: 4,
+            stdoutDroppedBytes: 0,
+            stderrDroppedBytes: 0,
+            outputPath: null,
             timedOut: false,
-            aborted: false
+            aborted: false,
+            exitSignal: null
         });
     });
 
     it('returns a non-zero exit as data instead of throwing', async () => {
-        await expect(shell({ command: 'node -e "process.exit(3)"' })).resolves.toEqual({
-            exitCode: 3,
-            stdout: '',
-            stderr: '',
-            truncated: false,
-            timedOut: false,
-            aborted: false
-        });
+        const result = await shell({ command: 'node -e "process.exit(3)"' });
+
+        expect(result.exitCode).toBe(3);
+        expect(result.timedOut).toBe(false);
+        expect(result.aborted).toBe(false);
+    });
+
+    it('normalises the Windows unsigned exit code to the signed convention', async () => {
+        // `process.exit(-1)` reaches Node as 4294967295 on Win32 and 255 on POSIX.
+        // Both mean the same thing to a model, so both read as -1.
+        const result = await shell({ command: 'node -e "process.exit(-1)"' });
+
+        expect(result.exitCode).toBe(-1);
+        expect(result.timedOut).toBe(false);
+        expect(result.aborted).toBe(false);
     });
 
     it('decodes a UTF-8 codepoint split across stream chunks', async () => {
@@ -109,51 +156,230 @@ describe('shell', () => {
         const command =
             'node -e "process.stdout.write(Buffer.from([0xE2,0x82])); setTimeout(() => process.stdout.write(Buffer.from([0xAC])), 100)"';
 
-        await expect(shell({ command })).resolves.toEqual({
-            exitCode: 0,
-            stdout: '€',
-            stderr: '',
-            truncated: false,
-            timedOut: false,
-            aborted: false
-        });
+        const result = await shell({ command });
+
+        expect(result.stdout).toBe('\u20AC');
+        expect(result.truncated).toBe(false);
     });
 
-    it('caps stdout at 128 KiB and flags truncation', async () => {
+    it('keeps the head AND the tail of a truncated stdout and marks the cut', async () => {
+        // 200 000 ASCII bytes against the 128 KiB cap. A head-kept cap returned the
+        // first 131 072 and lost the last 68 928 — which is where a build or test
+        // run prints its verdict — with nothing in the text saying a cut happened.
         const result = await shell({ command: 'node -e "process.stdout.write(\'a\'.repeat(200000))"' });
 
         expect(result.exitCode).toBe(0);
-        // ASCII only, so the byte cap and the string length agree exactly.
-        expect(result.stdout.length).toBe(COMMAND_STDOUT_MAX_BYTES);
-        expect(result.stderr).toBe('');
         expect(result.truncated).toBe(true);
-        expect(result.timedOut).toBe(false);
-        expect(result.aborted).toBe(false);
+        expect(result.stdoutTruncated).toBe(true);
+        expect(result.stderrTruncated).toBe(false);
+        expect(result.stdoutBytes).toBe(200000);
+        expect(result.stdoutDroppedBytes).toBe(200000 - COMMAND_STDOUT_MAX_BYTES);
+        expect(result.stderrDroppedBytes).toBe(0);
+
+        // Both windows are full, and the marker between them names the count.
+        const [head, marker, tail] = result.stdout.split('\n');
+
+        expect(head).toHaveLength(Math.floor(COMMAND_STDOUT_MAX_BYTES / 4));
+        expect(tail).toHaveLength(COMMAND_STDOUT_MAX_BYTES - Math.floor(COMMAND_STDOUT_MAX_BYTES / 4));
+        expect(marker).toBe(`[... ${result.stdoutDroppedBytes} bytes omitted ...]`);
     });
 
-    it('caps stderr at 16 KiB and flags truncation', async () => {
+    it('keeps the LAST lines of a truncated stream, where the verdict is', async () => {
+        // The behaviour the whole head+tail policy exists for: 20 000 numbered lines
+        // (~204 KiB), and the LAST one must be in the result. A head-kept cap cut
+        // this at about line 4 300 and discarded the remaining 15 700 with no marker.
+        const result = await shell({
+            command: 'node -e "for(let i=0;i<20000;i++)console.log(\'line \'+i)"'
+        });
+
+        expect(result.stdoutTruncated).toBe(true);
+        expect(result.stdout.startsWith('line 0\n')).toBe(true);
+        expect(result.stdout.trimEnd().endsWith('line 19999')).toBe(true);
+
+        // A line from the middle is the one that is gone — the head and the tail
+        // both being present is only meaningful if the middle really was cut.
+        expect(result.stdout).not.toContain('line 6000\n');
+    });
+
+    it('caps stderr at 16 KiB and flags only that stream', async () => {
         const result = await shell({ command: 'node -e "process.stderr.write(\'b\'.repeat(20000))"' });
 
         expect(result.exitCode).toBe(0);
         expect(result.stdout).toBe('');
-        expect(result.stderr.length).toBe(COMMAND_STDERR_MAX_BYTES);
+        expect(result.stderrTruncated).toBe(true);
+        expect(result.stdoutTruncated).toBe(false);
+        expect(result.stderrBytes).toBe(20000);
+        expect(result.stderrDroppedBytes).toBe(20000 - COMMAND_STDERR_MAX_BYTES);
+    });
+
+    it('attributes truncation to the right stream and not to one that filled exactly', async () => {
+        // stdout lands exactly on its 128 KiB cap (complete, NOT cut) while stderr
+        // overflows its 16 KiB cap. One shared boolean reported both as truncated;
+        // the per-stream flags must not.
+        const result = await shell({
+            command: 'node -e "process.stdout.write(\'a\'.repeat(131072));process.stderr.write(\'E\'.repeat(17000))"'
+        });
+
+        expect(result.stdoutBytes).toBe(COMMAND_STDOUT_MAX_BYTES);
+        expect(result.stdoutTruncated).toBe(false);
+        expect(result.stdoutDroppedBytes).toBe(0);
+        expect(result.stdout).not.toContain('omitted');
+
+        expect(result.stderrTruncated).toBe(true);
+        expect(result.stderrDroppedBytes).toBe(17000 - COMMAND_STDERR_MAX_BYTES);
+
+        // `truncated` stays the OR of the two, so existing callers still see it.
         expect(result.truncated).toBe(true);
     });
 
-    it('times out a long run, kills it, and reports the flags', async () => {
+    it('tees the complete output to a file when a stream is cut', async () => {
+        const result = await shell({
+            command: 'node -e "for(let i=0;i<20000;i++)console.log(\'line \'+i)"'
+        });
+
+        expect(result.outputPath).toBeTruthy();
+
+        const saved = await readFile(result.outputPath as string, 'utf8');
+
+        // The file holds what the result had to drop, so `grep`/`read` can reach it
+        // without re-running the command with a manual redirect.
+        expect(saved).toContain('line 6000\n');
+        expect(saved).toContain('line 19999');
+        expect(saved).toContain('line 0\n');
+        expect(saved.startsWith('# shell: ')).toBe(true);
+
+        await rm(result.outputPath as string, { force: true });
+    });
+
+    it('writes no output file when nothing was cut or when saveOutput is false', async () => {
+        const small = await shell({ command: 'node -e "process.stdout.write(\'hi\')"' });
+
+        expect(small.outputPath).toBeNull();
+
+        const cut = await shell({
+            command: 'node -e "process.stdout.write(\'a\'.repeat(200000))"',
+            saveOutput: false
+        });
+
+        expect(cut.truncated).toBe(true);
+        expect(cut.outputPath).toBeNull();
+    });
+
+    it('runs every line of a multi-line command instead of only the first', async () => {
+        // cmd.exe /c takes the whole string as ONE command line and discards
+        // everything after the first newline, so this used to exit 0 with `exit 9`
+        // never executed — a silently lost failure that works fine on bash.
+        const result = await shell({ command: 'echo first\nexit 9' });
+
+        expect(result.exitCode).toBe(9);
+        expect(result.stdout).toContain('first');
+        expect(result.timedOut).toBe(false);
+
+        // The rewrite is reported when this tool did it. On POSIX the shell already
+        // ran both lines, so nothing was rewritten and the count stays 0.
+        if (process.platform === 'win32') expect(result.linesChained).toBeGreaterThan(0);
+        else expect(result.linesChained).toBe(0);
+    });
+
+    it('runs all three lines of a multi-line command', async () => {
+        const result = await shell({ command: 'echo 1\necho 2\necho 3' });
+
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('1');
+        expect(result.stdout).toContain('2');
+        expect(result.stdout).toContain('3');
+    });
+
+    it('leaves a newline inside a quoted argument alone', async () => {
+        // A break inside "…" is part of an argument, not a statement separator.
+        // Chaining it with `&&` would corrupt the string the program receives.
+        const result = await shell({
+            command: 'node -e "console.log(1)" \nnode -e "console.log(2)"'
+        });
+
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('1');
+        expect(result.stdout).toContain('2');
+    });
+
+    it('closes stdin so a command that reads it gets EOF instead of hanging', async () => {
+        // The old default was an empty PIPE that never ended, so this blocked until
+        // the timeout. `input` is the other half of the same fix.
+        const result = await shell({
+            command: 'node -e "process.stdout.write(JSON.stringify(require(\'fs\').readFileSync(0,\'utf8\')))"',
+            timeoutMs: 10_000
+        });
+
+        expect(result.timedOut).toBe(false);
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe('\"\"');
+    });
+
+    it('feeds stdin when input is provided', async () => {
+        const result = await shell({
+            command: 'node -e "process.stdout.write(require(\'fs\').readFileSync(0,\'utf8\'))"',
+            input: 'fed-in',
+            timeoutMs: 10_000
+        });
+
+        expect(result.stdout).toBe('fed-in');
+    });
+
+    it('survives a child that exits before its stdin write completes', async () => {
+        // A big write to a stdin whose process already left fails with EOF/EPIPE on
+        // the stream. Without an error listener that is an unhandled 'error'.
+        const result = await shell({
+            command: 'node -e "process.exit(9)"',
+            input: 'x'.repeat(70_000),
+            timeoutMs: 10_000
+        });
+
+        expect(result.exitCode).toBe(9);
+        expect(result.timedOut).toBe(false);
+    });
+
+    it('reports a completed run as completed when the timer fires in the same batch', async () => {
+        // The flake: 'close' had already produced a real exit code, and a timeout
+        // landing in the same event-loop batch overwrote it with -1/timedOut. A
+        // generous ceiling removes the race entirely; this pins the direction that
+        // must never happen (a finished run reported as cancelled).
+        for (let index = 0; index < 5; index += 1) {
+            const result = await shell({
+                command: 'node -e "console.log(\'RACE\');process.exit(5)"',
+                timeoutMs: 60_000
+            });
+
+            expect(result.stdout).toBe('RACE\n');
+            expect(result.exitCode).toBe(5);
+            expect(result.timedOut).toBe(false);
+            expect(result.aborted).toBe(false);
+        }
+    });
+
+    it('still times out a long run, kills it, and reports the flags', async () => {
         const result = await shell({
             command: 'node -e "setTimeout(() => {}, 5000)"',
             timeoutMs: 150
         });
 
-        expect(result).toEqual({
+        expect(settled(result)).toEqual({
             exitCode: -1,
             stdout: '',
             stderr: '',
             truncated: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            stdoutDroppedBytes: 0,
+            stderrDroppedBytes: 0,
+            outputPath: null,
             timedOut: true,
-            aborted: false
+            aborted: false,
+            exitSignal: null
         });
+
+        expect(result.durationMs).toBeLessThan(5000);
     });
 
     it('kills the shell GRANDCHILD on timeout (delayed marker never appears)', async () => {
@@ -205,14 +431,42 @@ describe('shell', () => {
                 controller.signal
             );
 
-            expect(result).toEqual({
+            expect(settled(result)).toEqual({
                 exitCode: -1,
                 stdout: '',
                 stderr: '',
                 truncated: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutBytes: 0,
+                stderrBytes: 0,
+                stdoutDroppedBytes: 0,
+                stderrDroppedBytes: 0,
+                outputPath: null,
                 timedOut: false,
-                aborted: true
+                aborted: true,
+                exitSignal: null
             });
+        } finally {
+            clearTimeout(timer);
+        }
+    });
+
+    it('does not report an abort that arrived after the process finished', async () => {
+        // Symmetric with the timeout case: a signal that lands once the child has
+        // exited terminated nothing, so the real result stands.
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 5_000);
+
+        try {
+            const result = await executeWithSignal(
+                { command: 'node -e "process.stdout.write(\'done\')"' },
+                controller.signal
+            );
+
+            expect(result.stdout).toBe('done');
+            expect(result.aborted).toBe(false);
+            expect(result.exitCode).toBe(0);
         } finally {
             clearTimeout(timer);
         }
@@ -222,15 +476,26 @@ describe('shell', () => {
         const controller = new AbortController();
         controller.abort();
 
-        await expect(
-            executeWithSignal({ command: 'node -e "process.stdout.write(\'never\')"' }, controller.signal)
-        ).resolves.toEqual({
+        const result = await executeWithSignal(
+            { command: 'node -e "process.stdout.write(\'never\')"' },
+            controller.signal
+        );
+
+        expect(settled(result)).toEqual({
             exitCode: -1,
             stdout: '',
             stderr: '',
             truncated: false,
+            stdoutTruncated: false,
+            stderrTruncated: false,
+            stdoutBytes: 0,
+            stderrBytes: 0,
+            stdoutDroppedBytes: 0,
+            stderrDroppedBytes: 0,
+            outputPath: null,
             timedOut: false,
-            aborted: true
+            aborted: true,
+            exitSignal: null
         });
     });
 
@@ -265,6 +530,18 @@ describe('shell', () => {
         await expect(
             shell({ command: 'node --version', timeoutMs: Number.POSITIVE_INFINITY })
         ).rejects.toThrow(new HarnessError(message));
+    });
+
+    it('rejects a non-string input and a non-boolean saveOutput', async () => {
+        // The harness does not validate JSON Schema, so a model can send 5 for a
+        // string. Rejecting beats silently feeding the child "5".
+        await expect(shell({ command: 'node --version', input: 5 as unknown as string })).rejects.toThrow(
+            new HarnessError('shell input must be a string when provided.')
+        );
+
+        await expect(
+            shell({ command: 'node --version', saveOutput: 'no' as unknown as boolean })
+        ).rejects.toThrow(new HarnessError('shell saveOutput must be a boolean when provided.'));
     });
 
     it('exposes bounded timeout defaults with no unlimited override', () => {

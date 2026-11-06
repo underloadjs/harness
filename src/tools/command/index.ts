@@ -4,9 +4,12 @@
 // host's permissions. gitDiff is the narrow alternative for the common case — a
 // fixed, non-mutating `git diff` argv with no shell.
 //
-// Both tools bound their output (./boundedText) and end runaway runs through
-// ./processTree: a timeout, or an AbortSignal on the ToolContext, terminates the
-// child process tree rather than leaving it holding the pipes.
+// Both tools bound their output and end runaway runs through ./processTree: a
+// timeout, or an AbortSignal on the ToolContext, terminates the child process tree
+// rather than leaving it holding the pipes. The two bound it DIFFERENTLY on
+// purpose: gitDiff keeps the HEAD of a diff (./boundedText, a diff is read
+// top-down) and shell keeps the HEAD AND THE TAIL of a command's output
+// (./boundedOutput, a build log is read bottom-up, where `BUILD FAILED` lives).
 //
 // TYPE-ONLY BARREL (T21): re-exporting the tool VALUES here would statically
 // evaluate `node:child_process` for every importer of the folder barrel, which is

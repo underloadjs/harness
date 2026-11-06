@@ -14,9 +14,12 @@
 // The captured text can therefore be one character longer than the byte cap.
 //
 // Consumers:
-//   - ./shell   — 128 KiB stdout, 16 KiB stderr
 //   - ./gitDiff      — 128 KiB stdout, 16 KiB stderr
 //   - ../syntax/python — 8 KiB stderr diagnostics
+//   - ./shell        — only the two cap CONSTANTS: a command's verdict is at the
+//                      END of its output, so shell switched to the head+tail
+//                      capture in ./boundedOutput. Read a diff top-down, read a
+//                      build log bottom-up; that is why both policies exist.
 
 import { StringDecoder } from 'node:string_decoder';
 

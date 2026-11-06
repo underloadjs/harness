@@ -24,8 +24,8 @@
 //     read the failure and correct itself. Spawn failures (missing cwd/shell) are
 //     thrown: those are harness setup problems, not command results.
 //
-// The four things a command tool gets wrong most often, and what this file does
-// about each (all four were observed against the real tool before being fixed):
+// The five things a command tool gets wrong most often, and what this file does
+// about each (all five were observed against the real tool before being fixed):
 //
 //   1. WHERE THE ANSWER IS. Builds, test runners and installers print their verdict
 //      LAST (`npm test` ends with the failure summary, `tsc` with the error count,
@@ -45,6 +45,10 @@
 //      event-loop batch as a normal exit used to overwrite a real exit code with
 //      `exitCode: -1, timedOut: true`. A run that finished on its own is now always
 //      reported as finished; the kill only speaks when it was actually needed.
+//   5. AN STDIN THAT NEVER ENDS. `spawn` defaults stdin to a PIPE, so a command
+//      that reads stdin blocked until the timeout on an endless empty stream, and
+//      `timeout.exe` — the idiomatic Windows sleep — refused to start at all. stdin
+//      is IGNORED (immediate EOF) unless `input` is given.
 //
 // Result flags:
 //   - truncated         true when EITHER stream was cut at its cap;
@@ -245,10 +249,26 @@ const chainWindowsLines = (command: string): { command: string; linesChained: nu
         const char = command[index] as string;
 
         // `^` escapes the next character outside quotes; copy the pair verbatim so
-        // an escaped quote never flips the quote state.
+        // an escaped quote never flips the quote state. The one exception is `^`
+        // immediately before a break, which is cmd's line-CONTINUATION: those two
+        // lines are one line, so they join with a space rather than `&&`.
         if (!inQuotes && char === '^' && index + 1 < command.length) {
-            out += char + command[index + 1];
-            index += 1;
+            const next = command[index + 1] as string;
+
+            if (next !== '\n' && next !== '\r') {
+                out += char + next;
+                index += 1;
+                continue;
+            }
+
+            let cursor = index + 1;
+
+            while (cursor < command.length && /[\r\n \t]/.test(command[cursor] as string)) cursor += 1;
+
+            chained += 1;
+
+            if (cursor < command.length) out += ' ';
+            index = cursor - 1;
             continue;
         }
 
@@ -270,8 +290,10 @@ const chainWindowsLines = (command: string): { command: string; linesChained: nu
 
         // Every break consumed is reported, because a folded break — dropped or
         // joined — means the string the shell received is not the string sent.
+        // `cursor - 1` because the for-loop steps once more: `cursor` is the first
+        // character to KEEP, and it must not be skipped.
         chained += 1;
-        index = cursor;
+        index = cursor - 1;
 
         // Nothing after it: a trailing break, dropped rather than left dangling.
         if (cursor >= command.length) continue;
@@ -289,8 +311,10 @@ const chainWindowsLines = (command: string): { command: string; linesChained: nu
 // 4294967295 — correct, and useless to a model that then has to notice a ten-digit
 // number means "failed". Reading the same bits as a signed int32 gives -1, which is
 // the convention both POSIX shells and cmd.exe itself use.
-const signedExitCode = (code: number | null): number => {
-    if (code === null) return -1;
+// `== null`, not `=== null`: Node fills these in only after 'exit', and the package
+// supports Node 18, where `signalCode` may be absent rather than null.
+const signedExitCode = (code: number | null | undefined): number => {
+    if (code == null) return -1;
 
     return code > 0x7f_ff_ff_ff ? code - 0x1_0000_0000 : code;
 };
@@ -375,7 +399,9 @@ const writeFullOutput = async (
     // One header line naming the command, then each stream verbatim, so `grep` over
     // the file sees the command output itself rather than a wrapper per line.
     const body = [
-        `# shell: ${command.replaceAll(/[\r\n]+/g, ' ')}`,
+        // Regex form, not `replaceAll`: the package tsconfig lib stops at es2015,
+        // so `String.prototype.replaceAll` is not a declared method here.
+        `# shell: ${command.replace(/[\r\n]+/g, ' ')}`,
         `# exitCode=${exitCode} durationMs=${durationMs} stdout=${stdout.totalBytes}B stderr=${stderr.totalBytes}B`,
         stdout.end(),
         `# --- stderr (${stderr.totalBytes} bytes) ---`,
@@ -485,9 +511,11 @@ export const shell = tool<CommandRunParameters, CommandRunResult>({
 
             // The child is still running when neither its exit nor a signal has been
             // reported. Node fills in `exitCode`/`signalCode` as soon as 'exit'
-            // arrives, which is exactly the window the race below closes.
+            // arrives, which is exactly the window the race below closes. Loose
+            // `== null` on purpose: an ABSENT value means "has not exited yet", and
+            // treating it as exited would skip a kill that was really needed.
             const isRunning = (): boolean =>
-                !exited && child.exitCode === null && child.signalCode === null;
+                !exited && child.exitCode == null && child.signalCode == null;
 
             // Settle exactly once: a killed child can emit both 'error' and
             // 'close', and a duplicate resolve/reject would be ignored but would

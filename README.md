@@ -863,8 +863,9 @@ await edit([{ path: 'a.ts', oldString: 'let x', newString: 'let y' }]);
 await glob({ patterns: ['src/**/*.ts'] });                          // { files, truncated } — names only
 await grep({ pattern: 'TODO', patterns: ['*.ts'] });                // { matches, truncated, bytes, contentBudget } — lines
 await gitDiff();                                                    // { exitCode, stdout, stderr, truncated, timedOut, stderrTruncated, aborted }
-await shell({ command: 'git status' });                        // { exitCode, stdout, stderr, truncated, timedOut, aborted }
-await shell({ command: 'npm test', timeoutMs: 600_000 });      // 1..600000 ms; tree killed on timeout
+await shell({ command: 'git status' });                        // { exitCode, stdout, stderr, truncated, stdoutTruncated, stderrTruncated, stdoutBytes, stderrBytes, stdoutDroppedBytes, stderrDroppedBytes, outputPath, timedOut, aborted, exitSignal, durationMs, linesChained }
+await shell({ command: 'npm test', timeoutMs: 600_000 });      // 1..600000 ms; tree killed best-effort on timeout, and a run that already finished is never reported as timed out
+await shell({ command: 'echo a\nexit 9' });                    // 9, not 0: on Windows the lines are chained with `&&` first, because cmd.exe would run only the first
 await download({ url: 'https://example.com/spec.pdf' });            // toolMedia() envelope: { content: { url, finalUrl, contentType, kind, name, bytes, media: 'attached', mediaId }, __toolMedia: [attachment] }
 ```
 
@@ -978,7 +979,7 @@ process; it makes no claim about another process or worker thread.
 | `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` — non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` gives `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (200 entries by default, 1000 maximum, one shared 64 KiB entry-text budget across the call), `move`/`copy` give `{ path, to, kind, bytes }` and gate an existing destination on `overwrite`, `delete` gives `{ path, removed, recursive }` and refuses a non-empty directory without `recursive` (`force` reports a missing path as a no-op), `mkdir` gives `{ path, created }`; a failed list entry carries its own `error: { code, message }`, a failed mutation rejects the call naming the operations already applied (no rollback) |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — NAMES only, capped at 100; there is no `content` property any more |
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }`; caps at 100 matches and 64 KiB of match text, matching time-bounded |
-| `shell` | `({ command, cwd? })` | `{ exitCode, stdout, stderr }` |
+| `shell` | `({ command, cwd?, timeoutMs?, input?, saveOutput? })` | `{ exitCode, stdout, stderr, truncated, stdoutTruncated, stderrTruncated, stdoutBytes, stderrBytes, stdoutDroppedBytes, stderrDroppedBytes, outputPath, timedOut, aborted, exitSignal, durationMs, linesChained }`; caps keep the **beginning and the end** with an in-band `[... N bytes omitted ...]` marker, and a cut stream is teed whole to `outputPath` |
 | `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut }`; read-only |
 
 **Search is two tools now, not one tool with two modes.** `fileGlob` used to
