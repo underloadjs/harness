@@ -103,7 +103,12 @@ export class ServerRuntimeError extends Error {
 }
 
 const DEFAULT_BASE_URL = 'http://localhost:5500/providers/private/v1';
-const DEFAULT_MODEL = 'merge/ds4-flash';
+// The local basalt model, which is the id the private provider at DEFAULT_BASE_URL
+// actually serves for it (its /models catalogue lists `local/basalt`; a hosted
+// `merge/ds4-flash` request costs money and a `localhost/basalt` request 404s).
+// Every live preset agent with no per-agent override resolves to this id, so the
+// UI's agent deck shows it on every tile.
+const DEFAULT_MODEL = 'local/basalt';
 
 // Safe default: today's behaviour, kept deliberately. Worker isolation is a
 // per-deployment opt-in because it changes WHERE a body runs (one worker thread per

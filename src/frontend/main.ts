@@ -445,7 +445,9 @@ const STORAGE_KEY = 'underload-harness-app:settings';
 const DEFAULT_SETTINGS: RunnerSettings = {
     baseURL: 'http://localhost:5500/providers/private/v1',
     apiKey: '',
-    model: 'merge/ds4-flash'
+    // The local basalt model: the id the gateway above serves for it, and the model
+    // every preset agent shows in the deck when it has no per-agent override.
+    model: 'local/basalt'
 };
 
 let hasStoredSettings = false;
