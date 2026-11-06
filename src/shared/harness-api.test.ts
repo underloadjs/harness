@@ -168,10 +168,20 @@ describe('harness contract published numbers', () => {
             pending_actions: 4,
             steer_records: 64,
             created_tools: 32,
-            tool_result_bytes: 65536,
+            tool_result_bytes: 262144,
             page_limit_default: 25,
             page_limit_max: 100,
         });
+    });
+
+    it('publishes a tool_result_bytes that matches the cap the server enforces', async () => {
+        // The published limit is a literal (this module is shared with the browser and
+        // imports only types), so nothing but this assertion stops it drifting from the
+        // value `boundToolValue` actually applies. A client that trusts a stale number
+        // would truncate results the server was happy to send.
+        const { MODEL_TOOL_RESULT_BUDGET_BYTES } = await import('../core/result-budget');
+
+        expect(HARNESS_SERVICE_LIMITS.tool_result_bytes).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
     });
 
     it('advertises all nine capabilities as booleans', () => {

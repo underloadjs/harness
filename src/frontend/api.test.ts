@@ -109,7 +109,7 @@ const info: ServiceInfo = {
         pending_actions: 4,
         steer_records: 64,
         created_tools: 32,
-        tool_result_bytes: 65_536,
+        tool_result_bytes: 262_144,
         page_limit_default: 25,
         page_limit_max: 100
     },

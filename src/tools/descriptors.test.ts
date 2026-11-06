@@ -381,6 +381,8 @@ describe('live Node descriptor catalogue (T24)', () => {
         const target = path.join(folder, 'alpha.txt');
         fs.writeFileSync(target, 'alpha', 'utf8');
 
+        // `wireBytes` depends on the length of the per-run scratch path, so it is
+        // matched rather than hardcoded; every other field is asserted exactly.
         const expected = {
             files: [
                 {
@@ -391,12 +393,16 @@ describe('live Node descriptor catalogue (T24)', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
-                    bytes: 5
+                    nextByte: null,
+                    bytes: 5,
+                    sizeBytes: 5
                 }
             ],
             truncated: false,
             bytes: 5,
-            contentBudget: 65536
+            wireBytes: expect.any(Number),
+            contentBudget: 262144,
+            skipped: 0
         };
 
         // Proxy path (what `presetTools` exposes) and the direct seam both run the

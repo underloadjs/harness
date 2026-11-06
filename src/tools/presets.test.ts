@@ -27,11 +27,15 @@ import {
     syntax
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
+import { MODEL_TOOL_RESULT_BUDGET_BYTES } from '../core/result-budget';
 
-// Mirrors FILE_READ_CONTENT_BUDGET in ./files/read. Importing the constant
-// through the package would evaluate the implementation module eagerly and break
-// the lazy-loading contract (see laziness.test.ts).
-const FILE_READ_CONTENT_BUDGET = 64 * 1024;
+// read's aggregate budget is DERIVED from the model-facing wire cap (see
+// FILE_READ_WIRE_BUDGET in ./files/read.tool.ts), so this test imports that one
+// number instead of mirroring a literal. A mirrored `64 * 1024` sat here silently
+// stale once the cap moved: the value is part of the result shape a model reads, so
+// a hardcoded copy is exactly the drift the derivation was chosen to prevent.
+// Importing the leaf module pulls in no tool body, so laziness.test.ts is unaffected.
+const FILE_READ_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
 // Mirrors FILE_LIST_CONTENT_BUDGET / FILE_LIST_DEFAULT_LIMIT in ./files/fileList
 // for the same lazy-loading reason as above.
@@ -159,7 +163,9 @@ describe('syntax', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
+                    nextByte: null,
                     bytes: 0,
+                    sizeBytes: null,
                     error: {
                         code: 'ENOENT',
                         message:
@@ -174,7 +180,9 @@ describe('syntax', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
+                    nextByte: null,
                     bytes: 0,
+                    sizeBytes: null,
                     error: {
                         code: 'ENOENT',
                         message:
@@ -184,7 +192,11 @@ describe('syntax', () => {
             ],
             truncated: false,
             bytes: 0,
-            contentBudget: FILE_READ_CONTENT_BUDGET
+            // wireBytes is the serialized length of the response, so it depends on the
+            // per-run workdir path and is matched rather than hardcoded.
+            wireBytes: expect.any(Number),
+            contentBudget: FILE_READ_CONTENT_BUDGET,
+            skipped: 2
         });
     });
 
@@ -237,12 +249,16 @@ describe('file tools', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
-                    bytes: 7
+                    nextByte: null,
+                    bytes: 7,
+                    sizeBytes: 7
                 }
             ],
             truncated: false,
             bytes: 7,
-            contentBudget: FILE_READ_CONTENT_BUDGET
+            wireBytes: expect.any(Number),
+            contentBudget: FILE_READ_CONTENT_BUDGET,
+            skipped: 0
         });
         // Results carry the directory they came from, so one flat list can hold
         // several directories without ambiguity.
@@ -365,7 +381,9 @@ describe('file tools', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
-                    bytes: 1
+                    nextByte: null,
+                    bytes: 1,
+                    sizeBytes: 1
                 },
                 {
                     path: join(workdir, 'multi-read', 'a.txt'),
@@ -375,12 +393,16 @@ describe('file tools', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
-                    bytes: 1
+                    nextByte: null,
+                    bytes: 1,
+                    sizeBytes: 1
                 }
             ],
             truncated: false,
             bytes: 2,
-            contentBudget: FILE_READ_CONTENT_BUDGET
+            wireBytes: expect.any(Number),
+            contentBudget: FILE_READ_CONTENT_BUDGET,
+            skipped: 0
         });
     });
 
@@ -487,12 +509,16 @@ describe('file tools', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
-                    bytes: 6
+                    nextByte: null,
+                    bytes: 6,
+                    sizeBytes: 6
                 }
             ],
             truncated: false,
             bytes: 6,
-            contentBudget: FILE_READ_CONTENT_BUDGET
+            wireBytes: expect.any(Number),
+            contentBudget: FILE_READ_CONTENT_BUDGET,
+            skipped: 0
         });
     });
 
@@ -509,7 +535,9 @@ describe('file tools', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
+                    nextByte: null,
                     bytes: 0,
+                    sizeBytes: null,
                     error: {
                         code: 'ENOENT',
                         message:
@@ -519,7 +547,9 @@ describe('file tools', () => {
             ],
             truncated: false,
             bytes: 0,
-            contentBudget: FILE_READ_CONTENT_BUDGET
+            wireBytes: expect.any(Number),
+            contentBudget: FILE_READ_CONTENT_BUDGET,
+            skipped: 1
         });
     });
 });
@@ -625,12 +655,17 @@ describe('presets inside a harness', () => {
                     truncated: false,
                     nextLine: null,
                     nextColumn: null,
-                    bytes: 14
+                    nextByte: null,
+                    bytes: 14,
+                    sizeBytes: 14
                 }
             ],
             truncated: false,
             bytes: 14,
-            contentBudget: FILE_READ_CONTENT_BUDGET
+            // wireBytes varies with the per-run workdir path, so it is matched.
+            wireBytes: expect.any(Number),
+            contentBudget: FILE_READ_CONTENT_BUDGET,
+            skipped: 0
         });
     });
 

@@ -207,7 +207,12 @@ export const HARNESS_SERVICE_LIMITS = {
     pending_actions: 4,
     steer_records: 64,
     created_tools: 32,
-    tool_result_bytes: 65536,
+    // MUST equal MODEL_TOOL_RESULT_BUDGET_BYTES (../core/result-budget.ts), which is
+    // what the server actually applies via boundToolValue. It is a literal here
+    // because this module is shared with the browser and imports ONLY types, so
+    // pulling in a runtime value from core would drag the whole core barrel into the
+    // client bundle. harness-api.test.ts pins the two together to catch drift.
+    tool_result_bytes: 262144,
     page_limit_default: 25,
     page_limit_max: 100,
 } satisfies ServiceLimits;

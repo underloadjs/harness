@@ -2609,12 +2609,18 @@ describe('manual tool execution', () => {
                             truncated: false,
                             nextLine: null,
                             nextColumn: null,
-                            bytes: 9
+                            nextByte: null,
+                            bytes: 9,
+                            sizeBytes: 9
                         }
                     ],
                     truncated: false,
                     bytes: 9,
-                    contentBudget: 65536
+                    // wireBytes is the serialized length of the response, which embeds
+                    // the absolute fixture path, so it is matched rather than hardcoded.
+                    wireBytes: expect.any(Number),
+                    contentBudget: 262144,
+                    skipped: 0
                 },
                 duration_ms: expect.any(Number)
             });
@@ -2625,14 +2631,66 @@ describe('manual tool execution', () => {
 
     it('bounds a huge manual result with the shared cap instead of returning it verbatim', async () => {
         const runtime = createRuntime();
+        const session = await createDemo(runtime);
 
-        // A file long enough that even a bounded read serializes past the cap: read's own 64 KiB
-        // content budget fills the page and the JSON envelope around it crosses it.
-        const fixture = await createFixture('harness-bounds-api-');
+        // A tool with NO budget of its own. This used to be tested through `read`, but
+        // read now bounds itself at exactly the wire cap and measures that budget on
+        // the serialized form, so a read result can never overflow the envelope —
+        // which is the point of the change. The shared cap is therefore a BACKSTOP for
+        // tools that do not bound themselves, and that is what is exercised here.
+        const registered = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTools(session.id), {
+            name: 'dump',
+            description: 'Return an unbounded string.',
+            tags: ['text'],
+            source: 'return "z".repeat(300000);'
+        });
+        expect(registered.status).toBe(201);
+
+        const executed = await call(
+            runtime,
+            'POST',
+            HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(session.id, 'dump'),
+            { parameters: {} }
+        );
+
+        expect(executed.status).toBe(200);
+        expect(executed.body.ok).toBe(true);
+
+        // `boundToolValue` (./api.ts) cuts the serialized value with `boundToolResult`
+        // and re-parses the envelope, so the HTTP body stays valid JSON while a prefix
+        // of the tool's own text survives inside it.
+        const bounded = executed.body.result as {
+            truncated: boolean;
+            originalBytes: number;
+            budgetBytes: number;
+            content: string;
+        };
+
+        expect(Object.keys(bounded).sort()).toEqual(['budgetBytes', 'content', 'originalBytes', 'truncated']);
+        expect(bounded.truncated).toBe(true);
+        expect(bounded.budgetBytes).toBe(HARNESS_SERVICE_LIMITS.tool_result_bytes);
+        expect(bounded.originalBytes).toBe(300_000);
+        expect(bounded.content.startsWith('zzz')).toBe(true);
+
+        // The envelope itself fits the published cap, which is the guarantee a client
+        // relies on when it reads `tool_result_bytes` from the boot document.
+        expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(
+            HARNESS_SERVICE_LIMITS.tool_result_bytes
+        );
+    });
+
+    it('returns a full-budget read result verbatim, without the envelope', async () => {
+        // The other half of the change above, and the regression this file pins. A
+        // read that fills its own budget must arrive UNWRAPPED: previously read
+        // measured 64 KiB of RAW content while the cap measured 64 KiB of SERIALIZED
+        // JSON, so escaping (2-15%) always pushed it over and the envelope destroyed
+        // nextLine/nextColumn — the fields the caller needs in order to continue.
+        const runtime = createRuntime();
+        const fixture = await createFixture('harness-fullbudget-api-');
 
         try {
             const path = join(fixture, 'big.txt');
-            await writeTextFile(path, 'x'.repeat(70_000), 'utf8');
+            await writeTextFile(path, 'x'.repeat(300_000), 'utf8');
 
             const read = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('read'), {
                 parameters: [path]
@@ -2641,47 +2699,23 @@ describe('manual tool execution', () => {
             expect(read.status).toBe(200);
             expect(read.body.ok).toBe(true);
 
-            // The shared 64 KiB cap still produces the SHARED envelope: `boundToolValue` (./api.ts:557)
-            // cuts the serialized value with `boundToolResult` and re-parses the envelope, so the HTTP
-            // body stays valid JSON while the prefix of the tool's own document is preserved inside it.
-            const bounded = read.body.result as {
-                truncated: boolean;
-                originalBytes: number;
-                budgetBytes: number;
-                content: string;
-            };
+            // The tool's own object, not the envelope: no budgetBytes/content keys.
+            const result = read.body.result as Record<string, unknown>;
+            expect(Object.keys(result).sort()).toEqual([
+                'bytes',
+                'contentBudget',
+                'files',
+                'skipped',
+                'truncated',
+                'wireBytes'
+            ]);
 
-            expect(Object.keys(bounded).sort()).toEqual(['budgetBytes', 'content', 'originalBytes', 'truncated']);
-            expect(bounded.truncated).toBe(true);
-            expect(bounded.budgetBytes).toBe(HARNESS_SERVICE_LIMITS.tool_result_bytes);
-
-            // EXACT and PORTABLE: `originalBytes` is the UTF-8 length of the tool's own serialized
-            // result. read returns the 64 KiB content budget as ONE unterminated line for this
-            // fixture, and its metadata is fixed, so the expectation is DERIVED from the fixture
-            // rather than hard-coded (`JSON.stringify(path)` makes separators the platform's problem).
-            const expectedResult = {
-                files: [
-                    {
-                        path,
-                        content: 'x'.repeat(64 * 1024),
-                        startLine: 1,
-                        endLine: 1,
-                        truncated: true,
-                        nextLine: 1,
-                        nextColumn: 64 * 1024,
-                        bytes: 64 * 1024
-                    }
-                ],
-                truncated: true,
-                bytes: 64 * 1024,
-                contentBudget: 64 * 1024
-            };
-            expect(bounded.originalBytes).toBe(Buffer.byteLength(JSON.stringify(expectedResult), 'utf8'));
-            // The prefix IS the beginning of the tool's JSON text, and the envelope itself fits the cap.
-            expect(bounded.content.startsWith('{"files":[{"path"')).toBe(true);
-            expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(
-                HARNESS_SERVICE_LIMITS.tool_result_bytes
-            );
+            // And the continuation fields survived, which is the whole point.
+            const entry = (result.files as Record<string, unknown>[])[0];
+            expect(entry.truncated).toBe(true);
+            expect(entry.nextLine).toBe(1);
+            expect(entry.nextByte).toBeGreaterThan(0);
+            expect(result.wireBytes).toBeLessThanOrEqual(HARNESS_SERVICE_LIMITS.tool_result_bytes);
         } finally {
             await rm(fixture, { recursive: true, force: true });
         }

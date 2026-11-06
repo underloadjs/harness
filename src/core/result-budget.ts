@@ -35,11 +35,23 @@
 //   - ./tool-ui.ts     — the separate panel bounds
 //   - ../types        — the tool_result event whose `content` is this text
 
-// The default budget: 64 KiB of UTF-8 bytes per model-facing tool result or
-// tool error. 64 KiB is roughly 16k tokens of English prose — large enough for
-// any honest tool result (read's own content budget is the same size) and
-// small enough that a handful of them still fit a context window.
-export const MODEL_TOOL_RESULT_BUDGET_BYTES = 64 * 1024;
+// The default budget: 256 KiB of UTF-8 bytes per model-facing tool result or
+// tool error. 256 KiB is roughly 64k tokens of English prose.
+//
+// It is 4x the previous 64 KiB for one specific reason: `read` budgets its own
+// output at the same order of magnitude, and the two numbers MUST agree. When
+// both were 64 KiB, a read that exactly filled its content budget was always
+// over this wire cap (JSON escaping adds 2-15%), so the harness cut the result
+// mid-string and replaced the whole object with its envelope — destroying the
+// `nextLine`/`nextColumn` fields an agent needs in order to continue. `read`
+// now measures its own budget on the serialized form and reports `wireBytes`,
+// and this cap is set to match, so a full-budget read survives intact.
+//
+// The honest cost of raising it: the cap is PER RESULT and there is no aggregate
+// guard, so N parallel tool calls can now commit up to N x 256 KiB in one turn.
+// A single result is still bounded, which is what protects the session from the
+// one-unbounded-output-kills-the-context-window failure this module exists for.
+export const MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024;
 
 // Keys of the truncation envelope. They are stable because a model may parse a
 // truncated result and a test asserts the exact shape.

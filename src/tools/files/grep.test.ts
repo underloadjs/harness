@@ -50,7 +50,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HarnessError } from '../../util';
-import { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } from '../../core/result-budget';
+import { boundToolResult } from '../../core/result-budget';
 import {
     DEFAULT_GREP_LIMITS,
     FILE_GREP_CONTENT_BUDGET,
@@ -987,12 +987,16 @@ describe('grep', () => {
 
     it('keeps the honesty fields ahead of the result list in the serialized form', async () => {
         // The harness caps a serialized tool result at 64 KiB of TEXT and keeps the
-        // BEGINNING when it must cut (core/result-budget.ts). grep's own budget is the
-        // same 64 KiB — of match text, not of JSON — so a full page of 1 KiB snippets
-        // serializes past the wire cap, because every entry also carries its path, line
-        // number, flags and braces. If `matches` came first, the envelope would cut
-        // exactly the fields that explain the cut: `truncated`, `stopReason`, `skipped`,
-        // `excluded`, `note`.
+        // BEGINNING when it must cut (core/result-budget.ts). grep's own budget is 64
+        // KiB of MATCH TEXT, not of JSON, so a full page of 1 KiB snippets serializes
+        // past that — every entry also carries its path, line number, flags and braces.
+        // If `matches` came first, the envelope would cut exactly the fields that
+        // explain the cut: `truncated`, `stopReason`, `skipped`, `excluded`, `note`.
+        //
+        // The wire cap is now 256 KiB, comfortably above a 64 KiB-budget grep page, so
+        // the DEFAULT cap no longer bites here. The ordering property is still what
+        // protects a caller, so the test supplies a cap that DOES bite rather than
+        // quietly degrading into an assertion about a truncation that never happens.
         const result = await grep({ pattern: 'Q', patterns: ['lines.txt'] });
 
         expect(result.truncated).toBe(true);
@@ -1000,10 +1004,11 @@ describe('grep', () => {
         const serialized = JSON.stringify(result);
 
         // The premise, asserted rather than assumed: this result really does exceed the
-        // wire cap, so the ordering is load-bearing and not decorative.
-        expect(Buffer.byteLength(serialized, 'utf8')).toBeGreaterThan(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        // cap being applied, so the ordering is load-bearing and not decorative.
+        const appliedBudget = FILE_GREP_CONTENT_BUDGET;
+        expect(Buffer.byteLength(serialized, 'utf8')).toBeGreaterThan(appliedBudget);
 
-        const bounded = boundToolResult(serialized);
+        const bounded = boundToolResult(serialized, appliedBudget);
 
         expect(bounded.truncated).toBe(true);
 

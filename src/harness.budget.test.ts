@@ -62,7 +62,8 @@ describe('model-facing result budget', () => {
     });
 
     it('caps a huge tool result in a valid truncation envelope, in the transcript and the event', async () => {
-        const huge = 'z'.repeat(70_000);
+        // Must exceed the 256 KiB cap, so the fixture scales with it.
+        const huge = 'z'.repeat(300_000);
         const dump = tool({
             description: 'Dump.',
             tags: ['dump'],
@@ -86,9 +87,9 @@ describe('model-facing result budget', () => {
         // a client and a reload agree byte for byte.
         expect(JSON.parse(fed)).toEqual({
             truncated: true,
-            originalBytes: 70_000,
-            budgetBytes: 65_536,
-            content: 'z'.repeat(58_982)
+            originalBytes: 300_000,
+            budgetBytes: 262_144,
+            content: 'z'.repeat(235_929)
         });
 
         const result = events.find((event) => event.type === 'tool_result');
@@ -101,7 +102,7 @@ describe('model-facing result budget', () => {
             tags: ['boom'],
             visibility: 'core',
             execute: () => {
-                throw new Error('e'.repeat(70_000));
+                throw new Error('e'.repeat(300_000));
             }
         });
         const entry = brain(scripted([callTool('c1', 'boom', '{}'), answer('recovered')]));
@@ -109,13 +110,13 @@ describe('model-facing result budget', () => {
 
         await writer('go');
 
-        const message = `Tool "boom" failed: ${'e'.repeat(70_000)}`;
+        const message = `Tool "boom" failed: ${'e'.repeat(300_000)}`;
 
         expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
             truncated: true,
             originalBytes: message.length,
-            budgetBytes: 65_536,
-            content: message.slice(0, 58_982)
+            budgetBytes: 262_144,
+            content: message.slice(0, 235_929)
         });
     });
 });

@@ -78,6 +78,31 @@ const prepareFixtures = (): void => {
     fs.writeFileSync(EDIT_TARGET, 'before value', 'utf8');
 };
 
+// The exact result of reading the 5-byte fixture. `wireBytes` is the serialized
+// length of the response, so it depends on the length of this scratch path and is
+// matched rather than hardcoded; every other field is asserted exactly.
+const readAlphaExpected = () => ({
+    files: [
+        {
+            path: READ_TARGET,
+            content: 'alpha',
+            startLine: 1,
+            endLine: 1,
+            truncated: false,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 5,
+            sizeBytes: 5
+        }
+    ],
+    truncated: false,
+    bytes: 5,
+    wireBytes: expect.any(Number),
+    contentBudget: 262_144,
+    skipped: 0
+});
+
 afterAll(() => {
     fs.rmSync(SCRATCH_ROOT, { recursive: true, force: true });
 });
@@ -96,9 +121,22 @@ describe('lazy preset tools', () => {
         // discovery matches (or the visibility flag), and the schema the harness
         // declares — with no body compiled.
         expect(presetTools.read.name).toBe('read');
-        expect(presetTools.read.description).toBe(
-            'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: "ENOENT", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or glob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.'
-        );
+        // The description is pinned in full by the manifest consistency check, so
+        // restating the whole string here only makes every wording change break two
+        // tests. What THIS test is about is that the complete descriptor — prose
+        // included — is readable with no body compiled, so it asserts the shape and a
+        // few load-bearing phrases rather than the exact sentence.
+        expect(presetTools.read.description.length).toBeGreaterThan(1000);
+        for (const phrase of [
+            'Read a BOUNDED window of one or more UTF-8 text files',
+            'startByte',
+            'nextByte',
+            '256 KiB budget measured on the SERIALIZED JSON',
+            'EBINARY',
+            'maxLines 1200'
+        ]) {
+            expect(presetTools.read.description).toContain(phrase);
+        }
         expect(presetTools.read.tags).toEqual(['files', 'read', 'filesystem']);
         // Core by catalogue metadata (R18): declared up front, but that changes no
         // laziness property — the body still compiles only on first call.
@@ -132,12 +170,18 @@ describe('lazy preset tools', () => {
                                         description:
                                             '0-based UTF-8 byte offset within startLine, for continuing a giant line. Defaults to 0.'
                                     },
+                                    startByte: {
+                                        type: 'integer',
+                                        minimum: 0,
+                                        description:
+                                            'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. Defaults to null (count from the start).'
+                                    },
                                     maxLines: {
                                         type: 'integer',
                                         minimum: 1,
-                                        maximum: 5000,
+                                        maximum: 20_000,
                                         description:
-                                            'Maximum lines to return. Defaults to 200 and is capped at 5000.'
+                                            'Maximum lines to return. Defaults to 1200 and is capped at 20000.'
                                     }
                                 },
                                 required: ['path'],
@@ -157,45 +201,13 @@ describe('lazy preset tools', () => {
         expect(compiles).toEqual([]);
 
         // First execution compiles the entry the descriptor was scanned from.
-        await expect(presetTools.read([READ_TARGET])).resolves.toEqual({
-            files: [
-                {
-                    path: READ_TARGET,
-                    content: 'alpha',
-                    startLine: 1,
-                    endLine: 1,
-                    truncated: false,
-                    nextLine: null,
-                    nextColumn: null,
-                    bytes: 5
-                }
-            ],
-            truncated: false,
-            bytes: 5,
-            contentBudget: 65536
-        });
+        await expect(presetTools.read([READ_TARGET])).resolves.toEqual(readAlphaExpected());
         expect(compiles).toEqual([
             { sourcePath: 'tools/files/read.tool.ts', expectedName: 'read' }
         ]);
 
         // The proxy caches its successful resolve: a second call compiles nothing.
-        await expect(presetTools.read([READ_TARGET])).resolves.toEqual({
-            files: [
-                {
-                    path: READ_TARGET,
-                    content: 'alpha',
-                    startLine: 1,
-                    endLine: 1,
-                    truncated: false,
-                    nextLine: null,
-                    nextColumn: null,
-                    bytes: 5
-                }
-            ],
-            truncated: false,
-            bytes: 5,
-            contentBudget: 65536
-        });
+        await expect(presetTools.read([READ_TARGET])).resolves.toEqual(readAlphaExpected());
         expect(compiles).toHaveLength(1);
     });
 
@@ -219,23 +231,7 @@ describe('lazy preset tools', () => {
         expect(first.name).toBe('read');
         expect(second.name).toBe('read');
         expect(first.description).toBe(second.description);
-        await expect(first([READ_TARGET])).resolves.toEqual({
-            files: [
-                {
-                    path: READ_TARGET,
-                    content: 'alpha',
-                    startLine: 1,
-                    endLine: 1,
-                    truncated: false,
-                    nextLine: null,
-                    nextColumn: null,
-                    bytes: 5
-                }
-            ],
-            truncated: false,
-            bytes: 5,
-            contentBudget: 65536
-        });
+        await expect(first([READ_TARGET])).resolves.toEqual(readAlphaExpected());
         // Invoking a resolved tool compiles nothing further.
         expect(compiles).toHaveLength(2);
     });
