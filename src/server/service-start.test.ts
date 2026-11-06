@@ -164,7 +164,7 @@ const TOOL_NAMES = [
     'read',
     'write',
     'edit',
-    'fileList',
+    'files',
     'glob',
     'grep',
     'shell',

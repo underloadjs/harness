@@ -36,7 +36,7 @@
 //   context    0-10 lines before and after each hit (content mode only). Without it
 //              every hit costs a follow-up `read` to understand.
 //   offset     0-based index into the result sequence; pages a capped search the way
-//              read and fileList do. The walk is a deterministic prefix, which is what
+//              read and files do. The walk is a deterministic prefix, which is what
 //              makes this well defined.
 //   maxResults Requested cap, clamped to 1-1000, applied GLOBALLY across every root,
 //              pattern and file — not a per-file budget.

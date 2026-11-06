@@ -31,7 +31,7 @@ export const TOOL_REQUEST_METADATA: CoreToolMetadata = {
             names: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'Exact wire names to enable, case-sensitive (e.g. ["fileList"]).'
+                description: 'Exact wire names to enable, case-sensitive (e.g. ["files"]).'
             },
             regex: {
                 type: 'string',

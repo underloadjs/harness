@@ -280,18 +280,126 @@ const findLineOccurrences = (content: string, search: string): Match[] => {
     return found;
 };
 
-// The dominant line ending in `text`, or `fallback` when neither wins.
-const lineEnding = (text: string, fallback: string): string => {
-    const crlfCount = text.split('\r\n').length - 1;
-    const lfCount = text.split('\n').length - 1 - crlfCount;
-    if (crlfCount === lfCount) return fallback;
-    return crlfCount > lfCount ? '\r\n' : '\n';
+// How many times the single character `needle` occurs in `haystack`, from `from`.
+// `indexOf` in a loop: no allocation per match, and for a character that is absent it
+// is a single memchr-speed scan.
+const countChar = (haystack: string, needle: string, from = 0): number => {
+    let count = 0;
+    let at = haystack.indexOf(needle, from);
+
+    while (at !== -1) {
+        count += 1;
+        at = haystack.indexOf(needle, at + 1);
+    }
+
+    return count;
 };
+
+// Fold CRLF to LF in a caller-supplied string. `split/join` rather than `replaceAll`
+// (the declared `lib` predates ES2021), guarded by one `includes` because the vast
+// majority of oldStrings and newStrings carry no CR at all and the split would allocate
+// an array the size of the string's line count for nothing.
+const foldLf = (value: string): string => (value.includes('\r') ? value.split('\r\n').join('\n') : value);
+
+// The LF view of a source, plus the CRLF positions needed to map view offsets back.
+type LfView = { view: string; removed: number[] };
+
+// Shared empty position list: an LF-only file needs no offset mapping at all, and one
+// array literal per call would be garbage for nothing. `countBefore` only reads it.
+const NO_CRLF: number[] = [];
+
+// Fold CRLF to LF for MATCHING ONLY, and record enough to map offsets back.
+//
+// The previous shape did this unconditionally: a whole-file `split('\r\n').join('\n')`
+// plus `[...source.matchAll(/\r\n/g)]`, which allocates one match OBJECT per CRLF on
+// top of a second array of positions. On an 11 MB file that fixed cost was 90 ms paid
+// before any matching happened — even for a tier-1 exact hit that needed none of it —
+// against 34 ms for the LF equivalent. Two changes:
+//
+//   - a file with no CR at all costs one `includes`, because the LF view IS the source
+//     and no offset ever needs mapping (the fold is the identity);
+//   - a file with CRs is walked with `indexOf`, so only the positions array is built
+//     and no per-match object exists.
+//
+// `removed[k]` is the VIEW offset of the k-th CRLF, i.e. its source offset minus the k
+// carriage returns already dropped. Adding the count of entries strictly below a view
+// offset converts view coordinates to source coordinates, exactly as before.
+const foldToLf = (source: string): LfView => {
+    if (!source.includes('\r')) return { view: source, removed: NO_CRLF };
+
+    const removed: number[] = [];
+    let view = '';
+    let cursor = 0;
+    let at = source.indexOf('\r\n');
+
+    while (at !== -1) {
+        // Drop the CR, keep the LF. `view.length` is now (at + 1) - removed.length,
+        // so the view offset of this very newline is `view.length - 1`.
+        view += source.slice(cursor, at) + '\n';
+        removed.push(view.length - 1);
+        cursor = at + 2;
+        at = source.indexOf('\r\n', cursor);
+    }
+
+    return { view: view + source.slice(cursor), removed };
+};
+
+// The dominant line ending in `text`, or `fallback` when neither wins.
+//
+// `lfCount` is BARE newlines — a CRLF is one line ending, not two — so it is the total
+// newline count MINUS the CRLF count. Getting that subtraction wrong silently flips the
+// answer on a pure-CRLF file, which is why the equivalence is pinned by a test rather
+// than argued here.
+//
+// This used to be two `split()`s, which materialise TWO ARRAYS OF STRINGS the size of
+// the file's line count just to read their lengths: 8.5 ms and 16.2 ms on a 200,000-line
+// file, paid on EVERY edit call including a tier-1 exact hit. Counting with `indexOf`
+// allocates nothing and answers the same question. A file with no CR at all — the
+// common case — skips the CRLF scan entirely.
+const lineEnding = (text: string, fallback: string): string => {
+    const crlfCount = text.includes('\r') ? countChar(text, '\r\n') : 0;
+    const bareLfCount = countChar(text, '\n') - crlfCount;
+
+    if (crlfCount === bareLfCount) return fallback;
+    return crlfCount > bareLfCount ? '\r\n' : '\n';
+};
+
+// `lineEnding` without the fallback: null means "no opinion" (no line endings at all,
+// or an exact tie), so the caller decides what to do and only pays for a wider scan
+// when this one is inconclusive.
+const dominantEnding = (text: string): '\r\n' | '\n' | null => {
+    const crlfCount = text.includes('\r') ? countChar(text, '\r\n') : 0;
+    const bareLfCount = countChar(text, '\n') - crlfCount;
+
+    if (crlfCount === bareLfCount) return null;
+    return crlfCount > bareLfCount ? '\r\n' : '\n';
+};
+
+// Above this many cell comparisons, `alignLines` gives up on the LCS and maps lines
+// positionally instead. The alignment exists ONLY to choose a line ending per replaced
+// line, and the full table costs O(before x after) in BOTH time and memory: a
+// replaceAll over a 5,000-line region measured 275 ms and a 95 MB `Uint32Array`
+// (5001 x 5001 x 4 bytes) for that nicety. 1,000 x 1,000 = 1e6 cells is already more
+// work than most whole edits are worth, and stays under 4 MB.
+const ALIGN_CELL_LIMIT = 1_000_000;
 
 // For each line of `after`, the index of the `before` line it keeps (longest
 // common subsequence) or, between kept lines, the line it takes the place of;
 // undefined for lines with no counterpart.
+//
+// PAST THE CELL LIMIT, POSITIONAL IS THE FALLBACK. Line i of `after` takes the ending
+// of line i of `before` where such a line exists, and no counterpart beyond that — the
+// same answer an LCS gives when the two sides line up, which is what a replacement that
+// rewrites a region line-for-line looks like. It is NOT the same answer when lines are
+// inserted or deleted in a MIXED-ending region, and that is the honest trade: a
+// mixed-ending region several thousand lines deep, edited by a single call, is rare;
+// stalling the process for 275 ms and 95 MB on every such call is worse.
 const alignLines = (before: string[], after: string[]): (number | undefined)[] => {
+    if (before.length * after.length > ALIGN_CELL_LIMIT) {
+        const shared = Math.min(before.length, after.length);
+        return after.map((_, index) => (index < shared ? index : undefined));
+    }
+
     const width = after.length + 1;
     const table = new Uint32Array((before.length + 1) * width);
     for (let i = before.length - 1; i >= 0; i--)
@@ -403,19 +511,70 @@ const countBefore = (positions: number[], offset: number): number => {
 // fallback tiers only run when the tier above found NOTHING, so an exact match is
 // never displaced by a looser one. `tier` names the tier that produced the match,
 // so the result can report that a fallback was used; undefined means exact bytes.
+// THE SINGLE-LINE FAST PATH, AND WHY IT IS EXACTLY EQUIVALENT
+// -----------------------------------------------------------
+// An oldString that contains NEITHER a carriage return NOR a newline — one line of
+// text, which is what the overwhelming majority of real hunks are — can be matched
+// against the raw source, because folding CRLF to LF cannot change WHERE such a string
+// occurs:
+//
+//   - a match of it in the source occupies characters that are all still adjacent in
+//     the view (the fold deletes only CRs, and this string contains none);
+//   - a match of it in the view cannot straddle a line boundary, because it contains no
+//     LF, and within one line the view and the source are the same characters up to a
+//     trailing CR that this string does not contain.
+//
+// So the two match sets are in one-to-one correspondence, at offsets that are already
+// in SOURCE coordinates — no view copy, no position array, no mapping pass. When the
+// fast path finds nothing the full cascade below still runs, and since a CR-deletion
+// can only CREATE matches, a raw miss is never a false negative.
+//
+// MEASURED (2.3 MB / 2.5 MB files, 200,000 lines, tier-1 exact hit, edit-only timing):
+// CRLF 90.8 ms -> 25.6 ms, LF 34.3 ms -> 15.5 ms. The whole-file fold that used to run
+// on EVERY call — including the exact hits that need none of it — now runs only when a
+// multi-line oldString actually misses the raw bytes.
 const matchView = (
     source: string,
     oldString: string,
     newString: string
 ): { matches: Match[]; tier?: FileEditMatch; replace: (match: Match) => string } => {
-    // split/join, not replaceAll: the declared `lib` predates ES2021.
-    const view = source.split('\r\n').join('\n');
-    // View offset of every CRLF; adding the count strictly before an offset maps
-    // view coordinates back to source coordinates (the fold is one-to-one).
-    const removed = [...source.matchAll(/\r\n/g)].map((match, index) => (match.index ?? 0) - index);
-    const fileEnding = lineEnding(source, '\n');
-    const search = oldString.split('\r\n').join('\n');
-    const replacement = newString.split('\r\n').join('\n');
+    // The file's own dominant ending, computed at most ONCE per call. A single-line
+    // region has no ending of its own, so it falls back to this — and a `replaceAll`
+    // over 40,000 matches would otherwise rescan the whole file 40,000 times, which is
+    // the exact quadratic trap this file's header warns about. (It bit once already:
+    // the previous code computed `fileEnding` eagerly for every call, single match or
+    // not; making it lazy without caching made it per-MATCH.)
+    let fileEnding: string | null = null;
+    const endingOfWholeFile = (): string => (fileEnding ??= lineEnding(source, '\n'));
+
+    // A replacement with NO newline is one line, and `withRegionEndings` returns a
+    // one-line replacement VERBATIM: its only line is also its last line, and the last
+    // line never receives an ending. So the ending choice cannot change the output, and
+    // neither the region scan nor the whole-file tie-break is worth paying for. This is
+    // the common case — a one-line hunk replaced by one line — and without it a
+    // single-line edit on a large file still rescans the whole file for a tie-break it
+    // never uses.
+    const replacement = foldLf(newString);
+    const verbatim = !replacement.includes('\n');
+
+    const singleLine = !oldString.includes('\r') && !oldString.includes('\n');
+    const rawExact = singleLine ? findOccurrences(source, oldString) : [];
+
+    if (rawExact.length > 0) {
+        return {
+            matches: rawExact,
+            tier: undefined,
+            replace: verbatim
+                ? () => replacement
+                : (match: Match) => {
+                      const region = source.slice(match.start, match.end);
+                      return withRegionEndings(region, replacement, dominantEnding(region) ?? endingOfWholeFile());
+                  }
+        };
+    }
+
+    const { view, removed } = foldToLf(source);
+    const search = foldLf(oldString);
 
     const exact = findOccurrences(view, search);
     const unicode =
@@ -433,9 +592,13 @@ const matchView = (
             end: match.end + countBefore(removed, match.end)
         })),
         tier,
+        // The whole file's dominant ending is only a TIE-BREAK for a region that has no
+        // opinion of its own, so it is computed on demand and memoised: a region with a
+        // clear majority — nearly every real one — never pays for the scan, and a
+        // `replaceAll` pays for it once rather than per match.
         replace: (match: Match) => {
             const region = source.slice(match.start, match.end);
-            return withRegionEndings(region, replacement, lineEnding(region, fileEnding));
+            return withRegionEndings(region, replacement, dominantEnding(region) ?? endingOfWholeFile());
         }
     };
 };

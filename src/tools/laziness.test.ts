@@ -89,6 +89,8 @@ const readAlphaExpected = () => ({
             startLine: 1,
             endLine: 1,
             truncated: false,
+            limit: null,
+            startByteAligned: null,
             nextLine: null,
             nextColumn: null,
             nextByte: null,
@@ -133,7 +135,12 @@ describe('lazy preset tools', () => {
             'nextByte',
             '256 KiB budget measured on the SERIALIZED JSON',
             'EBINARY',
-            'maxLines 5000'
+            // The default line cap is gone: the budget is the documented limit, and an
+            // EXPLICIT maxLines is what stays bounded. Pinning the phrase that used to
+            // read "maxLines 5000" keeps this test doing its job — proving the full
+            // prose ships with the metadata — without re-pinning the whole sentence.
+            'NO line cap',
+            'limit'
         ]) {
             expect(presetTools.read.description).toContain(phrase);
         }
@@ -174,14 +181,14 @@ describe('lazy preset tools', () => {
                                         type: 'integer',
                                         minimum: 0,
                                         description:
-                                            'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. Defaults to null (count from the start).'
+                                            'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. An offset inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; an offset at or past EOF is an ERANGE entry. Without an explicit startLine the true line at this offset is counted and reported. Defaults to null (count from the start).'
                                     },
                                     maxLines: {
                                         type: 'integer',
                                         minimum: 1,
                                         maximum: 20_000,
                                         description:
-                                            'Maximum lines to return. Defaults to 5000 and is capped at 20000.'
+                                            'Maximum lines to return. OMIT for no line cap: the 256 KiB budget then decides, which is the default. When supplied it must be an integer in [1, 20000]. A window cut by this cap reports limit: "maxLines".'
                                     }
                                 },
                                 required: ['path'],

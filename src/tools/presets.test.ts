@@ -6,9 +6,10 @@
 //
 // T14: the four file tools are BATCHED (one array argument each). The rename moved
 // `fileWrite` to `write`, split `fileGlob` into `glob` (names) and `grep` (lines), and
-// moved `syntax` to `syntax` — with no old names on the wire, so this file also
-// pins that the PUBLIC ENTRY exports the new names. Names follow
-// `<namespace><action>` except the two bare search verbs.
+// moved `syntax` to `syntax`; `fileList` became the `list` operation of `files` — all
+// with no old names on the wire, so this file also pins that the PUBLIC ENTRY exports
+// the new names. A name describes what the tool does best: an action for a single
+// capability (`read`, `glob`), the domain for a set of them (`files`).
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
@@ -21,7 +22,7 @@ import {
     edit,
     glob,
     grep,
-    fileList,
+    files,
     read,
     write,
     syntax
@@ -37,10 +38,10 @@ import { MODEL_TOOL_RESULT_BUDGET_BYTES } from '../core/result-budget';
 // Importing the leaf module pulls in no tool body, so laziness.test.ts is unaffected.
 const FILE_READ_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
-// Mirrors FILE_LIST_CONTENT_BUDGET / FILE_LIST_DEFAULT_LIMIT in ./files/fileList
+// Mirrors FILES_CONTENT_BUDGET / FILES_LIST_DEFAULT_LIMIT in ./files/files.tool.ts
 // for the same lazy-loading reason as above.
-const FILE_LIST_CONTENT_BUDGET = 64 * 1024;
-const FILE_LIST_DEFAULT_LIMIT = 200;
+const FILES_CONTENT_BUDGET = 64 * 1024;
+const FILES_LIST_DEFAULT_LIMIT = 200;
 
 // Mirrors FILE_GREP_CONTENT_BUDGET in ./files/grep.tool for the same reason: grep is
 // the content half of the old fileGlob, and its aggregate budget is part of the
@@ -161,6 +162,8 @@ describe('syntax', () => {
                     startLine: 1,
                     endLine: 0,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -178,6 +181,8 @@ describe('syntax', () => {
                     startLine: 1,
                     endLine: 0,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -247,6 +252,8 @@ describe('file tools', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -263,16 +270,24 @@ describe('file tools', () => {
         // Results carry the directory they came from, so one flat list can hold
         // several directories without ambiguity.
         //
-        // The listing is PAGINATED (fileList.ts header): the legacy string argument
-        // still selects the directory, but the answer is one bounded page.
-        await expect(fileList('notes')).resolves.toEqual({
-            entries: ['notes/hello.md'],
-            truncated: false,
-            nextOffset: null,
-            offset: 0,
-            limit: 200,
+        // The listing is PAGINATED (files.tool.ts header): listing is one OPERATION of
+        // `files`, and the page cursor travels inside that entry's own receipt, which is
+        // why `files` declares a single `ops` property like every other batched tool.
+        await expect(files([{ op: 'list', path: 'notes' }])).resolves.toEqual({
+            results: [
+                {
+                    op: 'list',
+                    path: 'notes',
+                    entries: ['notes/hello.md'],
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: 200,
+                    bytes: 14
+                }
+            ],
             bytes: 14,
-            contentBudget: FILE_LIST_CONTENT_BUDGET
+            contentBudget: FILES_CONTENT_BUDGET
         });
     });
 
@@ -379,6 +394,8 @@ describe('file tools', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -391,6 +408,8 @@ describe('file tools', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -437,37 +456,53 @@ describe('file tools', () => {
             { path: 'tree/sub/b.txt', content: 'b' }
         ]);
 
-        await expect(fileList('tree')).resolves.toEqual({
-            entries: ['tree/a.txt', 'tree/sub/'],
-            truncated: false,
-            nextOffset: null,
-            offset: 0,
-            limit: FILE_LIST_DEFAULT_LIMIT,
-            // 'tree/a.txt' (10) + 'tree/sub/' (9) UTF-8 bytes.
+        await expect(files([{ op: 'list', path: 'tree' }])).resolves.toEqual({
+            results: [
+                {
+                    op: 'list',
+                    path: 'tree',
+                    entries: ['tree/a.txt', 'tree/sub/'],
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: FILES_LIST_DEFAULT_LIMIT,
+                    // 'tree/a.txt' (10) + 'tree/sub/' (9) UTF-8 bytes.
+                    bytes: 19
+                }
+            ],
             bytes: 19,
-            contentBudget: FILE_LIST_CONTENT_BUDGET
+            contentBudget: FILES_CONTENT_BUDGET
         });
     });
 
-    it('lists several directories in one call, grouped in the caller order', async () => {
+    it('lists several directories in one operation, grouped in the caller order', async () => {
         await write([
             { path: 'multi/src/a.ts', content: 'a' },
             { path: 'multi/task/b.ts', content: 'b' }
         ]);
 
-        await expect(fileList(['multi/task', 'multi/src'])).resolves.toEqual({
-            entries: ['multi/task/b.ts', 'multi/src/a.ts'],
-            truncated: false,
-            nextOffset: null,
-            offset: 0,
-            limit: FILE_LIST_DEFAULT_LIMIT,
-            // 'multi/task/b.ts' (15) + 'multi/src/a.ts' (14) UTF-8 bytes.
+        // One list operation, several directories: `path` accepts a string or a string
+        // array, and the flat sequence it pages is grouped by directory in caller order.
+        await expect(files([{ op: 'list', path: ['multi/task', 'multi/src'] }])).resolves.toEqual({
+            results: [
+                {
+                    op: 'list',
+                    path: 'multi/task',
+                    entries: ['multi/task/b.ts', 'multi/src/a.ts'],
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: FILES_LIST_DEFAULT_LIMIT,
+                    // 'multi/task/b.ts' (15) + 'multi/src/a.ts' (14) UTF-8 bytes.
+                    bytes: 29
+                }
+            ],
             bytes: 29,
-            contentBudget: FILE_LIST_CONTENT_BUDGET
+            contentBudget: FILES_CONTENT_BUDGET
         });
     });
 
-    it('defaults fileList to the working directory', async () => {
+    it('defaults a list operation to the working directory', async () => {
         // A fresh, otherwise-empty directory makes the default listing exact: no
         // other test's fixtures leak in, so "." must produce exactly these names
         // with no prefix at all.
@@ -479,17 +514,25 @@ describe('file tools', () => {
         try {
             // 'marker.txt' (10) + 'sub/' (4) UTF-8 bytes, no prefix (".").
             const defaultPage = {
-                entries: ['marker.txt', 'sub/'],
-                truncated: false,
-                nextOffset: null,
-                offset: 0,
-                limit: FILE_LIST_DEFAULT_LIMIT,
+                results: [
+                    {
+                        op: 'list',
+                        path: '.',
+                        entries: ['marker.txt', 'sub/'],
+                        truncated: false,
+                        nextOffset: null,
+                        offset: 0,
+                        limit: FILES_LIST_DEFAULT_LIMIT,
+                        bytes: 14
+                    }
+                ],
                 bytes: 14,
-                contentBudget: FILE_LIST_CONTENT_BUDGET
+                contentBudget: FILES_CONTENT_BUDGET
             };
-            await expect(fileList(undefined)).resolves.toEqual(defaultPage);
-            // Omitted and explicit ["."] are the same request.
-            await expect(fileList(['.'])).resolves.toEqual(defaultPage);
+
+            await expect(files([{ op: 'list' }])).resolves.toEqual(defaultPage);
+            // Omitted and explicit "." are the same request.
+            await expect(files([{ op: 'list', path: '.' }])).resolves.toEqual(defaultPage);
         } finally {
             process.chdir(previous);
         }
@@ -507,6 +550,8 @@ describe('file tools', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -533,6 +578,8 @@ describe('file tools', () => {
                     startLine: 1,
                     endLine: 0,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -599,7 +646,7 @@ describe('presets inside a harness', () => {
         // everyday first steps of a code task.
         expect(glob.visibility).toBe('core');
         expect(grep.visibility).toBe('core');
-        expect(fileList.visibility).toBe('searchable');
+        expect(files.visibility).toBe('searchable');
         expect(shell.visibility).toBe('searchable');
         expect(syntax.visibility).toBe('searchable');
     });
@@ -653,6 +700,8 @@ describe('presets inside a harness', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,

@@ -17,7 +17,7 @@
 // WHAT IS IN THE SHARED TOOLBOX (T14 names)
 // -----------------------------------------
 //   - package presets  — src/tools: syntax, read, write, edit,
-//                        fileList, glob, grep, shell, gitDiff
+//                        files, glob, grep, shell, gitDiff
 //                        (lazy proxies, see src/tools/lazy.ts)
 //   - harness tools    — src/server/tools/shared: timeNow, textCount, diceRoll,
 //                        noteSearch, textSummarize (T25: discovered from the files,
@@ -34,7 +34,7 @@
 //                        toolRequest (the discovery bootstrap) plus task (the
 //                        session plan), with delegate for a preset that declares
 //                        subagents.
-//                        fileList, the other package/app tools, and the runtime
+//                        files, the other package/app tools, and the runtime
 //                        rows R9-R11 demoted (toolRegistry/toolList/toolManage/
 //                        toolCreate/profileManage/chapterManage/locationManage/
 //                        agentManage/agentResult/actionRequest/threadFork) stay
@@ -191,7 +191,7 @@ export const CORE_TOOL_NAMES: readonly string[] = Object.freeze(
 
 // Package presets that are declared on every request (R18), derived from the
 // descriptor metadata: `visibility: 'core'` is what makes a preset declared up
-// front. fileList is deliberately absent from the result because it stays
+// front. files is deliberately absent from the result because it stays
 // discoverable. There is no fileSearch entry — the approved consolidation is the
 // one glob tool (plus grep for content), now core.
 export const CORE_PRESET_TOOL_NAMES: readonly string[] = Object.freeze(

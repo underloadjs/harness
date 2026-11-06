@@ -71,7 +71,7 @@ const EXPECTED_SOURCE_PATHS = {
     read: 'tools/files/read.tool.ts',
     write: 'tools/files/write.tool.ts',
     edit: 'tools/files/edit.tool.ts',
-    fileList: 'tools/files/fileList.tool.ts',
+    files: 'tools/files/files.tool.ts',
     glob: 'tools/files/glob.tool.ts',
     grep: 'tools/files/grep.tool.ts',
     shell: 'tools/command/shell.tool.ts',

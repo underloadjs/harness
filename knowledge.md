@@ -114,7 +114,7 @@ src/
       read.tool.ts
       write.tool.ts       was fileWrite
       edit.tool.ts
-      fileList.tool.ts
+      files.tool.ts
       glob.tool.ts        names only          } the two halves of the old fileGlob
       grep.tool.ts        contents only      }
       glob.ts           shared walker (used by glob and grep)
@@ -494,8 +494,10 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 - the six everyday capabilities are bare **action verbs** — `read`, `edit`, `shell`,
   `search`, `fetch`, `delegate` — because they are the tools a model reaches for
   constantly and a namespace prefix would only cost tokens;
-- everything else keeps `<namespace><action>`, which is what groups a large catalogue
-  for `toolRequest`:
+- a tool that owns ONE action keeps `<namespace><action>`, which is what groups a large
+  catalogue for `toolRequest`; a tool that owns a DOMAIN of operations is named for the
+  domain (`files` = list/move/copy/delete/mkdir, `task` = the task list), because no
+  single verb describes it and one call can sequence the operations that belong together.
 
 | Namespace | Tools |
 |---|---|
@@ -507,7 +509,7 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 | `agent*` | `agentManage` (list agents + result previews), `agentResult` (read one completed result) |
 | `action*` | `actionRequest` (conditional owner question; `interaction` configured) |
 | `thread*` | `threadFork` (conditional private history fork; forks enabled), `threadSend`, `threadList`, `threadRead` (paged transcript read: whole thread, one message, regex/role filters, per-message content paging) |
-| `file*` | `fileList` (the renamed half is bare: `write`, `glob`, `grep`; the read/edit pair is `read`/`edit`) |
+| `file*` | `files` (the domain-named manager of list/move/copy/delete/mkdir; the single-action halves stay bare verbs: `read`, `write`, `edit`, `glob`, `grep`) |
 | (verbs) | `read`, `write`, `edit`, `glob`, `grep`, `shell`, `search`, `fetch`, `delegate` |
 | `text*` | `textCount`, `textSummarize` |
 | `time*` | `timeNow` |
@@ -522,9 +524,11 @@ There are **no aliases**. The T14 spellings (`fileRead`, `fileEdit`, `commandRun
 `wordCount`, `roll`, `searchNotes`, `summarize`, `flaky`) are gone from the wire
 surface, the exports, the entry file names, the catalogue, the prompts, and the
 reserved-name list. The later rename removed `fileWrite` (now `write`), `fileGlob`
-(now the pair `glob` + `grep`) and `syntaxCheck` (now `syntax`) the same way, and the
-bare search verbs are the documented exception to `<namespace><action>`: naming a file
-and finding a line are verbs a model already types. Two names for one tool makes
+(now the pair `glob` + `grep`), `syntaxCheck` (now `syntax`), and `fileList` (now the
+`list` OPERATION of `files`) the same way, and the naming rule is simply "name it for
+what it does best": bare verbs where a verb is the capability (naming a file, finding a
+line, searching, fetching), and the domain name where a tool owns a set of operations.
+Two names for one tool makes
 discovery ambiguous, and a
 compatibility alias would also mean a second catalogue entry the model could pick by
 mistake. The public TYPE names (`FileReadResult`, `FileWriteParameters`,
@@ -619,7 +623,7 @@ declares:
 **Every harness preloads the preset catalogue** (`src/tools/`) unless it is
 created with `presets: false`. **Five file tools are core (R18)** —
 `read`, `write`, `edit`, `glob`, `grep` — so they are declared on every
-request and need no discovery. `fileList`, `syntax`, `shell`, and
+request and need no discovery. `files`, `syntax`, `shell`, and
 `gitDiff` stay searchable: a model that needs a directory listing asks for
 `files`/`list`. A configured tool replaces a preloaded preset of the same name.
 The harness-owned `toolRequest` and `task` are core too, and so is the
@@ -900,10 +904,10 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 ## Preset tools
 
 `src/tools/` ships ten presets: `syntax`, the six file tools (`read`,
-`write`, `edit`, `fileList`, `glob`, `grep`), `shell`, `gitDiff`, and
+`write`, `edit`, `files`, `glob`, `grep`), `shell`, `gitDiff`, and
 `download`. Each
 is a standard `tool()` and each is executable standalone. R18 kept `read`,
-`write`, `edit`, `glob`, and `grep` **core**; `fileList`, `syntax`, `shell`,
+`write`, `edit`, `glob`, and `grep` **core**; `files`, `syntax`, `shell`,
 `gitDiff`, and (R9-R11) `download` are **searchable**.
 
 The folder is one file per tool, one folder per capability — `tools/syntax/`,
@@ -937,9 +941,9 @@ when it is newer than the manifest (T24). Consequences:
 - a failed import clears the cache so the next call retries.
 
 Every preset is tagged. The five core file tools are declared up front; the
-searchable remainder (`fileList`, `syntax`, `shell`, `gitDiff`, `download`) waits for
-`files`/`list`, `shell`, `git`, `javascript`/`typescript`/`json`/`python`, or the
-`grep` tag.
+searchable remainder (`files`, `syntax`, `shell`, `gitDiff`, `download`) waits for
+`files`/`list`/`move`/`rename`/`copy`/`delete`/`remove`/`mkdir`, `shell`, `git`,
+`javascript`/`typescript`/`json`/`python`, or the `grep` tag.
 
 | Export | Call | Result |
 |---|---|---|
@@ -947,7 +951,7 @@ searchable remainder (`fileList`, `syntax`, `shell`, `gitDiff`, `download`) wait
 | `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }`; defaults `startLine 1`, `maxLines 5000` (max 20000); the 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap. A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call. Binary detection is window-scoped, not whole-file |
 | `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks, line endings preserved), all preflighted before the first write, each file written once. `match` names a fallback tier. Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call fails with "no match" instead of clobbering the other's change |
-| `fileList` | `(paths?)` legacy string/string[] or `({ paths?, offset?, limit? })`; defaults to `["."]` | `{ entries: string[], truncated, nextOffset, offset, limit, bytes, contentBudget }` — ONE page of `dir/entry`, directories end with `/`; non-recursive |
+| `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (ONE page of `dir/entry`, directories end with `/`, non-recursive, 200 entries default / 1000 max, 64 KiB of entry text shared by every list operation in the call); `move`/`copy` → `{ path, to, kind, bytes }`, and an existing destination is refused unless `overwrite`; `delete` → `{ path, removed, recursive }` (a non-empty directory needs `recursive`, a missing path needs `force` and is then reported `removed: false, skipped: true`); `mkdir` → `{ path, created }`, creating parents and reporting an existing directory as `created: false`. A failed list entry carries its own `error: { code, message }`; a failed mutation rejects the call and names the operations already applied (there is no rollback). Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — names only; the old `content` property is gone and the schema rejects it |
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }` (required `pattern`; 1 KiB snippet per line, 64 KiB aggregate) |
 | `shell` | `({ command, cwd?, timeoutMs? })` | `{ exitCode, stdout, stderr, truncated, timedOut, aborted }`; stdout 128 KiB / stderr 16 KiB, timeout 1..600000 ms (default 120000), process tree killed best-effort |
@@ -1045,13 +1049,18 @@ Implementation notes worth keeping:
   a directory rather than a permission denial, which matters because Windows reports
   EPERM for both. The result reports `replacements`, the new byte size, and `match`
   when a fallback tier was used.
-- **`fileList` takes a directory array and returns ONE PAGE.** `fileList(['src', 'task'])`
-  returns one flat list whose entries are prefixed with their directory (`src/a.ts`,
-  `src/nested/`, `task/b.ts`); directories keep the trailing `/`. It stays
-  **non-recursive** — `glob({ patterns: ['**/*'] })` is the walking tool — and
-  the default `paths: ["."]` returns bare entry names (the schema declares
-  `default: ["."]`). `undefined`, `null`, `{}`, and a `{ "paths": [...] }` wrapper
-  all normalize to that default; the server's direct-call route resolves both the
+- **`files`' `list` operation takes one directory or several and returns ONE PAGE.**
+  `files([{ op: 'list', path: ['src', 'task'] }])` returns one flat list whose entries
+  are prefixed with their directory (`src/a.ts`, `src/nested/`, `task/b.ts`); directories
+  keep the trailing `/`. It stays **non-recursive** - `glob({ patterns: ['**/*'] })` is the
+  walking tool - and omitting `path` lists the working directory, returning bare entry
+  names. Paging state lives INSIDE the list receipt (`{ entries, truncated, nextOffset,`
+  `offset, limit, bytes }`), which is what lets `files` declare ONE array property (`ops`)
+  where `fileList` needed three - the catalogue's last exception to the batching rule is
+  gone. The 64 KiB entry-text budget is shared by every list operation in one call. Unlike
+  `fileList`, a directory that cannot be read is that entry’s own `error`
+  (`ENOENT`/`ENOTDIR`/`EACCES`…) rather than a failed call, because a read-only miss must not
+  discard mutations the same call already applied; the server's direct-call route resolves both the
   legacy bare value and the wrapper through the shared validator
   (`resolveToolParameters`, 'direct' mode), so they are the same request. An explicit
   `[]` is still an error. Directories are visited in the caller's order, each listing
@@ -1774,7 +1783,7 @@ await writer('tell me about new year');
   there is a subagent; a request declares every core tool
   (`read`/`write`/`edit`/`glob`/`grep`, the environment `search`/`fetch` pair it
   actually registered, and the declared harness-owned set), then whatever toolRequest
-  enabled. The searchable remainder (`fileList`, `shell`, `download`, ...) waits for
+  enabled. The searchable remainder (`files`, `shell`, `download`, ...) waits for
   discovery. `delegate` is core for
   the primary only.
 - **`discoveredTools`** is a read-only copy of the enabled set, in discovery order.
@@ -2724,8 +2733,8 @@ can fix.
 - The direct (session-less) runner resolves `parameters` through
   `resolveToolParameters(schema, raw, 'direct')` before `execute` sees them. Both
   documented shapes therefore work — the legacy unwrapped value (a bare array for a
-  single-property schema, or `fileList(['src'])`) and the schema wrapper
-  (`{ "paths": ["src"] }`) — and a wrong type is a `{ ok: false }` tool error with a
+  single-property schema, or `files([{ op: 'list', path: 'src' }])`) and the schema
+wrapper (`{ "ops": [{ op: 'list', path: 'src' }] }`) - and a wrong type is a `{ ok: false }` tool error with a
   JSON path instead of an implementation crash. `null` is normalized to `{}`.
 - Result and error TEXT share the model-facing 64 KiB cap (`boundToolResult` in
   `src/core/result-budget.ts`, applied AFTER the `toolUi()` unwrap so panels stay on
@@ -2780,7 +2789,7 @@ harness-owned entries above plus `delegate`, `actionRequest`, and `threadFork`
 owning run). The UI's core dropdown reads
 `coreTools` from the descriptor, which is computed from the registered names and
 therefore includes the file tools, adds `search` only when this host resolved a
-key, omits `fileList` (and the other searchable tools), and matches the harness's
+key, omits `files` (and the other searchable tools), and matches the harness's
 actual core declarations.
 
 Every standalone request requires `X-Harness-Client: ui`. A browser on another

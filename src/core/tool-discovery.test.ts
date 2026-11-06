@@ -120,7 +120,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'read',
             'write',
             'edit',
-            'fileList',
+            'files',
             'glob',
             'grep',
             'shell',

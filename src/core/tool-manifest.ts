@@ -142,7 +142,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     items: {
                         type: "string"
                     },
-                    description: "Exact wire names to enable, case-sensitive (e.g. [\"fileList\"])."
+                    description: "Exact wire names to enable, case-sensitive (e.g. [\"files\"])."
                 },
                 regex: {
                     type: "string",
@@ -1050,7 +1050,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "read",
     metadata: {
         name: "read",
-        description: "Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, maxLines 5000 (hard maximum 20000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use fileList or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte rescans from the start to count lines. Binary detection is WINDOW-SCOPED, not whole-file: a NUL past the requested window is not reported, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.",
+        description: "Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, and NO line cap — the byte budget is the limit, so a default read returns as much as the envelope holds; an EXPLICIT maxLines is an integer in [1, 20000]. `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. `limit` says WHY a truncated window stopped: \"maxLines\" (raise maxLines to get more) or \"budget\" (more lines would not help; the 256 KiB envelope is full) — or null when the window reached EOF, in which case truncated is false. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. A startByte that lands inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; a startByte at or past the end of the file is an ERANGE entry, not an empty window, so \"offset out of range\" and \"file is empty\" are different answers. With no startLine, the true line at a seek offset is counted and reported rather than defaulting to 1. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use files or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), ERANGE (startByte at or past EOF), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte counts newlines from the start to find it, on raw bytes and at seek speed. Binary detection is WINDOW-SCOPED, not whole-file: bytes outside the requested window are never decoded, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.",
         tags: [
             "files",
             "read",
@@ -1087,13 +1087,13 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                                     startByte: {
                                         type: "integer",
                                         minimum: 0,
-                                        description: "Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. Defaults to null (count from the start)."
+                                        description: "Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. An offset inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; an offset at or past EOF is an ERANGE entry. Without an explicit startLine the true line at this offset is counted and reported. Defaults to null (count from the start)."
                                     },
                                     maxLines: {
                                         type: "integer",
                                         minimum: 1,
                                         maximum: 20000,
-                                        description: "Maximum lines to return. Defaults to 5000 and is capped at 20000."
+                                        description: "Maximum lines to return. OMIT for no line cap: the 256 KiB budget then decides, which is the default. When supplied it must be an integer in [1, 20000]. A window cut by this cap reports limit: \"maxLines\"."
                                     }
                                 },
                                 required: [
@@ -1128,7 +1128,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "write",
     metadata: {
         name: "write",
-        description: "Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. A write error part-way through is reported with the paths already completed: there is no rollback.",
+        description: "Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. A write error part-way through is reported with the paths already completed: there is no rollback.",
         tags: [
             "files",
             "write",
@@ -1139,6 +1139,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             properties: {
                 files: {
                     type: "array",
+                    maxItems: 100,
                     items: {
                         type: "object",
                         properties: {
@@ -1243,45 +1244,105 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "fileList",
+    name: "files",
     metadata: {
-        name: "fileList",
-        description: "List the immediate entries of one or more directories, non-recursively, ONE PAGE at a time. Every entry is prefixed with the directory it came from (e.g. [\"src/a.ts\", \"src/nested/\", \"task/b.ts\"]), directories end with a trailing slash so they are distinguishable from files, and entries are sorted. Pass several directories to survey them in one call; the default is [\".\"], which returns bare entry names. The result is { entries, truncated, nextOffset, offset, limit, bytes, contentBudget }: a page holds at most 200 entries by default (maximum 1000) and at most 64 KiB of UTF-8 entry text, so when `truncated` is true pass `nextOffset` back as `offset` to read the rest. A missing or unreadable directory fails the whole call rather than returning a partial list.",
+        name: "files",
+        description: "Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace); delete takes `path` plus `recursive` (a non-empty directory without it is refused) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory as `created: false`. Returns `{ results, bytes, contentBudget }` with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }` (a page holds at most 200 entries by default, 1000 maximum, and 64 KiB of entry text across the whole call, so pass `nextOffset` back as that entry's `offset` for more), move/copy give `{ path, to, kind, bytes }`, delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with \"/\", and listings are sorted by code point, so paging is deterministic. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation names the ops already applied and there is NO rollback, while a failing list entry reports its own `error: { code, message }` without failing the batch. Cross-device moves report EXDEV rather than copying behind your back. Use read/write/edit for content and glob/grep for searching.",
         tags: [
             "files",
             "list",
-            "filesystem"
+            "filesystem",
+            "folder",
+            "directory",
+            "move",
+            "rename",
+            "copy",
+            "delete",
+            "remove",
+            "mkdir"
         ],
         parameters: {
             type: "object",
             properties: {
-                paths: {
+                ops: {
                     type: "array",
                     items: {
-                        type: "string"
+                        type: "object",
+                        properties: {
+                            op: {
+                                type: "string",
+                                enum: [
+                                    "list",
+                                    "move",
+                                    "copy",
+                                    "delete",
+                                    "mkdir"
+                                ],
+                                description: "The operation this entry performs. Required, and it decides which other fields are allowed."
+                            },
+                            path: {
+                                oneOf: [
+                                    {
+                                        type: "string"
+                                    },
+                                    {
+                                        type: "array",
+                                        items: {
+                                            type: "string"
+                                        }
+                                    }
+                                ],
+                                description: "list: one directory or several, paged as one flat sequence (default the working directory). delete/mkdir: the one path. Absolute or relative to the working directory."
+                            },
+                            from: {
+                                type: "string",
+                                description: "move/copy: the existing path to move or copy."
+                            },
+                            to: {
+                                type: "string",
+                                description: "move/copy: the destination. Parent directories are created. Existing destinations need overwrite: true."
+                            },
+                            overwrite: {
+                                type: "boolean",
+                                description: "move/copy: replace an existing destination (recursively, when it is a directory) instead of failing on it. Defaults to false."
+                            },
+                            recursive: {
+                                type: "boolean",
+                                description: "delete: remove a directory and everything under it. Defaults to false."
+                            },
+                            force: {
+                                type: "boolean",
+                                description: "delete: treat a missing path as done (removed: false, skipped: true) instead of an error. Defaults to false."
+                            },
+                            offset: {
+                                type: "integer",
+                                minimum: 0,
+                                description: "list: 0-based index into the flat entry list. Defaults to 0; pass the previous nextOffset here."
+                            },
+                            limit: {
+                                type: "integer",
+                                minimum: 1,
+                                maximum: 1000,
+                                description: "list: maximum entries in this page, 1-1000. Defaults to 200."
+                            }
+                        },
+                        required: [
+                            "op"
+                        ],
+                        additionalProperties: false
                     },
-                    default: [
-                        "."
-                    ],
-                    description: "Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to [\".\"]."
-                },
-                offset: {
-                    type: "integer",
-                    minimum: 0,
-                    description: "0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page."
-                },
-                limit: {
-                    type: "integer",
-                    minimum: 1,
-                    maximum: 1000,
-                    description: "Maximum entries in this page, 1-1000. Defaults to 200."
+                    maxItems: 100,
+                    description: "Operations to perform, in the order they are applied and the order the receipts come back. A later entry sees what an earlier one did, so a rename followed by a delete works; at most 100 per call."
                 }
             },
+            required: [
+                "ops"
+            ],
             additionalProperties: false
         }
     },
-    sourcePath: "tools/files/fileList.tool.ts",
-    label: "tools/files/fileList.tool.ts",
+    sourcePath: "tools/files/files.tool.ts",
+    label: "tools/files/files.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
@@ -1863,8 +1924,8 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/files/write.tool.ts");
         case "tools/files/edit.tool.ts":
             return import("../tools/files/edit.tool.ts");
-        case "tools/files/fileList.tool.ts":
-            return import("../tools/files/fileList.tool.ts");
+        case "tools/files/files.tool.ts":
+            return import("../tools/files/files.tool.ts");
         case "tools/files/glob.tool.ts":
             return import("../tools/files/glob.tool.ts");
         case "tools/files/grep.tool.ts":

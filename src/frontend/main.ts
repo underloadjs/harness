@@ -312,7 +312,7 @@ import {
 import {
     fileChipOf,
     fileGlobPattern,
-    fileListEntriesOf,
+    filesListEntriesOf,
     filePathsOf,
     fileQueryScope,
     fileToken,
@@ -1318,8 +1318,14 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
             value: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }]
         }
     ],
-    // "." works from whatever directory the server runs in.
-    fileList: [{ label: 'Current directory', value: ['.'] }],
+    // `files` declares ONE array property (`ops`), so the textarea holds the array of
+    // operations itself. A list of the server's working directory is the cheapest way to
+    // see the shape; the second preset shows a mutation, which is what makes this tool
+    // more than the `fileList` it replaced.
+    files: [
+        { label: 'List the current directory', value: [{ op: 'list', path: '.' }] },
+        { label: 'Create Temp/probe', value: [{ op: 'mkdir', path: 'Temp/probe' }] }
+    ],
     // glob declares three OPTIONAL properties, so a preset takes the whole object.
     // Both lists below are the documented defaults, and the optional `maxResults` is
     // OMITTED: an absent `maxResults` means the documented cap, whereas `0` would be
@@ -4074,7 +4080,7 @@ if (typeof requestAnimationFrame === 'function') {
 //     endpoint; no new route). Each query changes the glob, so the server walk is
 //     narrowed instead of permanently limiting the picker to the first 100 files.
 //     A monotonically increasing sequence drops stale replies.
-//   - `@query` folders: the SAME debounced beat also reads `fileList` for the typed
+//   - `@query` folders: the SAME debounced beat also reads the `files` list operation for the typed
 //     scope (glob never yields directories), because folders are listed FIRST —
 //     navigation on top, matching file hits below. Both answers carry the same
 //     sequence, so they are painted together or not at all.
@@ -4082,7 +4088,7 @@ if (typeof requestAnimationFrame === 'function') {
 //     by label with the latest occurrence winning (the server's plain-text
 //     resolution rule). No network.
 //
-// A THIRD source fills the same list: `@query` also asks fileList for the folders
+// A THIRD source fills the same list: `@query` also asks `files` (list) for the folders
 // of the typed scope (glob answers file names only — content search is `grep`, and
 // neither of them is what a mention picker wants), and those rows are placed FIRST
 // so folder navigation reads top-down. A folder row ends with "/" and drills in.
@@ -4110,7 +4116,7 @@ let composerPopupState: ComposerPopupState | undefined;
 let lookupTimer: number | undefined;
 let lookupSeq = 0;
 
-// Page size for the folder read. `fileList` defaults to 200 entries per page, which
+// Page size for the folder read. A `files` list defaults to 200 entries per page, which
 // is already far more folders than a picker can usefully show; asking for more would
 // only make the debounced read heavier for the same browsing experience.
 const FILE_FOLDER_LIMIT = 200;
@@ -4310,13 +4316,13 @@ const scheduleFileLookup = (trigger: MentionTrigger & { kind: 'file' }): void =>
         lookupTimer = undefined;
         void (async () => {
             const scope = fileQueryScope(trigger.query);
-            // Folders come from `fileList` (glob walks past directories), read
+            // Folders come from the `files` list operation (glob walks past directories), read
             // in parallel with the glob: one debounce still, two answers. The folder
             // read NEVER fails the picker — an unreadable half-typed directory or an
             // unconfigured tool just contributes no folder rows, and the glob keeps
             // ownership of the error note.
-            const folders = callTool('fileList', { paths: [scope.directory], limit: FILE_FOLDER_LIMIT }).then(
-                (reply) => (reply.ok ? folderPathsOf(fileListEntriesOf(reply.result), scope) : []),
+            const folders = callTool('files', { ops: [{ op: 'list', path: scope.directory, limit: FILE_FOLDER_LIMIT }] }).then(
+                (reply) => (reply.ok ? folderPathsOf(filesListEntriesOf(reply.result), scope) : []),
                 () => []
             );
 
@@ -7809,7 +7815,7 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
 // lives on the identified read (../shared/harness-api.ts:636-648, `ToolDetail` at :654). The
 // runner paints three things from that schema — the preset list, the single-property rule line
 // and the schema pane — so painting a bare row fills the box with `{}` and claims "this schema
-// declares no properties" for a tool that has a full one (the `fileList`/`widgetManage`
+// declares no properties" for a tool that has a full one (the `files`/`widgetManage`
 // regressions this memo exists to end).
 //
 // The detail is therefore fetched when, and only when, a tool is opened, and memoized for as

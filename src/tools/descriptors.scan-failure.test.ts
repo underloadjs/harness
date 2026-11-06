@@ -68,7 +68,7 @@ describe('live catalogue scan failures (T24)', () => {
             'read',
             'write',
             'edit',
-            'fileList',
+            'files',
             'glob',
             'grep',
             'shell',

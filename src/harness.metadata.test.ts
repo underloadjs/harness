@@ -34,7 +34,7 @@ describe('core tool metadata', () => {
                     type: 'array',
                     items: { type: 'string' },
                     description:
-                        'Exact wire names to enable, case-sensitive (e.g. ["fileList"]).'
+                        'Exact wire names to enable, case-sensitive (e.g. ["files"]).'
                 },
                 regex: {
                     type: 'string',

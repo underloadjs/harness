@@ -72,7 +72,7 @@ const IDENTITY = {
 const PROMPT_LENGTHS = [
     { name: 'instruct', length: 1367 },
     { name: 'research', length: 1391 },
-    { name: 'workspace', length: 1351 },
+    { name: 'workspace', length: 1348 },
     { name: 'reviewer', length: 1372 },
     { name: 'planner', length: 1434 },
     { name: 'summarizer', length: 141 },

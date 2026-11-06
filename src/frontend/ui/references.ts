@@ -209,8 +209,9 @@ export const fileGlobPattern = (query: string): string[] => {
 // --- @ folder rows -----------------------------------------------------------
 //
 // `glob` only ever yields FILES (src/tools/files/glob.tool.ts recurses past
-// directories), so the one source of folder rows is `fileList`: it reads ONE
-// directory non-recursively and marks directories with a trailing slash.
+// directories), so the one source of folder rows is the `files` tool's `list`
+// operation: it reads ONE directory non-recursively and marks directories with a
+// trailing slash.
 //
 // A typed @ query splits into the directory to read and the partial entry name:
 //   `@`         -> { directory: '.',     prefix: '' }     root overview
@@ -240,20 +241,32 @@ export const fileQueryScope = (query: string): FileQueryScope => {
     return { directory: directory.length === 0 ? '.' : directory, prefix: normalized.slice(cut + 1) };
 };
 
-// `fileList` answers `{ entries, ... }`; an error body / unconfigured tool answers
-// something else and contributes no folder rows.
-export const fileListEntriesOf = (result: unknown): string[] => {
+// `files` answers `{ results: [{ op: 'list', entries, … }, …] }`; an error body or an
+// unconfigured tool answers something else and contributes no folder rows. The flat
+// `{ entries }` shape is still read, because that is what the tool this replaced
+// answered and a host may pin an older revision.
+export const filesListEntriesOf = (result: unknown): string[] => {
     if (typeof result !== 'object' || result === null) return [];
 
-    const entries = (result as { entries?: unknown }).entries;
-    if (!Array.isArray(entries)) return [];
+    const records = (result as { results?: unknown }).results;
+    const groups = Array.isArray(records)
+        ? records.filter((entry): entry is object => typeof entry === 'object' && entry !== null)
+        : [result as object];
 
-    return entries.filter((entry): entry is string => typeof entry === 'string');
+    for (const group of groups) {
+        const entries = (group as { entries?: unknown }).entries;
+
+        if (Array.isArray(entries)) {
+            return entries.filter((entry): entry is string => typeof entry === 'string');
+        }
+    }
+
+    return [];
 };
 
 // Immediate FOLDER rows for a scope. Entries arrive already prefixed with the
-// directory `fileList` read (`src/nested/`, or bare `nested/` for '.'), in the
-// tool's deterministic code-point order, and files never end with "/", so the
+// directory the `list` operation read (`src/nested/`, or bare `nested/` for '.'), in
+// the tool's deterministic code-point order, and files never end with "/", so the
 // split is unambiguous. The typed prefix matches the entry NAME only
 // (case-insensitive, like `filterFilePathList`), never an ancestor directory.
 export const folderPathsOf = (entries: readonly string[], scope: FileQueryScope): string[] => {

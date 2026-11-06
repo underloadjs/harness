@@ -58,7 +58,7 @@
 // Core vs searchable (R18): the everyday file tools (read, write,
 // edit, glob, grep) carry `visibility: 'core'` in the preset catalogue, and a
 // configured search is core too, so they are declared up front. The rest of the
-// preset catalogue — fileList, syntax, shell, gitDiff, the app tools —
+// preset catalogue — files, syntax, shell, gitDiff, the app tools —
 // stays searchable. "core" is only a declaration classification: it does NOT make
 // the tool session-bound. The harness-owned tools below are the session-bound set,
 // and the server gates only those on a sessionId.
@@ -8827,7 +8827,7 @@ export {
     read,
     write,
     edit,
-    fileList,
+    files,
     glob,
     grep,
     shell,
@@ -8862,7 +8862,10 @@ export type {
     FileEditParameters,
     FileEditResult,
     FileEditResultEntry,
-    FileListParameters,
+    FilesOperation,
+    FilesOperationResult,
+    FilesParameters,
+    FilesResult,
     FileGlobParameters,
     FileGlobResult,
     FileGrepMatch,

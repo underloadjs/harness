@@ -130,7 +130,7 @@ const PRESET_SOURCE_ENTRIES = [
     'tools/files/edit.tool.ts',
     'tools/files/glob.tool.ts',
     'tools/files/grep.tool.ts',
-    'tools/files/fileList.tool.ts',
+    'tools/files/files.tool.ts',
     'tools/files/read.tool.ts',
     'tools/files/write.tool.ts',
     'tools/syntax/syntax.tool.ts',

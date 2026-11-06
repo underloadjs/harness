@@ -149,7 +149,7 @@ const TOOL_NAMES = [
     'read',
     'write',
     'edit',
-    'fileList',
+    'files',
     'glob',
     'grep',
     'shell',
@@ -173,7 +173,7 @@ const TOOLBOX = [
     'read',
     'write',
     'edit',
-    'fileList',
+    'files',
     'glob',
     'grep',
     'shell',
@@ -298,7 +298,7 @@ const createFixture = async (prefix: string, root: string = TEMP_LIST_ROOT): Pro
     return mkdtemp(join(root, prefix));
 };
 
-// fileList reports posix separators on every platform, so an absolute Windows fixture path has to
+// files reports posix separators on every platform, so an absolute Windows fixture path has to
 // be compared in that same form.
 const posix = (value: string): string => value.split(sep).join('/');
 
@@ -899,7 +899,7 @@ describe('service origin gate', () => {
 // are definition/instruction reads now, and the write field list names what a client may send.
 describe('harness catalogue reads', () => {
     const INSTRUCT_DESCRIPTION =
-        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.';
+        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.';
 
     it('pages the cards as identity + tool names, with no definition text', async () => {
         const runtime = createRuntime();
@@ -1197,7 +1197,7 @@ describe('harness catalogue reads', () => {
                 names: {
                     type: 'array',
                     items: { type: 'string' },
-                    description: 'Exact wire names to enable, case-sensitive (e.g. ["fileList"]).'
+                    description: 'Exact wire names to enable, case-sensitive (e.g. ["files"]).'
                 },
                 regex: { type: 'string', description: 'JavaScript regex tested against tool names; bare source or /source/flags.' },
                 tags: {
@@ -1216,32 +1216,47 @@ describe('harness catalogue reads', () => {
             additionalProperties: false
         });
 
-        // T12/T16: fileList declares the default AND the two paging knobs the implementation reads.
-        const fileList = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('fileList'));
-        expect(fileList.body.tool.parameters).toEqual({
-            type: 'object',
+        // T12/T16: `files` declares ONE array property, and the operation discriminator
+        // lives inside the item (the full item schema is pinned in ../tools/catalogue.test.ts).
+        const files = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('files'));
+        const filesSchema = files.body.tool.parameters as {
+            type: string;
+            required: string[];
+            additionalProperties: boolean;
             properties: {
-                paths: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    default: ['.'],
-                    description:
-                        'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
-                },
-                offset: {
-                    type: 'integer',
-                    minimum: 0,
-                    description: '0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page.'
-                },
-                limit: {
-                    type: 'integer',
-                    minimum: 1,
-                    maximum: 1000,
-                    description: 'Maximum entries in this page, 1-1000. Defaults to 200.'
-                }
-            },
-            additionalProperties: false
-        });
+                ops: {
+                    type: string;
+                    maxItems: number;
+                    items: {
+                        required: string[];
+                        additionalProperties: boolean;
+                        properties: {
+                            op: { enum: string[] };
+                            limit: { maximum: number };
+                        };
+                    };
+                };
+            };
+        };
+
+        expect(filesSchema.type).toBe('object');
+        expect(Object.keys(filesSchema.properties)).toEqual(['ops']);
+        expect(filesSchema.required).toEqual(['ops']);
+        expect(filesSchema.additionalProperties).toBe(false);
+        expect(filesSchema.properties.ops.type).toBe('array');
+        expect(filesSchema.properties.ops.maxItems).toBe(100);
+        expect(filesSchema.properties.ops.items.required).toEqual(['op']);
+        expect(filesSchema.properties.ops.items.additionalProperties).toBe(false);
+        expect(filesSchema.properties.ops.items.properties.op.enum).toEqual([
+            'list',
+            'move',
+            'copy',
+            'delete',
+            'mkdir'
+        ]);
+        // Paging is a property of the list operation, not of the call, so the entry-level
+        // cap is where a paged answer is bounded.
+        expect(filesSchema.properties.ops.items.properties.limit.maximum).toBe(1000);
 
         // The unconfigured environment row is listed but not manually executable, and a name the
         // catalogue never had is a 404.
@@ -2529,27 +2544,37 @@ describe('manual tool execution', () => {
             await writeTextFile(join(fixture, 'task', 'b.ts'), 'b\n', 'utf8');
 
             // The direct runner applies the same single-property rule as the harness: `parameters`
-            // IS the value of "paths", not a wrapper object (./api.ts resolveToolParameters).
-            const listed = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('fileList'), {
-                parameters: [join(fixture, 'src'), join(fixture, 'task')]
+            // IS the value of "ops", not a wrapper object (./api.ts resolveToolParameters).
+            const listed = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('files'), {
+                parameters: [{ op: 'list', path: [join(fixture, 'src'), join(fixture, 'task')] }]
             });
 
             // Absolute inputs keep their absolute prefix, posix-normalized, and the directory order
-            // is the caller's: src (with its child) then task. The answer is one bounded PAGE.
+            // is the caller's: src (with its child) then task. The answer is one bounded PAGE, and
+            // its cursor lives inside the `list` entry's own receipt.
             const expectedEntries = [
                 `${posix(fixture)}/src/a.ts`,
                 `${posix(fixture)}/src/nested/`,
                 `${posix(fixture)}/task/b.ts`
             ];
+            const expectedBytes = expectedEntries.reduce((total, entry) => total + Buffer.byteLength(entry, 'utf8'), 0);
+
             expect(listed.body).toEqual({
                 ok: true,
                 result: {
-                    entries: expectedEntries,
-                    truncated: false,
-                    nextOffset: null,
-                    offset: 0,
-                    limit: 200,
-                    bytes: expectedEntries.reduce((total, entry) => total + Buffer.byteLength(entry, 'utf8'), 0),
+                    results: [
+                        {
+                            op: 'list',
+                            path: `${posix(fixture)}/src`,
+                            entries: expectedEntries,
+                            truncated: false,
+                            nextOffset: null,
+                            offset: 0,
+                            limit: 200,
+                            bytes: expectedBytes
+                        }
+                    ],
+                    bytes: expectedBytes,
                     contentBudget: 64 * 1024
                 },
                 duration_ms: expect.any(Number)
@@ -2557,31 +2582,41 @@ describe('manual tool execution', () => {
 
             // The schema-wrapper spelling means the same request (both documented shapes resolve
             // through the shared validator in 'direct' mode).
-            const wrapped = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('fileList'), {
-                parameters: { paths: [join(fixture, 'task')] }
+            const wrapped = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('files'), {
+                parameters: { ops: [{ op: 'list', path: join(fixture, 'task') }] }
             });
             const wrappedEntry = `${posix(fixture)}/task/b.ts`;
             expect(wrapped.body).toEqual({
                 ok: true,
                 result: {
-                    entries: [wrappedEntry],
-                    truncated: false,
-                    nextOffset: null,
-                    offset: 0,
-                    limit: 200,
+                    results: [
+                        {
+                            op: 'list',
+                            path: `${posix(fixture)}/task`,
+                            entries: [wrappedEntry],
+                            truncated: false,
+                            nextOffset: null,
+                            offset: 0,
+                            limit: 200,
+                            bytes: Buffer.byteLength(wrappedEntry, 'utf8')
+                        }
+                    ],
                     bytes: Buffer.byteLength(wrappedEntry, 'utf8'),
                     contentBudget: 64 * 1024
                 },
                 duration_ms: expect.any(Number)
             });
 
-            // A missing directory is a tool failure reported as DATA (200 + ok:false), not a partial
-            // list and not a request error.
-            const missing = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('fileList'), {
-                parameters: [join(fixture, 'src'), join(fixture, 'nope')]
+            // A missing directory is reported IN PLACE on the list entry (the same rule
+            // `read` publishes), so the call still answers 200 + ok:true: a read-only miss
+            // never throws away operations that already succeeded. `fileList` used to fail
+            // the whole call here; `files` says which entry failed and why.
+            const missing = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('files'), {
+                parameters: [{ op: 'list', path: [join(fixture, 'src'), join(fixture, 'nope')] }]
             });
             expect(missing.status).toBe(200);
-            expect(missing.body.ok).toBe(false);
+            expect(missing.body.ok).toBe(true);
+            expect(missing.body.result.results[0].error.code).toBe('ENOENT');
 
             // `read` with a number where an array of paths belongs is a schema failure reported as
             // a tool error, never an implementation crash.
@@ -2607,6 +2642,8 @@ describe('manual tool execution', () => {
                             startLine: 1,
                             endLine: 1,
                             truncated: false,
+                            limit: null,
+                            startByteAligned: null,
                             nextLine: null,
                             nextColumn: null,
                             nextByte: null,

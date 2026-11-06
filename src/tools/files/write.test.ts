@@ -279,12 +279,63 @@ describe('write', () => {
         await expect(readTextFile(completed, 'utf8')).resolves.toBe('written');
     });
 
+    it('rejects a batch larger than the published cap, before writing anything', async () => {
+        // D9. `read` refused more than 100 paths but `write` accepted 400 — and write is
+        // the file tool that carries unbounded PAYLOAD, since every entry holds a whole
+        // file's text. One call could therefore create an arbitrary number of files of
+        // an arbitrary size with no budget anywhere in the path.
+        const tooMany = Array.from({ length: 101 }, (_, index) => ({
+            path: join(workdir, 'cap', `${index}.txt`),
+            content: 'x'
+        }));
+
+        await expect(write(tooMany)).rejects.toThrow(
+            'write accepts at most 100 files per call; received 101. Split the batch.'
+        );
+        // Rejected in preflight, so the batch that was refused wrote nothing at all.
+        await expect(readTextFile(join(workdir, 'cap', '0.txt'), 'utf8')).rejects.toThrow(/ENOENT/);
+
+        // Exactly at the cap is accepted.
+        const atCap = Array.from({ length: 100 }, (_, index) => ({
+            path: join(workdir, 'cap-ok', `${index}.txt`),
+            content: 'x'
+        }));
+        expect((await write(atCap)).length).toBe(100);
+    });
+
+    it('creates one directory once, however many files name it', async () => {
+        // D9. Sixty files in one new directory used to mean sixty `mkdir` calls: measured
+        // at 85 ms to write 60 bytes in total, so the bookkeeping cost more than the
+        // content. Deduplicating by directory must not change what gets created — every
+        // file still exists, including in a directory named for the first time by a later
+        // entry — it only removes repeat syscalls.
+        const first = join(workdir, 'mkdir-dedupe', 'shared');
+        const entries = [
+            ...Array.from({ length: 30 }, (_, index) => ({ path: join(first, `${index}.txt`), content: `f${index}` })),
+            // A second directory, named only by the last entries, still gets created.
+            ...Array.from({ length: 5 }, (_, index) => ({
+                path: join(workdir, 'mkdir-dedupe', 'other', `${index}.txt`),
+                content: `o${index}`
+            }))
+        ];
+
+        const result = await write(entries);
+
+        expect(result).toHaveLength(35);
+        await expect(readTextFile(join(first, '29.txt'), 'utf8')).resolves.toBe('f29');
+        await expect(readTextFile(join(workdir, 'mkdir-dedupe', 'other', '4.txt'), 'utf8')).resolves.toBe('o4');
+        // The reported byte sizes are still per file, not per directory.
+        expect(result[0]).toEqual({ path: join(first, '0.txt'), bytes: 2 }); // 'f0'
+        expect(result[30]).toEqual({ path: join(workdir, 'mkdir-dedupe', 'other', '0.txt'), bytes: 2 }); // 'o0'
+    });
+
     it('declares a single "files" array property of { path, content } objects', () => {
         expect(write.parameters).toEqual({
             type: 'object',
             properties: {
                 files: {
                     type: 'array',
+                    maxItems: 100,
                     items: {
                         type: 'object',
                         properties: {

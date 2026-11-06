@@ -5,7 +5,7 @@
 //
 //   syntax/   syntax (javascript, typescript, tsx, jsx, json or python, named by
 //             the caller)
-//   files/    read, write, edit, fileList, glob, grep
+//   files/    read, write, edit, files (list, move, copy, delete, mkdir), glob, grep
 //   command/  shell, gitDiff
 //   runtime/  the harness-owned core entries (toolRequest, toolCreate, …) — moved
 //             here from the old top-level `runtime-tools/` folder (T21)
@@ -19,11 +19,12 @@
 //             (<=20 MiB, any content type) whose bytes travel to the model as
 //             multimodal input through the `toolMedia()` envelope
 //
-// NAMING: every wire name is an action a model would type. The file tools are
-// read/write/edit plus the two search surfaces (glob for names, grep for contents) and
-// fileList; shell/search keep their names. Renames (fileWrite -> write, fileGlob ->
-// glob + grep, syntaxCheck -> syntax) have NO aliases, because two names for one tool
-// makes discovery ambiguous.
+// NAMING: a tool is named for what it does best — a single action when the action is
+// the capability (read, write, edit, glob, grep, shell), the domain it owns when one verb
+// would undersell it (files manages files and folders: list, move, copy, delete, mkdir).
+// See the NAMING note in ./catalogue.ts. Renames (fileWrite -> write, fileGlob ->
+// glob + grep, syntaxCheck -> syntax, fileList -> files) have NO aliases, because two
+// names for one tool makes discovery ambiguous.
 //
 // Lazy, not eager (R1b)
 // --------------------
@@ -58,10 +59,10 @@
 // surface.
 //
 // R18: read/write/edit/glob/grep are **core** and declared up front; download,
-// fileList, syntax, shell, and gitDiff stay **searchable**, so the model asks
-// toolRequest for `download`, `files`/`list`, `shell`, `git`, … and discovery
-// enables the matches. The opt-in web tools stay out of this table entirely (see
-// the two factory notes below). A harness preloads `presetTools` unless it is
+// files, syntax, shell, and gitDiff stay **searchable**, so the model asks
+// toolRequest for `download`, `files`/`list`/`move`/`delete`, `shell`, `git`, … and
+// discovery enables the matches. The opt-in web tools stay out of this table entirely
+// (see the two factory notes below). A harness preloads `presetTools` unless it is
 // created with `presets: false`.
 //
 // They are deliberately opinionated about *shape* and unopinionated about
@@ -81,8 +82,9 @@ import type {
     FileGlobResult,
     FileGrepParameters,
     FileGrepResult,
-    FileListParameters,
-    FileListResult,
+    FilesOperation,
+    FilesParameters,
+    FilesResult,
     FileReadParameters,
     FileReadResult,
     FileWriteResult
@@ -121,7 +123,11 @@ export const syntax = presetProxy<SyntaxCheckParameters, boolean>('syntax');
 export const read = presetProxy<FileReadParameters, FileReadResult>('read');
 export const write = presetProxy<{ path: string; content: string }[], FileWriteResult>('write');
 export const edit = presetProxy<FileEditParameters, FileEditResult>('edit');
-export const fileList = presetProxy<FileListParameters, FileListResult>('fileList');
+// The file/folder manager (list, move, copy, delete, mkdir). It replaced `fileList`:
+// the paged listing is now the `list` operation, and paging state travels inside that
+// entry's receipt, so the one tool declares ONE array property (`ops`) like the rest of
+// the batch instead of being the catalogue's batching exception.
+export const files = presetProxy<FilesParameters, FilesResult>('files');
 // The two search presets, split from the old `fileGlob` mode switch. Each declares
 // several properties, so both receive the whole object; glob answers with file names
 // and grep answers with matching lines.
@@ -153,9 +159,10 @@ export type {
     FileGrepMatch,
     FileGrepParameters,
     FileGrepResult,
-    FileListParameters,
-    FileListQuery,
-    FileListResult,
+    FilesOperation,
+    FilesOperationResult,
+    FilesParameters,
+    FilesResult,
     FileReadEntry,
     FileReadParameters,
     FileReadResult,

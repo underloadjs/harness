@@ -288,6 +288,88 @@ describe('edit', () => {
         await expect(readTextFile(path, 'utf8')).resolves.toBe('A\r\nB\r\nC\r\n');
     });
 
+    it('matches a single-line oldString in a CRLF file without folding the file', async () => {
+        // D7. A one-line oldString (no CR, no LF) can be matched against the RAW source:
+        // folding CRLF to LF deletes only carriage returns, and this string contains
+        // none, so an occurrence cannot straddle a line boundary and the match sets are
+        // identical — at identical offsets. That removes a whole-file copy plus a
+        // per-CRLF position array from the common case (measured: a tier-1 hit on a
+        // 2.5 MB CRLF file, 90.8 ms -> 22.3 ms).
+        const path = await seed('fast/crlf.txt', 'alpha\r\nbeta\r\ngamma\r\n');
+
+        const result = await edit([{ path, oldString: 'beta', newString: 'BETA!' }]);
+
+        // 'alpha\r\nBETA!\r\ngamma\r\n' is 5+2 + 5+2 + 5+2 = 21 bytes.
+        expect(result).toEqual([{ path, replacements: 1, bytes: 21 }]);
+        // The file's CRLF endings survive untouched, exactly as before the fast path.
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('alpha\r\nBETA!\r\ngamma\r\n');
+    });
+
+    it('keeps a single-line edit exact when the file has mixed endings', async () => {
+        // The fast path must not quietly become a line-ending policy. Each line keeps
+        // whatever it already had, because only the matched text is replaced.
+        const path = await seed('fast/mixed.txt', 'one\r\ntwo\nthree\r\n');
+
+        await edit([{ path, oldString: 'two', newString: 'TWO' }]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('one\r\nTWO\nthree\r\n');
+
+        await edit([{ path, oldString: 'three', newString: 'THREE' }]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('one\r\nTWO\nTHREE\r\n');
+    });
+
+    it('still finds a multi-line oldString that only exists in the folded view', async () => {
+        // The other half of the fast-path argument: when the raw search finds nothing,
+        // the full cascade still runs, so a CR-deletion that CREATES a match is not
+        // lost. A multi-line oldString is where that matters.
+        const path = await seed('fast/fold-only.txt', 'one\r\ntwo\r\nthree\r\n');
+
+        const result = await edit([{ path, oldString: 'one\ntwo\nthree', newString: 'A\nB\nC' }]);
+
+        expect(result[0].replacements).toBe(1);
+        // Matched through the view, re-joined with the region's dominant CRLF.
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('A\r\nB\r\nC\r\n');
+    });
+
+    it('writes a newline-free newString verbatim, with no ending chosen for it', async () => {
+        // A replacement with no newline is ONE line, and a one-line replacement never
+        // receives an ending (its only line is also its last line). So skipping the
+        // region and whole-file ending scans cannot change the bytes written — and on a
+        // large file it removes a full rescan per call.
+        const path = await seed('fast/verbatim.txt', 'alpha\r\nbeta\r\n');
+
+        await edit([{ path, oldString: 'alpha\r\n', newString: 'ALPHA\r\n' }]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('ALPHA\r\nbeta\r\n');
+
+        // A newline-free newString replacing text that spanned an ending: the result is
+        // the newString itself, and the surrounding endings are the file's own.
+        await edit([{ path, oldString: 'ALPHA\r\nbeta', newString: 'MERGED' }]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('MERGED\r\n');
+    });
+
+    it('aligns a huge region positionally instead of paying for a quadratic table', async () => {
+        // D8. The LCS in alignLines exists only to pick a line ending per replaced line,
+        // and it cost O(before x after) in time AND memory: a 5,000 x 5,000 region was
+        // 275 ms and a 95 MB Uint32Array. Past the cell cap the mapping is positional,
+        // which gives the same answer whenever the two sides line up — the shape of a
+        // line-for-line rewrite — for a fraction of the cost.
+        const lines = (marker: string, count: number) =>
+            Array.from({ length: count }, (_, i) => `${marker}${i}`).join('\n');
+        const path = await seed('align/big.txt', lines('a', 5000));
+
+        const result = await edit([{ path, oldString: lines('a', 5000), newString: lines('b', 5000) }]);
+
+        expect(result[0].replacements).toBe(1);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe(lines('b', 5000));
+
+        // Under the cap the LCS still runs, and a replaced line still takes the ending
+        // of the line it stands in for — NOT the region's dominant ending. That is the
+        // behaviour the cap must not erase, and a mixed-ending region is where the two
+        // answers differ: CRLF dominates here, yet line 2 keeps its own bare LF.
+        const mixed = await seed('align/small-mixed.txt', 'x1\r\nx2\nx3\r\n');
+        await edit([{ path: mixed, oldString: 'x1\nx2\nx3', newString: 'y1\ny2\ny3' }]);
+        await expect(readTextFile(mixed, 'utf8')).resolves.toBe('y1\r\ny2\ny3\r\n');
+    });
+
     it('never forgives indentation on the trailing-whitespace tier', async () => {
         // Leading whitespace is NOT ignored: a wrong-indent oldString simply does not
         // match, which is the failure mode the flexible replacers got wrong.

@@ -20,7 +20,7 @@
 //     documented default.
 //
 // The fixtures below carry the CURRENT wire names and schemas: the rename made the
-// file tools `read` / `write` / `edit` / `fileList` / `glob` / `grep`, split the old
+// file tools `read` / `write` / `edit` / `files` / `glob` / `grep`, split the old
 // two-mode `fileGlob` (its `content` property is gone — a request that still sends
 // it is rejected), and turned `syntaxCheck` into `syntax` with a free-text
 // `language` (no enum: the tool normalizes aliases and errors on a language it has

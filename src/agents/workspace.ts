@@ -7,7 +7,7 @@
 //
 // Verified against src/core/tool-manifest.ts: read takes `paths`; write takes
 // `files: [{ path, content }]`; edit takes `edits: [{ path, oldString, newString }]`;
-// glob and grep are `visibility: 'core'`; syntax, fileList, shell and gitDiff carry
+// glob and grep are `visibility: 'core'`; syntax, files, shell and gitDiff carry
 // no visibility, so they default to searchable and must be enabled before the first
 // call. An earlier draft told the model to "review changes with gitDiff" as if it were
 // already declared — that is the kind of instruction a model follows into a failed call.
@@ -30,7 +30,7 @@ export const workspace: AgentProfile = {
         'Paths are absolute or relative to the server working directory; glob with no arguments lists every file under it.',
         'Read before writing, prefer edit over rewriting a whole file, and confirm the result by re-reading it or running the check that covers it.',
         // The four tools a coder reaches for that are NOT in the declaration list.
-        'shell, gitDiff, syntax and fileList are searchable, not declared: enable the one you need with toolRequest before calling it.',
+        'shell, gitDiff, syntax and files are searchable, not declared: enable the one you need with toolRequest before calling it.',
         DISCOVERY_GUIDELINE,
         DELEGATION_GUIDELINE,
         PERMISSIONS_GUIDELINE,

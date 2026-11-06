@@ -70,7 +70,7 @@ describe('browser catalogue fallback (T24)', () => {
             'read',
             'write',
             'edit',
-            'fileList',
+            'files',
             'glob',
             'grep',
             'shell',

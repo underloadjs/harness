@@ -136,6 +136,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -148,6 +150,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -178,6 +182,8 @@ describe('read', () => {
                         startLine: 1,
                         endLine: 1,
                         truncated: false,
+                        limit: null,
+                        startByteAligned: null,
                         nextLine: null,
                         nextColumn: null,
                         nextByte: null,
@@ -190,6 +196,8 @@ describe('read', () => {
                         startLine: 1,
                         endLine: 1,
                         truncated: false,
+                        limit: null,
+                        startByteAligned: null,
                         nextLine: null,
                         nextColumn: null,
                         nextByte: null,
@@ -219,6 +227,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 2,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -231,6 +241,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 0,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -257,6 +269,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -272,11 +286,32 @@ describe('read', () => {
         });
     });
 
-    it('defaults to the first 5000 lines and reports the continuation', async () => {
+    it('has no default line cap: a 5100-line file of short lines comes back whole', async () => {
+        // The D6 regression. The default used to be 5000 lines, so this file — 5,100
+        // lines of 8-9 bytes, 33 KB, a twelfth of the budget — came back cut at line
+        // 5000 with `truncated: true`, and the agent paid a whole round trip for the
+        // last 100 lines. The budget, not the line count, is the documented limit.
+        const result = await read([join(workdir, 'many-lines.txt')]);
+        const entry = result.files[0];
+
+        expect(entry.content).toBe(LINES_5100);
+        expect(entry.startLine).toBe(1);
+        expect(entry.endLine).toBe(5100);
+        expect(entry.truncated).toBe(false);
+        expect(entry.limit).toBeNull();
+        expect(entry.nextByte).toBeNull();
+        expect(entry.sizeBytes).toBe(Buffer.byteLength(LINES_5100, 'utf8'));
+        expect(result.wireBytes).toBeLessThan(FILE_READ_WIRE_BUDGET);
+    });
+
+    it('applies an explicit maxLines and names it as the reason', async () => {
+        // An EXPLICIT cap still cuts, and `limit` says so — that is the whole point of
+        // the field: a caller reading `truncated: true` must know whether raising
+        // `maxLines` would help (it would, here) or not (it never does for "budget").
         const first5000 = linesUpTo(5000);
         const bytes = Buffer.byteLength(first5000, 'utf8');
 
-        const result = await read([join(workdir, 'many-lines.txt')]);
+        const result = await read([{ path: join(workdir, 'many-lines.txt'), maxLines: 5000 }]);
         const entry = result.files[0];
 
         expect(entry.content).toBe(first5000);
@@ -284,10 +319,9 @@ describe('read', () => {
         expect(entry.endLine).toBe(5000);
         expect(entry.bytes).toBe(bytes);
         expect(entry.truncated).toBe(true);
+        expect(entry.limit).toBe('maxLines');
         expect(entry.nextLine).toBe(5001);
         expect(entry.nextColumn).toBe(0);
-        // The whole file is reported, so a caller can see how much is left.
-        expect(entry.sizeBytes).toBe(Buffer.byteLength(LINES_5100, 'utf8'));
         // nextByte is the absolute offset of line 5001, i.e. exactly the bytes read.
         expect(entry.nextByte).toBe(bytes);
         expect(result.truncated).toBe(true);
@@ -325,6 +359,8 @@ describe('read', () => {
                     startLine: 50,
                     endLine: 52,
                     truncated: true,
+                    limit: 'maxLines',
+                    startByteAligned: null,
                     nextLine: 53,
                     nextColumn: 0,
                     nextByte: Buffer.byteLength(
@@ -352,6 +388,8 @@ describe('read', () => {
             startLine: 1299,
             endLine: 1300,
             truncated: false,
+            limit: null,
+            startByteAligned: null,
             nextLine: null,
             nextColumn: null,
             nextByte: null,
@@ -369,6 +407,8 @@ describe('read', () => {
             startLine: 5000,
             endLine: 4999,
             truncated: false,
+            limit: null,
+            startByteAligned: null,
             nextLine: null,
             nextColumn: null,
             nextByte: null,
@@ -386,6 +426,8 @@ describe('read', () => {
             startLine: 2,
             endLine: 2,
             truncated: false,
+            limit: null,
+            startByteAligned: null,
             nextLine: null,
             nextColumn: null,
             nextByte: null,
@@ -405,6 +447,8 @@ describe('read', () => {
             startLine: 1,
             endLine: 3,
             truncated: false,
+            limit: null,
+            startByteAligned: null,
             nextLine: null,
             nextColumn: null,
             nextByte: null,
@@ -572,6 +616,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -584,6 +630,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 0,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -612,7 +660,7 @@ describe('read', () => {
 
         expect(result.files[0].error?.code).toBe('EISDIR');
         expect(result.files[0].error?.message).toBe(
-            `read cannot read "${directory}": it is a directory, not a file. Use fileList to list its entries, or glob to find files inside it.`
+            `read cannot read "${directory}": it is a directory, not a file. Use files to list its entries, or glob to find files inside it.`
         );
         expect(result.files[1].content).toBe('alpha\n');
         expect(result.skipped).toBe(1);
@@ -638,13 +686,204 @@ describe('read', () => {
         expect(bySeek.files[0].nextByte).toBe(byLine.files[0].nextByte);
     });
 
-    it('returns an empty window for a startByte past EOF', async () => {
-        const result = await read([{ path: join(workdir, 'a.txt'), startByte: 9999 }]);
+    it('answers ERANGE, not an empty window, for a startByte at or past EOF', async () => {
+        // D10. `startByte: 9999` on a 6-byte file used to return content "", bytes 0,
+        // truncated false — the SAME shape as "this file is empty". A caller threading a
+        // stale nextByte through a paging loop therefore read "the file is empty" where
+        // the truth is "your offset is out of range", and stopped on a false premise.
+        const path = join(workdir, 'a.txt');
+        const past = await read([{ path, startByte: 9999 }]);
+        const atEof = await read([{ path, startByte: 6 }]);
 
-        expect(result.files[0].content).toBe('');
-        expect(result.files[0].bytes).toBe(0);
-        expect(result.files[0].truncated).toBe(false);
-        expect(result.files[0].sizeBytes).toBe(6);
+        expect(past.files[0].error?.code).toBe('ERANGE');
+        expect(past.files[0].error?.message).toBe(
+            `read could not seek "${path}" to byte 9999: the file is 6 bytes, so that offset is at or past its end (ERANGE). An empty window is NOT "this file is empty"; drop startByte to read from the beginning, or treat this as the end of the file.`
+        );
+        expect(past.files[0].sizeBytes).toBe(6);
+        // Exactly at EOF is the same case: there is no byte there to read.
+        expect(atEof.files[0].error?.code).toBe('ERANGE');
+        // The last offset WITH a byte still reads.
+        expect((await read([{ path, startByte: 5 }])).files[0].content).toBe('\n');
+
+        // Per-entry, like every other failure: the readable sibling is untouched.
+        const mixed = await read([path, join(workdir, 'utf8.txt')]);
+        const oneBad = await read([{ path, startByte: 9999 }, join(workdir, 'utf8.txt')]);
+        expect(mixed.files[0].error).toBeUndefined();
+        expect(oneBad.files[0].error?.code).toBe('ERANGE');
+        expect(oneBad.files[1].content).toBe('h\u00e9llo\n');
+        expect(oneBad.skipped).toBe(1);
+    });
+
+    it('advances a startByte that lands inside a code point and reports the move', async () => {
+        // D1. "ab" + three 2-byte é + "cd". Byte 3 is the CONTINUATION half of the first
+        // é, so decoding from there used to see a lone 0b10xxxxxx byte, call the whole
+        // file binary, and report EBINARY for an ordinary UTF-8 text file — while the
+        // same offset through startColumn read fine.
+        const path = await seed('seek-mid-codepoint.txt', 'ab\u00e9\u00e9\u00e9cd\n');
+
+        const mid = await read([{ path, startByte: 3 }]);
+        const boundary = await read([{ path, startByte: 4 }]);
+
+        expect(mid.files[0].error).toBeUndefined();
+        expect(mid.files[0].content).toBe('\u00e9\u00e9cd\n');
+        // The adjustment is reported, so the answer says where the window really began.
+        expect(mid.files[0].startByteAligned).toBe(4);
+        // An offset already on a boundary reports no adjustment.
+        expect(boundary.files[0].content).toBe('\u00e9\u00e9cd\n');
+        expect(boundary.files[0].startByteAligned).toBeNull();
+        // And the two now agree, which is the whole point: the error class was the bug.
+        expect(mid.files[0].content).toBe(boundary.files[0].content);
+    });
+
+    it('reports the true line at a seek offset when startLine is not given', async () => {
+        // D2. A seek with no `startLine` used to report the DEFAULT line number 1 for
+        // bytes tens of thousands of lines deep — a wrong number, not a missing one.
+        // The prefix is now counted on raw bytes, so the truth is cheap.
+        const path = join(workdir, 'lines.txt');
+        const offsetToLine800 = Buffer.byteLength(
+            Array.from({ length: 799 }, (_, index) => `line ${index + 1}\n`).join(''),
+            'utf8'
+        );
+
+        const counted = await read([{ path, startByte: offsetToLine800, maxLines: 3 }]);
+        const told = await read([{ path, startByte: offsetToLine800, startLine: 800, maxLines: 3 }]);
+
+        expect(counted.files[0].startLine).toBe(800);
+        expect(counted.files[0].endLine).toBe(802);
+        expect(counted.files[0].content).toBe('line 800\nline 801\nline 802\n');
+        // An explicit startLine still wins, so threading nextByte + nextLine back
+        // together remains correct and skips the count entirely.
+        expect(told.files[0].startLine).toBe(800);
+        expect(told.files[0].content).toBe(counted.files[0].content);
+        // A caller that LIES about the line gets its own number back, not the truth.
+        const lied = await read([{ path, startByte: offsetToLine800, startLine: 42_000, maxLines: 3 }]);
+        expect(lied.files[0].startLine).toBe(42_000);
+    });
+
+    it('keeps the bulk-run fast path exact where the budget cuts mid-line', async () => {
+        // The scanner appends a RUN of plain ASCII in one slice rather than one character
+        // at a time, because such a run costs the same in raw bytes, wire bytes and
+        // UTF-16 units and contains no newline. The risk is a budget cut that lands
+        // INSIDE such a run: the slice must stop at exactly the last character that fits,
+        // and `nextByte` must point at the next one.
+        //
+        // So the samples must be BIGGER than the budget — a 20 KB file is returned whole
+        // and never exercises a mid-run cut at all (an earlier version of this test did
+        // exactly that and proved nothing). Each sample here is ~300 KB of ~50-byte
+        // lines, which forces the allowance to run out part-way through a line, and the
+        // content is adversarial: escaped characters change the wire cost per character,
+        // multi-byte characters change the raw cost, and control characters change both.
+        const LINES = 6000;
+        const samples: [string, string][] = [
+            ['plain', Array.from({ length: LINES }, (_, i) => `line ${i} const value = compute(a, b); // note ${i}`).join('\n')],
+            ['escapes', Array.from({ length: LINES }, (_, i) => `  "k${i}": "v\\${i}\t${i}\\n", value = "x"`).join('\n')],
+            ['multibyte', Array.from({ length: LINES }, (_, i) => `emoji \u{1F389} \u4f60\u597d caf\u00e9 \u2013 row ${i} padded`).join('\n')],
+            ['control', Array.from({ length: LINES }, (_, i) => `a${i}\u0001b${i}\u001fc${i}\u0007d${i} padded to length here`).join('\n')],
+            ['crlf', Array.from({ length: LINES }, (_, i) => `row,${i},value "x", another "y", more text`).join('\r\n')]
+        ];
+
+        for (const [name, body] of samples) {
+            const path = await seed(`fastpath-${name}.txt`, body);
+            // No raw-size precondition: the budget is charged on the ESCAPED form, so a
+            // quote-heavy sample of 237 KB raw is already over 256 KiB wire while a plain
+            // one needs more. `limit === "budget"` below is the assertion that actually
+            // proves the allowance bound mid-window, which is the precondition here.
+
+            // A default read: the budget binds mid-line, and paging by nextByte must
+            // stitch the file back together with nothing lost or duplicated at the join.
+            const first = (await read([path])).files[0];
+            expect(first.truncated, name).toBe(true);
+            expect(first.limit, name).toBe('budget');
+
+            let collected = first.content;
+            let next = first;
+            let pages = 0;
+            while (next.truncated && next.nextByte !== null && pages < 20) {
+                const page = await read([{ path, startByte: next.nextByte, startLine: next.nextLine ?? 1 }]);
+                next = page.files[0];
+                collected += next.content;
+                pages += 1;
+            }
+            expect(next.truncated, `${name} reached EOF`).toBe(false);
+            expect(collected, `${name} paging by nextByte`).toBe(body);
+
+            // A cut inside a plain run must still respect the envelope exactly, and
+            // `wireBytes` must be the true serialized length rather than an estimate.
+            const r = await read([path]);
+            expect(r.wireBytes, `${name} budget`).toBeLessThanOrEqual(r.contentBudget);
+            expect(Buffer.byteLength(JSON.stringify(r), 'utf8'), `${name} wireBytes`).toBe(r.wireBytes);
+
+            // The line-cap path, where the cut is at a line boundary instead. The
+            // expected prefix is taken from the body itself — up to and including the
+            // third \n — so a CRLF sample keeps its CRLFs rather than being normalised
+            // by the test into something the tool never promised to produce.
+            const thirdNewline = body.indexOf('\n', body.indexOf('\n', body.indexOf('\n') + 1) + 1);
+            const capped = await read([{ path, maxLines: 3 }]);
+            expect(capped.files[0].limit).toBe('maxLines');
+            expect(capped.files[0].content, `${name} cap`).toBe(body.slice(0, thirdNewline + 1));
+        }
+    });
+
+    it('names the reason a window was cut, so the caller knows what to raise', async () => {
+        // D5. A `maxLines` cut and a budget cut used to be indistinguishable: identical
+        // shapes, opposite remedies. `limit` tells them apart.
+        const manyLines = await seed('limit-lines.txt', Array.from({ length: 30_000 }, (_, i) => `l${i}`).join('\n'));
+        const oneBigLine = await seed('limit-budget.txt', 'y'.repeat(400_000));
+
+        const byLines = await read([{ path: manyLines, maxLines: 10 }]);
+        expect(byLines.files[0].truncated).toBe(true);
+        expect(byLines.files[0].limit).toBe('maxLines');
+
+        // Same file, no cap: 30,000 lines of ~6 bytes is ~180 KB, which FITS the 256 KiB
+        // budget, so nothing was cut and `limit` stays null. The budget-bound case needs
+        // more BYTES than the envelope holds, not more lines than a cap would allow.
+        const fits = await read([{ path: manyLines }]);
+        expect(fits.files[0].truncated).toBe(false);
+        expect(fits.files[0].limit).toBeNull();
+
+        const tooManyLines = await seed(
+            'limit-budget-lines.txt',
+            Array.from({ length: 60_001 }, (_, i) => `${i}`).join('\n')
+        );
+        const byBudget = await read([{ path: tooManyLines }]);
+        expect(byBudget.files[0].truncated).toBe(true);
+        expect(byBudget.files[0].limit).toBe('budget');
+
+        const bigLine = await read([oneBigLine]);
+        expect(bigLine.files[0].limit).toBe('budget');
+
+        // A complete window has no reason to give.
+        const whole = await read([join(workdir, 'a.txt')]);
+        expect(whole.files[0].truncated).toBe(false);
+        expect(whole.files[0].limit).toBeNull();
+    });
+
+    it('counts a deep startLine on raw bytes and agrees with the seek', async () => {
+        // D3. The skip used to decode and iterate every skipped CHARACTER just to count
+        // newlines (482 ms for a 50-line window at line 199,000 of an 11 MB file,
+        // against 1.6 ms at line 1). The byte scan must give the SAME answer, and the
+        // reused read buffer must not count stale bytes past `bytesRead` — a real bug
+        // this pinned: an unbounded indexOf saw newlines left over from a previous,
+        // larger chunk and reported line 6378 for a byte on line 4552.
+        const deep = Array.from({ length: 12_000 }, (_, i) => `line ${i} ${'z'.repeat(40)}`).join('\n');
+        const path = await seed('deep-lines.txt', deep);
+        const startLine = 11_000;
+
+        const byLine = await read([{ path, startLine, maxLines: 5 }]);
+        const seekByte = Buffer.byteLength(
+            Array.from({ length: startLine - 1 }, (_, i) => `line ${i} ${'z'.repeat(40)}`).join('\n') + '\n',
+            'utf8'
+        );
+        const bySeek = await read([{ path, startByte: seekByte, maxLines: 5 }]);
+
+        expect(byLine.files[0].content).toBe(
+            Array.from({ length: 5 }, (_, k) => `line ${startLine - 1 + k} ${'z'.repeat(40)}`).join('\n') + '\n'
+        );
+        expect(byLine.files[0].startLine).toBe(startLine);
+        expect(byLine.files[0].endLine).toBe(startLine + 4);
+        // The seek with no startLine counts the same line the walk arrived at.
+        expect(bySeek.files[0].startLine).toBe(byLine.files[0].startLine);
+        expect(bySeek.files[0].content).toBe(byLine.files[0].content);
     });
 
     it('rejects an empty array instead of answering "no files"', async () => {
@@ -687,11 +926,18 @@ describe('read', () => {
             'read startColumn must be an integer between 0 and 9007199254740991; received -1.'
         );
         await expect(read([{ path: join(workdir, 'a.txt'), maxLines: 0 }])).rejects.toThrow(
-            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}; received 0.`
+            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}, or omitted for no line cap; received 0.`
         );
         await expect(read([{ path: join(workdir, 'a.txt'), maxLines: FILE_READ_MAX_LINES + 1 }])).rejects.toThrow(
-            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}; received ${FILE_READ_MAX_LINES + 1}.`
+            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}, or omitted for no line cap; received ${FILE_READ_MAX_LINES + 1}.`
         );
+        // The exported default round-trips: a caller that reads FILE_READ_DEFAULT_MAX_LINES
+        // and passes it back gets the no-cap behaviour, not a validation error. It is the
+        // one value outside [1, FILE_READ_MAX_LINES] that is accepted, and the message
+        // says "or omitted" rather than printing the sentinel.
+        await expect(read([{ path: join(workdir, 'a.txt'), maxLines: FILE_READ_DEFAULT_MAX_LINES }])).resolves.toMatchObject({
+            files: [{ content: 'alpha\n' }]
+        });
         await expect(read([{ path: join(workdir, 'a.txt'), startByte: -1 }])).rejects.toThrow(
             'read startByte must be a non-negative integer or null; received -1.'
         );
@@ -712,6 +958,8 @@ describe('read', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -760,13 +1008,14 @@ describe('read', () => {
                                         type: 'integer',
                                         minimum: 0,
                                         description:
-                                            'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. Defaults to null (count from the start).'
+                                            'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. An offset inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; an offset at or past EOF is an ERANGE entry. Without an explicit startLine the true line at this offset is counted and reported. Defaults to null (count from the start).'
                                     },
                                     maxLines: {
                                         type: 'integer',
                                         minimum: 1,
                                         maximum: 20_000,
-                                        description: 'Maximum lines to return. Defaults to 5000 and is capped at 20000.'
+                                        description:
+                                            'Maximum lines to return. OMIT for no line cap: the 256 KiB budget then decides, which is the default. When supplied it must be an integer in [1, 20000]. A window cut by this cap reports limit: "maxLines".'
                                     }
                                 },
                                 required: ['path'],
@@ -785,7 +1034,10 @@ describe('read', () => {
     });
 
     it('publishes the documented default and hard caps', () => {
-        expect(FILE_READ_DEFAULT_MAX_LINES).toBe(5000);
+        // No default line cap: the budget is the limit. An EXPLICIT maxLines is still
+        // bounded by FILE_READ_MAX_LINES, which is why the two numbers differ.
+        expect(FILE_READ_DEFAULT_MAX_LINES).toBe(Number.MAX_SAFE_INTEGER);
+        expect(FILE_READ_DEFAULT_MAX_LINES).toBeGreaterThan(FILE_READ_MAX_LINES);
         expect(FILE_READ_MAX_LINES).toBe(20_000);
         expect(FILE_READ_MAX_TARGETS).toBe(100);
         // read's budget must never exceed the harness wire cap, or a full-budget read
@@ -809,6 +1061,8 @@ describe('read', () => {
             startLine: 2,
             endLine: 2,
             truncated: true,
+            limit: 'maxLines',
+            startByteAligned: null,
             nextLine: 3,
             nextColumn: 0,
             // "line 1\n" + "line 2\n": the absolute offset of the first unread byte.

@@ -127,18 +127,18 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
 
 type Call = { url: string; method: string | undefined; body: unknown };
 
-// Extra knobs for the FOLDER half of the @ lookup. `fileList` reads exactly ONE
-// directory (src/frontend/main.ts:2245 `scheduleFileLookup`) and is the only source
+// Extra knobs for the FOLDER half of the @ lookup. The `files` list operation reads
+// exactly ONE directory (src/frontend/main.ts `scheduleFileLookup`) and is the only source
 // of folder rows - `glob` recurses past directories - so a test must be able to
 // both feed it entries and make it fail independently of the glob (which alone owns
 // the popup's error note).
 type StubFilesOptions = {
-    // Entries answered by POST /api/tools/fileList, in tool order. Directories carry
+    // Entries answered by POST /api/tools/files, in tool order. Directories carry
     // the tool's trailing "/" and files do not.
     entries?: readonly string[];
-    // When set, fileList answers `ok: false` with this message while the glob still
+    // When set, the list read answers `ok: false` with this message while the glob still
     // succeeds: the failed folder read must only drop the folder rows.
-    fileListError?: string;
+    filesError?: string;
 };
 
 const stubServer = (
@@ -173,19 +173,26 @@ const stubServer = (
             // mirrors the real tool envelope (result.entries + paging/budget
             // bookkeeping the picker ignores today); the default `entries: []` keeps
             // every pre-folder test seeing zero folder rows.
-            if (url === '/api/tools/fileList' && method === 'POST') {
-                if (options.fileListError !== undefined) {
-                    return json({ ok: false, error: { message: options.fileListError }, durationMs: 1 });
+            if (url === '/api/tools/files' && method === 'POST') {
+                if (options.filesError !== undefined) {
+                    return json({ ok: false, error: { message: options.filesError }, durationMs: 1 });
                 }
 
                 return json({
                     ok: true,
                     result: {
-                        entries: options.entries ?? [],
-                        truncated: false,
-                        nextOffset: null,
-                        offset: 0,
-                        limit: 200,
+                        results: [
+                            {
+                                op: 'list',
+                                path: '.',
+                                entries: options.entries ?? [],
+                                truncated: false,
+                                nextOffset: null,
+                                offset: 0,
+                                limit: 200,
+                                bytes: 0
+                            }
+                        ],
                         bytes: 0,
                         contentBudget: 65536
                     },
@@ -559,7 +566,7 @@ it('shows an explicit error when the file lookup fails', async () => {
 //
 // `glob` recurses PAST directories (src/tools/files/glob.tool.ts walks file names only), so the
 // picker could never offer a folder. A SECOND request now runs in parallel after the
-// same 160ms debounce: `fileList` reads the typed scope's directory and its entries
+// same 160ms debounce: the `files` list reads the typed scope's directory and its entries
 // ending in "/" become folder rows (ui/references.ts `folderPathsOf`), placed BEFORE
 // every file hit so browsing reads top-down. A picked folder is plain `@dir/` text,
 // not a chip, which re-opens the picker scoped to that directory.
@@ -587,10 +594,10 @@ it('lists folders above files for an empty @ query', async () => {
     const rows = [...document.querySelectorAll<HTMLElement>('.composer-popup-option')];
     expect(rows.map((row) => row.dataset.folder)).toEqual(['true', 'true', undefined, undefined]);
 
-    // An empty "@" asks fileList for the root ('.' with no name prefix) and the glob
+    // An empty "@" asks `files` for the root ('.' with no name prefix) and the glob
     // for the repository overview.
-    expect(calls.filter((call) => call.url === '/api/tools/fileList').map((call) => call.body)).toEqual([
-        { parameters: { paths: ['.'], limit: 200 } }
+    expect(calls.filter((call) => call.url === '/api/tools/files').map((call) => call.body)).toEqual([
+        { parameters: { ops: [{ op: 'list', path: '.', limit: 200 }] } }
     ]);
     expect(calls.filter((call) => call.url === '/api/tools/glob').map((call) => call.body)).toEqual([
         { parameters: { patterns: ['**/*'], paths: ['.'], maxResults: 100 } }
@@ -620,11 +627,11 @@ it('drills into a picked folder and re-scopes both lookups', async () => {
     // The re-scoped lookup is debounced again; wait past the 160ms window.
     await new Promise((resolve) => setTimeout(resolve, 220));
 
-    // `@src/` reads src ITSELF (paths ['src'], no name prefix) and globs only its
+    // `@src/` reads src ITSELF (list path 'src', no name prefix) and globs only its
     // descendants (`**/src/**`), never files NAMED *src*.
-    expect(calls.filter((call) => call.url === '/api/tools/fileList').map((call) => call.body)).toEqual([
-        { parameters: { paths: ['.'], limit: 200 } },
-        { parameters: { paths: ['src'], limit: 200 } }
+    expect(calls.filter((call) => call.url === '/api/tools/files').map((call) => call.body)).toEqual([
+        { parameters: { ops: [{ op: 'list', path: '.', limit: 200 }] } },
+        { parameters: { ops: [{ op: 'list', path: 'src', limit: 200 }] } }
     ]);
     expect(calls.filter((call) => call.url === '/api/tools/glob').map((call) => call.body)).toEqual([
         { parameters: { patterns: ['**/*'], paths: ['.'], maxResults: 100 } },
@@ -633,7 +640,7 @@ it('drills into a picked folder and re-scopes both lookups', async () => {
 });
 
 it('drops only the folder rows when the directory read fails', async () => {
-    const calls = stubServer(restored(), ['README.md'], undefined, { fileListError: 'fileList exploded' });
+    const calls = stubServer(restored(), ['README.md'], undefined, { filesError: 'files exploded' });
     await mount();
 
     const input = composer();
@@ -643,14 +650,14 @@ it('drops only the folder rows when the directory read fails', async () => {
 
     // A refused folder read contributes NO folder rows and NEVER an error note: the
     // glob keeps ownership of the error state, so a half-typed directory (or an
-    // unconfigured fileList) must not break @ browsing.
+    // unconfigured `files`) must not break @ browsing.
     expect(popupNames()).toEqual(['README.md']);
     expect(document.querySelector('.composer-popup-error')).toBeNull();
     expect(input.getAttribute('aria-expanded')).toBe('true');
 
     // The read really was attempted for the root scope; only its answer was refused.
-    expect(calls.filter((call) => call.url === '/api/tools/fileList').map((call) => call.body)).toEqual([
-        { parameters: { paths: ['.'], limit: 200 } }
+    expect(calls.filter((call) => call.url === '/api/tools/files').map((call) => call.body)).toEqual([
+        { parameters: { ops: [{ op: 'list', path: '.', limit: 200 }] } }
     ]);
 });
 

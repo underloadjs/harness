@@ -88,7 +88,7 @@ const TOOLBOX = [
     'read',
     'write',
     'edit',
-    'fileList',
+    'files',
     'glob',
     'grep',
     'shell',
@@ -378,13 +378,13 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('flaky')).toContain('testFlaky');
     });
 
-    it('marks the five everyday file tools core and leaves fileList discoverable', () => {
+    it('marks the five everyday file tools core and leaves files discoverable', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
         const harness = presetOf('instruct').create(SETTINGS, progress);
 
-        // R18: read/write/edit/glob/grep are declared up front. fileList and the app /
+        // R18: read/write/edit/glob/grep are declared up front. files and the app /
         // command tools still go through toolRequest. The harness-owned tools are
         // core as well, but they are the session-bound set.
         expect(
@@ -396,7 +396,7 @@ describe('one toolbox, different agents', () => {
             read: 'core',
             write: 'core',
             edit: 'core',
-            fileList: 'searchable',
+            files: 'searchable',
             glob: 'core',
             grep: 'core',
             shell: 'searchable',

@@ -274,7 +274,7 @@ export type HarnessDescriptor = {
     // toolRequest/toolCreate/task, delegate when a subagent allowlist
     // exists, and search when this host has a provider key. The UI core dropdown
     // renders this exact set, so it reflects runtime visibility rather than a
-    // hard-coded harness list. fileList and the other presets stay searchable.
+    // hard-coded harness list. files and the other presets stay searchable.
     coreTools?: string[];
     // Per-agent model overrides (R9): agent id → model id. PRESENT ONLY WHEN a
     // harness actually overrides something, so existing cards keep their exact

@@ -194,7 +194,7 @@ export const matchesPatterns = (set: PatternSet, relativePath: string): boolean 
 export type SearchCandidate = {
     // Canonical file key; the dedupe key (one file, one entry). See ./identity.
     identity: string;
-    // Root-prefixed posix path, exactly the presentation fileList uses.
+    // Root-prefixed posix path, exactly the presentation files uses.
     display: string;
     // Absolute path for a content read.
     absolute: string;
@@ -255,7 +255,7 @@ const rootErrorMessage = (tool: string, root: string, code: string, cwd: string)
         return (
             `${tool} path "${root}" does not exist. Roots are resolved against the working directory (${toPosixPath(
                 cwd
-            )}); check the spelling, or list the parent with fileList to see what is there.`
+            )}); check the spelling, or list the parent with files to see what is there.`
         );
     }
 

@@ -42,7 +42,7 @@
 //
 // The fixture tree is the process cwd for this file, so roots are relative and the
 // results are the documented root-prefixed relative paths (the same presentation
-// fileList uses: "." contributes no prefix). Fixtures live under the repo-root
+// files uses: "." contributes no prefix). Fixtures live under the repo-root
 // `Temp/`, one unique directory per run, removed afterwards.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -350,7 +350,7 @@ describe('grep', () => {
 
     it('echoes the effective cap instead of silently flooring a larger request', async () => {
         // Defect 3. `maxResults: 500` used to answer with 100 and never say the cap was
-        // 100; the hard cap is now 1000 (the number fileList settled on) and `limit`
+        // 100; the hard cap is now 1000 (the number files settled on) and `limit`
         // reports what was actually applied.
         const result = await grep({ pattern: 'TODO', maxResults: 5000 });
 
@@ -557,7 +557,7 @@ describe('grep', () => {
 
     it('reports paths relative to a nested root and deduplicates overlapping roots', async () => {
         // Root 'src' + '.' both reach src/a.ts. Every result is root-prefixed (the
-        // same presentation fileList uses), and the FIRST root wins, so the file is
+        // same presentation files uses), and the FIRST root wins, so the file is
         // reported once as "src/a.ts" — never twice, and never "src/src/a.ts".
         await expect(grep({ pattern: 'TODO: one', paths: ['src', '.'] }).then((r) => r.matches)).resolves.toEqual([
             { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 }

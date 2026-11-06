@@ -107,7 +107,7 @@ const ALL_PACKAGE_NAMES = [
     'read',
     'write',
     'edit',
-    'fileList',
+    'files',
     'glob',
     'grep',
     'shell',
@@ -126,7 +126,7 @@ const PRESET_NAMES = [
     'read',
     'write',
     'edit',
-    'fileList',
+    'files',
     'glob',
     'grep',
     'shell',
@@ -212,7 +212,7 @@ describe('live Node descriptor catalogue (T24)', () => {
 
     it('lists the new grep row beside glob, and write in fileWrite\'s slot', () => {
         // R1/R2 registration contract: the rename kept every historical `order` slot
-        // (read 170, write 180, edit 190, fileList 200, glob 210, syntax 160) and grep
+        // (read 170, write 180, edit 190, files 200, glob 210, syntax 160) and grep
         // sits at 215, directly beside the name search, so discovery order does not
         // move for anything else.
         expect(descriptorOf('grep')).toEqual({
@@ -391,6 +391,8 @@ describe('live Node descriptor catalogue (T24)', () => {
                     startLine: 1,
                     endLine: 1,
                     truncated: false,
+                    limit: null,
+                    startByteAligned: null,
                     nextLine: null,
                     nextColumn: null,
                     nextByte: null,
@@ -429,21 +431,30 @@ describe('live Node descriptor catalogue (T24)', () => {
         fs.writeFileSync(path.join(folder, 'beta.txt'), 'b', 'utf8');
         fs.writeFileSync(path.join(folder, 'gamma.txt'), 'c', 'utf8');
 
-        const listing = await presetTools.fileList({ paths: [folder], limit: 2 });
+        const listing = await presetTools.files([{ op: 'list', path: folder, limit: 2 }]);
 
         const posixFolder = folder.replace(/\\/g, '/');
         const first = `${posixFolder}/alpha.txt`;
         const second = `${posixFolder}/beta.txt`;
+        const pageBytes = Buffer.byteLength(first, 'utf8') + Buffer.byteLength(second, 'utf8');
 
         // `bytes` is the UTF-8 size of THIS page's entries (the strings above), not
-        // of the files they name.
+        // of the files they name. The cursor lives inside the `list` entry's receipt,
+        // and the envelope's own `bytes` totals what the call charged to the budget.
         expect(listing).toEqual({
-            entries: [first, second],
-            truncated: true,
-            nextOffset: 2,
-            offset: 0,
-            limit: 2,
-            bytes: Buffer.byteLength(first, 'utf8') + Buffer.byteLength(second, 'utf8'),
+            results: [
+                {
+                    op: 'list',
+                    path: posixFolder,
+                    entries: [first, second],
+                    truncated: true,
+                    nextOffset: 2,
+                    offset: 0,
+                    limit: 2,
+                    bytes: pageBytes
+                }
+            ],
+            bytes: pageBytes,
             contentBudget: 65536
         });
 

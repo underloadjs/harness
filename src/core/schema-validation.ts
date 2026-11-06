@@ -336,12 +336,14 @@ export const resolveToolParameters = (
         const check = validateSchemaValue(schema, raw, '$');
 
         if (!check.valid && mode === 'direct' && !isPlainObject(raw)) {
-            // LEGACY DIRECT FORM of a multi-property tool. fileList's documented
-            // direct call is the bare directory value (`fileList(['src'])`), which
-            // predates the paged object schema and is still accepted by its
-            // implementation. Wrap it under the ONE property whose schema accepts it
-            // and validate the wrapper: an ambiguous value (a number that could be
-            // `offset` or `limit`) is NOT guessed — it keeps the original error.
+            // LEGACY DIRECT FORM of a multi-property tool. `glob`'s and `grep`'s
+            // documented direct call accepts the bare directory array (`grep(['src'])`
+            // for `paths`), which predates their paged object schemas and is still
+            // accepted by their implementations. Wrap it under the ONE property whose
+            // schema accepts it and validate the wrapper: an ambiguous value (a number
+            // that could be `offset` or `limit`) is NOT guessed — it keeps the original
+            // error. (`fileList` used to be the example here; the tool is now `files`,
+            // which declares ONE array property, so it takes the single-property path.)
             const matches = Object.entries(properties ?? {}).filter(
                 ([, propertySchema]) => validateSchemaValue(propertySchema, raw, '$.legacy').valid
             );
@@ -383,7 +385,8 @@ export const resolveToolParameters = (
 
     // An EMPTY object is the "nothing filled in" argument box, not a value: both a
     // model and the HTTP UI send `{}` for a call with no arguments, and the
-    // documented default (fileList `paths: ["."]`) must apply. `execute` receives
+    // documented default must apply — for `files`, the `list` op's working directory,
+    // exactly as `fileList`'s `paths: ["."]` was. `execute` receives
     // the single property's value (undefined), which every implementation treats as
     // "use the default" and reports a specific error for when it cannot.
     //

@@ -53,12 +53,12 @@ describe('browser baseline fallback', () => {
 
         // Existing browser harness semantics remain: model turns and discovery
         // metadata are available. The fallback registry carries the same searchable
-        // rows as the compiled one, so a 'files' query finds fileList, download
+        // rows as the compiled one, so a 'files' query finds files, download
         // (R9-R11), and the profile row that shares the files vocabulary.
         const result = await writer('go');
         expect(result.content).toBe('browser-ok');
         expect(await writer.executeTool('toolRequest', { tags: ['files'] })).toMatchObject({
-            enabled: ['fileList', 'download', 'profileManage']
+            enabled: ['files', 'download', 'profileManage']
         });
     });
 
@@ -86,7 +86,7 @@ describe('browser baseline fallback', () => {
         expect(() =>
             harness({
                 agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
-                toolSources: { fromMap: 'tools/files/fileList.tool.ts' }
+                toolSources: { fromMap: 'tools/files/files.tool.ts' }
             })
         ).toThrow(/unavailable in the browser build/);
 

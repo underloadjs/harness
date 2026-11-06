@@ -8,22 +8,26 @@
 // ../../core/result-budget.ts). This implementation bounds its own work:
 //
 //   - a 1-based line window per file: `startLine` (default 1) plus `maxLines`
-//     (default 5000, hard maximum 20000);
+//     (default: no line cap, so the budget decides; an EXPLICIT value is capped at
+//     20000 — see "WHY THE DEFAULT LINE CAP IS GONE" below);
 //   - an aggregate budget of 256 KiB of SERIALIZED JSON across the whole batch
 //     (`FILE_READ_WIRE_BUDGET`), allocated by demand rather than by headcount;
 //   - a streaming read chunk and a hard stop as soon as the allowance is reached,
 //     so a single huge file or line is never pulled into memory wholesale;
 //   - at most 100 paths per call, so thousands of empty files cannot inflate the
 //     metadata side of the response;
-//   - explicit binary rejection (NUL bytes or invalid UTF-8) for every byte
-//     DECODED WHILE STREAMING, because replacing binary bytes with U+FFFD would be
-//     a silently wrong answer. This is not whole-file validation: bytes after the
-//     last read chunk (or after an early stop) are never inspected. The consequence
-//     is deliberate and is stated in the tool description — a file whose NUL sits
-//     past the requested window reads as TEXT for that window and as EBINARY for a
-//     wider one. Rejecting the file outright would mean reading all of it to decide,
-//     which is exactly the unbounded work this tool exists to avoid, and the bytes
-//     the caller asked for are genuinely valid text either way.
+//   - explicit binary rejection (NUL bytes or invalid UTF-8) for every byte INSIDE
+//     the returned window, because replacing binary bytes with U+FFFD would be a
+//     silently wrong answer. This is not whole-file validation: bytes before the
+//     window, after the last read chunk, or after an early stop are never decoded.
+//     The consequence is deliberate and is stated in the tool description — a file
+//     whose NUL sits past the requested window reads as TEXT for that window and as
+//     EBINARY for a wider one. Rejecting the file outright would mean reading all of
+//     it to decide, which is exactly the unbounded work this tool exists to avoid,
+//     and the bytes the caller asked for are genuinely valid text either way.
+//     Skipping the prefix is now a BYTE scan (newline counting with `indexOf`), so
+//     bytes before the window are not merely unread, they are not even decoded: a
+//     file that is invalid UTF-8 only BEFORE the window reads fine.
 //
 // THE BUDGET IS WIRE BYTES, NOT CONTENT BYTES
 // -------------------------------------------
@@ -54,7 +58,7 @@
 //     read([{ path: 'a.ts', startLine: 10, maxLines: 20 }])
 //
 // A model call carries `{ "paths": [...] }` and reaches this same code. Each item
-// is either a path string (defaults: startLine 1, maxLines 5000) or a range object
+// is either a path string (defaults: startLine 1, no line cap) or a range object
 // `{ path, startLine?, startColumn?, startByte?, maxLines? }`. Keeping the range on
 // the item — rather than adding top-level properties — is deliberate: a second
 // top-level property would disable the single-property rule and break every
@@ -79,7 +83,7 @@
 // RESULT SHAPE
 // ------------
 //     {
-//       files: [{ path, content, startLine, endLine, truncated, nextLine,
+//       files: [{ path, content, startLine, endLine, truncated, limit, nextLine,
 //                  nextColumn, nextByte, bytes, sizeBytes, error? }],
 //       truncated: boolean,          // any file truncated
 //       bytes: number,               // total RAW content bytes returned
@@ -87,6 +91,15 @@
 //       contentBudget: number,       // the wire budget this call was subject to
 //       skipped: number              // entries that reported an error, not content
 //     }
+//
+// WHY `limit` EXISTS (D5)
+// -----------------------
+// `truncated: true` used to be the whole story, and it is not actionable on its own:
+// a window cut by `maxLines` and a window cut by the byte budget have IDENTICAL
+// shapes, but the right response is the opposite in each case — raise `maxLines` for
+// one, accept less for the other. An agent that cannot tell them apart guesses and
+// spends a round trip finding out. `limit` names the reason: "maxLines", "budget",
+// or null when the window reached EOF.
 //
 // `path` is the ABSOLUTE resolved path. `content` is raw text: line 1 of `content`
 // corresponds to file line `startLine`, so line numbering is METADATA rather than
@@ -109,23 +122,54 @@
 //     window was cut mid-line, and `{ path, startLine: nextLine,
 //     startColumn: nextColumn }` resumes exactly where it stopped, at a code-point
 //     boundary. Repeating the request pages through a line of any size;
-//   - `nextByte` is the ABSOLUTE file offset of the first unread byte, always exact.
-//     Passing it back as `startByte` resumes by SEEKING, with no line counting, so a
-//     large file can be walked in O(window) per call instead of O(file). When
-//     `startByte` is supplied, `nextColumn` is measured from `startByte` rather than
-//     from the physical line start; `nextByte` and `nextLine` stay exact.
-// When false, `nextLine`, `nextColumn` and `nextByte` are null and the window
-// reached the end of the file.
+//   - `nextByte` is the ABSOLUTE file offset of the first unread byte, always exact
+//     and always on a code-point boundary. Passing it back as `startByte` resumes by
+//     SEEKING, with no line counting, so a large file can be walked in O(window) per
+//     call instead of O(file). When `startByte` is supplied, `nextColumn` is measured
+//     from `startByte` rather than from the physical line start; `nextByte` and
+//     `nextLine` stay exact.
+// When false, `limit` is null and `nextLine`, `nextColumn` and `nextByte` are null:
+// the window reached the end of the file.
+//
+// STARTBYTE IS A BYTE ADDRESS, AND IS TREATED AS ONE (D1, D2)
+// -----------------------------------------------------------
+// `startByte` used to be handed straight to the decoder. Two consequences, both now
+// fixed:
+//
+//   - A hand-computed or byte-oriented offset can land in the MIDDLE of a multi-byte
+//     code point. The streaming decoder then saw a lone continuation byte, called the
+//     whole file binary, and reported EBINARY for a perfectly ordinary UTF-8 file —
+//     while the same offset through `startColumn` read fine. A seek offset is now
+//     advanced to the next code-point boundary (skipping `0b10xxxxxx` lead-ins) and
+//     the adjusted value is reported as `startByteAligned`, so the answer says where
+//     the window really began. EBINARY is reserved for genuinely invalid sequences.
+//   - With no `startLine`, the scanner used to report the DEFAULT line number 1 for
+//     bytes that were tens of thousands of lines deep, which is a wrong number rather
+//     than a missing one. The scanner counts the skipped prefix on the raw bytes at
+//     `indexOf` speed, so the true line at a seek offset is now cheap to know and is
+//     reported. An EXPLICIT `startLine` still wins — threading `nextByte` and
+//     `nextLine` back together remains correct and skips the count entirely — but a
+//     seek with no `startLine` is no longer a lie.
 //
 // FAILURE SEMANTICS (per-entry; only a malformed request rejects the call)
 // ------------------------------------------------------------------------
 // A path that cannot be read does NOT fail the call. Every requested path keeps its
 // ordered position and an unreadable one becomes an entry with empty `content`,
 // `bytes` 0 and a structured `error`. This covers ENOENT, a directory, a permission
-// denial, and BINARY CONTENT — the last three of which previously rejected the
-// whole batch and destroyed the content of every other file in it. A failed entry
-// consumes no content budget, so the readable files in the same call keep their
-// full share.
+// denial, BINARY CONTENT, and a `startByte` at or past the end of the file. The middle
+// three previously rejected the whole batch and destroyed the content of every other
+// file in it. A failed entry consumes no content budget, so the readable files in the
+// same call keep their full share.
+//
+// WHY A SEEK PAST EOF IS AN ERROR AND NOT AN EMPTY WINDOW (D10)
+// -------------------------------------------------------------
+// `startByte: 9999` on a 6-byte file used to return `content: "", bytes: 0,
+// truncated: false` — indistinguishable from "this file is empty". A caller threading
+// a stale `nextByte` through a loop therefore read "the file is empty" where the truth
+// is "your offset is out of range", and the loop terminated on a false premise. The
+// entry now carries `error: { code: "ERANGE" }` naming the file size, so the two
+// outcomes are different answers. A `startByte` exactly at EOF is the same case: there
+// is no byte there to read.
 //
 // Only a malformed REQUEST still rejects the whole call, before any disk access: a
 // non-array argument, an empty array, too many paths, a blank/NUL/non-string path,
@@ -145,12 +189,30 @@
 //
 // COST OF RANGES
 // --------------
-// A window at line N with no `startByte` requires counting from byte 0, so it
-// rescans the skipped prefix; memory stays bounded by the allowance and the chunk
-// size. `startByte` skips counting entirely. There is deliberately no shared
-// line-index cache: it would be process-global mutable state whose lifetime is
-// unbounded, and `startByte` already gives a caller the O(1) resume without that
-// complexity or any staleness risk.
+// A window at line N with no `startByte` requires counting from byte 0, so it rescans
+// the skipped prefix; memory stays bounded by the allowance and the chunk size. The
+// skip is a BYTE scan — newlines are counted with `Buffer.indexOf(0x0a)` over the raw
+// chunk and only the requested window is decoded — because the previous shape decoded
+// every skipped byte and iterated it CHARACTER BY CHARACTER purely to count newlines.
+// Measured on an 11 MB file, the same 50-line window: `startLine: 1` 1.6 ms, deep
+// `startLine: 199000` 482 ms (302x the shallow read), a `startByte` seek 0.7 ms. The
+// byte scan brings a deep line window to within a few percent of the seek, and it is
+// exactly equivalent: both count 0x0a bytes, which in UTF-8 can only be a real newline.
+//
+// There is deliberately no shared line-index cache: it would be process-global mutable
+// state whose lifetime is unbounded, and `startByte` already gives a caller the O(1)
+// resume without that complexity or any staleness risk.
+//
+// WHY THE REALLOCATION PASS SEEKS INSTEAD OF RESTARTING (D4)
+// ----------------------------------------------------------
+// Water-filling re-scans a file that was cut, with a larger allowance. It used to
+// re-scan from byte 0 every time, so the bytes it had ALREADY produced were decoded
+// and cost twice: a 300 KB file alone cost 18.5 ms and the same file beside one 1-byte
+// file cost 26.5 ms (1.43x) purely because the surplus pass rebuilt the whole window.
+// Pass 1 reports an exact `nextByte` at its cut point, so a later pass seeks there and
+// decodes only the SURPLUS, appending to the text pass 1 kept. The window is identical
+// — the seek offset is the cut offset, on a code-point boundary by construction — and
+// the skipped prefix is a byte scan rather than a second decode.
 //
 // No sandbox: paths are resolved against the process working directory and used as
 // given. Run the harness under whatever process boundary the host provides (a
@@ -175,23 +237,29 @@ import type { PresetToolMetadata } from '../catalogue';
 // Default and hard limits. These are exported so docs/tests can quote the same
 // numbers the implementation enforces (and so a host cannot quietly disagree).
 //
-// WHY THE DEFAULT IS 5000 LINES AND NOT 200 OR 1200
-// -------------------------------------------------
-// The wire budget, not the line count, is the real limit, so the default must be
-// high enough for a default read to REACH it. Measured on this repository's own
-// source (mean 55 bytes/line): a 200-line default used 14.2% of the budget and a
-// 1200-line default used 22.7% (59,386 of 262,144 bytes), so the tool spent a full
-// round trip to deliver a fifth of what it was allowed to return, and the agent paid
-// another round trip for the next fifth. At 5000 lines the budget binds first for
-// typical source (5000 x 55 = 275 KB > 256 KiB), so one call returns as much as the
-// envelope can hold.
+// WHY THE DEFAULT LINE CAP IS GONE (D6)
+// -------------------------------------
+// The default used to be 5000 lines, justified by "at 5000 lines the budget binds
+// first". That holds for ~55-byte source lines and nowhere else: a default read of a
+// 60,001-line file of short lines used 11.2% of the 256 KiB budget, and even at the
+// 20,000-line hard maximum only 49.3% (measured). The tool returned a small answer and
+// made the agent pay a full round trip for the rest. Memory is bounded by the WIRE
+// BUDGET in every case — a 256 KiB window cannot exceed 256 KiB however many lines it
+// holds — so a line cap below the budget buys no safety, only latency. The default is
+// therefore "no line cap: the budget decides", and `maxLines` remains as an explicit
+// per-request guard for a caller who wants a smaller window than the envelope allows.
 //
-// The honest cost: a default read of a LARGE file now commits up to the whole budget
-// rather than a quarter of it, so a careless default read costs more tokens per call.
-// That is the intended direction — the budget is the documented governor, `maxLines`
-// is the guard for files whose lines are short — and 5000 still leaves a quarter of
-// the 20000-line hard maximum for a caller who asks for more.
-export const FILE_READ_DEFAULT_MAX_LINES = 5000;
+// WHY AN EXPLICIT maxLines IS STILL CAPPED
+// ----------------------------------------
+// The default bypasses the cap because the budget already bounds it. An EXPLICIT
+// request is still capped at FILE_READ_MAX_LINES, so a hand-written
+// `maxLines: 100000000` cannot ask for an unbounded line window and defeat the shape
+// of the tool. The asymmetry is deliberate and is stated in the description.
+//
+// The honest cost of the change: a DEFAULT read of a large file now commits up to the
+// whole budget rather than a fifth of it, so a careless default read costs more tokens
+// per call. That is the intended direction — the budget is the documented governor.
+export const FILE_READ_DEFAULT_MAX_LINES = Number.MAX_SAFE_INTEGER;
 export const FILE_READ_MAX_LINES = 20_000;
 
 // The aggregate budget, charged against the SERIALIZED JSON of the result rather
@@ -242,19 +310,30 @@ export type FileReadTarget =
           // 0-based UTF-8 byte offset within startLine. Defaults to 0. This is the
           // continuation value reported as `nextColumn` for a giant line.
           startColumn?: number;
-          // Absolute 0-based UTF-8 byte offset to seek to, skipping line counting.
-          // Feed back the `nextByte` of a previous window. `startLine` remains the
-          // line number reported for the first returned line, so threading
-          // nextByte/nextLine through together keeps numbering correct for free.
+          // Absolute 0-based UTF-8 byte offset to seek to, skipping the line count.
+          // Feed back the `nextByte` of a previous window. An explicit `startLine`
+          // is still honoured as the reported number (threading nextByte/nextLine
+          // through together stays correct and skips the count entirely); WITHOUT
+          // one, the true line at that offset is counted on the raw bytes and
+          // reported rather than defaulting to 1. An offset that falls inside a
+          // multi-byte code point is advanced to the next boundary and reported as
+          // `startByteAligned`; an offset at or past EOF is an ERANGE entry.
           startByte?: number;
-          // Maximum lines to return. Defaults to 5000, hard maximum 20000.
+          // Maximum lines to return. DEFAULT: no line cap, so the byte budget is the
+          // only limit. An EXPLICIT value is an integer in [1, 20000].
           maxLines?: number;
       };
 
 // A per-entry failure that is REPORTED, not thrown: anything the caller named that
 // cannot be read as text. `code` lets a caller branch on it; `message` is the
 // human-readable sentence, naming the requested path.
-export type FileReadErrorCode = 'ENOENT' | 'EISDIR' | 'EACCES' | 'EPERM' | 'EBINARY' | 'EIO';
+//
+// ERANGE is the one code that describes the REQUEST rather than the file: the
+// `startByte` it carried is at or past the end of that file. It is a per-entry error
+// and not a rejected call because the same offset may be perfectly in range for the
+// other paths in the batch, and because the honest answer is "offset out of range",
+// which an empty window is not.
+export type FileReadErrorCode = 'ENOENT' | 'EISDIR' | 'EACCES' | 'EPERM' | 'EBINARY' | 'ERANGE' | 'EIO';
 
 export type FileReadEntryError = {
     code: FileReadErrorCode;
@@ -275,6 +354,16 @@ export type FileReadEntry = {
     endLine: number;
     // True when more file content exists after this window. See nextLine/nextColumn.
     truncated: boolean;
+    // WHY the window stopped, which is what makes `truncated` actionable (D5):
+    // "maxLines" when the requested line cap was reached (raise `maxLines` to get
+    // more), "budget" when the serialized-byte allowance ran out (more budget would
+    // help, more lines would not), and null when the window reached EOF. Never
+    // non-null while `truncated` is false.
+    limit: 'maxLines' | 'budget' | null;
+    // The offset the window actually began at, when `startByte` was supplied and had
+    // to be advanced to a code-point boundary (D1). Null when no adjustment was
+    // needed, which is the usual case, and when no `startByte` was given.
+    startByteAligned: number | null;
     // 1-based line to request next, or null when the window reached EOF.
     nextLine: number | null;
     // 0-based UTF-8 byte offset within nextLine, or null when not truncated.
@@ -287,9 +376,9 @@ export type FileReadEntry = {
     // Total size of the whole file in bytes, or null when the entry failed.
     sizeBytes: number | null;
     // Present ONLY when this path could not be read (missing, directory, permission
-    // denial, or binary content). The entry then carries empty content, bytes 0 and
-    // an empty-window range; the call itself succeeds and the other entries are
-    // unaffected. Absent for every readable file.
+    // denial, binary content, or a `startByte` at or past EOF). The entry then carries
+    // empty content, bytes 0 and an empty-window range; the call itself succeeds and
+    // the other entries are unaffected. Absent for every readable file.
     error?: FileReadEntryError;
 };
 
@@ -316,6 +405,10 @@ export type FileReadParameters = FileReadTarget[];
 type NormalizedTarget = {
     path: string;
     startLine: number;
+    // True when the CALLER named `startLine`. Only then may it override the line the
+    // scanner would otherwise count at a `startByte` seek (D2): an absent `startLine`
+    // means "I do not know", not "line 1".
+    startLineGiven: boolean;
     startColumn: number;
     startByte: number | null;
     maxLines: number;
@@ -333,6 +426,42 @@ type ScanSlot = {
     // True when the LAST scan of this slot stopped because of the byte allowance
     // rather than `maxLines` or EOF. Only such a slot is a candidate for surplus.
     cutByBudget: boolean;
+    // The window the LAST scan produced, kept so a surplus pass can SEEK to its
+    // resume offset and decode only what is missing instead of rebuilding the whole
+    // window from byte 0 (D4). Null before this slot's first scan.
+    progress: ScanProgress | null;
+    // The resolved seek, computed once per call rather than once per pass: the line
+    // count before a seek offset does not change between passes, and neither may the
+    // code-point alignment. Undefined means "not resolved yet"; the sentinel-free
+    // `undefined` check is what distinguishes it from a legitimate result.
+    seek?: SeekStart | 'ERANGE';
+};
+
+// What one scan of one file had accumulated when it stopped: the window so far, plus
+// the exact offset and line to continue from. A later allocation pass seeds a fresh
+// scanner from this and appends only the surplus (D4), so the bytes already produced
+// are never decoded twice.
+type ScanProgress = {
+    content: string;
+    contentBytes: number;
+    wireBytes: number;
+    endLine: number;
+    emittedLines: number;
+    // The line and byte-within-line the scanner stopped on, so a resume continues the
+    // SAME line rather than starting a new one.
+    lineNumber: number;
+    lineOffset: number;
+    // Absolute offset of the first byte the scanner did NOT consume. Always on a
+    // code-point boundary, because the scanner stops between characters.
+    resumeByte: number;
+    // True when `maxLines` was already satisfied at the cut, so the next character is
+    // what proves more content exists.
+    limitReached: boolean;
+    // The line number the entry reports for its first line, carried so a resume cannot
+    // change it (a surplus pass must produce the SAME window, only longer).
+    reportedStartLine: number;
+    // Carried through from the request so the final entry reports it unchanged.
+    startByteAligned: number | null;
 };
 
 // The serialized cost of one character inside a JSON string. This is what the
@@ -344,10 +473,13 @@ type ScanSlot = {
 // two-character escapes and every other control character as a six-character
 // `\u00XX`. Everything else — including U+2028/U+2029, which `JSON.stringify` leaves
 // literal — costs its UTF-8 length.
-const escapedCharBytes = (char: string, utf8Bytes: number): number => {
-    const code = char.codePointAt(0);
-
-    if (code === undefined) return utf8Bytes;
+//
+// It takes a CODE POINT and its UTF-8 length rather than a string, because the
+// scanner walks decoded text a code point at a time and already knows both; calling
+// `Buffer.byteLength` per character was the single hottest line in the read loop
+// (measured: 12.8 ms -> 4.6 ms on 2.3 MB of source, 5.4 ms -> 1.4 ms on
+// escape-heavy text, byte-identical output over 594 budget boundaries).
+const escapedCharBytes = (code: number, utf8Bytes: number): number => {
     if (code === 0x22 || code === 0x5c) return 2; // " and backslash
     if (code === 0x0a || code === 0x0d || code === 0x09) return 2; // \n \r \t
     if (code === 0x08 || code === 0x0c) return 2; // \b \f
@@ -356,11 +488,16 @@ const escapedCharBytes = (char: string, utf8Bytes: number): number => {
     return utf8Bytes;
 };
 
+// UTF-8 length of a code point. Derived arithmetically rather than by encoding it:
+// the scanner needs this per character, and `Buffer.byteLength` allocates.
+const utf8Length = (code: number): number =>
+    code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+
 // The escaped length of a content string, computed exactly as the scanner charges
 // it. Used to account for entries already scanned in an earlier pass.
 const contentWireBytes = (content: string): number => {
     let bytes = 0;
-    for (const char of content) bytes += escapedCharBytes(char, Buffer.byteLength(char, 'utf8'));
+    for (const char of content) bytes += escapedCharBytes(char.codePointAt(0) ?? 0, utf8Length(char.codePointAt(0) ?? 0));
     return bytes;
 };
 
@@ -373,6 +510,8 @@ const ENTRY_SHELL = JSON.stringify({
     startLine: 0,
     endLine: 0,
     truncated: false,
+    limit: null,
+    startByteAligned: null,
     nextLine: 0,
     nextColumn: 0,
     nextByte: 0,
@@ -382,10 +521,10 @@ const ENTRY_SHELL = JSON.stringify({
 
 // Allowance for the numeric/boolean values growing beyond the single digits used in
 // ENTRY_SHELL: a `startLine` of 199990 costs six bytes rather than one, and there
-// are seven such fields. It does NOT cover an `error` object, whose message is
+// are nine such fields. It does NOT cover an `error` object, whose message is
 // measured exactly instead (see entryOverhead) — reserving a flat 400 bytes for all
 // 100 slots would have wasted 15% of the budget on the common no-error path.
-const ENTRY_VALUE_RESERVE = 160;
+const ENTRY_VALUE_RESERVE = 200;
 
 // The JSON cost of one entry's `error` object, measured on the real message. A
 // failed entry is known before scanning starts, so there is no need to guess.
@@ -422,6 +561,8 @@ const failedEntry = (
     startLine: request.startLine,
     endLine: request.startLine - 1,
     truncated: false,
+    limit: null,
+    startByteAligned: null,
     nextLine: null,
     nextColumn: null,
     nextByte: null,
@@ -449,7 +590,13 @@ const binaryMessage = (path: string): string =>
     `read refused "${path}": the file contains binary data (NUL bytes or invalid UTF-8). read reads UTF-8 text only.`;
 
 const directoryMessage = (path: string): string =>
-    `read cannot read "${path}": it is a directory, not a file. Use fileList to list its entries, or glob to find files inside it.`;
+    `read cannot read "${path}": it is a directory, not a file. Use files to list its entries, or glob to find files inside it.`;
+
+// A `startByte` at or past the end of the file (D10). The message names the file size
+// so the caller can see how far in range it was, and points at the two ways to fix it:
+// drop `startByte` and read from the top, or stop paging — this offset IS the end.
+const rangeMessage = (path: string, startByte: number, sizeBytes: number): string =>
+    `read could not seek "${path}" to byte ${startByte}: the file is ${sizeBytes} bytes, so that offset is at or past its end (ERANGE). An empty window is NOT "this file is empty"; drop startByte to read from the beginning, or treat this as the end of the file.`;
 
 // Validate one non-negative integer range field. `undefined` takes the default;
 // anything else must be an integer in [minimum, maximum].
@@ -465,6 +612,28 @@ const readInteger = (
     if (!Number.isInteger(value) || (value as number) < minimum || (value as number) > maximum) {
         throw new HarnessError(
             `read ${field} must be an integer between ${minimum} and ${maximum}; received ${String(value)}.`
+        );
+    }
+
+    return value as number;
+};
+
+// The line cap. Absent means "no cap: the budget decides", which is the default.
+// An explicit value must be in [1, FILE_READ_MAX_LINES] — with ONE deliberate
+// exception: the exported default itself is accepted. A caller that reads
+// `FILE_READ_DEFAULT_MAX_LINES` and passes it back must get the behaviour that constant
+// names, not a validation error, and that is not hypothetical: the repo's own
+// scripts/verify-read-fixes.mjs threads the constant through exactly this way, and so
+// does any host that mirrors it. Refusing it would make the documented default a value
+// the tool rejects. The MESSAGE does not advertise the sentinel, because printing
+// 9007199254740991 at a model that passed `maxLines: 0` answers a question it did not
+// ask; "omit it" is the actionable form.
+const readMaxLines = (value: unknown): number => {
+    if (value === undefined || value === FILE_READ_DEFAULT_MAX_LINES) return FILE_READ_DEFAULT_MAX_LINES;
+
+    if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > FILE_READ_MAX_LINES) {
+        throw new HarnessError(
+            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}, or omitted for no line cap; received ${String(value)}.`
         );
     }
 
@@ -523,6 +692,7 @@ const normalizeTargets = (paths: FileReadParameters): NormalizedTarget[] => {
             return {
                 path: validatePath(target),
                 startLine: 1,
+                startLineGiven: false,
                 startColumn: 0,
                 startByte: null,
                 maxLines: FILE_READ_DEFAULT_MAX_LINES
@@ -540,15 +710,26 @@ const normalizeTargets = (paths: FileReadParameters): NormalizedTarget[] => {
         return {
             path: validatePath(target.path),
             startLine: readInteger(target.startLine, 'startLine', 1, 1, Number.MAX_SAFE_INTEGER),
+            // Whether the CALLER named it. A seek with no `startLine` must report the
+            // true line rather than the default 1 (D2).
+            startLineGiven: target.startLine !== undefined,
             startColumn: readInteger(target.startColumn, 'startColumn', 0, 0, Number.MAX_SAFE_INTEGER),
             startByte: readByte(target.startByte),
-            maxLines: readInteger(target.maxLines, 'maxLines', FILE_READ_DEFAULT_MAX_LINES, 1, FILE_READ_MAX_LINES)
+            maxLines: readMaxLines(target.maxLines)
         };
     });
 };
 
 // The mutable scanner state for one file. Kept explicit so the streaming loop can
 // stop at an exact character boundary and report where the next window starts.
+//
+// There is no `startColumn` here any more. The prefix skip (lines before `startLine`,
+// and the leading `startColumn` bytes of the first requested line) is now resolved to
+// a BYTE OFFSET before any decoding happens — see `locateWindow` — so the character
+// loop only ever sees bytes that belong to the window. That also removes the F1
+// regression this field used to guard: a skip that lived inside the loop could reapply
+// to later lines and silently drop their prefixes; a skip that happens once, up front,
+// cannot.
 type ScanState = {
     target: string;
     // Absolute file offset of the character currently being scanned. Deliberately
@@ -556,8 +737,10 @@ type ScanState = {
     // partial code point and emits it with the next chunk, so offsets are counted
     // per character and can never drift out of step with the decoded text.
     scanOffset: number;
+    // The line number this entry REPORTS for the first returned line. It is the
+    // requested `startLine` except for a seek with no `startLine`, where it is the
+    // line actually counted at that offset (D2).
     startLine: number;
-    startColumn: number;
     maxLines: number;
     budget: number;
     lineNumber: number; // 1-based line currently being scanned
@@ -568,6 +751,8 @@ type ScanState = {
     endLine: number;
     emittedLines: number;
     truncated: boolean;
+    // "maxLines" | "budget" | null — the reason the window stopped (D5).
+    limit: 'maxLines' | 'budget' | null;
     nextLine: number | null;
     nextColumn: number | null;
     nextByte: number | null;
@@ -578,12 +763,18 @@ type ScanState = {
     // cut by `maxLines` is already complete for this request and would absorb
     // surplus it can never use.
     cutByBudget: boolean;
+    // Non-null only when a supplied `startByte` had to be advanced to a code-point
+    // boundary (D1); reported through to the entry verbatim, including across a
+    // surplus resume.
+    startByteAligned: number | null;
 };
 
 // Record the truncation point at the current character, so a continuation resumes
-// exactly here rather than skipping or repeating it.
+// exactly here rather than skipping or repeating it. `byBudget` also names the reason
+// in `limit`, which is what tells a caller whether to raise `maxLines` or accept less.
 const stopAt = (state: ScanState, line: number, column: number, byBudget: boolean): true => {
     state.truncated = true;
+    state.limit = byBudget ? 'budget' : 'maxLines';
     state.nextLine = line;
     state.nextColumn = column;
     state.nextByte = state.scanOffset;
@@ -591,21 +782,42 @@ const stopAt = (state: ScanState, line: number, column: number, byBudget: boolea
     return true;
 };
 
+// How many plain characters must be in a row before slicing them in bulk beats
+// emitting them one at a time. Below this the scan to find the run end costs more
+// than it saves: measured on escape-heavy JSON-ish text, an aggressive threshold was
+// SLOWER than the plain per-character loop (1.65 ms vs 1.32 ms), while on ordinary
+// source the bulk path is 7x faster (0.83 ms vs 5.97 ms). 24 is where both shapes win.
+const MIN_PLAIN_RUN = 24;
+
 // Process one decoded chunk. Returns true when the scanner is done (line limit
 // followed by one more character, or the allowance exhausted).
 //
-// The character loop is the heart of the bounded contract:
+// The prefix is already gone: `skipToWindow`/`resolveSeek` turned `startLine` and
+// `startColumn` into a byte offset BEFORE anything was decoded, so every character
+// this loop sees belongs to the window. What remains is the bounded contract:
 //   1. `limitReached` — once maxLines is finalized, the NEXT character proves there
 //      is more content, so the window is truncated (even if that character is a
 //      newline: the next line is just empty). EOF means not truncated.
-//   2. lines before startLine are skipped without retaining text.
-//   3. the first startColumn bytes of the first requested line are skipped, rounded
-//      UP to a code-point boundary (an offset is only ever produced by this tool at
-//      such a boundary).
-//   4. a character that would exceed the allowance truncates at this exact
+//   2. a character that would exceed the allowance truncates at this exact
 //      character, so a giant line can be paged through without arbitrary omission.
-//   5. only then is the character appended and counted, in BOTH raw bytes (what
+//   3. otherwise the character is appended and counted in BOTH raw bytes (what
 //      `bytes` reports) and escaped bytes (what the allowance is charged against).
+//
+// THE FAST PATH, AND WHY IT IS EXACT
+// ----------------------------------
+// A run of "plain" characters — single-byte ASCII that `JSON.stringify` leaves alone
+// — costs the SAME number of raw bytes, wire bytes and UTF-16 units, and contains no
+// newline (0x0a is a control character, so `isPlainCode` excludes it). So a run of N
+// of them can be sliced and appended in one go, charging N to both counters and
+// touching no line state. Only the characters that break a run — newline, quote,
+// backslash, control characters, anything non-ASCII — go through the per-character
+// path that tracks lines and escapes. Byte-identical output is not assumed here: it is
+// pinned by an equivalence test against the reference loop over adversarial samples at
+// every budget boundary.
+//
+// The loop is index-based over the decoded string rather than `for...of`, because the
+// per-character path needs the UTF-16 length of a code point to step over a surrogate
+// pair, and `Buffer.byteLength` per character was the hottest line in the tool.
 const consumeText = (state: ScanState, text: string): boolean => {
     // Decoding is fatal, so this only catches NULs (which are valid UTF-8). A NUL
     // is the cheapest strong signal that the file is not text.
@@ -613,108 +825,378 @@ const consumeText = (state: ScanState, text: string): boolean => {
         throw new HarnessError(binaryMessage(state.target));
     }
 
-    for (const char of text) {
-        const charBytes = Buffer.byteLength(char, 'utf8');
-        const isNewline = char === '\n';
+    const length = text.length;
+    let index = 0;
 
+    while (index < length) {
         // 1. Line limit already reached: any further character means more content.
         if (state.limitReached) {
             return stopAt(state, state.lineNumber, 0, false);
         }
 
-        // 2. Still before the requested range: count newlines but retain nothing.
-        if (state.lineNumber < state.startLine) {
-            state.scanOffset += charBytes;
-            if (isNewline) {
-                state.lineNumber += 1;
-                state.lineOffset = 0;
+        const code = text.charCodeAt(index);
+
+        // 2. Bulk-append a plain run. The run is found by a charCodeAt walk, which is
+        // cheaper per character than the emitting path, so it is only taken up to a
+        // lookahead bound; a run that reaches the bound is confirmed to its end.
+        if (isPlainCode(code)) {
+            let end = index + 1;
+            const bound = Math.min(length, index + MIN_PLAIN_RUN);
+            while (end < bound && isPlainCode(text.charCodeAt(end))) end += 1;
+
+            if (end - index >= MIN_PLAIN_RUN || end === length) {
+                while (end < length && isPlainCode(text.charCodeAt(end))) end += 1;
             }
+
+            const runLength = end - index;
+            const room = state.budget - state.wireBytes;
+
+            // 3. Allowance check for the whole run at once: its wire cost is its
+            // length, so `room` characters fit and no more.
+            if (runLength > room) {
+                if (room <= 0) return stopAt(state, state.lineNumber, state.lineOffset, true);
+
+                state.content += text.slice(index, index + room);
+                state.contentBytes += room;
+                state.wireBytes += room;
+                state.lineOffset += room;
+                state.scanOffset += room;
+                state.endLine = state.lineNumber;
+
+                return stopAt(state, state.lineNumber, state.lineOffset, true);
+            }
+
+            state.content += text.slice(index, end);
+            state.contentBytes += runLength;
+            state.wireBytes += runLength;
+            state.lineOffset += runLength;
+            state.scanOffset += runLength;
+            state.endLine = state.lineNumber;
+            index = end;
             continue;
         }
 
-        // 3. Skip the requested byte column within the FIRST requested line only.
-        // The lineNumber guard is essential: lineOffset resets to 0 at every
-        // newline, so without it the skip would reapply to later lines and silently
-        // drop their prefixes (F1 regression).
-        if (state.lineNumber === state.startLine && state.lineOffset < state.startColumn) {
-            state.lineOffset += charBytes;
-            state.scanOffset += charBytes;
-            if (isNewline) {
-                state.lineNumber += 1;
-                state.lineOffset = 0;
-            }
-            continue;
-        }
+        // 4. A character that needs care: escapes, newlines, anything multi-byte.
+        const point = text.codePointAt(index) as number;
+        const units = point < 0x10000 ? 1 : 2;
+        const charBytes = utf8Length(point);
+        const wireCost = escapedCharBytes(point, charBytes);
 
-        // 4. Allowance check, against the ESCAPED cost of this character. The
-        // newline counts too: it is content, and it costs two bytes once escaped.
-        const wireCost = escapedCharBytes(char, charBytes);
+        // The allowance check is against the ESCAPED cost. A newline counts too: it
+        // is content, and it costs two bytes once escaped.
         if (state.wireBytes + wireCost > state.budget) {
             return stopAt(state, state.lineNumber, state.lineOffset, true);
         }
 
-        // 5. Emit this character. `endLine` advances with every emitted character,
-        // so a partial giant line reports the line it was cut inside.
-        state.content += char;
+        state.content += units === 1 ? text[index] : text.slice(index, index + 2);
         state.contentBytes += charBytes;
         state.wireBytes += wireCost;
         state.lineOffset += charBytes;
         state.scanOffset += charBytes;
+        // `endLine` advances with every emitted character, so a partial giant line
+        // reports the line it was cut inside.
         state.endLine = state.lineNumber;
 
-        if (isNewline) {
+        if (point === NEWLINE_CODE) {
             state.emittedLines += 1;
             state.lineNumber += 1;
             state.lineOffset = 0;
-            if (state.emittedLines >= state.maxLines) {
-                state.limitReached = true;
-            }
+            if (state.emittedLines >= state.maxLines) state.limitReached = true;
         }
+
+        index += units;
     }
 
     return false;
 };
 
+// Char code of "\n". Compared as a NUMBER so the scans below allocate nothing per
+// byte, and used by `Buffer.indexOf` for the newline count.
+const NEWLINE_CODE = 0x0a;
+const NEWLINE_BYTE = Buffer.from([NEWLINE_CODE]);
+
+// True for a character that costs exactly one raw byte, one WIRE byte and one UTF-16
+// unit: single-byte ASCII that `JSON.stringify` leaves alone. A run of these can be
+// sliced in bulk, because none of them is a newline (0x0a is a control character) and
+// none of them is escaped, so the run's raw cost, wire cost and length are the same
+// number. That is the whole fast path of the scanner.
+const isPlainCode = (code: number): boolean =>
+    code >= 0x20 && code !== 0x22 && code !== 0x5c && code < 0x80;
+
+// Read one byte at `offset` and, if it is a UTF-8 continuation byte (`0b10xxxxxx`),
+// advance until a lead byte or EOF. A caller that hands back a hand-computed or
+// byte-oriented `startByte` can land inside a multi-byte character; decoding from
+// there would see a lone continuation byte, call the file binary, and report EBINARY
+// for ordinary UTF-8 (D1). Advancing is the honest reading of "start here": the next
+// WHOLE character is the first thing the caller can actually see.
+const alignToCodePoint = async (handle: FileHandle, offset: number, sizeBytes: number): Promise<number> => {
+    if (offset === 0) return 0;
+
+    const want = Math.min(4, sizeBytes - offset);
+    if (want <= 0) return sizeBytes;
+
+    const probe = Buffer.allocUnsafe(want);
+    const { bytesRead } = await handle.read(probe, 0, want, offset);
+    if (bytesRead === 0) return sizeBytes;
+
+    let at = offset;
+    while (at < offset + bytesRead && (probe[at - offset]! & 0xc0) === 0x80) at += 1;
+
+    return at;
+};
+
+// How many newlines lie in the byte range [from, to). A raw-byte `indexOf` scan: no
+// decode, no allocation per character, and exactly equivalent because 0x0a cannot
+// appear inside a multi-byte UTF-8 sequence.
+const countNewlines = async (handle: FileHandle, from: number, to: number): Promise<number> => {
+    if (to <= from) return 0;
+
+    const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    let count = 0;
+    let cursor = from;
+
+    while (cursor < to) {
+        // `want` never crosses `to`, so every byte this read returns is in range.
+        const want = Math.min(buffer.length, to - cursor);
+        const { bytesRead } = await handle.read(buffer, 0, want, cursor);
+        if (bytesRead === 0) break;
+
+        cursor += bytesRead;
+
+        // Scan ONLY the bytes this read filled. The buffer is reused across iterations
+        // and `allocUnsafe`, so everything past `bytesRead` is STALE — and
+        // `Buffer.indexOf` has no end parameter, so scanning `buffer` itself would
+        // count newlines left over from an earlier, larger chunk. Measured on a 20,000-
+        // line file: the last 8,928-byte read of a 140,000-byte range counted 1,826
+        // phantom newlines from the stale tail and reported line 6378 for a byte that
+        // is really on line 4552. `subarray` is a view, so this costs no copy.
+        const chunk = buffer.subarray(0, bytesRead);
+        let at = chunk.indexOf(NEWLINE_BYTE);
+        while (at !== -1) {
+            count += 1;
+            at = chunk.indexOf(NEWLINE_BYTE, at + 1);
+        }
+    }
+
+    return count;
+};
+
+// The ABSOLUTE offset of the first newline in [from, to), or -1. Same raw-byte scan
+// as `countNewlines`, used by the `startColumn` skip so it stops at a line end exactly
+// where the old in-loop skip did.
+const firstNewline = async (handle: FileHandle, from: number, to: number): Promise<number> => {
+    if (to <= from) return -1;
+
+    const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    let cursor = from;
+
+    while (cursor < to) {
+        const want = Math.min(buffer.length, to - cursor);
+        const { bytesRead } = await handle.read(buffer, 0, want, cursor);
+        if (bytesRead === 0) break;
+
+        // Same stale-tail rule as `countNewlines`: bound the scan to what was read.
+        const at = buffer.subarray(0, bytesRead).indexOf(NEWLINE_BYTE);
+        if (at !== -1) return cursor + at;
+
+        cursor += bytesRead;
+    }
+
+    return -1;
+};
+
+// Where a scan begins: the byte offset to decode from, the line that offset belongs
+// to, and the aligned offset when a supplied `startByte` had to be moved.
+type SeekStart = {
+    offset: number;
+    line: number;
+    aligned: number | null;
+};
+
+// Resolve `startByte` into a place to start DECODING. Nothing here counts characters:
+// a seek is a byte read plus, at worst, one raw newline count.
+const resolveSeek = async (
+    handle: FileHandle,
+    request: NormalizedTarget,
+    sizeBytes: number
+): Promise<SeekStart | 'ERANGE'> => {
+    const given = request.startByte;
+    if (given === null) return { offset: 0, line: 1, aligned: null };
+
+    // D10: a seek at or past EOF is answered as an ERANGE entry. That is normally
+    // settled in phase 1 from the stat, so this is the defensive path; the case that
+    // genuinely cannot be known that early is below, where ALIGNMENT walks off the end.
+    if (given >= sizeBytes) return 'ERANGE';
+
+    const aligned = await alignToCodePoint(handle, given, sizeBytes);
+
+    // The offset was inside the file but pointed at a continuation byte, and walking
+    // forward to the next whole character ran past the end: the last character of the
+    // file started before this offset, so there is nothing readable from here. That is
+    // an empty window, NOT "offset out of range" — the offset was in range — and not an
+    // error at all, because a caller paging through the file has reached its end.
+    if (aligned >= sizeBytes) {
+        return { offset: sizeBytes, line: 1 + (await countNewlines(handle, 0, sizeBytes)), aligned: aligned === given ? null : aligned };
+    }
+
+    // The line at the seek point is the caller's word when it named one — threading
+    // `nextByte` and `nextLine` back together is then free, with no count at all —
+    // and otherwise the truth, counted on raw bytes rather than defaulted to 1 (D2).
+    const line = request.startLineGiven
+        ? request.startLine
+        : 1 + (await countNewlines(handle, 0, aligned));
+
+    return { offset: aligned, line, aligned: aligned === given ? null : aligned };
+};
+
+// Advance past the requested prefix WITHOUT decoding it: `linesToSkip` newlines, then
+// `columnToSkip` bytes rounded up to a code-point boundary. Returns the offset the
+// window starts at and the line that offset belongs to.
+//
+// This is the D3 fix. The skip used to live inside the character loop, so reaching
+// line 199,000 decoded and iterated 199,000 lines' worth of CHARACTERS purely to count
+// newlines — 482 ms against 1.6 ms for the same window at line 1, and 0.7 ms for a
+// `startByte` seek. Counting 0x0a with `indexOf` does the same job at seek speed.
+type WindowStart = { offset: number; line: number };
+
+const skipToWindow = async (
+    handle: FileHandle,
+    sizeBytes: number,
+    start: WindowStart,
+    linesToSkip: number,
+    columnToSkip: number
+): Promise<WindowStart> => {
+    let cursor = start.offset;
+    let line = start.line;
+    let needed = linesToSkip;
+
+    if (needed > 0) {
+        const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+        let landed = false;
+
+        while (!landed && cursor < sizeBytes) {
+            const want = Math.min(buffer.length, sizeBytes - cursor);
+            const { bytesRead } = await handle.read(buffer, 0, want, cursor);
+            if (bytesRead === 0) break;
+
+            // Bound to the bytes actually read: the buffer is reused, so its tail holds
+            // newlines from a previous chunk (see `countNewlines`). Without this a deep
+            // `startLine` can stop at the WRONG offset, because a phantom newline makes
+            // `needed` reach zero too early.
+            const chunk = buffer.subarray(0, bytesRead);
+            let at = chunk.indexOf(NEWLINE_BYTE);
+            while (at !== -1) {
+                needed -= 1;
+                line += 1;
+                if (needed === 0) {
+                    cursor = cursor + at + 1;
+                    landed = true;
+                    break;
+                }
+                at = chunk.indexOf(NEWLINE_BYTE, at + 1);
+            }
+
+            // The chunk held fewer newlines than still needed: it is skipped whole.
+            if (!landed) cursor += bytesRead;
+        }
+
+        // Fewer newlines exist than were asked for: the window starts at EOF and is
+        // empty, which is the documented answer for a `startLine` past the end.
+        if (!landed) cursor = sizeBytes;
+    }
+
+    if (columnToSkip > 0 && cursor < sizeBytes) {
+        const want = Math.min(cursor + columnToSkip, sizeBytes);
+        const newlineAt = await firstNewline(handle, cursor, want);
+
+        if (newlineAt !== -1) {
+            // The requested column runs past the end of the first requested line. The
+            // old in-loop skip consumed that newline and then stopped, so the window
+            // begins on the FOLLOWING line — reproduced exactly rather than improved
+            // on, because `startColumn` past a line end is a caller error and the old
+            // answer is the one already pinned by tests.
+            cursor = newlineAt + 1;
+            line += 1;
+        } else {
+            // Rounding up to a code-point boundary cannot cross a newline: 0x0a is a
+            // single-byte character, never a continuation byte, so `line` is unchanged.
+            cursor = await alignToCodePoint(handle, want, sizeBytes);
+        }
+    }
+
+    return { offset: cursor, line };
+};
+
+// The outcome of one scan of one file: the entry, whether a larger allowance would
+// have helped, and the progress a surplus pass resumes from (D4).
+type ScanOutcome = {
+    entry: FileReadEntry;
+    cutByBudget: boolean;
+    progress: ScanProgress | null;
+};
+
 // Stream one file, retaining only the requested window.
 //
-// `seekTo` is the byte offset to read from: 0 when the caller gave no `startByte`,
-// otherwise the absolute offset it supplied. `lineAtSeek` is the 1-based line at
-// that offset, so the scanner reports correct line numbers without recounting the
-// skipped prefix. With `startByte` the read is therefore O(window); without it,
-// line numbers force a count from byte 0.
+// `seek` is where decoding may begin and what line that offset belongs to; `progress`
+// is the window an earlier allocation pass already produced, or null on the first
+// pass. With `startByte` the read is O(window); without it, line numbers force a raw
+// newline count from byte 0 — cheap, but not free.
 const scanFile = async (
     handle: FileHandle,
     request: NormalizedTarget,
     allowance: number,
-    seekTo: number,
-    lineAtSeek: number
-): Promise<{ entry: FileReadEntry; cutByBudget: boolean }> => {
+    sizeBytes: number,
+    seek: SeekStart,
+    progress: ScanProgress | null
+): Promise<ScanOutcome> => {
+    const resuming = progress !== null;
+
+    // A seek says WHERE to read, so it never skips lines: `startLine` beside a
+    // `startByte` is a reporting field, exactly as the contract describes it. Without
+    // a seek, `startLine` selects the position and must be walked to.
+    const linesToSkip = resuming || request.startByte !== null ? 0 : request.startLine - seek.line;
+    const columnToSkip = resuming ? 0 : request.startColumn;
+
+    const windowStart = resuming
+        ? { offset: seek.offset, line: seek.line }
+        : await skipToWindow(handle, sizeBytes, seek, linesToSkip, columnToSkip);
+
+    // What the entry REPORTS as the first line: the caller's `startLine` when it named
+    // one or when there was no seek at all, otherwise the line actually counted at the
+    // seek offset (D2).
+    const reportedStartLine = resuming
+        ? progress.reportedStartLine
+        : request.startByte === null || request.startLineGiven
+          ? request.startLine
+          : windowStart.line;
+
     const state: ScanState = {
         target: request.path,
-        scanOffset: seekTo,
-        startLine: request.startLine,
-        startColumn: request.startColumn,
+        scanOffset: windowStart.offset,
+        startLine: reportedStartLine,
         maxLines: request.maxLines,
         budget: allowance,
-        lineNumber: lineAtSeek,
-        lineOffset: 0,
-        content: '',
-        contentBytes: 0,
-        wireBytes: 0,
-        endLine: request.startLine - 1,
-        emittedLines: 0,
+        lineNumber: windowStart.line,
+        lineOffset: resuming ? progress.lineOffset : 0,
+        content: resuming ? progress.content : '',
+        contentBytes: resuming ? progress.contentBytes : 0,
+        wireBytes: resuming ? progress.wireBytes : 0,
+        endLine: resuming ? progress.endLine : reportedStartLine - 1,
+        emittedLines: resuming ? progress.emittedLines : 0,
         truncated: false,
+        limit: null,
         nextLine: null,
         nextColumn: null,
         nextByte: null,
-        limitReached: false,
+        limitReached: resuming ? progress.limitReached : false,
         stopped: false,
-        cutByBudget: false
+        cutByBudget: false,
+        startByteAligned: seek.aligned
     };
 
     const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
     const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
-    let readOffset = seekTo;
+    let readOffset = windowStart.offset;
 
     while (!state.stopped) {
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, readOffset);
@@ -751,9 +1233,11 @@ const scanFile = async (
     const entry: FileReadEntry = {
         path: resolve(request.path),
         content: state.content,
-        startLine: request.startLine,
+        startLine: state.startLine,
         endLine: state.endLine,
         truncated: state.truncated,
+        limit: state.truncated ? state.limit : null,
+        startByteAligned: state.startByteAligned,
         nextLine: state.truncated ? state.nextLine : null,
         nextColumn: state.truncated ? state.nextColumn : null,
         nextByte: state.truncated ? state.nextByte : null,
@@ -761,10 +1245,43 @@ const scanFile = async (
         sizeBytes: null
     };
 
+    // The state a surplus pass resumes from. Only a BUDGET cut can use it: a file that
+    // reached EOF or its line cap is already final, and `scanSafely` drops the progress
+    // in those cases so a later pass cannot double-count.
+    const resumable = state.truncated && state.cutByBudget && state.nextByte !== null;
+    const next: ScanProgress | null = resumable
+        ? {
+              content: state.content,
+              contentBytes: state.contentBytes,
+              wireBytes: state.wireBytes,
+              endLine: state.endLine,
+              emittedLines: state.emittedLines,
+              lineNumber: state.nextLine ?? state.lineNumber,
+              lineOffset: state.nextColumn ?? 0,
+              resumeByte: state.nextByte as number,
+              reportedStartLine: state.startLine,
+              limitReached: state.limitReached,
+              startByteAligned: state.startByteAligned
+          }
+        : null;
+
     // `cutByBudget` is not part of the public entry: it only tells the allocator
     // whether a larger allowance would have helped, so a `maxLines` cut is never
     // offered surplus it cannot use.
-    return { entry, cutByBudget: state.cutByBudget };
+    return { entry, cutByBudget: state.cutByBudget, progress: next };
+};
+
+// Resolve a slot's seek ONCE and keep it. A surplus pass would otherwise recount the
+// newlines before the seek point every time it ran, which is exactly the rescanning
+// D4 exists to remove; and the alignment decision must not be able to change between
+// passes, or two passes of one batch would disagree about where the window starts.
+const seekOf = async (slot: ScanSlot): Promise<SeekStart | 'ERANGE'> => {
+    if (slot.seek !== undefined) return slot.seek;
+
+    const { handle, request, sizeBytes } = slot;
+    // handle is null only for an entry that already failed, which never scans.
+    slot.seek = handle === null ? { offset: 0, line: 1, aligned: null } : await resolveSeek(handle, request, sizeBytes);
+    return slot.seek;
 };
 
 // Scan one slot, translating the scanner's binary throw into a per-entry EBINARY
@@ -774,14 +1291,32 @@ const scanSafely = async (slot: ScanSlot, allowance: number): Promise<FileReadEn
     const { request, handle, sizeBytes } = slot;
     if (handle === null) return failedEntry(request, 'EIO', `read failed to read "${request.path}".`, sizeBytes);
 
-    const seekTo = request.startByte ?? 0;
-    // With an explicit byte the caller is responsible for the line number it wants
-    // reported; without one, counting starts at line 1 as always.
-    const lineAtSeek = request.startByte === null ? 1 : request.startLine;
+    const seek = await seekOf(slot);
+    if (seek === 'ERANGE') {
+        slot.cutByBudget = false;
+        slot.progress = null;
+        return failedEntry(request, 'ERANGE', rangeMessage(request.path, request.startByte as number, sizeBytes), sizeBytes);
+    }
+
+    // A surplus pass continues where the last one stopped (D4): the seek becomes the
+    // resume offset, and the window the last pass produced is seeded into the scanner
+    // so only the missing bytes are decoded.
+    const progress = slot.progress;
+    const start: SeekStart = progress === null
+        ? seek
+        : { offset: progress.resumeByte, line: progress.lineNumber, aligned: progress.startByteAligned };
 
     try {
-        const { entry, cutByBudget } = await scanFile(handle, request, allowance, seekTo, lineAtSeek);
+        const { entry, cutByBudget, progress: next } = await scanFile(
+            handle,
+            request,
+            allowance,
+            sizeBytes,
+            start,
+            progress
+        );
         slot.cutByBudget = cutByBudget;
+        slot.progress = next;
         return { ...entry, sizeBytes };
     } catch (error) {
         if (error instanceof HarnessError) {
@@ -862,7 +1397,7 @@ const isDirectory = async (path: string): Promise<boolean> => {
 export const FILE_READ_METADATA: PresetToolMetadata = {
     name: 'read',
     description:
-        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, maxLines 5000 (hard maximum 20000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use fileList or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte rescans from the start to count lines. Binary detection is WINDOW-SCOPED, not whole-file: a NUL past the requested window is not reported, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.',
+        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, and NO line cap — the byte budget is the limit, so a default read returns as much as the envelope holds; an EXPLICIT maxLines is an integer in [1, 20000]. `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. `limit` says WHY a truncated window stopped: "maxLines" (raise maxLines to get more) or "budget" (more lines would not help; the 256 KiB envelope is full) — or null when the window reached EOF, in which case truncated is false. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. A startByte that lands inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; a startByte at or past the end of the file is an ERANGE entry, not an empty window, so "offset out of range" and "file is empty" are different answers. With no startLine, the true line at a seek offset is counted and reported rather than defaulting to 1. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use files or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), ERANGE (startByte at or past EOF), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte counts newlines from the start to find it, on raw bytes and at seek speed. Binary detection is WINDOW-SCOPED, not whole-file: bytes outside the requested window are never decoded, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.',
     tags: ['files', 'read', 'filesystem'],
     // R18: everyday file access is core — always declared, never discovered.
     visibility: 'core',
@@ -898,13 +1433,14 @@ export const FILE_READ_METADATA: PresetToolMetadata = {
                                     type: 'integer',
                                     minimum: 0,
                                     description:
-                                        'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. Defaults to null (count from the start).'
+                                        'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. An offset inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; an offset at or past EOF is an ERANGE entry. Without an explicit startLine the true line at this offset is counted and reported. Defaults to null (count from the start).'
                                 },
                                 maxLines: {
                                     type: 'integer',
                                     minimum: 1,
                                     maximum: 20_000,
-                                    description: 'Maximum lines to return. Defaults to 5000 and is capped at 20000.'
+                                    description:
+                                        'Maximum lines to return. OMIT for no line cap: the 256 KiB budget then decides, which is the default. When supplied it must be an integer in [1, 20000]. A window cut by this cap reports limit: "maxLines".'
                                 }
                             },
                             required: ['path'],
@@ -982,7 +1518,30 @@ export const read = tool<FileReadParameters, FileReadResult>({
                             sizeBytes: info.size,
                             overhead: entryOverhead(absolute, { code: 'EISDIR', message }),
                             entry: failedEntry(request, 'EISDIR', message, info.size),
-                            cutByBudget: false
+                            cutByBudget: false,
+                            progress: null
+                        });
+                        continue;
+                    }
+
+                    // A `startByte` at or past EOF is decided here, from the stat we
+                    // already have, rather than inside the scan: an entry that will
+                    // carry an error message must have that message measured into the
+                    // reservation BEFORE the budget is split, exactly like ENOENT and
+                    // EISDIR, or it would take a content share it cannot use and then
+                    // spend wire bytes on the error instead.
+                    if (request.startByte !== null && request.startByte >= info.size) {
+                        await closeQuietly([handle]);
+                        openHandles.delete(handle);
+                        const message = rangeMessage(request.path, request.startByte, info.size);
+                        slots.push({
+                            request,
+                            handle: null,
+                            sizeBytes: info.size,
+                            overhead: entryOverhead(absolute, { code: 'ERANGE', message }),
+                            entry: failedEntry(request, 'ERANGE', message, info.size),
+                            cutByBudget: false,
+                            progress: null
                         });
                         continue;
                     }
@@ -993,7 +1552,8 @@ export const read = tool<FileReadParameters, FileReadResult>({
                         sizeBytes: info.size,
                         overhead: entryOverhead(absolute),
                         entry: null,
-                        cutByBudget: false
+                        cutByBudget: false,
+                        progress: null
                     });
                 } catch (error) {
                     const { code, message } = await classifyFailure(request, error);
@@ -1003,7 +1563,8 @@ export const read = tool<FileReadParameters, FileReadResult>({
                         sizeBytes: 0,
                         overhead: entryOverhead(absolute, { code, message }),
                         entry: failedEntry(request, code, message),
-                        cutByBudget: false
+                        cutByBudget: false,
+                        progress: null
                     });
                 }
             }
@@ -1029,9 +1590,11 @@ export const read = tool<FileReadParameters, FileReadResult>({
             let allowance = pending.length > 0 ? Math.floor(contentBudget / pending.length) : 0;
 
             for (let pass = 0; pass < ALLOCATION_PASSES && pending.length > 0 && allowance > 0; pass += 1) {
-                // A cut file must be RE-SCANNED from the start on the next pass, so
-                // the handle stays open until the allocation is final. Closing it
-                // here would force a re-open per pass.
+                // A cut file is scanned AGAIN on the next pass with a larger allowance,
+                // so the handle stays open until the allocation is final. It is not
+                // re-read from byte 0: `scanSafely` resumes from the previous pass's
+                // exact cut point (see ScanProgress / D4), and closing the handle here
+                // would force a re-open per pass.
                 for (const slot of pending) {
                     slot.entry = await scanSafely(slot, allowance);
                 }

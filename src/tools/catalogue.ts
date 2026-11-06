@@ -31,10 +31,17 @@
 // tool. The only names spelled out in the package are the public NAMED EXPORTS in
 // `./index` (an API surface, not an inventory).
 //
-// NAMING: every wire name is an action a model types — read, write, edit, fileList,
-// glob, grep, shell, gitDiff, syntax. There are no compatibility aliases (the former
-// fileWrite/fileGlob/syntaxCheck names are gone from the table), because a catalogue
-// with two names for one tool makes discovery ambiguous.
+// NAMING: a tool is named for WHAT IT DOES BEST, and that is the whole rule. Some
+// names here are single actions a model would type — read, write, edit, glob, grep,
+// shell, gitDiff, syntax — because the action IS the tool's strength. Others are named
+// for the domain they own — `files` is the file and folder manager (list, move, copy,
+// delete, mkdir), exactly as `task` is the task list — because no single verb describes
+// what they do, and forcing one (`fileMove`, `fileRemove`, `fileManage`) names the
+// weakest operation instead of the capability. What actually matters is that the name is
+// the word a caller already reaches for and that no two tools share one. There are no
+// compatibility aliases (the former fileWrite/fileGlob/syntaxCheck/fileList names are
+// gone from the table), because a catalogue with two names for one tool makes discovery
+// ambiguous.
 //
 // Cross-references:
 //   - ./descriptors  — the single seam onto the discovered catalogue + loader

@@ -5,12 +5,13 @@
 // and the two search surfaces. It never calls an implementation — that is the point
 // of R1b.
 //
-// T14: every wire name is `<namespace><action>`, and there are no legacy aliases.
-// A separate `searchFiles` tool no longer exists: fileGlob covers filename and
+// T14: a tool is named for what it does best (../catalogue.ts), and there are no legacy
+// aliases. A separate `searchFiles` tool no longer exists: fileGlob covers filename and
 // content search, so this file asserts its absence explicitly. The rename splits that
-// one tool in two — `glob` answers with NAMES and `grep` with matching LINES — and
-// `fileWrite` becomes `write` and `syntaxCheck` becomes `syntax`, again with no
-// aliases, so this file pins both halves separately.
+// one tool in two — `glob` answers with NAMES and `grep` with matching LINES —
+// `fileWrite` becomes `write`, `syntaxCheck` becomes `syntax`, and `fileList` becomes
+// the `list` operation of the `files` manager, again with no aliases, so this file pins
+// every retired name.
 
 import { describe, expect, it } from 'vitest';
 import { toolParameterKey, normalizeTags } from '../core/tool';
@@ -24,7 +25,7 @@ describe('preset catalogue', () => {
             'read',
             'write',
             'edit',
-            'fileList',
+            'files',
             'glob',
             'grep',
             'shell',
@@ -48,6 +49,7 @@ describe('preset catalogue', () => {
             'searchFiles',
             'fileWrite',
             'fileGlob',
+            'fileList',
             'fileSearch',
             'syntaxCheck',
             'runCommand',
@@ -121,17 +123,17 @@ describe('preset catalogue', () => {
         expect(presetTools.syntax.visibility).toBe('searchable');
     });
 
-    it('makes the five everyday file tools core and keeps fileList discoverable', () => {
-        // R18: read/write/edit/glob/grep are declared on every request; fileList is the
-        // occasional directory survey and still waits for toolRequest. Exactly the
-        // approved set and no fileSearch alias.
+    it('makes the five everyday file tools core and keeps the files manager discoverable', () => {
+        // R18: read/write/edit/glob/grep are declared on every request; `files` is the
+        // occasional listing and the destructive path-level operation set, and still
+        // waits for toolRequest. Exactly the approved set and no fileSearch alias.
         for (const name of ['read', 'write', 'edit', 'glob', 'grep'] as const) {
             expect(PRESET_TOOLS[name].visibility).toBe('core');
             expect(presetTools[name].visibility).toBe('core');
         }
 
-        expect('visibility' in PRESET_TOOLS.fileList).toBe(false);
-        expect(presetTools.fileList.visibility).toBe('searchable');
+        expect('visibility' in PRESET_TOOLS.files).toBe(false);
+        expect(presetTools.files.visibility).toBe('searchable');
         expect(PRESET_TOOLS).not.toHaveProperty('fileSearch');
 
         // R9-R11: `download` registers with the package presets but is SEARCHABLE,
@@ -149,33 +151,46 @@ describe('preset catalogue', () => {
         }
     });
 
-    it('declares the three batched file tools as ONE array property each', () => {
+    it('declares the four batched file tools as ONE array property each', () => {
         // This is the schema half of the batching contract: one property means the
         // single-property rule hands `execute` the array itself.
         expect(toolParameterKey(PRESET_TOOLS.read.parameters)).toBe('paths');
         expect(toolParameterKey(PRESET_TOOLS.write.parameters)).toBe('files');
         expect(toolParameterKey(PRESET_TOOLS.edit.parameters)).toBe('edits');
 
-        // R9: fileList is the exception — its paged contract needs `offset`/`limit`
-        // beside `paths`, so it is a multi-property object with no `required`. The
-        // implementation (and the direct runner) still accept the legacy bare array.
-        expect(toolParameterKey(PRESET_TOOLS.fileList.parameters)).toBeUndefined();
-        expect(Object.keys(PRESET_TOOLS.fileList.parameters.properties ?? {})).toEqual([
-            'paths',
-            'offset',
-            'limit'
-        ]);
+        // `files` closed the last batching exception: `fileList` needed `offset`/`limit`
+        // beside `paths` and so declared three properties, while `files` pages INSIDE the
+        // list entry's own receipt. Its op discriminator lives in the array item, which
+        // the JSON Schema vocabulary here CAN enforce (an `enum` on `op`), rather than as
+        // a tool-level mode switch.
+        expect(toolParameterKey(PRESET_TOOLS.files.parameters)).toBe('ops');
+        expect(Object.keys(PRESET_TOOLS.files.parameters.properties ?? {})).toEqual(['ops']);
 
         expect(PRESET_TOOLS.read.parameters.required).toEqual(['paths']);
         expect(PRESET_TOOLS.write.parameters.required).toEqual(['files']);
         expect(PRESET_TOOLS.edit.parameters.required).toEqual(['edits']);
-        // fileList has no `required`: the documented default is ["."].
-        expect('required' in PRESET_TOOLS.fileList.parameters).toBe(false);
+        // A call that names no operation is meaningless, so `ops` is required — unlike
+        // fileList, whose documented default was the working directory.
+        expect(PRESET_TOOLS.files.parameters.required).toEqual(['ops']);
 
         expect(PRESET_TOOLS.read.tags).toEqual(['files', 'read', 'filesystem']);
         expect(PRESET_TOOLS.write.tags).toEqual(['files', 'write', 'filesystem']);
         expect(PRESET_TOOLS.edit.tags).toEqual(['files', 'edit', 'write', 'replace', 'filesystem']);
-        expect(PRESET_TOOLS.fileList.tags).toEqual(['files', 'list', 'filesystem']);
+        // The list tags `fileList` was found by survive, and the operations are tagged
+        // too, so toolRequest answers a "move"/"delete"/"rename" query with this tool.
+        expect(PRESET_TOOLS.files.tags).toEqual([
+            'files',
+            'list',
+            'filesystem',
+            'folder',
+            'directory',
+            'move',
+            'rename',
+            'copy',
+            'delete',
+            'remove',
+            'mkdir'
+        ]);
     });
 
     it('pins the batched entry shapes', () => {
@@ -199,7 +214,10 @@ describe('preset catalogue', () => {
                         required: ['path', 'content'],
                         additionalProperties: false
                     },
-                    description: 'Files to write, in the order the results are returned.'
+                    description: 'Files to write, in the order the results are returned.',
+                    // The batch cap is part of the published schema, so the pin carries it
+                    // too (an uncapped array argument is an unbounded response).
+                    maxItems: 100
                 }
             },
             required: ['files'],
@@ -243,6 +261,47 @@ describe('preset catalogue', () => {
             required: ['edits'],
             additionalProperties: false
         });
+
+        // `files` is the batched shape with a DISCRIMINATOR: the single `ops` property,
+        // an `op` enum as the only mode switch, and every operation's own fields beside
+        // it. This is the schema half of why merging the list and mutation operations
+        // into one tool is NOT the old `fileGlob` mode switch — the mode is an explicit
+        // required field, never the presence or absence of a property.
+        const filesOps = PRESET_TOOLS.files.parameters.properties as {
+            ops: {
+                maxItems: number;
+                description: string;
+                items: {
+                    type: string;
+                    required: string[];
+                    additionalProperties: boolean;
+                    properties: Record<string, { enum?: string[]; oneOf?: unknown[] }>;
+                };
+            };
+        };
+
+        expect(filesOps.ops.maxItems).toBe(100);
+        expect(filesOps.ops.items.type).toBe('object');
+        expect(filesOps.ops.items.required).toEqual(['op']);
+        expect(filesOps.ops.items.additionalProperties).toBe(false);
+        expect(Object.keys(filesOps.ops.items.properties)).toEqual([
+            'op',
+            'path',
+            'from',
+            'to',
+            'overwrite',
+            'recursive',
+            'force',
+            'offset',
+            'limit'
+        ]);
+        expect(filesOps.ops.items.properties.op.enum).toEqual(['list', 'move', 'copy', 'delete', 'mkdir']);
+        // `path` is a string for delete/mkdir and a string OR string[] for a multi-root
+        // list — the one union the item publishes, and the validator does enforce oneOf.
+        expect(filesOps.ops.items.properties.path.oneOf).toHaveLength(2);
+        // The receipt envelope is the contract a caller switches on.
+        expect(PRESET_TOOLS.files.description).toContain('{ results, bytes, contentBudget }');
+        expect(PRESET_TOOLS.files.description).toContain('NO rollback');
     });
 
     it('splits search into glob for names and grep for contents', () => {
@@ -250,7 +309,7 @@ describe('preset catalogue', () => {
         // NOT apply and `execute` receives the whole object.
         expect(PRESET_TOOLS.glob.tags).toEqual(['files', 'glob', 'find', 'paths', 'filesystem']);
         // `offset` joins the list because a capped search is now resumable, the way read
-        // and fileList already were.
+        // and the files manager already were.
         expect(Object.keys(PRESET_TOOLS.glob.parameters.properties)).toEqual([
             'patterns',
             'paths',

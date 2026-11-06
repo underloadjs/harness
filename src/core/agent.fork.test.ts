@@ -133,7 +133,7 @@ describe('Agent.fork', () => {
                     content: '',
                     toolCalls: [
                         { id: 'a', name: 'read', arguments: '{}' },
-                        { id: 'b', name: 'fileList', arguments: '[]' }
+                        { id: 'b', name: 'files', arguments: '[]' }
                     ]
                 },
                 { role: 'tool', content: 'A', toolCallId: 'a', name: 'read' }
@@ -150,7 +150,7 @@ describe('Agent.fork', () => {
                 content: '',
                 toolCalls: [
                     { id: `call_${branchId}_1`, name: 'read', arguments: '{}' },
-                    { id: `call_${branchId}_2`, name: 'fileList', arguments: '[]' }
+                    { id: `call_${branchId}_2`, name: 'files', arguments: '[]' }
                 ]
             },
             { role: 'tool', content: 'A', toolCallId: `call_${branchId}_1`, name: 'read' },
@@ -158,7 +158,7 @@ describe('Agent.fork', () => {
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER.threadFork,
                 toolCallId: `call_${branchId}_2`,
-                name: 'fileList'
+                name: 'files'
             }
         ]);
         expect(source.messages).toEqual(before);

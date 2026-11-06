@@ -59,7 +59,7 @@ describe('materializeBranchHistory', () => {
                 reasoning: 'why',
                 toolCalls: [
                     { id: 'origin-a', name: 'read', arguments: '{}' },
-                    { id: 'origin-b', name: 'fileList', arguments: '[]' }
+                    { id: 'origin-b', name: 'files', arguments: '[]' }
                 ]
             },
             { role: 'tool', content: 'A', toolCallId: 'origin-a', name: 'read' }
@@ -81,7 +81,7 @@ describe('materializeBranchHistory', () => {
                 reasoning: 'why',
                 toolCalls: [
                     { id: 'call_branch-1_1', name: 'read', arguments: '{}' },
-                    { id: 'call_branch-1_2', name: 'fileList', arguments: '[]' }
+                    { id: 'call_branch-1_2', name: 'files', arguments: '[]' }
                 ]
             },
             { role: 'tool', content: 'A', toolCallId: 'call_branch-1_1', name: 'read' },
@@ -89,7 +89,7 @@ describe('materializeBranchHistory', () => {
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER.threadFork,
                 toolCallId: 'call_branch-1_2',
-                name: 'fileList'
+                name: 'files'
             }
         ]);
         expect(result.toolCallIds).toEqual([
@@ -382,12 +382,12 @@ describe('materializeBranchHistory', () => {
                         content: '',
                         toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
                     },
-                    { role: 'tool', content: 'ok', toolCallId: 'x', name: 'fileList' }
+                    { role: 'tool', content: 'ok', toolCallId: 'x', name: 'files' }
                 ],
                 branchId: 'b'
             })
         ).toThrow(
-            'Branch history message [1] names tool "fileList" but call "x" requested "read".'
+            'Branch history message [1] names tool "files" but call "x" requested "read".'
         );
 
         expect(() =>

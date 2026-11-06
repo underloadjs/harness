@@ -1,7 +1,7 @@
 // Composer @ / # pure logic (T5 R1/R2).
 //
 // Pins the token grammar, the query-aware file glob, the @ folder rows (folders
-// come from `fileList`; `glob` only yields files), the latest-label rule (the
+// come from the `files` list operation; `glob` only yields files), the latest-label rule (the
 // same rule the server applies to plain `#LABEL`) and the exact {turnId,
 // threadId?, label} metadata a reference chip carries into a submit.
 //
@@ -12,7 +12,7 @@ import {
     referenceChipOf,
     fileChipOf,
     fileGlobPattern,
-    fileListEntriesOf,
+    filesListEntriesOf,
     filePathsOf,
     fileQueryScope,
     filterFilePathList,
@@ -77,7 +77,7 @@ it('drills into a folder for a trailing-slash query', () => {
 });
 
 it('splits an @ query into the directory to list and the name prefix', () => {
-    // An empty query is the repository ROOT overview; `fileList` takes '.'.
+    // An empty query is the repository ROOT overview; the list read takes '.'.
     expect(fileQueryScope('')).toEqual({ directory: '.', prefix: '' });
     // No slash: a name prefix within the root listing.
     expect(fileQueryScope('src')).toEqual({ directory: '.', prefix: 'src' });
@@ -94,15 +94,21 @@ it('splits an @ query into the directory to list and the name prefix', () => {
     expect(fileQueryScope('/')).toEqual({ directory: '.', prefix: '' });
 });
 
-it('reads `fileList` entries tolerantly', () => {
-    // Folder rows keep their trailing slash; files are bare paths.
-    expect(fileListEntriesOf({ entries: ['a', 'b/'] })).toEqual(['a', 'b/']);
+it('reads `files` list entries tolerantly', () => {
+    // The real answer nests the page inside the operation's own receipt.
+    expect(filesListEntriesOf({ results: [{ op: 'list', path: '.', entries: ['a', 'b/'] }] })).toEqual(['a', 'b/']);
+    // Several operations in one call: the first receipt that carries a page wins.
+    expect(filesListEntriesOf({ results: [{ op: 'mkdir', path: 'x' }, { op: 'list', entries: ['x/'] }] })).toEqual(['x/']);
+    // A flat { entries } body is still read: that is the shape the tool this replaced
+    // answered, and a host may pin an older revision.
+    expect(filesListEntriesOf({ entries: ['a', 'b/'] })).toEqual(['a', 'b/']);
     // A malformed entry list contributes only the strings.
-    expect(fileListEntriesOf({ entries: [1, 'x', null] })).toEqual(['x']);
+    expect(filesListEntriesOf({ entries: [1, 'x', null] })).toEqual(['x']);
     // An error body / missing reply contributes no rows.
-    expect(fileListEntriesOf(null)).toEqual([]);
-    // `glob`-shaped replies are not `fileList` replies.
-    expect(fileListEntriesOf({ files: [] })).toEqual([]);
+    expect(filesListEntriesOf(null)).toEqual([]);
+    // A `glob` reply, and a `files` reply with no list in it, are not pages.
+    expect(filesListEntriesOf({ files: [] })).toEqual([]);
+    expect(filesListEntriesOf({ results: [{ op: 'move', path: 'a', to: 'b' }] })).toEqual([]);
 });
 
 it('offers only immediate FOLDER rows matching the name prefix', () => {
@@ -116,7 +122,7 @@ it('offers only immediate FOLDER rows matching the name prefix', () => {
     expect(folderPathsOf(['src/', 'dist/', 'a.md'], { directory: '.', prefix: 's' })).toEqual(['src/']);
     // The prefix is case-insensitive, like `filterFilePathList`.
     expect(folderPathsOf(['src/', 'dist/'], { directory: '.', prefix: 'S' })).toEqual(['src/']);
-    // Inside a listed directory `fileList` prefixes entries with that directory.
+    // Inside a listed directory the list operation prefixes entries with it.
     expect(folderPathsOf(['src/ui/', 'src/frontend/', 'src/a.ts'], { directory: 'src', prefix: '' })).toEqual([
         'src/ui/',
         'src/frontend/'
@@ -125,7 +131,7 @@ it('offers only immediate FOLDER rows matching the name prefix', () => {
     // `src` segment of `src/ui/` does not make it a row for the prefix `src`.
     expect(folderPathsOf(['src/ui/'], { directory: '.', prefix: 'src' })).toEqual([]);
     // `folderPathsOf` does NOT scope by `directory`: it trusts the caller, which
-    // passes the entries `fileList` returned for that ONE directory. Both entries
+    // passes the entries the list operation returned for that ONE directory. Both entries
     // are folders whose NAME starts with `ui`, so both are rows.
     const srcScope: FileQueryScope = { directory: 'src', prefix: 'ui' };
     expect(folderPathsOf(['src/ui/', 'lib/ui/'], srcScope)).toEqual(['src/ui/', 'lib/ui/']);

@@ -28,7 +28,7 @@ import * as syntaxEntry from '../tools/syntax/syntax.tool';
 import * as fileReadEntry from '../tools/files/read.tool';
 import * as writeEntry from '../tools/files/write.tool';
 import * as fileEditEntry from '../tools/files/edit.tool';
-import * as fileListEntry from '../tools/files/fileList.tool';
+import * as filesEntry from '../tools/files/files.tool';
 import * as globEntry from '../tools/files/glob.tool';
 import * as grepEntry from '../tools/files/grep.tool';
 import * as commandRunEntry from '../tools/command/shell.tool';
@@ -247,11 +247,11 @@ const presetEntries: PresetEntry[] = [
         tool: fileEditEntry.edit
     },
     {
-        key: 'fileList',
-        metadataName: 'FILE_LIST_METADATA',
-        sourcePath: '../tools/files/fileList.tool.ts',
-        metadata: fileListEntry.FILE_LIST_METADATA,
-        tool: fileListEntry.fileList
+        key: 'files',
+        metadataName: 'FILES_METADATA',
+        sourcePath: '../tools/files/files.tool.ts',
+        metadata: filesEntry.FILES_METADATA,
+        tool: filesEntry.files
     },
     {
         // The two halves of the old `fileGlob`: names here, contents in grep below.

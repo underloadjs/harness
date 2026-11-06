@@ -85,7 +85,7 @@ export const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 //
 // The hard cap used to be 100, which made a survey question unanswerable: 738 matching
 // lines in 68 files came back as "100, truncated", with no way forward but to guess a
-// narrower pattern. 1000 is the same number fileList settled on for the same reason, and
+// narrower pattern. 1000 is the same number files settled on for the same reason, and
 // the aggregate BYTE budget (not the count) is what actually protects the response.
 export const DEFAULT_MAX_RESULTS = 100;
 export const MAX_RESULTS_LIMIT = 1000;

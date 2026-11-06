@@ -53,7 +53,7 @@ every tool the model asks for along the way.
 enables it). The built-in opt-in `search` factory is core: when a key is
 configured it is declared on the first request. The bundled catalogue splits the
 same way (R18): `read`, `write`, `edit`, `glob`, and `grep` are core, while
-`fileList`, `shell`, `gitDiff`, `syntax`, and the always-registered
+`files`, `shell`, `gitDiff`, `syntax`, and the always-registered
 `download` are discovered through the
 core `toolRequest` tool — see [Tool discovery](#tool-discovery). The harness-owned
 `toolRequest` and `task` (plus `delegate` when
@@ -304,7 +304,7 @@ loopback port (health, harness index, session POST, clean close).
 **Browser note.** Importing the browser root (or `./frontend`) evaluates no Node
 graph: `dist/underload-harness.browser.mjs` statically reaches only the library,
 shared and client chunks. The package tools are a documented Node-only exception —
-`read`/`write`/`edit`/`glob`/`grep`/`fileList`, `shell`, `gitDiff` and
+`read`/`write`/`edit`/`glob`/`grep`/`files`, `shell`, `gitDiff` and
 `syntax` are lazy chunks (`import()`) whose bodies use `node:fs`, `node:vm` and
 `node:child_process`. They are exported (the root is the same library surface) but a
 browser must not call them; the catalogue only loads a body when that tool is called,
@@ -325,7 +325,7 @@ tools/
                         python.ts load on demand)
   files/                read.tool.ts, write.tool.ts, edit.tool.ts,
                         glob.tool.ts + grep.tool.ts (both core, always declared),
-                        fileList.tool.ts (searchable by tag), glob.ts (shared walker),
+                        files.tool.ts (searchable by tag), glob.ts (shared walker),
                         search.ts (the pattern/root rules both searches share)
   command/              shell.tool.ts, gitDiff.tool.ts
   websearch/            request.ts (bounds/errors), exa.ts, tavily.ts, linkup.ts,
@@ -521,7 +521,7 @@ declared from the first request, together with the harness-owned `toolRequest` a
 conditional `actionRequest` (`interaction` configured) and `threadFork`
 (`forks.enabled`, the default) stays registered but searchable: the model enables
 them with `toolRequest`, and a manual server call still runs them directly.
-`fileList`, `download`, `shell`, `gitDiff`, `syntax`, and the app tools
+`files`, `download`, `shell`, `gitDiff`, `syntax`, and the app tools
 stay searchable too. `toolList` is the name+description inventory of the live registry
 (enabled or not); `toolManage` is the source/path/edit surface described below.
 
@@ -539,8 +539,8 @@ tools: {
 ```text
 round 1  model -> read({ "paths": ["README.md"] })     // core, no discovery
 round 2  model -> toolRequest({ "tags": ["files", "list"] })
-         result -> { enabled: ["fileList"], tools: [...], matched: 1, omitted: 0 }
-round 3  model -> fileList(["src"])                         // now declared
+         result -> { enabled: ["files"], tools: [...], matched: 1, omitted: 0 }
+round 3  model -> files({ "ops": [{ "op": "list", "path": "src" }] })   // now declared
 round 4  model -> toolRequest({ "names": ["shell"] })
          result -> { enabled: ["shell"], tools: [{ name: "shell", ... }], matched: 1, omitted: 0 }
 round 5  model -> shell({ "command": "git status" })   // now declared
@@ -562,7 +562,7 @@ claiming nothing matched. These entries are never enabled, never count against
 |---|---|
 | Query shape | `names` (exact, case-sensitive), `regex` (bare source or `/source/flags`), and `tags` are OR-ed into one union; each match appears once. An empty query enables nothing and returns the vocabulary. |
 | Tags | Trimmed, lowercased, deduplicated. Not required when `names` or `regex` is supplied. |
-| Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`task`, a configured `search`/`fetch`, and `delegate` on a primary with subagents. Everything else is demand-discovered: `fileList`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
+| Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`task`, a configured `search`/`fetch`, and `delegate` on a primary with subagents. Everything else is demand-discovered: `files`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools, `download`, `search`, and `fetch` run directly. |
 | Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
 | Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are always declared and never count. |
@@ -774,8 +774,18 @@ id, and `reset()` clears the archive with the conversation.
 
 ### Tool names
 
-Every tool — core and preset — is named `<namespace><action>`. The namespace
-groups related tools for discovery; the action is what the model calls.
+A tool is named for **what it does best**. Where ONE action is the capability, the
+name is that action - `read`, `write`, `edit`, `glob`, `grep`, `shell`, `search`,
+`fetch`, `download` - because those are the words a model already types. Where a tool
+owns a DOMAIN of related operations, the name is the domain: `files` manages files and
+folders (list, move, copy, delete, mkdir), exactly as `task` is the task list and
+`profileManage` the profile store. `<namespace><action>` is a useful convention for
+grouping a large catalogue, not a requirement: forcing it here would name the
+capability after its weakest operation (`fileMove`) and split one coherent bundle
+across several rows the model then sequences by hand - the harness launches a
+message’s tool calls CONCURRENTLY, so separate calls have no order between them.
+Two things ARE required: the name is the word a caller reaches for, and no two tools
+share one.
 
 | Old name (removed) | Current name | Notes |
 |---|---|---|
@@ -786,7 +796,7 @@ groups related tools for discovery; the action is what the model calls.
 | `readFile` | `read` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }` |
 | `writeFile` / `fileWrite` | `write` | **batched**: `({ path, content }[])` → `{ path, bytes }[]` |
 | `editFile` | `edit` | **batched**: `({ path, oldString, newString, replaceAll? }[])` → `{ path, replacements, bytes }[]` |
-| `listFiles` | `fileList` | **paged**: `(paths?)` or `({ paths?, offset?, limit? })` → `{ entries, truncated, nextOffset, offset, limit, bytes, contentBudget }` |
+| `listFiles` / `fileList` | `files` | **one manager, five operations**: `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path?, from?, to?, overwrite?, recursive?, force?, offset?, limit? })[])` → `{ results: [ ...ordered receipts... ], bytes, contentBudget }`; the paged listing is one OPERATION and its cursor lives inside that receipt (`{ entries, truncated, nextOffset, offset, limit, bytes }`), which is why `files` declares ONE property instead of three |
 | `globFiles` + `searchFiles` / `fileGlob` | `glob` (names) + `grep` (contents) | the one mode-switched tool is SPLIT: `glob` never reads file contents and has no `content` property, `grep` takes a required `pattern` and answers `{ matches, truncated, bytes, contentBudget }` |
 | `runCommand` | `shell` | unchanged shape |
 | `gitDiff` | `gitDiff` | unchanged (already `namespace`+`action` shape) |
@@ -804,12 +814,15 @@ names, so they have no removed-name row. All three are core session tools with t
 same incremental action set — see
 [Session records](#session-records-profilemanage-chaptermanage-locationmanage).
 `actionRequest` and `threadFork` were also added under their final names and follow
-the same `<namespace><action>` shape (`action`+`Request`, `thread`+`Fork`); they are
+the `<namespace><action>` shape (`action`+`Request`, `thread`+`Fork`) where a single
+action names them; they are
 conditional harness-owned tools (registered, searchable) — see
 [Owner questions and history forks](#owner-questions-and-history-forks).
 
-The three web entries are the documented exception to that shape: the TOOLS are
-`search`, `fetch`, and `download`, because those are the words a model types.
+The three web entries are bare verbs for the same reason: `search`, `fetch`, and
+`download` are the words a model types. A domain name is likewise not an exception: a
+tool named for the domain it owns (`files`) is the same decision made once, not a
+deviation from it.
 `websearch` and `webfetch` remain harness CONFIGURATION field names (only the tool
 is renamed), and `download` needs no field at all — it is an always-registered
 preset. See [Web search](#web-search-search), [Page fetch](#page-fetch-fetch), and
@@ -832,7 +845,7 @@ import {
     read,
     write,
     edit,
-    fileList,
+    files,
     glob,
     grep,
     shell,
@@ -844,8 +857,8 @@ await syntax({ code: 'def f():\n    pass', language: 'python' });  // true
 await syntax({ code: 'const a: number = 1;', language: 'ts' });     // true (typescript, tsx, jsx and json too)
 await read(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, wireBytes, contentBudget, skipped }
 await write([{ path: 'notes.md', content: '# Notes' }]);            // [{ path, bytes }]
-await fileList(['src', 'task']);                                    // { entries: ['src/a.ts', 'src/nested/', 'task/b.ts', ...], truncated, nextOffset, offset, limit, bytes, contentBudget }
-await fileList({ paths: ['src'], offset: 200, limit: 100 });        // page 2 of the same list
+await files([{ op: 'list', path: ['src', 'task'] }]);                // { results: [{ op: 'list', path: 'src', entries: ['src/a.ts', 'src/nested/', 'task/b.ts', …], truncated, nextOffset, offset, limit, bytes }], bytes, contentBudget }
+await files([{ op: 'list', path: 'src', offset: 200 }]);           // page 2 of the same list
 await edit([{ path: 'a.ts', oldString: 'let x', newString: 'let y' }]);
 await glob({ patterns: ['src/**/*.ts'] });                          // { files, truncated } — names only
 await grep({ pattern: 'TODO', patterns: ['*.ts'] });                // { matches, truncated, bytes, contentBudget } — lines
@@ -860,7 +873,7 @@ Each tool lives in its own file under a capability folder (`tools/syntax/`,
 `tools/runtime/`), and the
 barrel also exports the preset set as `presetTools`. **Every new harness preloads
 that catalogue**: `read`, `write`, `edit`, `glob`, `grep`, and `download` are
-declared immediately (core), while `fileList`, `syntax`, `shell`, and `gitDiff`
+declared immediately (core), while `files`, `syntax`, `shell`, and `gitDiff`
 cost context only after a toolRequest query enables them; `presets: false` turns
 the preload off.
 
@@ -890,8 +903,8 @@ never asks for `shell` never loads it. The published build turns each branch
 into a chunk next to `dist/underload-harness.mjs`; all of `dist/` is shipped, and
 `inlineDynamicImports` must stay off or the split is undone.
 
-**The file tools are batched.** `read`, `write`, `edit`, and `fileList`
-each declare exactly ONE array property (`paths` / `files` / `edits`), so the
+**The file tools are batched.** `read`, `write`, `edit`, and `files`
+each declare exactly ONE array property (`paths` / `files` / `edits` / `ops`), so the
 single-property rule hands `execute` the array itself. A direct call and a model
 call therefore reach the same code:
 
@@ -934,7 +947,7 @@ and `contentBudget` the cap this call was subject to.
 A path that cannot be read is a per-entry result, not a failed call: it keeps its
 ordered position with empty `content`, `bytes` 0, the empty-window range
 (`endLine = startLine - 1`), and `error: { code, message }` — `ENOENT`, `EISDIR` (a
-directory; use `glob` or `fileList`), `EACCES`/`EPERM` (a real denial), `EBINARY`, or
+directory; use `glob` or `files`), `EACCES`/`EPERM` (a real denial), `EBINARY`, or
 `EIO` — while every other requested file is still read. A failed entry consumes
 **no** budget, so it cannot shrink the window of a file that does exist. Only a
 malformed REQUEST (bad path, bad range, empty or oversized array) rejects the whole
@@ -962,7 +975,7 @@ process; it makes no claim about another process or worker thread.
 | `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files, truncated, bytes, wireBytes, contentBudget, skipped }`; one window per path, ordered, default 5000 lines; an unreadable path keeps its slot with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call |
 | `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected; serialized per file against a concurrent `edit` |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted; read-match-write is one per-file critical section |
-| `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
+| `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` — non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` gives `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (200 entries by default, 1000 maximum, one shared 64 KiB entry-text budget across the call), `move`/`copy` give `{ path, to, kind, bytes }` and gate an existing destination on `overwrite`, `delete` gives `{ path, removed, recursive }` and refuses a non-empty directory without `recursive` (`force` reports a missing path as a no-op), `mkdir` gives `{ path, created }`; a failed list entry carries its own `error: { code, message }`, a failed mutation rejects the call naming the operations already applied (no rollback) |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — NAMES only, capped at 100; there is no `content` property any more |
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }`; caps at 100 matches and 64 KiB of match text, matching time-bounded |
 | `shell` | `({ command, cwd? })` | `{ exitCode, stdout, stderr }` |
@@ -1022,7 +1035,7 @@ Every preset is tagged. The five core file tools and `download` are always
 declared, so a model
 reads/writes/edits/lists names with `glob` and finds text with `grep` directly, and
 pulls a real file with `download` without a discovery round.
-`fileList` is found with `files`/`list`; a shell
+`files` is found with `files`/`list`/`move`/`rename`/`copy`/`delete`/`mkdir`; a shell
 with `shell`, git with `git`, syntax checks with `javascript`/`typescript`/`json`/`python`,
 and `fetch` with `web`/`fetch`/`url`/`read`/`research` when the harness opted into
 `webfetch`. Those
@@ -2360,7 +2373,7 @@ needs no extra variable when the service is running.
 The catalogue lives in `src/server/harnesses/`. Both entry points use it. Every **live**
 preset is built by the same factory (`src/server/harnesses/toolbox.ts`), so the registered
 toolbox is identical: all nine package tools (`syntax`, the six file tools
-`read`/`write`/`edit`/`fileList`/`glob`/`grep`,
+`read`/`write`/`edit`/`files`/`glob`/`grep`,
 `shell`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `search`, and the harness-owned tools
 (`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`,
@@ -2370,7 +2383,7 @@ preset declares a subagent,
 interaction handler).
 R18 splits declarations: the five core file tools, the harness-owned
 `toolRequest`/`task`, and the environment pair it actually registered (a configured
-`search`, an enabled `fetch`) are always declared, while `download`, `fileList`,
+`search`, an enabled `fetch`) are always declared, while `download`, `files`,
 `shell`, `gitDiff`, `syntax`, and the app tools are discovered. Choosing a harness
 changes the agents, not the tools.
 
@@ -2519,12 +2532,12 @@ property**; `{ "parameters": {} }` is a valid argument-less call, and a body wit
 two forms are not interchangeable:
 
 ```jsonc
-// fileList declares ONE property, so the value IS that property (the same unwrapping
+// files declares ONE property, so the value IS that property (the same unwrapping
 // a model call gets and a direct call passes):
-POST /api/tools/fileList   { "parameters": ["src", "task"] }
+POST /api/tools/files   { "parameters": [{ "op": "list", "path": ["src", "task"] }] }
 
 // its schema, as listed by GET /api/tools, is still an object:
-{ "type": "object", "properties": { "paths": { "type": "array", … } }, … }
+{ "type": "object", "properties": { "ops": { "type": "array", … } }, "required": ["ops"], … }
 
 // a multi-property tool takes the whole object, because there is nothing to unwrap:
 POST /api/tools/glob       { "parameters": { "patterns": ["**/*.ts"], "paths": ["src"] } }
@@ -2534,7 +2547,7 @@ POST /api/tools/search     { "parameters": { "query": "harness docs", "provider"
 POST /api/tools/toolRequest { "parameters": { "tags": ["files"] }, "sessionId": "…" }
 ```
 
-The single-property tools are `read`, `write`, `edit`, and `fileList`;
+The single-property tools are `read`, `write`, `edit`, and `files`;
 `glob`, `grep`, `syntax`, `shell`, `gitDiff`, `download`, `search`, and every core
 tool carry several
 properties. `search`'s optional `provider` only accepts a value whose key
@@ -2543,10 +2556,10 @@ exists (`fetch` follows the same rule inside a session harness, where it is
 registered rather than catalogued). `read`'s single `paths` property still accepts range objects as its
 ITEMS (`{ "paths": [{ "path": "big.ts", "startLine": 400, "maxLines": 50 }] }`), so
 per-file windows do not add a second top-level property and the unwrapping rule is
-unchanged. `fileList` normalizes the tolerated "no preference" shapes itself
-(`undefined`, `null`, `{}`, and a `{ "paths": [...] }` wrapper all mean `["."]`), so an
-empty argument box and a model-shaped body agree, while an explicit `[]` is still an
-error.
+unchanged. `files` requires `ops`, so there is no "no preference" shape to normalize:
+a `{ "ops": [...] }` wrapper and a bare `[...]` are the same request (the same
+unwrapping rule), while an empty argument box and `{ "ops": [] }` are both refused -
+only a `list` entry may omit `path`, and that one means the working directory.
 
 **Harness creation and overrides.** `POST /api/harnesses` adds a live harness
 built from trusted agents and the shared toolbox; `PATCH` changes any harness,

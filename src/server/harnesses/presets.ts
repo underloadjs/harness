@@ -143,7 +143,7 @@ export const teamOf = (primary: string): string[] => [
 // The general-purpose choice and the first card in the UI. Its profile's
 // guidelines are about *behaviour* and discovery, not about which capabilities
 // exist: the four core file tools and a configured search are always declared;
-// fileList, commands, git, syntax and the app tools are searchable.
+// files, commands, git, syntax and the app tools are searchable.
 // The allowlist is computed once per preset so the metadata and the factory
 // closure cannot see two different lists.
 const instructTeam = teamOf('instruct');
@@ -152,7 +152,7 @@ const instruct: HarnessPreset = {
     name: 'instruct',
     title: 'Instruct',
     description:
-        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
+        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
     requiresEndpoint: true,
     primary: 'instruct',
     subagents: instructTeam,
@@ -205,7 +205,7 @@ const workspace: HarnessPreset = {
     name: 'workspace',
     title: 'Coder',
     description:
-        'Coding agent with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and fileList, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. Everything runs on the server host.',
+        'Coding agent with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. Everything runs on the server host.',
     requiresEndpoint: true,
     primary: 'workspace',
     subagents: workspaceTeam,
@@ -446,7 +446,7 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
     instruct: {
         title: 'Instruct',
         description:
-            'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured search are always available; call toolRequest with capability tags for fileList, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
+            'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured search are always available; call toolRequest with capability tags for files, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
         requiresEndpoint: true,
         primary: 'instruct',
         subagents: [],
@@ -470,7 +470,7 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
     workspace: {
         title: 'Workspace (coding)',
         description:
-            'A coding agent with the full shared toolbox: file read/write/edit/glob are always available, and fileList, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host.',
+            'A coding agent with the full shared toolbox: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host.',
         requiresEndpoint: true,
         primary: 'workspace',
         subagents: [],

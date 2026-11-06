@@ -24,7 +24,7 @@
 // What THIS revision adds, and pins:
 //
 //   - `offset`/`limit`/`nextOffset`: a capped listing is resumable. The walk is a
-//     deterministic prefix, which is the precondition; `read` and `fileList` already
+//     deterministic prefix, which is the precondition; `read` and `files` already
 //     paged and a search that could not was the asymmetry that left a caller guessing a
 //     narrower pattern.
 //   - the cap is 1-1000 instead of 1-100, and `limit` echoes what was applied — a
@@ -38,7 +38,7 @@
 //
 // The fixture tree is the process cwd for this file, so roots are relative and the
 // results are the documented root-prefixed relative paths (the same presentation
-// fileList uses: "." contributes no prefix). Fixtures live under the repo-root
+// files uses: "." contributes no prefix). Fixtures live under the repo-root
 // `Temp/`, one unique directory per run, removed afterwards. The `.gitignore` describes
 // at the end of this file each own a second `Temp/` directory of their own, because that
 // shared tree deliberately has no `.gitignore` in it.

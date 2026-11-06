@@ -637,10 +637,10 @@ describe('self-modifying tool kernel', () => {
     it('registers configuration.toolSources after the baseline and before configured tool overrides', async () => {
         const sourced = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
-            toolSources: { customList: 'tools/files/fileList.tool.ts' }
+            toolSources: { customList: 'tools/files/files.tool.ts' }
         });
 
-        expect(sourced.toolSource('customList')?.sourcePath).toBe('tools/files/fileList.tool.ts');
+        expect(sourced.toolSource('customList')?.sourcePath).toBe('tools/files/files.tool.ts');
         expect(sourced.tools.customList.name).toBe('customList');
         await expect(
             sourced.executeTool('customList', ['not-a-real-directory'])
@@ -654,7 +654,7 @@ describe('self-modifying tool kernel', () => {
         });
         const overridden = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
-            toolSources: { customList: 'tools/files/fileList.tool.ts' },
+            toolSources: { customList: 'tools/files/files.tool.ts' },
             tools: { customList: override }
         });
 
@@ -749,14 +749,14 @@ describe('self-modifying tool kernel', () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('ok')])) } });
 
         await writer.registerTool({
-            name: 'fileList',
+            name: 'files',
             description: 'runtime replacement',
             tags: ['files', 'list'],
-            moduleText: moduleFor({ name: 'fileList', body: "return 'runtime-only';" })
+            moduleText: moduleFor({ name: 'files', body: "return 'runtime-only';" })
         });
         await writer.executeTool('toolRequest', { tags: ['files', 'list'] });
-        expect(writer.discoveredTools).toContain('fileList');
-        expect(writer.toolSource('fileList')?.moduleText).toContain('runtime-only');
+        expect(writer.discoveredTools).toContain('files');
+        expect(writer.toolSource('files')?.moduleText).toContain('runtime-only');
 
         const snapshot = writer.snapshot();
         expect(snapshot.createdTools).toEqual([]);
@@ -766,9 +766,9 @@ describe('self-modifying tool kernel', () => {
 
         // The name stays enabled/restorable; the replacement itself is
         // runtime-only, so the fresh baseline implementation is loaded.
-        expect(restored.discoveredTools).toContain('fileList');
-        expect(restored.toolSource('fileList')?.sourcePath).toBe('tools/files/fileList.tool.ts');
-        expect(restored.tools.fileList.description).not.toBe('runtime replacement');
+        expect(restored.discoveredTools).toContain('files');
+        expect(restored.toolSource('files')?.sourcePath).toBe('tools/files/files.tool.ts');
+        expect(restored.tools.files.description).not.toBe('runtime replacement');
 
         // Restoring a snapshot that does not contain a created tool removes both
         // the registry entry and its captured source record.

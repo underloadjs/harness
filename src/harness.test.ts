@@ -6,7 +6,7 @@
 //     and its name is the harness name;
 //   - the harness-owned core tools are toolRequest, toolCreate, task,
 //     profileManage, chapterManage, and locationManage (delegate only when
-//     subagents exist); the rest of the preset catalogue — fileList and beyond —
+//     subagents exist); the rest of the preset catalogue — files and beyond —
 //     is searchable and toolRequest enables the matches for the next turn, until
 //     then it is invisible and uncallable;
 //   - toolCreate, task, and the record tools are always core, and delegate
@@ -161,7 +161,7 @@ describe('harness', () => {
         // Both halves of the split search are core: `glob` names files, `grep` reads them.
         expect(writer.tools.glob.visibility).toBe('core');
         expect(writer.tools.grep.visibility).toBe('core');
-        expect(writer.tools.fileList.visibility).toBe('searchable');
+        expect(writer.tools.files.visibility).toBe('searchable');
         expect(writer.tools.shell.visibility).toBe('searchable');
         // ...so the first request declares exactly the core file tools plus the
         // harness-owned set.
@@ -196,15 +196,28 @@ describe('harness', () => {
 
         // read/write/edit/glob/grep are core, so a "files" query only
         // finds the searchable remainder. There is no fileSearch: glob and grep are
-        // the two search surfaces and both are already declared. `download` is
+        // the two search surfaces and both are already declared. `files` is the
+        // searchable manager (list/move/copy/delete/mkdir), and `download` is
         // searchable under R9-R11, so the 'file' tag offers it here.
         const fileSearch = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(fileSearch.enabled).toEqual(['fileList', 'download', 'profileManage']);
+        expect(fileSearch.enabled).toEqual(['files', 'download', 'profileManage']);
         expect(fileSearch.tools).toEqual([
             {
-                name: 'fileList',
-                description: expect.stringContaining('List the immediate entries'),
-                tags: ['files', 'list', 'filesystem']
+                name: 'files',
+                description: expect.stringContaining('Manage files and folders'),
+                tags: [
+                    'files',
+                    'list',
+                    'filesystem',
+                    'folder',
+                    'directory',
+                    'move',
+                    'rename',
+                    'copy',
+                    'delete',
+                    'remove',
+                    'mkdir'
+                ]
             },
             {
                 name: 'download',

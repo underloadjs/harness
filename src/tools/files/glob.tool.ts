@@ -43,14 +43,14 @@
 // Matching paths in walk order, deduplicated, capped, and now PAGEABLE: the walk is
 // depth-first over name-sorted entries, so a capped result is a deterministic prefix
 // of the tree — exactly the precondition `offset`/`nextOffset` need. `read` and
-// `fileList` already paged; a search that could not was the asymmetry that left a
+// `files` already paged; a search that could not was the asymmetry that left a
 // caller guessing a narrower pattern.
 //
 // Two bounds can close a page, and `nextOffset` is correct for both:
 //   - `limit` entries (default 100, hard maximum 1000 — raised from 100, which made a
 //     369-file question unanswerable and never echoed the cap it had applied);
 //   - FILE_GLOB_CONTENT_BUDGET (64 KiB) of UTF-8 path text, the same budget read,
-//     fileList and grep enforce. A page stops BEFORE the entry that would cross it.
+//     files and grep enforce. A page stops BEFORE the entry that would cross it.
 //
 // `truncated` is proven by one extra match beyond the window, never guessed, and
 // `stopReason` says which bound did it. `excluded` reports what the WALK did not
@@ -75,7 +75,7 @@
 //
 // PATHS
 // -----
-// Results are root-prefixed and posix-style, exactly like fileList: walking '.' and
+// Results are root-prefixed and posix-style, exactly like files: walking '.' and
 // 'src' yields 'a.ts' and 'src/b.ts'. Overlapping roots (['src', '.'] or patterns that
 // both match one file) are deduplicated by RESOLVED FILE IDENTITY, so a file appears
 // once, under the FIRST root that reached it. A root that resolves to a directory
@@ -118,7 +118,7 @@ import {
 import type { PatternSet, SearchStats } from './search';
 
 // Maximum UTF-8 bytes of path text across the whole call — the same 64 KiB budget
-// read, fileList and grep enforce. Paths are short strings, so in practice the entry
+// read, files and grep enforce. Paths are short strings, so in practice the entry
 // cap binds first; the budget is what makes that true by construction rather than by
 // luck (1000 entries of a 300-character Windows path is 300 KiB).
 export const FILE_GLOB_CONTENT_BUDGET = 64 * 1024;
@@ -283,7 +283,7 @@ const listMatchingFiles = async (
         // It must be tested BEFORE the cumulative one: at the start of a page `bytes` is
         // 0 and the two conditions coincide, so the cumulative reading would call the
         // entry a budget stop, promise a resume, and meet it again at the same offset.
-        // fileList orders the two the same way, for the same reason.
+        // files orders the two the same way, for the same reason.
         if (size > FILE_GLOB_CONTENT_BUDGET) {
             throw new HarnessError(
                 `glob entry "${candidate.display.slice(0, 200)}" is ${size} UTF-8 bytes, larger than the ${FILE_GLOB_CONTENT_BUDGET}-byte page budget, so it can never be returned. Walk a deeper directory so the prefix is shorter.`

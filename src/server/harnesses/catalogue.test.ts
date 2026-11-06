@@ -149,7 +149,7 @@ describe('tool catalogue', () => {
             'read',
             'write',
             'edit',
-            'fileList',
+            'files',
             'glob',
             'grep',
             'shell',
