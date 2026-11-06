@@ -91,16 +91,41 @@ const show = (label, ok, detail) => {
     ]);
     const seekMs = Date.now() - t1;
 
+    // The documented equivalent of `startByte = nextByte` is
+    // `{ startLine: nextLine, startColumn: nextColumn }`, so that is what the seek must
+    // reproduce. The check used to compare against `startLine` ALONE, which was only
+    // ever equal because the old 5000-line default cut exactly at a line boundary
+    // (nextColumn = 0); with no default cap the budget binds mid-line, and a window that
+    // starts at the beginning of nextLine is a different — also correct — answer. Both
+    // claims are checked now: the mid-line equivalence, and line-boundary equality where
+    // the offset is derived from the fixture rather than from a reported nextByte.
     const t2 = Date.now();
     const lineBased = await read([
-        { path: `${C}/big.txt`, startLine: first.files[0].nextLine, maxLines: FILE_READ_DEFAULT_MAX_LINES }
+        {
+            path: `${C}/big.txt`,
+            startLine: first.files[0].nextLine,
+            startColumn: first.files[0].nextColumn ?? 0,
+            maxLines: FILE_READ_DEFAULT_MAX_LINES
+        }
     ]);
     const lineMs = Date.now() - t2;
 
     show(
-        'seek  startByte reproduces the line-based window exactly',
+        'seek  startByte reproduces the line+column window exactly',
         seeked.files[0].content === lineBased.files[0].content && seeked.files[0].nextByte === lineBased.files[0].nextByte,
-        `seek=${seekMs}ms vs rescan=${lineMs}ms`
+        `seek=${seekMs}ms vs rescan=${lineMs}ms (cut at line ${first.files[0].nextLine}, column ${first.files[0].nextColumn})`
+    );
+
+    const boundaryLine = 100_000;
+    const boundaryByte = Buffer.byteLength(L.slice(0, boundaryLine - 1).map((s) => s + '\n').join(''), 'utf8');
+    const atBoundarySeek = await read([{ path: `${C}/big.txt`, startByte: boundaryByte, maxLines: 50 }]);
+    const atBoundaryLine = await read([{ path: `${C}/big.txt`, startLine: boundaryLine, maxLines: 50 }]);
+    show(
+        'seek  at a line boundary, startByte equals the counted window',
+        atBoundarySeek.files[0].content === atBoundaryLine.files[0].content &&
+            atBoundarySeek.files[0].startLine === atBoundaryLine.files[0].startLine &&
+            atBoundarySeek.files[0].nextByte === atBoundaryLine.files[0].nextByte,
+        `line ${boundaryLine}`
     );
 }
 
