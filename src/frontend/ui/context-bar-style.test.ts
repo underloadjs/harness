@@ -61,6 +61,34 @@ const blockOf = (selector: string): string => {
     return css.slice(open + 1, close);
 };
 
+// Responsive rules in this stylesheet live beside the section they adapt, so a cap can sit in
+// ANY `@media` block carrying this header. `blockOf` cannot slice one (its first `}` is the first
+// INNER rule's), so this joins every matching at-rule body: comments are stripped first because
+// they name selectors, and each body is brace-matched so a nested rule cannot cut the slice short.
+const atRulesOf = (header: string): string => {
+    const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const bodies: string[] = [];
+
+    for (let index = rules.indexOf(header); index >= 0; index = rules.indexOf(header, index + 1)) {
+        const open = rules.indexOf('{', index);
+        if (open < 0) continue;
+
+        let depth = 0;
+        for (let cursor = open; cursor < rules.length; cursor += 1) {
+            if (rules[cursor] === '{') depth += 1;
+            if (rules[cursor] === '}') {
+                depth -= 1;
+                if (depth === 0) {
+                    bodies.push(rules.slice(open + 1, cursor));
+                    break;
+                }
+            }
+        }
+    }
+
+    return bodies.join('\n');
+};
+
 it('gives DOM mode the model gap and the model strip box', () => {
     const segments = blockOf('.context-bar-segments {');
 
@@ -165,7 +193,15 @@ it('puts the figures at the right of the bar, with the unit and without the labe
 // bring the wall of stale previews back.
 it('prints the one current tail block as text and hides everything superseded', () => {
     const tail = blockOf('.context-bar-tail {');
-    expect(tail).toContain('display: block;');
+    // The block is a two-row flex column — caption row then body — because the OUTER height is
+    // ONE shared token and the body has to be the part that fits inside it (see the height test
+    // below for the 12-line figure and the mobile cap).
+    expect(tail).toContain('display: flex;');
+    expect(tail).toContain('flex-direction: column;');
+    expect(tail).toContain('height: var(--context-tail-height);');
+    // The viewport clamp lives on the base rule with the height, so it applies at every width.
+    expect(tail).toContain('max-height: 50vh;');
+    expect(tail).toContain('max-height: 50dvh;');
     // The amber edge is the strip's own reasoning tone: the same token
     // `CONTEXT_BAR_TONE_STYLES.reasoning` paints for the segment this body stands for,
     // so a theme change moves the segment and its body together.
@@ -177,10 +213,14 @@ it('prints the one current tail block as text and hides everything superseded', 
 
     // Reasoning is scratch space: it renders verbatim (`pre-wrap` keeps the model's own
     // line breaks) and a long round scrolls inside its box rather than growing the tile.
+    // The bound itself is the BLOCK's (the token above); `min-height: 0` + `flex: 1 1 auto` are
+    // what make that true — the body is the shrinkable remainder, so neither a long body nor the
+    // mobile viewport cap can push the block past its height.
     const body = blockOf('.context-bar-tail-body {');
     expect(body).toContain('white-space: pre-wrap;');
     expect(body).toContain('overflow: auto;');
-    expect(body).toContain('max-height:');
+    expect(body).toContain('flex: 1 1 auto;');
+    expect(body).toContain('min-height: 0;');
 
     // The caption line states the exact recorded length beside the body, in the same mono
     // face as the bar's count, so the two read as one instrument.
@@ -255,18 +295,42 @@ it('prints the designated call in the strip tones, one bounded pane per recorded
     expect(detailNote).toContain('font-family: var(--mono);');
 });
 
-it('gives the recorded call and the thinking tail the SAME body height (R1a)', () => {
-    // R1a is one NUMBER, declared once on the block and read by the one body rule BOTH kinds
-    // share. There is no second height to change, so a call and a thinking window rendered in
-    // the same running turn cannot drift apart.
+it('sizes the tail block at 12 of its OWN text line boxes, shared by both kinds (R1a, T28)', () => {
+    // T28: "The block height too big. It should be 50% maximum on mobile view, and about 12 line
+    // height on desktop." The figure is measured in the line box THIS block actually renders, and
+    // it is DERIVED here from the body's own type declarations — so changing `font-size` or
+    // `line-height` without re-deriving the token fails this test instead of silently resizing the
+    // block. There is still exactly ONE height, declared once on the block and shared by both
+    // kinds, so a call and a thinking window cannot drift apart.
+    const body = blockOf('.context-bar-tail-body {');
+    const fontSize = Number(/font-size: (\d+)px/.exec(body)?.[1]);
+    const leading = Number(/line-height: ([\d.]+)/.exec(body)?.[1]);
+
+    expect([fontSize, leading]).toEqual([12, 1.55]);
+
+    const lineBox = fontSize * leading; // 18.6px
+
+    // The ARGUMENTS/RESULT `pre` renders at the identical metrics, so one line box is the honest
+    // ruler for both tail kinds; the thinking body is the representative text here.
+    const paneBody = blockOf('.context-bar-tail-pane-body {');
+
+    expect(paneBody).toContain('font-size: 12px;');
+    expect(paneBody).toContain('line-height: 1.55;');
+
     const tail = blockOf('.context-bar-tail {');
 
-    expect(tail).toContain('--context-tail-body-height: 28rem;');
+    expect(tail).toContain(`--context-tail-line-height: ${lineBox}px;`);
+    expect(tail).toContain('--context-tail-height: calc(12 * var(--context-tail-line-height));');
+    // The file-wide border-box reset makes that token the OUTER box — caption row + body +
+    // padding + border — i.e. 12 x 18.6px = 223.2px on desktop, not merely the scroll viewport.
+    expect(tail).toContain('height: var(--context-tail-height);');
 
-    const body = blockOf('.context-bar-tail-body {');
-
-    expect(body).toContain('height: var(--context-tail-body-height);');
-    expect(body).toContain('max-height: var(--context-tail-body-height);');
+    // Budget arithmetic the next two rules have to keep true: the caption is a fixed
+    // 2 x (10px x 1.3) = 26px row plus its 6px bottom margin (32px), and the block's own chrome is
+    // 8+8px padding and 1+1px border (18px), so the shared body viewport is
+    // 223.2 - 32 - 18 = 173.2px = 9.3 of the same line boxes.
+    expect(body).toContain('flex: 1 1 auto;');
+    expect(body).toContain('min-height: 0;');
     // R1b: the whole thinking body is in the DOM, so the box has to be able to scroll it.
     expect(body).toContain('overflow: auto;');
 
@@ -277,6 +341,9 @@ it('gives the recorded call and the thinking tail the SAME body height (R1a)', (
     // the OUTER boxes of the two kinds match rather than only their scroll boxes.
     const caption = blockOf('.context-bar-tail-caption {');
 
+    // Fixed row of the flex column: it neither grows (which would push the block past 12 lines)
+    // nor shrinks (which would let a mobile cap swallow the state line).
+    expect(caption).toContain('flex: 0 0 auto;');
     expect(caption).toContain('line-height: 1.3;');
     expect(caption).toContain('min-height: 2.6em;');
     expect(caption).toContain('max-height: 2.6em;');
@@ -308,16 +375,34 @@ it('gives the recorded call and the thinking tail the SAME body height (R1a)', (
     expect(pane).toContain('flex-direction: column;');
     expect(pane).toContain('min-height: 0;');
 
-    // The request keeps its natural height up to a cap; the response takes the rest. Together
-    // they fill the shared 28rem viewport exactly, so the two kinds are the same size and the
-    // call is no smaller than the block it had before.
+    // T28 proportions: at the 173.2px remainder a rem cap would either waste the box or starve
+    // one field, so the request is held to a SHARE of it and the response takes the rest. The
+    // percentage is the part that keeps working under the mobile cap, where the box is smaller.
+    expect(tail).toContain('--context-tail-args-share: 40%;');
+
     const argsPane = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] {");
 
+    // `flex-shrink: 0` is load-bearing (T28 review): the request pane is sized by its OWN payload,
+    // so a short argument list keeps its natural height instead of being shrunk proportionally
+    // against a long result. With shrink allowed the most common shape — a one-line `grep`
+    // argument list against an 80-line result — collapsed the pane to a ~5px sliver its own label
+    // and `pre` spilled out of.
     expect(argsPane).toContain('flex: 0 0 auto;');
+    expect(argsPane).toContain('min-height: 0;');
+    // 40% of 173.2px = 69.3px (label included) at desktop, and 40% of whatever the `50dvh` clamp
+    // leaves at mobile — the result pane can never be squeezed out of the box.
+    expect(argsPane).toContain('max-height: var(--context-tail-args-share);');
+    // A floor AND a ceiling: the share is a `max-height`, never a `height`, so a two-line request
+    // does not reserve 40% of the box it does not need.
+    expect(argsPane).not.toMatch(/(^|\n)\s*height\s*:/);
 
     const argsBody = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] .context-bar-tail-pane-body {");
 
-    expect(argsBody).toContain('max-height: 12rem;');
+    // The pane owns the cap, so the `pre` fills it and scrolls inside it: its own rem figure is
+    // lifted deliberately, otherwise a 14rem pane would overflow a 69px box.
+    expect(argsBody).toContain('flex: 1 1 auto;');
+    expect(argsBody).toContain('min-height: 0;');
+    expect(argsBody).toContain('max-height: none;');
 
     const resultPane = blockOf(".context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='result'] {");
 
@@ -328,6 +413,38 @@ it('gives the recorded call and the thinking tail the SAME body height (R1a)', (
     expect(resultBody).toContain('flex: 1 1 auto;');
     expect(resultBody).toContain('min-height: 0;');
     expect(resultBody).toContain('max-height: none;');
+});
+
+it('clamps the WHOLE tail block to half the visual viewport, at every width (T28)', () => {
+    // "It should be 50% maximum on mobile view." A width-keyed cap was the coverage gap: it left a
+    // large landscape phone/tablet (932x430 measured ~52% of the viewport) and a short desktop
+    // window (1000x300 measured 223.19px, over the viewport itself) uncapped, because the media
+    // query never matched there. The clamp therefore sits on the base rule beside the height it
+    // clamps, so the used height is `min(12 line boxes, 50% of the viewport)` for BOTH kinds, with
+    // no new breakpoint invented.
+    const tail = blockOf('.context-bar-tail {');
+
+    // Dual declaration: `vh` is the fallback for an engine with no `dvh`, and the `dvh`
+    // declaration wins where it parses — the VISUAL viewport, so mobile browser chrome cannot
+    // leave the block taller than half of what the reader actually sees.
+    expect(tail).toContain('max-height: 50vh;');
+    expect(tail).toContain('max-height: 50dvh;');
+    // A clamp, not a re-sized box: the 12-line height stays declared where it is.
+    expect(tail).toContain('height: var(--context-tail-height);');
+    // One clamp for both kinds — no per-kind override of the BLOCK may exist anywhere, or the two
+    // blocks drift. (`\s*\{` right after the kind selector, so the call's own pane layout rules —
+    // descendants that legitimately carry the 40% share — are not mistaken for a block override.)
+    expect(css).not.toMatch(/\.context-bar-tail\[data-kind='[a-z]+'\]\s*\{[^}]*max-height/);
+    // And the clamp is not repeated per width, which is how the two figures would start disagreeing
+    // by breakpoint: no responsive block may mention the tail at all.
+    expect(atRulesOf('@media (max-width: 860px)')).not.toContain('.context-bar-tail');
+    expect(atRulesOf('@media (max-width: 1180px)')).not.toContain('.context-bar-tail');
+    expect(atRulesOf('@media (max-width: 600px)')).not.toContain('.context-bar-tail');
+    // The shrink has somewhere to go under the clamp: the body is the block's flex remainder with
+    // `min-height: 0`, while the caption row is `flex: 0 0 auto` and keeps its two fixed lines.
+    expect(blockOf('.context-bar-tail-body {')).toContain('min-height: 0;');
+    expect(blockOf('.context-bar-tail-body {')).toContain('flex: 1 1 auto;');
+    expect(blockOf('.context-bar-tail-caption {')).toContain('flex: 0 0 auto;');
 });
 
 it('keeps every segment bounded under forced colors', () => {

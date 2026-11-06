@@ -62,6 +62,17 @@
 // entry, therefore leaves every file untouched, which is why the batch can be
 // trusted. Each file is then written exactly ONCE with its final text.
 //
+// BOUNDED WORK ON THE FAILURE AND replaceAll PATHS
+// ------------------------------------------------
+// A broad oldString can match an order of magnitude more often than a model meant,
+// so nothing on those paths may scale with matches x file size. The candidate line
+// numbers are collected in ONE forward pass over the text (not one prefix copy per
+// match), the ambiguity message NAMES only the first AMBIGUITY_LINE_LIMIT of them
+// (the count stays exact), and replaceAll splices by collecting the gaps and joining
+// ONCE (not one whole-file rebuild per match). All three were quadratic, and because
+// this tool is declared `mode: 'sync'` and the server defaults to
+// `threadExecution: 'inline'`, a quadratic tool body stalls the whole process.
+//
 // The result reports, per entry, HOW the oldString matched: exact byte-for-byte
 // (nothing extra in the result), or one of the two fallback tiers, which is named
 // in `match`. A model that retyped a quote instead of copying it still gets its
@@ -281,11 +292,41 @@ const withRegionEndings = (region: string, replacement: string, fallback: string
         .join('');
 };
 
+// How many candidate lines an ambiguity error NAMES. The reported count is always
+// exact; only the list is capped, so the failure stays readable and small enough to
+// journal. See the note in this file's header.
+const AMBIGUITY_LINE_LIMIT = 10;
+
+// Char code of "\n". Compared numerically so the scan below allocates nothing per
+// character.
+const NEWLINE_CODE = 0x0a;
+
 // 1-based line numbers of each match start, so an ambiguity error can say WHERE
-// the candidates are instead of only how many. Cheap: the text is already in
-// memory, and only the newlines before each start are counted.
-const lineNumbers = (content: string, matches: Match[]): number[] =>
-    matches.map((match) => content.slice(0, match.start).split('\n').length);
+// the candidates are instead of only how many.
+//
+// ONE forward pass over the text, not one prefix copy per match. Both finders scan
+// left to right, so `matches` arrive in ascending order and a single scan that
+// counts newlines while walking to each match start answers every match at once:
+// O(content.length) regardless of how many matches there are. The previous shape,
+// `matches.map((m) => content.slice(0, m.start).split('\n').length)`, copied a fresh
+// prefix per match — O(content.length x matches) — so a 3.3 MB file whose oldString
+// matched 200,000 times asked for ~323 GB of temporary strings and stalled the
+// process it ran in. The regression test in ./edit.test.ts rebuilds that shape.
+const lineNumbers = (content: string, matches: Match[]): number[] => {
+    const result: number[] = [];
+    let line = 1;
+    let offset = 0;
+
+    for (const match of matches) {
+        while (offset < match.start) {
+            if (content.charCodeAt(offset) === NEWLINE_CODE) line += 1;
+            offset += 1;
+        }
+        result.push(line);
+    }
+
+    return result;
+};
 
 // Number of sorted positions strictly before `offset`.
 const countBefore = (positions: number[], offset: number): number => {
@@ -341,6 +382,36 @@ const matchView = (
             return withRegionEndings(region, replacement, lineEnding(region, fileEnding));
         }
     };
+};
+
+// Apply replacements to `content`. `matches` are ascending and non-overlapping (both
+// finders scan left to right and drop overlaps), and `replace` maps one match to the
+// text that takes its place, line endings already resolved.
+//
+// One pass: the untouched gaps and the replacements are collected in order and joined
+// ONCE. The previous right-to-left `reduce` spliced the whole string per match, which
+// is O(content.length x matches) — the same quadratic trap the ambiguity message fell
+// into, reached by any `replaceAll` on a common oldString.
+const applyReplacements = (
+    content: string,
+    matches: Match[],
+    replace: (match: Match) => string
+): string => {
+    if (matches.length === 1) {
+        const only = matches[0];
+        return content.slice(0, only.start) + replace(only) + content.slice(only.end);
+    }
+
+    const pieces: string[] = [];
+    let cursor = 0;
+
+    for (const match of matches) {
+        pieces.push(content.slice(cursor, match.start), replace(match));
+        cursor = match.end;
+    }
+    pieces.push(content.slice(cursor));
+
+    return pieces.join('');
 };
 
 // A validated edit whose target has been resolved: what the read/match pass needs.
@@ -491,22 +562,25 @@ const prepareEdits = async (
 
         if (matches.length > 1 && !edit.replaceAll) {
             // Naming the lines is what makes the failure actionable: a model can
-            // copy more surrounding text from a line it can actually locate.
+            // copy more surrounding text from a line it can actually locate. Only the
+            // first AMBIGUITY_LINE_LIMIT are named — the count stays exact and the tail
+            // is named by how many it is, because a broad oldString can match hundreds
+            // of thousands of times and the full list is a megabyte of text no model
+            // reads and the session journal still has to store.
+            const lines = lineNumbers(content, matches);
+            const named = lines.slice(0, AMBIGUITY_LINE_LIMIT);
+            const remaining = lines.length - named.length;
+            const where = remaining > 0 ? `${named.join(', ')}, and ${remaining} more` : named.join(', ');
+
             throw new HarnessError(
-                `edit found ${matches.length} matches for oldString in ${edit.target} (lines ${lineNumbers(content, matches).join(', ')}). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+                `edit found ${matches.length} matches for oldString in ${edit.target} (lines ${where}). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
             );
         }
 
-        // Splice right-to-left so earlier match offsets stay valid through every
-        // replacement. Without replaceAll only the single unique match is applied.
+        // Without replaceAll only the single unique match is applied; with it, every
+        // occurrence is replaced in one pass (see ./applyReplacements).
         const chosen = edit.replaceAll ? matches : matches.slice(0, 1);
-        const updated = chosen
-            .slice()
-            .reverse()
-            .reduce(
-                (text, match) => text.slice(0, match.start) + replace(match) + text.slice(match.end),
-                content
-            );
+        const updated = applyReplacements(content, chosen, replace);
 
         // A fallback tier can match text that already equals newString (for example
         // curly quotes in the file against an ASCII oldString and a curly newString).

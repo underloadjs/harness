@@ -7109,15 +7109,48 @@ body.is-resizing-rail {
    ======================================================================== */
 
 .context-bar-tail {
-    /* R1a (T27): ONE shared content-viewport height for BOTH tail kinds, declared here so the
-       token travels with the block that uses it. `.context-bar-tail-body` reads it and the tool
-       panes lay themselves out inside it, so a running turn's `grep · ok · 42ms` block and its
-       thinking block are the same size instead of one being a 14rem stub under a 28rem call.
-       28rem is the scale the tool already rendered at (a 14rem args pane + an 14rem result pane
-       + their labels and the 8px gap ≈ 30rem, capped by the old 22rem body) — the thinking body
-       grows to that height rather than the call shrinking to the old preview box. */
-    --context-tail-body-height: 28rem;
-    display: block;
+    /* R1a (T27) + T28 ("the block height too big … about 12 line height on desktop"): ONE
+       shared OUTER height for both tail kinds, measured in this block's OWN text line box
+       rather than an arbitrary rem.
+
+       The line box is not guessed: `.context-bar-tail-body` and the ARGUMENTS/RESULT
+       `pre.context-bar-tail-pane-body` both render at `font-size: 12px` x `line-height: 1.55`
+       = 18.6px, so 12 of them is "12 line heights" read literally. The file-wide border-box
+       reset makes `height` the OUTER box, so the caption row and
+       the padding/border are INSIDE the 12 lines and the block — not just its scroll viewport
+       — is the requested size. The body takes the flex remainder:
+
+           12 x 18.6px                    = 223.2px  outer block (desktop)
+           caption 2 x (10 x 1.3) = 26px
+           + its 6px bottom margin          32px
+           padding 8px + 8px, border 1px + 1px 18px
+           ------------------------------------------------
+           body viewport                      173.2px  = 9.3 text lines
+
+       The two kinds stay equal because they size the SAME block with the SAME fixed caption
+       row. The `max-height` below then clamps that height against the viewport at EVERY width,
+       so a short window — a landscape phone or a slim desktop window — gets half the screen
+       instead of a 223px block, and this flex body with `min-height: 0` is what shrinks while
+       the caption row keeps its height. */
+    --context-tail-line-height: 18.6px;
+    --context-tail-height: calc(12 * var(--context-tail-line-height));
+    /* A long argument list can never claim more than this share of the body, so the result
+       pane keeps the rest and scrolls (40% of 173.2px = 69.3px, label included). */
+    --context-tail-args-share: 40%;
+    display: flex;
+    flex-direction: column;
+    height: var(--context-tail-height);
+    /* T28 review: "50% maximum on mobile view" is a VIEWPORT rule, so it belongs on the base
+       rule rather than keyed to one width. A width-keyed cap left every wide-but-short window
+       uncapped — measured: a 1000x300 window kept the full 223.19px, 110% of its 202px layout
+       viewport, and a 932x430 landscape phone likewise sat above half the screen. Used height is
+       therefore `min(12 line boxes, 50% of the visual viewport)`: a tall desktop window keeps the
+       12 lines, because 223.2px is below half of it, and no new breakpoint was invented. `vh` is
+       the fallback for an engine with no `dvh`; the `dvh` declaration wins where it parses, and
+       `dvh` is the VISUAL viewport, so mobile browser chrome cannot push the block past half of
+       what the reader actually sees. */
+    max-height: 50vh;
+    max-height: 50dvh;
     margin-top: 4px;
     padding: 8px 10px;
     border: 1px solid var(--border);
@@ -7168,6 +7201,11 @@ body.is-resizing-rail {
 
 .context-bar-tail-caption {
     margin: 0 0 6px;
+    /* T28: the caption is a FIXED row of the flex column — it never grows and never shrinks, so
+       the desktop 12-line budget (26 + 6 = 32px of it) and the mobile `50dvh` cap both leave the
+       same room for the body, for both kinds. Its `min-height` below is the floor flex would
+       otherwise have to respect anyway. */
+    flex: 0 0 auto;
     /* R1a: the caption is the only row in this block whose height is CONTENT-driven, and a
        settled call's line ("read · ok · 1.3s · 8,000 characters · args 3,900 + result 4,100 ·
        1 panel · 1 media") wraps exactly where a thinking line ("thinking · 591 characters") does
@@ -7192,19 +7230,19 @@ body.is-resizing-rail {
     overflow-wrap: anywhere;
 }
 
-/* T27 (R1b + R1a): the body is a FIXED-height viewport, the same one for a thinking window and
-   for a recorded call (`--context-tail-body-height`, declared on `.context-bar-tail` above).
-   R1b removed the render-side window from thinking text — the box now holds the WHOLE round and
-   the reader scrolls it, which is why the caption stopped saying "showing X of Y". R1a makes the
-   two kinds equal so the block under a running turn stops changing size every round.
-   `max-height` repeats the token: an element with no layout (a stripped webview) still cannot
-   grow past it, and the box keeps its own scrollbar either way.
+/* T27 (R1b + R1a) / T28: the body is the block's FLEX REMAINDER, not a separately sized box. The
+   shared height lives on `.context-bar-tail` (12 text line boxes, outer), so this box is what is
+   left after the fixed caption row and the padding — identical for a thinking window and for a
+   recorded call, because both kinds size the same block. `min-height: 0` + `flex-shrink` are what
+   let the mobile `50dvh` cap (and a short desktop viewport) shrink THIS box instead of the block
+   overflowing it.
+   R1b: the whole thinking body is in the DOM, so the box has to be able to scroll it;
    `data-follow='latest'` (ui/turns.ts `followLatest`) still aims the scroll at the newest byte,
-   so a streaming round reads as text that MOVES rather than a static opening sentence. */
+   which is the T26 (R26) half that survives. */
 .context-bar-tail-body {
     margin: 0;
-    height: var(--context-tail-body-height);
-    max-height: var(--context-tail-body-height);
+    flex: 1 1 auto;
+    min-height: 0;
     overflow: auto;
     color: var(--text);
     font-family: var(--mono);
@@ -7258,13 +7296,13 @@ body.is-resizing-rail {
     border-radius: var(--radius-sm);
 }
 
-/* R1a (T27): the current call's two recorded panes lay out INSIDE the same fixed-height
-   viewport the thinking body gets (`--context-tail-body-height`), so a call and a thinking
-   round are the same height from the outside — the screenshot's `grep · ok · 42ms` block is the
-   scale both keep. The request keeps its natural height up to a cap, the response takes every
-   pixel that is left, and each field still scrolls in its OWN box: `overflow: hidden` on the
-   shared box means the panes own the scrollbars, so a huge result can never push the request the
-   reader aimed at off screen (the rule the base pane rule above already states). */
+/* R1a (T27) / T28: the current call's two recorded panes lay out INSIDE the same block viewport
+   the thinking body gets (the flex remainder of `.context-bar-tail`'s 12-line outer height), so a
+   call and a thinking round are the same height from the outside. The request keeps its natural
+   height up to a share of the body, the response takes every pixel that is left, and each field
+   still scrolls in its OWN box: `overflow: hidden` on the shared box means the panes own the
+   scrollbars, so a huge result can never push the request the reader aimed at off screen (the rule
+   the base pane rule above already states). */
 .context-bar-tail[data-kind='tool'] .context-bar-tail-body {
     display: flex;
     flex-direction: column;
@@ -7279,19 +7317,31 @@ body.is-resizing-rail {
     min-height: 0;
 }
 
-/* The request: natural height, `flex: 0 0 auto` so it is never squeezed, and the 12rem cap below
-   so a long argument list cannot eat the response's half of the box. */
+/* T28 review: `flex-shrink: 0` is load-bearing, not a style choice. The request pane is sized by
+   its OWN payload — short (a `grep`/`shell`/`read` call's one-line argument list) it keeps that
+   natural height, long it stops at the 40% ceiling. With `flex-shrink: 1` a short request is
+   shrunk proportionally against a 80-line result and the pane collapses to a ~5px sliver its own
+   label and `pre` then spill out of (measured 5.38px desktop before the fix, ~51px after), which
+   is the most common shape in a running turn. The percentage cap resolves because this item's
+   containing block is the body, whose height is definite (the block's flex remainder) — so the
+   ceiling holds under the `50dvh` cap too. The pane's `pre` is capped by the PANE and not by its
+   own rem figure, and fills/shrinks inside it. */
 .context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] {
     flex: 0 0 auto;
+    min-height: 0;
+    max-height: var(--context-tail-args-share);
 }
 
 .context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='args'] .context-bar-tail-pane-body {
-    max-height: 12rem;
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
 }
 
 /* The response: fills whatever the request left and scrolls its complete recorded bytes. The
    base pane cap is lifted here on purpose — this is the field that grows, and the box it lives in
-   is already bounded by the shared token. */
+   is already bounded by the shared block height, with the request held to
+   `--context-tail-args-share` of it. */
 .context-bar-tail[data-kind='tool'] .context-bar-tail-pane[data-pane='result'] {
     flex: 1 1 auto;
 }

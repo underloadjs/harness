@@ -417,9 +417,10 @@ describe('the current tail block, streamed frame by frame', () => {
         // The requirement in one test, in the user's words: "Thought should no longer truncate
         // (i.e. showing x of y...), but display everything for user to see in a scrollable box."
         // The pane used to keep only the newest 320 characters of a streaming round behind a `…`;
-        // now the full text is in the DOM and styles.css gives the box its own scrollbar
-        // (`--context-tail-body-height`), with `data-follow='latest'` still aiming it at the
-        // newest byte — the T26 (R26) behaviour that survives the change.
+        // now the full text is in the DOM and styles.css bounds the box (`--context-tail-height`
+        // on `.context-bar-tail`, 12 text line boxes outer, leaves this scroll viewport the
+        // remainder), with `data-follow='latest'` still aiming it at the newest byte — the T26
+        // (R26) behaviour that survives the change.
         const first = `HEAD-${'x'.repeat(380)}`; // 385 characters, over the old 320 bound
         const more = `-TAIL-${'y'.repeat(200)}`; // 206 more
         const view = documentOf([summary()], { t1: [rootSection()] });

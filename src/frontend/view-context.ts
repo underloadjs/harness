@@ -785,10 +785,10 @@ const proseIsBounded = (node: DisplayTextNode | DisplayReasoningNode, chars: num
 /**
  * The PROSE body a tail paints, plus the two figures that describe it honestly.
  *
- * T27 (R1b): a THINKING tail is no longer windowed. Its pane is a fixed-height scroll box
- * (styles.css `.context-bar-tail-body`, height `--context-tail-body-height`) that holds the
- * whole round, so the reader scrolls the round instead of being shown "320 of 1,234
- * characters" behind a leading `…`: `renderText` is the node's text EXACTLY as the wire
+ * T27 (R1b): a THINKING tail is no longer windowed. Its pane is a bounded scroll box (styles.css
+ * `.context-bar-tail-body`, the flex remainder of the block's 12-line `--context-tail-height`)
+ * that holds the whole round, so the reader scrolls the round instead of being shown "320 of
+ * 1,234 characters" behind a leading `…`: `renderText` is the node's text EXACTLY as the wire
  * delivered it, with no render-side cut and no marker of our own.
  *
  * Honesty is still derived from what actually arrived (T27 review, P2). A producer that

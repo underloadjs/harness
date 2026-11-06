@@ -93,6 +93,56 @@ describe('edit', () => {
         await expect(readTextFile(path, 'utf8')).resolves.toBe('a a a\n');
     });
 
+    // CRASH REGRESSION. A broad oldString on a large file used to make the ambiguity
+    // failure copy a fresh prefix of the file PER MATCH (O(file x matches)) and then
+    // name every candidate line in the message. On a 3.3 MB file whose oldString
+    // matched 200,000 times that was ~323 GB of temporary strings and a 1.5 MB error,
+    // computed on the event loop (this tool is `mode: 'sync'` and the server defaults
+    // to `threadExecution: 'inline'`), which stalled the whole server. Both the work
+    // and the message are bounded now: one forward pass, ten named lines, exact count.
+    it('fails an ambiguity on a large file quickly and names only the first candidate lines', async () => {
+        const lines = 40_000;
+        const source = 'line 0 data\n'.repeat(lines);
+        const path = await seed('ambiguous-large.txt', source);
+
+        const startedAt = Date.now();
+        const failure = await edit([{ path, oldString: 'line ', newString: 'LINE ' }]).catch(
+            (error: unknown) => error
+        );
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(failure).toBeInstanceOf(HarnessError);
+        const message = (failure as Error).message;
+        expect(message).toContain(
+            `edit found ${lines} matches for oldString in ${path} (lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, and 39990 more).`
+        );
+        // The failure has to stay small enough to journal and cheap for a model to read.
+        expect(message.length).toBeLessThan(600);
+        // The old shape paid tens of seconds here; the bound is loose on purpose (a CI
+        // box under load is slower) but far above what one pass over the text costs.
+        expect(elapsedMs).toBeLessThan(5_000);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe(source);
+    });
+
+    it('replaces every occurrence on a large file without rebuilding it per match', async () => {
+        const lines = 40_000;
+        const source = 'line 0 data\n'.repeat(lines);
+        const updated = 'LINE 0 data\n'.repeat(lines);
+        const path = await seed('all-large.txt', source);
+
+        const startedAt = Date.now();
+        const result = await edit([
+            { path, oldString: 'line ', newString: 'LINE ', replaceAll: true }
+        ]);
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(result).toEqual([{ path, replacements: lines, bytes: Buffer.byteLength(updated, 'utf8') }]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe(updated);
+        // Same trap on the success path: the old right-to-left splice reduce rebuilt the
+        // whole file once per match.
+        expect(elapsedMs).toBeLessThan(5_000);
+    });
+
     it('replaces every occurrence when replaceAll is set', async () => {
         const path = await seed('all.txt', 'a a a\n');
 
