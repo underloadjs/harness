@@ -737,6 +737,16 @@ summary::-webkit-details-marker {
     gap: 9px;
 }
 
+/* The Harness server URL action row (Apply & reconnect / Reset). It sits directly
+   under the field it acts on, so the two buttons are right-aligned like the rest of
+   the sheet's confirmations (`.composer-actions`) and never stretch across the
+   dialog: the primary reads last, which is where a reader expects the commit. */
+.endpoint-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
 .field {
     display: flex;
     flex-direction: column;

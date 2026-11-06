@@ -211,6 +211,10 @@ import {
     listProviderModels,
     listSessions,
     loadBootstrap,
+    // The UI-level harness server URL (its own storage key, separate from the provider
+    // settings below): read to prefill the dialog field, written by Apply/Reset.
+    saveApiRootSetting,
+    storedApiRoot,
     updateHarness,
     getHarness,
     // T32: the one member's effective instruction text, asked for only when the definition's
@@ -2722,7 +2726,157 @@ modelManual.addEventListener('input', () => {
 const modelField = el('div', 'field');
 modelField.append(el('span', 'field-label', 'Model'), modelSelect, modelManual, modelStatus);
 
+// ---------------------------------------------------------------------------
+// Harness server URL (the control-plane root) — the UI-level server setting
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS: the UI is independent of the server it talks to. Nothing about
+// this bundle is built for one host, so the reader must be able to point it at any
+// harness control plane from the browser, with no rebuild. The default stays
+// automatic: `API_ROOT` is `/v1/harness` (./api.ts `FALLBACK_ROOT`), i.e. the origin
+// that served this page — a UI at http://localhost:8180 dials
+// http://localhost:8180/v1/harness.
+//
+// WHY IT IS NOT A `RunnerSettings` FIELD: `settings` (./main.ts `STORAGE_KEY` /
+// `loadSettings` / `saveSettings`) is the PROVIDER triple — base URL / API key /
+// model — that travels in the body of `POST /models` and `POST /sessions`. The server
+// URL decides WHICH harness receives those bodies, so it lives in its own storage key
+// (./api.ts `API_ROOT_STORAGE_KEY`) and is never serialized into a payload. Keeping it
+// out of `field()`/`controls` is also what stops a keystroke here from firing a
+// provider catalogue refresh.
+//
+// WHY APPLY RATHER THAN SAVE-ON-INPUT: every request URL in this app is built from
+// the root resolved at module load (`API_ROOT`, plus the socket URL ./stream.ts
+// derives from it), and there is no in-place teardown for a conversation in flight —
+// `boot()` is called exactly once. So Apply persists the value and reloads, which is
+// the same contract the offline pane's `Retry` already uses (`showOffline`).
+const serverRootInput = el('input', 'field-input');
+serverRootInput.type = 'text';
+serverRootInput.id = 'harness-server-root';
+serverRootInput.placeholder = 'http://localhost:8180/v1/harness';
+serverRootInput.spellcheck = false;
+serverRootInput.autocomplete = 'off';
+
+// A `label[for]` rather than a wrapping `<label>`: the two provider fields wrap their
+// single control in `label.field`, and keeping this one a plain `div.field` is what
+// makes `label.field > input.field-input` keep naming the provider pair.
+const serverRootField = el('div', 'field');
+const serverRootLabel = el('label', 'field-label', 'Harness server URL');
+serverRootLabel.htmlFor = serverRootInput.id;
+serverRootField.append(serverRootLabel, serverRootInput);
+
+const serverRootHint = el(
+    'p',
+    'field-hint',
+    'Relative paths resolve against the page that served this UI, so the default /v1/harness means the harness on the same host and port (a UI at http://localhost:8180 dials http://localhost:8180/v1/harness). Blank restores automatic resolution. An absolute URL may name another host: it must accept this page origin at the service Origin gate and CORS, and an https page cannot dial a plain-http host. ?apiRoot= still overrides for a single load.'
+);
+
+// The refusal line: hidden until Apply rejects the typed value, and a `role="status"`
+// live region so the reason is announced without moving focus out of the field.
+const serverRootStatus = el('p', 'field-hint is-warning');
+serverRootStatus.setAttribute('role', 'status');
+serverRootStatus.hidden = true;
+
+const serverRootApply = el('button', 'button primary', 'Apply & reconnect');
+serverRootApply.type = 'button';
+
+// Secondary on purpose: clearing the setting is the way back to the automatic default,
+// but it is the less common action and a reload either way, so it must not compete
+// with Apply for a stray Enter.
+const serverRootReset = el('button', 'button', 'Reset');
+serverRootReset.type = 'button';
+
+const serverRootActions = el('div', 'endpoint-actions');
+serverRootActions.append(serverRootApply, serverRootReset);
+
+const setServerRootStatus = (message: string): void => {
+    serverRootStatus.textContent = message;
+    serverRootStatus.hidden = message.length === 0;
+};
+
+// The "which root is live" line. A named node because it is REPAINTED, not written once
+// (see `paintServerRoot`).
+const serverRootLive = el('p', 'field-hint', '');
+
+// Paint the two root displays from the values that are live AT THE MOMENT OF THE CALL:
+//   - the FIELD previews what Apply would write, so it reads `storedApiRoot() ?? API_ROOT`
+//     exactly as module load does: a saved URL outranks a one-load `?apiRoot=` here (the
+//     override wins for the load it is on, but pressing Apply must keep the saved value);
+//   - the LINE names what THIS load actually dials, so it reads `API_ROOT` alone. The two
+//     lines disagreeing on such a URL is the documented contract, not a bug to reconcile.
+//
+// WHY A FUNCTION INSTEAD OF ONE MODULE-SCOPE ASSIGNMENT: on a GitHub Pages host `API_ROOT`
+// is not final when this module finishes. `resolveRoot` returns the compiled local/LAN
+// chain (./api.ts:417) and `ensureApiRoot` — awaited inside `loadBootstrap`, i.e. strictly
+// AFTER this dialog DOM was built — moves the ESM live binding to the gateway that
+// answered (./api.ts:681). A one-time paint therefore leaves the reader looking at
+// `STATIC_API_CANDIDATES[0]` while every request and the socket go to the host that
+// actually answered. `openEndpointDialog` repaints on every open; Apply/Reset reload the
+// page, so a repaint can never drop edits the reader is about to commit.
+const paintServerRoot = (): void => {
+    serverRootInput.value = storedApiRoot() ?? API_ROOT;
+    serverRootLive.textContent =
+        `API root in use: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'} · every request and the live stream go here. Change it for this browser with the Harness server URL above, or for a single load with ?apiRoot=.`;
+};
+
+// Initial paint: the settings root is a PERSISTENT node that exists long before the
+// dialog first adopts it, so it must not carry an empty line while detached.
+paintServerRoot();
+
+// `?apiRoot=` outranks the saved setting for the load it is on (a shared link must
+// still be able to pin a host, and it stays the only per-load escape hatch), so an
+// Apply that left it in the address bar would be undone by its own reload. Dropping
+// that ONE parameter through `replaceState` keeps every other parameter and the hash,
+// and does not litter Back with the intermediate URL.
+//
+// A URL this engine cannot round-trip is not worth a failed Apply: the saved value is
+// already written, and the hint above documents the query override.
+const dropApiRootQuery = (): void => {
+    try {
+        const current = new URL(location.href);
+        if (!current.searchParams.has('apiRoot')) return;
+
+        current.searchParams.delete('apiRoot');
+        history.replaceState(history.state, '', `${current.pathname}${current.search}${current.hash}`);
+    } catch {
+        // See above.
+    }
+};
+
+// Shared by both actions: write, then re-enter the page against the new root. The
+// reload is the reconnect — `boot()` runs again from a clean module graph.
+const applyServerRootSetting = (value: string | null): void => {
+    try {
+        // Blank is a real value: it CLEARS the setting, so the next load resolves
+        // automatically again. Everything malformed throws from `normalizeApiRoot`
+        // inside `saveApiRootSetting`, before anything was written.
+        saveApiRootSetting(value);
+    } catch (error) {
+        // Nothing was stored and no reload happens: the typed value stays on screen
+        // with the reason beside it.
+        setServerRootStatus(messageOf(error));
+
+        return;
+    }
+
+    dropApiRootQuery();
+    location.reload();
+};
+
+serverRootApply.addEventListener('click', () => applyServerRootSetting(serverRootInput.value));
+
+// Reset is "stop overriding": drop the saved value AND the per-load query, which
+// restores the automatic chain (page origin `/v1/harness`, then the compiled Pages
+// candidates on a static host).
+serverRootReset.addEventListener('click', () => applyServerRootSetting(null));
+
 endpointBody.append(
+    // The server choice reads FIRST: it decides where the provider credentials below
+    // are about to be sent.
+    serverRootField,
+    serverRootHint,
+    serverRootStatus,
+    serverRootActions,
     field('Base URL', 'baseURL', 'text', 'http://localhost:5500/providers/private/v1'),
     field('API key', 'apiKey', 'password', 'optional'),
     modelField,
@@ -2732,9 +2886,9 @@ endpointBody.append(
         'Sent to the harness server when a session starts. Leave the key blank to use the key configured on the server. Values are saved in this browser only. The model list is fetched by the server from {base URL}/models.'
     ),
     // Show the resolved root so a deployment question ("is this page talking to
-    // /v1/harness or /api?") is answerable without devtools. `?apiRoot=` wins at
-    // runtime; this text is the value actually in use.
-    el('p', 'field-hint', `API root: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'} · override with ?apiRoot=/v1/harness`)
+    // /v1/harness or /api?") is answerable without devtools. This is the value ACTUALLY
+    // in use for this load; the field above is how it changes for the next one.
+    serverRootLive
 );
 
 // Initial paint: the stored model is a valid selection even before the server
@@ -2750,7 +2904,10 @@ renderModelOptions();
 // fresh `.endpoint-dialog` wrapper each time — the same move-a-live-pane pattern the
 // tool runner uses (`openToolDialog`, `ui/dialog.ts` adopts `content` instead of
 // cloning it). Nothing here rebuilds a field, so a value typed while open is still
-// there after close/reopen and the debounced refresh keeps running while closed.
+// there after close/reopen and the debounced refresh keeps running while closed. The
+// harness server URL and its "root in use" line are the one exception: both are
+// repainted from the live values on every open (see `paintServerRoot`), because they
+// describe the deployment rather than a draft the reader is working on.
 //
 // `endpointDialog` is guarded by identity in `onClose` (a replacement open may already
 // own the variable when a queued close callback runs), and the pill is the trigger so
@@ -2762,6 +2919,14 @@ const closeEndpointDialog = (): void => {
 };
 
 const openEndpointDialog = (trigger: HTMLElement): void => {
+    // Repaint the two root displays BEFORE the layer is shown: on a static host the
+    // probe moves `API_ROOT` after this module ran (see `paintServerRoot`), and the
+    // persistent body would otherwise keep naming the candidate the loader started on.
+    paintServerRoot();
+    // A refusal from a PREVIOUS open is stale here: it names a value that is no longer on
+    // screen, so re-showing it would claim the freshly painted root had been rejected.
+    setServerRootStatus('');
+
     const body = el('div', 'endpoint-dialog');
     body.append(endpointBody);
 

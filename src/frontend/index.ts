@@ -11,8 +11,9 @@
 //     modules build DOM only when their `create*`/`apply*` functions are called.
 //   - The module-scope computations are `API_ROOT` in `./api.ts` (the resolved API
 //     root) and the chain it may later probe (./deployment.ts). Both read
-//     `globalThis.location`/`globalThis.document` defensively through optional
-//     chaining, so evaluating them in Node does not touch the DOM. Neither issues
+//     `globalThis.location`/`globalThis.document` and the saved server URL in
+//     `globalThis.localStorage` defensively through optional chaining or a `try`, so
+//     evaluating them in Node does not touch the DOM. Neither issues
 //     a request: the static-host probe runs only when `loadBootstrap` (or
 //     `ensureApiRoot`) is called, and `API_ROOT` is a live binding that moves to
 //     the gateway that answered.

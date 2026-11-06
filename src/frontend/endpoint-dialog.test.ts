@@ -5,12 +5,24 @@
 //   - the trigger: the `<span class="status" role="status">` live region keeps its tag,
 //     classes, ARIA and children, and a bare `<button class="status-button">` wraps it
 //     (a live region cannot also be a button, so the two semantics nest);
-//   - the dialog: title `Endpoint & model`, and inside it the Base URL / API key / Model
-//     controls plus the model status line, the explanatory paragraph and the API-root
-//     line — the same nodes the rail used to host, adopted rather than rebuilt;
+//   - the dialog: title `Endpoint & model`, and inside it the harness server URL group
+//     (field + explanation + refusal line + Apply/Reset) followed by the Base URL / API
+//     key / Model controls, the model status line, the explanatory paragraph and the
+//     API-root line — the same nodes the rail used to host, adopted rather than rebuilt;
 //   - the data path is unchanged by the move: dialog edits still write the exact
 //     `underload-harness-app:settings` payload, still fire ONE debounced catalogue
 //     refresh, and still describe the next session the app creates;
+//   - the harness server URL is a SEPARATE setting (`underload-harness-app:api-root`,
+//     ./api.ts): prefilled from what this browser saved rather than from a one-load
+//     `?apiRoot=`, applied only by its button (validate → persist → strip the override
+//     → reload), refused inline when malformed or when the browser cannot keep the
+//     value, and cleared by Reset. Typing in it never touches the provider payload and
+//     never refreshes the provider catalogue;
+//   - THE ROOT DISPLAYS ARE REPAINTED ON EVERY OPEN: on a GitHub Pages host `API_ROOT`
+//     only moves inside `loadBootstrap` (`ensureApiRoot`, ./api.ts), after `main.ts`
+//     module scope built this dialog, so both the field and the "API root in use" line
+//     must name the gateway the probe LANDED on — and a refusal line from a previous open
+//     must not survive the reopen (./main.ts `paintServerRoot`);
 //   - persistence across the dialog lifecycle: closing removes only the overlay, and the
 //     reopen shows the SAME control nodes with the SAME values (no duplicates, no lost
 //     listeners — the dropdown is still populated from the provider answer);
@@ -38,18 +50,37 @@ import type {
     SessionTurn
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { HARNESS_API_ROOT } from '../shared/harness-api';
 import { API_ROOT } from './api';
+import { STATIC_API_CANDIDATES } from './deployment';
 import { viewAwareFetch } from './view-test-support';
 
 const SETTINGS_KEY = 'underload-harness-app:settings';
+// The harness server URL has its OWN storage key (./api.ts `API_ROOT_STORAGE_KEY`): it
+// decides where the provider settings above are sent, so it must survive their reset
+// and must never ride in a request body.
+const SERVER_URL_KEY = 'underload-harness-app:api-root';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 // Realistic epoch stamps: the shell formats real server milliseconds.
 const T = 1_700_000_000_000;
 
-// The API-root hint is built by `main.ts` from the SAME live binding, at module scope
-// and therefore before boot can move the root, so the expected line is computed rather
-// than guessed (`resolveApiRoot()` in api.ts documents that pre-probe value).
-const API_ROOT_HINT = `API root: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'} · override with ?apiRoot=/v1/harness`;
+// The "which root is live" line the dialog renders. `main.ts` writes it from the SAME
+// live binding (`API_ROOT`) — at module scope and again on every dialog open, because a
+// static-host probe moves that binding after module scope (see the Pages test below) —
+// so the expected text is computed rather than guessed, and a test can name the root a
+// scenario resolved to.
+const apiRootLine = (root: string): string =>
+    `API root in use: ${root.length > 0 ? root : '(origin)'} · every request and the live stream go here. Change it for this browser with the Harness server URL above, or for a single load with ?apiRoot=.`;
+
+const API_ROOT_HINT = apiRootLine(API_ROOT);
+
+// The two fixed strings of the new server-URL group. Pinning them as constants keeps
+// the DOM-order assertion below readable, and a source change is a deliberate edit.
+const SERVER_URL_PLACEHOLDER = 'http://localhost:8180/v1/harness';
+const SERVER_URL_HINT =
+    'Relative paths resolve against the page that served this UI, so the default /v1/harness means the harness on the same host and port (a UI at http://localhost:8180 dials http://localhost:8180/v1/harness). Blank restores automatic resolution. An absolute URL may name another host: it must accept this page origin at the service Origin gate and CORS, and an https page cannot dial a plain-http host. ?apiRoot= still overrides for a single load.';
+const SETTINGS_HINT =
+    'Sent to the harness server when a session starts. Leave the key blank to use the key configured on the server. Values are saved in this browser only. The model list is fetched by the server from {base URL}/models.';
 
 const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor =>
     ({
@@ -169,26 +200,45 @@ type Call = { url: string; method: string; body: unknown; raw?: string };
 // Every boot answers the same two reads; a test adds the session/task routes it needs.
 // An unmapped URL throws LOUDLY instead of letting a missing request masquerade as
 // "nothing happened".
-const stub = (extra?: (url: string, method: string, body: unknown) => Response | undefined): Call[] => {
+//
+// `browser` is an optional layer IN FRONT of the shared double. The double reduces every
+// request to the configured fixture mount (`stripOrigin`), which is exactly what hides a
+// static-host deployment: the client dials `http://localhost:5000/v1/harness/health` and
+// `http://127.0.0.1:5000/v1/harness/health` as the SAME `/api/health` route. A Pages test
+// therefore answers or rewrites on the URL the browser actually sent — a `Response` to
+// settle it, a string to hand the double a different URL, `undefined` to pass it through.
+const stub = (
+    extra?: (url: string, method: string, body: unknown) => Response | undefined,
+    browser?: (url: string) => Response | string | undefined
+): Call[] => {
     const calls: Call[] = [];
+
+    const double = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? 'GET';
+        const raw = init?.body === undefined ? undefined : String(init.body);
+        const body = raw === undefined ? undefined : JSON.parse(raw);
+        calls.push({ url, method, body, ...(raw === undefined ? {} : { raw }) });
+
+        const handled = extra?.(url, method, body);
+        if (handled !== undefined) return handled;
+
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models' && method === 'POST') return json({ models: ['m1', 'm2'] });
+
+        throw new Error(`unexpected request: ${method} ${url}`);
+    }, { root: '/api' });
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
-            const method = init?.method ?? 'GET';
-            const raw = init?.body === undefined ? undefined : String(init.body);
-            const body = raw === undefined ? undefined : JSON.parse(raw);
-            calls.push({ url, method, body, ...(raw === undefined ? {} : { raw }) });
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const handled = browser?.(String(input));
+            if (handled instanceof Response) return handled;
 
-            const handled = extra?.(url, method, body);
-            if (handled !== undefined) return handled;
+            const answer = double(typeof handled === 'string' ? handled : String(input), init);
 
-            if (url === '/api') return json(bootstrap());
-            if (url === '/api/models' && method === 'POST') return json({ models: ['m1', 'm2'] });
-
-            throw new Error(`unexpected request: ${method} ${url}`);
-        }, { root: '/api' }))
+            return answer instanceof Promise ? await answer : answer;
+        })
     );
 
     return calls;
@@ -205,6 +255,9 @@ const modelCalls = (calls: Call[]): Call[] => calls.filter((call) => call.url ==
 beforeEach(() => {
     vi.resetModules();
     localStorage.clear();
+    // The server-URL tests put `?apiRoot=` in the address bar; the real Location is a
+    // per-file singleton, so a leaked query would change the NEXT test's resolved root.
+    window.history.replaceState(null, '', '/');
     document.body.innerHTML = '<div id="app"></div>';
 });
 
@@ -234,6 +287,74 @@ const closeWithEscape = (): void => {
 // `.endpoint-body` ARE unique to the settings, which is what makes the "no duplicate
 // fields" assertions below exact rather than positional.
 const settingsRoot = (): HTMLElement => byClass('.dialog .endpoint-body', 'div');
+
+// The dialog's LAST line: the root this load resolved. Addressed by position because
+// that is what the DOM order pins (see the child-list assertion below).
+const lastBodyHint = (): string | null | undefined => {
+    const children = settingsRoot().children;
+
+    return children[children.length - 1]?.textContent;
+};
+
+// The harness server URL control (a `div.field`, so `label.field > input.field-input`
+// below keeps naming the provider pair) and its two action buttons.
+const serverRootInput = (): HTMLInputElement => byClass('.dialog #harness-server-root', 'input');
+const serverRootButtons = (): HTMLButtonElement[] => [
+    ...document.querySelectorAll<HTMLButtonElement>('.dialog .endpoint-actions button')
+];
+
+// The model catalogue's status line. It must be scoped through the model `div.field`:
+// the server-URL group above it owns two `.field-hint` siblings of its own, so the
+// first `.field-hint` inside `.endpoint-body` is no longer the model status.
+const modelStatusLine = (): string | null | undefined =>
+    settingsRoot().querySelector('.field .field-hint')?.textContent;
+
+// The server URL's refusal line. `role="status"` is unique to it (the model status line
+// is a plain `.field-hint`), so this selector cannot land on another node.
+const serverRootStatusLine = (): HTMLParagraphElement =>
+    byClass('.dialog p.field-hint[role="status"]', 'p');
+
+// jsdom cannot fake a navigation. `location.reload` is an UNFORGEABLE own property of
+// jsdom's Location (non-writable, non-configurable — verified: assignment,
+// `defineProperty` and `vi.spyOn` all throw, and a Proxy `get` trap that returns
+// anything else violates the proxy invariant and raises a TypeError at the call site).
+// Calling the real one only logs "Not implemented: navigation to another Document"
+// without reporting anything, so `vi.stubGlobal` swaps the GLOBAL SLOT that a bare
+// `location.reload()` resolves to (main.ts:11096 `Retry` included) with a plain object
+// whose URL members read through to the REAL Location. `history.replaceState` therefore
+// still moves the real document URL, and a test can count the reloads AND read the
+// stripped query back from the returned `location`.
+const stubNavigation = (): { readonly reloads: () => number; readonly location: Location } => {
+    const real = window.location;
+    let count = 0;
+
+    const read = (property: 'href' | 'search' | 'hash' | 'pathname' | 'origin'): string => real[property];
+
+    vi.stubGlobal('location', {
+        reload: (): void => {
+            count += 1;
+        },
+        assign: (): void => undefined,
+        replace: (): void => undefined,
+        get href(): string {
+            return read('href');
+        },
+        get search(): string {
+            return read('search');
+        },
+        get hash(): string {
+            return read('hash');
+        },
+        get pathname(): string {
+            return read('pathname');
+        },
+        get origin(): string {
+            return read('origin');
+        }
+    });
+
+    return { reloads: (): number => count, location: real };
+};
 
 // --- the trigger ---------------------------------------------------------------
 
@@ -308,8 +429,14 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
     expect(document.querySelectorAll('.endpoint-dialog')).toHaveLength(1);
     expect(document.querySelectorAll('.model-manual')).toHaveLength(1);
 
-    // Field order and labels are the ones the rail used to carry.
+    // Child order: the harness server URL group FIRST (it decides where the provider
+    // credentials below are sent), then the three provider fields the rail used to
+    // carry, then the two provider hints.
     expect([...body.children].map((child) => child.className)).toEqual([
+        'field',
+        'field-hint',
+        'field-hint is-warning',
+        'endpoint-actions',
         'field',
         'field',
         'field',
@@ -317,13 +444,16 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
         'field-hint'
     ]);
     expect([...body.querySelectorAll('.field-label')].map((node) => node.textContent)).toEqual([
+        'Harness server URL',
         'Base URL',
         'API key',
         'Model'
     ]);
 
-    // Base URL and API key are the two labelled text inputs, in that order, prefilled
-    // from the server defaults with the placeholders the rail showed.
+    // Base URL and API key are still the two labelled text inputs, in that order,
+    // prefilled from the server defaults with the placeholders the rail showed. The
+    // server URL field is a `div.field` with a `label[for]`, which is what keeps this
+    // selector naming the PROVIDER pair and nothing else.
     const inputs = [...body.querySelectorAll<HTMLInputElement>('label.field > input.field-input')];
     expect(inputs.map((input) => input.type)).toEqual(['text', 'password']);
     expect(inputs.map((input) => input.value)).toEqual(['http://provider/v1', '']);
@@ -336,6 +466,36 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
         [false, 'off']
     ]);
 
+    // The harness server URL: the root this load actually uses, an absolute-URL
+    // placeholder, and a real accessible name through `label[for]`.
+    const serverRoot = serverRootInput();
+    expect(serverRoot.type).toBe('text');
+    expect(serverRoot.value).toBe(API_ROOT);
+    expect(serverRoot.placeholder).toBe(SERVER_URL_PLACEHOLDER);
+    expect([serverRoot.spellcheck, serverRoot.autocomplete]).toEqual([false, 'off']);
+    expect(byClass('.dialog label.field-label[for="harness-server-root"]', 'label').textContent).toBe(
+        'Harness server URL'
+    );
+    expect(document.querySelector('.dialog label.field > #harness-server-root')).toBeNull();
+
+    // Its two status nodes: the explanation, and the refusal line that starts empty and
+    // hidden (it is the `role="status"` target of a failed Apply).
+    expect(body.children[1].textContent).toBe(SERVER_URL_HINT);
+    const serverStatus = body.children[2] as HTMLElement;
+    expect(serverStatus.getAttribute('role')).toBe('status');
+    expect(serverStatus.textContent).toBe('');
+    expect(serverStatus.hidden).toBe(true);
+
+    // Its two actions, primary first in the DOM (CSS right-aligns the row, so the
+    // commit button lands where a reader expects it to be pressed).
+    const [apply, reset] = serverRootButtons();
+    expect(apply.textContent).toBe('Apply & reconnect');
+    expect(apply.className).toBe('button primary');
+    expect(apply.type).toBe('button');
+    expect(reset.textContent).toBe('Reset');
+    expect(reset.className).toBe('button');
+    expect(reset.type).toBe('button');
+
     // The dropdown is populated from the catalogue boot fetched, plus the manual
     // fallback entry, and it selects the current model.
     const select = byClass('.dialog .field-select', 'select');
@@ -346,10 +506,13 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
     expect(manual.hidden).toBe(true);
     expect(manual.value).toBe('m1');
 
-    // The three text lines: the model status, the explanation, the resolved API root.
+    // The text lines, in DOM order: the server explanation, its (empty) refusal line,
+    // the model status, the provider explanation, the API root actually in use.
     expect([...body.querySelectorAll('.field-hint')].map((node) => node.textContent)).toEqual([
+        SERVER_URL_HINT,
+        '',
         'Loaded 2 models from http://provider/v1.',
-        'Sent to the harness server when a session starts. Leave the key blank to use the key configured on the server. Values are saved in this browser only. The model list is fetched by the server from {base URL}/models.',
+        SETTINGS_HINT,
         API_ROOT_HINT
     ]);
 
@@ -446,9 +609,7 @@ it('persists dialog edits to storage and fires one debounced catalogue refresh',
     // 'm2' is in the provider list, so the order stays the provider's.
     expect([...select.options].map((option) => option.textContent)).toEqual(['m1', 'm2', 'Custom model…']);
     expect(select.value).toBe('m2');
-    expect(settingsRoot().querySelector('.field-hint')?.textContent).toBe(
-        'Loaded 2 models from http://other/v1.'
-    );
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://other/v1.');
 });
 
 it('sends the dialog values to the session it creates next', async () => {
@@ -570,9 +731,11 @@ it('reopens with the same control nodes, values and listeners', async () => {
 
     openSettings();
 
-    // Identity, not similarity: the reopen adopts the SAME persistent nodes.
+    // Identity, not similarity: the reopen adopts the SAME persistent nodes. Scoped to
+    // `label.field` because the first `input.field-input` in the dialog is now the
+    // harness server URL, which is not part of the provider triple.
     expect(settingsRoot()).toBe(body);
-    expect(document.querySelector('.dialog input.field-input')).toBe(baseURL);
+    expect(document.querySelector('.dialog label.field > input.field-input')).toBe(baseURL);
     expect(document.querySelector('.dialog .field-select')).toBe(select);
     expect(baseURL.value).toBe('http://typed-once/v1');
     expect(select.value).toBe('m1');
@@ -709,9 +872,7 @@ it('still paints the same status live region in place while the dialog is open',
     // says what to do next.
     await pastDebounce();
     expect(modelCalls(calls)).toHaveLength(1);
-    expect(settingsRoot().querySelector('.field-hint')?.textContent).toBe(
-        'Set a base URL to load models. Enter a model manually until then.'
-    );
+    expect(modelStatusLine()).toBe('Set a base URL to load models. Enter a model manually until then.');
 
     // The pill still closes from an error state, and reopens on the blanked value.
     button.click();
@@ -719,6 +880,384 @@ it('still paints the same status live region in place while the dialog is open',
     button.click();
     expect(byClass('.dialog label.field > input.field-input', 'input').value).toBe('');
     expect(byClass('.model-manual', 'input').hidden).toBe(false);
+});
+
+// --- the harness server URL (the UI-level server setting) -------------------
+//
+// The dialog is where a reader points this UI at a DIFFERENT harness without a
+// rebuild: the field is prefilled from what this browser saved (or from the automatic
+// root), Apply validates and persists it, and both actions strip the one-load
+// `?apiRoot=` override and reload — because every request URL and the socket are built
+// from the root resolved at module load (./api.ts), and the shell has no in-place
+// reset. `location.reload` is stubbed (see `stubNavigation`), so these tests count the
+// reload instead of performing it.
+//
+// A click fails LOUDLY whenever the write cannot land, and then changes NOTHING: the
+// reason goes on the refusal line, the dialog stays open with the typed value, no key is
+// written and no reload happens. That covers a malformed URL, a root that normalizes
+// away to `''` (`/`), and a typed Apply in a browser that exposes no `localStorage`; a
+// store that can read but refuses the `remove` fails the same way on Reset. Reloading in
+// any of those cases would land on the OLD root and read as an Apply that silently did
+// nothing. The clear in a browser with NO store is the one case that cannot fail (T5):
+// there is nothing to remove and automatic resolution is what such a browser already
+// gets, so Reset succeeds and reloads.
+
+it('prefills the server URL from the saved setting, not from a one-load override', async () => {
+    // A saved cross-origin root is the whole point of the setting: it is trusted
+    // (typed by this browser, never delivered by a link), so the UI boots against it and
+    // the dialog names it as the root in use.
+    localStorage.setItem(SERVER_URL_KEY, 'https://harness.example.test/v1/harness');
+    stub();
+    await boot();
+    openSettings();
+
+    expect(serverRootInput().value).toBe('https://harness.example.test/v1/harness');
+    expect(lastBodyHint()).toBe(apiRootLine('https://harness.example.test/v1/harness'));
+
+    byClass('.dialog-close', 'button').click();
+
+    // The link-supplied override outranks the saved value FOR THAT LOAD, so the field
+    // still shows the saved URL (pressing Apply would keep it) while the dialog reports
+    // the root actually in use. The two lines disagreeing is the contract.
+    vi.resetModules();
+    document.body.innerHTML = '<div id="app"></div>';
+    window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness');
+    stub();
+    await boot();
+    openSettings();
+
+    expect(serverRootInput().value).toBe('https://harness.example.test/v1/harness');
+    expect(lastBodyHint()).toBe(apiRootLine('http://localhost:5000/v1/harness'));
+});
+
+it('saves a typed server URL normalized, strips the one-load override, and reloads', async () => {
+    stub();
+    await boot();
+    openSettings();
+
+    // `?apiRoot=` is consulted at module load and outranks the saved value, so Apply
+    // must remove it — otherwise the reload it triggers ignores the value just written.
+    // A second parameter and the hash pin that ONLY `apiRoot` is dropped.
+    window.history.replaceState(
+        null,
+        '',
+        '/?theme=dark&apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness#sessions'
+    );
+
+    const navigation = stubNavigation();
+    const field = serverRootInput();
+
+    // The trailing slash is the reader's, not the store's: normalization happens before
+    // the write, so a reload cannot drift from what Apply accepted.
+    field.value = 'https://harness.example.test/v1/harness/';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // Typing alone changes NOTHING: the root is resolved at module load, so only the
+    // explicit action may touch storage, the provider draft, or the model catalogue.
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
+        '{"baseURL":"http://provider/v1","apiKey":"","model":"m1"}'
+    );
+
+    serverRootButtons()[0].click();
+
+    expect(navigation.reloads()).toBe(1);
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBe('https://harness.example.test/v1/harness');
+    expect(navigation.location.pathname).toBe('/');
+    expect(navigation.location.search).toBe('?theme=dark');
+    expect(navigation.location.hash).toBe('#sessions');
+
+    // The provider draft is byte-for-byte the triple it was before: the server URL never
+    // joins `underload-harness-app:settings`, and a keystroke here never refreshes the
+    // provider catalogue (that belongs to the base URL and the key alone).
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
+        '{"baseURL":"http://provider/v1","apiKey":"","model":"m1"}'
+    );
+
+    await pastDebounce();
+});
+
+it('refuses a malformed server URL inline and keeps the dialog, the storage and the page as they were', async () => {
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+    const field = serverRootInput();
+
+    // Protocol-relative: syntactically another origin hiding behind a rooted path, which
+    // `normalizeApiRoot` rejects (./api.ts:228).
+    field.value = '//evil.example/v1/harness';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    serverRootButtons()[0].click();
+
+    const status = serverRootStatusLine();
+    expect(status.hidden).toBe(false);
+    expect(status.classList.contains('is-warning')).toBe(true);
+    expect(status.textContent).toBe('A relative API root must start with a single "/".');
+
+    // Nothing was written, nothing navigated, and the address bar is untouched.
+    expect(navigation.reloads()).toBe(0);
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+    expect(navigation.location.search).toBe('');
+
+    // The typed value stays so the reader can fix it, and the dialog is still open.
+    expect(serverRootInput().value).toBe('//evil.example/v1/harness');
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+
+    // Closing and REOPENING repaints both root displays: the refusal named a value that is
+    // no longer on screen, so carrying it over would claim the freshly painted root had
+    // been rejected. Nothing was written in between, so the field restarts from what this
+    // browser saved (nothing) or the root this load dials, and no reload happened.
+    byClass('.dialog-close', 'button').click();
+    openSettings();
+
+    expect(serverRootStatusLine().hidden).toBe(true);
+    expect(serverRootStatusLine().textContent).toBe('');
+    expect(serverRootInput().value).toBe(API_ROOT);
+    expect(lastBodyHint()).toBe(API_ROOT_HINT);
+    expect(navigation.reloads()).toBe(0);
+});
+
+it('refuses a bare "/" server URL inline instead of saving a value that silently reverts', async () => {
+    // Syntactically a root, and the validator strips trailing slashes, so `/` collapses
+    // to `''` — and `''` is exactly what the store reports for "nothing saved"
+    // (./api.ts `storedApiRoot`). Persisting it would ACCEPT the value, reload, and hand
+    // the next load back to automatic resolution: an Apply that quietly undid itself.
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+    const field = serverRootInput();
+
+    field.value = '/';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    serverRootButtons()[0].click();
+
+    const status = serverRootStatusLine();
+    expect(status.hidden).toBe(false);
+    expect(status.classList.contains('is-warning')).toBe(true);
+    expect(status.textContent).toBe(
+        'The API root cannot be just "/"; use an absolute origin or a path such as /v1/harness.'
+    );
+
+    // No write, no reload, dialog open, typed value intact: the reader fixes it instead
+    // of chasing a root that moved back on its own.
+    expect(navigation.reloads()).toBe(0);
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+    expect(serverRootInput().value).toBe('/');
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+});
+
+it('names a browser with no local storage instead of reloading onto the automatic root', async () => {
+    // The SAVE half of the no-store rule: a typed URL has to be kept somewhere, and a
+    // browser that exposes no store cannot keep it, so the click reports why and stays put
+    // (a blank field / Reset is the other half — see the test below, which succeeds).
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+    const field = serverRootInput();
+    field.value = 'http://localhost:8180/v1/harness';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // Stubbed only now, and only for the click: the shell reads and writes its own
+    // settings throughout boot, so a store that never existed would fail long before
+    // Apply. `vi.stubGlobal` swaps the global SLOT `globalThis.localStorage` reads;
+    // `afterEach` (`vi.unstubAllGlobals`) restores it, and this test restores it itself
+    // to inspect the store afterwards.
+    vi.stubGlobal('localStorage', undefined);
+    serverRootButtons()[0].click();
+
+    const status = serverRootStatusLine();
+    expect(status.hidden).toBe(false);
+    expect(status.textContent).toBe(
+        'This browser does not expose local storage, so the harness server URL cannot be saved.'
+    );
+
+    // The failure replaces the reload: before this, the missing store was an optional
+    // chain that reported success and navigated anyway.
+    expect(navigation.reloads()).toBe(0);
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+
+    vi.unstubAllGlobals();
+
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+});
+
+it('resets to the automatic root even in a browser with no local storage', async () => {
+    // The CLEAR half of the same rule (./api.ts `saveApiRootSetting`, T5): the missing
+    // store may only refuse a value that has to be kept. Reset asks for automatic
+    // resolution, and a browser with no store is already there — `storedApiRoot()` reads
+    // it as "no setting" — so there is nothing to remove and the click must behave like
+    // every other successful Reset: write nothing, show no refusal, drop the one-load
+    // override, reload.
+    stub();
+    await boot();
+    openSettings();
+
+    // Same mid-session stubbing as the test above (the boot needs the real store for the
+    // provider settings); the guard is only observable at the click.
+    window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness');
+    const navigation = stubNavigation();
+
+    vi.stubGlobal('localStorage', undefined);
+
+    expect(serverRootButtons()[1].textContent).toBe('Reset');
+    serverRootButtons()[1].click();
+
+    // Success, not a refusal: the reload happened and the status line stayed empty.
+    expect(navigation.reloads()).toBe(1);
+    expect(serverRootStatusLine().hidden).toBe(true);
+    expect(serverRootStatusLine().textContent).toBe('');
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+
+    // `apiRoot` is stripped even though nothing was written, because leaving it would
+    // point the reload at the override instead of at automatic resolution.
+    expect(navigation.location.search).toBe('');
+
+    // Globals restored (the `location` slot too), and the key is still ABSENT: the click
+    // wrote nothing, which is the whole point of a clear in a store-less browser.
+    vi.unstubAllGlobals();
+
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+});
+
+it('treats a blank field as automatic: Apply clears the saved URL instead of storing an empty one', async () => {
+    localStorage.setItem(SERVER_URL_KEY, 'https://harness.example.test/v1/harness');
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+    const field = serverRootInput();
+    field.value = '';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    serverRootButtons()[0].click();
+
+    // An empty string would be a stored value that resolves to nothing; the key is gone,
+    // so the next load walks the documented ladder from the top.
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+    expect(navigation.reloads()).toBe(1);
+});
+
+it('resets to the automatic root: clears the saved URL, drops the override, and reloads', async () => {
+    localStorage.setItem(SERVER_URL_KEY, 'https://harness.example.test/v1/harness');
+    stub();
+    await boot();
+    openSettings();
+
+    window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness');
+    const navigation = stubNavigation();
+
+    // The secondary button of the row (`Reset`, not `Apply & reconnect`).
+    expect(serverRootButtons()[1].textContent).toBe('Reset');
+    serverRootButtons()[1].click();
+
+    expect(navigation.reloads()).toBe(1);
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+    expect(navigation.location.search).toBe('');
+
+    // A reset with no failure never shows the refusal line.
+    expect(serverRootStatusLine().hidden).toBe(true);
+});
+
+it('reports a store that refuses the reset instead of reloading onto the same saved root', async () => {
+    // The store here CAN read (the boot resolves the saved root and the field is
+    // prefilled from it) but CANNOT remove. Silently accepting that made Reset a no-op
+    // the reader could never see finish: the reload re-resolved the very host they just
+    // asked to leave.
+    localStorage.setItem(SERVER_URL_KEY, 'https://harness.example.test/v1/harness');
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+        throw new Error('SecurityError');
+    });
+
+    expect(serverRootButtons()[1].textContent).toBe('Reset');
+    serverRootButtons()[1].click();
+
+    const status = serverRootStatusLine();
+    expect(status.hidden).toBe(false);
+    expect(status.textContent).toBe(
+        'Could not clear the saved harness server URL in this browser: SecurityError'
+    );
+
+    expect(navigation.reloads()).toBe(0);
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+
+    removeItem.mockRestore();
+
+    // Why the reload is the wrong answer: the saved root survived the failed clear.
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBe('https://harness.example.test/v1/harness');
+});
+
+// --- the static-host probe moves the root AFTER this dialog was built ---------
+//
+// A GitHub Pages deployment pins nothing (./api.ts source 5), so `resolveRoot` hands the
+// compiled local/LAN chain to `ensureApiRoot`, and `API_ROOT` — an ESM live binding —
+// only becomes final inside `loadBootstrap` (./api.ts:681), strictly AFTER `main.ts`
+// module scope painted this dialog. The two root displays are therefore repainted on
+// every open (./main.ts `paintServerRoot`). Pre-fix, both kept naming candidate 1 (dead)
+// while every request and the live stream went to the gateway that answered.
+
+it('names the gateway the static-host probe landed on, not the candidate resolved at module load', async () => {
+    // The Pages Location double `api-static-host.test.ts:85` uses. It must be in place
+    // before `api.ts` is evaluated: `vi.resetModules()` (beforeEach) plus the dynamic
+    // `import('./main')` below give this test its own module graph, so this stubbed
+    // Location is what `isStaticPagesHost()` reads.
+    vi.stubGlobal('location', {
+        protocol: 'https:',
+        hostname: 'underload-app.github.io',
+        host: 'underload-app.github.io',
+        origin: 'https://underload-app.github.io',
+        href: 'https://underload-app.github.io/harness/',
+        search: '',
+        reload: (): void => undefined
+    });
+
+    const dead = STATIC_API_CANDIDATES[0];
+    const live = STATIC_API_CANDIDATES[1];
+    const dialled: string[] = [];
+
+    stub(undefined, (url) => {
+        dialled.push(url);
+
+        // Candidate 1 refuses: `probeRoot` requires `response.ok`, so a 503 fails the
+        // probe and the chain moves on to candidate 2 (the shared double would answer
+        // its `/health` with `{ ok: true }`, which is what pins the winner).
+        if (url.startsWith(dead)) return json({ error: { message: 'gateway down' } }, 503);
+
+        // The double answers the canonical MOUNT (every other test in this file dials
+        // `/v1/harness`); the client dials the absolute candidate root instead, and
+        // `stripOrigin` only reduces an absolute URL once a path follows the root, so the
+        // mount-stamped path is handed over here. The log above still shows what the
+        // browser really sent.
+        return url.startsWith(live) ? `${HARNESS_API_ROOT}${url.slice(live.length)}` : undefined;
+    });
+
+    await boot();
+
+    // The move is real, not merely displayed: the chain was walked in order and the boot
+    // document was read from the gateway that answered.
+    expect(dialled[0]).toBe(`${dead}/health`);
+    expect(dialled).toContain(`${live}/health`);
+    expect(dialled).toContain(live);
+
+    openSettings();
+
+    // Both displays name the root actually in use. `API_ROOT` (imported at the top of this
+    // file) belongs to the PRE-reset module instance, so the expectation is the compiled
+    // candidate the live binding moved to — and it is provably NOT the stale candidate.
+    expect(serverRootInput().value).toBe(live);
+    expect(serverRootInput().value).not.toBe(dead);
+    expect(lastBodyHint()).toBe(apiRootLine(live));
 });
 
 // --- the stylesheet contract --------------------------------------------------
@@ -799,6 +1338,15 @@ it('styles the pill trigger as a bare wrapper and drops the accordion rules', ()
     const body = blockOf('.endpoint-body {');
     expect(body).toContain('gap: 9px');
     expect(body).not.toContain('padding');
+
+    // The server-URL action row: a right-aligned pair under the field it commits, with
+    // the sheet's standard action spacing, and no wrapping surprises at the dialog's
+    // `min-width: min(440px, 100%)`.
+    const actions = blockOf('.endpoint-actions {');
+    expect(actions).toContain('display: flex');
+    expect(actions).toContain('justify-content: flex-end');
+    expect(actions).toContain('gap: 8px');
+    expect(actions).not.toContain('position:');
 
     // The disclosure vocabulary is gone from every layer of the sheet.
     for (const dead of ['.endpoint {', '.endpoint-summary', '.endpoint[open]']) {

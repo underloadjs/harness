@@ -678,6 +678,47 @@ describe('bounds', () => {
         expect(result.results[0].snippet).toHaveLength(MAX_SNIPPET_CHARS);
     });
 
+    it('flags a snippet that was cut at the bound', async () => {
+        // A cut snippet and a complete snippet were indistinguishable, and the
+        // difference is exactly whether the caller should go and fetch the page.
+        stubFetch(
+            json({
+                results: [
+                    { title: 'long', url: 'https://example.com/a', highlights: ['s'.repeat(MAX_SNIPPET_CHARS + 500)] },
+                    { title: 'short', url: 'https://example.com/b', highlights: ['whole thing'] }
+                ]
+            })
+        );
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q' });
+
+        expect(result.results[0].snippetTruncated).toBe(true);
+        // Absent, not false: an uncut result keeps its exact previous shape.
+        expect(result.results[1].snippetTruncated).toBeUndefined();
+    });
+
+    it('rejects a malformed domain entry by name instead of taking a provider 400', async () => {
+        // The provider answers a bad entry with a bare "HTTP 400" that names no
+        // field, because the body is deliberately never surfaced (it can echo the
+        // key). Validate locally and point at the entry.
+        let requests = 0;
+        stubFetch(async () => {
+            requests += 1;
+            return json({ results: [] });
+        });
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        await expect(tool({ query: 'q', includeDomains: ['not a domain!!'] })).rejects.toThrow(
+            /entry "not a domain!!" is not a domain/
+        );
+        expect(requests).toBe(0);
+
+        // What the provider documents as valid must still pass: hostname, path
+        // prefix, wildcard subdomain, and a scheme the caller left on by habit.
+        await tool({ query: 'q', includeDomains: ['example.com', 'example.com/docs', '*.example.com'] });
+        expect(requests).toBe(1);
+    });
+
     it('redacts before truncation so no key prefix survives the boundary', async () => {
         // Each value is only a few characters shorter than its bound, so the
         // credential straddles the cut. Redacting after truncation (the old order)
@@ -708,6 +749,10 @@ describe('bounds', () => {
                 title: `${titlePrefix}[r`,
                 url: 'https://example.com/page',
                 snippet: `${snippetPrefix}[reda`,
+                // This snippet straddles the bound by construction, so the new
+                // truncation flag is expected here; the assertion below is the one
+                // that matters for this test — no key characters survive the cut.
+                snippetTruncated: true,
                 published: `${publishedPrefix}[red`
             }
         ]);

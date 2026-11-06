@@ -1611,6 +1611,10 @@ export type WebSearchMatch = {
     title: string;
     url: string;
     snippet: string;
+    // True when `snippet` was cut at the character bound rather than ending at the
+    // source's own end. Present only when true. A cut snippet and a complete one
+    // otherwise look identical, and the difference is whether to `fetch` the page.
+    snippetTruncated?: boolean;
     // Provider-reported publication date, when it sends one.
     published?: string;
 };
@@ -1665,6 +1669,18 @@ export type WebFetchConfiguration = {
     // key is absent: not offered in the schema and not callable. Resolution and
     // the wire adapter belong to tools/webfetch.
     linkup?: WebsearchProviderConfiguration;
+    // Resolved-address SSRF gate (F5). By default the native provider resolves
+    // the host and re-applies the private-address check to the ANSWER, which
+    // closes the hole a URL-spelling check cannot: `169-254-169-254.nip.io` is a
+    // public name whose A record is the cloud metadata IP.
+    //   `lookup` — inject a resolver (tests, or a runtime without node:dns).
+    //   `off: true` — skip the gate and keep spelling-only validation.
+    // The gate is fail-open: a resolver that errors, hangs, or is unavailable
+    // never turns into a "this URL is private" verdict.
+    dns?: {
+        lookup?: (hostname: string) => Promise<string[]>;
+        off?: boolean;
+    };
 };
 
 // The model-facing argument shape. `url` is the only required property; having
@@ -1713,8 +1729,14 @@ export type WebFetchResult = {
     // Characters the page holds in total (before any bound). Lets a caller tell a
     // complete short page from a long one that was cut.
     pageCharacters?: number;
-    // The offset this window started at, echoed back from the argument.
+    // The offset this window ACTUALLY started at. Normally the argument; when the
+    // argument was past the end of the page it is the clamped value, and
+    // `offsetClamped` says so. Echoed so a caller paging a document always knows
+    // where it is.
     offset?: number;
+    // True only when the requested `offset` was past the end and had to be pulled
+    // back. Without this, an overshoot looked identical to an empty page.
+    offsetClamped?: boolean;
     // Character offset of the NEXT page of this page. Present only when
     // `truncated` is true, so resuming is a fact from the tool rather than a
     // guess about where the cut landed.
@@ -1730,6 +1752,15 @@ export type WebFetchResult = {
     matches?: number;
     totalSections?: number;
     totalMatches?: number;
+    // How a query answer was produced. 'heading' = the section filter worked as
+    // documented. 'proximity' = the page has no heading structure, so the answer
+    // is a text window around the first match rather than a section, and the
+    // caller should not read it as a precise structural hit.
+    matchMode?: 'heading' | 'proximity';
+    // A plain-language pointer attached when a behaviour needs explaining: an
+    // offset that was clamped, or a query that degraded to proximity. Cheap to
+    // ignore, and cheaper than a wasted turn.
+    note?: string;
 };
 
 // ---------------------------------------------------------------------------

@@ -154,8 +154,18 @@ const statusFailure = (status: number): HarnessError => {
     return new HarnessError(`fetch failed (HTTP ${status}).`);
 };
 
+// The cap itself is a deliberate design (2 tests pin it): a page that will not
+// fit is a file, not an article, and the tool refuses rather than streaming an
+// arbitrary host into memory. What was missing is the REMEDY. The binary path
+// already names `download`; the size path just said "too big" and left the model
+// to guess. Measured in this session, that meant three real pages — an RFC in
+// .html, the same RFC's 1.1 MB sibling, and a 1.6 MB Project Gutenberg text —
+// were simply unfetchable with no way forward offered, even though the tool can
+// serve 240,000 characters of a page it would accept.
 const oversizedResponse = (): HarnessError =>
-    new HarnessError(`fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
+    new HarnessError(
+        `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes. Try the plain-text or raw source form of the page if the host offers one (for example .txt, or a "?action=raw" / print view), ask for fewer characters with "query", or use the \`download\` tool to save the bytes and read them with grep and read.`
+    );
 
 // ---------------------------------------------------------------------------
 // Charset
@@ -297,6 +307,70 @@ export const safeFetchUrl = (value: unknown): string | undefined => {
     } catch {
         return undefined;
     }
+};
+
+// ---------------------------------------------------------------------------
+// Resolved-address SSRF (F5)
+// ---------------------------------------------------------------------------
+//
+// `isPrivateHost` validates the ADDRESS FORM. A public-looking DNS name that
+// RESOLVES to a private address sailed through it, and that is exactly how the
+// cloud metadata service gets read from a text tool: `169-254-169-254.nip.io`
+// and `127.0.0.1.nip.io` are public names (verified by lookup) whose A records
+// are 169.254.169.254 and 127.0.0.1. Measured in this session: the literal
+// `http://127.0.0.1/` was refused by the filter, while `http://127.0.0.1.nip.io/`
+// was not refused at all and reached the network — two different error classes
+// proving the address check never saw the resolved IP.
+//
+// So the gate is applied twice: lexically on the URL (fast, always), and again
+// on the resolved address when a resolver is configured. The second pass is
+// deliberately OPTIONAL and FAIL-OPEN, for three reasons:
+//   1. Node's `dns` is not available to a browser/bun runtime, and this tool
+//      must not stop working there;
+//   2. a resolver failure must not be reported as "this URL is private";
+//   3. the offline test suite stubs `fetch` and never stubs DNS, so an
+//      un-injected resolver must not turn a green suite red.
+// A host that injects `resolve` closes the rebinding hole; a host that does not
+// keeps today's behaviour and the documented limitation stays honest.
+export type DnsLookup = (hostname: string) => Promise<string[]>;
+
+// Bound the lookup so a slow or hostile DNS answer cannot consume the fetch
+// budget before the fetch itself has started.
+const RESOLVE_TIMEOUT_MS = 2_000;
+
+export const resolvePublicHost = async (
+    hostname: string,
+    resolve?: DnsLookup
+): Promise<{ blocked: boolean; address?: string }> => {
+    if (resolve === undefined) return { blocked: false };
+
+    // An IP literal needs no lookup, and looking one up would be a wasted query.
+    if (isPrivateHost(hostname)) return { blocked: true };
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) return { blocked: false };
+
+    let addresses: string[];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        // The watchdog is cleared in `finally`: an un-cleared timer would hold the
+        // event loop open after the answer arrived and delay process exit.
+        const deadline = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('dns timeout')), RESOLVE_TIMEOUT_MS);
+        });
+
+        addresses = await Promise.race([resolve(hostname), deadline]);
+    } catch {
+        // No answer, a timeout, or a resolver that is not a function: not a
+        // security verdict, so proceed and let the connection decide.
+        return { blocked: false };
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
+    }
+
+    for (const address of addresses ?? []) {
+        if (isPrivateHost(address)) return { blocked: true, address };
+    }
+
+    return { blocked: false };
 };
 
 // Best-effort release of a body that is rejected before it is read (a failing
@@ -487,7 +561,13 @@ const redirectTarget = (location: string | null, from: string): string | undefin
 // local server on 127.0.0.1 answered a fetch and its 404 came back as the tool's
 // own error. Following manually lets every hop be re-validated, keeps the
 // `redirects` count honest, and still reports the final URL.
-export const requestPage = async (url: string, format: 'markdown' | 'text' | 'html'): Promise<PageFetch> => {
+export const requestPage = async (
+    url: string,
+    format: 'markdown' | 'text' | 'html',
+    // Optional DNS resolver (see resolvePublicHost). Injected by a host that wants
+    // the rebinding hole closed; absent means address-form checking only.
+    resolve?: DnsLookup
+): Promise<PageFetch> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -524,13 +604,26 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
         }
     };
 
+    // Refusal wording shared by the first hop and every redirect, so a blocked
+    // target always says which address was the problem when a resolver found one.
+    const refuse = (detail?: string): HarnessError =>
+        new HarnessError(
+            `fetch refuses this URL: it is not a public absolute http(s) address (loopback and private addresses are not fetched)${
+                detail === undefined ? '' : ` — ${detail} resolves to a non-public address`
+            }.`
+        );
+
     try {
         let target = safeFetchUrl(url);
 
         if (target === undefined) {
-            throw new HarnessError(
-                'fetch refuses this URL: it is not a public absolute http(s) address (loopback and private addresses are not fetched).'
-            );
+            throw refuse();
+        }
+
+        // Second gate: the name may be public while the address behind it is not.
+        const firstHop = await resolvePublicHost(new URL(target).hostname, resolve);
+        if (firstHop.blocked) {
+            throw refuse(firstHop.address ?? new URL(target).hostname);
         }
 
         let response: Response | undefined;
@@ -569,6 +662,17 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
                 if (safe === undefined) {
                     throw new HarnessError(
                         `fetch refused a redirect to a non-public address (HTTP ${response.status}).`
+                    );
+                }
+
+                // A redirect is the attacker's turn: re-run the resolved check on the
+                // new host, not just its spelling.
+                const hop = await resolvePublicHost(new URL(safe).hostname, resolve);
+                if (hop.blocked) {
+                    throw new HarnessError(
+                        `fetch refused a redirect to a non-public address (HTTP ${response.status})${
+                            hop.address === undefined ? '' : ` — ${hop.address}`
+                        }.`
                     );
                 }
 

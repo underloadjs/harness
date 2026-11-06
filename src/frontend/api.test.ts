@@ -22,12 +22,19 @@
 // provider key is posted there), the header/error/accept semantics of the transport, and
 // the encoding of every id that is user data.
 //
+// WHAT THIS FILE NOW ALSO OWNS: the saved "Harness server URL" (`API_ROOT_STORAGE_KEY` /
+// `storedApiRoot` / `saveApiRootSetting`) — step 2 of the resolution ladder, written by
+// the Endpoint & model dialog. To the trust rule above it is the one exception by
+// design: it can only have been typed in this browser, so it may name another origin
+// (like the build-time value), it outranks that value and the injected config, and only
+// `?apiRoot=` still beats it.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts api.test.ts
 
 import { HARNESS_PAGE_LIMIT, HARNESS_ROUTES } from '../shared/harness-api';
 import type { GlobalConfigDocument, HarnessCard, ServiceInfo, ToolSummary, AgentSummary, SessionSummary } from '../shared/harness-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { normalizeApiRoot } from './api';
+import { API_ROOT_STORAGE_KEY, normalizeApiRoot, saveApiRootSetting, storedApiRoot } from './api';
 
 const CANONICAL = '/v1/harness';
 
@@ -170,6 +177,10 @@ beforeEach(() => {
     vi.resetModules();
     calls = [];
     window.history.replaceState(null, '', '/');
+    // The saved server URL lives in localStorage (./api.ts `API_ROOT_STORAGE_KEY`), and
+    // the store is a per-file singleton — without this a value saved by one test would
+    // decide the root of the next one.
+    localStorage.clear();
 });
 
 afterEach(() => {
@@ -363,6 +374,283 @@ describe('resolveApiRoot', () => {
         expect(calls).toEqual([
             { method: 'GET', url: '/v1/harness/sessions/a%2Fb', body: undefined, keepalive: undefined }
         ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// The saved "Harness server URL" — the Endpoint & model dialog's own setting
+// ---------------------------------------------------------------------------
+//
+// This is the source that makes the UI independent of the server it was served by:
+// the reader types a control-plane root, it is validated and persisted by
+// `saveApiRootSetting`, and the NEXT load (the dialog reloads on Apply) resolves it as
+// step 2 of the ladder. It outranks the injected config and `VITE_HARNESS_API` — an
+// operator bundle must be re-pointable without a rebuild — and only `?apiRoot=` beats
+// it, because that parameter is the documented per-load override.
+
+describe('the saved server URL', () => {
+    it('becomes the root every request and the socket dial', async () => {
+        localStorage.setItem(API_ROOT_STORAGE_KEY, 'https://harness.example.test/v1/harness');
+        serve({ 'GET https://harness.example.test/v1/harness/health': { ok: true, sessions: 0, epoch: 'e' } });
+
+        const module = await import('./api');
+
+        expect(module.API_ROOT).toBe('https://harness.example.test/v1/harness');
+        expect(await module.getHealth()).toEqual({ ok: true, sessions: 0, epoch: 'e' });
+        expect(calls).toEqual([
+            {
+                method: 'GET',
+                url: 'https://harness.example.test/v1/harness/health',
+                body: undefined,
+                keepalive: undefined
+            }
+        ]);
+
+        // The realtime plane follows the SAME root, and an https host must dial `wss:`.
+        expect(module.streamSocketUrl()).toBe('wss://harness.example.test/v1/harness/stream');
+    });
+
+    it('trusts a cross-origin absolute root that a runtime source must refuse', async () => {
+        // F1 keeps refusing `https://evil.example` from a query string: a link must not
+        // take the saved provider key. The same host SAVED in this browser is a
+        // deliberate choice, so it is accepted — that is the whole feature.
+        window.history.replaceState(null, '', '/?apiRoot=https%3A%2F%2Fevil.example%2Fv1%2Fharness');
+        let module = await import('./api');
+        expect(module.API_ROOT).toBe(CANONICAL);
+
+        vi.resetModules();
+        window.history.replaceState(null, '', '/');
+        localStorage.setItem(API_ROOT_STORAGE_KEY, 'https://evil.example/v1/harness');
+        module = await import('./api');
+        expect(module.API_ROOT).toBe('https://evil.example/v1/harness');
+    });
+
+    it('outranks the injected config and VITE_HARNESS_API, and only ?apiRoot= beats it', async () => {
+        localStorage.setItem(API_ROOT_STORAGE_KEY, 'https://saved.example.test/v1/harness');
+        vi.stubEnv('VITE_HARNESS_API', 'https://built.example.test/v1/harness');
+        (globalThis as { __HARNESS_CONFIG__?: { apiRoot?: string } }).__HARNESS_CONFIG__ = {
+            apiRoot: 'https://injected.example.test/v1/harness'
+        };
+
+        const saved = await import('./api');
+        expect(saved.API_ROOT).toBe('https://saved.example.test/v1/harness');
+
+        vi.resetModules();
+        window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness');
+        const overridden = await import('./api');
+        expect(overridden.API_ROOT).toBe('http://localhost:5000/v1/harness');
+
+        // A BROKEN query value is ignored, so the saved root still applies: the reader's
+        // setting is not held hostage by a hand-edited address bar.
+        vi.resetModules();
+        window.history.replaceState(null, '', '/?apiRoot=javascript%3Aalert(1)');
+        const brokenQuery = await import('./api');
+        expect(brokenQuery.API_ROOT).toBe('https://saved.example.test/v1/harness');
+    });
+
+    it('ignores a stored value that cannot be a root instead of refusing to boot', async () => {
+        // Reachable when the store is edited by hand or by another tab: `resolveRoot`
+        // never trusts the raw string, so an unusable entry falls through to the
+        // documented default rather than throwing during module load.
+        for (const value of ['javascript:alert(1)', '//evil.example/api', 'v1/harness', '/v1/harness?k=secret', '']) {
+            vi.resetModules();
+            localStorage.setItem(API_ROOT_STORAGE_KEY, value);
+
+            const module = await import('./api');
+            expect(module.API_ROOT).toBe(CANONICAL);
+        }
+    });
+
+    it('normalizes a hand-written entry the same way the write path does', async () => {
+        localStorage.setItem(API_ROOT_STORAGE_KEY, '  https://harness.example.test/v1/harness///  ');
+        let module = await import('./api');
+        expect(module.API_ROOT).toBe('https://harness.example.test/v1/harness');
+
+        vi.resetModules();
+        localStorage.setItem(API_ROOT_STORAGE_KEY, ' /v1/harness/ ');
+        module = await import('./api');
+        expect(module.API_ROOT).toBe('/v1/harness');
+    });
+});
+
+describe('saveApiRootSetting / storedApiRoot', () => {
+    it('round-trips the normalized value and clears the key (never stores an empty string)', () => {
+        expect(storedApiRoot()).toBeUndefined();
+
+        expect(saveApiRootSetting('http://127.0.0.1:5000/v1/harness/')).toBe(
+            'http://127.0.0.1:5000/v1/harness'
+        );
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBe('http://127.0.0.1:5000/v1/harness');
+        expect(storedApiRoot()).toBe('http://127.0.0.1:5000/v1/harness');
+
+        // `null`, blank and `undefined` all REMOVE the key, which is what makes the next
+        // load resolve automatically again; an empty string left behind would be a saved
+        // value that means nothing.
+        expect(saveApiRootSetting(null)).toBeUndefined();
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+
+        expect(saveApiRootSetting('   ')).toBeUndefined();
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+
+        saveApiRootSetting('/v1/harness');
+        expect(saveApiRootSetting(undefined)).toBeUndefined();
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+        expect(storedApiRoot()).toBeUndefined();
+    });
+
+    it('refuses a root that normalizes away to the origin instead of storing an empty string', () => {
+        // `normalizeApiRoot` keeps `/` as `''` (./api.ts:244) because `${root}${path}`
+        // must stay correct — and `storedApiRoot` reports `''` as "nothing saved". So
+        // persisting `''` here would ACCEPT the value on Apply and hand the NEXT load
+        // back to automatic resolution: a save that silently reverts. The refusal is the
+        // fix, and it is limited to the write path (query/injected roots keep the old
+        // semantics, pinned above).
+        for (const typed of ['/', ' / ', '  /  ']) {
+            expect(() => saveApiRootSetting(typed)).toThrow(
+                'The API root cannot be just "/"; use an absolute origin or a path such as /v1/harness.'
+            );
+
+            expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+            expect(storedApiRoot()).toBeUndefined();
+        }
+
+        // Every longer all-slash form is refused EARLIER, by the rule that rejects a
+        // protocol-relative root (`//host` hides another origin behind a rooted path).
+        // Same outcome — a refusal and nothing stored — different sentence, so it is
+        // pinned rather than assumed.
+        for (const typed of ['//', '///']) {
+            expect(() => saveApiRootSetting(typed)).toThrow(
+                'A relative API root must start with a single "/".'
+            );
+
+            expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+            expect(storedApiRoot()).toBeUndefined();
+        }
+    });
+
+    it('still saves an absolute origin that carries no path', () => {
+        // The refusal above is about the ROOT collapsing to nothing. A bare origin URL
+        // is a deliberate "dial this host at its root" and normalizes to a non-empty
+        // value, so it must keep working after that guard.
+        expect(saveApiRootSetting('http://localhost:8180')).toBe('http://localhost:8180');
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBe('http://localhost:8180');
+        expect(storedApiRoot()).toBe('http://localhost:8180');
+
+        // The trailing-slash form is the same host and lands on the same bytes.
+        expect(saveApiRootSetting('http://localhost:8180/')).toBe('http://localhost:8180');
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBe('http://localhost:8180');
+    });
+
+    it('refuses to SAVE in a browser with no local storage, and treats a CLEAR as already done', () => {
+        // A store that is ABSENT (not one that throws) used to make every branch fall
+        // through the optional chain and report success: Apply saved nothing, then
+        // reloaded onto the automatic root. That is the silent-revert bug, so the write
+        // path now fails loudly and the dialog keeps the reader's typed value.
+        //
+        // The clear is the other half, and it is NOT symmetric (T5): with no store there is
+        // nothing to remove, and `storedApiRoot()` already answers "no setting" — which is
+        // exactly what Reset and an empty Apply ask for. Throwing there made Reset an error
+        // line the reader could not act on, so a blank value returns `undefined` and the
+        // caller reloads onto automatic resolution, the same place it would land anyway.
+        // Hence the guard order inside `saveApiRootSetting`: blank first, store check after.
+        //
+        // Approach: `vi.stubGlobal('localStorage', undefined)` replaces the jsdom global
+        // SLOT that `globalThis.localStorage` reads (restored by `vi.unstubAllGlobals()`,
+        // which `afterEach` also calls); no descriptor juggling is needed.
+        vi.stubGlobal('localStorage', undefined);
+
+        expect(storedApiRoot()).toBeUndefined();
+
+        // A value that has to be KEPT is the only failure.
+        expect(() => saveApiRootSetting('http://localhost:8180/v1/harness')).toThrow(
+            'This browser does not expose local storage, so the harness server URL cannot be saved.'
+        );
+
+        // The store check still runs BEFORE `normalizeApiRoot`, so a malformed URL in a
+        // no-storage browser names the storage, not the syntax. Unchanged by the reorder:
+        // only the blank branch moved above the guard.
+        expect(() => saveApiRootSetting('//evil.example/api')).toThrow(
+            'This browser does not expose local storage, so the harness server URL cannot be saved.'
+        );
+
+        // Every clear form succeeds without a store, silently and with no key written.
+        for (const cleared of [null, undefined, '', '   ']) {
+            expect(saveApiRootSetting(cleared)).toBeUndefined();
+        }
+
+        vi.unstubAllGlobals();
+
+        // Nothing was written while the store was gone, and the same value saves fine
+        // once it is back: the throw came from the missing store, not from the value.
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+        expect(saveApiRootSetting('http://localhost:8180/v1/harness')).toBe(
+            'http://localhost:8180/v1/harness'
+        );
+    });
+
+    it('rejects every value that is not a plain path or http(s) origin, and writes nothing', () => {
+        // The dialog shows these exact sentences, so they are pinned, not paraphrased.
+        const refused: Array<[string, string]> = [
+            ['v1/harness', 'A relative API root must start with a single "/".'],
+            ['//evil.example/api', 'A relative API root must start with a single "/".'],
+            ['localhost:8180/v1/harness', 'The API root must be an http(s) URL.'],
+            ['/v1/harness?apiKey=secret', 'The API root cannot carry a query string or a fragment.'],
+            ['/v1/harness#mount', 'The API root cannot carry a query string or a fragment.'],
+            ['http://user:pass@example.test/v1/harness', 'The API root cannot carry credentials.'],
+            ['/\\evil.example/api', 'A relative API root cannot contain backslashes or control characters.']
+        ];
+
+        for (const [value, message] of refused) {
+            expect(() => saveApiRootSetting(value)).toThrow(message);
+            expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBeNull();
+        }
+    });
+
+    it('surfaces a store that refuses the write, because the caller is about to reload', () => {
+        const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+            throw new Error('SecurityError');
+        });
+
+        expect(() => saveApiRootSetting('/v1/harness')).toThrow(
+            'Could not save the harness server URL in this browser: SecurityError'
+        );
+
+        setItem.mockRestore();
+    });
+
+    it('reads a blocked store as no setting at all, so resolution keeps working', () => {
+        const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+            throw new Error('SecurityError');
+        });
+
+        localStorage.setItem(API_ROOT_STORAGE_KEY, '/v1/harness');
+        expect(storedApiRoot()).toBeUndefined();
+
+        getItem.mockRestore();
+        expect(storedApiRoot()).toBe('/v1/harness');
+    });
+
+    it('surfaces a store that refuses the clear, because the caller is about to reload', () => {
+        // Reset used to swallow this, on the theory that an unreachable store already
+        // behaves as "nothing saved". That is wrong for a store that CAN read but cannot
+        // remove: the saved root survives the reload, so Reset is a silent no-op and the
+        // reader is left on the host they just asked to leave.
+        localStorage.setItem(API_ROOT_STORAGE_KEY, '/v1/harness');
+
+        const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+            throw new Error('SecurityError');
+        });
+
+        expect(() => saveApiRootSetting(null)).toThrow(
+            'Could not clear the saved harness server URL in this browser: SecurityError'
+        );
+
+        removeItem.mockRestore();
+
+        // The exact reason the throw matters: the key is STILL there, so a reload would
+        // have re-resolved the same saved root.
+        expect(localStorage.getItem(API_ROOT_STORAGE_KEY)).toBe('/v1/harness');
+        expect(storedApiRoot()).toBe('/v1/harness');
     });
 });
 

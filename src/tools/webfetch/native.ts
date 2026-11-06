@@ -22,7 +22,7 @@
 //   - ./index   — dispatch + redaction + the character bound
 
 import { requestPage } from './request';
-import type { PageFetch } from './request';
+import type { DnsLookup, PageFetch } from './request';
 
 export type ConvertedPage = {
     content: string;
@@ -96,6 +96,37 @@ const NON_CONTENT =
     /<(script|style|noscript|template|head|svg|canvas)\b[^>]*>[\s\S]*?<\/(?:script|style|noscript|template|head|svg|canvas)>/gi;
 const COMMENTS = /<!--[\s\S]*?(?:-->|$)/g;
 
+// Page CHROME: navigation and sidebars, whose text a reader never wanted but
+// which survive the pass above because they are legitimate content elements.
+// Measured: a Wikipedia article returned its entire 321-entry interlanguage list
+// (`Аԥсшәа / Acèh / Адыгабзэ / Afrikaans …`) plus the sidebar menu before the
+// lead paragraph, and a footer-only offset window came back as nothing but
+// "Privacy policy / About Wikipedia / Disclaimers". That is a third of a 64 KiB
+// budget spent on links.
+//
+// A SEPARATE regex from NON_CONTENT, not another name in its alternation: that
+// pattern's lazy body stops at the first closing tag of ANY of its elements, so
+// folding `nav` in would let a `</aside>` inside a `<nav>` end the match early
+// and leave half the navigation behind as stray text. Its own alternation makes
+// nav/aside nest correctly against their own kind.
+//
+// `header` and `footer` are deliberately NOT pruned. On article and docs pages a
+// `<header>` routinely carries the page's own heading and summary, and dropping
+// it would lose real content to save a few lines — a worse trade than the noise
+// it keeps. `format: "html"` is the inspector's view and stays untouched.
+//
+// KNOWN LIMIT, stated rather than oversold: chrome built from generic `<div>`s
+// with class names survives. Measured on the same article, the 321-entry
+// interlanguage list lives in `<div class="vector-dropdown mw-portlet">`, not in
+// a landmark element. Pruning it would mean matching `<div>` with a lazy close,
+// and divs NEST — the first `</div>` ends the match early, so a regex pass
+// cannot tell chrome divs from content divs without a real parser. Pruning by
+// class name is also how a site's own rename silently changes what the tool
+// returns. Verified effect on that page: 40,760 bytes of markup inside the 12
+// `<nav>` elements is dropped, and the main menu/sidebar block is gone from the
+// output; the language list remains.
+const CHROME = /<(nav|aside)\b[^>]*>[\s\S]*?<\/(?:nav|aside)>/gi;
+
 // <pre> blocks become fenced code. The placeholder is a private-use codepoint
 // pair, so page text can never collide with it, and the block's content skips
 // every later inline pass (a `<b>` inside code stays literal text).
@@ -162,7 +193,7 @@ const convertHtmlToMarkdown = (html: string): { text: string; title?: string } =
     // <head>, and <head> is one of the stripped containers.
     const title = extractTitle(html);
 
-    let output = html.replace(COMMENTS, '').replace(NON_CONTENT, '');
+    let output = html.replace(COMMENTS, '').replace(NON_CONTENT, '').replace(CHROME, '');
 
     const { html: withoutPre, blocks } = extractPreBlocks(output, true);
     output = withoutPre;
@@ -253,7 +284,7 @@ const convertHtmlToText = (html: string): { text: string; title?: string } => {
     // Same ordering rule as the markdown pass: title first, then strip <head>.
     const title = extractTitle(html);
 
-    let output = html.replace(COMMENTS, '').replace(NON_CONTENT, '');
+    let output = html.replace(COMMENTS, '').replace(NON_CONTENT, '').replace(CHROME, '');
 
     const { html: withoutPre, blocks } = extractPreBlocks(output, false);
 
@@ -287,14 +318,17 @@ const convertHtmlToText = (html: string): { text: string; title?: string } => {
 
 export type NativeFetch = (
     url: string,
-    format: 'markdown' | 'text' | 'html'
+    format: 'markdown' | 'text' | 'html',
+    // Optional DNS resolver forwarded to requestPage for the resolved-address SSRF
+    // gate (see ./request). Absent means address-form checking only.
+    resolve?: DnsLookup
 ) => Promise<{ page: PageFetch; converted: ConvertedPage }>;
 
 // Fetch and convert. The decision of WHAT to return is driven by the response's
 // actual content type, not the requested format: a markdown request against a
 // JSON API returns the JSON, not a conversion of it.
-export const fetchNative: NativeFetch = async (url, format) => {
-    const page = await requestPage(url, format);
+export const fetchNative: NativeFetch = async (url, format, resolve?) => {
+    const page = await requestPage(url, format, resolve);
 
     const isHtml = page.contentType.includes('text/html') || page.contentType.includes('application/xhtml+xml');
 

@@ -67,9 +67,14 @@ const stubFetch = (respond: (url: string, init: RequestInit) => Response | Promi
     return mock;
 };
 
-const keyless = () => createWebFetchTool({ env: {} });
-const withExa = () => createWebFetchTool({ env: { EXA_API_KEY: 'exa-secret-key' } });
-const withLinkup = () => createWebFetchTool({ env: { LINKUP_API_KEY: 'linkup-secret-key' } });
+// `dns: { off: true }` keeps this suite offline and deterministic: the resolved-
+// address SSRF gate (F5) is ON by default in production and would otherwise make
+// a real DNS query per native test. The gate itself is tested separately below
+// with an INJECTED resolver, so nothing about its behaviour goes unverified.
+const keyless = () => createWebFetchTool({ env: {}, dns: { off: true } });
+const withExa = () => createWebFetchTool({ env: { EXA_API_KEY: 'exa-secret-key' }, dns: { off: true } });
+const withLinkup = () =>
+    createWebFetchTool({ env: { LINKUP_API_KEY: 'linkup-secret-key' }, dns: { off: true } });
 
 // Both hosted keys, so a test can prove `native` is still the default and that
 // the enum lists every provider this harness can call.
@@ -855,6 +860,62 @@ describe('fetch: content shape and safety (defect fixes)', () => {
         expect(safeFetchUrl('https://example.com/')).toBe('https://example.com/');
     });
 
+    it('blocks a public name that RESOLVES to a private address', async () => {
+        // The hole: `isPrivateHost` checks the spelling of the authority, so a
+        // public-looking name whose A record is the metadata IP got through. Verified
+        // by lookup in this session — 169-254-169-254.nip.io answers 169.254.169.254,
+        // and the literal form was refused while the name was not refused at all.
+        const fetchMock = stubFetch(() => html('<p>metadata</p>'));
+        const tool = createWebFetchTool({
+            env: {},
+            dns: { lookup: async () => ['169.254.169.254'] }
+        });
+
+        await expect(call(tool, { url: 'http://169-254-169-254.nip.io/latest/meta-data/' })).rejects.toThrow(
+            /resolves to a non-public address/
+        );
+
+        // Blocked before the connection: no request was ever made.
+        expect(fetchMock).toHaveBeenCalledTimes(0);
+    });
+
+    it('allows a name that resolves to a public address', async () => {
+        stubFetch(() => html('<p>fine</p>'));
+        const tool = createWebFetchTool({ env: {}, dns: { lookup: async () => ['93.184.216.34'] } });
+
+        const result = await call(tool, { url: 'https://example.com/page' });
+
+        expect(result.content).toContain('fine');
+    });
+
+    it('fails open when the resolver errors, rather than calling a good URL private', async () => {
+        stubFetch(() => html('<p>served</p>'));
+        const tool = createWebFetchTool({
+            env: {},
+            dns: { lookup: async () => { throw new Error('SERVFAIL'); } }
+        });
+
+        const result = await call(tool, { url: 'https://example.com/page' });
+
+        expect(result.content).toContain('served');
+    });
+
+    it('re-validates the host of a redirect, not just its spelling', async () => {
+        stubFetch((url) =>
+            url.includes('jump')
+                ? response(null, { status: 302, headers: { location: 'http://evil.nip.io/' } })
+                : html('<p>should not be read</p>')
+        );
+        const tool = createWebFetchTool({
+            env: {},
+            dns: { lookup: async (host: string) => (host === 'evil.nip.io' ? ['127.0.0.1'] : ['93.184.216.34']) }
+        });
+
+        await expect(call(tool, { url: 'https://public.example/jump' })).rejects.toThrow(
+            /refused a redirect to a non-public address.*127\.0\.0\.1/s
+        );
+    });
+
     it('refuses a redirect that lands on a private address', async () => {
         stubFetch(() =>
             response(null, {
@@ -967,6 +1028,102 @@ describe('fetch: content shape and safety (defect fixes)', () => {
         const result = await call(keyless(), { url: 'https://example.com/n', query: 'Notes (draft)' });
 
         expect(result.matches).toBe(1);
+    });
+
+    it('reports an out-of-range offset as a clamp, not as an empty page', async () => {
+        // The defect: offset 40,000 into an 18,000-character page returned
+        // content:"" with truncated:false, which is byte-for-byte the shape of "this
+        // page has no content". A caller that overshot abandoned a readable page.
+        const page = 'x'.repeat(2_000);
+        stubFetch(() => response(page, { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/short', offset: 40_000 });
+
+        expect(result.content).toBe('');
+        expect(result.offsetClamped).toBe(true);
+        expect(result.truncated).toBe(false);
+        // The echoed offset is the one actually used, so paging stays coherent.
+        expect(result.offset).toBe(2_000);
+        expect(result.pageCharacters).toBe(2_000);
+        expect(result.note).toContain('past the end');
+    });
+
+    it('leaves offsetClamped absent when the offset is in range', async () => {
+        stubFetch(() => response('x'.repeat(2_000), { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/ok', offset: 10 });
+
+        expect(result.offset).toBe(10);
+        expect(result.offsetClamped).toBeUndefined();
+        expect(result.note).toBeUndefined();
+    });
+
+    it('answers a query on a heading-less page with a window, not the whole document', async () => {
+        // The defect: a plain-text page converts to ONE section, so "return the
+        // matching sections" returned the entire document while still reporting
+        // matches:1 — full price, no narrowing, and nothing telling the caller.
+        const filler = (seed: string, times: number): string =>
+            Array.from({ length: times }, (_, index) => `${seed}-${index} ${'lorem ipsum dolor sit amet'.repeat(3)}`).join('\n');
+
+        const page = `${filler('a', 400)}\n13.1.1. If-Match\n${filler('b', 400)}`;
+        stubFetch(() => response(page, { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/rfc', query: 'If-Match' });
+
+        expect(result.matchMode).toBe('proximity');
+        expect(result.content).toContain('If-Match');
+        // The whole point: a window, not the document.
+        expect(result.characters).toBeLessThan(10_000);
+        expect(result.pageCharacters).toBe(page.length);
+        expect(result.note).toContain('no heading structure');
+    });
+
+    it('labels a heading-bearing query answer as heading mode', async () => {
+        stubFetch(() =>
+            html(
+                '<h2>Installation</h2><p>Run npm install.</p>' +
+                    '<h2>Usage</h2><p>Call the tool.</p>' +
+                    '<h2>Security</h2><p>Rotate the token.</p>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/manual', query: 'install' });
+
+        expect(result.matchMode).toBe('heading');
+        expect(result.note).toBeUndefined();
+    });
+
+    it('drops navigation and aside chrome but keeps the article body', async () => {
+        // Measured on real pages: a language switcher and a sidebar menu ate roughly
+        // a third of the returned budget before the lead paragraph appeared.
+        stubFetch(() =>
+            html(
+                '<nav><a href="/a">Аԥсшәа</a><a href="/b">Afrikaans</a></nav>' +
+                    '<aside class="sidebar">Contents 1 Overview 2 History</aside>' +
+                    '<article><h1>Wikipedia</h1><p>The free encyclopedia.</p></article>' +
+                    '<footer>Privacy policy · About</footer>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.org/wiki' });
+
+        expect(result.content).toContain('The free encyclopedia.');
+        expect(result.content).not.toContain('Afrikaans');
+        expect(result.content).not.toContain('Contents 1 Overview');
+        // header/footer are deliberately kept: on article and docs pages a <header>
+        // carries the page heading, and losing real content to save a line is a bad
+        // trade. Pinning that here so a later "prune more" change is a decision, not
+        // an accident.
+        expect(result.content).toContain('Privacy policy');
+    });
+
+    it('leaves chrome markup intact when the caller asked for raw html', async () => {
+        stubFetch(() => html('<nav><a href="/a">Menu</a></nav><p>Body.</p>'));
+
+        const result = await call(keyless(), { url: 'https://example.org/raw', format: 'html' });
+
+        expect(result.content).toContain('<nav>');
+        expect(result.content).toContain('Menu');
     });
 
     it('rejects an unknown argument rather than ignoring it', async () => {

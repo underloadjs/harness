@@ -168,6 +168,26 @@ export const text = (value: unknown, max: number): string => {
 export const bounded = (value: unknown, max: number, redact: (text: string) => string): string =>
     typeof value === 'string' ? text(redact(value), max) : '';
 
+// `bounded` plus the truth of whether it cut anything.
+//
+// A snippet that ends mid-word is indistinguishable from a snippet that ended at
+// the source's own last character, and the difference decides whether the caller
+// should `fetch` the page. Measured across real searches in this session:
+// several 1,000-character snippets were cut mid-word ("...call `workflow` with the
+// argumen") with no marker at all. Reported only when true, so an uncut result
+// keeps its exact existing shape and the flag never costs bytes on the common
+// short-snippet path.
+export const boundedFlagged = (
+    value: unknown,
+    max: number,
+    redact: (text: string) => string
+): { value: string; truncated: boolean } => {
+    if (typeof value !== 'string') return { value: '', truncated: false };
+
+    const collapsed = text(redact(value), Number.POSITIVE_INFINITY);
+    return { value: collapsed.slice(0, max), truncated: collapsed.length > max };
+};
+
 // A snippet source may be a string (Tavily content) or a list of strings (Exa
 // highlights). Join highlights with a space, then let `text` bound the result.
 export const excerpt = (value: unknown): string => {
@@ -237,12 +257,16 @@ export const normalizeMatches = (
         const safeUrl = redact(url);
         if (safeUrl.length > MAX_URL_CHARS) continue;
 
+        const snippet = boundedFlagged(fields.snippet, MAX_SNIPPET_CHARS, redact);
+
         const match: WebSearchMatch = {
             // Fall back to the URL so a result never has an empty title.
             title: bounded(fields.title, MAX_TITLE_CHARS, redact) || safeUrl,
             url: safeUrl,
-            snippet: bounded(fields.snippet, MAX_SNIPPET_CHARS, redact)
+            snippet: snippet.value
         };
+
+        if (snippet.truncated) match.snippetTruncated = true;
 
         const published = bounded(date(fields.published), MAX_PUBLISHED_CHARS, redact);
         if (published.length > 0) match.published = published;

@@ -38,6 +38,23 @@ export type SectionMatch = {
     line: number;
 };
 
+// How a `query` answer was produced. Reported to the caller because the two
+// modes have very different costs and the caller must be able to tell a precise
+// hit from a best-effort excerpt (see selectProximity).
+export type MatchMode = 'heading' | 'proximity';
+
+// A document with this few headings has no usable section structure, so
+// "return the matching sections" degenerates into "return the whole document".
+// Measured: an RFC plain-text page (one pseudo-section, 502,906 characters) and
+// a raw-HTML book chapter (two sections, 50,406 characters) both came back
+// essentially undiminished while still reporting `matches: 1`, which read like a
+// precise hit and was not one.
+export const FLAT_DOCUMENT_SECTIONS = 2;
+
+// How much text a proximity window may carry. This is the whole point of the
+// mode: a flat page must cost a window, not a document.
+export const PROXIMITY_WINDOW_CHARS = 6_000;
+
 const FENCE = /^\s*(?:```|~~~|`{4,}|~{4,})/;
 const HEADING = /^(#{1,6})\s+(.*\S)\s*$/;
 
@@ -83,7 +100,7 @@ export const selectSections = (
     content: string,
     query: string,
     maxBlocks: number
-): { matches: SectionMatch[]; totalSections: number; totalMatches: number } => {
+): { matches: SectionMatch[]; totalSections: number; totalMatches: number; matchMode: MatchMode } => {
     const sections = splitSections(content);
     const needle = query.toLowerCase();
     const lines = content.split('\n');
@@ -104,5 +121,72 @@ export const selectSections = (
         }
     }
 
-    return { matches, totalSections: sections.length, totalMatches };
+    return { matches, totalSections: sections.length, totalMatches, matchMode: 'heading' };
+};
+
+// The fallback for a document with no heading structure: one window of text
+// centred on the first occurrence of the phrase.
+//
+// WHY THIS EXISTS
+// ---------------
+// `selectSections` is only a filter when the content HAS sections. Plain text,
+// CSV, JSON, and raw HTML markup convert to one or two "sections", so a `query`
+// against them returned the entire document while reporting `matches: 1` — the
+// caller paid full price, got no narrowing, and had no way to know the filter
+// had not done anything. This answers the same question at window cost.
+//
+// The window is centred so the phrase lands mid-block with context on both
+// sides; a caller reading a hit wants the sentences around it, not the hit at
+// character zero. The heading label is the nearest preceding markdown heading
+// when one exists, so the block is still self-describing.
+export const selectProximity = (
+    content: string,
+    query: string,
+    windowChars = PROXIMITY_WINDOW_CHARS
+): { matches: SectionMatch[]; totalSections: number; totalMatches: number; matchMode: MatchMode } => {
+    const sections = splitSections(content);
+    const needle = query.toLowerCase();
+    const haystack = content.toLowerCase();
+
+    const at = haystack.indexOf(needle);
+    if (at === -1) {
+        return { matches: [], totalSections: sections.length, totalMatches: 0, matchMode: 'proximity' };
+    }
+
+    // Count every occurrence, so `totalMatches` still means "how many hits exist"
+    // across both modes rather than silently changing units.
+    let totalMatches = 0;
+    for (let scan = at; scan !== -1; ) {
+        totalMatches += 1;
+        const next = haystack.indexOf(needle, scan + needle.length);
+        scan = next === -1 || next === scan ? -1 : next;
+    }
+
+    const start = Math.max(0, Math.floor(at - windowChars / 2));
+    const end = Math.min(content.length, start + windowChars);
+
+    // Snap to line boundaries so a window never opens or closes mid-word, which
+    // is what makes a returned excerpt readable rather than a puzzle. A page with
+    // no newlines at all (one giant line) has nothing to snap to, so the raw
+    // character window is used there rather than collapsing to an empty block.
+    const openLine = content.lastIndexOf('\n', start);
+    const from = openLine === -1 ? start : openLine + 1;
+    const nextBreak = content.indexOf('\n', end);
+    const to = nextBreak === -1 ? content.length : nextBreak;
+
+    const before = content.slice(0, at);
+    const line = before.split('\n').length - 1;
+
+    // Nearest preceding heading, if the document has any.
+    let heading = '';
+    for (const section of sections) {
+        if (section.start <= line && section.heading.length > 0) heading = section.heading;
+    }
+
+    return {
+        matches: [{ heading, text: content.slice(from, to).trim(), line }],
+        totalSections: sections.length,
+        totalMatches,
+        matchMode: 'proximity'
+    };
 };

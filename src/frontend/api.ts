@@ -27,22 +27,31 @@
 // the counter it is comparing a stream frame against. `request` stays the
 // body-only path used by every read that does not reconcile a revision.
 //
-// ROOT RESOLUTION (unchanged semantics, canonical default):
+// ROOT RESOLUTION (the UI is server-agnostic: the same bundle dials whatever root
+// this browser was told to dial):
 //   1. `?apiRoot=` on the page URL (validated, runtime → trust-gated);
-//   2. server-injected config (`window.__HARNESS_CONFIG__.apiRoot` or
+//   2. the "Harness server URL" saved in this browser by the Endpoint & model dialog
+//      (`API_ROOT_STORAGE_KEY`, validated on write — see `saveApiRootSetting`);
+//   3. server-injected config (`window.__HARNESS_CONFIG__.apiRoot` or
 //      `<meta name="harness-api-root">`), also runtime → trust-gated;
-//   3. build-time `VITE_HARNESS_API` (operator data → trusted);
-//   4. on a GitHub Pages host: the local/LAN gateway chain in ./deployment.ts
+//   4. build-time `VITE_HARNESS_API` (operator data → trusted);
+//   5. on a GitHub Pages host: the local/LAN gateway chain in ./deployment.ts
 //      (every entry already names `/v1/harness`), probed by `ensureApiRoot`;
-//   5. `HARNESS_API_ROOT` (`/v1/harness`) — the standalone and the gateway mount
-//      answer the same path, so there is no per-mount root any more.
+//   6. `HARNESS_API_ROOT` (`/v1/harness`) — the standalone and the gateway mount
+//      answer the same path, so there is no per-mount root any more. A UI served at
+//      `http://localhost:8180` therefore talks to `http://localhost:8180/v1/harness`
+//      with no configuration at all, which is the default the dialog shows.
 //
-// TRUST: sources 1 and 2 are RUNTIME and therefore untrusted. The UI posts the
+// TRUST: sources 1 and 3 are RUNTIME and therefore untrusted. The UI posts the
 // provider key saved in this browser to whatever root it resolves, so an absolute
 // root from a query string or injected config must be same-origin with the page,
 // a loopback host, or one of the compiled chain entries (../shared/origin.ts).
-// Source 3 is compiled into the bundle by the operator and is deliberately
-// trusted: a cross-origin `VITE_HARNESS_API` is a supported deployment.
+// Source 2 is typed by this browser's own user into the in-app dialog (it can never
+// arrive through a link) and source 4 is compiled in by the operator, so both may
+// name another origin — the service's own Origin/CORS gate and the mixed-content
+// rule are what decide whether that host actually answers. A SAVED value outranks
+// source 4 on purpose: an operator-built bundle with a baked-in `VITE_HARNESS_API`
+// must still be re-pointable from the UI without a rebuild.
 
 import { HARNESS_API_ROOT, HARNESS_EPOCH_HEADER, HARNESS_PAGE_LIMIT, HARNESS_REVISION_HEADER, HARNESS_ROUTES } from '../shared/harness-api';
 import { isTrustedRuntimeOrigin } from '../shared/origin';
@@ -237,6 +246,142 @@ export const normalizeApiRoot = (value: string | null | undefined, fallback: str
     return raw.replace(/\/+$/, '');
 };
 
+// The key the Endpoint & model dialog writes the user's harness server URL to.
+//
+// It is deliberately a SEPARATE key from `underload-harness-app:settings`
+// (./main.ts:431, the PROVIDER triple): this value decides WHERE every request goes
+// — including the one that carries the saved provider key — so it must survive a
+// provider-settings reset, and it is never part of a request body.
+export const API_ROOT_STORAGE_KEY = 'underload-harness-app:api-root';
+
+// The saved value exactly as it was written (already normalized by
+// `saveApiRootSetting`), or `undefined` when nothing is saved.
+//
+// Read defensively: storage can throw (private mode, blocked cookies, disabled
+// origin), and a blank entry means "automatic", never the fallback string — an
+// empty value here must not stop the later sources from being consulted.
+// `globalThis.` is required, not `localStorage`: this module is also importable from
+// Node (./index.ts is the published browser barrel), where the global is absent, and
+// some engines THROW on the access itself (an experimental or blocked storage
+// implementation) — hence the whole read sits inside the `try`.
+export const storedApiRoot = (): string | undefined => {
+    try {
+        const raw = globalThis.localStorage?.getItem(API_ROOT_STORAGE_KEY);
+        if (raw === null || raw === undefined) return undefined;
+
+        const trimmed = raw.trim();
+
+        return trimmed.length > 0 ? trimmed : undefined;
+    } catch {
+        // An unreadable store is an absent setting: `saveApiRootSetting` reports the
+        // failure when the user actually tries to change it.
+        return undefined;
+    }
+};
+
+// The refusal sentences this module raises for the write path. The dialog prints them
+// verbatim through `messageOf` (./main.ts `applyServerRootSetting`), so they are pinned
+// by ./api.test.ts and changing one means changing the test.
+const STORAGE_UNAVAILABLE =
+    'This browser does not expose local storage, so the harness server URL cannot be saved.';
+
+// `/` is the one syntactically valid root that normalizes away to nothing: the trailing
+// slashes are stripped (because `${root}${path}` must stay correct) and it collapses to
+// `''`. A saved `''` is what `storedApiRoot` already reports for "nothing saved", so
+// persisting one would ACCEPT a value on Apply and silently hand the next load back to
+// automatic resolution. (`//` and `///` never get here — the protocol-relative rule in
+// `normalizeApiRoot` refuses them first.) Refusing `/` is cheaper than teaching the
+// reader that "/" means the origin.
+const ROOT_NORMALIZES_AWAY =
+    'The API root cannot be just "/"; use an absolute origin or a path such as /v1/harness.';
+
+// The store this browser exposes, or nothing when it exposes none.
+//
+// Read through `globalThis.` and inside a `try`: this module is also importable from
+// Node (./index.ts is the published browser barrel) where the global is absent, and
+// some engines THROW on the access itself (a blocked or experimental storage
+// implementation). `storedApiRoot` reads every one of those as "no setting" — that is
+// correct for resolution. A write must not: see `saveApiRootSetting`.
+const apiRootStore = (): Storage | null | undefined => {
+    try {
+        return globalThis.localStorage;
+    } catch {
+        return undefined;
+    }
+};
+
+// Persist (or clear) the harness server URL this browser dials.
+//
+//   - `null`/blank clears the setting, so the next load resolves automatically again
+//     (page origin `/v1/harness`, then the compiled Pages chain). A store that refuses
+//     the `remove` is an ERROR, not a shrug: a browser that can read but not remove
+//     would otherwise make Reset a silent no-op, and the reload would land on exactly
+//     the root the reader just asked to leave. A browser with NO store is the opposite
+//     case and returns `undefined`: there is nothing to clear, and automatic resolution
+//     is what such a browser already gets, so Reset is genuinely a success there.
+//   - anything else is validated by `normalizeApiRoot` and stored in NORMALIZED
+//     form (trailing slash stripped, absolute origin + path), so a reload cannot
+//     drift from what this call accepted. A value that normalizes away to `''`
+//     (`/`) is refused for the same reason — it would drift.
+//
+// Unlike `resolveRoot` — which ignores a bad value so a hand-edited URL never stops
+// the UI from booting — this rejects LOUDLY: the dialog has to say why the typed URL
+// was refused instead of silently going somewhere else. Every storage failure is
+// rethrown with the reason, because the caller is about to reload and a quietly-dropped
+// setting would look like a successful Apply (or a successful Reset) that did nothing.
+// The one case that is NOT a failure is a blank value in a browser that exposes no
+// store at all: no setting was dropped there, because there never was one.
+export const saveApiRootSetting = (value: string | null | undefined): string | undefined => {
+    const trimmed = (value ?? '').trim();
+
+    // Read once, up front: both branches need to know whether this engine exposes a
+    // store, and the access itself can throw (see `apiRootStore`).
+    const store = apiRootStore();
+
+    if (trimmed.length === 0) {
+        // Blank/null handled FIRST, and a missing store is a SUCCESS here. Clearing is
+        // what Reset and an empty Apply ask for; with no store the setting is already
+        // absent, the caller's reload lands on automatic resolution (the same answer a
+        // store-less `storedApiRoot` gives), and throwing would turn Reset into an
+        // error the reader cannot act on.
+        if (!store) return undefined;
+
+        try {
+            store.removeItem(API_ROOT_STORAGE_KEY);
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+
+            throw new Error(`Could not clear the saved harness server URL in this browser: ${reason}`);
+        }
+
+        return undefined;
+    }
+
+    // Only a value that is meant to be KEPT needs a store: without one the typed URL
+    // silently disappears on the next load, which is the silent-revert bug this guard
+    // exists for. Checked after the blank branch, so it never fires on a clear.
+    if (!store) throw new Error(STORAGE_UNAVAILABLE);
+
+    // `''` as the fallback: a blank value never reaches this line, so a fallback
+    // string would only mask a validation bug as the canonical root.
+    const root = normalizeApiRoot(trimmed, '');
+
+    // See `ROOT_NORMALIZES_AWAY`: this is the only accepted value that cannot be
+    // stored meaningfully, and the check belongs after normalization because the
+    // stored bytes are whatever normalization produced.
+    if (root.length === 0) throw new Error(ROOT_NORMALIZES_AWAY);
+
+    try {
+        store.setItem(API_ROOT_STORAGE_KEY, root);
+    } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+
+        throw new Error(`Could not save the harness server URL in this browser: ${reason}`);
+    }
+
+    return root;
+};
+
 // Server-injected config, for a host that renders this bundle itself. Read
 // defensively: the global is not typed and may be absent, partial, or hostile.
 const injectedRoot = (): string | undefined => {
@@ -247,14 +392,17 @@ const injectedRoot = (): string | undefined => {
     return meta?.content;
 };
 
-// Resolve once at module load: every later request uses the same root, and the
-// query parameter is not consulted per request (a change means a reload).
+// Resolve once at module load: every later request uses the same root, and neither
+// the query parameter nor the saved setting is consulted per request (a change means
+// a reload — which is exactly what the Endpoint & model dialog's Apply/Reset do,
+// ./main.ts:2848 `applyServerRootSetting`).
 //
 // The one exception is the STATIC-HOST chain (./deployment.ts): on a GitHub Pages
 // host the documented sources name nothing, and the answer is not knowable
 // synchronously — it is whichever local/LAN gateway actually answers. `resolveRoot`
 // therefore returns the chain to probe, `ensureApiRoot` walks it, and `API_ROOT`
-// moves to the winner before the first catalogue request.
+// moves to the winner before the first catalogue request. A saved server URL makes
+// the root explicit, so it also disables the probe (see `ResolvedRoot.candidates`).
 type ResolvedRoot = {
     root: string;
     // The ordered roots to probe, or `undefined` when the root is explicit (a
@@ -276,9 +424,10 @@ const resolveRoot = (): ResolvedRoot => {
     // value must return undefined, not the fallback, or the later sources would
     // never be consulted.
     //
-    // `trusted` is false for both runtime sources: they may only name the page's own
-    // origin or a loopback host, because the saved provider key travels here. The
-    // build-time value is operator-controlled and may be cross-origin.
+    // `trusted` is false for the two sources a link or a hosting page can supply (the
+    // query string and the injected config): they may only name the page's own origin
+    // or a loopback host, because the saved provider key travels here. The value this
+    // browser SAVED and the build-time value are trusted and may be cross-origin.
     const attempt = (value: string | undefined, trusted: boolean): string | undefined => {
         if (value === undefined || value.trim().length === 0) return undefined;
 
@@ -308,6 +457,12 @@ const resolveRoot = (): ResolvedRoot => {
 
     const explicit =
         attempt(query, false) ??
+        // The URL the reader typed into the Endpoint & model dialog and saved in THIS
+        // browser. It is trusted like the build-time value: it can only have come from
+        // someone using this app (never from a link), it was normalized on write, and
+        // an operator bundle with a baked-in `VITE_HARNESS_API` must be re-pointable
+        // from the UI without a rebuild.
+        attempt(storedApiRoot(), true) ??
         attempt(injectedRoot(), false) ??
         attempt(import.meta.env.VITE_HARNESS_API, true);
 

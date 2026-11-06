@@ -17,6 +17,11 @@
 // sibling ./api.test.ts keeps the loopback host and pins that this chain never
 // engages off Pages.
 //
+// The chain is the LAST automatic source. Anything the reader saves in the Endpoint &
+// model dialog ("Harness server URL", ./api.ts `API_ROOT_STORAGE_KEY`) is step 2 of the
+// ladder and therefore silences the probe here — which is the point of the setting on a
+// host that has no API of its own.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -25,6 +30,7 @@ import {
     HARNESS_SERVICE_LIMITS
 } from '../shared/harness-api';
 import { LOCAL_AREA_NETWORK_HOST_NAME, STATIC_API_CANDIDATES, isStaticPagesHost } from './deployment';
+import { API_ROOT_STORAGE_KEY } from './api';
 
 // One harness definition, as the canonical `GET /harnesses` page publishes it: the
 // contract's resources are snake_case (../shared/harness-api.ts), so the card spells
@@ -132,6 +138,12 @@ const stubGateways = (live: readonly string[]): string[] => {
 
 beforeEach(() => {
     vi.resetModules();
+    // The saved "Harness server URL" (./api.ts `API_ROOT_STORAGE_KEY`) is step 2 of the
+    // ladder, so a leaked entry would pin the root of the NEXT test and silence the
+    // probe it is meant to exercise. The URL is reset for the same reason: several tests
+    // below put `?apiRoot=` in the address bar.
+    localStorage.clear();
+    window.history.replaceState(null, '', '/harness/');
 });
 
 afterEach(() => {
@@ -296,6 +308,39 @@ describe('a pinned root on a Pages host', () => {
         const module = await import('./api');
 
         expect(module.API_ROOT).toBe(STATIC_API_CANDIDATES[0]);
+    });
+
+    it('honours a saved server URL and silences the chain', async () => {
+        // The dialog's "Harness server URL" outranks the Pages chain, and a host that is
+        // NEITHER same-origin NOR loopback is still accepted: the value was typed into
+        // this browser, so the provider key goes where the reader chose. Whether that
+        // host actually answers is the service Origin gate's and the browser's decision,
+        // not the resolver's.
+        localStorage.setItem(API_ROOT_STORAGE_KEY, 'https://harness.example.test/v1/harness');
+        const calls = stubGateways([STATIC_API_CANDIDATES[0]]);
+
+        const module = await import('./api');
+
+        expect(module.API_ROOT).toBe('https://harness.example.test/v1/harness');
+        // No candidates and no health probe: a pinned root is never replaced by a guess.
+        expect(module.apiRootCandidates()).toEqual([]);
+        expect(await module.ensureApiRoot()).toBe('https://harness.example.test/v1/harness');
+        expect(calls).toEqual([]);
+    });
+
+    it('lets a saved rooted path beat the chain and dial the Pages origin itself', async () => {
+        // The other thing the setting is for on Pages: pointing the UI at a proxy that
+        // answers `/api` on the SAME host. A rooted path is same-origin by construction,
+        // so it pins without a probe exactly as `?apiRoot=/v1/harness` does.
+        localStorage.setItem(API_ROOT_STORAGE_KEY, '/api');
+        const calls = stubGateways([STATIC_API_CANDIDATES[0]]);
+
+        const module = await import('./api');
+
+        expect(module.API_ROOT).toBe('/api');
+        expect(module.apiRootCandidates()).toEqual([]);
+        expect(await module.ensureApiRoot()).toBe('/api');
+        expect(calls).toEqual([]);
     });
 
     it('prefers a build-time VITE_HARNESS_API over the chain', async () => {

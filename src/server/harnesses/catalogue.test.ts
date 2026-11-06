@@ -65,7 +65,8 @@ const UNCONFIGURED_PARAMETERS = {
         category: {
             type: 'string',
             maxLength: 64,
-            description: 'Source category to favour, e.g. "news", "company", "publication" or "people".'
+            description:
+                'Source category to favour. Documented and best-supported: "company", "publication", "news", "personal site", "financial report", "people". Other strings are accepted and used as weaker category hints, not hard filters. Note "people" and "company" do not support date filters, and "people" does not support excludeDomains.'
         },
         speed: {
             type: 'string',

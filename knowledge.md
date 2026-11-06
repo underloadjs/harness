@@ -2498,7 +2498,7 @@ as their own entries.
   unreadable conversation from dropping a session. `static.ts` serves
   `src/frontend/dist`; `dev.ts` is the separate standalone API launcher
   (`yarn dev:server`, static serving disabled), while
-  `yarn dev:frontend` is Vite only and proxies `/api` to the service on :5000.
+  `yarn dev:frontend` is Vite only and proxies `/v1/harness` to the service on :5000.
   It binds the IPv6 wildcard `::` (`DEV_SERVER_HOST` in
   `src/frontend/vite-proxy.ts`), which Node opens dual-stack, so the one listener
   serves `localhost` (`::1`), `127.0.0.1` and the LAN IPv4 address; an IPv4-only
@@ -2575,8 +2575,10 @@ as their own entries.
   result into the handler; the CLI calls it from `--tools`/`/tools`, which run
   after the same load.
 - **UI (`src/frontend/`)** is only a client. It resolves its API root at runtime
-  (`?apiRoot=` → `window.__HARNESS_CONFIG__.apiRoot` / meta tag → build-time
-  `VITE_HARNESS_API` → `/api`), then lists presets/tools, creates sessions,
+  (`?apiRoot=` → the **“Harness server URL”** saved in this browser →
+  `window.__HARNESS_CONFIG__.apiRoot` / meta tag → build-time
+  `VITE_HARNESS_API` → the compiled Pages chain → `/v1/harness` on the page's own
+  origin), then lists presets/tools, creates sessions,
   enqueues tasks (`POST /tasks`, `202`), and observes the session's queue through
   one `GET /events` watcher while work is pending (polling fallback). A `/…` composer
   line is submitted like any other task and answered as a server-side command turn —
@@ -2589,7 +2591,24 @@ as their own entries.
   page's own origin or loopback (`src/shared/origin.ts`, shared with the service
   Origin gate) because the saved provider key is posted to that root;
   `VITE_HARNESS_API` is operator-controlled and deliberately trusted across
-  origins. It imports no harness code and no `node:` built-ins, which is why
+  origins. The **saved “Harness server URL”** (step 2 of the ladder) is the other
+  source the client trusts, and the only
+  one a reader controls: the status pill opens **Endpoint & model**, the field at the
+  top of that dialog edits it, `Apply & reconnect` validates it (a rooted path, or an
+  absolute `http(s)` URL with no query, fragment, credentials or backslashes), stores
+  the NORMALIZED value under its own `underload-harness-app:api-root` key
+  (`src/frontend/api.ts` `API_ROOT_STORAGE_KEY`, `saveApiRootSetting`), strips any
+  `apiRoot` parameter from the address bar (that parameter outranks the saved value for
+  the load it is on, so leaving it would undo the save) and reloads — the root is
+  resolved once at module load, so a reload IS the reconnect. `Reset`, or applying a
+  blank field, deletes the key and restores automatic resolution; a refused value is
+  reported inline and stores nothing. A saved cross-origin host is accepted on the
+  reader's own authority, so what decides whether it answers is the service Origin
+  gate, CORS and the browser's mixed-content rule (an https page cannot dial a
+  plain-http harness). The value never enters a request body: the dialog's base URL /
+  API key / model triple is the PROVIDER, and where the UI dials is a separate
+  decision. A saved root also pins a Pages host — the compiled chain is a fallback,
+  never an override. It imports no harness code and no `node:` built-ins, which is why
   `node-stub.ts` and the source alias were deleted. To drive the service host
   from the built UI:
   `http://localhost:5180/?apiRoot=http://localhost:5000/v1/harness` — the Vite

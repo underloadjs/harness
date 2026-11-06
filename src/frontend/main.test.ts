@@ -62,6 +62,10 @@ const metaReadsFor = (sessionId: string): string[] =>
     );
 
 const SESSION_KEY = 'underload-harness-app:session';
+// The PROVIDER draft the endpoint dialog edits (`./main.ts` `STORAGE_KEY`): the exact
+// payload is asserted wherever a test needs to prove a keystroke landed on a provider
+// field rather than on the harness server URL above it.
+const SETTINGS_KEY = 'underload-harness-app:settings';
 // Realistic epoch stamps: the UI formats real server milliseconds, and a tiny
 // value would make the live label look like a clock-skew bug.
 const T = 1_700_000_000_000;
@@ -445,6 +449,22 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
     const found = document.querySelector<HTMLElementTagNameMap[K]>(selector);
     if (found === null) throw new Error(`missing element ${selector}`);
     return found;
+};
+
+// The dialog's provider input whose label reads exactly this, addressed by label TEXT.
+// Position matters here: the Endpoint & model dialog opens with the harness server URL
+// field (./main.ts), which also wears `.field-input`, so a bare
+// `.endpoint-body input.field-input` selector silently stopped naming the provider pair.
+// Only the provider fields are wrapped in `label.field` (./main.ts `field`), so scoping to
+// it excludes the server URL (`div.field` + `label[for]`) and the model control.
+const byFieldLabel = (label: string): HTMLInputElement => {
+    const control = [
+        ...document.querySelectorAll<HTMLInputElement>('.dialog .endpoint-body label.field > input.field-input')
+    ].find((input) => input.closest('label.field')?.querySelector('.field-label')?.textContent === label);
+
+    if (control === undefined) throw new Error(`missing ${label} field`);
+
+    return control;
 };
 
 beforeEach(() => {
@@ -2760,9 +2780,23 @@ it('keeps the existing session when endpoint settings change', async () => {
     // inside `.rail-left`.
     expect(document.querySelector('.rail-left .endpoint-body')).toBeNull();
     byClass('.status-button', 'button').click();
-    const baseURL = byClass('.dialog .endpoint-body input.field-input', 'input');
+
+    // The provider Base URL control, addressed through the `label.field` wrapper rather
+    // than by position: since the harness server URL group was added at the TOP of
+    // `.endpoint-body` (./main.ts), a bare `input.field-input` here would land on THAT
+    // field and this test would silently stop editing the endpoint. The wrapper's own
+    // label text is pinned so the selector cannot drift onto the API key either.
+    const baseURL = byFieldLabel('Base URL');
+
     baseURL.value = 'http://other-provider/v1';
     baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // The edit really hit the provider draft (the payload `underload-harness-app:settings`
+    // is what a session create reads), which is the "endpoint settings change" this test
+    // is named for.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
+        '{"baseURL":"http://other-provider/v1","apiKey":"","model":"m1"}'
+    );
 
     // Long enough for the debounced model refresh to fire, so a bug that tripped
     // session recreation on any settings change would have happened by now.

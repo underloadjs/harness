@@ -231,8 +231,8 @@ src/frontend/
   index.ts              the reusable client: api + contract + ui panels
                         -> @underload/harness/frontend
   main.ts               the app shell (imports styles.css, mounts the DOM on load)
-  api.ts                root resolution (query/injected/build/Pages-chain/api) +
-                        fetch + SSE
+  api.ts                root resolution (query/saved URL/injected/build/Pages chain,
+                        defaulting to /v1/harness) + fetch + SSE
   deployment.ts         the local/LAN gateway chain a GitHub Pages host probes
   contract.ts           wire validation/presentation helpers
   ui/                   turns, agents, create form, markdown, panels, tools, tokens,
@@ -2251,8 +2251,8 @@ toggle state and shows both rails permanently.
 yarn build:frontend       # UI -> src/frontend/dist (base /, standalone/static hosts)
 
 yarn start-service        # repo root: builds UI for /harness/, serves UI + /v1/harness on :5000
-yarn dev:frontend         # Vite on all interfaces, dual-stack (localhost + LAN); /api proxies to the running service
-yarn preview:frontend     # built UI on :5180 (loopback only); same /api proxy
+yarn dev:frontend         # Vite on all interfaces, dual-stack (localhost + LAN); /v1/harness proxies to the running service
+yarn preview:frontend     # built UI on :5180 (loopback only); same /v1/harness proxy
 
 yarn dev:server           # optional standalone API on :5181 (no Vite, no UI)
 ```
@@ -2266,10 +2266,11 @@ standalone server or a static host, not the gateway.
 
 `yarn dev:frontend` starts **only Vite**. It never imports or calls
 `startHarnessServer`; its `server.proxy` (and `preview.proxy`) maps the client's
-default `/api` root onto the service mount at `http://127.0.0.1:5000/v1/harness`.
+default `/v1/harness` root onto the service mount at `http://127.0.0.1:5000/v1/harness`.
 Start the service first (see [Service host](#service-host-v1harness)), or override
-the root with `?apiRoot=` / `VITE_HARNESS_API` (see “Connecting the UI to the
-service” below).
+the root with `?apiRoot=` / `VITE_HARNESS_API` — or from the UI itself, with the
+“Harness server URL” field in the Endpoint & model dialog (see “Connecting the UI to
+the service” below).
 
 **LAN development (R7/R8/R11).** The dev server binds the IPv6 wildcard (`::`), which
 Node opens dual-stack, so **one** listener answers `http://localhost:5180/`,
@@ -2286,7 +2287,7 @@ Then open the **Network** URL Vite prints, e.g.
 `http://192.168.1.20:5180/`, from the other device. If :5180 is already busy, Vite
 starts on the next free port (usually :5181) — use the port in the printed
 `Network:` line, not the `Local:` one. The backend must be running first: Vite
-serves only the UI and proxies `/api`, so a stopped service gives a proxy error,
+serves only the UI and proxies `/v1/harness`, so a stopped service gives a proxy error,
 not a UI-only page. Keep `HARNESS_DEV_API` unset for the normal gateway; when you
 do set it, Vite proxies to that mount and stamps its origin on the outgoing
 request, so a custom target must still be reachable from the machine running
@@ -3371,46 +3372,89 @@ trusted network only, and prefer loopback (`host: '127.0.0.1'`) when the port is
 reachable from elsewhere. No global service host/CORS settings are changed by this
 package.
 
-**Connecting the UI to the service.** The browser chooses its API root at runtime
-(`?apiRoot=` → injected config → `VITE_HARNESS_API` → the local/LAN chain on a
-GitHub Pages host → `/api`), so the same built bundle works against either mount:
+**Connecting the UI to the service.** The UI is server-agnostic: nothing about the
+built bundle names a host, and the browser picks its API root at runtime. The ladder,
+in order (`src/frontend/api.ts` `resolveRoot`):
+
+1. `?apiRoot=` on the page URL — this load only;
+2. the **“Harness server URL”** this browser saved in the Endpoint & model dialog
+   (`localStorage` key `underload-harness-app:api-root`);
+3. server-injected config (`window.__HARNESS_CONFIG__.apiRoot`, or the
+   `<meta name="harness-api-root">` tag);
+4. build-time `VITE_HARNESS_API`;
+5. on a GitHub Pages host, the local/LAN gateway chain compiled into
+   `src/frontend/deployment.ts` (see “GitHub Pages” below);
+6. `/v1/harness` — the contract's one root (`HARNESS_API_ROOT`,
+   `src/shared/harness-api.ts`), resolved against the page's own origin.
+
+Step 6 is the default the dialog shows and needs no configuration: a UI served at
+`http://localhost:8180` dials `http://localhost:8180/v1/harness`.
+
+**Pointing the UI at another harness, from the UI.** Press the status pill at the top
+right to open **Endpoint & model**; the field at the top of that dialog is this
+browser's harness server URL, and the line at the bottom of the dialog prints the root
+actually in use. `Apply & reconnect` validates the value — a rooted path, or an
+absolute `http(s)` URL with no query, fragment, credentials or backslashes — stores it
+in normalized form (so a trailing slash cannot drift between loads), removes the
+`apiRoot` parameter from the address bar (that parameter outranks the saved value, so
+leaving it in place would undo the save; every other parameter and the hash survive),
+and reloads, which re-resolves the root and reconnects the `harness.v1` WebSocket. A
+value the validator refuses is reported inline and nothing is written. `Reset`, or
+applying a blank field, deletes the key and reloads — that restores automatic
+resolution, which on a Pages host means the compiled chain again.
+
+The setting has its own storage key and is never serialized into a request body: the
+dialog's Base URL / API key / model triple describes the **provider**, and where the UI
+sends its requests is a separate decision. A saved root also silences the Pages probe
+chain — a deliberate choice is never replaced by a guess.
+
+A one-load override looks like this:
 
 ```text
 http://localhost:5180/?apiRoot=http://localhost:5000/v1/harness
 ```
 
 `yarn dev:frontend` (Vite) and `yarn preview:frontend` (built UI) serve on `:5180`
-and proxy `/api` to the service gateway on `:5000`, so the explicit `?apiRoot=`
-above is only needed when bypassing that proxy. A loopback Vite origin is allowed
-by the Origin gate directly; a LAN browser's non-loopback origin is not, so the
-dev proxy stamps the target's origin on its server-to-server request (the gate
-still rejects a foreign origin that reaches the service without that proxy).
-For a LAN browser keep the default relative `/api` root; an absolute
-`?apiRoot=http://<LAN-IP>:5000/...` is a different page origin and the runtime
-gate ignores it — the one exception is a root that names an entry of the compiled
-Pages chain exactly (see “GitHub Pages” below). The UI never sees the API key — it
-posts only the base URL and model, and `defaults.hasApiKey` is a boolean.
+and proxy `/v1/harness` (REST and the WebSocket upgrade alike) to the service gateway
+on `:5000`, so the explicit `?apiRoot=` above is only needed when bypassing that
+proxy. A loopback Vite origin is allowed by the Origin gate directly; a LAN browser's
+non-loopback origin is not, so the dev proxy stamps the target's origin on its
+server-to-server request (the gate still rejects a foreign origin that reaches the
+service without that proxy). For a LAN browser keep the default relative
+`/v1/harness` root; an absolute `?apiRoot=http://<LAN-IP>:5000/...` is a different page
+origin and the runtime gate ignores it — the exceptions are a root that names an entry
+of the compiled Pages chain exactly (see “GitHub Pages” below) and the **saved** server
+URL, which the runtime gate does not apply to (see the trust rule below). The UI never
+sees the API key — it posts only the base URL and model, and `defaults.hasApiKey` is a
+boolean.
 
 A **runtime** absolute root (`?apiRoot=` or injected `__HARNESS_CONFIG__`/meta)
 must be the page's own origin, a loopback hostname (`localhost`, `127.0.0.1`,
 `[::1]`), or one of those compiled chain entries; anything else is silently
 ignored and the next source is used. This is
 deliberate: the UI posts the provider key saved in this browser to that root, so a
-crafted `?apiRoot=https://evil.example/api` link must not receive it. A rooted path
+crafted `?apiRoot=https://evil.example/v1/harness` link must not receive it. A rooted path
 such as `/v1/harness` is same-origin by construction. Build-time
 `VITE_HARNESS_API` is operator-controlled and may name another origin; it cannot
-be changed by a URL a user is tricked into opening. The loopback list is shared
+be changed by a URL a user is tricked into opening. The **saved** server URL is
+trusted for the same reason — it can only have been typed by someone using this app —
+so it may name any host the browser can reach, and it outranks `VITE_HARNESS_API` so
+an operator-built bundle stays re-pointable without a rebuild. What decides whether
+that host answers is the service, not the client: an absolute root must be an origin
+the service's Origin gate accepts and that answers CORS, and an **https** page cannot
+dial a plain-`http` harness at all (the browser blocks the mixed content), so an https
+deployment needs an https (or loopback) server URL. The loopback list is shared
 with the service Origin gate (`src/server/origin.ts`), so "local" has one definition.
 
 **GitHub Pages (`https://underloadjs.github.io/harness/`).** `.github/workflows/ci.yml`
 publishes `src/frontend/dist` to Pages, a host that serves the bundle and **no API**.
-A relative root cannot work there: `/api` resolved to
-`https://underloadjs.github.io/api/…` and returned GitHub's 404 HTML page, so the UI
-booted and then reported “The harness server returned a non-JSON response”. When the
-page is served from a `*.github.io` host and nothing is pinned by `?apiRoot=`,
-injected config, or `VITE_HARNESS_API`, the client therefore dials the absolute chain
-compiled into `src/frontend/deployment.ts`, in order, and keeps the first gateway that
-answers `GET <root>/health`:
+A relative root cannot work there: `/v1/harness` resolves to
+`https://underloadjs.github.io/v1/harness/…` and returns GitHub's 404 HTML page, so the UI
+boots and then reports “The harness server returned a non-JSON response”. When the
+page is served from a `*.github.io` host and nothing is pinned by `?apiRoot=`, the saved
+“Harness server URL”, injected config, or `VITE_HARNESS_API`, the client therefore dials
+the absolute chain compiled into `src/frontend/deployment.ts`, in order, and keeps the
+first gateway that answers `GET <root>/health`:
 
 ```text
 http://localhost:5000/v1/harness        # the service gateway on this machine
@@ -3443,7 +3487,9 @@ If nothing answers, the offline pane lists every host that was tried; `Retry` is
 full reload, which re-probes. Pin one host with
 `https://underloadjs.github.io/harness/?apiRoot=http://192.168.50.109:5000/v1/harness`
 (a root that names a compiled chain entry exactly is trusted; any other foreign
-absolute root is still ignored), or bake one in with `VITE_HARNESS_API` at build time.
+absolute root is still ignored), save one in this browser with the dialog's
+“Harness server URL” field (a saved root is trusted across origins, and it silences the
+chain until `Reset` clears it), or bake one in with `VITE_HARNESS_API` at build time.
 The host/port constants mirror the monorepo's `config/environment` (`src/host.ts`,
 `src/port.ts`); that package is not published, so they are restated here — update both
 when the LAN address changes.
