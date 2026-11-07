@@ -20,8 +20,9 @@
 //   - one pending confirmation per conversation: a second press for the SAME thread does
 //     not stack a second dialog, and a press for a DIFFERENT conversation replaces the
 //     layer instead of stacking it;
-//   - everything that already protected the request survives the move: default/active
-//     protection never opens a dialog, an unwired host never opens one, an in-flight
+//   - everything that already protected the request survives the move: a default
+//     conversation never opens a dialog, live work is the Stop control instead (R1, and it
+//     never opens one either), an unwired host never opens one, an in-flight
 //     thread never starts a second request, and a failed DELETE leaves the conversation
 //     intact and retryable;
 //   - a session switch or a cleared board dismisses the layer instead of leaving a dialog
@@ -519,10 +520,16 @@ describe('mobile thread Delete', () => {
             })
         );
         const runningDelete = deleteOf(at(running.handles, 0));
+        // R1: live work no longer means a dead Delete button — it means the SAME control
+        // is a Stop. This mount wires only `deleteThread`, so the Stop reports the missing
+        // transport rather than firing a request, and (as before) a press cannot arm a
+        // dialog that could only ever fail.
+        expect(runningDelete.classList.contains('thread-delete')).toBe(true);
+        expect(runningDelete.classList.contains('thread-stop')).toBe(true);
+        expect(runningDelete.querySelector('.action-label')?.textContent).toBe('Stop');
+        expect(runningDelete.getAttribute('aria-label')).toBe('Stop thread RR6');
         expect(runningDelete.disabled).toBe(true);
-        expect(runningDelete.title).toBe(
-            'Stop the active or queued work in this thread before deleting it.'
-        );
+        expect(runningDelete.title).toBe('Thread stop is not wired in this host.');
         runningDelete.click();
         expect(running.calls).toEqual([]);
         expect(deleteDialogs()).toHaveLength(0);

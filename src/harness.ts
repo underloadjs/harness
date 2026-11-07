@@ -175,7 +175,9 @@
 // promise resolves only when the model has answered AND the whole tree (delegated
 // children included) has drained. A `wakeup` heartbeat (default every 600000 ms)
 // re-requests a paused agent so it can inspect elapsed times and cancel a hung
-// call through the `toolCancel` control. Scheduler: core/scheduler.ts.
+// call through the `toolCancel` control; the interval is owned by the shipped
+// `async-ping` plugin (plugins/async-ping.plugin.ts), not by the scheduler.
+// Scheduler: core/scheduler.ts.
 //
 // Tool-failure containment (compiled tools are arbitrary JavaScript):
 //   - a scheduled throw/rejection is caught by core/scheduler.ts and DELIVERED as
@@ -350,7 +352,23 @@ import type { DiscoveredTool } from './core';
 // wire names are no longer needed for registration: every baseline row comes from
 // descriptor discovery, so this module holds no inventory of tool names.
 import { createWebSearchTool, createWebFetchTool } from './tools';
-import { runPlugins } from './plugin';
+// The plugin framework (R2/R3/R4). `BUILTIN_PLUGINS` is the GENERATED auto-discovery
+// result (src/plugins/**/*.plugin.ts); the bus and the default settings provider are
+// built once per harness so no plugin state is ever shared between two writers.
+import {
+    BUILTIN_PLUGINS,
+    BUILTIN_PLUGIN_DESCRIPTORS,
+    createHookBus,
+    createInMemoryPluginSettingsProvider,
+    createPluginSettingsView,
+    runPlugins
+} from './plugin';
+import type { HarnessPluginApiBase, HarnessPluginHostResult } from './plugin';
+// The maybe-sync round types `turn.before` needs at the call site (plugin/hooks.ts
+// rule 6). Imported from the module directly; the barrel re-exports the same names.
+import type { HarnessMaybeAsync, HarnessMergedHookResult } from './plugin/hooks';
+// Rough transcript sizing for the per-agent context limit (`turn.before`).
+import { estimateContextTokens } from './core/context-estimate';
 import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
@@ -380,6 +398,13 @@ import type {
     HarnessForkResult,
     HarnessIdentityReservation,
     HarnessInvocationArchiveInput,
+    // R2/R3 plugin framework: the lifecycle event union (helper parameter types), the
+    // declared plugin catalogue (the handle's `pluginMetadata`), and the `turn.before`
+    // context built in requestTurn.
+    HarnessLifecycleEvent,
+    HarnessPluginApi,
+    HarnessPluginMetadata,
+    HarnessTurnBeforeContext,
     HarnessMessage,
     HarnessPendingTool,
     HarnessProgress,
@@ -425,10 +450,13 @@ import type { PreparedTool, ToolSourceRecord } from './core';
 // (positive safe integer) and can never be Infinity.
 const DEFAULT_MAX_ITERATIONS = 16;
 
-// Recurring wake while background tool calls are pending (R4): 10 minutes. This
-// is a LIVENESS heartbeat, not a timeout — nothing is killed automatically (the
-// model decides, via toolCancel). Configurable through `wakeIntervalMs` so tests
-// can exercise it in milliseconds; the timer exists only while work is pending.
+// Background-work heartbeat (R4): 10 minutes. This is a LIVENESS interval, not a
+// timeout — nothing is killed automatically (the model decides, via toolCancel).
+// Core no longer arms a timer for it: the value is the DEFAULT SEED of the shipped
+// `async-ping` plugin's `intervalMs` setting (see the pluginSettings seed below and
+// `api.config.wakeIntervalMs`), so `harness({ wakeIntervalMs })` keeps its documented
+// meaning while the plugin owns the timer. Validated at construction like every other
+// numeric bound, so a typo fails before a run starts.
 const DEFAULT_WAKE_INTERVAL_MS = 600_000;
 
 // Bound on the enabled SEARCHABLE set. The old toolRequest capped a single call at
@@ -694,7 +722,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const maxIterations = resolveMaxIterations(configuration.maxIterations);
 
     // Background heartbeat interval (T3/R4), validated at construction like every
-    // other numeric bound so a typo fails before a run starts.
+    // other numeric bound so a typo fails before a run starts. It is no longer a
+    // scheduler option: it seeds the `async-ping` plugin's `intervalMs` setting and is
+    // exposed to plugins as `api.config.wakeIntervalMs`.
     const wakeIntervalMs = resolveWakeInterval(configuration.wakeIntervalMs);
 
     // R12 policy resolved once, at construction: a bad `toolCreation` or
@@ -1042,6 +1072,147 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // ------------------------------------------------------------------
+    // R2/R3/R4 plugin framework: lifecycle bus + settings read model
+    // ------------------------------------------------------------------
+    //
+    // ONE bus per harness (built before anything can emit): subscriptions die with the
+    // writer, so a test harness never inherits another test's hooks. Every emit site
+    // below is fail-open (plugin/hooks.ts), which is what lets the harness call the bus
+    // from a run loop without a try/catch of its own.
+    const hookBus = createHookBus();
+
+    // Plugin settings. A host supplies its own provider (the server will read a stored
+    // session document); without one, the in-memory provider answers from each plugin's
+    // DECLARED defaults, with the legacy `wakeIntervalMs` configuration field mapped
+    // onto the `async-ping` plugin's `intervalMs` so an existing deployment changes
+    // nothing when the heartbeat moves from the scheduler into the plugin.
+    const pluginSettings =
+        configuration.pluginSettings ??
+        createInMemoryPluginSettingsProvider(BUILTIN_PLUGIN_DESCRIPTORS, {
+            'async-ping': { intervalMs: wakeIntervalMs }
+        });
+
+    // ------------------------------------------------------------------
+    // R3 plugin api: the plugin-agnostic half, built ONCE per harness
+    // ------------------------------------------------------------------
+    //
+    // Everything here is a thin forward onto the same handle operation a host calls, so
+    // "a plugin can trigger anything within the server" costs no private path with
+    // different rules. The two per-plugin members (`on`, `settings`) are added by
+    // plugin/host.ts once per plugin; this object is what it clones.
+    //
+    // WHY IT IS BUILT HERE (long before the plugin phase at the bottom): a `turn.before`
+    // context must carry an api, and the fallback view for a hook registered WITHOUT one
+    // (`hostPluginApi` below) has to exist by the first run. Building it here also keeps
+    // the plugin surface in one readable block instead of an inline object in a call.
+    //
+    // Every member is an arrow or a getter-less literal, so nothing is READ during
+    // construction except `wakeIntervalMs`; the registries, the scheduler and the thread
+    // helpers below are resolved when a plugin actually calls them.
+    const pluginApiBase: HarnessPluginApiBase = {
+        agents,
+        tools,
+        createAgent: (name, agentConfiguration) => {
+            if (agents[name]) {
+                throw new HarnessError(`Agent "${name}" is already registered.`);
+            }
+            const brain = createAgent({ ...agentConfiguration, name });
+            agents[name] = brain;
+            // R2: a plugin-added agent owns a default conversation like every
+            // configured one, so `threads()`/threadSend can address it and
+            // `sendThreadInput('agent:<name>')` resumes it.
+            threadStates.set(defaultThreadIdOf(name), {
+                record: {
+                    id: defaultThreadIdOf(name),
+                    agent: name,
+                    origin: 'agent',
+                    status: 'idle',
+                    sequence: ++threadSequence
+                },
+                agent: brain,
+                queue: [],
+                generation: 0
+            });
+            return brain;
+        },
+        addTool: (name, toolConfiguration) => {
+            // No reserved names and no "already registered" rejection: a plugin is
+            // an intentional later registration and therefore REPLACES by name.
+            // It commits through the same atomic kernel as every other path.
+            const definition = defineTool({ ...toolConfiguration, name });
+            registerAtStartup({ definition });
+            return definition;
+        },
+        // Commands follow the SAME replace-by-name rule as addTool, and for the
+        // same reason: the plugin phase runs after the built-ins and
+        // `configuration.commands`, so contributing a name that already exists is
+        // how a plugin intentionally overrides one.
+        addCommand: (name, definition) =>
+            installCommand({ ...definition, name }, 'a plugin', true),
+        threads: {
+            // Detached copies, exactly like the handle's `threads()`.
+            list: () => [...threadStates.values()].map((state) => threadRecordCopy(state.record)),
+            create: (agent, options) => createThreadState(agent, options).record,
+            // `delete` is the contract name; `remove` is an alias for the same
+            // operation (see HarnessPluginApi.threads in ./types).
+            delete: (threadId) => deleteThread(threadId),
+            remove: (threadId) => deleteThread(threadId),
+            stop: (threadId, reason) => stopThread(threadId, reason),
+            send: (threadId, input, options) => sendThreadInput(threadId, input, options),
+            steer: (threadId, text) => steerThread(threadId, text),
+            messages: (threadId) => threadMessages(threadId),
+            replaceMessages: (threadId, messages) =>
+                setThreadMessages(threadId, [...messages]),
+            setStatus: (threadId, status) => setThreadStatus(threadId, status)
+        },
+        // Arrows, not direct references: `pluginApiBase` is built high in the
+        // constructor while the switch helpers are declared further down, and an eager
+        // property read of a block-scoped const would be a temporal-dead-zone crash at
+        // construction. The arrow defers the read to the first plugin call.
+        enableTool: (name) => enableToolFor(name),
+        disableTool: (name) => disableToolFor(name),
+        // A detached copy: a plugin must not be able to mutate the live enabled set
+        // through the handle's own array.
+        enabledTools: () => currentEnabledNames(),
+        async: {
+            // The wire view of the board (ids + elapsed), never a task or a controller.
+            pending: (agent) => scheduler.pendingList(agent),
+            // Emits the background wake for one agent (or every agent with pending
+            // work) through the harness's per-agent mailbox. This is the ONLY way the
+            // heartbeat happens now: the `async-ping` plugin owns the timer (R4) and
+            // calls this on each tick. An empty board is a no-op.
+            wake: (agent) => scheduler.wake(agent)
+        },
+        // Effective legacy heartbeat, handed to the plugin so `intervalMs` can fall
+        // back to it. Read-only: a plugin changes the policy through its setting.
+        config: { wakeIntervalMs }
+    };
+
+    // Fallback api for a hook registered directly on the bus (a host, or a test) rather
+    // than through a plugin. `settings` is scoped to the pseudo-plugin name `harness`,
+    // which declares nothing, so every read falls back to the caller's own fallback —
+    // honest, because this view has no plugin namespace of its own.
+    const hostPluginApi: HarnessPluginApi = {
+        ...pluginApiBase,
+        settings: createPluginSettingsView('harness', pluginSettings),
+        on: (event, handler) =>
+            hookBus.on(event, handler, { owner: 'harness', api: hostPluginApi })
+    };
+
+    // Shared identity block for every `run.*` / `turn.*` / `tool.*` payload. `threadId`
+    // is omitted (not empty) when the run owns an ephemeral transcript instead of a
+    // conversation — a fork or an autoanswer branch — so a handler can test for it the
+    // same way it tests the event frames.
+    const runLifecycleContext = (
+        run: RunState
+    ): { threadId?: string; agent: string; depth: number; input: string } => ({
+        ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
+        agent: run.agent.name,
+        depth: run.depth,
+        input: run.input
+    });
+
     // Tools toolRequest has enabled. Order is the CURRENT cap order: the newest
     // selection's matches first, then retained prior entries. Searchable tools stay
     // in the registry but are not declared — and not callable — until they land
@@ -1136,6 +1307,57 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             evicted: previous.filter((name) => !result.has(name) && !retainedSet.has(name)),
             retained: retained.filter((name) => result.has(name))
         };
+    };
+
+    // ------------------------------------------------------------------
+    // R3 plugin-facing tool switching
+    // ------------------------------------------------------------------
+    //
+    // A plugin must not get a second, weaker set of rules than the model-facing
+    // `toolManage` or the operator route: the same three refusals apply (unknown name,
+    // core declaration, blank name) and the mutation goes through the same helpers.
+    // Both operations are IDEMPOTENT, like the `enable`/`disable` operations are, so a
+    // plugin that re-enables a tool it already enabled costs nothing.
+    //
+    // `enableTool` intentionally uses the SAME newest-first selection as a `toolRequest`
+    // match, which means it can evict whatever no longer fits `maxEnabledTools` — the
+    // cap is not bypassed for a plugin, only for the operator's manual EXECUTION path.
+    const requireSwitchableTool = (name: string): string => {
+        if (typeof name !== 'string' || name.trim().length === 0) {
+            throw new HarnessError('A tool switch requires a non-empty tool name.');
+        }
+
+        if (tools[name] === undefined) {
+            throw new HarnessError(`Tool "${name}" is not registered in this harness.`);
+        }
+
+        // A core declaration is always in context and never occupies a cap slot, so
+        // switching it would be a no-op the caller believes took effect.
+        if (!occupiesSearchableSlot(name)) {
+            throw new HarnessError(
+                `Tool "${name}" is a core declaration; it is always in context and cannot be enabled or disabled.`
+            );
+        }
+
+        return name;
+    };
+
+    const enableToolFor = (name: string): void => {
+        const switchable = requireSwitchableTool(name);
+        if (currentEnabledSet().has(switchable)) return;
+
+        enableTools([switchable, ...currentEnabledNames()]);
+        notifyStateChange('tool_create', { tool: switchable });
+    };
+
+    const disableToolFor = (name: string): void => {
+        const switchable = requireSwitchableTool(name);
+        if (!currentEnabledSet().has(switchable)) return;
+
+        // The registration stays: discovery gates the MODEL, so a disabled tool is
+        // still callable by a host and costs no budget to re-enable.
+        setActiveTools(currentEnabledNames().filter((entry) => entry !== switchable));
+        notifyStateChange('tool_create', { tool: switchable });
     };
 
     // The core tools a given agent may actually see: every 'core' definition, minus
@@ -3278,6 +3500,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // other. The lineage is the ancestry chain, which is what makes the cycle and
     // depth rules work without a global run stack.
     type RunState = {
+        // R2/R3 plugin hooks: the run's root prompt, kept so any payload built during
+        // the run (tool/turn lifecycle) can name the conversation's input without
+        // threading it through every helper. Informational only — nothing reads it for
+        // behaviour.
+        input: string;
         // Monotonic id; also the scheduler scope, so toolCancel can never reach a
         // sibling run's tasks.
         id: number;
@@ -3723,6 +3950,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         threadStates.set(id, state);
         registerThreadTools();
         if (notify) notifyStateChange('thread');
+
+        // R2 plugin hook: a conversation now exists. Synchronous emit (`fire`) because
+        // createThread is a synchronous handle method — a hook cannot turn it into a
+        // promise. The payload is a DETACHED copy so a hook that keeps or mutates it
+        // cannot reach the live record, and the copy is only built when something listens.
+        if (hookBus.has('thread.created')) {
+            hookBus.fire('thread.created', threadRecordCopy(state.record));
+        }
         return state;
     };
 
@@ -3763,6 +3998,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // a later host revive starts from the host's new input, not from stale
         // steering the aborted run never consumed.
         state.queue.length = 0;
+
+        // R2 plugin hook. Emitted HERE rather than in stopThread so every stop path
+        // (stopThread, stopAllThreads, an owner-linked cascade) reports the transition
+        // exactly once per conversation. A thread that was 'paused' is reported as
+        // stopped: the hook says what the record IS now, not what it was.
+        if (hookBus.has('thread.stopped')) {
+            hookBus.fire('thread.stopped', threadRecordCopy(state.record));
+        }
 
         if (state.run === undefined || !state.run.active || state.controller === undefined) {
             return false;
@@ -3893,9 +4136,64 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
         }
 
+        // Capture the identities BEFORE the purge: a hook that receives the payload must
+        // not be able to observe (or be confused by) half-removed lookups, and
+        // `purgeThread` drops the record from every index the id appears in. Only built
+        // when something listens — the purge itself must stay a single path.
+        const removed = hookBus.has('thread.deleted')
+            ? [state, ...descendants].map((entry) => ({
+                  threadId: entry.record.id,
+                  agent: entry.record.agent
+              }))
+            : undefined;
+
         purgeThread(state);
         for (const child of descendants) purgeThread(child);
         notifyStateChange('thread');
+
+        // R2 plugin hook: one event per purged conversation, cascade children last
+        // (creation order), so a listener sees the owner before what it owned.
+        if (removed !== undefined) {
+            for (const payload of removed) hookBus.fire('thread.deleted', payload);
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // R2/R3 plugin park/unpark ('paused')
+    // ------------------------------------------------------------------
+    //
+    // 'paused' is the ONE thread status a plugin owns. A lifecycle hook runs at a turn
+    // boundary with the run parked inside it, so a plugin that needs the conversation
+    // to stop moving (compaction, a budget gate, a human review) marks the record and
+    // resumes it before returning. The run itself is NOT suspended — this is an
+    // observable status at a boundary, and a hook that wants a real pause awaits its
+    // own work.
+    //
+    // Both helpers notify persistence exactly like a status change already does
+    // (`thread`), so a snapshot of a parked thread is a snapshot of an idle one
+    // (snapshot() maps anything not 'stopped' to 'idle').
+    const pauseThreadState = (state: ThreadState): void => {
+        if (state.record.status === 'paused') return;
+
+        state.record.status = 'paused';
+        notifyStateChange('thread', { agent: state.agent.name });
+        if (hookBus.has('thread.paused')) {
+            hookBus.fire('thread.paused', threadRecordCopy(state.record));
+        }
+    };
+
+    // Resume returns a parked conversation to whatever status the run loop would have
+    // it in: 'running' while a run is still attached (the normal case, because the run
+    // is inside the very hook that paused), 'idle' when the run has already ended and
+    // the park outlived it.
+    const resumeThreadState = (state: ThreadState): void => {
+        if (state.record.status !== 'paused') return;
+
+        state.record.status = state.run === undefined ? 'idle' : 'running';
+        notifyStateChange('thread', { agent: state.agent.name });
+        if (hookBus.has('thread.resumed')) {
+            hookBus.fire('thread.resumed', threadRecordCopy(state.record));
+        }
     };
 
     const steerThread = (threadId: string, input: string): HarnessThreadSteerReceipt => {
@@ -3949,6 +4247,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             notifyStateChange('thread');
         }
 
+        // R2: an explicit host turn is ALSO the revival path for a conversation a
+        // plugin parked and never resumed. Without this a 'paused' record would sit
+        // unreachable, since nothing else writes that status. `resumeThreadState`
+        // emits `thread.resumed`, so a plugin that parked the thread sees its own park
+        // being lifted by the host.
+        if (state.record.status === 'paused') {
+            resumeThreadState(state);
+        }
+
         return runAgent(
             state.agent,
             input,
@@ -3989,6 +4296,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Edge case: `validated` may be an EMPTY array. That is a legal transcript
     // here (a bare conversation with no system seed); restore() accepts it for a
     // host thread, and the next run simply starts from the agent instructions.
+    // The transcript-write half of `setThreadMessages`, WITHOUT the live-work guard.
+    //
+    // The guard exists for a HOST caller that could tear a transcript out from under a
+    // run. `turn.before`'s `replaceHistory()` is different in exactly one way: the
+    // caller IS the run, parked at a boundary where nothing is being read, so refusing
+    // the write (status is always 'running' there) would make per-agent context
+    // compaction impossible. The validation, the in-place replacement, and the
+    // persistence notification are identical, which is what keeps a compacted transcript
+    // snapshot-restorable.
+    //
+    // Declared BEFORE `setThreadMessages` so neither can ever be reached before the
+    // other is initialized.
+    const writeThreadTranscript = (target: ThreadState, messages: HarnessMessage[]): void => {
+        const validated = readHarnessMessages(messages, `thread "${target.record.id}" messages`);
+
+        target.agent.messages.length = 0;
+        for (const message of validated) target.agent.messages.push(message);
+
+        // Shared-store persistence: the transcript IS harness state, so the
+        // session's state-change observer must capture it. `agent_message` + the
+        // owning agent's name is exactly what `postThreadMessage` reports for an
+        // idle append (line ~3460); no new reason is introduced.
+        notifyStateChange('agent_message', { agent: target.agent.name });
+    };
+
     const setThreadMessages = (threadId: string, messages: HarnessMessage[]): void => {
         const target = threadStateOf(threadId);
 
@@ -4003,16 +4335,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
-        const validated = readHarnessMessages(messages, `thread "${threadId}" messages`);
-
-        target.agent.messages.length = 0;
-        for (const message of validated) target.agent.messages.push(message);
-
-        // Shared-store persistence: the transcript IS harness state, so the
-        // session's state-change observer must capture it. `agent_message` + the
-        // owning agent's name is exactly what `postThreadMessage` reports for an
-        // idle append (line ~3460); no new reason is introduced.
-        notifyStateChange('agent_message', { agent: target.agent.name });
+        writeThreadTranscript(target, messages);
     };
 
     // ------------------------------------------------------------------
@@ -4723,18 +5046,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         await progress(withThread(run, { type: 'error', agent: run.agent.name, error }));
     };
 
-    // The one board per harness. It owns the per-call AbortControllers and the
-    // single recurring wake timer.
+    // The one board per harness. It owns the per-call AbortControllers and the pending
+    // set; it owns NO timer (R4). The recurring background wake is emitted by the
+    // shipped `async-ping` plugin, which arms its own per-agent interval and calls
+    // `api.async.wake()` — the same `onWake` mailbox path used below, unchanged.
     const scheduler = createTaskScheduler({
-        wakeIntervalMs,
         // Wake delivery goes through the per-agent mailbox for the same reason a
         // completion does: it may append nothing, but it emits an event and starts
         // a turn, and those must not race a completion for the same agent.
         //
-        // The pending list is recomputed INSIDE the mailbox: the scheduler's tick
-        // snapshot can be stale by the time a queued delivery runs (a completion
-        // may have drained the board), and a stale list would tell the model (and
-        // the UI) that finished work is still running.
+        // The pending list is recomputed INSIDE the mailbox: the wake's snapshot can be
+        // stale by the time a queued delivery runs (a completion may have drained the
+        // board), and a stale list would tell the model (and the UI) that finished work
+        // is still running.
         onWake: (actorKey) => {
             enqueueMailbox(actorKey, async () => {
                 const live = [...runs].filter(
@@ -5132,6 +5456,37 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // A tool may have mutated session state; notify for every settled call,
         // success or failure, exactly like the synchronous path's finally.
         notifyStateChange('tool_execute', { agent: brain.name, tool: call.name });
+
+        // `async.drained` fires on the transition where this agent's board became empty;
+        // `tool.after` reports the OUTCOME as the transcript has it (content, the
+        // structured classification, the measured span). Both are `has()`-guarded — see
+        // the `thread.started` note. The drained list is computed AFTER the scheduler
+        // removed the task, so the payload is what is still running, never the call just
+        // delivered (that is `tool.after`'s job).
+        //
+        // `agent` is the SCHEDULER identity (`run.actorKey`), matching `async.pending`:
+        // the `async-ping` plugin keys its per-agent timer on that value, so a drained
+        // signal carrying the display name would leave the timer of a host thread
+        // (`thread:<id>`) armed behind an empty board.
+        if (hookBus.has('tool.after')) {
+            await hookBus.emit('tool.after', () => ({
+                ...runLifecycleContext(run),
+                name: call.name,
+                call,
+                callId: call.id,
+                content,
+                isError,
+                outcome,
+                durationMs
+            }));
+        }
+
+        if (pending.length === 0 && hookBus.has('async.drained')) {
+            await hookBus.emit('async.drained', () => ({
+                agent: run.actorKey,
+                pending: []
+            }));
+        }
     };
 
     // Emit a result that never became background work (validation failure, or a
@@ -5167,6 +5522,44 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         });
     };
 
+    // R4 plugin hook — the ONE `async.pending` announcement, used by every site that
+    // puts background work on an actor's board: `launchToolCall` (an ordinary async tool
+    // call), `launchThreadFork` (a branch run) and `launchActionRequest` (an owner
+    // answer). This IS the heartbeat's arming signal: the shipped `async-ping` plugin
+    // listens here and arms (or keeps) one unref'd interval for this actor, calling
+    // `api.async.wake(agent)` on each tick. The scheduler itself owns no timer, so a
+    // harness whose ping plugin is replaced by the host simply stops pinging — and a
+    // schedule site that never announces here is a board NOTHING ever wakes. Before R5
+    // the old board-wide 10-minute interval covered all three sites by accident of
+    // being global; moving the timer into the plugin made each site responsible for its
+    // own announcement, which is the coverage gap this helper closes.
+    //
+    // WHY BEFORE `schedule()`: the task starts immediately and may settle synchronously,
+    // so reading the LIVE board here would report an empty list for the first call of a
+    // turn and the plugin would never arm (`async-ping.plugin.ts` `arm()`). The payload
+    // is therefore the live list PLUS this call, and `elapsedMs: 0` is honest — the call
+    // started now. The paired `async.drained` fires in `deliverTask`, which all three
+    // sites reach through their `onSettled`, so a fork-only or request-only board drains
+    // exactly like a tool-only one.
+    //
+    // `agent` is the SCHEDULER identity (`run.actorKey`) — the same key
+    // `api.async.pending(agent)`, `api.async.wake(agent)` and the plugin's timer map key
+    // on, and the same key `async.drained` reports: the display name for a registered
+    // agent, `thread:<id>` for a host thread, `branch:<id>` for a branch run's own board.
+    const announcePending = async (run: RunState, call: HarnessToolCall): Promise<void> => {
+        // Rule 5 (plugin/hooks.ts): no listener means no emit, and therefore no extra
+        // microtask between the frame above and `scheduler.schedule()`.
+        if (!hookBus.has('async.pending')) return;
+
+        await hookBus.emit('async.pending', () => ({
+            agent: run.actorKey,
+            pending: [
+                ...scheduler.pendingList(run.actorKey),
+                { callId: call.id, name: call.name, elapsedMs: 0 }
+            ]
+        }));
+    };
+
     // Launch one tool call. Validation is still synchronous and every failure
     // mode still becomes a readable tool result; only the implementation runs in
     // the background.
@@ -5194,6 +5587,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     ): Promise<void> => {
         // ABORT BOUNDARY (R10): no call starts into a cancelled run.
         throwIfAborted(run);
+
+        // R2 plugin hook: `tool.before` fires BEFORE the `tool_call` frame, so a plugin
+        // that logs or prepares state is observed in the same order the transcript is
+        // built. A hook cannot VETO a call — a refusal needs a tool result, and that is
+        // the model's contract rather than a hook's — but it can see the exact call
+        // object, disable the tool for the NEXT turn, or spawn the work the call needs.
+        if (hookBus.has('tool.before')) {
+            await hookBus.emit('tool.before', () => ({
+                ...runLifecycleContext(run),
+                name: call.name,
+                call
+            }));
+        }
 
         await emit(run, { type: 'tool_call', agent: run.agent.name, call });
 
@@ -5391,6 +5797,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T2/R3: a sync call joins the group here (not at dispatch), so only a call that
         // really became background work can hold the batch gate.
         joinSyncBatch(run, syncGroup, call.id);
+
+        // R4 plugin hook — the heartbeat's arming signal for this call. Full rules on
+        // the helper (`announcePending`, above): emitted BEFORE `schedule()`, carrying
+        // the live board plus this call, keyed on `run.actorKey`.
+        await announcePending(run, call);
 
         scheduler.schedule({
             scope: run.scope,
@@ -5871,6 +6282,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // The start frame is now observable: a later release may emit its terminal.
         branchStarted.add(metadata.branchId);
 
+        // R4 plugin hook — a branch run IS background work on the requester's board, so
+        // the heartbeat has to arm for it here too (see `announcePending`). A turn whose
+        // only work is forks used to be covered by the old board-wide timer and is silent
+        // without this announcement; `deliverTask` clears it again on the drain.
+        await announcePending(run, call);
+
         scheduler.schedule({
             scope: run.scope,
             agent: run.actorKey,
@@ -6174,6 +6591,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw error;
         }
 
+        // R4 plugin hook — the owner answer (a host handler or an autoanswer fork) is
+        // background work on this run's board for as long as it is unanswered, so the
+        // heartbeat arms for it exactly as it does for a fork or an async tool call.
+        // Nothing is announced when the report itself failed: that run never schedules.
+        await announcePending(run, call);
+
         scheduler.schedule({
             scope: run.scope,
             agent: run.actorKey,
@@ -6351,6 +6774,137 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return previous.then(work).finally(() => release());
     };
 
+    // ------------------------------------------------------------------
+    // R2/R3 plugin hook: the turn boundary
+    // ------------------------------------------------------------------
+    //
+    // Builds and emits one `turn.before` round and returns the transcript the provider
+    // must actually receive — synchronously when every handler stayed synchronous, as a
+    // promise only when one of them did real work (see the maybe-sync note below). Kept
+    // as a helper (rather than inlined) because the context has to be rebuilt PER HANDLER
+    // — that is the only way a second hook can see what the first one already rewrote,
+    // and hook order is otherwise unobservable.
+    //
+    // PRECEDENCE, stated exactly (both interception styles compose deterministically):
+    //   - `setTranscript()` writes immediately and is visible to every LATER handler;
+    //   - a handler that RETURNS `{ transcript }` is applied after the round, so it wins
+    //     over an earlier `setTranscript`, and the LAST returned value wins overall;
+    //   - an empty array is never an override (see plugin/hooks.ts `overrideOf`).
+    //
+    // NOTHING IS COMMITTED HERE. The override affects this REQUEST only; the agent's
+    // transcript is untouched unless a hook calls `replaceHistory()`, which is what
+    // keeps "compact this turn" and "shrink this conversation" separate decisions.
+    //
+    // Cost when nobody listens: one `has()` check. The estimate, the record copies and
+    // the context object are all behind it, so a harness without a `turn.before` hook
+    // pays nothing for the framework.
+    //
+    // WHY THIS IS MAYBE-SYNCHRONOUS (and why `await` here is not an option):
+    // `turn.before` is the one hook with a PERMANENT subscriber — the shipped
+    // `context-compaction` plugin registers it unconditionally, and on an under-limit
+    // turn (i.e. nearly every turn) its handler returns synchronously. `has()` is
+    // therefore always true, so the rule-5 guard cannot save this call site any more:
+    // an `await` in the emission path adds a microtask on every single turn, and the
+    // harness interleaves concurrent runs on exactly those boundaries. `src/server/
+    // queue.test.ts` ("a late observer disconnect cannot cancel the queued task that
+    // started next") is the regression that pins this: with an unconditional await, one
+    // extra `event:text` frame reaches an observer that had already disconnected.
+    // `hookBus.emitMaybeSync` keeps the round on the caller's tick while every handler
+    // is synchronous, so a synchronously inert hook is event-order identical to no hook
+    // at all (plugin/hooks.ts rule 6).
+    const alwaysActiveSignal = new AbortController().signal;
+
+    const emitTurnBefore = (
+        run: RunState,
+        projection: readonly HarnessMessage[]
+    ): HarnessMaybeAsync<HarnessMessage[]> => {
+        if (!hookBus.has('turn.before')) {
+            return { sync: true, value: projection as HarnessMessage[] };
+        }
+
+        const threadState = run.threadState;
+        const brain = run.agent;
+        // The live override, visible to each subsequent handler through the freshly
+        // built context below.
+        let override: readonly HarnessMessage[] | undefined;
+
+        // The factory runs once per handler, so `messages` and `estimatedTokens` always
+        // describe what THIS handler is being asked about.
+        // The factory receives the bus's context object (which carries the owning
+        // plugin's api), not the api itself.
+        const context = ({ api }: { api?: HarnessPluginApi }): HarnessTurnBeforeContext => {
+            const messages = override ?? projection;
+
+            return {
+                // A branch run has no persistent conversation, so it reports the actor
+                // identity it is running under rather than a fake thread id.
+                threadId: run.threadId ?? run.actorKey,
+                agent: brain.name,
+                iteration: run.iteration,
+                messages,
+                // Same ~4 chars/token convention as the UI context bar
+                // (core/context-estimate.ts), plus the agent's leading instruction
+                // blocks: those occupy the provider's context window too, and a limit
+                // that ignored them would compact later than the operator expected.
+                estimatedTokens: estimateContextTokens(messages, brain.instructions),
+                signal: run.signal ?? alwaysActiveSignal,
+                api: api ?? hostPluginApi,
+                setTranscript: (messages): void => {
+                    override = messages;
+                },
+                replaceHistory: (messages): void => {
+                    if (threadState === undefined) {
+                        throw new HarnessError(
+                            'replaceHistory needs a persistent conversation; this run has none.'
+                        );
+                    }
+
+                    // THE same write the host's `setThreadMessages` performs (snapshot
+                    // validation, in-place replacement, `agent_message` persistence
+                    // notification) minus its live-work guard: the guard exists for a host
+                    // that could tear a transcript out from under a run, and here the
+                    // caller IS the run, parked at a boundary. Keeping it would make
+                    // compaction impossible, because the record always says 'running' at
+                    // this point.
+                    writeThreadTranscript(threadState, [...messages]);
+                },
+                // Awaited so a plugin can do real work between park and unpark. Both are
+                // no-ops for a run without a conversation (a branch), which cannot be
+                // parked because nothing can address it.
+                pause: async (): Promise<void> => {
+                    if (threadState !== undefined) pauseThreadState(threadState);
+                },
+                resume: async (): Promise<void> => {
+                    if (threadState !== undefined) resumeThreadState(threadState);
+                }
+            };
+        };
+
+        const round = hookBus.emitMaybeSync('turn.before', context);
+
+        // One round's merged result becomes the request body. `setTranscript()` (the
+        // live `override`) and a returned `{ transcript }` keep their documented
+        // precedence: a returned value wins over an earlier `setTranscript`.
+        const requestOf = (merged: HarnessMergedHookResult): HarnessMessage[] => {
+            const final = merged.transcript ?? override;
+
+            // A hook hands back a readonly array; `turn()` expects the request's own
+            // array, and copying also protects the harness from a hook that keeps
+            // mutating it.
+            if (final === undefined || final.length === 0) return projection as HarnessMessage[];
+
+            return [...final];
+        };
+
+        // SYNC means "no handler yielded": the override is applied here, on the caller's
+        // tick, exactly as it was before plugins existed. Only a handler that returned a
+        // promise (a real compaction pass) costs a boundary — which is the point of that
+        // turn.
+        return round.sync
+            ? { sync: true, value: requestOf(round.value) }
+            : { sync: false, promise: round.promise.then(requestOf) };
+    };
+
     // One model turn, made abort-PREEMPTIVE (T15). The transport may ignore its
     // signal entirely, so we do not rely on it settling: the consumer races the
     // run signal and throws as soon as the run is cancelled. The abandoned
@@ -6381,11 +6935,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // returned by it execute these objects even if a replacement publishes
             // before the calls are launched.
             const { offered, declarations: declarationsForRequest } = offerDeclarations(run);
+
+            // R2/R3 — `turn.before`: the ONE interception point of the plugin
+            // lifecycle, and the reason a per-agent context limit is implementable at
+            // all. It fires with the array the provider is about to receive (committed
+            // history plus a placeholder for every still-running call), so a hook can
+            // shrink it without touching durable state.
+            //
+            // NO `await` on the hot path. The `has()` check alone is no longer enough,
+            // because `turn.before` always HAS a subscriber (the shipped
+            // context-compaction plugin) while usually being inert. `emitTurnBefore`
+            // therefore hands back a discriminated result: a synchronous round is applied
+            // here with zero microtasks, and only a genuinely asynchronous handler
+            // yields. Awaiting unconditionally moved an observer-visible event frame in
+            // src/server/queue.test.ts.
+            const before = emitTurnBefore(run, projection);
+            const requestTranscript = before.sync ? before.value : await before.promise;
+
             const iterator = brain
                 .turn({
                     signal: run.signal,
                     tools: declarationsForRequest,
-                    transcript: projection,
+                    transcript: requestTranscript,
                     precommit: () => assertCommitAllowed(run)
                 })
                 [Symbol.asyncIterator]();
@@ -6678,6 +7249,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // agent.turn() committed the assistant message before yielding
                 // `done`; persist that append before any tool work or the next turn.
                 notifyRunStateChange(run, 'agent_message', { agent: brain.name });
+
+                // R2 plugin hook: the turn is COMMITTED, so `turn.after` reports real
+                // history (usage, stop reason, the calls the model asked for). Emitted
+                // before any tool is launched, which is what lets a budget plugin stop a
+                // conversation from spending more without racing its own tool work.
+                if (hookBus.has('turn.after')) {
+                    await hookBus.emit('turn.after', () => ({
+                        ...runLifecycleContext(run),
+                        iteration: run.iteration,
+                        message
+                    }));
+                }
 
                 // R3/F1: this request's SUCCESS boundary. It is emitted whenever this
                 // response gets NO `done` — a tool-calling round (closed after its
@@ -7166,6 +7749,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             const id = ++runSequence;
             const run: RunState = {
+                input,
                 id,
                 scope: String(id),
                 agent: runBrain,
@@ -7263,6 +7847,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // thread's status/invocation id are derived from that same run.
                 // Emitting `thread` on every turn would double every save without
                 // recording anything a snapshot of the transcript does not.
+
+                // R2 plugin hook: the conversation is live again. The bus is NOT
+                // `stateChange` — it costs the persistence layer nothing, so firing it
+                // per run is free of the concern above.
+                //
+                // Every awaited emit below is guarded by `hookBus.has(...)` for one
+                // non-obvious reason (plugin/hooks.ts rule 5): an unconditional `await`
+                // inserts a microtask into every run even when NO plugin is installed, and
+                // the harness interleaves a delegated child's frames with its parent's on
+                // exactly those boundaries. The guard keeps a hookless harness bit-for-bit
+                // on its old event order.
+                if (hookBus.has('thread.started')) {
+                    await hookBus.emit('thread.started', () => threadRecordCopy(resolvedThread.record));
+                }
             }
 
             // A run-level abort wakes a paused loop so the next iteration observes
@@ -7286,12 +7884,41 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // it never touches history or events.
             registerInvocation(run);
 
+            // R2/R3 plugin hooks around ONE run. `run.started` fires after the
+            // invocation is registered (so a handler that reads the roster sees this
+            // run) and after the actor is owned (so it cannot report a run that was
+            // refused in the queue). Guarded by `has()` — see the `thread.started` note.
+            if (hookBus.has('run.started')) {
+                await hookBus.emit('run.started', () => runLifecycleContext(run));
+            }
+
             try {
                 const message = await runAgentCore(run, input);
                 finishInvocation(run, { message });
+
+                // Only a run that produced an answer gets `run.finished`; the failure
+                // path below reports `run.failed` instead, so a handler never sees both
+                // and never sees neither.
+                if (hookBus.has('run.finished')) {
+                    await hookBus.emit('run.finished', () => ({
+                        ...runLifecycleContext(run),
+                        message
+                    }));
+                }
+
                 return message;
             } catch (error) {
                 finishInvocation(run, { error });
+
+                // `toErrorInfo` is total (util/errors.ts), so a tool that threw a
+                // primitive/object/Proxy still yields a serializable payload here.
+                if (hookBus.has('run.failed')) {
+                    await hookBus.emit('run.failed', () => ({
+                        ...runLifecycleContext(run),
+                        error: toErrorInfo(error)
+                    }));
+                }
+
                 throw error;
             } finally {
                 run.active = false;
@@ -7321,6 +7948,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     }
                     if (resolvedThread.record.status === 'running') {
                         resolvedThread.record.status = 'idle';
+                    }
+
+                    // R2 plugin hook: the conversation stopped working. Emitted ONLY for
+                    // a real transition to idle — a record left 'stopped' already had
+                    // `thread.stopped`, and one left 'paused' (a plugin parked it and did
+                    // not resume) already had `thread.paused`. Reporting idle for either
+                    // would contradict the record the handler can read back.
+                    if (resolvedThread.record.status === 'idle' && hookBus.has('thread.idle')) {
+                        await hookBus.emit('thread.idle', () =>
+                            threadRecordCopy(resolvedThread.record)
+                        );
                     }
                 }
 
@@ -7955,47 +8593,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // Apply plugins before returning so the handle is complete and consistent.
-    const pluginNames = runPlugins(configuration.plugins ?? [], {
-        agents,
-        tools,
-        createAgent: (name, agentConfiguration) => {
-            if (agents[name]) {
-                throw new HarnessError(`Agent "${name}" is already registered.`);
-            }
-            const brain = createAgent({ ...agentConfiguration, name });
-            agents[name] = brain;
-            // R2: a plugin-added agent owns a default conversation like every
-            // configured one, so `threads()`/threadSend can address it and
-            // `sendThreadInput('agent:<name>')` resumes it.
-            threadStates.set(defaultThreadIdOf(name), {
-                record: {
-                    id: defaultThreadIdOf(name),
-                    agent: name,
-                    origin: 'agent',
-                    status: 'idle',
-                    sequence: ++threadSequence
-                },
-                agent: brain,
-                queue: [],
-                generation: 0
-            });
-            return brain;
-        },
-        addTool: (name, toolConfiguration) => {
-            // No reserved names and no "already registered" rejection: a plugin is
-            // an intentional later registration and therefore REPLACES by name.
-            // It commits through the same atomic kernel as every other path.
-            const definition = defineTool({ ...toolConfiguration, name });
-            registerAtStartup({ definition });
-            return definition;
-        },
-        // Commands follow the SAME replace-by-name rule as addTool, and for the
-        // same reason: the plugin phase runs after the built-ins and
-        // `configuration.commands`, so contributing a name that already exists is
-        // how a plugin intentionally overrides one.
-        addCommand: (name, definition) =>
-            installCommand({ ...definition, name }, 'a plugin', true)
+    //
+    // R2/R3/R4 — DISCOVERY AND PRECEDENCE. The auto-discovered built-ins
+    // (./plugin/manifest.ts, generated from src/plugins/**/*.plugin.ts) are applied
+    // FIRST, then `configuration.plugins`. A host plugin that names a built-in REPLACES
+    // it in place, which is how an operator swaps the shipped compaction or ping plugin
+    // out; two host plugins with one name is still an error, because there is no honest
+    // precedence between two entries the host wrote by hand.
+    //
+    // The harness supplies only the plugin-agnostic half of the api (`pluginApiBase`);
+    // runPlugins adds the per-plugin `on` (bound to THIS bus, so a subscription cannot
+    // leak between writers) and the settings view scoped to that plugin's own name and
+    // declared defaults.
+    const pluginHost: HarnessPluginHostResult = runPlugins({
+        builtins: BUILTIN_PLUGINS,
+        plugins: configuration.plugins ?? [],
+        hooks: hookBus,
+        settings: pluginSettings,
+        apiBase: pluginApiBase
     });
+
+    const pluginNames = pluginHost.names;
+    // Declared metadata for the UI's Plugins pane, same order as `pluginNames`.
+    const pluginCatalogue = pluginHost.metadata;
 
     // Startup is complete: registrations from here on are runtime registrations
     // (budget, enabled set, persistence bookkeeping, and state-change reporting).
@@ -8530,6 +9150,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         subagents,
         tools,
         plugins: pluginNames,
+        // R2/R3: the declared catalogue behind those names (title, description,
+        // version, tags, hooks, settings) for the server/UI plugin view.
+        pluginMetadata: pluginCatalogue,
         // The single kernel registration operation. Runtime source revisions and
         // the model-facing toolRegistry both go through this exact function.
         registerTool,

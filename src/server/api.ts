@@ -152,6 +152,10 @@ import type {
     ModelDiscoveryRequest,
     ModelIndex,
     PendingActionListResponse,
+    PluginDetailResponse,
+    PluginSetting,
+    PluginSettingsUpdate,
+    PluginSummary,
     ProviderDefaults,
     QueuedTaskPage,
     ResetSessionResult,
@@ -190,6 +194,9 @@ import type {
 } from '../shared/harness-api';
 import type { StreamResourceKind, WsUpdateKind } from '../shared/harness-stream';
 import type { HarnessAttachment } from '../harness';
+// T5 (R2/R3): the plugin catalogue types (domain models, re-exported by the library root) and
+// the status-carrying error the settings store throws at the write edge.
+import type { HarnessPluginMetadata, HarnessPluginSettingDescriptor } from '../harness';
 import { unwrapToolResult, toolMediaDescriptors, boundToolResult, resolveToolParameters } from '../harness';
 import { isInstanceOf, toErrorInfo } from '../util';
 import { listModels, ModelListError } from '../transport/models';
@@ -219,6 +226,10 @@ import { writeHarnessAgentRecords } from './persistence';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
 import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
+// T5 (R2/R3): the plugin settings store's status-carrying failure (404 unknown plugin, 400
+// unknown key / mistyped / out-of-range value). The store itself is reached through
+// `store.pluginSettings`, so this dispatcher never constructs a second one.
+import { HarnessPluginSettingsError } from './plugins';
 import type { HarnessIndex, SessionStreamItem, SessionViewStreamItem } from './protocol';
 import { HttpError, capabilityDenied } from './api-errors';
 import { HARNESS_RUNTIME_EPOCH, createHarnessEventHub, resourceKeyOf } from './api-events';
@@ -1297,6 +1308,8 @@ export const createHarnessApi = ({
             harnesses: `${ctx.mount}/harnesses`,
             agents: `${ctx.mount}/agents`,
             tools: `${ctx.mount}/tools`,
+            // T5 (R2/R3): the built-in plugin catalogue (R3's Plugins pane reads it).
+            plugins: `${ctx.mount}/plugins`,
             models: `${ctx.mount}/models`,
             sessions: `${ctx.mount}/sessions`,
             stream: `${ctx.mount}/stream`
@@ -1901,6 +1914,114 @@ export const createHarnessApi = ({
         } catch (error) {
             return json(200, toolCallFailure(boundErrorMessage(error), Date.now() - started));
         }
+    };
+
+    // ---- plugins (T5 / R2-R3) ---------------------------------------------------
+
+    // The runtime's plugin settings store, reached THROUGH the store that owns it, so this
+    // dispatcher never builds a second catalogue: a `PATCH` here writes the same map that a
+    // running session's `api.settings` reads (./plugins.ts, ./sessions.ts `buildHarness`).
+    const plugins = store.pluginSettings;
+
+    // One declared descriptor -> one wire `PluginSetting`. The spellings already match (the
+    // spec copied them from `HarnessPluginSettingDescriptor`), so this is a presence filter,
+    // not a rename: an unset optional stays absent rather than becoming `undefined` on the wire.
+    const pluginSettingOf = (entry: HarnessPluginSettingDescriptor): PluginSetting => ({
+        key: entry.key,
+        label: entry.label,
+        type: entry.type,
+        default: entry.default,
+        ...(entry.min === undefined ? {} : { min: entry.min }),
+        ...(entry.max === undefined ? {} : { max: entry.max }),
+        ...(entry.step === undefined ? {} : { step: entry.step }),
+        ...(entry.description === undefined ? {} : { description: entry.description })
+    });
+
+    /**
+     * One built-in plugin as an operator sees it: the metadata the plugin file itself declares
+     * (via the generated manifest) beside the EFFECTIVE values this runtime reads right now.
+     * `values` comes from the store's settings-view resolution, so a row and a live plugin can
+     * never disagree; `settings[].default` is the reset target a `null` patch restores.
+     */
+    const pluginRowOf = (metadata: HarnessPluginMetadata): PluginSummary => {
+        const tags = metadata.tags === undefined ? undefined : [...metadata.tags];
+        const hooks = metadata.hooks === undefined ? undefined : [...metadata.hooks];
+
+        return {
+            name: metadata.name,
+            title: metadata.title,
+            ...(metadata.description === undefined ? {} : { description: metadata.description }),
+            ...(metadata.version === undefined ? {} : { version: metadata.version }),
+            ...(tags === undefined || tags.length === 0 ? {} : { tags }),
+            ...(hooks === undefined || hooks.length === 0 ? {} : { hooks }),
+            // Every row on this route is auto-scanned from `src/plugins`, so `builtin` is true;
+            // the field stays explicit (never inferred client-side) for the same reason the
+            // harness card states it.
+            builtin: metadata.builtin ?? true,
+            settings: (metadata.settings ?? []).map(pluginSettingOf),
+            values: plugins.values(metadata.name)
+        };
+    };
+
+    // `GET /plugins` — the loaded catalogue plus what each plugin is set to. Answerable with no
+    // harness and no model, in the manifest's stable order (path-ascending from the scan).
+    const getPlugins: Handler = (ctx) => {
+        const limit = resolveLimit(ctx.query.get('limit'));
+        const cursor = decodeCursor(ctx.query.get('cursor'));
+        const search = paramOf(ctx.query, 'q');
+
+        const all = [...plugins.descriptors];
+        const filtered =
+            search === undefined
+                ? all
+                : all.filter((metadata) =>
+                      `${metadata.name} ${metadata.title} ${metadata.description ?? ''} ${
+                          (metadata.tags ?? []).join(' ')
+                      }`
+                          .toLowerCase()
+                          .includes(search.toLowerCase())
+                  );
+
+        const page = slicePage(filtered, cursor, limit, filtered.length);
+
+        // The collection revision is the plugin settings store's own counter (one bump per
+        // accepted PATCH). It is NOT a hub counter: `plugins` is not a `StreamResourceKind`, and
+        // adding one would change the stream's bounded per-scope baseline set for a pane that
+        // rereads on open and on save. Same epoch, so a client's staleness test still holds.
+        return json(
+            200,
+            pageMeta({ items: page.items.map(pluginRowOf), next: page.next }, plugins.revision())
+        );
+    };
+
+    // `PATCH /plugins/{plugin_id}` — edit one plugin's settings.
+    //
+    // IMMEDIATE and durable: the store applies the value to the live map the harness reads, then
+    // the document carrying it is written BEFORE the answer (the store's rule for every
+    // structural mutation, ./sessions.ts `updatePluginSettings`). No stream publish: there is no
+    // `plugins` update kind in the contract's vocabulary, and the Plugins pane rereads.
+    const patchPlugin: Handler = async (ctx) => {
+        const name = ctx.params.plugin_id;
+        const body = requireObjectBody<PluginSettingsUpdate>(await ctx.body());
+
+        requireKnownFields(body, ['settings']);
+
+        if (body.settings === undefined) {
+            throw new HttpError(400, 'A plugin settings patch requires a "settings" object.');
+        }
+
+        // Validation (unknown plugin => 404, unknown key / wrong type / out-of-range => 400) is
+        // the store's decision and throws BEFORE it mutates anything, so this handler only moves
+        // bytes - the same split `patchHarness` follows with the definition registry.
+        await store.updatePluginSettings(name, { ...body.settings });
+
+        const metadata = plugins.metadata(name);
+
+        if (metadata === undefined) throw missing('plugin', name);
+
+        const revision = plugins.revision();
+
+        return json(200, { plugin: pluginRowOf(metadata) } satisfies PluginDetailResponse, revision);
     };
 
     // ---- model discovery --------------------------------------------------------
@@ -3935,6 +4056,9 @@ export const createHarnessApi = ({
         tools: { GET: getTools },
         toolsByToolId: { GET: getToolOne },
         toolsByToolIdExecutions: { POST: postToolExecution },
+        // T5 (R2/R3): the built-in plugin catalogue and the one writable field it has.
+        plugins: { GET: getPlugins },
+        pluginsByPluginId: { PATCH: patchPlugin },
         models: { POST: postModels },
         sessions: { GET: getSessions, POST: postSession },
         sessionsBySessionId: { GET: getSession, PATCH: patchSession, DELETE: deleteSession },
@@ -4039,7 +4163,7 @@ export const createHarnessApi = ({
                 return { kind: 'json', status: error.status, body: { error: { message: messageOf(error) } } };
             }
 
-            if (isInstanceOf(error, SessionError) || isInstanceOf(error, HarnessRegistryError) || isInstanceOf(error, AgentStateError)) {
+            if (isInstanceOf(error, SessionError) || isInstanceOf(error, HarnessRegistryError) || isInstanceOf(error, AgentStateError) || isInstanceOf(error, HarnessPluginSettingsError)) {
                 return {
                     kind: 'json',
                     status: error.status,

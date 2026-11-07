@@ -91,6 +91,10 @@ import type {
     ModelIndex,
     PageMeta,
     PendingActionListResponse,
+    PluginDetailResponse,
+    PluginSettingsUpdate,
+    PluginSummary,
+    PluginSummaryPage,
     ProviderDefaults,
     QueuedTask,
     QueuedTaskPage,
@@ -909,6 +913,33 @@ export const callTool = (
     sessionId === undefined || sessionId.length === 0
         ? executeGlobalTool(name, parameters)
         : executeSessionTool(sessionId, name, parameters);
+
+// ---------------------------------------------------------------------------
+// Plugins (T5 / R2-R3: the built-in catalogue + the settings an operator edits)
+// ---------------------------------------------------------------------------
+
+// `GET /plugins` — every auto-scanned built-in, its declared settings, and the
+// effective values in force right now. One row carries the descriptor AND the
+// current value, so the Plugins pane renders an editable form from a single
+// read: `settings[].default` is the reset target beside `values[key]`.
+export const listPlugins = (query: PageQuery = {}): Promise<Page<PluginSummary>> =>
+    request<PluginSummaryPage>(`${HARNESS_ROUTES.plugins()}${pageParams(query)}`).then(pageOf);
+
+// `PATCH /plugins/{id}` — change one plugin's settings and get the row back.
+// `settings` is the map the pane edited: a value REPLACES that key's override,
+// an explicit `null` resets it to the plugin's declared default, and an omitted
+// key is untouched. The server validates every key against the plugin's own
+// descriptor (400 for an unknown key, a wrong type, or a value outside
+// `min`/`max`; 404 for a plugin this build does not ship), and an accepted
+// change is visible to an EXISTING session on its next turn — no reload.
+export const updatePluginSettings = (
+    pluginId: string,
+    settings: Record<string, number | string | boolean | null>
+): Promise<PluginSummary> =>
+    request<PluginDetailResponse>(HARNESS_ROUTES.pluginsByPluginId(encodeURIComponent(pluginId)), {
+        method: 'PATCH',
+        body: JSON.stringify({ settings } satisfies PluginSettingsUpdate)
+    }).then((body) => body.plugin);
 
 // `POST /models` — provider discovery. `api_key` is write-only and travels in
 // this body (never a query string), and `signal` abandons a superseded lookup.

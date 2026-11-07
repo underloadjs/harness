@@ -392,10 +392,12 @@ it('wraps the status live region in a bare dialog trigger in the top-right clust
     expect(button.getAttribute('aria-pressed')).toBeNull();
     expect(button.getAttribute('aria-expanded')).toBeNull();
 
-    // The topbar cluster still holds exactly the status and the tools toggle, in order.
+    // The topbar cluster still holds the status pill, the tools toggle and (T7/R2) the
+    // plugins toggle, in that order — the two catalogue icons adjacent, plugins last.
     expect([...byClass('.topbar-right', 'div').children]).toEqual([
         button,
-        byClass('.tools-toggle', 'button')
+        byClass('.tools-toggle', 'button'),
+        byClass('.plugins-toggle', 'button')
     ]);
 
     // Nothing is open before the reader presses it.

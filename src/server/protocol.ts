@@ -434,7 +434,9 @@ export type SessionThread = {
     id: string;
     agent: string;
     origin: 'agent' | 'host';
-    status: 'idle' | 'running' | 'stopped';
+    // 'paused' is the plugin-owned park at a turn boundary (types/index.ts
+    // `HarnessThreadStatus`); the server only mirrors what the runtime reports.
+    status: 'idle' | 'running' | 'paused' | 'stopped';
     // Creation order (monotonic per session; copied from the runtime record).
     sequence: number;
     // The persistent parent thread (a delegated child links to its caller).
@@ -480,7 +482,9 @@ export type SessionThreadView = {
     id: string;
     agent: string;
     origin: 'agent' | 'host';
-    status: 'idle' | 'running' | 'stopped';
+    // Same four states as `SessionThread.status` (the compact surface must not invent
+    // a narrower one, or a paused conversation would render as `undefined`).
+    status: 'idle' | 'running' | 'paused' | 'stopped';
     sequence: number;
     ownerThreadId?: string;
     label?: string;

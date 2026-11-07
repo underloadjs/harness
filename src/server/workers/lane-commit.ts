@@ -73,7 +73,11 @@ export const MUTATION_GROUP_LIMIT = 64;
 export type CanonicalThread = {
     id: string;
     agent: string;
-    status: 'idle' | 'running' | 'stopped';
+    // R2/R3 ripple: 'paused' is a runtime status a plugin owns (types/index.ts
+    // `HarnessThreadStatus`), so the canonical view must be able to HOLD it or a lane
+    // fold would drop the transition. A snapshot still never carries it — snapshot()
+    // maps a parked thread to 'idle' — so this widens the shape, not the persisted set.
+    status: 'idle' | 'running' | 'paused' | 'stopped';
     sequence: number;
     label?: string;
     ownerThreadId?: string;

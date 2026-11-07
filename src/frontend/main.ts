@@ -120,7 +120,7 @@ import type { DisplayStep, TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlock
 // `loadAgentPresetTexts`): the ONLY response that states an agent's preset
 // instruction text, because `GET /agents` rows are text-free summaries
 // (../shared/harness-api.ts:552-563).
-import type { AgentProfile, HarnessInstructionSummaryEntry, HarnessPendingTool, TaskReceipt, ToolDetail } from '../shared/harness-api';
+import type { AgentProfile, HarnessInstructionSummaryEntry, HarnessPendingTool, PluginSetting, PluginSummary, TaskReceipt, ToolDetail } from '../shared/harness-api';
 // The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
 // and every submit below speaks `/views`, so no round trip on this path can carry a
 // recorded event. The raw client (./api.ts) stays imported for the catalogue routes
@@ -229,6 +229,12 @@ import {
     // configuration dialog needs that text, exactly as `getTool` is asked for when a
     // tool is opened (T50).
     getAgent,
+    // T7 (R2/R3): the plugin catalogue read and the ONE write the Plugins pane makes.
+    // `listPlugins` is `GET /plugins` (every auto-scanned built-in, its declared
+    // settings and the effective values), `updatePluginSettings` is
+    // `PATCH /plugins/{id}` (settings-only; the answer is the whole row).
+    listPlugins,
+    updatePluginSettings,
     // T7b (R5/R6/R7): the SESSION-scoped roster surface. A saved conversation owns its own
     // members, their models and their complete prompts, and these are the only routes that
     // read or write them (`GET/POST /sessions/{id}/agents`,
@@ -909,7 +915,12 @@ const createView = (
         turnId: string;
         blockId: string;
         sessionId?: string;
-    }) => Promise<TurnBlockDetail>
+    }) => Promise<TurnBlockDetail>,
+    // R1: the bar's Stop control delegates the per-thread cancel here. The shell owns the
+    // route (./view-shell.ts `cancelViewThread`) and the roster reconcile that turns the
+    // control back into Delete; the board owns single-flight and the no-confirmation rule.
+    // Omitted in an embedding without the route: the control renders Stop-but-disabled.
+    stopThread?: (sessionId: string, threadId: string) => Promise<unknown>
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -958,6 +969,9 @@ const createView = (
             ? {}
             : { refreshSessionSnapshot: refreshTranscript }),
         ...(removeThread === undefined ? {} : { deleteThread: removeThread }),
+        // R1: same shape as the delete transport — passed through only when the shell can
+        // actually reach the cancel route.
+        ...(stopThread === undefined ? {} : { stopThread }),
         ...(saveTranscript === undefined ? {} : { saveThreadTranscript: saveTranscript }),
         ...(loadDetail === undefined ? {} : { loadStepDetail: loadDetail }),
         ...(loadBlock === undefined ? {} : { loadBlockDetail: loadBlock }),
@@ -2414,6 +2428,34 @@ const toolsGlyph = el('span', 'tools-toggle-icon', '⚒');
 toolsGlyph.setAttribute('aria-hidden', 'true');
 toolsToggle.append(toolsGlyph);
 
+// T7 (R2): the Plugins toggle sits IMMEDIATELY AFTER the Tools toggle in the same
+// right cluster, and is built by exactly the same rules: an icon-only button whose
+// glyph is decoration (`aria-hidden`), whose accessible name is `aria-label`, and
+// whose `aria-pressed` reports whether the Plugins pane owns the centre column.
+//
+// It is a TOGGLE of the same shape as Tools because the two views are mutually
+// exclusive (one centre column, one owner): `setPluginsView` closes Tools and
+// `setToolsView` closes Plugins, so at most one of these buttons is ever pressed.
+//
+// T7 (R3): the Plugins pane is a read-only catalogue for ENABLEMENT (plugins are
+// auto-scanned; there is no enable/disable switch to offer), but the shipped
+// Context Compaction plugin declares a `contextLimit` setting that IS editable
+// there — the row's dialog is that editor.
+const pluginsToggle = el('button', 'plugins-toggle');
+pluginsToggle.type = 'button';
+pluginsToggle.id = 'plugins-toggle';
+pluginsToggle.setAttribute('aria-label', 'Plugins');
+pluginsToggle.setAttribute('aria-controls', 'harness-stage');
+pluginsToggle.setAttribute('aria-pressed', 'false');
+pluginsToggle.title = 'Show the plugin catalogue';
+// Same gate as Tools: before boot has answered there is no catalogue to list, and
+// `paintControls` enables it once a harness is selected (and `showOffline` disables
+// it again when the server goes away).
+pluginsToggle.disabled = true;
+const pluginsGlyph = el('span', 'plugins-toggle-icon', '⚙');
+pluginsGlyph.setAttribute('aria-hidden', 'true');
+pluginsToggle.append(pluginsGlyph);
+
 // R4 (T4): the status pill is ALSO the entry point to the endpoint/model settings.
 // The pill itself is untouched — it stays the `<span class="status" role="status">`
 // live region every status assertion reads — and a bare wrapper BUTTON around it
@@ -2431,8 +2473,12 @@ statusButton.append(statusPill);
 // top-right on every width. There is NO rail control in the topbar or on the harness
 // title row any more (T3/R1+R3): the harness listing is opened by the "Harness UI"
 // brand button and the scratch board by the floating `.scratch-fab` below.
+//
+// T7 (R2): the Plugins toggle is appended IMMEDIATELY AFTER Tools, so the two catalogue
+// controls read as one pair in the corner (and `pluginsToggle` is the cluster's last
+// child).
 const topbarRight = el('div', 'topbar-right');
-topbarRight.append(statusButton, toolsToggle);
+topbarRight.append(statusButton, toolsToggle, pluginsToggle);
 
 const railIcon = (glyph: string): HTMLSpanElement => {
     const icon = el('span', 'rail-toggle-icon', glyph);
@@ -2966,8 +3012,12 @@ const openEndpointDialog = (trigger: HTMLElement): void => {
 // reader cannot dismiss with the same gesture that opened it). The `showingTools` guard
 // matches `headTitleButton`: while the tools catalogue owns the centre, the top-right
 // pill is still the APP status pill, and pressing it must not fight that view.
+//
+// T7 (R2): the Plugins view owns the centre in exactly the same way, so it is gated
+// here too — pressing the pill while the plugin catalogue is on screen does nothing
+// rather than opening the endpoint dialog over it.
 statusButton.addEventListener('click', () => {
-    if (showingTools) return;
+    if (showingTools || showingPlugins) return;
     if (endpointDialog !== undefined) {
         closeEndpointDialog();
         return;
@@ -3446,8 +3496,13 @@ const openHarnessDetails = (trigger: HTMLElement): void => {
     // a harness, so the harness copy below the dashboard would describe something the
     // reader is not looking at.
     const instance = current;
+    // T7 (R2): the Plugins view replaces the head exactly like the tools view does, so
+    // it takes the same Sessions-only layer — the heading names a catalogue, not a
+    // harness, and harness copy below it would describe something off screen.
     const display =
-        instance === undefined || showingTools ? undefined : instance.frozen ?? instance.descriptor;
+        instance === undefined || showingTools || showingPlugins
+            ? undefined
+            : instance.frozen ?? instance.descriptor;
     const body = harnessDetailsBody(display);
 
     let handle: DialogHandle | undefined;
@@ -5217,6 +5272,11 @@ let toolEntries: readonly ToolDescriptor[] = [];
 // view (catalogue + manual runner). There is no tab strip (R3); the topbar's
 // icon-only Tools toggle drives this through `setToolsView`.
 let showingTools = false;
+// T7 (R2): which centre view is showing is a THREE-way exclusive, not a pair of
+// independent flags: the chat, the GLOBAL tools view, or the Plugins catalogue. Every
+// opener closes the other catalogue (`setToolsView`/`setPluginsView`), so at most one
+// of `showingTools`/`showingPlugins` is ever true — and both false is the chat.
+let showingPlugins = false;
 // R11/R12/T3: the agent dialog is APP-scoped, not per view. It is opened from the
 // composer button, kept in sync across routine chrome rebuilds (see
 // `refreshAgentDialog`) and closed by the lifecycle changes that used to reset the
@@ -5498,7 +5558,10 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
                     input.sessionId ?? instance.sessionId ?? '',
                     input.turnId,
                     input.blockId
-                )
+                ),
+            // R1: the per-thread Stop the transcript bar offers while a conversation has
+            // live work. Same session resolution as the delete below, minus the tombstones.
+            stopThreadForSession
         ),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
@@ -5608,6 +5671,14 @@ const paintToolsToggle = (): void => {
     toolsToggle.setAttribute('aria-pressed', showingTools ? 'true' : 'false');
 };
 
+// T7 (R2): the Plugins toggle's visuals, same rule as above (content switching lives in
+// `setPluginsView`, declared with the plugin catalogue). Because the two catalogues are
+// mutually exclusive this painter ALWAYS disagrees with `paintToolsToggle`: exactly one
+// of the two corner buttons can read `aria-pressed="true"`.
+const paintPluginsToggle = (): void => {
+    pluginsToggle.setAttribute('aria-pressed', showingPlugins ? 'true' : 'false');
+};
+
 // Remove every activity ring. Called on terminal frames, cancel, delete, new
 // session, harness switch and pagehide: after those there is no in-flight agent
 // in view, and a leftover ring would claim work that is not happening.
@@ -5684,6 +5755,9 @@ const selectHarness = (
     // A tool runner is a modal belonging to the view being left; close it before
     // the chat is restored (a programmatic switch may happen while it is open).
     closeToolDialog();
+    // T7: same rule for the plugin detail dialog — it describes a plugin row that the
+    // incoming view does not own.
+    closePluginDialog();
     // R2: the details dialog describes the harness being LEFT, so selecting another
     // harness/session closes it rather than leaving stale content on screen.
     closeHarnessDialog();
@@ -5693,6 +5767,10 @@ const selectHarness = (
     // collapsed for the new team (R1 default).
     showingTools = false;
     paintToolsToggle();
+    // T7 (R2): the Plugins catalogue is left the same way the tools view is, so a
+    // harness switch always lands the reader on the new conversation.
+    showingPlugins = false;
+    paintPluginsToggle();
     // R7: the playground was left, so its temporary session goes with it. This must
     // happen BEFORE the new selection paints the chat, so no late frame can adopt it.
     releasePlaygroundSession();
@@ -5822,6 +5900,11 @@ const applyHarnessRemoved = (name: string): void => {
             // The playground owns the centre column, so it stays: its note now says there
             // is no context for a session-bound tool, and a direct call still works.
             paintToolsHead();
+        } else if (showingPlugins) {
+            // T7: same for the Plugins catalogue — it is server-wide, not harness-scoped, so
+            // the last harness disappearing leaves it in place; only its count note can
+            // change (nothing else about a plugin depends on the roster).
+            paintPluginsHead();
         } else {
             // Empty roster without crashing: the chat has nowhere to go, so the centre
             // column says what is available instead of showing a dead transcript. The
@@ -6011,7 +6094,10 @@ const renderHarnessChrome = (): void => {
     // tool whose dialog is open); a background repaint must not overwrite it with
     // the chat title. `setToolsView`/`selectHarness` restore the chat head by
     // clearing `showingTools` before they call back in here.
-    if (showingTools) return;
+    //
+    // T7 (R2): the Plugins catalogue owns the head under the same contract, and the
+    // same restore path applies (`setPluginsView`/`selectHarness` clear the flag first).
+    if (showingTools || showingPlugins) return;
 
     const locked = instance.sessionId !== undefined;
 
@@ -7616,6 +7702,14 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     // the only tool listing (R21.2).
     showingTools = true;
     paintToolsToggle();
+    // T7 (R2): this is the second writer of `showingTools`, so it keeps the same
+    // exclusivity rule as `setToolsView` — a tool row is only reachable from the tools
+    // pane, but a plugin layer must never survive the switch behind it.
+    if (showingPlugins) {
+        closePluginDialog();
+        showingPlugins = false;
+        paintPluginsToggle();
+    }
     // T29: opening the tools surface is the request for the figure its note shows. A
     // direct (no-session) call has no playground context yet, so this costs NO read:
     // `hydratePlaygroundDiscovered` is a no-op until a temporary session exists, which
@@ -7686,6 +7780,10 @@ const setToolsView = (open: boolean): void => {
     if (open) {
         closeAgentDialog();
         closeHarnessDialog();
+        // T7 (R2): the centre column has ONE owner, so opening Tools leaves the Plugins
+        // catalogue first — through `setPluginsView(false)`, which closes any open plugin
+        // dialog and restores the chat chrome that the pass below then replaces.
+        if (showingPlugins) setPluginsView(false);
     }
 
     if (!open) {
@@ -7869,6 +7967,717 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
     toolDetails.clear();
     buildToolsTab(entries);
 };
+
+// ---------------------------------------------------------------------------
+// Plugins view (T7 / R2-R3): the auto-scanned catalogue and its settings editor
+// ---------------------------------------------------------------------------
+//
+// R2 asked for a Plugins button next to Tools that shows what the server ships; R3 adds
+// the shipped Context Compaction plugin with an EDITABLE context limit. The two halves
+// of that answer are deliberately different:
+//
+//   - ENABLEMENT is read-only. Plugin loading is auto-scanned by the host, so the
+//     contract carries no enable/disable field at all (../shared/harness-api.ts
+//     `PluginSettingsUpdate` is settings-only) and this pane offers no toggle to invent
+//     one. The catalogue is a listing plus a detail dialog.
+//   - SETTINGS are editable, and the row dialog is the only write path:
+//     `PATCH /plugins/{id}` with `{ settings: { key: value } }`.
+//
+// STRUCTURE mirrors the tools view (the code directly above) on purpose: a topbar
+// icon-only toggle, a full-width `.plugins-pane` in `stage`, `.plugin-tab-button` rows,
+// and the SHARED modal (`ui/dialog.ts`) for the detail. The centre column has ONE owner,
+// so `setPluginsView` and `setToolsView` close each other.
+//
+// WHY THE PAGE IS CACHED AND RE-READ BY HAND
+// ------------------------------------------
+// `GET /plugins` answers the whole surface in one document (descriptor + effective
+// values), and the server publishes NO stream update kind for plugins (T5): the only way
+// a row goes stale is another visitor writing it. So the first open pays for the read,
+// every later open repaints from `pluginRows`, and `Reload plugins` (plus the Retry
+// button on a failed read) is the explicit re-read. A SAVE merges the PATCH answer into
+// the same cache, which is why reopening a row shows the saved figure without a second
+// request.
+//
+// WHY A SAVE REPAINTS IN PLACE
+// ----------------------------
+// `updatePluginSettings` returns the WHOLE row (the values it reports ARE the result of
+// the write). The dialog therefore keeps its own DOM, takes the server's figures as the
+// new form values, and repaints exactly one list row's settings line. Rebuilding the
+// list would replace the button that opened the dialog, and `ui/dialog.ts` restores
+// focus to a node that is still connected — so the dismissal would land the reader on
+// `<body>`.
+
+// The rows the browser has read (the whole page: the shipped set is small, and the
+// contract's page order is the catalogue order).
+let pluginRows: PluginSummary[] = [];
+// Three transient read states, so the pane can tell "not asked yet" from "in flight"
+// from "asked and refused". `pluginsLoaded` is the cache flag `loadPlugins` honours.
+let pluginsLoaded = false;
+let pluginsLoading = false;
+let pluginsError: string | undefined;
+// The open detail dialog and the NAME of the row it is showing (the row identity a save
+// merges back into, and the row that carries `aria-pressed`). One dialog at a time, like
+// the tool runner — a second activation replaces the first through `selectPlugin`.
+let pluginDialog: DialogHandle | undefined;
+let currentPlugin: string | undefined;
+
+// The catalogue rows, keyed by plugin name, so a save repaints its own row; the
+// `values` span is the line that carries the effective settings.
+const pluginTabButtons = new Map<string, HTMLButtonElement>();
+const pluginRowNodes = new Map<string, { button: HTMLButtonElement; values: HTMLSpanElement }>();
+
+const pluginsPane = el('div', 'pane plugins-pane');
+const pluginsTabHead = el('div', 'plugins-tab-head');
+// R2/R3 wording the user asked for: the catalogue is auto-scanned, and enablement is
+// not a decision this UI makes.
+const pluginsTabHint = el(
+    'p',
+    'plugins-tab-hint',
+    'Auto-scanned · read-only enablement. Every plugin this harness server ships is loaded, so there is nothing to enable or disable here. The settings a plugin declares are editable in its dialog, and a saved value applies to every conversation from its next turn.'
+);
+// The count/error line. `aria-live` carries the load transition to assistive tech
+// because nothing here moves focus.
+const pluginsTabNote = el('p', 'plugins-tab-note field-hint', '');
+pluginsTabNote.setAttribute('role', 'status');
+pluginsTabNote.setAttribute('aria-live', 'polite');
+const pluginsRefresh = el('button', 'button plugins-refresh', 'Reload plugins');
+pluginsRefresh.type = 'button';
+// Same gate as the toggle it belongs to: nothing is readable before boot has answered,
+// and `buildPluginsTab`/`paintControls` are the only writers afterwards.
+pluginsRefresh.disabled = true;
+// Deferred read (the same discipline every other control in this file follows):
+// `loadPlugins` is a module-level `const` declared below this listener's installation.
+pluginsRefresh.addEventListener('click', () => {
+    void loadPlugins(true);
+});
+pluginsTabHead.append(el('h2', 'plugins-tab-title', 'Plugins'), pluginsTabHint, pluginsTabNote, pluginsRefresh);
+// The list is the whole content area, exactly like `.tool-tab-list`.
+const pluginsTabList = el('div', 'plugin-tab-list');
+pluginsPane.append(pluginsTabHead, pluginsTabList);
+
+// One declared setting's value in the spelling this surface prints. The server's
+// effective value wins and the declared default is the fallback, so a row never claims
+// "undefined" for a key nothing was stored under.
+const settingTextOf = (setting: PluginSetting, value: unknown): string => {
+    const shown = value === undefined || value === null ? setting.default : value;
+
+    return String(shown);
+};
+
+// The settings line a row shows: `key: effective value` per declared setting. This is
+// the figure a SAVE repaints, so the list always states what is in force.
+const pluginValuesOf = (plugin: PluginSummary): string =>
+    plugin.settings
+        .map((setting) => `${setting.key}: ${settingTextOf(setting, plugin.values[setting.key])}`)
+        .join(' · ');
+
+// Count labels, spelled the same in the pane, the head and the dialog.
+const pluginHookLabel = (plugin: PluginSummary): string => {
+    const count = plugin.hooks?.length ?? 0;
+
+    return `${count} hook${count === 1 ? '' : 's'}`;
+};
+
+const pluginSettingLabel = (plugin: PluginSummary): string => {
+    const count = plugin.settings.length;
+
+    // R3: a plugin with no declared settings is pure behaviour — the pane says so
+    // instead of leaving the reader looking for a control that does not exist.
+    return count === 0 ? 'read-only' : `${count} setting${count === 1 ? '' : 's'}`;
+};
+
+// The "how many, and can we read them right now" sentence. ONE writer, because the head
+// note and the pane note must never disagree about a failed or in-flight read.
+const pluginsCountNote = (): string => {
+    if (pluginsLoading) return 'Reading the plugin catalogue…';
+    if (pluginsError !== undefined) return `The plugin catalogue could not be read: ${pluginsError}`;
+
+    const count = pluginRows.length;
+
+    return count === 0
+        ? 'The server reported no plugins.'
+        : `${count} plugin${count === 1 ? '' : 's'} · auto-scanned · settings save on the harness server`;
+};
+
+// The head while the Plugins view owns the centre and no dialog is open. Same contract
+// as `paintToolsHead`: this is the ONLY writer of the head in that state, and the chat
+// head hides the badge/note, so both are un-hidden here.
+const paintPluginsHead = (): void => {
+    headTitleText.textContent = 'Plugins';
+    // A Plugins heading is not a harness, so the popup this head opens is the session
+    // dashboard (the same T9 rule the tools head follows).
+    paintHeadTitleTrigger('sessions');
+    headName.hidden = false;
+    headName.textContent = 'built-ins';
+    headNote.hidden = false;
+    headNote.textContent = pluginsCountNote();
+};
+
+// The head while ONE plugin's dialog is open: the heading names that plugin, not the
+// catalogue. Mirrors `selectTool`'s head pass.
+const paintPluginHead = (plugin: PluginSummary): void => {
+    headTitleText.textContent = plugin.title;
+    paintHeadTitleTrigger('sessions');
+    // The registry key (`context-compaction`) is a category-style label here, so the
+    // badge shows it and the note carries the version/hook/settings facts.
+    headName.hidden = false;
+    headName.textContent = plugin.name;
+    headNote.hidden = false;
+    headNote.textContent = [
+        ...(plugin.version === undefined ? [] : [`v${plugin.version}`]),
+        pluginHookLabel(plugin),
+        pluginSettingLabel(plugin),
+        ...(plugin.builtin ? ['built-in'] : ['custom'])
+    ].join(' · ');
+};
+
+// Paint the head's title/badge for whichever of the two Plugins states is showing, so
+// every async completion (a read landing, a dialog closing) re-describes the right thing.
+const paintPluginsChrome = (): void => {
+    const open = currentPlugin === undefined ? undefined : pluginRows.find((row) => row.name === currentPlugin);
+
+    if (open !== undefined) paintPluginHead(open);
+    else paintPluginsHead();
+};
+
+// Close the plugin dialog if one is open. Idempotent: every dismissal path (Escape,
+// backdrop, close button, the other catalogue's toggle, a harness switch) converges on
+// the same `onClose` reset.
+const closePluginDialog = (): void => {
+    pluginDialog?.close();
+};
+
+// Merge a fresh row into the cached page. Both the PATCH answer and a reload land here,
+// so the cache is never a stale copy of a row the server just restated.
+const rememberPlugin = (plugin: PluginSummary): void => {
+    const index = pluginRows.findIndex((row) => row.name === plugin.name);
+    if (index >= 0) pluginRows[index] = plugin;
+    else pluginRows = [...pluginRows, plugin];
+
+    currentPlugin = plugin.name;
+};
+
+// Repaint ONE row from its row data, without touching the list's other nodes (see the
+// in-place-repaint note at the top of this section).
+const paintPluginRow = (plugin: PluginSummary): void => {
+    const nodes = pluginRowNodes.get(plugin.name);
+    if (nodes === undefined) return;
+
+    nodes.values.textContent = pluginValuesOf(plugin);
+    nodes.button.title = plugin.description ?? plugin.title;
+};
+
+// Build the catalogue list: loading, empty, and an error WITH a retry are real states of
+// this surface, not a blank column. Every row is a dialog trigger, so it advertises the
+// popup kind and passes itself back as the close-time focus target.
+const buildPluginsTab = (): void => {
+    pluginsTabList.replaceChildren();
+    pluginTabButtons.clear();
+    pluginRowNodes.clear();
+    pluginsTabNote.textContent = pluginsCountNote();
+    pluginsRefresh.disabled = pluginsLoading || !booted;
+
+    if (pluginsLoading && pluginRows.length === 0) {
+        pluginsTabList.append(el('p', 'field-hint plugins-loading', 'Reading the plugin catalogue…'));
+
+        return;
+    }
+
+    if (pluginsError !== undefined && pluginRows.length === 0) {
+        // The server's own sentence, verbatim (api.ts flattens `ErrorBody` to exactly
+        // that), plus the one action that can fix it.
+        pluginsTabList.append(el('p', 'field-hint plugins-error', pluginsError));
+
+        const retry = el('button', 'button plugins-retry', 'Retry');
+        retry.type = 'button';
+        retry.addEventListener('click', () => {
+            void loadPlugins(true);
+        });
+        pluginsTabList.append(retry);
+
+        return;
+    }
+
+    if (pluginRows.length === 0) {
+        pluginsTabList.append(
+            el('p', 'field-hint', 'The server reported no plugins. Check that the harness server is reachable.')
+        );
+
+        return;
+    }
+
+    for (const plugin of pluginRows) {
+        const button = el('button', 'plugin-tab-button');
+        button.type = 'button';
+        button.dataset.plugin = plugin.name;
+        button.setAttribute('aria-pressed', plugin.name === currentPlugin ? 'true' : 'false');
+        button.setAttribute('aria-haspopup', 'dialog');
+        button.title = plugin.description ?? plugin.title;
+        // The whole row is kept, never truncated away: the description is the part a
+        // reader scans, so CSS clamps it to two lines (`.plugin-tab-desc`) and the full
+        // text stays in the row's accessible description.
+        const meta = el(
+            'span',
+            'plugin-tab-meta',
+            `${pluginHookLabel(plugin)} · ${pluginSettingLabel(plugin)} · ${plugin.builtin ? 'built-in' : 'custom'}`
+        );
+
+        // The effective settings line. A plugin that declares nothing gets the explicit
+        // `no settings` word rather than an empty line the reader has to interpret.
+        const values = el('span', 'plugin-tab-values', plugin.settings.length === 0 ? 'no settings' : pluginValuesOf(plugin));
+
+        button.append(
+            el('span', 'plugin-tab-title', plugin.title),
+            el('span', 'plugin-tab-name', plugin.name),
+            el('span', 'plugin-tab-desc', plugin.description ?? 'No description.'),
+            meta,
+            values
+        );
+        // The row's data comes from the CACHE at click time, not from the closure: a save
+        // merges a new row into `pluginRows`, and a dialog opened after that must show the
+        // server's figures rather than the object this list frame was built from.
+        button.addEventListener('click', () => {
+            selectPlugin(pluginRows.find((row) => row.name === plugin.name) ?? plugin, button);
+        });
+        button.disabled = running || submitting;
+
+        pluginTabButtons.set(plugin.name, button);
+        pluginRowNodes.set(plugin.name, { button, values });
+        pluginsTabList.append(button);
+    }
+};
+
+// Read the catalogue. `force` is the Reload/Retry path; without it a cached page is
+// painted from, which is what keeps the second (and every later) open free of traffic.
+const loadPlugins = async (force = false): Promise<void> => {
+    // Single-flight: a double press of Reload, or an open while a read is in flight,
+    // must not race two answers into the cache.
+    if (pluginsLoading) return;
+    if (pluginsLoaded && !force) {
+        buildPluginsTab();
+
+        return;
+    }
+
+    pluginsLoading = true;
+    pluginsError = undefined;
+    buildPluginsTab();
+    if (showingPlugins) paintPluginsChrome();
+
+    try {
+        const page = await listPlugins();
+        pluginRows = [...page.items];
+        pluginsLoaded = true;
+        pluginsError = undefined;
+    } catch (error) {
+        // NOT memoized: the next open (or Retry) asks again, exactly like the tool
+        // detail read above.
+        pluginsError = messageOf(error);
+    } finally {
+        pluginsLoading = false;
+        buildPluginsTab();
+        if (showingPlugins) paintPluginsChrome();
+    }
+};
+
+// The value one control holds right now, or `undefined` when it does not hold a value of
+// the declared type (an emptied number box). Two callers need this and must NOT disagree:
+// the dirty test (not-a-value means "nothing to send") and the save (a number field the
+// reader cleared is a refusal to save, with a message naming the field).
+const literalOf = (setting: PluginSetting, input: HTMLInputElement): number | string | boolean | undefined => {
+    if (setting.type === 'boolean') return input.checked;
+    if (setting.type === 'string') return input.value;
+
+    const text = input.value.trim();
+    const parsed = Number(text);
+
+    return text.length === 0 || !Number.isFinite(parsed) ? undefined : parsed;
+};
+
+// The value the form is showing as current: the server's effective value, falling back
+// to the declared default for a key nothing was stored under. Every dirty comparison and
+// every reset after a refused/accepted write is taken from this.
+const effectiveOf = (plugin: PluginSummary, setting: PluginSetting): number | string | boolean => {
+    const stored = plugin.values[setting.key];
+
+    return stored === undefined || stored === null ? setting.default : (stored as number | string | boolean);
+};
+
+// Write the declared hints onto the control. `min`/`max` are what the SERVER validates
+// (../shared/harness-api.ts:640-657) and `step` only bounds what a spinner offers, so all
+// three go on the element and the browser can pre-validation nudge the reader.
+const applySettingHints = (setting: PluginSetting, input: HTMLInputElement): void => {
+    if (setting.type !== 'number') return;
+    if (setting.min !== undefined) input.min = String(setting.min);
+    if (setting.max !== undefined) input.max = String(setting.max);
+    if (setting.step !== undefined) input.step = String(setting.step);
+};
+
+// One labelled control per declared setting. The label is a real `<label for>`, the hint
+// is the setting's own description, and every control is marked with its key so the save
+// handler walks the form instead of guessing.
+const buildSettingField = (
+    plugin: PluginSummary,
+    setting: PluginSetting,
+    register: (field: PluginField) => void
+): HTMLElement => {
+    const row = el('div', 'plugin-setting');
+    const inputId = `plugin-setting-${plugin.name}-${setting.key}`;
+    const input = el('input', 'plugin-setting-input');
+    input.id = inputId;
+    input.dataset.setting = setting.key;
+    input.type = setting.type === 'number' ? 'number' : setting.type === 'boolean' ? 'checkbox' : 'text';
+    applySettingHints(setting, input);
+
+    const current = effectiveOf(plugin, setting);
+
+    if (setting.type === 'boolean') input.checked = current === true;
+    else input.value = String(current);
+
+    const label = el('label', 'plugin-setting-label', setting.label);
+    label.htmlFor = inputId;
+    row.append(label, input);
+
+    if (setting.description !== undefined) {
+        // Text, never markup: a plugin manifest is server data (the same data-only rule
+        // `ui/dialog.ts` enforces for `content`).
+        row.append(el('p', 'plugin-setting-hint', setting.description));
+    }
+
+    register({ setting, input });
+
+    return row;
+};
+
+// A field of the form, plus the row it belongs to.
+type PluginField = { setting: PluginSetting; input: HTMLInputElement };
+
+// Open one plugin's detail in the shared modal. The dialog owns Escape/backdrop/focus
+// restore (the tools runner gets the same machinery), and the settings form is built
+// fresh for every open, so the values it shows are always the cache's.
+const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void => {
+    // The row THIS dialog is painted from. A save replaces it with the PATCH answer;
+    // every repaint below reads this variable rather than the row passed in, so a late
+    // answer can never paint figures from a superseded read.
+    let shown = plugin;
+    let saving = false;
+    const fields: PluginField[] = [];
+
+    const body = el('div', 'plugin-detail');
+    body.append(el('p', 'plugin-detail-description', plugin.description ?? 'No description.'));
+
+    // Identity facts, existing metadata only (the discipline the harness details dialog
+    // follows): name, version, tags and the builtin state.
+    const facts = el('div', 'plugin-detail-facts');
+
+    for (const fact of [
+        plugin.name,
+        ...(plugin.version === undefined ? [] : [`v${plugin.version}`]),
+        plugin.builtin ? 'built-in' : 'custom',
+        ...(plugin.tags === undefined || plugin.tags.length === 0 ? [] : [`tags: ${plugin.tags.join(', ')}`])
+    ]) {
+        facts.append(el('span', 'plugin-detail-fact', fact));
+    }
+
+    body.append(facts);
+
+    // Declared hooks as chips: the live subscription list is the part that explains WHEN a
+    // plugin runs, and the row only counts it.
+    const hooksSection = el('div', 'plugin-detail-hooks');
+    hooksSection.append(el('h3', 'plugin-detail-section-title', 'Hooks'));
+    const hookList = el('div', 'plugin-hook-list');
+    const hooks = plugin.hooks ?? [];
+
+    if (hooks.length === 0) hookList.append(el('p', 'plugin-detail-empty', 'Declares no lifecycle hooks.'));
+    else for (const hook of hooks) hookList.append(el('span', 'plugin-hook-chip', hook));
+
+    hooksSection.append(hookList);
+    body.append(hooksSection);
+
+    // --- settings -----------------------------------------------------------------
+    const settingsSection = el('div', 'plugin-detail-settings');
+    settingsSection.append(el('h3', 'plugin-detail-section-title', 'Settings'));
+
+    // The status line is a polite live region: "Saving…", "Saved" and a refusal are all
+    // things the reader is told about, and nothing here moves focus.
+    const status = el('p', 'plugin-setting-status field-hint', '');
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+
+    let save: HTMLButtonElement | undefined;
+
+    if (plugin.settings.length === 0) {
+        // R3: no declared settings means nothing to edit. Rendered read-only on purpose
+        // (no disabled inputs pretending an edit is pending), and with NO save control —
+        // an action that could only ever send an empty patch.
+        settingsSection.append(el('p', 'plugin-detail-empty', 'This plugin declares no settings · read-only.'));
+        body.append(settingsSection);
+    } else {
+        const form = el('div', 'plugin-settings-form');
+        form.setAttribute('role', 'group');
+        form.append(el('span', 'plugin-settings-form-label', 'Plugin settings'));
+
+        for (const setting of plugin.settings) {
+            form.append(buildSettingField(plugin, setting, (field) => fields.push(field)));
+        }
+
+        settingsSection.append(form);
+
+        const actions = el('div', 'plugin-setting-actions');
+
+        save = el('button', 'button primary plugin-setting-save', 'Save');
+        save.type = 'button';
+        // Nothing is dirty on the first frame, and an honest control says so.
+        save.disabled = true;
+        actions.append(save);
+        settingsSection.append(actions, status);
+        body.append(settingsSection);
+    }
+
+    // Dirty state drives the save control: enabled exactly while some field differs from
+    // what the server last reported.
+    const paintDirty = (): void => {
+        if (save === undefined) return;
+
+        const dirty = fields.some(({ setting, input }) => {
+            const value = literalOf(setting, input);
+
+            return value !== undefined && !Object.is(value, effectiveOf(shown, setting));
+        });
+
+        save.disabled = saving || !dirty;
+    };
+
+    // Take the server's figures as the form's current values. A write can clamp/normalise
+    // what was sent, so the box shows what is IN FORCE afterwards, not what was typed.
+    const paintValues = (): void => {
+        for (const { setting, input } of fields) {
+            const current = effectiveOf(shown, setting);
+
+            if (setting.type === 'boolean') input.checked = current === true;
+            else input.value = String(current);
+        }
+
+        paintDirty();
+    };
+
+    const note = (text: string, failed: boolean): void => {
+        status.textContent = text;
+        // Text AND class: colour is never the only signal (the shell's standing rule).
+        status.className = failed ? 'plugin-setting-status plugin-setting-status-error' : 'plugin-setting-status field-hint';
+    };
+
+    if (save !== undefined) {
+        save.addEventListener('click', () => {
+            void (async () => {
+                if (saving) return;
+
+                const patch: Record<string, number | string | boolean> = {};
+
+                for (const { setting, input } of fields) {
+                    const value = literalOf(setting, input);
+
+                    if (value === undefined) {
+                        // A cleared number box has no value to send; naming the field is
+                        // the actionable part, and the typed text stays for the fix.
+                        note(`${setting.label} needs a number.`, true);
+
+                        return;
+                    }
+
+                    // Only CHANGED keys go on the wire: an omitted key is documented as "no
+                    // change" (../shared/harness-api.ts:695-706), so untouched settings are
+                    // never rewritten by an unrelated save.
+                    if (!Object.is(value, effectiveOf(shown, setting))) patch[setting.key] = value;
+                }
+
+                if (Object.keys(patch).length === 0) return;
+
+                saving = true;
+                paintDirty();
+                note('Saving…', false);
+                // An app-scoped config write, so the topbar pill reports the window
+                // exactly like the endpoint/model and harness writes do.
+                setStatus('saving', `plugin settings: ${shown.name}`);
+
+                try {
+                    const updated = await updatePluginSettings(shown.name, patch);
+                    // The answer IS the new state: merge it into the cache, repaint this
+                    // row's settings line, and re-take the form's values from it.
+                    shown = updated;
+                    rememberPlugin(updated);
+                    paintPluginRow(updated);
+                    paintValues();
+                    pluginsTabNote.textContent = pluginsCountNote();
+                    if (showingPlugins) paintPluginsChrome();
+                    note('Saved', false);
+                    setStatus('idle');
+                } catch (error) {
+                    // The server's sentence, verbatim (a 400 for a value outside `min`/
+                    // `max` is the validator's message, not a client guess) — and the
+                    // form keeps what the reader typed, so the fix is one keystroke away.
+                    // The cache is NOT touched: nothing was written.
+                    const message = messageOf(error);
+
+                    note(message, true);
+                    setStatus('error', `plugin settings: ${message}`);
+                } finally {
+                    saving = false;
+                    paintDirty();
+                }
+            })();
+        });
+
+        for (const { input } of fields) {
+            // `input` (not `change`) so the save control lights up as the reader types.
+            input.addEventListener('input', () => {
+                note('', false);
+                paintDirty();
+            });
+        }
+    }
+
+    let handle: DialogHandle | undefined;
+
+    handle = openDialog({
+        // The plugin's own display title, so the layer is named the way the row is.
+        title: plugin.title,
+        content: body,
+        // Escape/close lands the reader back on the row they activated.
+        ...(trigger === undefined ? {} : { returnFocus: trigger }),
+        onClose: () => {
+            // Identity check: a replacement dialog may own the variable already.
+            if (pluginDialog !== handle) return;
+
+            pluginDialog = undefined;
+            currentPlugin = undefined;
+            for (const button of pluginTabButtons.values()) button.setAttribute('aria-pressed', 'false');
+
+            // The catalogue is still on screen: describe the list again. When the dialog
+            // was closed by LEAVING the view, that view has its own restore path
+            // (`setPluginsView`/`selectHarness`) and must not be painted over here.
+            if (showingPlugins) paintPluginsHead();
+            else if (current !== undefined) renderHarnessChrome();
+        }
+    });
+
+    // The settings form is a working surface (identity + hooks + editable values), so it
+    // uses the wide dialog variant — the same class the tool runner adds (ui/dialog.css).
+    handle.element.classList.add('dialog-wide');
+    pluginDialog = handle;
+};
+
+// Activate one catalogue row: the plugins view is ensured behind the dialog (the same
+// "one listing" rule `selectTool` follows), the head names that plugin, and the detail
+// opens in the shared modal.
+const selectPlugin = (plugin: PluginSummary, trigger?: HTMLElement): void => {
+    if (running) return;
+
+    stopPolling();
+    closePluginDialog();
+
+    currentPlugin = plugin.name;
+    showingPlugins = true;
+    paintPluginsToggle();
+    // T7: opening Plugins leaves Tools, through Tools' own close path (it releases the
+    // playground session and resets the runner state), so exactly one catalogue is ever
+    // marked pressed.
+    if (showingTools) setToolsView(false);
+
+    for (const [name, button] of pluginTabButtons) {
+        button.setAttribute('aria-pressed', name === plugin.name ? 'true' : 'false');
+    }
+
+    // The harness stays selected: the sessions rail is still scoped to it, and clicking a
+    // harness row returns to that chat.
+    for (const [name, button] of harnessButtons) {
+        button.setAttribute('aria-pressed', name === selectedName ? 'true' : 'false');
+    }
+
+    paintPluginHead(plugin);
+    agentSlot.hidden = true;
+    composer.hidden = true;
+    closeAgentDialog();
+    stage.replaceChildren(pluginsPane);
+    delete stage.dataset.preset;
+    // The list is NOT rebuilt here: the trigger button stays the node the dialog hands
+    // focus back to, and the pressed state is set by the pass above.
+    openPluginDialog(plugin, trigger);
+    setStatus('idle');
+};
+
+// Open or close the PLUGINS view. One function both directions, exactly like
+// `setToolsView`: the topbar toggle calls it, harness selection and the Tools toggle
+// close it, and a run in flight keeps the view locked (leaving the transcript of a
+// streaming queue is not offered).
+//
+// The dialogs that belong to the view being entered are dismissed first (agent +
+// harness details, as Tools does), because their titles describe the chat head that is
+// being replaced.
+const setPluginsView = (open: boolean): void => {
+    if (running || showingPlugins === open) return;
+
+    if (open) {
+        closeAgentDialog();
+        closeHarnessDialog();
+        // Exclusivity: leaving the tools playground is a FULL close (its temporary
+        // session is released by `setToolsView(false)`), then Plugins takes the column.
+        if (showingTools) setToolsView(false);
+
+        showingPlugins = true;
+        paintPluginsToggle();
+        agentSlot.hidden = true;
+        composer.hidden = true;
+        paintPluginsHead();
+        stage.replaceChildren(pluginsPane);
+        delete stage.dataset.preset;
+        setStatus('idle');
+
+        // R2: the read is paid for on the FIRST open, never at boot — the bootstrap
+        // document already carries the catalogues the chat needs, and a plugin page is
+        // only useful to a reader who asked for it. `loadPlugins` no-ops on a cached page.
+        void loadPlugins();
+
+        // Focus handoff, same rule as `setToolsView`: opening closes the details dialog,
+        // which returns focus to the title button that the new head re-titles, so the
+        // press hands focus to the toggle that performed the switch rather than dropping
+        // the reader on `<body>`.
+        const active = document.activeElement;
+
+        if (active === null || active === document.body || active === headTitleButton) {
+            pluginsToggle.focus({ preventScroll: true });
+        }
+
+        return;
+    }
+
+    // The plugin dialog goes first: its `onClose` still sees the Plugins view and only
+    // resets the row pressed state/head.
+    closePluginDialog();
+    showingPlugins = false;
+    paintPluginsToggle();
+    for (const button of pluginTabButtons.values()) button.setAttribute('aria-pressed', 'false');
+
+    agentSlot.hidden = false;
+    composer.hidden = false;
+
+    if (current !== undefined) {
+        stage.replaceChildren(current.view.pane);
+        renderHarnessChrome();
+        renderSessions();
+    } else {
+        stage.replaceChildren();
+    }
+
+    setStatus('idle');
+};
+
+// The topbar icon is a real toggle: a second press closes the pane and returns to the
+// selected chat. `paintControls` disables it while a run is pending or before boot, so
+// this handler never races the queue or blanks the startup pane.
+pluginsToggle.addEventListener('click', () => {
+    setPluginsView(!showingPlugins);
+});
 
 // ---------------------------------------------------------------------------
 // Session directory (server-owned, filtered by harness)
@@ -9406,6 +10215,34 @@ const reconcileDeletedThread = (
     if (current === instance) refreshAgentDialog(agentViewOf(instance), instance);
 };
 
+// R1: the per-thread Stop the transcript bar offers while a conversation (or one it
+// owns) has live work. The mirror of `deleteThreadForSession` WITHOUT the teardown:
+//   1. resolve the view that points at this session — an id this page does not hold is a
+//      local error, so no request leaves for a conversation nobody is looking at;
+//   2. send the POST to the EXISTING cancel route (no new API surface);
+//   3. apply the roster document `cancelViewThread` reads back through `applyView`, the
+//      one authority path that owns the stale-watermark guard, the tombstones, the
+//      roster/rows reconcile, the pending figures (the composer's own Stop) and the board
+//      repaint. `setThreads`/`setSessionView` inside it are what re-paint the action bar,
+//      so the control flips from Stop back to Delete from the SERVER's answer rather than
+//      from an optimistic local flag.
+// The thread SURVIVES a stop, so nothing here may tombstone it, and a rejection is thrown
+// verbatim: the board reports it and leaves every surface intact.
+const stopThreadForSession = async (
+    sessionId: string,
+    threadId: string
+): Promise<{ cancelled: boolean }> => {
+    const instance = [...instances.values()].find(
+        (candidate) => candidate.sessionId === sessionId
+    );
+    if (instance === undefined) throw new Error('Unknown session');
+
+    const result = await cancelViewThread(sessionId, threadId);
+    applyView(instance, result.view);
+
+    return { cancelled: result.cancelled };
+};
+
 const deleteThreadForSession = async (
     sessionId: string,
     threadId: string
@@ -10328,6 +11165,14 @@ const paintControls = (): void => {
     // replaced; leaving the transcript of a streaming queue is not offered. It is also
     // locked before boot has a catalogue (`booted`) and after `showOffline` disables it.
     toolsToggle.disabled = submitting || pending || !booted;
+    // T7 (R2): the Plugins toggle carries the identical lock, because it replaces the
+    // same centre column for the same reasons — and its rows/dialog are locked the way
+    // the tool rows are, so a save cannot be started against a view that is about to be
+    // torn down by a run.
+    pluginsToggle.disabled = submitting || pending || !booted;
+    pluginsRefresh.disabled = submitting || pending || pluginsLoading || !booted;
+
+    for (const button of pluginTabButtons.values()) button.disabled = submitting || pending;
 
     // R1/T3: pills replace the rail rows, and an archived conversation's pill is the same
     // control, so the busy-state pass walks every live strip instead of two lists.
@@ -11141,6 +11986,10 @@ const showOffline = (message: string): void => {
 
     // No catalogue, no tools view: the only useful action is Retry.
     toolsToggle.disabled = true;
+    // T7 (R2): the Plugins catalogue is server-wide data this pane can only read through
+    // the same dead transport, so its toggle goes disabled with the tools one.
+    pluginsToggle.disabled = true;
+    pluginsRefresh.disabled = true;
 
     if (presetDescriptors.length === 0) {
         harnessList.replaceChildren(el('p', 'field-hint', 'No server connection.'));

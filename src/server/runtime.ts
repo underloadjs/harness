@@ -199,6 +199,15 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
 
     // The store owns no catalogue, so bind its describer to this runtime's. A
     // supplied store keeps its own registry/settings (tests) and is used as-is.
+    //
+    // T5 (R2/R3): the runtime's PLUGIN SETTINGS STORE lives inside this SessionStore (built in
+    // its constructor from `database.pluginSettings` + the generated built-in manifest), so
+    // there is exactly one per resolved database root - the same singleton rule as `store`,
+    // `registry`, and `events`. No extra wiring belongs here: `buildHarness` hands that one
+    // store's LIVE provider to every harness it builds (fresh and restored), and
+    // `runtime.store.pluginSettings` is the handle the REST surface writes through. An injected
+    // store keeps its own, exactly like its own settings and registry.
+    //
     // ONE provider-settings object per runtime (T28): the store builds harnesses with it, and
     // the dispatcher authenticates its OWN provider calls (`POST /models`) with the SAME
     // credential through a private channel. A service deployment therefore cannot report one

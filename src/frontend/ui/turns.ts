@@ -552,6 +552,14 @@ export type TurnBoardOptions = {
     // reconciliation. Omitted in an embedding that does not expose thread delete:
     // the control is rendered disabled rather than silently pretending to work.
     deleteThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>;
+    // R1 stop transport. While a thread (or a descendant its Delete would cascade into)
+    // has live work, the bar's single destructive action IS this control: one press,
+    // no confirmation, and the shell's existing per-thread cancel route. The board owns
+    // single-flight dedupe and failure reporting; the shell owns the POST plus the roster
+    // reconcile that turns the control back into Delete. Omitted in an embedding that
+    // does not expose stopping: the control renders Stop-but-disabled with the honest
+    // reason instead of pretending to work.
+    stopThread?: (sessionId: string, threadId: string) => Promise<unknown>;
     // C5 transcript editing transport. The dialog owns the editor (local JSON parse,
     // the inline error area, the pending/disable rule and the invalid-transcript
     // banner); the shell owns the PUT plus applying the returned `session` through its
@@ -1499,22 +1507,73 @@ export const threadSubtreeIdsOf = (
     return subtree;
 };
 
-// Why a thread's Delete control must not send a request:
+// Why a thread's destructive control must not send a DELETE request:
 //   - 'default' — an `agent:<name>` conversation is not deletable at all (the
 //     server answers 400; use Reset session), so the control is hidden;
-//   - 'active'  — the thread (or any descendant it would cascade into) has a
-//     running/queued turn, or the roster itself says running. The server answers
-//     409; the UI disables the control until the work settles. It never auto-stops
-//     work on the user's behalf.
+//   - 'active'  — the thread (or any descendant it would cascade into) has live
+//     work: a running/paused roster status, or a running/queued turn. The server
+//     answers 409 to a DELETE, so R1 swaps the control's MEANING rather than
+//     disabling it: it becomes `Stop`, and one press cancels the thread through the
+//     existing per-thread cancel route (no confirmation). It never stops work
+//     automatically on the user's behalf.
 // The server remains the authority; this is the same protection computed from the
 // last applied snapshot so a stale frame cannot enable a destructive request.
 export type ThreadDeleteProtection = 'default' | 'active';
+
+// R1: the visible text/glyph pair of the bar's ONE destructive control in each of its
+// two modes. Both nodes always live in the DOM (styles.css swaps label↔glyph per
+// surface), and `aria-label` carries the full accessible name either way, so a
+// screenshot-free test can pin the exact copy of every state.
+const ACTION_LABELS = {
+    // Delete mode keeps EXACTLY today's copy in every state — including while the DELETE
+    // is in flight, where only `disabled`/`title` change. R1 does not touch it.
+    delete: { text: 'Delete', glyph: 'X' },
+    // The stop copy uses the ellipsis character, matching what the board already shows
+    // for a pending delete; `pending` is the desktop label, the glyph stays `■` so the
+    // mobile button never reads as a spinner-only control.
+    stop: { text: 'Stop', glyph: '■', pending: 'Stopping…' }
+} as const;
+
+// The hover reasons, in ONE place so the wording cannot drift between the states the
+// control can be in. R1: none of the Stop entries promises a confirmation — there is
+// none — and the unwired one states the missing transport instead of lying.
+const ACTION_TITLES = {
+    delete: 'Delete this thread permanently',
+    deletePending: 'Deleting this thread...',
+    deleteUnwired: 'Thread deletion is not wired in this host.',
+    threadDefault:
+        'The default agent conversation cannot be deleted; reset the session instead.',
+    stop: 'Stop this thread',
+    stopPending: 'Stopping this thread...',
+    // A DELETE already in flight owns the control; a second destructive request for the
+    // same conversation is never the answer, and the reason says which one is running.
+    stopWhileDeleting: 'Deleting this thread...',
+    stopUnwired: 'Thread stop is not wired in this host.'
+} as const;
 
 // The row shape delete protection needs: the conversation a turn ran in, and its
 // status. `SessionTurn` (raw) and `TurnSummary` (display wire) BOTH satisfy it,
 // which is the point — the same destructive-action guard must run identically on
 // either surface, without either one being re-projected into the other.
 export type ThreadProtectionRow = { status: string; threadId?: string };
+
+// Which roster statuses mean "this conversation still has live work": a run the reader
+// can stop, and that the server refuses to delete (409). The Delete guard and the Stop
+// control ask the SAME question, so the answer lives once here.
+//
+// `'paused'` counts as live on purpose: a paused/compacting thread is mid-flight, so it
+// must still offer Stop and must still refuse Delete. `SessionThread.status`
+// (server/protocol.ts:437, ui/threads.ts:65) is `'idle' | 'running' | 'stopped'` at the
+// time of writing — the `'paused'` spelling is landing from a sibling worker. Reading the
+// list through `includes` (instead of `status === 'paused'`) is deliberate: a narrowing
+// comparison against a literal outside the union is a COMPILE error today, while this
+// check is correct both before and after the enum grows.
+const LIVE_THREAD_STATUSES: readonly string[] = ['running', 'paused'];
+
+// Exported because it is the whole live-work rule for roster rows, it is pure, and a
+// test can pin it without mounting a board.
+export const isLiveThreadStatus = (status: string): boolean =>
+    LIVE_THREAD_STATUSES.includes(status);
 
 export const threadDeleteProtectionOf = (
     entry: SessionThreadEntry,
@@ -1523,11 +1582,11 @@ export const threadDeleteProtectionOf = (
 ): ThreadDeleteProtection | undefined => {
     if (entry.origin === 'agent') return 'default';
 
-    if (entry.status === 'running') return 'active';
+    if (isLiveThreadStatus(entry.status)) return 'active';
 
     const doomed = threadSubtreeIdsOf(entry.id, threads);
     for (const thread of threads) {
-        if (doomed.has(thread.id) && thread.status === 'running') return 'active';
+        if (doomed.has(thread.id) && isLiveThreadStatus(thread.status)) return 'active';
     }
 
     for (const turn of turns) {
@@ -1671,6 +1730,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // late resolution of the old request must not clear the new session's dedupe.
     const deletingRequests = new Set<string>();
     let deleteRequestSequence = 0;
+    // R1: in-flight thread STOPS, keyed exactly like deletes (session + thread, because
+    // a thread id is only unique per session and a session switch may show the same id
+    // again). Unlike a delete, a stop keeps the conversation, so nothing else is
+    // suppressed while it runs — this set exists only to make the Stop press idempotent
+    // while the request is in flight and to repaint the control as `Stopping…`.
+    const stoppingRequests = new Set<string>();
     // One token per in-flight confirmed delete. A successful delete closes the
     // transcript through the missing-roster path; that is expected, not a "thread
     // vanished unexpectedly" error. A Set (not a boolean) keeps a stale request's
@@ -1686,6 +1751,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const isDeleting = (threadId: string): boolean => {
         const sessionId = currentSessionId();
         return sessionId !== undefined && deletingRequests.has(deletionKey(sessionId, threadId));
+    };
+    // R1: same session+thread keying as a delete, so a stop and a delete of one
+    // conversation are separately tracked but both dedupe per session.
+    const isStopping = (threadId: string): boolean => {
+        const sessionId = currentSessionId();
+        return sessionId !== undefined && stoppingRequests.has(deletionKey(sessionId, threadId));
     };
     // Every live action bar's sync callback. Expansion, roster, snapshot,
     // confirmation and in-flight changes repaint all of them from one source.
@@ -1995,6 +2066,64 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
     };
 
+    // R1: the Stop press. ONE click, NO confirmation dialog, NO two-press arming — on
+    // every surface. `requiresDeleteConfirmation` deliberately does not apply here: that
+    // policy guards an IRREVERSIBLE removal, while a stop only halts work the server can
+    // resume, and asking a thumb to confirm a pause would be the friction the request is
+    // removing. The same control also stays a Stop for the whole time the roster says the
+    // work is live, so there is no state in which a Stop click could land as a Delete.
+    const requestThreadStop = (threadId: string): void => {
+        // Single-flight: a double tap while the POST is in flight is one request. The
+        // repaint below is what keeps the control honest about that.
+        if (isStopping(threadId)) return;
+
+        const sessionId = currentSessionId();
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (
+            entry === undefined ||
+            // An `agent:<name>` conversation is internal plumbing: it has no Stop either,
+            // exactly as it has no Delete (its control is hidden by 'default' protection).
+            entry.origin === 'agent' ||
+            // Nothing to send without the transport: the control stays visible-but-disabled
+            // with the unwired reason (see `sync`), and a press does nothing.
+            options.stopThread === undefined ||
+            sessionId === undefined
+        ) {
+            refreshActionBars();
+            return;
+        }
+
+        void confirmThreadStop(threadId, sessionId);
+    };
+
+    // The request itself. The shell callback owns the existing cancel route AND the roster
+    // reconcile (`thread.upsert` publish + re-read), so this board only flips its own
+    // in-flight flag and reports failure. A successful stop normally arrives back as a
+    // newer roster frame, which repaints the control to Delete through `setThreads`/
+    // `setSessionView`; when the server has not settled yet the roster still says live and
+    // the control correctly remains Stop.
+    const confirmThreadStop = async (threadId: string, sessionId: string): Promise<void> => {
+        const requestKey = deletionKey(sessionId, threadId);
+        if (stoppingRequests.has(requestKey)) return;
+
+        stoppingRequests.add(requestKey);
+        refreshActionBars();
+
+        try {
+            await options.stopThread?.(sessionId, threadId);
+        } catch (error) {
+            // Non-destructive by construction: no tile, focus, transcript or selection is
+            // touched. The reader keeps the same conversation and can press Stop again.
+            const message = error instanceof Error ? error.message : String(error);
+            notice(`stop thread: ${message}`, 'error');
+        } finally {
+            // Key-scoped cleanup: a late answer from another session can only remove the
+            // entry it created, never the one the new binding owns.
+            stoppingRequests.delete(requestKey);
+            refreshActionBars();
+        }
+    };
+
     // One action bar shared by the expanded tile, every nested child card and the
     // roster-only focus panel. T26: the two controls SWAPPED homes — Delete now leads the
     // bar (left, where Transcript used to be) and Transcript closes it (right, where
@@ -2009,9 +2138,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // (`openThreadDeleteConfirmation`). The bar is therefore exactly its two actions: no
     // inline row that a stray second tap could confirm, and nothing left to reflow the
     // identity line on a click.
+    //
+    // R1: the destructive slot is ONE control with TWO meanings, never a third button.
+    // Live work makes it `Stop` (one press, no dialog); an idle/terminal conversation
+    // makes it `Delete` (today's desktop/mobile rules). The element, its `.thread-delete`
+    // class and its position in the bar never change — a Stop simply adds `.thread-stop`
+    // and repaints the copy — so every existing selector, stylesheet rule and layout
+    // contract keeps working.
     type ThreadActionBar = {
         element: HTMLElement;
         transcriptButton: HTMLButtonElement;
+        // The ONE destructive action: Delete, or Stop while the thread/subtree is live.
         deleteButton: HTMLButtonElement;
         sync: () => void;
         dispose: () => void;
@@ -2044,9 +2181,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         deleteButton.append(deleteLabel, deleteGlyph);
         deleteButton.addEventListener('click', () => {
             const threadId = input.target();
+            if (threadId === undefined) return;
+
+            // R1: the click follows the protection recomputed AT PRESS TIME, not the copy
+            // painted at the last sync — a snapshot frame can settle (or start) work in
+            // between, and the request must match the thread's actual state. Live work
+            // means Stop: one press, straight to the cancel transport, no layer.
+            if (deleteProtectionFor(threadId) === 'active') {
+                requestThreadStop(threadId);
+                return;
+            }
+
             // The pressed control travels with the request so a confirmation dialog can
             // hand focus back to it on dismissal (desktop presses never open one).
-            if (threadId !== undefined) requestThreadDelete(threadId, deleteButton);
+            requestThreadDelete(threadId, deleteButton);
         });
 
         // T26: Delete leads the bar and Transcript closes it (the two swapped places, and
@@ -2086,24 +2234,65 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const protection = deleteProtectionFor(threadId);
 
             // The agent's default conversation is never deletable (Reset session
-            // clears it); a live/queued thread is temporarily protected. Both keep
-            // the toolbar honest instead of sending a request the server refuses.
-            deleteButton.hidden = protection === 'default';
-            deleteButton.disabled =
-                protection !== undefined ||
-                transcriptBusy ||
-                options.deleteThread === undefined;
+            // clears it); a live/queued thread trades Delete for Stop. Both branches
+            // keep the toolbar honest instead of sending a request the server refuses.
+            if (protection === 'default') {
+                // Hidden, and nothing about it is Stop: the class list stays exactly
+                // `.thread-delete` so a Stop-only style can never leak onto it.
+                deleteButton.hidden = true;
+                deleteButton.classList.remove('thread-stop');
+                deleteLabel.textContent = ACTION_LABELS.delete.text;
+                deleteGlyph.textContent = ACTION_LABELS.delete.glyph;
+                deleteButton.disabled = true;
+                deleteButton.setAttribute('aria-label', `Delete thread ${name}`);
+                deleteButton.title = ACTION_TITLES.threadDefault;
+                return;
+            }
+
+            if (protection === 'active') {
+                // --- Stop mode (R1) ---
+                // `.thread-delete` is RETAINED and `.thread-stop` is added, so every
+                // existing selector and the shared button sizing/layout rules keep
+                // working; the modifier only re-colours the control as a stop.
+                deleteButton.hidden = false;
+                deleteButton.classList.add('thread-stop');
+
+                const stopping = isStopping(threadId);
+                const wired = options.stopThread !== undefined;
+
+                // A delete already in flight for this thread owns the control: two
+                // destructive requests for one conversation is never the answer.
+                deleteButton.disabled = stopping || transcriptBusy || !wired;
+                deleteLabel.textContent = stopping
+                    ? ACTION_LABELS.stop.pending
+                    : ACTION_LABELS.stop.text;
+                deleteGlyph.textContent = ACTION_LABELS.stop.glyph;
+                deleteButton.setAttribute(
+                    'aria-label',
+                    stopping ? `Stopping thread ${name}` : `Stop thread ${name}`
+                );
+                deleteButton.title = stopping
+                    ? ACTION_TITLES.stopPending
+                    : transcriptBusy
+                      ? ACTION_TITLES.stopWhileDeleting
+                      : wired
+                        ? ACTION_TITLES.stop
+                        : ACTION_TITLES.stopUnwired;
+                return;
+            }
+
+            // --- Delete mode: exactly today's behaviour, unchanged ---
+            deleteButton.hidden = false;
+            deleteButton.classList.remove('thread-stop');
+            deleteLabel.textContent = ACTION_LABELS.delete.text;
+            deleteGlyph.textContent = ACTION_LABELS.delete.glyph;
+            deleteButton.disabled = transcriptBusy || options.deleteThread === undefined;
             deleteButton.setAttribute('aria-label', `Delete thread ${name}`);
-            deleteButton.title =
-                protection === 'active'
-                    ? 'Stop the active or queued work in this thread before deleting it.'
-                    : protection === 'default'
-                      ? 'The default agent conversation cannot be deleted; reset the session instead.'
-                      : transcriptBusy
-                        ? 'Deleting this thread...'
-                        : options.deleteThread === undefined
-                          ? 'Thread deletion is not wired in this host.'
-                          : 'Delete this thread permanently';
+            deleteButton.title = transcriptBusy
+                ? ACTION_TITLES.deletePending
+                : options.deleteThread === undefined
+                  ? ACTION_TITLES.deleteUnwired
+                  : ACTION_TITLES.delete;
         };
 
         actionBarSyncs.add(sync);
@@ -8567,6 +8756,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         closeThreadDeleteConfirmation();
         deletingRequests.clear();
         activeDeleteSuppressions.clear();
+        // R1: a cleared board tears down the surface a Stop was pressed on; its in-flight
+        // flag goes with it (the late answer only ever removes its own key).
+        stoppingRequests.clear();
         // A cleared board is a NEW conversation surface: the next content may be
         // auto-opened (`reconcile` first-content rule). The explicit "no focus" flag
         // is reset with the session, not inherited across it.
@@ -9082,6 +9274,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // cannot be cleared by the old request.
             deletingRequests.clear();
             activeDeleteSuppressions.clear();
+            // R1: same rule for a stop in flight — it belongs to the session being left,
+            // and a late resolution removes only its own composite key.
+            stoppingRequests.clear();
         }
 
         for (const record of answerCards.values()) {

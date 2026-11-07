@@ -13,8 +13,11 @@
 //     owner synchronously; a later resolution is data on a dead task and is
 //     ignored (the implementation cannot be preempted, so this is the only
 //     honest way to release it);
-//   - a single timer emits the recurring wake while anything is pending, and it
-//     is cleared as soon as the board is empty or the board is disposed.
+//   - the board owns NO timer (R4). The recurring "you still have work running"
+//     heartbeat used to be a `setInterval` armed here; it is now a policy of the
+//     shipped `async-ping` plugin, which calls `wake()` on its own schedule
+//     through `api.async.wake()`. The board only answers "who is pending right
+//     now" and "notify them now".
 //
 // Why not `worker_threads`: a tool is an arbitrary JavaScript closure captured by
 // the host (file access, fetch, a harness's own `ctx.run`). It cannot be moved to
@@ -23,9 +26,11 @@
 // CPU execution.
 //
 // Cross-references:
-//   - ../harness.ts          — owns one board per harness and delivers outcomes
-//   - ../types               — HarnessPendingTool, the wire view of a task
-//   - ./agent.ts             — serializes model turns; this module never does
+//   - ../harness.ts               — owns one board per harness and delivers outcomes
+//   - ../types                    — HarnessPendingTool, the wire view of a task
+//   - ./agent.ts                    — serializes model turns; this module never does
+//   - ../plugins/async-ping.plugin.ts — the ONLY timer for the background wake (R4);
+//                                       it drives `wake()` and reads `pendingList()`
 
 import type { HarnessPendingTool } from '../types';
 import { HarnessError } from '../util';
@@ -84,7 +89,6 @@ export type ScheduleSpec<TResult> = {
 };
 
 export type TaskScheduler = {
-    readonly wakeIntervalMs: number;
     schedule: <TResult>(spec: ScheduleSpec<TResult>) => ScheduledTask<TResult>;
     // Every pending task, optionally narrowed to one agent (the public views and
     // the `toolCancel` declaration are agent-scoped).
@@ -94,6 +98,14 @@ export type TaskScheduler = {
     pendingOfScope: (scope: string) => ScheduledTask[];
     // The wire view. `now` is injectable so tests can pin elapsed values.
     pendingList: (agent?: string, now?: number) => HarnessPendingTool[];
+    // Trigger a wake NOW, optionally narrowed to one agent (R4). This exists for the
+    // plugin framework: `api.async.wake()` lets the shipped `async-ping` plugin (or any
+    // host plugin) drive the heartbeat policy — its own interval, backoff, or an
+    // event-driven wake — instead of the board owning a fixed timer. The board stays
+    // transport-free: it only answers "who is pending" and calls `onWake` once per
+    // pending agent. A narrowed wake for an agent with nothing pending is a no-op — a
+    // wake claims "you have work waiting", and a false claim would cost a model turn.
+    wake: (agent?: string) => void;
     // Lookups used by toolCancel. Only pending tasks are returned.
     find: (scope: string, callId: string) => ScheduledTask | undefined;
     cancel: (scope: string, callId: string) => ScheduledTask | undefined;
@@ -104,32 +116,24 @@ export type TaskScheduler = {
 };
 
 export type TaskSchedulerOptions = {
-    // Recurring wake interval. 600000 (10 minutes) is the harness default.
-    wakeIntervalMs: number;
-    // Emitted once per agent with pending work on every tick. The harness routes
-    // this through its per-agent mailbox, so it is never called concurrently
-    // with a completion delivery for the same agent.
+    // Called once per agent that HAS pending work, on every `wake()` call. The harness
+    // routes this through its per-agent mailbox, so it is never called concurrently
+    // with a completion delivery for the same agent. There is no interval option: the
+    // board never schedules anything itself, it only wakes when asked (R4).
     onWake: (agent: string, pending: HarnessPendingTool[]) => void;
     // Clock injection for deterministic tests. Defaults to Date.now.
     now?: () => number;
 };
 
-// Build one scheduler. A harness owns exactly one, so wake timers are per
-// harness and `reset()`/dispose never leaks a global interval.
+// Build one scheduler. A harness owns exactly one, so the wake callback (and the
+// per-harness plugin timers that drive it) can never reach another harness's board.
 export const createTaskScheduler = (options: TaskSchedulerOptions): TaskScheduler => {
     const now = options.now ?? (() => Date.now());
     const tasks = new Map<string, ScheduledTask>();
 
-    // Timer handle for the recurring wake. Undefined = no timer running. One
-    // interval for the whole board (grouped per agent on each tick) rather than
-    // one per task keeps a burst of calls from multiplying timers.
-    let timer: ReturnType<typeof setInterval> | undefined;
-
-    const stopTimer = (): void => {
-        if (timer === undefined) return;
-        clearInterval(timer);
-        timer = undefined;
-    };
+    // Timer handle removed in R4: the recurring wake is the `async-ping` plugin's job
+    // (../plugins/async-ping.plugin.ts), and it drives this board through `wake()`.
+    // The board therefore holds NO handle and has nothing to stop on teardown.
 
     // Debounce a pending task by agent so the public list is ordered by launch
     // time (insertion order after filtering), not map/string order.
@@ -137,31 +141,6 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
         [...tasks.values()].filter(
             (task) => task.status === 'pending' && (agent === undefined || task.agent === agent)
         );
-
-    const wake = (): void => {
-        // Group by agent so `wakeup` names one agent and carries only its calls.
-        const agents = new Set<string>();
-        for (const task of tasks.values()) {
-            if (task.status === 'pending') agents.add(task.agent);
-        }
-
-        for (const agent of agents) {
-            options.onWake(agent, pendingList(agent));
-        }
-
-        // A tick that drained everything (or a board disposed mid-tick) stops
-        // the timer; there is no reason to keep an empty interval alive.
-        if (pendingOf().length === 0) stopTimer();
-    };
-
-    const ensureTimer = (): void => {
-        if (timer !== undefined) return;
-        timer = setInterval(wake, options.wakeIntervalMs);
-        // Never hold a Node process open for a heartbeat: a pending run already
-        // keeps its own promise alive; a stray timer would keep a CLI alive after
-        // the caller stopped caring.
-        (timer as { unref?: () => void }).unref?.();
-    };
 
     const pendingList = (agent?: string, at: number = now()): HarnessPendingTool[] =>
         pendingOf(agent)
@@ -174,9 +153,18 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
                 elapsedMs: Math.max(0, at - task.startedAt)
             }));
 
+    // One wake per agent. `agents` is the already-decided set of scheduler identities
+    // to notify; an agent with nothing pending is skipped, so a wake never claims
+    // work that is not there (each false wake costs the agent a model turn).
+    const wakeAgents = (agents: Iterable<string>): void => {
+        for (const agent of agents) {
+            if (pendingOf(agent).length === 0) continue;
+            options.onWake(agent, pendingList(agent));
+        }
+    };
+
     const remove = (task: ScheduledTask): void => {
         tasks.delete(task.id);
-        if (tasks.size === 0) stopTimer();
     };
 
     const schedule = <TResult>(spec: ScheduleSpec<TResult>): ScheduledTask<TResult> => {
@@ -225,7 +213,6 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
         };
 
         tasks.set(id, record);
-        ensureTimer();
 
         const settle = (
             status: 'completed',
@@ -321,11 +308,13 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
             task._notify = undefined;
             tasks.delete(task.id);
         }
-        if (tasks.size === 0) stopTimer();
     };
 
+    // Teardown: every task is released and the board is empty. Nothing else is
+    // required — R4 removed the board's own interval, so there is no handle to clear
+    // here. A wake after dispose is therefore a no-op (the pending set is empty),
+    // which is what keeps a late plugin tick from waking a dead board.
     const dispose = (): void => {
-        stopTimer();
         for (const task of tasks.values()) {
             task.status = 'abandoned';
             if (!task.controller.signal.aborted) task.controller.abort();
@@ -335,13 +324,33 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
         tasks.clear();
     };
 
+    // Public, plugin-facing wake. `agent` narrows to one conversation's board; an
+    // unknown or drained agent changes nothing. Called with no argument it wakes every
+    // agent that has pending work right now — the grouping the old board timer did on
+    // each tick — so a plugin that wants a board-wide heartbeat needs one call, while
+    // a plugin that pings per agent (async-ping, R4) never disturbs another board.
+    // The pending set is read LIVE, so a wake racing a drain simply finds nothing.
+    const wake = (agent?: string): void => {
+        if (agent === undefined) {
+            const agents = new Set<string>();
+            for (const task of tasks.values()) {
+                if (task.status === 'pending') agents.add(task.agent);
+            }
+
+            wakeAgents(agents);
+            return;
+        }
+
+        wakeAgents([agent]);
+    };
+
     return {
-        wakeIntervalMs: options.wakeIntervalMs,
         schedule,
         pending: (agent?: string) => pendingOf(agent),
         pendingOfScope: (scope: string) =>
             pendingOf().filter((task) => task.scope === scope),
         pendingList,
+        wake,
         find,
         cancel,
         abandonScope,

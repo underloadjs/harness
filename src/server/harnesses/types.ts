@@ -8,6 +8,7 @@
 import type {
     Harness,
     HarnessInteractionConfiguration,
+    HarnessPluginSettingsProvider,
     HarnessProgress,
     HarnessStateChangeEvent,
     Tool,
@@ -37,6 +38,19 @@ export type HarnessPresetReport = {
     // its N4 update, or a custom preset) simply produces a harness with no owner
     // questions rather than failing.
     interaction?: HarnessInteractionConfiguration;
+    // T5 (R2/R3): the host's LIVE plugin settings provider, forwarded verbatim into
+    // HarnessConfiguration.pluginSettings by the shared toolbox factory. Same optional-third
+    // -argument discipline as `interaction` above, so every existing factory signature and
+    // caller keeps compiling and a factory that ignores it simply produces a harness on the
+    // library's declared-default provider (src/harness.ts:1080) rather than failing.
+    //
+    // It is a PROVIDER, not a snapshot, and that is the whole point: `harness()` stores the
+    // reference and each plugin's `api.settings` re-reads it on every call
+    // (src/plugin/settings.ts, src/plugin/host.ts:151), so a `PATCH /v1/harness/plugins/
+    // {plugin_id}` changes what an ALREADY RUNNING session reads on its next turn with no
+    // rebuild. SessionStore passes one provider for the whole process (./sessions.ts
+    // `buildHarness`); the worker lane cannot (see ./plugins.ts, "WORKER MODE").
+    pluginSettings?: HarnessPluginSettingsProvider;
 };
 
 // One named harness in the catalogue.

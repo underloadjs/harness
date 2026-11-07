@@ -36,7 +36,10 @@ export type ThreadRow = {
     id: string;
     agent: string;
     origin: 'agent' | 'host';
-    status: 'idle' | 'running' | 'stopped';
+    // R2/R3 ripple: the contract now carries 'paused' (a plugin parked the
+    // conversation at a turn boundary). A row must be able to state it, or the mapper
+    // would have to invent a value for a real server state.
+    status: 'idle' | 'running' | 'paused' | 'stopped';
     sequence: number;
     ownerThreadId?: string;
     label?: string;

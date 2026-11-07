@@ -292,6 +292,12 @@ it('keeps the tools toggle disabled until the catalogue has loaded', async () =>
     const toggle = byClass('.tools-toggle', 'button');
     expect(toggle.disabled).toBe(true);
     expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    // T7 (R2): the Plugins toggle sits next to it and answers to the SAME gate — no
+    // catalogue read has landed, so opening it would replace the startup pane with an
+    // empty list.
+    const plugins = byClass('.plugins-toggle', 'button');
+    expect(plugins.disabled).toBe(true);
+    expect(plugins.getAttribute('aria-pressed')).toBe('false');
     expect(document.querySelector('.empty-title')?.textContent).toBe(
         'Connecting to the harness server…'
     );
@@ -567,6 +573,26 @@ it('has no tab strip rules left and styles the global icon toggle', () => {
     );
     expect(blockOf('.tools-toggle:disabled {')).toContain('cursor: not-allowed');
     expect(blockOf('.topbar-right {')).toContain('align-items: center');
+
+    // T7 (R2): the Plugins toggle is styled by its OWN rules — never a shared
+    // `.tools-toggle, .plugins-toggle` selector list — so the tools block pinned above
+    // stays byte-for-byte what it always was, and restyling one catalogue icon cannot
+    // silently move the other. Same 30px square, same pressed/disabled vocabulary.
+    const pluginsButton = blockOf('.plugins-toggle {');
+    expect(pluginsButton).toContain('width: 30px');
+    expect(pluginsButton).toContain('height: 30px');
+    expect(pluginsButton).toContain('justify-content: center');
+    expect(pluginsButton).toContain('border: 1px solid var(--border-strong)');
+    expect(pluginsButton).toContain('padding: 0');
+    expect(pluginsButton).toContain('font-size: 14px');
+    expect(blockOf(".plugins-toggle[aria-pressed='true'] {")).toContain(
+        'border-color: var(--accent)'
+    );
+    expect(blockOf('.plugins-toggle:disabled {')).toContain('cursor: not-allowed');
+    expect(blockOf('.plugins-toggle-icon {')).toContain('font-size: 15px');
+    // The tools rules were not turned into a shared list.
+    expect(rules).not.toContain('.tools-toggle, .plugins-toggle');
+    expect(rules).not.toContain('.plugins-toggle, .tools-toggle');
 });
 
 it('leaves the create-harness close baseline alone (F2 cascade guard)', () => {

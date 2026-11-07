@@ -656,7 +656,6 @@ describe('tool-call id integrity (P2-B)', () => {
         const wakeups: string[] = [];
         const gate = deferred<string>();
         const scheduler = createTaskScheduler({
-            wakeIntervalMs: 600_000,
             onWake: (agentName) => void wakeups.push(agentName)
         });
 

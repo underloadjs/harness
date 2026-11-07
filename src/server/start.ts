@@ -183,6 +183,11 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
     // call disagree about the provider after a `.env` change, and the API would then have only
     // the key-free `defaults` document to work from — which is how a placeholder reached the
     // Authorization header.
+    //
+    // T5 (R2/R3): this listener's PLUGIN SETTINGS STORE is created inside that SessionStore,
+    // seeded from `database.pluginSettings`, and read back by `GET/PATCH /v1/harness/plugins`
+    // through `store.pluginSettings` — one per process, exactly like the store itself, so no
+    // separate construction is needed here (see ./runtime.ts for the same note).
     const serverSettings = options.settings ?? configuration.settings;
 
     const store = new SessionStore(

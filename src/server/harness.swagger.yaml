@@ -152,6 +152,10 @@ tags:
     description: Global trusted agent catalogue and its declarative overrides.
   - name: Tools
     description: Global tool catalogue and direct (session-less) execution.
+  - name: Plugins
+    description: >-
+      Built-in lifecycle plugins this build ships, and the per-plugin settings an operator edits.
+      Loading itself is auto-scanned and not writable here; only declared settings are.
   - name: Models
     description: Provider model discovery performed by the server on the client's behalf.
   - name: Sessions
@@ -245,6 +249,7 @@ paths:
                   harnesses: /v1/harness/harnesses
                   agents: /v1/harness/agents
                   tools: /v1/harness/tools
+                  plugins: /v1/harness/plugins
                   sessions: /v1/harness/sessions
                   stream: /v1/harness/stream
         '405':
@@ -738,6 +743,98 @@ paths:
           $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/harness/plugins:
+    get:
+      tags: [Plugins]
+      operationId: listPlugins
+      summary: List the built-in plugins with their settings and current values
+      description: >-
+        GLOBAL, read-only at the collection level, and answerable without constructing a harness: every row comes
+        from the built-in plugin manifest this build ships (auto-scanned at build time from the plugin files
+        themselves) plus the overrides this deployment has stored. EVERY shipped plugin is listed, including one
+        that declares no settings and no hooks, because an operator has to be able to see what is loaded before
+        deciding what it does. `settings` is the plugin's own declared descriptor list (`key`, `label`, `type`,
+        `default`, and the `min`/`max`/`step` editor hints); `values` is the EFFECTIVE value of each declared key
+        right now - the stored override when the operator changed it, otherwise the declared default - resolved
+        through the same read a plugin performs, so a row can never disagree with what a running session does.
+        Order is the manifest's own and is stable across restarts. Rows carry no enable/disable state: plugin
+        loading is auto-scanned, and this contract exposes no HTTP toggle.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: q
+          in: query
+          required: false
+          description: >-
+            Case-insensitive substring match against `name`, `title`, `description`, and `tags`. It filters the
+            page; it never widens the row shape.
+          schema:
+            type: string
+            maxLength: 200
+      responses:
+        '200':
+          description: Page of plugin rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginSummaryPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/harness/plugins/{plugin_id}:
+    parameters:
+      - $ref: '#/components/parameters/PluginId'
+    patch:
+      tags: [Plugins]
+      operationId: updatePlugin
+      summary: Change one built-in plugin's settings
+      description: >-
+        GLOBAL write, declarative only, and IMMEDIATE. The runtime holds ONE live settings provider and a plugin's
+        `api.settings` re-reads it on every access, so an accepted patch changes what an EXISTING session reads on
+        its next turn - no rebuild and no new session. (A CPU-isolated lane worker rebuilds its replica from the
+        frozen blueprint it was handed, so a worker lane that is already running picks the new value up the next
+        time its lane is created; every in-process session sees it at once.)
+        Only `settings` is writable, and only the keys the plugin DECLARES: an unknown key is a 400 naming the
+        declared set, a value of the wrong type is a 400 naming the key, and a number outside the declared `min`
+        or `max` is a 400 naming the bound. `step` is an editor hint and is deliberately NOT enforced, because the
+        runtime that has to live with the value accepts it. A `null` value RESETS that key to the plugin's declared
+        default. `builtin` metadata, the declared defaults, and which hooks a plugin subscribes to are never
+        writable over HTTP - the plugin file is the single owner of its own description, and the next release
+        changing a default needs no migration because only overrides are stored. The write is durable before the
+        response. An unknown plugin is 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PluginSettingsUpdate'
+            examples:
+              context-limit:
+                summary: Set a context limit an existing session honours immediately
+                value:
+                  settings:
+                    contextLimit: 200000
+              reset:
+                summary: Put one key back on the plugin's declared default
+                value:
+                  settings:
+                    contextLimit: null
+      responses:
+        '200':
+          description: The updated plugin row, with the effective values it now runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '500':
           $ref: '#/components/responses/InternalError'
   /v1/harness/models:
@@ -1740,7 +1837,7 @@ paths:
           description: Filter conversations by lifecycle state.
           schema:
             type: string
-            enum: [idle, running, stopped]
+            enum: [idle, running, paused, stopped]
       responses:
         '200':
           description: Page of conversation rows.
@@ -2905,6 +3002,17 @@ components:
       schema:
         type: string
         pattern: '^[a-z][a-z0-9_-]*$'
+    PluginId:
+      name: plugin_id
+      in: path
+      required: true
+      description: >-
+        Built-in plugin id: the `name` its own metadata declares, which is also the key its settings and hook
+        registrations are addressed by. Ids come from the auto-scanned plugin files, so a name this build does
+        not ship is 404 rather than a silent no-op, and no route can register a plugin over HTTP.
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9_-]*$'
     Limit:
       name: limit
       in: query
@@ -3884,6 +3992,160 @@ components:
           description: >-
             True states the only restore path. A re-created profile with the same name is a code change, so this
             contract does not imply an HTTP undo.
+    # ---------------------------------------------------------------------
+    # Built-in plugins (R2/R3): the loaded catalogue, its declared settings,
+    # and the effective values an operator has set.
+    #
+    # WHY `settings` AND `values` TRAVEL TOGETHER. A plugin's descriptor list is
+    # authored in the plugin file itself (`src/plugins/*.plugin.ts`, projected into
+    # the generated manifest), so the server cannot restate it; `values` is the
+    # resolution of those same keys against the stored overrides. Shipping both in
+    # one row is what lets the Plugins pane render an editable form in a single
+    # request without a second identified read, and it is why `default` (the reset
+    # target) is on the wire next to the current value.
+    # ---------------------------------------------------------------------
+    PluginSetting:
+      type: object
+      description: >-
+        One DECLARED setting of a plugin, copied verbatim from the plugin's own metadata. `key` is the stable id
+        the runtime reads and the patch writes; `label` and `description` are for a form; `default` is the value
+        the plugin falls back to when nothing is stored, which is also what a `null` patch entry restores. The
+        numeric fields are EDITOR hints: `min` and `max` bound what the server accepts, `step` bounds only what a
+        client offers.
+      required: [key, label, type, default]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          maxLength: 100
+        label:
+          type: string
+          maxLength: 200
+        type:
+          type: string
+          enum: [number, string, boolean]
+          description: The declared value type; `PATCH` validates against it and normalizes to it.
+        default:
+          description: The plugin's own fallback value - a number, string, or boolean, per `type`.
+          oneOf:
+            - type: number
+            - type: string
+            - type: boolean
+        min:
+          type: number
+          description: Lower bound a `number` setting accepts, when the plugin declared one.
+        max:
+          type: number
+          description: Upper bound a `number` setting accepts, when the plugin declared one.
+        step:
+          type: number
+          description: >-
+            Increment hint for an editor. A server-side advisory ONLY: a value off the step is accepted, because
+            the runtime that has to live with the value accepts it too.
+        description:
+          type: string
+          maxLength: 2000
+    PluginSummary:
+      type: object
+      description: >-
+        One built-in plugin as an operator sees it: identity, the lifecycle hooks it declares, its settings
+        descriptors, and the values that are in force right now. `builtin` is always true on this route - the
+        catalogue is the auto-scanned set this build ships - and it stays on the wire so a client renders the
+        same row shape for a plugin a future release makes configurable.
+      required: [name, title, builtin, settings, values]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        title:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 2000
+        version:
+          type: string
+          maxLength: 50
+        tags:
+          type: array
+          description: Free-form categorisation for filtering and search; never behaviour-bearing.
+          items:
+            type: string
+            maxLength: 50
+        hooks:
+          type: array
+          description: >-
+            The lifecycle stages this plugin DECLARES it subscribes to (`turn.before`, `async.pending`, ...).
+            Informational by contract: the bus records what setup() actually registered, and this list is the
+            declared description shown to an operator.
+          items:
+            type: string
+            maxLength: 60
+        builtin:
+          type: boolean
+          description: True when the plugin ships with the application (every row on this route).
+        settings:
+          type: array
+          description: >-
+            The declared descriptors, in the plugin's own declared order. Empty when the plugin has no settings.
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/PluginSetting'
+        values:
+          type: object
+          description: >-
+            The EFFECTIVE value of every declared key: the stored override when the operator changed it, otherwise
+            the declared default. Same spelling as a `PATCH` body, so a client edits the object it read. A key
+            absent from `settings` can never appear here.
+          additionalProperties: true
+    PluginSummaryPage:
+      description: Page of built-in plugin rows.
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          additionalProperties: false
+          properties:
+            items:
+              type: array
+              maxItems: 100
+              items:
+                $ref: '#/components/schemas/PluginSummary'
+    PluginDetailResponse:
+      type: object
+      description: >-
+        Envelope of one plugin row, read or patched. A patch returns the whole row rather than a receipt because
+        the values it reports ARE the result of the write, and an editor needs the reset targets beside them.
+      required: [plugin]
+      additionalProperties: false
+      properties:
+        plugin:
+          $ref: '#/components/schemas/PluginSummary'
+    PluginSettingsUpdate:
+      type: object
+      description: >-
+        Settings patch for one plugin. Each key must be one the plugin declares; a value REPLACES that key's
+        override, an explicit `null` clears it (the declared default applies again), and an omitted key is no
+        change. Unknown keys are refused rather than ignored, so a client is never left believing it edited
+        something. There is no enable/disable field: plugin loading is auto-scanned.
+      minProperties: 1
+      additionalProperties: false
+      required: [settings]
+      properties:
+        settings:
+          type: object
+          minProperties: 1
+          description: >-
+            Key -> value, validated against each key's declared `type`, `min`, and `max`. A value may also be sent
+            as the numeric or `true`/`false` STRING form a query string or a JSON document legitimately carries,
+            and the server normalizes it to the declared type.
+          additionalProperties:
+            oneOf:
+              - type: number
+              - type: string
+              - type: boolean
+              - type: 'null'
     # ---------------------------------------------------------------------
     # Global tools
     # ---------------------------------------------------------------------
@@ -5437,7 +5699,7 @@ components:
             independent conversation, opened by an unfocused submit, by a client, or by a delegated child.
         status:
           type: string
-          enum: [idle, running, stopped]
+          enum: [idle, running, paused, stopped]
         sequence:
           type: integer
           minimum: 0

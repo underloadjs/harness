@@ -20,8 +20,13 @@
 //       `toolCancel({callId})` releases one call, siblings continue, and a late
 //       settlement of an uncooperative tool changes nothing.
 //   R5  The recurring wake is 600000 ms by default, reports elapsed pending time,
-//       repeats, and its timer is gone once the run is drained. Whole-run cancel
-//       rolls back every actor, aborts children, and leaves the harness reusable.
+//       repeats, and its timer is gone once the run is drained. The timer belongs to
+//       the shipped `async-ping` plugin (R4), not to core: replacing that preset
+//       removes the wake entirely. Because the plugin arms from the `async.pending`
+//       hook, EVERY schedule site has to emit it — an ordinary async tool call, a
+//       `threadFork` branch and an `actionRequest` owner answer — or that board loses
+//       the heartbeat the old board-wide timer used to give it. Whole-run cancel rolls
+//       back every actor, aborts children, and leaves the harness reusable.
 //       A thrown/rejected tool is recoverable data; `maxIterations` still bounds a
 //       run and its pending state is cleaned up on the rollback path.
 //
@@ -52,8 +57,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type {
+    HarnessActionChoice,
     HarnessEvent,
     HarnessMessage,
+    HarnessPendingTool,
+    HarnessPluginApi,
     HarnessStream,
     HarnessStreamEvent,
     HarnessStreamRequest,
@@ -842,6 +850,480 @@ describe('recurring wakeup', () => {
             }
         ]);
         expect(wakeupsOf(events)).toHaveLength(2);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // R4: the interval is now a PLUGIN setting (`async-ping.intervalMs`), seeded from
+    // the legacy `wakeIntervalMs` configuration field. A short value proves the whole
+    // chain: harness() → plugin settings provider → api.settings → the plugin's timer.
+    it('honours a configured wakeIntervalMs through the plugin', async () => {
+        const alphaGate = deferred<string>();
+        const started: string[] = [];
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    stream: streamFrom(
+                        (turn) =>
+                            turn === 0
+                                ? calls(call('a1', 'slowAlpha', '{"value":"A"}'))
+                                : answer(`waiting-${turn}`),
+                        seen
+                    )
+                })
+            },
+            tools: { slowAlpha: gatedTool('slowAlpha', alphaGate, started) },
+            presets: false,
+            wakeIntervalMs: 250,
+            report: {
+                progress: (event) => {
+                    events.push(event);
+                }
+            }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // 249ms is not a tick yet.
+        await advance(249);
+        expect(wakeupsOf(events)).toEqual([]);
+        expect(state.status).toBe('pending');
+
+        await advance(1);
+        expect(wakeupsOf(events)).toEqual([
+            {
+                type: 'wakeup',
+                agent: 'writer',
+                reason: 'pending-tools',
+                pending: [{ callId: 'a1', name: 'slowAlpha', elapsedMs: 250 }]
+            }
+        ]);
+
+        // The plugin re-arms while work remains: the second ping carries the doubled
+        // elapsed time, 250ms later.
+        await advance(250);
+        expect(wakeupsOf(events)[1]).toEqual({
+            type: 'wakeup',
+            agent: 'writer',
+            reason: 'pending-tools',
+            pending: [{ callId: 'a1', name: 'slowAlpha', elapsedMs: 500 }]
+        });
+        expect(wakeupsOf(events)).toHaveLength(2);
+
+        alphaGate.resolve('A-done');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // R4: nothing in core keeps a wake alive. A host plugin that REPLACES the shipped
+    // async-ping preset (the documented override path) removes the heartbeat entirely —
+    // which is only true because the scheduler no longer owns a timer.
+    it('produces no wake and no timer when the ping plugin is replaced', async () => {
+        const alphaGate = deferred<string>();
+        const started: string[] = [];
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    stream: streamFrom(
+                        (turn) =>
+                            turn === 0
+                                ? calls(call('a1', 'slowAlpha', '{"value":"A"}'))
+                                : answer(`waiting-${turn}`),
+                        seen
+                    )
+                })
+            },
+            tools: { slowAlpha: gatedTool('slowAlpha', alphaGate, started) },
+            presets: false,
+            plugins: [{ name: 'async-ping', setup: () => undefined }],
+            report: {
+                progress: (event) => {
+                    events.push(event);
+                }
+            }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // The historical cadence would have fired three times across this span.
+        await advance(600_000 * 3);
+        expect(wakeupsOf(events)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(state.status).toBe('pending');
+
+        // Completions are unaffected: the run still finishes normally.
+        alphaGate.resolve('A-done');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(wakeupsOf(events)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R5/T6 — the heartbeat covers EVERY schedule site, not just tool launches
+// ---------------------------------------------------------------------------
+//
+// WHY THESE TESTS EXIST: the wake is a PLUGIN behaviour now, armed only by the
+// `async.pending` hook (src/plugins/async-ping.plugin.ts). `launchToolCall` announced
+// there from the start; `launchThreadFork` and `launchActionRequest` did not, so a
+// conversation whose only in-flight work is a branch run or an owner answer had NO
+// heartbeat at all — the coverage gap the removed board-wide 10-minute timer used to
+// paper over (src/harness.ts `announcePending`).
+//
+// Each test asserts, in order:
+//   1. the exact `async.pending` payload (actor key + the scheduled call, `elapsedMs: 0`
+//      because the announcement precedes `scheduler.schedule()`);
+//   2. the real wake, driven by the SHIPPED plugin under fake timers — proof the payload
+//      is arming material and not decoration;
+//   3. exactly one `async.drained` and `getTimerCount() === 0` once the board empties.
+//
+// A host probe plugin (added alongside the built-ins, which stay loaded) records the two
+// transitions; the scripted transport routes by REQUEST CONTENT because a branch shares
+// its source's transport, and holds the branch open on a gate so the requester's board
+// genuinely has one pending call while the clock advances.
+
+describe('recurring wakeup covers every schedule site', () => {
+    // `routedStream`: like `streamFrom`, but the frames may arrive asynchronously (a
+    // branch that waits on a gate) and are chosen by request content rather than by turn
+    // index. The `await` before the frames keeps a same-actor overlap observable.
+    const routedStream = (
+        route: (request: HarnessStreamRequest) => Promise<HarnessStreamEvent[]> | HarnessStreamEvent[],
+        seen: SeenRequest[]
+    ): HarnessStream =>
+        async function* (request) {
+            seen.push(capture(request));
+            for (const frame of await route(request)) yield frame;
+        };
+
+    const latestUser = (request: HarnessStreamRequest): string => {
+        for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+            const message = request.messages[index];
+            if (message.role === 'user') return message.content;
+        }
+        return '';
+    };
+
+    const toolContents = (request: HarnessStreamRequest): string[] =>
+        request.messages
+            .filter(
+                (message): message is Extract<HarnessMessage, { role: 'tool' }> =>
+                    message.role === 'tool'
+            )
+            .map((message) => message.content);
+
+    // A host plugin that sees the two board transitions without replacing async-ping.
+    type BoardTransition = { agent: string; pending: HarnessPendingTool[] };
+    const boardProbe = (
+        announced: BoardTransition[],
+        drained: BoardTransition[]
+    ) => ({
+        name: 'board-probe',
+        setup: (api: HarnessPluginApi) => {
+            api.on('async.pending', (payload) => {
+                announced.push({ agent: payload.agent, pending: [...payload.pending] });
+            });
+            api.on('async.drained', (payload) => {
+                drained.push({ agent: payload.agent, pending: [...payload.pending] });
+            });
+        }
+    });
+
+    // The tool arguments must match `actionRequest`'s schema exactly (no extra
+    // properties), so this is the same shape harness.action-request.test.ts uses.
+    const REQUEST_ARGS = JSON.stringify({
+        question: 'Which path should I take?',
+        recommended: 'fast',
+        options: [
+            { id: 'fast', label: 'Fast path', description: 'Ship quickly.' },
+            { id: 'slow', label: 'Slow path' }
+        ]
+    });
+
+    it('announces and pings a board whose only work is a threadFork branch', async () => {
+        const branchGate = deferred<string>();
+        const events: HarnessEvent[] = [];
+        const seen: SeenRequest[] = [];
+        const announced: BoardTransition[] = [];
+        const drained: BoardTransition[] = [];
+
+        const entry = agent({
+            model: 'test/model',
+            stream: routedStream((request) => {
+                // The branch's own request: park it so the requester keeps exactly one
+                // pending call (the fork) while the heartbeat runs.
+                if (latestUser(request) === 'branch task') {
+                    return branchGate.promise.then((summary) => answer(`branch summary ${summary}`));
+                }
+                if (toolContents(request).some((content) => content.includes('branch summary'))) {
+                    return answer('root done');
+                }
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return calls(call('f1', 'threadFork', '{"input":"branch task"}'));
+                }
+                // A wake-driven turn with the branch still running: pause again.
+                return answer('waiting');
+            }, seen)
+        });
+
+        const writer = harness({
+            agents: { writer: entry },
+            presets: false,
+            plugins: [boardProbe(announced, drained)],
+            report: {
+                progress: (event) => {
+                    events.push(event);
+                }
+            }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // ONE announcement, on the scheduler actor key the plugin keys its timer with,
+        // carrying the call that is about to be scheduled.
+        expect(announced).toEqual([
+            { agent: 'writer', pending: [{ callId: 'f1', name: 'threadFork', elapsedMs: 0 }] }
+        ]);
+        expect(drained).toEqual([]);
+        expect(wakeupsOf(events)).toEqual([]);
+
+        // 599999ms is not a tick; 600000ms is, and the fork IS the pending work.
+        await advance(599_999);
+        expect(wakeupsOf(events)).toEqual([]);
+
+        await advance(1);
+        expect(wakeupsOf(events)).toEqual([
+            {
+                type: 'wakeup',
+                agent: 'writer',
+                reason: 'pending-tools',
+                pending: [{ callId: 'f1', name: 'threadFork', elapsedMs: 600_000 }]
+            }
+        ]);
+        expect(state.status).toBe('pending');
+
+        // Draining the branch stops the heartbeat: one drained transition, no timer.
+        branchGate.resolve('released');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('root done');
+        expect(drained).toEqual([{ agent: 'writer', pending: [] }]);
+        expect(announced).toHaveLength(1);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('announces and pings a board whose only work is an actionRequest answer', async () => {
+        const ownerGate = deferred<HarnessActionChoice>();
+        const events: HarnessEvent[] = [];
+        const seen: SeenRequest[] = [];
+        const announced: BoardTransition[] = [];
+        const drained: BoardTransition[] = [];
+
+        const entry = agent({
+            model: 'test/model',
+            stream: routedStream((request) => {
+                if (toolContents(request).some((content) => content.includes('answeredBy'))) {
+                    return answer('root done');
+                }
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return calls(call('q1', 'actionRequest', REQUEST_ARGS));
+                }
+                return answer('waiting');
+            }, seen)
+        });
+
+        const writer = harness({
+            agents: { writer: entry },
+            presets: false,
+            // The ROOT owner question: answered by the host handler, which the test holds
+            // open, so the board holds one pending `actionRequest` call.
+            interaction: {
+                actionRequest: () => ownerGate.promise
+            },
+            plugins: [boardProbe(announced, drained)],
+            report: {
+                progress: (event) => {
+                    events.push(event);
+                }
+            }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        expect(announced).toEqual([
+            { agent: 'writer', pending: [{ callId: 'q1', name: 'actionRequest', elapsedMs: 0 }] }
+        ]);
+        expect(drained).toEqual([]);
+
+        await advance(600_000);
+        expect(wakeupsOf(events)).toEqual([
+            {
+                type: 'wakeup',
+                agent: 'writer',
+                reason: 'pending-tools',
+                pending: [{ callId: 'q1', name: 'actionRequest', elapsedMs: 600_000 }]
+            }
+        ]);
+        expect(state.status).toBe('pending');
+
+        ownerGate.resolve({ kind: 'option', optionId: 'slow' });
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('root done');
+        expect(drained).toEqual([{ agent: 'writer', pending: [] }]);
+        expect(announced).toHaveLength(1);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('announces an async call and a branch once each, in call order, with the live board', async () => {
+        const alphaGate = deferred<string>();
+        const branchGate = deferred<string>();
+        const seen: SeenRequest[] = [];
+        const announced: BoardTransition[] = [];
+        const drained: BoardTransition[] = [];
+
+        const entry = agent({
+            model: 'test/model',
+            stream: routedStream((request) => {
+                if (latestUser(request) === 'branch task') {
+                    return branchGate.promise.then(() => answer('branch summary'));
+                }
+                const results = toolContents(request);
+                if (
+                    results.some((content) => content.includes('A-done')) &&
+                    results.some((content) => content.includes('branch summary'))
+                ) {
+                    return answer('root done');
+                }
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return calls(
+                        call('a1', 'slowAlpha', '{"value":"A"}'),
+                        call('f1', 'threadFork', '{"input":"branch task"}')
+                    );
+                }
+                return answer('waiting');
+            }, seen)
+        });
+
+        const alphaStarted: string[] = [];
+
+        const writer = harness({
+            agents: { writer: entry },
+            tools: { slowAlpha: gatedTool('slowAlpha', alphaGate, alphaStarted) },
+            presets: false,
+            plugins: [boardProbe(announced, drained)],
+            report: { progress: () => undefined }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // Exactly two announcements, in CALL ORDER. The second carries the board as it
+        // was (the still-running `slowAlpha`) plus the branch being scheduled — the
+        // payload is a transition claim, never a double-count of one call.
+        expect(announced).toEqual([
+            { agent: 'writer', pending: [{ callId: 'a1', name: 'slowAlpha', elapsedMs: 0 }] },
+            {
+                agent: 'writer',
+                pending: [
+                    { callId: 'a1', name: 'slowAlpha', elapsedMs: 0 },
+                    { callId: 'f1', name: 'threadFork', elapsedMs: 0 }
+                ]
+            }
+        ]);
+
+        alphaGate.resolve('A-done');
+        branchGate.resolve('B-done');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('root done');
+        // The board drains through the ordinary delivery path: ONE drained signal for
+        // the whole board, and the heartbeat is gone.
+        expect(drained).toEqual([{ agent: 'writer', pending: [] }]);
+        expect(announced).toHaveLength(2);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // WHY THIS ONE IS HERE TOO: `async-ping.plugin.ts` documents a `toolCancel` release
+    // as the case that leaves a timer armed until its next tick (no `async.drained`).
+    // The cancelled call's release DOES go through the delivery path, which owns the
+    // drained transition, so the heartbeat stops on the spot — this pins which of the
+    // two readings is the real one, and that no `toolCancel` announcement is invented
+    // for a control call that never became background work.
+    it('releases the heartbeat the moment toolCancel empties the board', async () => {
+        const alphaGate = deferred<string>();
+        const events: HarnessEvent[] = [];
+        const seen: SeenRequest[] = [];
+        const announced: BoardTransition[] = [];
+        const drained: BoardTransition[] = [];
+
+        const entry = agent({
+            model: 'test/model',
+            stream: streamFrom((turn, request) => {
+                if (turn === 0) return calls(call('a1', 'slowAlpha', '{"value":"A"}'));
+                // The wake turn: the model gives up on the hung call.
+                if (turn === 1) return calls(call('c9', 'toolCancel', '{"callId":"a1"}'));
+
+                const released = request.messages.some(
+                    (message) => message.role === 'tool' && message.toolCallId === 'a1'
+                );
+                return released ? answer('cancelled and done') : answer('waiting');
+            }, seen)
+        });
+
+        const writer = harness({
+            agents: { writer: entry },
+            tools: { slowAlpha: gatedTool('slowAlpha', alphaGate) },
+            presets: false,
+            plugins: [boardProbe(announced, drained)],
+            report: {
+                progress: (event) => {
+                    events.push(event);
+                }
+            }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // One announcement for the scheduled call; the `toolCancel` control announced
+        // nothing, because it was never scheduled as background work.
+        expect(announced).toEqual([
+            { agent: 'writer', pending: [{ callId: 'a1', name: 'slowAlpha', elapsedMs: 0 }] }
+        ]);
+        expect(wakeupsOf(events)).toEqual([]);
+
+        // THE dormant-handle question: releasing the LAST call through `toolCancel` goes
+        // through the delivery path, which owns the `async.drained` transition, so the
+        // heartbeat is cleared on the spot. An armed-but-pointless timer would still be
+        // sitting in the timer queue here (and `tick()`'s live re-check would only
+        // silence it at the next interval).
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('cancelled and done');
+        expect(drained).toEqual([{ agent: 'writer', pending: [] }]);
+        expect(announced).toHaveLength(1);
+        expect(vi.getTimerCount()).toBe(0);
+
+        // And it never fires: the board is empty, so the run is not woken again.
+        await advance(600_000);
+        expect(wakeupsOf(events)).toEqual([]);
         expect(vi.getTimerCount()).toBe(0);
     });
 });

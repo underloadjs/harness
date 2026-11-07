@@ -1763,19 +1763,26 @@ describe('confirmed thread deletion', () => {
         const runningTurn = board.adopt(snapshot.turns[1]);
         board.expand(runningTurn);
         const runningBar = tileAction(runningTurn);
-        // T26: a live thread keeps a VISIBLE but disabled Delete in the bar, and T6/R5 a
-        // press on it can never open the confirmation dialog.
+        // R1: a live thread's destructive action is STOP, not a disabled Delete. It is
+        // still the SAME single button and it still carries `.thread-delete` (the
+        // `.thread-stop` modifier is additive), so the bar's two-child anatomy, its order
+        // and every existing selector are unchanged. T6/R5 still holds: no confirmation
+        // dialog of any kind is reachable from a live conversation.
         expect([...runningBar.children].map((node) => node.className)).toEqual([
-            'thread-delete',
+            'thread-delete thread-stop',
             'transcript-open action-transcript'
         ]);
-        expect(deleteButton(runningTurn.element).hidden).toBe(false);
-        expect(deleteButton(runningTurn.element).disabled).toBe(true);
-        expect(deleteButton(runningTurn.element).title).toBe(
-            'Stop the active or queued work in this thread before deleting it.'
-        );
+        const runningStop = deleteButton(runningTurn.element);
+        expect(runningStop.hidden).toBe(false);
+        // This standalone board has no STOP transport either; the control says so instead
+        // of pretending the action is wired (same honesty rule as an unwired Delete).
+        expect(runningStop.disabled).toBe(true);
+        expect(runningStop.querySelector('.action-label')?.textContent).toBe('Stop');
+        expect(runningStop.querySelector('.action-glyph')?.textContent).toBe('■');
+        expect(runningStop.getAttribute('aria-label')).toBe('Stop thread RR6');
+        expect(runningStop.title).toBe('Thread stop is not wired in this host.');
 
-        deleteButton(runningTurn.element).click();
+        runningStop.click();
         expect(confirmDialogs()).toHaveLength(0);
     });
 

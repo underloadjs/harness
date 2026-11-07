@@ -1,0 +1,586 @@
+// The lifecycle hook bus (src/plugin/hooks.ts).
+//
+// Pins the four rules the framework depends on, each of which exists because of a
+// concrete failure it prevents:
+//   - SEQUENTIAL + AWAITED: hook order is the only ordering a plugin author can rely
+//     on, and a later handler must see what an earlier one did;
+//   - FAIL-OPEN: an optional extension must never break a conversation;
+//   - LAST NON-EMPTY transcript override wins, and an empty array is NOT an override;
+//   - a SYNC emitter (`fire`) for the lifecycle points inside synchronous handle
+//     methods, including a handler that returned a rejected promise anyway;
+//   - `emitMaybeSync`: the same sequential, fail-open round, but WITHOUT a microtask
+//     boundary while every handler stays synchronous. `turn.before` needs that because
+//     the shipped `context-compaction` plugin subscribes permanently and is inert under
+//     its limit (plugin/hooks.ts rule 6), and an unconditional `await` there moved
+//     observer-visible event order in src/server/queue.test.ts.
+//
+// Every assertion is an exact value (no range checks), so a change in merge or ordering
+// behavior fails loudly.
+
+import { describe, expect, it } from 'vitest';
+import { createHookBus } from './hooks';
+import type { HarnessLifecycleEvent, HarnessMessage } from '../types';
+
+// One user message, reused across the transcript assertions.
+const user = (content: string): HarnessMessage => ({ role: 'user', content });
+
+// The full `turn.before` payload, written once: the maybe-sync assertions below need it
+// in every case, and its shape (not its content) is what they exercise.
+const turnPayload = (messages: HarnessMessage[]) => ({
+    threadId: 'agent:writer',
+    agent: 'writer',
+    iteration: 1,
+    messages,
+    estimatedTokens: 1,
+    signal: new AbortController().signal,
+    api: undefined as never,
+    setTranscript: () => undefined,
+    replaceHistory: () => undefined,
+    pause: async () => undefined,
+    resume: async () => undefined
+});
+
+describe('createHookBus', () => {
+    it('runs handlers sequentially in registration order and awaits async ones', async () => {
+        const bus = createHookBus();
+        const order: string[] = [];
+
+        bus.on('thread.created', () => {
+            order.push('sync-a');
+        });
+        bus.on('thread.created', async () => {
+            // An async handler must complete before the next one starts; without the
+            // await, 'slow' would land last and a compaction hook could race a logger.
+            await Promise.resolve();
+            order.push('slow');
+        });
+        bus.on('thread.created', () => {
+            order.push('sync-b');
+        });
+
+        await bus.emit('thread.created', { id: 'thread-1', agent: 'writer', origin: 'host', status: 'idle', sequence: 1 });
+
+        expect(order).toEqual(['sync-a', 'slow', 'sync-b']);
+    });
+
+    it('skips a throwing handler and still runs the rest (fail-open)', async () => {
+        const failures: Array<{ event: HarnessLifecycleEvent; owner: string; error: unknown }> = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push(context)
+        });
+        const seen: string[] = [];
+
+        bus.on(
+            'thread.deleted',
+            () => {
+                throw new Error('boom');
+            },
+            { owner: 'broken' }
+        );
+        bus.on(
+            'thread.deleted',
+            async () => {
+                await Promise.resolve();
+                throw 'rejected-string';
+            },
+            { owner: 'async-broken' }
+        );
+        bus.on(
+            'thread.deleted',
+            () => {
+                seen.push('survivor');
+            },
+            { owner: 'ok' }
+        );
+
+        // `emit` must RESOLVE: a rejecting hook is reported, never propagated.
+        await expect(
+            bus.emit('thread.deleted', { threadId: 'thread-1', agent: 'writer' })
+        ).resolves.toEqual({});
+
+        expect(seen).toEqual(['survivor']);
+        expect(failures).toEqual([
+            { event: 'thread.deleted', owner: 'broken', error: new Error('boom') },
+            { event: 'thread.deleted', owner: 'async-broken', error: 'rejected-string' }
+        ]);
+    });
+
+    it('merges a turn.before transcript override: last non-empty wins', async () => {
+        const bus = createHookBus();
+
+        bus.on('turn.before', () => ({ transcript: [user('first')] }));
+        bus.on('turn.before', () => ({ transcript: [user('second')] }));
+
+        const merged = await bus.emit('turn.before', () => ({
+            threadId: 'thread-1',
+            agent: 'writer',
+            iteration: 1,
+            messages: [user('original')],
+            estimatedTokens: 3,
+            signal: new AbortController().signal,
+            api: undefined as never,
+            setTranscript: () => undefined,
+            replaceHistory: () => undefined,
+            pause: async () => undefined,
+            resume: async () => undefined
+        }));
+
+        expect(merged).toEqual({ transcript: [user('second')] });
+    });
+
+    it('treats an empty returned transcript as "no override"', async () => {
+        const bus = createHookBus();
+
+        bus.on('turn.before', () => ({ transcript: [] }));
+
+        const merged = await bus.emit('turn.before', () => ({
+            threadId: 'thread-1',
+            agent: 'writer',
+            iteration: 1,
+            messages: [user('keep')],
+            estimatedTokens: 1,
+            signal: new AbortController().signal,
+            api: undefined as never,
+            setTranscript: () => undefined,
+            replaceHistory: () => undefined,
+            pause: async () => undefined,
+            resume: async () => undefined
+        }));
+
+        // An empty request body is never what the caller meant; ignoring it keeps a
+        // hook that returns nothing from silently sending no messages.
+        expect(merged).toEqual({});
+    });
+
+    it('builds the payload once per handler so a later hook sees an earlier rewrite', async () => {
+        const bus = createHookBus();
+        const observed: number[] = [];
+        let current = 0;
+
+        bus.on('turn.after', () => {
+            observed.push(current);
+            current += 1;
+        });
+        bus.on('turn.after', () => {
+            observed.push(current);
+            current += 1;
+        });
+
+        // The factory form is what makes the value live per handler.
+        await bus.emit('turn.after', () => ({
+            agent: 'writer',
+            depth: 1,
+            input: 'go',
+            iteration: 1,
+            message: {
+                role: 'assistant',
+                content: 'ok',
+                reasoning: '',
+                toolCalls: [],
+                model: 'm',
+                stopReason: 'stop'
+            },
+            snapshot: current
+        }));
+
+        expect(observed).toEqual([0, 1]);
+    });
+
+    it('hands each handler its OWN registration api (scoped settings)', async () => {
+        const bus = createHookBus();
+        const apis: string[] = [];
+
+        bus.on(
+            'turn.before',
+            (payload) => {
+                apis.push((payload.api as { label: string }).label);
+            },
+            { owner: 'a', api: { label: 'a-api' } as never }
+        );
+        bus.on(
+            'turn.before',
+            (payload) => {
+                apis.push((payload.api as { label: string }).label);
+            },
+            { owner: 'b', api: { label: 'b-api' } as never }
+        );
+
+        await bus.emit('turn.before', ({ api }) => ({
+            threadId: 'thread-1',
+            agent: 'writer',
+            iteration: 1,
+            messages: [],
+            estimatedTokens: 0,
+            signal: new AbortController().signal,
+            api: api as never,
+            setTranscript: () => undefined,
+            replaceHistory: () => undefined,
+            pause: async () => undefined,
+            resume: async () => undefined
+        }));
+
+        expect(apis).toEqual(['a-api', 'b-api']);
+    });
+
+    it('unsubscribes exactly one registration, idempotently', async () => {
+        const bus = createHookBus();
+        let calls = 0;
+
+        // Two identical handlers from two plugins must stay independent.
+        const offFirst = bus.on('tool.before', () => {
+            calls += 1;
+        });
+        bus.on('tool.before', () => {
+            calls += 1;
+        });
+
+        const payload = { agent: 'writer', depth: 1, input: 'go', name: 'read', call: { id: 'c1', name: 'read', arguments: '{}' } };
+
+        await bus.emit('tool.before', payload);
+        expect(calls).toBe(2);
+
+        offFirst();
+        offFirst();
+
+        expect(bus.count('tool.before')).toBe(1);
+        await bus.emit('tool.before', payload);
+        expect(calls).toBe(3);
+    });
+
+    it('costs nothing when nobody listens (has/count/live)', async () => {
+        const bus = createHookBus();
+        let built = 0;
+
+        expect(bus.has('turn.before')).toBe(false);
+        expect(bus.count('turn.before')).toBe(0);
+        expect(bus.live()).toEqual({});
+
+        // A factory payload is never invoked for an event with no listeners.
+        await bus.emit('turn.before', () => {
+            built += 1;
+            return {
+                threadId: 'thread-1',
+                agent: 'writer',
+                iteration: 1,
+                messages: [],
+                estimatedTokens: 0,
+                signal: new AbortController().signal,
+                api: undefined as never,
+                setTranscript: () => undefined,
+                replaceHistory: () => undefined,
+                pause: async () => undefined,
+                resume: async () => undefined
+            };
+        });
+
+        expect(built).toBe(0);
+
+        const off = bus.on('thread.stopped', () => undefined, { owner: 'pinger' });
+        expect(bus.live()).toEqual({ 'thread.stopped': ['pinger'] });
+
+        off();
+        expect(bus.live()).toEqual({});
+    });
+
+    it('fire() reports a synchronous throw AND a rejected async handler without throwing', async () => {
+        const failures: string[] = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push(`${context.owner}:${(context.error as Error).message}`)
+        });
+
+        bus.on(
+            'thread.created',
+            () => {
+                throw new Error('sync-boom');
+            },
+            { owner: 'sync' }
+        );
+        bus.on(
+            'thread.created',
+            async () => {
+                throw new Error('async-boom');
+            },
+            { owner: 'async' }
+        );
+
+        // `fire` returns void: a createThread call cannot await a hook, so both failure
+        // shapes must be observed rather than propagated.
+        expect(() =>
+            bus.fire('thread.created', {
+                id: 'thread-1',
+                agent: 'writer',
+                origin: 'host',
+                status: 'idle',
+                sequence: 1
+            })
+        ).not.toThrow();
+
+        // The sync throw is reported inline; the rejection lands on the microtask queue
+        // (a fire-and-forget emitter has nothing to await), so one flush is enough.
+        expect(failures).toEqual(['sync:sync-boom']);
+
+        await Promise.resolve();
+
+        expect(failures).toEqual(['sync:sync-boom', 'async:async-boom']);
+    });
+
+    it('rejects a non-function handler', () => {
+        const bus = createHookBus();
+
+        expect(() => bus.on('thread.idle', undefined as never)).toThrow(
+            'A "thread.idle" handler must be a function.'
+        );
+        expect(() => bus.on(undefined as never, () => undefined)).toThrow(
+            'Unknown lifecycle event: undefined.'
+        );
+    });
+
+    it('clear() drops every subscription', async () => {
+        const bus = createHookBus();
+        let calls = 0;
+
+        bus.on('harness.dispose', () => {
+            calls += 1;
+        });
+        bus.clear();
+
+        await bus.emit('harness.dispose', {});
+        expect(calls).toBe(0);
+        expect(bus.has('harness.dispose')).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// `emitMaybeSync` — rule 6 (plugin/hooks.ts): a PERMANENTLY subscribed hook that is
+// currently inert must cost no microtask, because `turn.before` always HAS a listener
+// (the shipped context-compaction plugin) and `has()` can therefore not save it.
+// ---------------------------------------------------------------------------
+//
+// HOW "no microtask" is asserted exactly: a `queueMicrotask` probe is scheduled AFTER
+// the emit call returns. A round that never yielded leaves the caller's next statement
+// BEFORE the probe; a round that awaited leaves it AFTER. Both orders are exact, so each
+// case below asserts a complete order rather than a timing property.
+describe('emitMaybeSync', () => {
+    it('stays on the caller tick when every handler is synchronous', async () => {
+        // THE test for rule 6, written as the two shapes of harness call site. What
+        // matters is not the emit's own tick (a wrapper cannot change a synchronous
+        // caller's statements) but whether the CALLER resumes before a microtask that was
+        // already queued — i.e. whether another actor's pending chain gets a turn between
+        // the hook round and the provider request. That is exactly the interleaving
+        // `src/server/queue.test.ts` observed.
+        const bus = createHookBus();
+        const order: string[] = [];
+
+        // Which call site is emitting, so one bus can serve both shapes below.
+        let label = 'awaited';
+        bus.on('turn.before', () => {
+            order.push(`handler:${label}`);
+        });
+
+        // The awaited shape (`await bus.emit(...)`), the pre-rule-6 harness.
+        const awaited = async (): Promise<void> => {
+            void Promise.resolve().then(() => order.push('competing:awaited'));
+            await bus.emit('turn.before', turnPayload([user('go')]));
+            order.push('resumed:awaited');
+        };
+
+        // The maybe-sync shape (`turn.before` in harness.ts today).
+        const maybeSync = async (): Promise<void> => {
+            label = 'sync';
+            void Promise.resolve().then(() => order.push('competing:sync'));
+            const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+            // Nothing to await: the round already finished, value included.
+            expect(round).toEqual({ sync: true, value: {} });
+            order.push('resumed:sync');
+        };
+
+        await awaited();
+        await maybeSync();
+
+        // The awaited path let the already-queued chain cut in front of the caller; the
+        // maybe-sync path did not, so a synchronously inert hook is boundary-free.
+        expect(order).toEqual([
+            'handler:awaited',
+            'competing:awaited',
+            'resumed:awaited',
+            'handler:sync',
+            'resumed:sync',
+            'competing:sync'
+        ]);
+    });
+
+    it('costs nothing and builds nothing with no listener', () => {
+        const bus = createHookBus();
+        let built = 0;
+
+        const round = bus.emitMaybeSync('turn.before', () => {
+            built += 1;
+            return turnPayload([user('go')]);
+        });
+
+        expect(round).toEqual({ sync: true, value: {} });
+        // The factory form is still never invoked without a subscriber (rule 5).
+        expect(built).toBe(0);
+    });
+
+    it('applies a synchronous transcript override on the same tick', () => {
+        const bus = createHookBus();
+
+        bus.on('turn.before', () => ({ transcript: [user('compacted')] }));
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round).toEqual({ sync: true, value: { transcript: [user('compacted')] } });
+    });
+
+    it('runs the synchronous prefix immediately and defers only from the first promise', async () => {
+        const bus = createHookBus();
+        const order: string[] = [];
+
+        bus.on('turn.before', () => {
+            order.push('sync-1');
+        });
+        bus.on('turn.before', async () => {
+            await Promise.resolve();
+            order.push('async');
+            return { transcript: [user('from-async')] };
+        });
+        bus.on('turn.before', () => {
+            // Sequential dispatch: this handler may NOT have run at return time, even
+            // though it is synchronous — otherwise a later hook would race an earlier
+            // one's I/O and the round would be unordered.
+            order.push('sync-2');
+        });
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(order).toEqual(['sync-1']);
+        expect(round.sync).toBe(false);
+
+        const merged = await (round as { promise: Promise<unknown> }).promise;
+
+        expect(merged).toEqual({ transcript: [user('from-async')] });
+        expect(order).toEqual(['sync-1', 'async', 'sync-2']);
+    });
+
+    it('lets a later synchronous override win an earlier async one (last non-empty wins)', async () => {
+        const bus = createHookBus();
+
+        bus.on('turn.before', async () => ({ transcript: [user('from-async')] }));
+        bus.on('turn.before', () => ({ transcript: [user('from-sync')] }));
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+        const merged = await (round as { promise: Promise<unknown> }).promise;
+
+        expect(round.sync).toBe(false);
+        expect(merged).toEqual({ transcript: [user('from-sync')] });
+    });
+
+    it('fails open on a synchronous throw and still returns synchronously', () => {
+        const failures: string[] = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push(`${context.owner}:${(context.error as Error).message}`)
+        });
+        const order: string[] = [];
+
+        bus.on(
+            'turn.before',
+            () => {
+                throw new Error('boom');
+            },
+            { owner: 'broken' }
+        );
+        bus.on(
+            'turn.before',
+            (payload) => {
+                order.push(`survivor:${payload.messages.length}`);
+            },
+            { owner: 'ok' }
+        );
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        // A synchronous throw keeps the round synchronous: no promise appeared, so the
+        // caller never had to await, and the healthy handler still ran.
+        expect(round).toEqual({ sync: true, value: {} });
+        expect(order).toEqual(['survivor:1']);
+        expect(failures).toEqual(['broken:boom']);
+    });
+
+    it('fails open on a rejected handler and still runs the rest', async () => {
+        const failures: string[] = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push(`${context.owner}:${(context.error as Error).message}`)
+        });
+        const order: string[] = [];
+
+        bus.on(
+            'turn.before',
+            async () => {
+                await Promise.resolve();
+                throw new Error('late boom');
+            },
+            { owner: 'async-broken' }
+        );
+        bus.on(
+            'turn.before',
+            () => {
+                order.push('survivor');
+                return { transcript: [user('kept')] };
+            },
+            { owner: 'ok' }
+        );
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round.sync).toBe(false);
+        // The rejection is OBSERVED by the round, never propagated to the caller.
+        await expect((round as { promise: Promise<unknown> }).promise).resolves.toEqual({
+            transcript: [user('kept')]
+        });
+        expect(order).toEqual(['survivor']);
+        expect(failures).toEqual(['async-broken:late boom']);
+    });
+
+    it('snapshots the handler list, like emit', () => {
+        const bus = createHookBus();
+        const order: string[] = [];
+
+        bus.on('turn.before', () => {
+            order.push('first');
+            // A handler that subscribes mid-round must not extend THAT round (rule 3).
+            bus.on('turn.before', () => {
+                order.push('added-mid-round');
+            });
+        });
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round).toEqual({ sync: true, value: {} });
+        expect(order).toEqual(['first']);
+        expect(bus.count('turn.before')).toBe(2);
+    });
+
+    it('emits through the awaited path with the same order and merging as before', async () => {
+        // `emit` is now a wrapper over the maybe-sync round; this pins that the change
+        // kept the documented semantics for every OTHER harness emit site (sequential,
+        // fail-open, last non-empty override).
+        const bus = createHookBus();
+        const order: string[] = [];
+
+        bus.on('turn.before', () => {
+            order.push('sync');
+            return { transcript: [user('first')] };
+        });
+        bus.on('turn.before', async () => {
+            await Promise.resolve();
+            order.push('async');
+            return { transcript: [user('second')] };
+        });
+
+        await expect(bus.emit('turn.before', turnPayload([user('go')]))).resolves.toEqual({
+            transcript: [user('second')]
+        });
+        expect(order).toEqual(['sync', 'async']);
+    });
+});

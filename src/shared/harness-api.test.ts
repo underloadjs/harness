@@ -35,6 +35,10 @@ import type {
     DisplayState,
     HarnessUsage,
     PageMeta,
+    PluginDetailResponse,
+    PluginSettingsUpdate,
+    PluginSummary,
+    PluginSummaryPage,
     SessionDefinitionResource,
     SessionResponse,
     SessionSummaryPage,
@@ -66,6 +70,7 @@ const PARAM_SAMPLES: Record<string, string> = {
     harness_name: 'demo',
     agent_id: 'research',
     tool_id: 'shell',
+    plugin_id: 'context-compaction',
     session_id: 'ses_1',
     thread_id: 'thr_1',
     turn_id: 'turn_1',
@@ -98,9 +103,9 @@ describe('harness contract root and headers', () => {
 });
 
 describe('harness contract route tables', () => {
-    it('covers all 45 spec paths', () => {
-        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(45);
-        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(45);
+    it('covers all 47 spec paths', () => {
+        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(47);
+        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(47);
     });
 
     it('renders every path template into the builder output with no leftover placeholders', () => {
@@ -150,6 +155,11 @@ describe('harness contract route tables', () => {
         expect(
             HARNESS_ROUTES.harnessesByHarnessNameInstructionsByAgentId('demo', 'research'),
         ).toBe('/v1/harness/harnesses/demo/instructions/research');
+        // T5 (R2/R3): the plugin catalogue, and its settings-only item route.
+        expect(HARNESS_ROUTES.plugins()).toBe('/v1/harness/plugins');
+        expect(HARNESS_ROUTES.pluginsByPluginId('context-compaction')).toBe(
+            '/v1/harness/plugins/context-compaction',
+        );
     });
 });
 
@@ -415,6 +425,88 @@ describe('harness contract DTO shapes', () => {
 
         delete uncolored.agent_colors;
         expect(Object.hasOwn(uncolored, 'agent_colors')).toBe(false);
+    });
+
+    // T5 (R2/R3): the Plugins pane edits a plugin's settings from ONE read, so the row must
+    // carry the declared descriptor (with its `default`, the reset target) beside the effective
+    // `values`. The patch body uses the same key spelling as `values`, which is what makes the
+    // pane's write a "send back what you edited" round trip rather than a second vocabulary.
+    it('carries a plugin row with its declared settings and effective values', () => {
+        // Closed object: the row's key set is the contract's set and nothing else.
+        type PluginRowKeys = keyof PluginSummary;
+        const rowKeys: PluginRowKeys[] = [
+            'name',
+            'title',
+            'description',
+            'version',
+            'tags',
+            'hooks',
+            'builtin',
+            'settings',
+            'values'
+        ];
+
+        expect(rowKeys).toEqual([
+            'name',
+            'title',
+            'description',
+            'version',
+            'tags',
+            'hooks',
+            'builtin',
+            'settings',
+            'values'
+        ]);
+
+        // A wire-shaped row for the shipped context-compaction plugin: the descriptor states the
+        // bounds an editor offers, and `values` states what the runtime reads right now.
+        const row: PluginSummary = {
+            name: 'context-compaction',
+            title: 'Context Compaction',
+            description: 'Compacts a conversation at the turn boundary.',
+            version: '1.0.0',
+            tags: ['context', 'compaction'],
+            hooks: ['turn.before'],
+            builtin: true,
+            settings: [
+                {
+                    key: 'contextLimit',
+                    label: 'Context limit (tokens)',
+                    type: 'number',
+                    default: 100000,
+                    min: 1000,
+                    step: 1000
+                }
+            ],
+            values: { contextLimit: 200000 }
+        };
+
+        // `step` stays an EDITOR hint on the wire: the server accepts an off-step value, so the
+        // DTO must not imply otherwise, and an unset optional is absent rather than null.
+        expect(Object.hasOwn(row.settings[0], 'max')).toBe(false);
+        expect(row.settings[0].default).toBe(100000);
+        expect(row.values.contextLimit).toBe(200000);
+
+        const page: PluginSummaryPage = {
+            limit: 2,
+            next_cursor: null,
+            observed_at: 1762250000000,
+            revision: 1,
+            items: [row]
+        };
+
+        expect(page.items[0].name).toBe('context-compaction');
+        expect(page.revision).toBe(1);
+
+        const write: PluginSettingsUpdate = { settings: { contextLimit: 200000 } };
+        const reset: PluginSettingsUpdate = { settings: { contextLimit: null } };
+
+        expect(write).toEqual({ settings: { contextLimit: 200000 } });
+        expect(reset.settings.contextLimit).toBeNull();
+
+        const detail: PluginDetailResponse = { plugin: row };
+
+        expect(detail.plugin.settings).toHaveLength(1);
     });
 });
 

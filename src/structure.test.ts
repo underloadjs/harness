@@ -200,6 +200,10 @@ describe('package layout', () => {
             'core',
             'frontend',
             'plugin',
+            // R2/R3/R4: the auto-discovered built-in plugins. `src/plugins` is the
+            // scanned folder (one `*.plugin.ts` per plugin); `src/plugin` stays the
+            // host/loader. The manifest generator requires the folder to exist.
+            'plugins',
             'server',
             'shared',
             'tools',
@@ -701,11 +705,24 @@ describe('package layout', () => {
         expect(manifest.scripts['tools:manifest:check']).toBe(
             'vite-node scripts/generate-tool-manifest.mjs --check'
         );
-        expect(manifest.scripts['build']).toBe(
-            'npm run tools:manifest && vite build && npm run build:types'
+        // R2/R3/R4: the PLUGIN manifest is generated the same way — plain `node`, because
+        // the scanner only walks files and reads literals (no TypeScript loader needed),
+        // unlike the tool scanner which imports the AST reader through vite-node.
+        expect(manifest.scripts['plugins:manifest']).toBe(
+            'node scripts/generate-plugin-manifest.mjs'
         );
-        expect(manifest.scripts['typecheck']).toBe('npm run tools:manifest:check && tsc --noEmit');
-        expect(manifest.scripts['test']).toBe('npm run tools:manifest:check && vitest run');
+        expect(manifest.scripts['plugins:manifest:check']).toBe(
+            'node scripts/generate-plugin-manifest.mjs --check'
+        );
+        expect(manifest.scripts['build']).toBe(
+            'npm run tools:manifest && npm run plugins:manifest && vite build && npm run build:types'
+        );
+        expect(manifest.scripts['typecheck']).toBe(
+            'npm run tools:manifest:check && npm run plugins:manifest:check && tsc --noEmit'
+        );
+        expect(manifest.scripts['test']).toBe(
+            'npm run tools:manifest:check && npm run plugins:manifest:check && vitest run'
+        );
         expect(manifest.scripts['build:types']).toBe('node scripts/build-declarations.mjs');
         expect(manifest.scripts['test:package']).toBe('node scripts/check-package-types.mjs');
         expect(manifest.scripts['test:package:runtime']).toBe('node scripts/check-package-runtime.mjs');
@@ -725,6 +742,12 @@ describe('package layout', () => {
             'scripts/check-package-types.mjs',
             'scripts/check-package-runtime.mjs',
             'scripts/generate-tool-manifest.mjs',
+            // R2/R3/R4: the plugin manifest pipeline — CLI, scanner, renderer. All three
+            // must exist because the scanner and renderer are imported by
+            // src/plugin/manifest.test.ts, not only by the CLI.
+            'scripts/generate-plugin-manifest.mjs',
+            'scripts/plugin-manifest-scan.mjs',
+            'scripts/plugin-manifest-render.mjs',
             'tsconfig.entries.json'
         ]) {
             expect(fs.existsSync(path.join(PACKAGE_ROOT, script))).toBe(true);

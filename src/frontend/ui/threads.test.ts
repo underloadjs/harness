@@ -87,7 +87,9 @@ describe('sessionThreadsOf', () => {
                     id: 'thread-3',
                     agent: 'research',
                     origin: 'host',
-                    status: 'paused',
+                    // A status the board has NEVER heard of: the reader must fall back to
+                    // 'idle' rather than pass an unknown word through to a renderer.
+                    status: 'sleeping',
                     sequence: 3,
                     ownerThreadId: 'thread-1',
                     invocationId: 'thread-invocation-7',
@@ -110,6 +112,37 @@ describe('sessionThreadsOf', () => {
                 invocationId: 'thread-invocation-7',
                 originTurnId: 'turn-4',
                 originInvocationId: 'thread-invocation-7'
+            }
+        ]);
+    });
+
+    it('keeps a plugin-parked conversation as `paused` instead of flattening it to idle', () => {
+        // R2/R3 ripple: 'paused' became a REAL server state (a plugin parked the thread at
+        // a turn boundary). Before that it was just another unknown word and fell through
+        // to 'idle'; silently flattening it now would hide the park from the roster.
+        const threads = sessionThreadsOf({
+            threads: [
+                {
+                    id: 'thread-8',
+                    agent: 'research',
+                    origin: 'host',
+                    status: 'paused',
+                    sequence: 8
+                }
+            ]
+        });
+
+        expect(threads).toEqual([
+            {
+                id: 'thread-8',
+                agent: 'research',
+                origin: 'host',
+                status: 'paused',
+                sequence: 8,
+                // The display label is SYNTHESIZED per agent when the wire omits one (the
+                // first `research` conversation is `RH1`), so it is asserted exactly here
+                // too rather than ignored.
+                label: 'RH1'
             }
         ]);
     });

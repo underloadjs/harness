@@ -1912,7 +1912,19 @@ export type HarnessThreadOrigin = 'agent' | 'host';
 // 'running' means a run is active in this thread. 'stopped' means the host
 // halted it: no new run is started for it and AGENTS may not post into it until a
 // host resumes it through sendThreadInput (or deletes it).
-export type HarnessThreadStatus = 'idle' | 'running' | 'stopped';
+//
+// R2/R3 plugins: 'paused' is a THIRD, plugin-owned state. A lifecycle hook runs at
+// a turn boundary (`turn.before`), so a plugin that needs the conversation to stop
+// moving while it does work — compaction, a human gate, a budget park — marks the
+// thread 'paused' and resumes it before the hook returns. The RUN itself keeps
+// executing (the hook is awaited), so 'paused' is an OBSERVABLE pause at a turn
+// boundary, not a suspension of the process. A plugin that pauses and never resumes
+// leaves the thread parked: the run's finally-block only clears 'running', and the
+// next explicit host `sendThreadInput` revives a parked conversation exactly like a
+// stopped one. 'paused' is NEVER persisted — snapshot() maps it to 'idle' (a parked
+// thread has no live run after a restart), which is why HarnessThreadSnapshot keeps
+// its narrower 'idle' | 'stopped' union.
+export type HarnessThreadStatus = 'idle' | 'running' | 'paused' | 'stopped';
 
 export type HarnessThreadRecord = {
     id: string;
@@ -2522,8 +2534,14 @@ export type HarnessConfiguration = {
     // How often (milliseconds) a run with background tool calls emits a `wakeup`
     // and gets another model turn so it can inspect pending elapsed times and may
     // cancel a hung call (R4). Defaults to 600000 (10 minutes). Configurable so
-    // tests need not wait ten minutes; must be a positive safe integer. The timer
-    // exists ONLY while calls are pending and is cleared on every exit path.
+    // tests need not wait ten minutes; must be a positive safe integer.
+    //
+    // R4 moved the timer out of the scheduler and into the shipped `async-ping`
+    // plugin: this field is that plugin's `intervalMs` DEFAULT (seeded into the
+    // plugin settings provider) and is also readable as `api.config.wakeIntervalMs`.
+    // A `pluginSettings` provider that stores `async-ping.intervalMs` wins over it.
+    // The ping still exists ONLY while calls are pending, and its timer is cleared
+    // when the board drains.
     wakeIntervalMs?: number;
 
     // How many tools this harness instance may create over its LIFETIME.
@@ -2619,7 +2637,16 @@ export type HarnessConfiguration = {
     // `harness.registerCommand`) runs later and therefore MAY replace a name.
     commands?: readonly HarnessCommandConfiguration[];
     // Optional programmatic extension point, retained from the plugin design.
+    // Auto-discovered built-in plugins (src/plugins/**\/*.plugin.ts, see
+    // src/plugin/manifest.ts) are applied FIRST, so a name listed here REPLACES the
+    // built-in of that name instead of colliding with it.
     plugins?: readonly HarnessPlugin[];
+    // Read-only view of the host's per-plugin settings (R2/R3 plugin settings UI).
+    // The harness asks it for `<pluginName>.<key>` whenever a plugin reads
+    // `api.settings.*`. Absent = an in-memory provider seeded from each plugin's
+    // declared setting defaults, with `wakeIntervalMs` mapped onto the `async-ping`
+    // plugin's `intervalMs` so the legacy configuration field keeps working.
+    pluginSettings?: HarnessPluginSettingsProvider;
 };
 
 // The callable harness. `await writer('...')` runs the entry agent to
@@ -2731,8 +2758,16 @@ export type Harness = {
     // nothing. Validates the name and the definition, and throws HarnessError
     // without touching the registry when either is invalid.
     registerCommand: (command: HarnessCommandConfiguration) => HarnessCommand;
-    // Names of the applied plugins, in order.
+    // Names of the applied plugins, in order. Auto-discovered built-ins come first
+    // (src/plugins/**\/*.plugin.ts); a `configuration.plugins` entry of the same name
+    // replaces the built-in in place, so this list stays duplicate-free.
     readonly plugins: readonly string[];
+    // R2/R3: the full declared description of every APPLIED plugin, in the same
+    // order as `plugins`. This is what the server hands the UI's Plugins pane
+    // (title, description, version, tags, hooks, settings) — data only, never a
+    // function, so it is JSON-serializable as-is. A programmatic plugin without
+    // `metadata` gets the synthesized `{ name, title: name, builtin: false }`.
+    readonly pluginMetadata: readonly HarnessPluginMetadata[];
     // A complete, JSON-serializable core-state snapshot (R3a). See HarnessSnapshot
     // for what is and is not included. Safe to call DURING an active run (T16):
     // it synchronously captures the committed transcript, discovery, created-tool
@@ -2977,14 +3012,254 @@ export type Harness = {
 // Plugin contract
 // ---------------------------------------------------------------------------
 
+// The lifecycle stage a plugin may hook. ONE flat union, ordered by where it sits
+// in the harness's own timeline, because the manifest and the UI both need this list
+// as DATA (`metadata.hooks` is what the Plugins pane renders) and a plugin author
+// must be able to write a literal without importing a helper.
+//
+//   thread.*  — a conversation's identity changes. `created`/`deleted` bracket
+//               createThread/deleteThread; `started`/`idle` bracket one RUN of a
+//               thread; `paused`/`resumed` are the plugin-owned park/unpark at a
+//               turn boundary (see HarnessThreadStatus).
+//   run.*     — one agent run (a thread run, a delegated run, a fork). Emitted for
+//               EVERY run, including nested ones, so a plugin can observe the whole
+//               tree; `threadId` is absent for a branch run, which owns an
+//               ephemeral transcript instead of a conversation.
+//   turn.*    — one model request. `turn.before` is the ONLY hook whose return value
+//               matters (it may replace the transcript the provider is about to see)
+//               and the only one that carries control methods; that is what makes
+//               context compaction and the per-agent context limit possible.
+//   tool.*    — one tool call: `before` at launch, `after` when its result is
+//               committed to the transcript.
+//   async.*   — background tool work: `pending` when a call joins the board,
+//               `drained` when an agent's board became empty (the replacement for
+//               the hardcoded recurring wake).
+//   harness.dispose — reserved for a future explicit teardown. NO harness path emits
+//               it yet: harness() has no dispose/close method, so registering this
+//               hook is legal but currently inert (reported, not silently ignored).
+export type HarnessLifecycleEvent =
+    | 'thread.created'
+    | 'thread.started'
+    | 'thread.paused'
+    | 'thread.resumed'
+    | 'thread.stopped'
+    | 'thread.idle'
+    | 'thread.deleted'
+    | 'run.started'
+    | 'run.finished'
+    | 'run.failed'
+    | 'turn.before'
+    | 'turn.after'
+    | 'tool.before'
+    | 'tool.after'
+    | 'async.pending'
+    | 'async.drained'
+    | 'harness.dispose';
+
+// One declared setting of a plugin. `key` is the stable id the harness reads back
+// through HarnessPluginSettingsProvider; `label`/`description` are for the UI. The
+// numeric fields are UI hints (an editor must not offer a value outside min/max or
+// off a step) and are NOT enforced at read time — a host may store anything.
+export type HarnessPluginSettingType = 'number' | 'string' | 'boolean';
+
+export type HarnessPluginSettingDescriptor = {
+    key: string;
+    label: string;
+    type: HarnessPluginSettingType;
+    // The value used when the host has nothing stored. Required: a plugin must have
+    // an answer for a fresh session with no persisted settings.
+    default: number | string | boolean;
+    min?: number;
+    max?: number;
+    step?: number;
+    description?: string;
+};
+
+// Static, JSON-shaped description of a plugin. Lives in the plugin file itself as a
+// literal (`export const metadata = {...} satisfies HarnessPluginMetadata`) so the
+// manifest generator can read it without executing the plugin's behaviour, and so
+// the server can hand the whole catalogue to the UI as data.
+export type HarnessPluginMetadata = {
+    // Stable unique id — the key settings, hooks, and enable/disable state use.
+    name: string;
+    // Human display name for the Plugins pane.
+    title: string;
+    description?: string;
+    version?: string;
+    // Free-form categorisation for the UI (filters/search), never behaviour-bearing.
+    tags?: readonly string[];
+    // Which lifecycle stages this plugin subscribes to, for display. Informational:
+    // the bus records what a setup() call ACTUALLY registered, and that is what
+    // runs; this list is the declared contract shown to an operator.
+    hooks?: readonly HarnessLifecycleEvent[];
+    settings?: readonly HarnessPluginSettingDescriptor[];
+    // True for a plugin shipped by the package (auto-scanned from src/plugins).
+    // A programmatic `configuration.plugins` entry is never builtin.
+    builtin?: boolean;
+};
+
 // A plugin is a named unit of behaviour applied during harness construction.
 export type HarnessPlugin = {
     // Unique within one harness. Applied in array order.
     name: string;
+    // Declared metadata. A discovered `*.plugin.ts` file always carries it; a
+    // hand-written programmatic plugin may omit it, and the harness then synthesizes
+    // `{ name, title: name, builtin: false }` so the UI list is always complete.
+    metadata?: HarnessPluginMetadata;
     // Runs once, synchronously. Synchronous on purpose: harness() stays a plain
     // factory, so `const writer = harness({...})` needs no await.
     setup?: (api: HarnessPluginApi) => void;
 };
+
+// Host-side read model for plugin settings (R2/R3). The harness calls `get` with the
+// OWNING plugin's name plus the key from its metadata; the host decides where the
+// value came from (a server document, an env var, a CLI flag). Returning `undefined`
+// means "nothing stored" and the plugin's declared default applies.
+//
+// Synchronous and total: it runs inside setup() and inside every turn, so a provider
+// that throws is a host bug that fails the run (the harness does NOT swallow it —
+// a wrong settings read must not be silently defaulted).
+export type HarnessPluginSettingsProvider = {
+    get(plugin: string, key: string): unknown;
+};
+
+// What one plugin's `api.settings` looks like. Every accessor coerces: a stored value
+// of the wrong shape falls back to `fallback`, so a corrupt host document can never
+// hand a plugin a NaN or the string "false".
+export type HarnessPluginSettings = {
+    // Raw stored value, `undefined` when nothing is set.
+    get: (key: string) => unknown;
+    // Declared default of `key` when the plugin declared one, otherwise `fallback`.
+    number: (key: string, fallback?: number) => number;
+    string: (key: string, fallback?: string) => string;
+    boolean: (key: string, fallback?: boolean) => boolean;
+};
+
+// The ONE payload shape per lifecycle event. Keyed by event so `api.on` is typed
+// per-event without a single `any` at the public boundary: adding an event means
+// adding one entry here, and every exhaustive consumer (the bus, the harness emit
+// sites, the tests) fails to typecheck until it is filled in.
+export type HarnessLifecyclePayloads = {
+    'thread.created': HarnessThreadRecord;
+    'thread.started': HarnessThreadRecord;
+    'thread.paused': HarnessThreadRecord;
+    'thread.resumed': HarnessThreadRecord;
+    'thread.stopped': HarnessThreadRecord;
+    'thread.idle': HarnessThreadRecord;
+    // The record is gone by the time this fires (a delete already purged it), so the
+    // payload is the identity the handler still needs.
+    'thread.deleted': { threadId: string; agent: string };
+    'run.started': HarnessRunLifecycleContext;
+    'run.finished': HarnessRunLifecycleContext & { message: HarnessAssistantMessage };
+    'run.failed': HarnessRunLifecycleContext & { error: HarnessErrorInfo };
+    'turn.before': HarnessTurnBeforeContext;
+    'turn.after': HarnessTurnAfterContext;
+    'tool.before': HarnessToolLifecycleContext & { call: HarnessToolCall };
+    'tool.after': HarnessToolLifecycleContext & {
+        call: HarnessToolCall;
+        callId: string;
+        content: string;
+        isError: boolean;
+        outcome: HarnessToolOutcome;
+        durationMs: number;
+    };
+    'async.pending': HarnessAsyncLifecycleContext;
+    'async.drained': HarnessAsyncLifecycleContext;
+    'harness.dispose': Record<string, never>;
+};
+
+// `run.*` / `turn.*` share this identity block. `threadId` is absent only for a
+// branch run (fork/autoanswer), which has no persistent conversation of its own.
+export type HarnessRunLifecycleContext = {
+    // The persistent thread this run belongs to, when it has one.
+    threadId?: string;
+    // Display agent name (never the internal actor key), like every event frame.
+    agent: string;
+    // Delegation depth: 1 is a top-level run.
+    depth: number;
+    // The root prompt of this run.
+    input: string;
+};
+
+// Everything `turn.before` hands a plugin: the exact request that is about to go out,
+// a token estimate for the context limit, and the three controls that make a hook
+// able to ACT rather than only observe.
+export type HarnessTurnBeforeContext = {
+    threadId: string;
+    agent: string;
+    // 1-based model-turn counter within this run.
+    iteration: number;
+    // The PROJECTED transcript (committed history plus a placeholder for every
+    // still-running tool call) — exactly the array the provider is about to receive.
+    messages: readonly HarnessMessage[];
+    // Rough size of `messages` in tokens (core/context-estimate.ts). Good enough for
+    // a limit check; deliberately not provider-exact, because compaction decisions
+    // must not depend on a tokenizer the harness does not own.
+    estimatedTokens: number;
+    // The run's cancellation signal.
+    signal: AbortSignal;
+    // The api of the plugin being invoked, so a hook can create threads, register
+    // tools, read its own settings, etc.
+    api: HarnessPluginApi;
+    // Replace the transcript for THIS request only (compaction's main move). Does
+    // NOT touch committed history: the next turn projects the real transcript again
+    // unless every turn rewrites it. Last non-empty value written wins.
+    setTranscript: (messages: readonly HarnessMessage[]) => void;
+    // Rewrite the thread's COMMITTED transcript through the existing
+    // `setThreadMessages` path (validated, notifies `agent_message`). Use when the
+    // history itself is too big, not just this request. Throws for a transcript the
+    // snapshot reader would refuse.
+    replaceHistory: (messages: readonly HarnessMessage[]) => void;
+    // Park this conversation at the turn boundary: sets the thread record to
+    // 'paused' and emits `thread.paused`. Await it — the run continues immediately
+    // afterwards, so a plugin that wants a real pause awaits the work that unblocks
+    // it and then calls resume().
+    pause: () => Promise<void>;
+    // Undo pause(): the record returns to 'running' when a run is still attached
+    // (the normal case), to 'idle' otherwise, and emits `thread.resumed`.
+    resume: () => Promise<void>;
+};
+
+// The assistant turn that was just committed. `message` is the value the provider
+// returned; history already contains it.
+export type HarnessTurnAfterContext = HarnessRunLifecycleContext & {
+    iteration: number;
+    message: HarnessAssistantMessage;
+};
+
+// `tool.before` / `tool.after` share this identity block.
+export type HarnessToolLifecycleContext = HarnessRunLifecycleContext & {
+    // Tool name, for filtering/labels (the call's own `name` may differ in casing).
+    name: string;
+};
+
+// Background tool work for `async.pending` / `async.drained`. `pending` is the
+// agent's board AFTER the transition the event reports, so `drained` carries an
+// empty list and `pending` carries at least one entry.
+//
+// `agent` is the SCHEDULER identity, not the display name: the registered agent's
+// name, or `thread:<id>` for a host thread. It is the key `api.async.pending()`,
+// `api.async.wake()` and the `async-ping` plugin's per-agent timer all use, so the
+// two events must report the same value for the same board or a drain cannot clear
+// the timer that the launch armed.
+export type HarnessAsyncLifecycleContext = {
+    agent: string;
+    pending: readonly HarnessPendingTool[];
+};
+
+// What a `turn.before` handler may return: `{ transcript }` is merged as an
+// override of the request's message list; every other event ignores results.
+export type HarnessHookResult = { transcript?: readonly HarnessMessage[] } | void;
+
+// Result type per event. Only `turn.before` can contribute one.
+export type HarnessLifecycleResult<E extends HarnessLifecycleEvent> =
+    E extends 'turn.before' ? HarnessHookResult : void;
+
+// Handler per event. May be async: the bus awaits handlers sequentially, so hook
+// order is deterministic even when a hook does I/O (a settings read, a summarizer).
+export type HarnessLifecycleHandler<E extends HarnessLifecycleEvent> = (
+    payload: HarnessLifecyclePayloads[E]
+) => HarnessLifecycleResult<E> | Promise<HarnessLifecycleResult<E>>;
 
 // What a plugin is handed at setup time.
 export type HarnessPluginApi = {
@@ -3002,4 +3277,73 @@ export type HarnessPluginApi = {
     // override semantics `addTool` has — which is how a plugin swaps a
     // built-in out. Throws HarnessError for an invalid name or definition.
     addCommand: (name: string, definition: Omit<HarnessCommand, 'name'>) => HarnessCommand;
+
+    // Subscribe to one lifecycle stage. Registration order is execution order, and
+    // the returned function unsubscribes (idempotent). A handler that throws is
+    // skipped and the run continues (fail-open); a `turn.before` handler that
+    // returns `{ transcript }` overrides the request (last non-empty wins).
+    on: <E extends HarnessLifecycleEvent>(
+        event: E,
+        handler: HarnessLifecycleHandler<E>
+    ) => () => void;
+
+    // This plugin's settings, scoped to its own name and backed by
+    // `configuration.pluginSettings` (or the declared defaults when absent).
+    settings: HarnessPluginSettings;
+
+    // Harness control (R3: "a plugin can trigger anything within the server").
+    // Every operation is the SAME handle method a host calls, so a plugin cannot
+    // reach a private path with different rules.
+    threads: {
+        // Live conversations (detached copies, creation order).
+        list: () => readonly HarnessThreadRecord[];
+        // Open an independent conversation (throws for an unknown agent).
+        create: (agent: string, options?: HarnessThreadCreateOptions) => HarnessThreadRecord;
+        // Purge a terminal host thread (throws while it has live work). `delete` is the
+        // spelled-out contract name; `remove` is an ALIAS for the same operation, kept
+        // because `delete` reads awkwardly as a property to some callers and the plugin
+        // surface is easier to adopt when either spelling works.
+        delete: (threadId: string) => void;
+        remove: (threadId: string) => void;
+        // Abort live work and mark it stopped. True when a run was aborted.
+        stop: (threadId: string, reason?: string) => boolean;
+        // Run one turn in a conversation and resolve to its answer.
+        send: (
+            threadId: string,
+            input: string,
+            options?: HarnessRunOptions
+        ) => Promise<HarnessAssistantMessage>;
+        // Queue guidance for the next safe boundary of a running thread.
+        steer: (threadId: string, text: string) => HarnessThreadSteerReceipt;
+        // The conversation's committed transcript (detached copy).
+        messages: (threadId: string) => HarnessMessage[];
+        // Wholesale transcript replacement (the compaction write primitive).
+        replaceMessages: (threadId: string, messages: readonly HarnessMessage[]) => void;
+        // Move the roster state of a conversation that is NOT running here.
+        setStatus: (threadId: string, status: HarnessThreadStatus) => HarnessThreadRecord;
+    };
+
+    // Progressive-discovery gate. Both REFUSE a core declaration (it is always in
+    // context, so switching it would be a lie), exactly like `toolManage`'s
+    // enable/disable operations do. `enableTool` may evict an over-cap name.
+    enableTool: (name: string) => void;
+    disableTool: (name: string) => void;
+    // Names searchable RIGHT NOW, newest first (a detached copy).
+    enabledTools: () => readonly string[];
+
+    // Background tool work. `pending` is the wire view of the board; `wake` emits the
+    // background wake for an agent (or for every agent with pending work when called
+    // with no argument), which is what lets a plugin replace the heartbeat with its own
+    // policy. R4: the shipped `async-ping` plugin is that policy — the scheduler no
+    // longer arms any timer, so this accessor is the ONLY way a wake is produced.
+    async: {
+        pending: (agent?: string) => readonly HarnessPendingTool[];
+        wake: (agent?: string) => void;
+    };
+
+    // Read-only configuration the plugin needs to honour legacy fields.
+    // `wakeIntervalMs` is the effective background-work heartbeat resolved from
+    // `harness({ wakeIntervalMs })` (default 600000), so the `async-ping` plugin can
+    // keep the documented `wakeIntervalMs` behaviour through its own setting.
+    config: { readonly wakeIntervalMs: number };
 };

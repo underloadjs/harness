@@ -177,18 +177,22 @@ describe('canonical REST contract', () => {
         expect(root.body.capabilities).toEqual(HARNESS_SERVICE_CAPABILITIES);
 
         // Links are named pointers only; no catalogue rides along.
+        // T5 (R2/R3): `plugins` joined the set - the built-in plugin catalogue is a global
+        // collection like `tools`, and the Plugins pane's only read is the page behind it.
         expect(Object.keys(root.body.links).sort()).toEqual([
             'agents',
             'config',
             'harnesses',
             'health',
             'models',
+            'plugins',
             'self',
             'sessions',
             'stream',
             'tools'
         ]);
         expect(root.body.links.sessions).toBe(`${MOUNT}/sessions`);
+        expect(root.body.links.plugins).toBe(`${MOUNT}/plugins`);
 
         // THE acceptance number: seven long-running sessions, and the boot document is still
         // under 2 KB. The legacy bootstrap carried every descriptor, every session, and every

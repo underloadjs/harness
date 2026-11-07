@@ -555,6 +555,8 @@ describe('canonical root and provider document', () => {
             harnesses: `${MOUNT}/harnesses`,
             agents: `${MOUNT}/agents`,
             tools: `${MOUNT}/tools`,
+            // T5 (R2/R3): the built-in plugin catalogue (the Plugins pane's only read).
+            plugins: `${MOUNT}/plugins`,
             models: `${MOUNT}/models`,
             sessions: `${MOUNT}/sessions`,
             stream: `${MOUNT}/stream`

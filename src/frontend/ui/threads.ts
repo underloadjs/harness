@@ -62,7 +62,10 @@ export type SessionThreadEntry = {
     origin: 'agent' | 'host';
     // 'running' = a run is active in this thread; 'stopped' = the host halted it
     // (continuing it resumes the conversation); 'idle' = live but not working.
-    status: 'idle' | 'running' | 'stopped';
+    // 'paused' = a PLUGIN parked the conversation at a turn boundary and the run is
+    // still attached (types/index.ts `HarnessThreadStatus`). The board renders it as a
+    // waiting conversation, never as an error or as running.
+    status: 'idle' | 'running' | 'paused' | 'stopped';
     // Creation order within the session (monotonic, not wall clock).
     sequence: number;
     label?: string;
@@ -166,7 +169,16 @@ export const invalidThreadsOf = (session: unknown): InvalidThreadRecord[] => {
 // `origin` is deliberately not rendered: the roster this build understands is the
 // HOST roster, and an 'agent' default conversation is already represented by its
 // turns.
-const THREAD_STATUSES: readonly SessionThreadEntry['status'][] = ['idle', 'running', 'stopped'];
+//
+// 'paused' MUST stay in this list: it is a real server state (a plugin parked the
+// conversation), and dropping it here would silently render a parked thread as `idle`
+// through the `?? 'idle'` fallback below.
+const THREAD_STATUSES: readonly SessionThreadEntry['status'][] = [
+    'idle',
+    'running',
+    'paused',
+    'stopped'
+];
 
 const isObjectLike = (value: unknown): value is Record<string, unknown> =>
     typeof value === 'object' && value !== null;

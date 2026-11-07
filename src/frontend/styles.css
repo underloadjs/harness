@@ -231,6 +231,55 @@ summary::-webkit-details-marker {
     line-height: 1;
 }
 
+/* T7 (R2): the Plugins toggle, immediately next to the Tools toggle. Its own rules (not
+   a shared selector list) so the tools block above stays byte-for-byte what
+   compact-ui.test.ts pins, and a restyle of one catalogue control can never silently
+   move the other. */
+.plugins-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.plugins-toggle:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+/* `aria-pressed` is the only selection signal, and the two catalogues can never both be
+   pressed (main.ts `setToolsView`/`setPluginsView`), so exactly one icon shows this state. */
+.plugins-toggle[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--bg-elevated);
+    color: var(--text);
+}
+
+.plugins-toggle:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.plugins-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.plugins-toggle-icon {
+    font-size: 15px;
+    line-height: 1;
+}
+
 /* R4 (T4): the top-right status pill doubles as the trigger for the Endpoint & model
    dialog. The pill ITSELF stays the `role="status"` live region (`<span class="status">`),
    because a live region cannot also be a button; this bare wrapper button carries the
@@ -989,6 +1038,274 @@ body.is-resizing-rail {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
+}
+
+/* ---------------------------------------------------------------------------
+   T7 (R2/R3): the PLUGINS view — the auto-scanned catalogue and the row dialog
+   that edits a plugin's declared settings.
+
+   The layout mirrors `.tools-pane` above on purpose: the two catalogues are the two
+   non-chat owners of the centre column, so they read and scroll identically. Every
+   rule is scoped under `.plugins-*` / `.plugin-*` so the tools styles stay untouched.
+   --------------------------------------------------------------------------- */
+
+.plugins-pane {
+    gap: 12px;
+    padding: 14px;
+    /* Safety valve only: the list below is the scroll region while the head fits. */
+    overflow: auto;
+}
+
+.plugins-tab-head {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.plugins-tab-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.plugins-tab-hint {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.plugins-tab-note {
+    margin: 0;
+    font-size: 11.5px;
+}
+
+.plugins-refresh {
+    align-self: flex-start;
+    margin-top: 4px;
+}
+
+.plugin-tab-list {
+    display: grid;
+    /* One column instead of the tools grid: a plugin row carries a description, a hook
+       count and its effective settings line, and a 210px card would wrap all three. */
+    flex: 1;
+    grid-template-columns: 1fr;
+    align-content: start;
+    gap: 6px;
+    min-height: 0;
+    padding-right: 2px;
+    overflow: auto;
+}
+
+.plugin-tab-button {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 9px 11px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.plugin-tab-button:hover:not(:disabled) {
+    border-color: var(--border-strong);
+}
+
+.plugin-tab-button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.plugin-tab-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.plugin-tab-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.plugin-tab-name {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+/* Two clamped lines: the row must stay one screen tall, and the full sentence lives in
+   the row's tooltip (main.ts sets `button.title`). */
+.plugin-tab-desc {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.plugin-tab-meta,
+.plugin-tab-values {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+/* The effective settings line is the row's live figure: a SAVE repaints this node in
+   place, so the list states what the server has, not what the manifest defaults to. */
+.plugin-tab-values {
+    color: var(--text);
+}
+
+/* --- the plugin detail dialog ------------------------------------------------ */
+
+.plugin-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.plugin-detail-description {
+    margin: 0;
+    font-size: 12.5px;
+    line-height: 1.45;
+}
+
+.plugin-detail-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.plugin-detail-fact {
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.plugin-detail-section-title {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+}
+
+.plugin-detail-hooks,
+.plugin-detail-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.plugin-hook-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.plugin-hook-chip {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.plugin-detail-empty {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+/* R3: the settings form. One labelled control per declared setting, in the order the
+   plugin declares them, so the dialog and the manifest can never disagree. */
+.plugin-settings-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.plugin-settings-form-label {
+    /* The group's accessible name; the visible headings above already carry the copy. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+.plugin-setting {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.plugin-setting-label {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.plugin-setting-input {
+    width: 100%;
+    max-width: 320px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+/* A checkbox is a binary control, not a text box: it keeps its native box and sits next
+   to its own label instead of stretching under it. */
+.plugin-setting-input[type='checkbox'] {
+    width: auto;
+    max-width: none;
+    padding: 0;
+}
+
+.plugin-setting-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.plugin-setting-hint {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+.plugin-setting-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 2px;
+}
+
+/* The save outcome line: "Saving…", "Saved", or the server's own refusal. Text AND a
+   colour change, so the state is never carried by colour alone. */
+.plugin-setting-status {
+    margin: 4px 0 0;
+    font-size: 11.5px;
+}
+
+.plugin-setting-status-error {
+    color: var(--danger);
+    font-weight: 600;
 }
 
 /* The runner host is the dialog's content now (not a slot under the list). It is a
@@ -3127,6 +3444,22 @@ body.is-resizing-rail {
 .thread-delete {
     border-color: rgba(248, 113, 113, 0.45);
     color: var(--danger);
+}
+
+/* R1: the SAME control while the conversation (or one it owns) has live work — Delete
+   becomes Stop. The class is ADDITIVE (`ui/turns.ts` keeps `.thread-delete` on the node),
+   so sizing, layout and the bar's slot come from the rules above and only the colour
+   changes here: `--warn` is already this app's "still working" tone (see the status
+   legend at :2662), which reads as "this press halts work" rather than the danger red of
+   "this press destroys data". Kept to colour only — no sizing, nothing unrelated. */
+.thread-delete.thread-stop {
+    border-color: rgba(251, 191, 36, 0.5);
+    color: var(--warn);
+}
+
+.thread-delete.thread-stop:hover:not(:disabled) {
+    border-color: var(--warn);
+    background: rgba(251, 191, 36, 0.12);
 }
 
 /* T26: Transcript is the trailing action. `margin-left: auto` puts it flush right whether

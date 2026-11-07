@@ -64,6 +64,8 @@ export const HARNESS_PATH_TEMPLATES = {
     tools: '/v1/harness/tools',
     toolsByToolId: '/v1/harness/tools/{tool_id}',
     toolsByToolIdExecutions: '/v1/harness/tools/{tool_id}/executions',
+    plugins: '/v1/harness/plugins',
+    pluginsByPluginId: '/v1/harness/plugins/{plugin_id}',
     models: '/v1/harness/models',
     sessions: '/v1/harness/sessions',
     sessionsBySessionId: '/v1/harness/sessions/{session_id}',
@@ -125,6 +127,10 @@ export const HARNESS_ROUTES = {
     toolsByToolId: (toolId: string) => `${HARNESS_API_ROOT}/tools/${toolId}`,
     /** `/v1/harness/tools/{tool_id}/executions` */
     toolsByToolIdExecutions: (toolId: string) => `${HARNESS_API_ROOT}/tools/${toolId}/executions`,
+    /** `/v1/harness/plugins` */
+    plugins: () => `${HARNESS_API_ROOT}/plugins`,
+    /** `/v1/harness/plugins/{plugin_id}` */
+    pluginsByPluginId: (pluginId: string) => `${HARNESS_API_ROOT}/plugins/${pluginId}`,
     /** `/v1/harness/models` */
     models: () => `${HARNESS_API_ROOT}/models`,
     /** `/v1/harness/sessions` */
@@ -207,11 +213,6 @@ export const HARNESS_SERVICE_LIMITS = {
     pending_actions: 4,
     steer_records: 64,
     created_tools: 32,
-    // MUST equal MODEL_TOOL_RESULT_BUDGET_BYTES (../core/result-budget.ts), which is
-    // what the server actually applies via boundToolValue. It is a literal here
-    // because this module is shared with the browser and imports ONLY types, so
-    // pulling in a runtime value from core would drag the whole core barrel into the
-    // client bundle. harness-api.test.ts pins the two together to catch drift.
     tool_result_bytes: 262144,
     page_limit_default: 25,
     page_limit_max: 100,
@@ -634,6 +635,74 @@ export interface DeleteAgentResult {
     agent_id: string;
     tombstoned: boolean;
     restored_by_restart: boolean;
+}
+
+/**
+ * One DECLARED setting of a plugin, copied verbatim from the plugin's own metadata. `key` is the stable id the
+ * runtime reads and the patch writes; `label` and `description` are for a form; `default` is the value the
+ * plugin falls back to when nothing is stored, which is also what a `null` patch entry restores. The numeric
+ * fields are EDITOR hints: `min` and `max` bound what the server accepts, `step` bounds only what a client
+ * offers.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface PluginSetting {
+    key: string;
+    label: string;
+    type: "number" | "string" | "boolean";
+    default: number | string | boolean;
+    min?: number;
+    max?: number;
+    step?: number;
+    description?: string;
+}
+
+/**
+ * One built-in plugin as an operator sees it: identity, the lifecycle hooks it declares, its settings
+ * descriptors, and the values that are in force right now. `builtin` is always true on this route - the
+ * catalogue is the auto-scanned set this build ships - and it stays on the wire so a client renders the same
+ * row shape for a plugin a future release makes configurable.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface PluginSummary {
+    name: string;
+    title: string;
+    description?: string;
+    version?: string;
+    tags?: string[];
+    hooks?: string[];
+    builtin: boolean;
+    settings: PluginSetting[];
+    values: {
+      [key: string]: unknown;
+      };
+}
+
+/** Page of built-in plugin rows. */
+export type PluginSummaryPage = PageMeta
+    & {
+    items: PluginSummary[];
+};
+
+/**
+ * Envelope of one plugin row, read or patched. A patch returns the whole row rather than a receipt because the
+ * values it reports ARE the result of the write, and an editor needs the reset targets beside them.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface PluginDetailResponse {
+    plugin: PluginSummary;
+}
+
+/**
+ * Settings patch for one plugin. Each key must be one the plugin declares; a value REPLACES that key's
+ * override, an explicit `null` clears it (the declared default applies again), and an omitted key is no change.
+ * Unknown keys are refused rather than ignored, so a client is never left believing it edited something. There
+ * is no enable/disable field: plugin loading is auto-scanned.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface PluginSettingsUpdate {
+    settings: {
+      [key: string]: number | string | boolean | null;
+      };
 }
 
 /**
@@ -1409,7 +1478,7 @@ export interface ThreadSummary {
     id: string;
     agent: string;
     origin: "agent" | "host";
-    status: "idle" | "running" | "stopped";
+    status: "idle" | "running" | "paused" | "stopped";
     sequence: number;
     owner_thread_id?: string;
     label?: string;

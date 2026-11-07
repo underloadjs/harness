@@ -11,6 +11,11 @@
 //   - `deleted` (T5, optional) — the names of shipped built-ins the operator
 //     deleted. The registry array cannot express this: it is written from
 //     `list()`, while a fresh registry always re-seeds the shipped templates.
+//   - `globalSettings` (T16, optional) — the operator's global provider defaults.
+//   - `pluginSettings` (T5/R2-R3, optional) — the operator's per-plugin setting
+//     OVERRIDES, plugin name -> key -> value. Only what changed is stored: a
+//     plugin's declared default lives in its own `*.plugin.ts` metadata, so a
+//     release that changes a default needs no migration here.
 //   - `sessions` — per-session identity, the FROZEN preset metadata and
 //     descriptor the session was created with (a later registry patch cannot
 //     change what an old session must rebuild), provider settings WITHOUT the
@@ -275,6 +280,21 @@ export type HarnessGlobalSettingsRecord = {
     model: string;
 };
 
+// T5 (R2/R3): the persisted shape of the operator's PLUGIN setting overrides,
+// plugin name -> setting key -> value.
+//
+// ONLY overrides, never defaults: each built-in plugin declares its own default in its own
+// `*.plugin.ts` metadata (src/plugin/manifest.ts is generated from it), so a release that
+// moves a default moves it for every deployment with no migration in this file. A plugin
+// with no entry means "nothing has ever been changed about it".
+//
+// Values are the three JSON scalars the descriptors can declare (`number`/`string`/
+// `boolean`). `null` is NOT stored: a reset drops the key, which is the same fact in one
+// fewer bytes and keeps `values(plugin)` free of "explicitly nothing" states. The store
+// (./plugins.ts) filters anything this build no longer declares, so a retired setting
+// cannot resurrect itself on the next boot.
+export type HarnessPluginSettingsRecord = Record<string, Record<string, number | string | boolean>>;
+
 // T19 (ADDITIVE): one trusted-catalogue agent profile as the GLOBAL override layer
 // records it. The shipped profile itself is compiled in (`src/agents`), so a record
 // stores ONLY what the operator changed plus the retirement flag — never a copy of the
@@ -323,6 +343,13 @@ export type HarnessDatabase = {
     // for the life of the process (documented on the route). Absent means "the shipped
     // environment defaults" (every pre-T16 document).
     globalSettings?: HarnessGlobalSettingsRecord;
+    // T5 / R2-R3 (ADDITIVE): the operator's per-plugin setting OVERRIDES, written by
+    // `PATCH /v1/harness/plugins/{plugin_id}` and read back at construction by the runtime's
+    // plugin settings store (./plugins.ts, via `SessionStore`). Absent means "no plugin
+    // setting has ever been changed" (every pre-R3 document), and an absent field stays
+    // absent on a round trip. Values are JSON scalars only; the declared defaults they
+    // override are NOT stored (they belong to the plugin's own metadata).
+    pluginSettings?: HarnessPluginSettingsRecord;
     sessions: HarnessSessionRecord[];
 };
 
@@ -1272,6 +1299,58 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
                   } as HarnessGlobalSettingsRecord;
               })();
 
+    // T5 / R2-R3 (durability): the operator's per-plugin setting overrides.
+    //
+    // STRICT about shape, LENIENT about identity:
+    //   - OPTIONAL in both directions: an absent field stays absent, so a document from a
+    //     deployment that never opened the Plugins pane keeps its exact previous shape;
+    //   - the map must be an object of objects, and every value must be one of the three JSON
+    //     scalars a descriptor can declare. A nested object or an array is corruption of the
+    //     named slot and throws, exactly like every other field here;
+    //   - plugin NAMES and KEY NAMES are deliberately not checked against this build's
+    //     catalogue — the same rule `deleted` follows above. A saved override may name a
+    //     plugin this build stopped shipping or will ship again later, and ./plugins.ts
+    //     `restore` decides what is still meaningful;
+    //   - an empty map (or a map whose only entries are empty) normalizes to ABSENT, because
+    //     the writer never emits `{}`: gating here is what keeps load -> save byte-stable.
+    const pluginSettings =
+        record.pluginSettings === undefined
+            ? undefined
+            : (() => {
+                  const entry = requireRecord(record.pluginSettings, 'The harness database pluginSettings');
+
+                  const values: HarnessPluginSettingsRecord = {};
+
+                  for (const [plugin, raw] of Object.entries(entry)) {
+                      const inner = requireRecord(raw, `The harness database pluginSettings.${plugin}`);
+
+                      const settings: Record<string, number | string | boolean> = {};
+
+                      for (const [key, value] of Object.entries(inner)) {
+                          const label = `The harness database pluginSettings.${plugin}.${key}`;
+
+                          if (typeof value === 'number') {
+                              if (!Number.isFinite(value)) throw new TypeError(`${label} must be a finite number.`);
+                          } else if (typeof value === 'boolean') {
+                              // A boolean is already the right shape.
+                          } else if (typeof value === 'string') {
+                              // A string is already the right shape (an empty string is a value).
+                          } else {
+                              throw new TypeError(
+                                  `${label} must be a number, a string, or a boolean; plugin settings hold JSON scalars only.`
+                              );
+                          }
+
+                          settings[key] = value as number | string | boolean;
+                      }
+
+                      // An empty plugin map states nothing, so it is not carried forward.
+                      if (Object.keys(settings).length > 0) values[plugin] = settings;
+                  }
+
+                  return Object.keys(values).length === 0 ? undefined : values;
+              })();
+
     // Duplicate ids would make the Map silently keep only one session.
     const ids = new Set<string>();
     for (const session of sessions) {
@@ -1290,6 +1369,7 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
         // Key order mirrors `sessions.ts` `databaseRecord`, so a load+save of a document that
         // already carries the field does not reorder it.
         ...(globalSettings === undefined ? {} : { globalSettings }),
+        ...(pluginSettings === undefined ? {} : { pluginSettings }),
         sessions
     };
 };

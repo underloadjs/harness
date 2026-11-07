@@ -574,7 +574,17 @@ export const createToolboxHarness = (
         // configuration (not inside `report`), because presence is what makes the
         // runtime register actionRequest. A missing hook simply means this host has
         // no answerer and the tool is not declared.
-        ...(observer?.interaction === undefined ? {} : { interaction: observer.interaction })
+        ...(observer?.interaction === undefined ? {} : { interaction: observer.interaction }),
+        // T5 (R2/R3): the host's live plugin settings provider, on the same top-level rule
+        // (it is a HarnessConfiguration field, src/types/index.ts:2643). Presence means the
+        // harness reads operator edits; absence means the library's declared-default provider
+        // (src/harness.ts:1080), which is exactly the pre-R3 behaviour and what a lane worker
+        // still gets, because a closure cannot cross a `worker_threads` boundary.
+        //
+        // Only the REFERENCE crosses, and `harness()` never copies it: the settings view
+        // built per plugin calls `provider.get` on every read (src/plugin/settings.ts:145-153),
+        // so a value written after this harness was constructed is what its next turn sees.
+        ...(observer?.pluginSettings === undefined ? {} : { pluginSettings: observer.pluginSettings })
     };
 
     return harness(liveConfiguration);

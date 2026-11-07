@@ -98,6 +98,14 @@ export type HarnessResourceKey = {
 /** Host-wide kinds have no instance id, so `null` is their key (spec: WsRevisionRecord.id). */
 const HOST_KINDS: readonly StreamResourceKind[] = ['harnesses', 'agents', 'tools', 'config'];
 
+// T5 (R2/R3) — why `plugins` is NOT in this list: a counter key must be a `StreamResourceKind`,
+// and that vocabulary is the stream's bounded per-scope baseline set (`revision_records_per_state
+// = 20` = the kind count, src/shared/harness-api.test.ts). `GET /v1/harness/plugins` needs a
+// collection revision, so it reports the plugin settings store's OWN epoch-local counter
+// (./plugins.ts `revision`) instead of minting a 21st stream kind for a pane that rereads on open
+// and on save. Every published kind still flows through this hub; a plugins change publishes
+// nothing, so no `resources` entry names an unknown kind.
+
 /** Normalize an id so `undefined`/`''` and a host-wide kind collapse to the same key. */
 export const resourceKeyOf = (resource: StreamResourceKind, id?: string | null): HarnessResourceKey => ({
     resource,

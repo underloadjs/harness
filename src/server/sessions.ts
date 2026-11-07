@@ -255,6 +255,11 @@ import type { HarnessIoClient, IoCloseSummary } from './workers';
 import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
 import type { HarnessDatabase, HarnessGlobalSettingsRecord, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
+// T5 (R2/R3): the runtime-level plugin settings store. The store OWNS it (one per SessionStore,
+// hence one per HarnessRuntime / standalone listener) because it is durable registry-adjacent
+// state written through the same `state.json` commit as everything else here.
+import { createPluginSettingsStore } from './plugins';
+import type { HarnessPluginSettingsStore, HarnessPluginSettingValues } from './plugins';
 import type {
     CancelThreadResult,
     HarnessDescriptor,
@@ -1430,6 +1435,12 @@ export class SessionStore {
     // `HarnessGlobalSettingsRecord`). `undefined` means "the shipped environment defaults".
     private global: HarnessGlobalSettingsRecord | undefined;
 
+    // T5 (R2/R3): the plugin settings store for THIS runtime. Built in the constructor from
+    // the generated built-in manifest plus the overrides this database's document carried, so
+    // a restored process reads exactly what the operator last saved, and `buildHarness` hands
+    // every session (fresh or restored) this one object's LIVE provider.
+    private readonly plugins: HarnessPluginSettingsStore;
+
     private host?: LaneHost;
 
     // D4 (R1/R2/R4): the IO worker client that performs this store's checkpoint and journal
@@ -1495,6 +1506,14 @@ export class SessionStore {
         // from the document the host already loaded, so a `PATCH /config` survives a restart
         // instead of silently reverting to the environment. The credential is never in here.
         this.global = options.database?.globalSettings;
+
+        // T5 (R2/R3): the plugin settings store, seeded from the document this host already
+        // loaded (./persistence.ts `pluginSettings`). Declared defaults come from the generated
+        // built-in manifest, so a plugin file stays the single owner of its own settings and a
+        // deployment that never touched the Plugins pane stores nothing.
+        this.plugins = createPluginSettingsStore({
+            ...(options.database === undefined ? {} : { values: options.database.pluginSettings })
+        });
 
         // R3: the runtime is already validated (./config.ts resolveRuntimeConfiguration), and
         // ./runtime.ts asserted readiness BEFORE constructing this store. A missing option is
@@ -1808,6 +1827,41 @@ export class SessionStore {
     }
 
     /**
+     * T5 (R2/R3): the runtime's plugin settings store - the built-in plugin catalogue, the
+     * operator's overrides, and the LIVE provider every harness in this store is built with.
+     * Reads (`values`, `get`, `snapshot`, `revision`) are synchronous; writes go through
+     * `updatePluginSettings` so the durable commit happens before the caller answers.
+     */
+    get pluginSettings(): HarnessPluginSettingsStore {
+        return this.plugins;
+    }
+
+    /**
+     * T5 (R2/R3): change one plugin's settings (`PATCH /v1/harness/plugins/{plugin_id}`) and
+     * make the change durable BEFORE the answer, which is this store's rule for every
+     * structural mutation (see `updateGlobalSettings`, the same discipline one feature earlier).
+     *
+     * Validation is the store's (`./plugins.ts`), and it throws a status-carrying
+     * `HarnessPluginSettingsError` (404 unknown plugin, 400 unknown key / mistyped /
+     * out-of-range value) BEFORE anything mutates, so a rejected patch is a no-op.
+     *
+     * A failed durable write leaves the in-process value applied and reports the 500 - exactly
+     * `updateGlobalSettings`' documented behaviour. The value is live for every session from
+     * the moment it is applied, so rolling it back on a disk failure would tell an operator
+     * "the change failed" while their running sessions kept the value they had just been given.
+     */
+    async updatePluginSettings(
+        plugin: string,
+        settings: Record<string, unknown>
+    ): Promise<HarnessPluginSettingValues> {
+        const values = this.plugins.update(plugin, settings);
+
+        await this.persistOrThrow();
+
+        return values;
+    }
+
+    /**
      * Change the global defaults (`PATCH /config`) and make the change durable BEFORE the answer.
      * A `null` value resets that field to the shipped default, which is what the contract's
      * `null`-means-reset rule requires, so the reset target survives a restart too.
@@ -2014,7 +2068,19 @@ export class SessionStore {
             }
         };
 
-        return preset.create(settings, progress, { stateChange, interaction });
+        return preset.create(settings, progress, {
+            stateChange,
+            interaction,
+            // T5 (R2/R3): the runtime's LIVE plugin settings provider. Every build path lands
+            // here — `create` (a fresh session, line ~1875 above) and the restore path (line
+            // ~3044 below) — so both a new conversation and one rebuilt from `state.json` read
+            // operator edits. The harness stores the REFERENCE and each plugin's `api.settings`
+            // re-reads it on every call (../plugin/settings.ts, ../plugin/host.ts:151), which is
+            // why a PATCH takes effect with no rebuild. Proven by src/server/plugins-api.test.ts
+            // ("the live settings provider reaches an existing session"): with this line removed,
+            // a plugin's `turn.before` read still sees the declared default on turn 2.
+            pluginSettings: this.plugins.provider
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2689,6 +2755,15 @@ export class SessionStore {
             // T16: the operator's global defaults, written only once they have been changed, so a
             // document from a deployment that never touched `/config` keeps its exact shape.
             ...(this.global === undefined ? {} : { globalSettings: { ...this.global } }),
+            // T5 (R2/R3): the operator's per-plugin setting OVERRIDES, written only once any
+            // exist (a deployment that never opened the Plugins pane keeps its exact previous
+            // document). The store returns catalogue-ordered, defaults-free maps, so this is a
+            // delta and not a copy of anything the shipped plugin metadata already declares.
+            ...(() => {
+                const pluginSettings = this.plugins.snapshot();
+
+                return Object.keys(pluginSettings).length === 0 ? {} : { pluginSettings };
+            })(),
             sessions: [...this.sessions.values()].map(
                 (session) => overrides?.get(session.id) ?? this.sessionRecord(session)
             )

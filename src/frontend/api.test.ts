@@ -32,7 +32,7 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts api.test.ts
 
 import { HARNESS_PAGE_LIMIT, HARNESS_ROUTES } from '../shared/harness-api';
-import type { GlobalConfigDocument, HarnessCard, ServiceInfo, ToolSummary, AgentSummary, SessionSummary } from '../shared/harness-api';
+import type { GlobalConfigDocument, HarnessCard, PluginSummary, ServiceInfo, ToolSummary, AgentSummary, SessionSummary } from '../shared/harness-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { API_ROOT_STORAGE_KEY, normalizeApiRoot, saveApiRootSetting, storedApiRoot } from './api';
 
@@ -965,6 +965,105 @@ describe('harness mutations', () => {
             ],
             ['PATCH', '/v1/harness/harnesses/a%2Fb', { primary: 'helper', subagents: ['instruct'] }]
         ]);
+    });
+});
+
+// T5 (R2/R3): the Plugins pane's two calls. The page carries the declared descriptors AND the
+// effective values in one row, so the pane needs no second read to render an editor, and a
+// patch returns that same row shape (the write is the row back, with the new value in `values`).
+describe('plugin settings client (R2/R3)', () => {
+    const pluginRow: PluginSummary = {
+        name: 'context-compaction',
+        title: 'Context Compaction',
+        description: 'Compacts a conversation at the turn boundary.',
+        version: '1.0.0',
+        tags: ['context'],
+        hooks: ['turn.before'],
+        builtin: true,
+        settings: [
+            {
+                key: 'contextLimit',
+                label: 'Context limit (tokens)',
+                type: 'number',
+                default: 100000,
+                min: 1000,
+                step: 1000
+            }
+        ],
+        values: { contextLimit: 100000 }
+    };
+
+    const savedRow: PluginSummary = { ...pluginRow, values: { contextLimit: 200000 } };
+
+    it('pages the built-in catalogue with the query the server accepts', async () => {
+        serve({ 'GET /v1/harness/plugins?limit=25&q=compact': pageOf([pluginRow]) });
+
+        const module = await import('./api');
+        const page = await module.listPlugins({ q: 'compact' });
+
+        // `pageOf` maps the wire page onto the client's page boundary, revision included.
+        expect(page.items).toEqual([pluginRow]);
+        expect(page.nextCursor).toBeNull();
+        // `limit` echoes what the server stated on the wire (the stub page says 25).
+        expect(page.limit).toBe(25);
+        expect(page.revision).toBe(9);
+
+        expect(calls).toEqual([{ method: 'GET', url: '/v1/harness/plugins?limit=25&q=compact', body: undefined, keepalive: undefined }]);
+    });
+
+    it('patches one plugin by id and answers the updated row', async () => {
+        serve({ 'PATCH /v1/harness/plugins/context-compaction': { plugin: savedRow } });
+
+        const module = await import('./api');
+        const updated = await module.updatePluginSettings('context-compaction', { contextLimit: 200000 });
+
+        // The unwrap is the row, not the envelope: the pane re-renders from `values`.
+        expect(updated).toEqual(savedRow);
+        expect(calls).toEqual([
+            {
+                method: 'PATCH',
+                url: '/v1/harness/plugins/context-compaction',
+                body: { settings: { contextLimit: 200000 } },
+                keepalive: undefined
+            }
+        ]);
+    });
+
+    it('sends an explicit null as a reset, and encodes a plugin id like any other path segment', async () => {
+        serve({ 'PATCH /v1/harness/plugins/async-ping': { plugin: { ...pluginRow, name: 'async-ping' } } });
+
+        const module = await import('./api');
+
+        await module.updatePluginSettings('async-ping', { intervalMs: null });
+
+        expect(calls).toEqual([
+            {
+                method: 'PATCH',
+                url: '/v1/harness/plugins/async-ping',
+                // `null` survives stringification: it is the documented reset, not an omission.
+                body: { settings: { intervalMs: null } },
+                keepalive: undefined
+            }
+        ]);
+
+        serve({ 'PATCH /v1/harness/plugins/a%2Fb': { plugin: pluginRow } });
+
+        await module.updatePluginSettings('a/b', { contextLimit: 2000 });
+
+        expect(calls[1].url).toBe('/v1/harness/plugins/a%2Fb');
+    });
+
+    it('surfaces a server refusal with the message that names the offending setting', async () => {
+        serve(
+            { 'PATCH /v1/harness/plugins/context-compaction': { error: { message: '"contextLimit" of plugin "context-compaction" must be at least 1000; 999 was submitted.' } } },
+            { 'PATCH /v1/harness/plugins/context-compaction': 400 }
+        );
+
+        const module = await import('./api');
+
+        await expect(module.updatePluginSettings('context-compaction', { contextLimit: 999 })).rejects.toThrow(
+            '"contextLimit" of plugin "context-compaction" must be at least 1000; 999 was submitted.'
+        );
     });
 });
 
