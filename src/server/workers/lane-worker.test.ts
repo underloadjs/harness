@@ -42,6 +42,7 @@ import type { LaneHost } from './lane-host';
 // T12 (S7) + T14: the replica-shaping steps, exported for exactly this kind of test.
 import { nestedRunHandshakeLimitations, refuseNestedRuns } from './lane-worker-loop';
 import { NESTED_RUN_ARMED_DOORS, NESTED_RUN_LIMITATION_CODE, nestedRunLimitationMessage, nestedRunRefusalMessage } from './capability';
+import { buildTestWorkerEntry } from './worker-test-build.test-support';
 
 // A cold lane builds the harness, recompiles the created-tool sources and restores the
 // snapshot: measured at ~1.6 s on this machine, so the handshake bound is generous and the
@@ -56,10 +57,17 @@ import { NESTED_RUN_ARMED_DOORS, NESTED_RUN_LIMITATION_CODE, nestedRunLimitation
 // path the host already supports.
 const SOURCE_WORKER_ENTRY = fileURLToPath(new URL('./lane-worker.ts', import.meta.url));
 
+// Source mode needs Node's own TypeScript transform. On a Node build without it, Vite
+// builds the CURRENT entry into Temp instead: the tests still run the code under test,
+// not the stale `dist/` bundle.
+const SOURCE_WORKER_SUPPORTED = (process.features as { typescript?: string | false }).typescript !== false;
+const BUILT_TEST_WORKER = SOURCE_WORKER_SUPPORTED ? undefined : await buildTestWorkerEntry(SOURCE_WORKER_ENTRY);
+const WORKER_ENTRY = BUILT_TEST_WORKER?.entry ?? SOURCE_WORKER_ENTRY;
+
 const WORKER_RUNTIME: ServerRuntimeConfiguration = {
     ...DEFAULT_RUNTIME_CONFIGURATION,
     threadExecution: 'worker',
-    workerEntry: SOURCE_WORKER_ENTRY,
+    workerEntry: WORKER_ENTRY,
     // 0 keeps a lane alive for the whole test, so a second tool call does not pay a second
     // cold start (reclaim is exercised separately in ./lane-host tests).
     workerIdleMs: 0,
@@ -93,6 +101,8 @@ afterAll(async () => {
     // Give every terminate() a tick to land, so a closing vitest pool cannot race a live
     // worker (a leaked worker would keep the process alive, which is its own failure).
     await new Promise((resolve) => setTimeout(resolve, 250));
+
+    BUILT_TEST_WORKER?.dispose();
 });
 
 // The host is created lazily by the store on the first worker-mode dispatch, and even then

@@ -36,6 +36,12 @@ import {
 } from './io-client';
 import type { HarnessIoClient, HarnessIoClientOptions } from './io-client';
 
+// A SOURCE-mode worker is plain `.ts` evaluated by Node's own TypeScript transform. A Node
+// build compiled without that transform cannot run this mode at all (the spawn's execArgv
+// cannot supply it), so the tests that pin the SOURCE entry are skipped on such a build;
+// the built-entry tests still run.
+const SOURCE_WORKER_SUPPORTED = (process.features as { typescript?: string | false }).typescript !== false;
+
 // One directory deeper than ../journal.test.ts (src/server/workers), so the package
 // root is three levels up. Scratch still belongs in the REPO-root Temp/.
 const PACKAGE_ROOT = path.resolve(__dirname, '../../..');
@@ -282,7 +288,7 @@ describe('startup', () => {
         expect(new HarnessJournal(path.join(root, 'harness'), 'sess-early').read().events).toHaveLength(1);
     });
 
-    it('runs a SOURCE-mode worker, so dev and test need no build', async () => {
+    it.skipIf(!SOURCE_WORKER_SUPPORTED)('runs a SOURCE-mode worker, so dev and test need no build', async () => {
         // The same acceptance path as the bundle, loaded as `src/**.ts`: the entry installs
         // resolve hooks and the client adds `--experimental-transform-types` (the shape
         // ./lane-host.ts already uses). If this breaks, worker IO cannot run under
@@ -324,7 +330,7 @@ describe('startup', () => {
         expect(candidates.length).toBe(5);
     });
 
-    it('resolves the entry the way a checkout is laid out right now', async () => {
+    it.skipIf(!SOURCE_WORKER_SUPPORTED)('resolves the entry the way a checkout is laid out right now', async () => {
         // With no override at all, either the built entry exists (and the client starts
         // from it) or the failure names every candidate. Both are assertions; guessing
         // one would make the suite depend on another owner's build state.

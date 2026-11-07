@@ -86,6 +86,10 @@ const settled = (result: CommandRunResult): Omit<CommandRunResult, 'durationMs' 
     return rest;
 };
 
+// POSIX reports the signal a killed child ended with; the Windows taskkill path leaves
+// `signalCode` null. The tool reports what the platform observed.
+const KILL_EXIT_SIGNAL = process.platform === 'win32' ? null : 'SIGKILL';
+
 describe('shell', () => {
     it('returns the exact result for a small command', async () => {
         const result = await shell({ command: 'node -e "process.stdout.write(\'hello\')"' });
@@ -140,12 +144,13 @@ describe('shell', () => {
         expect(result.aborted).toBe(false);
     });
 
-    it('normalises the Windows unsigned exit code to the signed convention', async () => {
-        // `process.exit(-1)` reaches Node as 4294967295 on Win32 and 255 on POSIX.
-        // Both mean the same thing to a model, so both read as -1.
+    it('normalises the Windows unsigned exit code but passes the POSIX byte through', async () => {
+        // `process.exit(-1)` reaches Node as 4294967295 on Win32 (which
+        // `signedExitCode` folds into -1) and as the 8-bit 255 on POSIX, where the
+        // tool reports the code the shell actually produced.
         const result = await shell({ command: 'node -e "process.exit(-1)"' });
 
-        expect(result.exitCode).toBe(-1);
+        expect(result.exitCode).toBe(process.platform === 'win32' ? -1 : 255);
         expect(result.timedOut).toBe(false);
         expect(result.aborted).toBe(false);
     });
@@ -376,7 +381,7 @@ describe('shell', () => {
             outputPath: null,
             timedOut: true,
             aborted: false,
-            exitSignal: null
+            exitSignal: KILL_EXIT_SIGNAL
         });
 
         expect(result.durationMs).toBeLessThan(5000);
@@ -445,7 +450,7 @@ describe('shell', () => {
                 outputPath: null,
                 timedOut: false,
                 aborted: true,
-                exitSignal: null
+                exitSignal: KILL_EXIT_SIGNAL
             });
         } finally {
             clearTimeout(timer);

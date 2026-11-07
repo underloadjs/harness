@@ -30,16 +30,24 @@ import type { LaneAuthority } from './lane-authority';
 import type { SessionSnapshot, SessionTurn } from '../protocol';
 import { SessionStore } from '../sessions';
 import type { LaneHost } from './lane-host';
+import { buildTestWorkerEntry } from './worker-test-build.test-support';
 
 // S9: a `.ts` entry is source mode (./lane-host.ts `resolveEntry`). Without this the host
 // prefers `dist/underload-harness.worker.mjs`, and every assertion below would be about a
 // bundle built before the fix it is checking.
 const SOURCE_WORKER_ENTRY = fileURLToPath(new URL('./lane-worker.ts', import.meta.url));
 
+// Source mode needs Node's own TypeScript transform. On a Node build without it, Vite
+// builds the CURRENT entry into Temp instead: the tests still run the code under test,
+// not the stale `dist/` bundle.
+const SOURCE_WORKER_SUPPORTED = (process.features as { typescript?: string | false }).typescript !== false;
+const BUILT_TEST_WORKER = SOURCE_WORKER_SUPPORTED ? undefined : await buildTestWorkerEntry(SOURCE_WORKER_ENTRY);
+const WORKER_ENTRY = BUILT_TEST_WORKER?.entry ?? SOURCE_WORKER_ENTRY;
+
 const WORKER_RUNTIME: ServerRuntimeConfiguration = {
     ...DEFAULT_RUNTIME_CONFIGURATION,
     threadExecution: 'worker',
-    workerEntry: SOURCE_WORKER_ENTRY,
+    workerEntry: WORKER_ENTRY,
     // Lanes survive a turn here; reclaim is driven explicitly by the tests that need it.
     workerIdleMs: 0,
     maxLaneWorkers: 8,
@@ -69,6 +77,8 @@ afterAll(async () => {
     for (const store of stores) store.dispose();
 
     await new Promise((resolve) => setTimeout(resolve, 250));
+
+    BUILT_TEST_WORKER?.dispose();
 });
 
 const hostOf = (store: SessionStore): LaneHost | undefined => (store as unknown as { host?: LaneHost }).host;

@@ -354,13 +354,17 @@ export const readTurnAttachment = (
  * a separate WebSocket subscription, so a test that is not about realtime proves completion
  * the way any REST client does: by re-reading the turn. `pollMs` is fixed, and the helper
  * fails with the last observed record rather than timing out quietly.
+ *
+ * The default window is 30 s, not ~2 s: the scripted demo streams in 16 ms chunks across
+ * three rounds, so a healthy run already takes longer than a few hundred polls, and a
+ * parallel suite can stretch it further. A turn that really never settles still fails.
  */
 export const waitForTurnStatus = async (
     call: CanonicalCall,
     sessionId: string,
     turnId: string,
     wanted: TurnResource['status'][],
-    attempts = 400,
+    attempts = 6_000,
     pollMs = 5
 ): Promise<TurnResource> => {
     let last: TurnResource | undefined;
