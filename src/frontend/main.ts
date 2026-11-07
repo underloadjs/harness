@@ -2380,7 +2380,14 @@ const brand = el('button', 'brand');
 brand.type = 'button';
 const brandMark = el('span', 'brand-mark', '◍');
 brandMark.setAttribute('aria-hidden', 'true');
-brand.append(brandMark, el('span', 'brand-name', 'Harness UI'));
+// Build identity ("Harness UI v2.3.0(261108)"): version from package.json plus
+// the build date, both inlined at build time by src/frontend/vite.config.ts.
+// The bare name is the fallback for a host that does not define the constant
+// (the UI's vitest config), so tests and any non-Vite bundle keep a valid label.
+// See src/frontend/build-label.ts.
+const harnessUiLabel =
+    typeof __HARNESS_UI_LABEL__ === 'string' ? __HARNESS_UI_LABEL__ : 'Harness UI';
+brand.append(brandMark, el('span', 'brand-name', harnessUiLabel));
 
 // The status pill is the app's single live region, and it is APP-SCOPED: it
 // announces startup/readiness and app/config failures to screen readers and shows

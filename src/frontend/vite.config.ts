@@ -41,14 +41,33 @@
 // README's Server and UI section documents that warning.
 
 import { defineConfig } from 'vite';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DEV_SERVER_HOST, apiProxyRoutes } from './vite-proxy.ts';
+import { formatBuildStamp, formatHarnessUiLabel } from './build-label.ts';
 
 // The proxy lives in `./vite-proxy.ts` so its routing key (which must NOT capture
 // the `/api.ts` source module) is unit-testable. Re-exported here for callers that
 // already import the config helpers.
 export { API_PROXY_KEY, DEFAULT_DEV_API, apiProxyRoutes, createApiProxy, createApiProxyRoutes } from './vite-proxy.ts';
 export type { ApiProxy } from './vite-proxy.ts';
+
+// Build identity for the topbar brand: "Harness UI v<package version>(<YYMMDD>)".
+//
+// Composed HERE, once per build, because the label must name the artifact that
+// was produced: package.json's `version` (unavailable to the browser) plus the
+// build machine's date (GitHub Actions runners are UTC, so a CI build stamps the
+// day it ran). `define` inlines the literal as `__HARNESS_UI_LABEL__`; main.ts
+// keeps a bare-name fallback for hosts whose config does not define it (vitest).
+// See ./build-label.ts for why this is not computed in the browser.
+const packageVersion: string = JSON.parse(
+    // This config lives at src/frontend/vite.config.ts, so the package root is
+    // two levels up. Vite rewrites `import.meta.url` to this config's real path
+    // even though it bundles the config into a temp module, so the lookup works
+    // from any cwd (root script, workspace script, CI).
+    readFileSync(fileURLToPath(new URL('../../package.json', import.meta.url)), 'utf-8')
+).version;
+const harnessUiLabel = formatHarnessUiLabel(packageVersion, formatBuildStamp(new Date()));
 
 // Normalize a deployment subpath to a leading+trailing slash. The default is
 // root, which is where the static handler mounts the build.
@@ -62,6 +81,10 @@ const normalizeBase = (value: string | undefined): string => {
 export default defineConfig({
     root: fileURLToPath(new URL('.', import.meta.url)),
     base: normalizeBase(process.env.PLAYGROUND_BASE),
+    // The topbar label, inlined as a string literal (see `harnessUiLabel` above).
+    define: {
+        __HARNESS_UI_LABEL__: JSON.stringify(harnessUiLabel)
+    },
     build: {
         outDir: 'dist',
         emptyOutDir: true,
