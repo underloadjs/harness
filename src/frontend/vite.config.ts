@@ -52,13 +52,14 @@ import { formatBuildStamp, formatHarnessUiLabel } from './build-label.ts';
 export { API_PROXY_KEY, DEFAULT_DEV_API, apiProxyRoutes, createApiProxy, createApiProxyRoutes } from './vite-proxy.ts';
 export type { ApiProxy } from './vite-proxy.ts';
 
-// Build identity for the topbar brand: "Harness UI v<package version>(<YYMMDD>)".
+// Build identity for the topbar brand: "Harness UI v<package version>(<DDHHMM>)".
 //
 // Composed HERE, once per build, because the label must name the artifact that
 // was produced: package.json's `version` (unavailable to the browser) plus the
-// build machine's date (GitHub Actions runners are UTC, so a CI build stamps the
-// day it ran). `define` inlines the literal as `__HARNESS_UI_LABEL__`; main.ts
-// keeps a bare-name fallback for hosts whose config does not define it (vitest).
+// build machine's clock (GitHub Actions runners are UTC, so a CI build stamps the
+// UTC day and time it ran). `define` inlines the literal as
+// `__HARNESS_UI_LABEL__`; main.ts keeps a bare-name fallback for hosts whose
+// config does not define it (vitest).
 // See ./build-label.ts for why this is not computed in the browser.
 const packageVersion: string = JSON.parse(
     // This config lives at src/frontend/vite.config.ts, so the package root is
