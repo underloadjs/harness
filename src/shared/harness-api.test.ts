@@ -103,9 +103,14 @@ describe('harness contract root and headers', () => {
 });
 
 describe('harness contract route tables', () => {
-    it('covers all 47 spec paths', () => {
-        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(47);
-        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(47);
+    it('covers all 48 spec paths', () => {
+        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(48);
+        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(48);
+        // R1: the stop's counterpart is addressable with the same two ids, in the same
+        // order, so a client builds it exactly the way it builds `cancel`.
+        expect(HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdResume('ses_1', 'thr_3')).toBe(
+            '/v1/harness/sessions/ses_1/threads/thr_3/resume',
+        );
     });
 
     it('renders every path template into the builder output with no leftover placeholders', () => {

@@ -3440,7 +3440,12 @@ body.is-resizing-rail {
     display: none;
 }
 
+/* T4/R2: `.resume-open` joins the two existing action buttons here, in the SAME rule, so
+   the third control is sized identically by construction (a per-button copy is what drifts
+   out of step). ui/turns.ts always creates its label/glyph pair, so the mobile swap below
+   reaches it without a resume-specific selector. */
 .transcript-open,
+.resume-open,
 .thread-delete {
     padding: 4px 10px;
     border: 1px solid var(--border-strong);
@@ -3474,10 +3479,21 @@ body.is-resizing-rail {
     background: rgba(251, 191, 36, 0.12);
 }
 
-/* T26: Transcript is the trailing action. `margin-left: auto` puts it flush right whether
-   or not Delete is rendered — an undeletable default conversation hides Delete, and the
-   transcript button must not slide over to where the destructive action was. */
-.transcript-open {
+/* T4/R2: the right-hand GROUP. Resume is the first button of that pair in DOM order, so
+   `margin-left: auto` moves onto IT: `[Delete … auto gap … Resume Transcript]` parks
+   Resume+Transcript flush right with Transcript rightmost, and the destructive action keeps
+   the leading edge on its own. */
+.resume-open {
+    margin-left: auto;
+}
+
+/* The common case is a thread that is NOT stopped, where ui/turns.ts hides Resume with the
+   `hidden` attribute (`[hidden] { display: none !important }`, styles.css:101) — and a box
+   that paints nothing contributes no auto margin. Transcript takes the flush-right slot back
+   in exactly that case, so an undeletable default conversation (Delete hidden too) still
+   pins Transcript to the right edge instead of sliding it into the destructive action's
+   place. */
+.resume-open[hidden] + .transcript-open {
     margin-left: auto;
 }
 
@@ -3492,6 +3508,7 @@ body.is-resizing-rail {
 }
 
 .transcript-open:focus-visible,
+.resume-open:focus-visible,
 .thread-delete:focus-visible,
 .thread-delete-confirm-delete:focus-visible,
 .thread-delete-confirm-cancel:focus-visible {
@@ -3499,7 +3516,13 @@ body.is-resizing-rail {
     outline-offset: 2px;
 }
 
+/* T4/R2: `.resume-open` joins this list in the same slot it holds in the sizing, hover and
+   focus rules above, so a disabled Resume (an unwired host, a resume already in flight, or a
+   delete that owns the conversation) dims and takes the `not-allowed` cursor exactly like its
+   two siblings instead of sitting at full opacity with a live-looking pointer next to two
+   dimmed ones. */
 .transcript-open:disabled,
+.resume-open:disabled,
 .thread-delete:disabled,
 .thread-delete-confirm-delete:disabled {
     cursor: not-allowed;
@@ -4154,7 +4177,11 @@ body.is-resizing-rail {
 
     /* R8/T10: sm/mobile action bars show `X` (Delete) and `{}` (Transcript)
        glyphs. aria-label still supplies the full accessible name. T26: both actions live
-       in the bar again, so the glyph swap needs no header-slot variants. */
+       in the bar again, so the glyph swap needs no header-slot variants.
+       T4/R2: these are DESCENDANT rules over the whole bar, so the third control inherits
+       them for free — a stopped conversation shows `▶` (Resume) next to `X`/`{}` with no
+       resume-specific selector, which is why the pinned contract below stays ONE rule per
+       node kind. */
     :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) .action-label {
         display: none;
     }

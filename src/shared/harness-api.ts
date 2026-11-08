@@ -88,6 +88,7 @@ export const HARNESS_PATH_TEMPLATES = {
     sessionsBySessionIdThreads: '/v1/harness/sessions/{session_id}/threads',
     sessionsBySessionIdThreadsByThreadId: '/v1/harness/sessions/{session_id}/threads/{thread_id}',
     sessionsBySessionIdThreadsByThreadIdCancel: '/v1/harness/sessions/{session_id}/threads/{thread_id}/cancel',
+    sessionsBySessionIdThreadsByThreadIdResume: '/v1/harness/sessions/{session_id}/threads/{thread_id}/resume',
     sessionsBySessionIdThreadsByThreadIdTranscript: '/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript',
     sessionsBySessionIdThreadsByThreadIdTranscriptMessages: '/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript/messages',
     sessionsBySessionIdThreadsByThreadIdTranscriptDocument: '/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript/document',
@@ -175,6 +176,8 @@ export const HARNESS_ROUTES = {
     sessionsBySessionIdThreadsByThreadId: (sessionId: string, threadId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/threads/${threadId}`,
     /** `/v1/harness/sessions/{session_id}/threads/{thread_id}/cancel` */
     sessionsBySessionIdThreadsByThreadIdCancel: (sessionId: string, threadId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/threads/${threadId}/cancel`,
+    /** `/v1/harness/sessions/{session_id}/threads/{thread_id}/resume` */
+    sessionsBySessionIdThreadsByThreadIdResume: (sessionId: string, threadId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/threads/${threadId}/resume`,
     /** `/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript` */
     sessionsBySessionIdThreadsByThreadIdTranscript: (sessionId: string, threadId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/threads/${threadId}/transcript`,
     /** `/v1/harness/sessions/{session_id}/threads/{thread_id}/transcript/messages` */

@@ -1060,12 +1060,16 @@ describe('responsive thread action bar', () => {
 
         // T26: the bar holds BOTH actions now, in the requested order — destructive first,
         // transcript last. T6/R5 removed the third child it used to own, the inline
-        // confirmation row: that step is the shared dialog now.
+        // confirmation row: that step is the shared dialog now. T4/R2 adds the Resume
+        // control as a PERMANENT middle child (hidden unless the roster says `stopped`), so
+        // the DOM anatomy of a bar is three children on every surface, and the two actions
+        // this thread needs are still the visible ones.
         const bar = tileAction(turn);
         expect(bar.hidden).toBe(false);
         expect(bar.classList.contains('tile-transcript-action')).toBe(true);
         expect([...bar.children].map((node) => node.className)).toEqual([
             'thread-delete',
+            'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
 
@@ -1081,6 +1085,12 @@ describe('responsive thread action bar', () => {
         expect(barTranscript.querySelector('.action-label')?.textContent).toBe('Transcript');
         expect(barTranscript.querySelector('.action-glyph')?.textContent).toBe('{}');
         expect(barTranscript.getAttribute('aria-label')).toBe('Open the JSON transcript of RR1');
+
+        // T4/R2: this fixture's thread is `idle` — live but not halted — so the third child
+        // is in the DOM and NOT painted. Visibility is the roster's decision alone.
+        const barResume = actionButton(bar, '.resume-open');
+        expect(barResume.hidden).toBe(true);
+        expect(barResume.classList.contains('action-resume')).toBe(true);
 
         openTranscriptFrom(bar);
         expect(document.querySelector('.dialog-title')?.textContent).toBe(
@@ -1124,10 +1134,20 @@ describe('responsive thread action bar', () => {
         // Transcript flush right when Delete is hidden on an undeletable conversation.
         expect(barBlock).not.toContain('justify-content');
 
-        // T26: Transcript is the TRAILING action — one rule, one declaration, so it is flush
-        // right whether or not Delete is rendered (an undeletable default conversation
-        // hides Delete and the transcript button must not slide into its place).
-        expect(blockOf('\n.transcript-open {')).toBe('\n    margin-left: auto;\n');
+        // T26 → T4/R2: Transcript is still the TRAILING action, but the flush-right
+        // `margin-left: auto` moved ONCE onto Resume — the first button of the right-hand
+        // group `[Delete … gap … Resume Transcript]`, which is what puts Resume literally
+        // next to Transcript with Transcript rightmost. The trailing button takes the auto
+        // margin back ONLY while Resume is `hidden` (a thread that is not stopped, where a
+        // `[hidden] { display: none !important }` box contributes no margin at all), so an
+        // undeletable default conversation keeps Transcript pinned to the right edge. Both
+        // rules stay ONE declaration each, and no standalone `.transcript-open` rule is
+        // left holding the old auto margin.
+        expect(blockOf('\n.resume-open {')).toBe('\n    margin-left: auto;\n');
+        expect(blockOf('\n.resume-open[hidden] + .transcript-open {')).toBe(
+            '\n    margin-left: auto;\n'
+        );
+        expect(/\n\.transcript-open \{/.test(css)).toBe(false);
         // T26: Delete is the LEADING action, so its ONLY own rule is the destructive colour
         // pair — the `margin-left: auto` that used to push it to the bar's right edge (and
         // the compact 92px header-slot sizing) is gone from every `.thread-delete` rule.
@@ -1212,10 +1232,15 @@ describe('responsive thread action bar', () => {
         // anatomy the main tile now matches), so nothing about it needed a reserve.
         expect(css).toMatch(/\n\.thread-top \{\s*order: 2;[\s\S]*?margin-left: auto;/);
 
-        // The mobile glyph swap is now ONE list of the three bars; the three header-slot
+        // The mobile glyph swap is ONE list of the three bars; the three header-slot
         // variants are gone, because those hosts no longer exist. Each swap rule is pinned
         // as the ONLY `:is(...) .action-*` override in the stylesheet, so a phone still
         // gets `X`/`{}` and nothing else can hide a desktop label.
+        //
+        // T4/R2: these are DESCENDANT rules over the whole bar, so the third action
+        // (`Resume`, `▶`) inherits the swap with NO resume-specific selector — the pinned
+        // "exactly one rule per node kind" list is what proves the mobile play icon comes
+        // from the same mechanism, not from a copy that can drift.
         expect(css).toMatch(
             /@media \(max-width: 600px\) \{[\s\S]*?:is\(\.tile-transcript-action, \.thread-transcript-action, \.thread-focus-actions\) \.action-label \{\s*display: none;/
         );
@@ -1351,6 +1376,9 @@ describe('responsive thread action bar', () => {
         ]);
         expect([...(childBar?.children ?? [])].map((node) => node.className)).toEqual([
             'thread-delete',
+            // T4/R2: the shared bar means the nested card gets the Resume slot for free
+            // (`hidden` here — this roster row is `idle`), with Transcript still rightmost.
+            'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
         // R3: the nested card's identity half is its conversation code alone; the state
@@ -1383,6 +1411,9 @@ describe('responsive thread action bar', () => {
         expect(
             childBar?.querySelector('.transcript-open .action-label')?.textContent
         ).toBe('Transcript');
+        // T4/R2: same anatomy as the tile's bar — the Resume control exists here too, and
+        // stays unpainted for an `idle` conversation.
+        expect(actionButton(childBar as HTMLElement, '.resume-open').hidden).toBe(true);
     });
 
     it('gives a roster-only focused thread the same action bar', () => {
@@ -1419,9 +1450,12 @@ describe('responsive thread action bar', () => {
         const bar = panel?.querySelector<HTMLElement>('.thread-focus-actions');
         expect(bar?.hidden).toBe(false);
         // The roster bar keeps its panel-specific transcript class and the same child
-        // order as a tile's bar: Delete leads, Transcript closes (T6/R5: nothing else).
+        // order as a tile's bar: Delete leads, Resume sits next to Transcript, Transcript
+        // closes (T6/R5: no inline confirmation row; T4/R2: Resume is the permanent middle
+        // child and is hidden for a thread that is not `stopped`).
         expect([...(bar?.children ?? [])].map((node) => node.className)).toEqual([
             'thread-delete',
+            'resume-open action-resume',
             'transcript-open action-transcript thread-focus-transcript'
         ]);
         const rosterDelete = actionButton(bar as HTMLElement, '.thread-delete');
@@ -1592,10 +1626,12 @@ describe('confirmed thread deletion', () => {
         const card = turn.element;
 
         // T26: Delete first (it is clickable from the bar, no header host needed) and
-        // Transcript last. T6/R5: those are the bar's ONLY children — an accidental
-        // second press has no inline row to confirm any more.
+        // Transcript last. T6/R5: those are the bar's ONLY ACTIONS — an accidental
+        // second press has no inline row to confirm any more. T4/R2: the third child is
+        // the always-present Resume control, hidden because this thread is not stopped.
         expect([...bar.children].map((node) => node.className)).toEqual([
             'thread-delete',
+            'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
 
@@ -1744,6 +1780,9 @@ describe('confirmed thread deletion', () => {
         // T26: an undeletable default conversation hides ONLY the Delete button — the bar
         // stays (Transcript is still owed) and `margin-left: auto` keeps that trailing
         // action flush right instead of sliding it into the destructive action's place.
+        // T4/R2: this thread is not `stopped` either, so Resume is hidden as well and the
+        // `.resume-open[hidden] + .transcript-open { margin-left: auto }` rule is what hands
+        // the flush-right slot back to Transcript.
         expect(
             [...defaultBar.children]
                 .filter((node) => !(node instanceof HTMLElement && node.hidden))
@@ -1751,6 +1790,12 @@ describe('confirmed thread deletion', () => {
         ).toEqual(['transcript-open action-transcript']);
         expect(actionButton(defaultBar, '.transcript-open').hidden).toBe(false);
         expect(actionButton(defaultBar, '.transcript-open').disabled).toBe(false);
+        // The Resume node survives the `hidden` with its accessible name intact (a reader
+        // that reaches it can still tell what it would do), and an unwired host says so.
+        const defaultResume = actionButton(defaultBar, '.resume-open');
+        expect(defaultResume.hidden).toBe(true);
+        expect(defaultResume.getAttribute('aria-label')).toBe('Resume thread RR5');
+        expect(defaultResume.title).toBe('Thread resume is not wired in this host.');
         // The control is still there (just not painted), so its accessible name and honest
         // reason survive the `hidden`.
         expect(deleteButton(defaultTurn.element).getAttribute('aria-label')).toBe(
@@ -1765,13 +1810,16 @@ describe('confirmed thread deletion', () => {
         const runningBar = tileAction(runningTurn);
         // R1: a live thread's destructive action is STOP, not a disabled Delete. It is
         // still the SAME single button and it still carries `.thread-delete` (the
-        // `.thread-stop` modifier is additive), so the bar's two-child anatomy, its order
-        // and every existing selector are unchanged. T6/R5 still holds: no confirmation
-        // dialog of any kind is reachable from a live conversation.
+        // `.thread-stop` modifier is additive), so the bar's anatomy, its order and every
+        // existing selector are unchanged. T6/R5 still holds: no confirmation dialog of any
+        // kind is reachable from a live conversation. T4/R2: the third child is the Resume
+        // control, and a RUNNING thread is not `stopped`, so it stays unpainted.
         expect([...runningBar.children].map((node) => node.className)).toEqual([
             'thread-delete thread-stop',
+            'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
+        expect(actionButton(runningBar, '.resume-open').hidden).toBe(true);
         const runningStop = deleteButton(runningTurn.element);
         expect(runningStop.hidden).toBe(false);
         // This standalone board has no STOP transport either; the control says so instead

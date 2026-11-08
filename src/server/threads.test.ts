@@ -1439,6 +1439,572 @@ describe('thread HTTP contract', () => {
 
 
 // ---------------------------------------------------------------------------
+// R1: resuming a STOPPED conversation (store `resumeThread` +
+// POST /sessions/:id/threads/:threadId/resume)
+// ---------------------------------------------------------------------------
+//
+// A stop marks the run it aborted (and any backlog it dropped) `cancelled`, so the answer
+// the user asked for never arrived. `resumeThread` replays THAT turn's recorded input as a
+// fresh continuation turn through the ordinary submit path, and the interrupted row stays as
+// the durable record of the stop. Pinned here: the replayed turn and its fidelity
+// (prompt/attachments/references), the revived conversation status, every state guard
+// (409 not stopped / answer reached / nothing recorded / work in flight), the 404s, and the
+// HTTP route's receipt.
+//
+// The scripted fixture dispatches its gate on the conversation's FIRST user message
+// (`routed`), so an anchor turn creates a conversation whose LATER runs can all be parked on
+// one gate — that is how these tests hold a replay mid-run and read `running` deterministically.
+
+describe('stopped-thread resume', () => {
+    it('replays the interrupted turn as a continuation and revives the conversation', async () => {
+        pinClock(1_000);
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        // A completed first turn: it makes the conversation's later runs park on the
+        // `anchor` gate, which is what lets this test observe the replay mid-run.
+        const anchor = await store.enqueue(created.id, 'anchor');
+        await anchor.settled;
+
+        fixture.gate('anchor');
+        const interrupted = await store.enqueue(created.id, 'question', undefined, undefined, 'thread-1');
+        await fixture.started('question').promise;
+
+        expect((await store.cancelThread(created.id, 'thread-1')).cancelled).toBe(true);
+        await interrupted.settled;
+        await store.waitForIdle(created.id);
+
+        // THE STATE RESUME STARTS FROM: the interrupted row is terminal, the conversation is
+        // stopped, and no answer for `question` exists anywhere.
+        expect(store.get(created.id).turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}`)).toEqual([
+            '0:anchor:done',
+            '1:question:cancelled'
+        ]);
+        expect(store.get(created.id).threads!.map((thread) => `${thread.id}:${thread.status}`)).toEqual([
+            'thread-1:stopped'
+        ]);
+
+        const resumed = await store.resumeThread(created.id, 'thread-1');
+
+        // A NEW turn in the SAME conversation carrying the SAME input; the interrupted row is
+        // untouched. `queued` because the accepted record is captured before the pump runs.
+        expect(resumed.turn).toEqual({
+            id: resumed.turn.id,
+            index: 2,
+            prompt: 'question',
+            threadId: 'thread-1',
+            threadLabel: 'PE1',
+            status: 'queued',
+            updatedAt: 1_000,
+            events: [],
+            eventTimes: []
+        });
+
+        // The replay is really executing (parked on the anchor gate), and the conversation is
+        // no longer stopped: the runtime's host-revival path ran on this turn's behalf.
+        await waitUntil(() => fixture.log.filter((entry) => entry === 'start:question').length === 2);
+        expect(store.liveSession(created.id).harness.thread('thread-1')!.status).toBe('running');
+
+        fixture.gate('anchor').resolve();
+        await resumed.settled;
+        await store.waitForIdle(created.id);
+
+        // The transcript proves the continuation ran the interrupted prompt again, in the same
+        // conversation (the anchor answer is still in front of it).
+        expect(store.get(created.id).turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}`)).toEqual([
+            '0:anchor:done',
+            '1:question:cancelled',
+            '2:question:done'
+        ]);
+        expect(store.get(created.id).threads!.map((thread) => `${thread.id}:${thread.status}`)).toEqual([
+            'thread-1:idle'
+        ]);
+        expect(fixture.log).toEqual([
+            'start:anchor',
+            'end:anchor',
+            'start:question',
+            'end:question',
+            'start:question',
+            'end:question'
+        ]);
+        expect(lastUser(fixture.requests[fixture.requests.length - 1]!)).toBe('question');
+        // The replay asks the SAME question in the SAME conversation: the anchor turn is still
+        // the front of that transcript, and only the replayed `question` follows it.
+        expect(
+            fixture.requests[fixture.requests.length - 1]!
+                .filter((message) => message.role === 'user')
+                .map((message) => String(message.content))
+        ).toEqual(['anchor', 'question']);
+    });
+
+    it('refuses every state that is not a stopped conversation with an unanswered turn', async () => {
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        // 404s come first, in `cancelThread`'s exact wording, so one typo cannot 409.
+        await expect(store.resumeThread('missing', 'thread-1')).rejects.toThrow('Unknown session "missing".');
+        await expect(store.resumeThread(created.id, 'thread-404')).rejects.toThrow('Unknown thread "thread-404".');
+
+        // An IDLE conversation already takes ordinary input: nothing to revive.
+        const answered = await store.enqueue(created.id, 'answered');
+        await answered.settled;
+        await expect(store.resumeThread(created.id, 'thread-1')).rejects.toThrow(
+            'Thread "thread-1" is idle; only a stopped thread can be resumed.'
+        );
+
+        // A RUNNING conversation has work in flight.
+        fixture.gate('running');
+        const live = await store.enqueue(created.id, 'running', undefined, undefined, 'thread-1');
+        await fixture.started('running').promise;
+        await expect(store.resumeThread(created.id, 'thread-1')).rejects.toThrow(
+            'Thread "thread-1" is running; only a stopped thread can be resumed.'
+        );
+        fixture.gate('running').resolve();
+        await live.settled;
+        await store.waitForIdle(created.id);
+
+        // THE REQUEST'S OWN BOUNDARY: "as long as the answer isn't reached". A stopped thread
+        // whose LAST turn is `done` reached its answer, so replaying it would only duplicate it.
+        await store.cancelThread(created.id, 'thread-1');
+        expect(store.get(created.id).threads![0]).toEqual(expect.objectContaining({ id: 'thread-1', status: 'stopped' }));
+        await expect(store.resumeThread(created.id, 'thread-1')).rejects.toThrow(
+            'Thread "thread-1" already reached its answer (turn 1 is done).'
+        );
+    });
+
+    it('claims the lane so two resumes in one tick cannot queue two continuations', async () => {
+        pinClock(1_000);
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const anchor = await store.enqueue(created.id, 'anchor');
+        await anchor.settled;
+
+        fixture.gate('anchor');
+        const interrupted = await store.enqueue(created.id, 'question', undefined, undefined, 'thread-1');
+        await fixture.started('question').promise;
+        await store.cancelThread(created.id, 'thread-1');
+        await interrupted.settled;
+        await store.waitForIdle(created.id);
+
+        // Dispatched together: the status check alone would let BOTH through, because the
+        // runtime's `stopped` flag is cleared only when the revived run starts. The second
+        // caller is refused by the lane claim instead.
+        const [accepted, refused] = await Promise.allSettled([
+            store.resumeThread(created.id, 'thread-1'),
+            store.resumeThread(created.id, 'thread-1')
+        ]);
+
+        expect(accepted.status).toBe('fulfilled');
+        expect(refused).toEqual({
+            status: 'rejected',
+            reason: expect.objectContaining({
+                name: 'SessionError',
+                status: 409,
+                message: 'Thread "thread-1" is already being resumed.'
+            })
+        });
+
+        const resumed = (accepted.value as Awaited<ReturnType<SessionStore['resumeThread']>>).turn;
+
+        // Exactly ONE continuation exists, and it is the one that carries the replayed input.
+        expect(store.get(created.id).turns.filter((turn) => turn.index === 2)).toHaveLength(1);
+        expect(resumed.prompt).toBe('question');
+
+        // Parked on the anchor gate, the replay is verifiably RUNNING before the next call, so
+        // the refusal below is the state the first resume produced (R1's "already running"
+        // race), not a timing artefact of a pump that had not started yet.
+        await waitUntil(() => store.liveSession(created.id).harness.thread('thread-1')!.status === 'running');
+        await expect(store.resumeThread(created.id, 'thread-1')).rejects.toThrow(
+            'Thread "thread-1" is running; only a stopped thread can be resumed.'
+        );
+
+        fixture.gate('anchor').resolve();
+        await store.waitForIdle(created.id);
+        expect(store.get(created.id).turns.map((turn) => `${turn.index}:${turn.status}`)).toEqual([
+            '0:done',
+            '1:cancelled',
+            '2:done'
+        ]);
+    });
+
+    it('replays the interrupted turn with its attachments and result references', async () => {
+        pinClock(1_000);
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const base = await store.enqueue(created.id, 'base');
+        await base.settled;
+
+        // Hold the session's exclusive gate with a legacy run, so a lane submit QUEUES: the
+        // interrupted turn is then a backlog row the stop marks `cancelled` without ever
+        // running it, which keeps every value below known before it is asserted.
+        fixture.gate('legacy');
+        const legacy = store.run(created.id, 'legacy', async () => {});
+        await fixture.started('legacy').promise;
+
+        const attachment = {
+            id: 'image-1',
+            kind: 'image' as const,
+            marker: '[Image 1]',
+            name: 'pixel.png',
+            mime: 'image/png',
+            size: 8,
+            data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64')
+        };
+
+        const interrupted = await store.enqueue(
+            created.id,
+            'with media',
+            [attachment],
+            [{ turnId: base.turn.id, label: 'PE1' }],
+            'thread-1'
+        );
+        expect(interrupted.turn.status).toBe('queued');
+
+        await store.cancelThread(created.id, 'thread-1');
+        await interrupted.settled;
+
+        const stopped = store.get(created.id).turns.at(-1)!;
+        expect(stopped.status).toBe('cancelled');
+
+        const resumed = await store.resumeThread(created.id, 'thread-1');
+
+        // FULL FIDELITY: the durable turn row keeps the prompt, the accepted attachment bytes
+        // and the bound reference list, and the replay carries all three (./persistence.ts
+        // revalidates each on load, so a restart has the same record to replay).
+        expect(resumed.turn).toEqual({
+            id: resumed.turn.id,
+            index: 3,
+            prompt: 'with media',
+            threadId: 'thread-1',
+            threadLabel: 'PE1',
+            references: [{ turnId: base.turn.id, label: 'PE1' }],
+            attachments: [attachment],
+            status: 'queued',
+            updatedAt: 1_000,
+            events: [],
+            eventTimes: []
+        });
+
+        // The replay is accepted but NOT yet running (the legacy run holds the session's
+        // exclusive gate, so the lane parks). A second resume therefore reads the row the first
+        // one created and refuses it as work in flight — the claim is not what keeps this tight.
+        await expect(store.resumeThread(created.id, 'thread-1')).rejects.toThrow(
+            'Thread "thread-1" still has turn 3 queued.'
+        );
+
+        fixture.gate('legacy').resolve();
+        await legacy;
+        await resumed.settled;
+        await store.waitForIdle(created.id);
+
+        // And the run it produces is the run the interrupted turn would have had: the reference
+        // is re-expanded at execution (the stored prompt is the SUBMITTED text, so the block
+        // content is folded in by the same expansion the interrupted turn used), and the
+        // attachment rides along with it.
+        const expanded = [
+            'with media',
+            '',
+            REFERENCED_RESULTS_HEADER,
+            `--- #PE1 | agent probe | turn ${base.turn.id} ---`,
+            'answer:base',
+            '--- end #PE1 ---',
+            REFERENCED_RESULTS_FOOTER
+        ].join('\n');
+        const request = fixture.requests[fixture.requests.length - 1]!;
+
+        expect(lastUser(request)).toBe(expanded);
+        expect(request.filter((message) => message.role === 'user' && message.attachments !== undefined)).toEqual([
+            { role: 'user', content: expanded, attachments: [attachment] }
+        ]);
+    });
+
+    it('refuses a stopped conversation that has no recorded turn of its own', async () => {
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        // A conversation the runtime opened (a delegated child, or an extra host thread) can be
+        // stopped without this server ever recording a turn for it: there is no stored input to
+        // replay, and inventing one would be new persistence.
+        const extra = store.liveSession(created.id).harness.createThread('probe');
+        await store.cancelThread(created.id, extra.id);
+        expect(store.get(created.id).threads!.find((thread) => thread.id === extra.id)!.status).toBe('stopped');
+
+        await expect(store.resumeThread(created.id, extra.id)).rejects.toThrow(
+            `Thread "${extra.id}" has no recorded turn to resume.`
+        );
+    });
+
+    it('replays the interrupted turn after a restart from the durable record', async () => {
+        pinClock(3_000);
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't3-resume-'));
+        const fixture = createFixture();
+        const persistence = new HarnessPersistence(root);
+        const first = createStore([fixture.preset], persistence);
+        const created = await first.create('probe');
+
+        const attachment = {
+            id: 'image-1',
+            kind: 'image' as const,
+            marker: '[Image 1]',
+            name: 'pixel.png',
+            mime: 'image/png',
+            size: 8,
+            data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64')
+        };
+
+        fixture.gate('interrupted');
+        const interrupted = await first.enqueue(created.id, 'interrupted', [attachment]);
+        await fixture.started('interrupted').promise;
+        await first.cancelThread(created.id, 'thread-1');
+        fixture.gate('interrupted').resolve();
+        await interrupted.settled;
+        await first.waitForIdle(created.id);
+        expect(first.get(created.id).turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual([
+            'interrupted:cancelled'
+        ]);
+
+        // A crash: a FRESH store over the same root, no dispose, nothing running or queued.
+        const second = createStore([fixture.preset], persistence, persistence.load());
+
+        // The stop survives (a `stopped` thread record and its `cancelled` row are durable), so
+        // the replay after a restart needs nothing but the stored turn: same prompt, same
+        // conversation, same attachment bytes. This is the proof the fidelity claim is about the
+        // DURABLE record, not about process memory.
+        expect(second.get(created.id).threads!.map((thread) => `${thread.id}:${thread.status}`)).toEqual([
+            'thread-1:stopped'
+        ]);
+
+        const resumed = await second.resumeThread(created.id, 'thread-1');
+        expect(resumed.turn).toEqual({
+            id: resumed.turn.id,
+            index: 1,
+            prompt: 'interrupted',
+            threadId: 'thread-1',
+            threadLabel: 'PE1',
+            attachments: [attachment],
+            status: 'queued',
+            updatedAt: 3_000,
+            events: [],
+            eventTimes: []
+        });
+
+        await resumed.settled;
+        await second.waitForIdle(created.id);
+        expect(second.get(created.id).turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual([
+            'interrupted:cancelled',
+            'interrupted:done'
+        ]);
+
+        first.dispose();
+        second.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R1 (HTTP): POST /sessions/:id/threads/:threadId/resume
+// ---------------------------------------------------------------------------
+
+describe('thread resume HTTP contract', () => {
+    const runtimeOf = (presets: HarnessPreset[]): HarnessRuntime =>
+        createHarnessRuntime({
+            settings: SETTINGS,
+            defaults: RUNTIME_DEFAULTS,
+            store: new SessionStore(SETTINGS, createHarnessRegistry(presets)),
+            loadEnvironment: false
+        });
+
+    const turnOf = async (runtime: HarnessRuntime, sessionId: string, turnId: string): Promise<TurnResource> => {
+        const result = await jsonOf<TurnResponse>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}`)
+        );
+
+        expect(result.status).toBe(200);
+        return result.body.turn;
+    };
+
+    const threadRosterOf = async (runtime: HarnessRuntime, sessionId: string): Promise<ThreadSummary[]> => {
+        const result = await jsonOf<ThreadSummaryPage>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/threads`)
+        );
+
+        expect(result.status).toBe(200);
+        return result.body.items;
+    };
+
+    const turnRowsOf = async (runtime: HarnessRuntime, sessionId: string): Promise<TurnSummary[]> => {
+        const result = await jsonOf<TurnSummaryPage>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/turns`)
+        );
+
+        expect(result.status).toBe(200);
+        return result.body.items;
+    };
+
+    it('answers the submit receipt and re-runs the interrupted prompt', async () => {
+        pinClock(2_000);
+        const fixture = createFixture();
+        const runtime = runtimeOf([fixture.preset]);
+        const id = await createSession(runtime, 'probe');
+
+        // Anchor turn, then a `question` run parked on the anchor gate and stopped: the
+        // conversation's last row is the cancelled `question` the route has to replay.
+        const anchor = await jsonOf<TaskReceipt>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: 'anchor' })
+        );
+        expect(anchor.status).toBe(202);
+        await runtime.store.waitForIdle(id);
+
+        fixture.gate('anchor');
+        void callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: 'question', thread_id: 'thread-1' });
+        await fixture.started('question').promise;
+
+        expect(
+            (await jsonOf<CancelThreadResult>(
+                await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/cancel`)
+            )).status
+        ).toBe(200);
+        await runtime.store.waitForIdle(id);
+
+        const resumed = await jsonOf<TaskReceipt>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/resume`)
+        );
+
+        // 200 + the SAME `TaskReceipt` a normal submit answers with (the fixed contract), with
+        // no steering marker: this is a continuation turn, not guidance folded into a run. No
+        // `queue_position` either: the lane was free, so the pump moved the replay straight into
+        // its active slot — exactly how an ordinary continuation into a free thread reads. The
+        // two identity/revision fields are pinned by the turns call below.
+        expect(resumed.status).toBe(200);
+        expect(resumed.body).toEqual({
+            session_id: id,
+            turn_id: resumed.body.turn_id,
+            status: 'queued',
+            thread_id: 'thread-1',
+            session_revision: resumed.body.session_revision,
+            accepted_at: 2_000,
+            links: {
+                turn: `/v1/harness/sessions/${id}/turns/${resumed.body.turn_id}`,
+                turns: `/v1/harness/sessions/${id}/turns`,
+                thread: `/v1/harness/sessions/${id}/threads/thread-1`,
+                stream: '/v1/harness/stream'
+            }
+        });
+
+        // The recorded row IS a replay of the interrupted turn's input, in the same
+        // conversation and with the same label. The read happens after the pump started it, and
+        // the run is parked on the anchor gate, so the row is `running` while the receipt above
+        // stated the accepted state (`queued`) — the same pair every submit's receipt and later
+        // read show.
+        expect(await turnOf(runtime, id, resumed.body.turn_id)).toMatchObject({
+            id: resumed.body.turn_id,
+            index: 2,
+            prompt: 'question',
+            thread_id: 'thread-1',
+            thread_label: 'PE1',
+            status: 'running'
+        });
+
+        // The lane backlog parked on the anchor gate, so the roster row states the revival.
+        expect((await threadRosterOf(runtime, id)).find((row) => row.id === 'thread-1')!.status).toBe('running');
+
+        fixture.gate('anchor').resolve();
+        await runtime.store.waitForIdle(id);
+
+        // The page is the durable proof of what the resume did: the interrupted row stays
+        // `cancelled`, the replay is a NEW row with the same preview in the same conversation,
+        // and the conversation is addressable again (`idle`, not `stopped`).
+        expect(
+            (await turnRowsOf(runtime, id)).map((row) => `${row.index}:${row.threadId}:${row.promptPreview}:${row.status}`)
+        ).toEqual([
+            '0:thread-1:anchor:done',
+            '1:thread-1:question:cancelled',
+            '2:thread-1:question:done'
+        ]);
+        expect((await threadRosterOf(runtime, id)).find((row) => row.id === 'thread-1')!.status).toBe('idle');
+
+        // A conversation that answered again is no longer resumable: the answer was reached.
+        const again = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/resume`)
+        );
+        expect(again).toEqual({
+            status: 409,
+            body: { error: { message: 'Thread "thread-1" is idle; only a stopped thread can be resumed.' } }
+        });
+    });
+
+    it('refuses the states this route is not for, and 404s an unknown conversation', async () => {
+        const fixture = createFixture();
+        const runtime = runtimeOf([fixture.preset]);
+        const id = await createSession(runtime, 'probe');
+
+        // Unknown conversation in a known session: 404, scoped to the session in the path, in
+        // `cancel`/`delete`'s exact wording.
+        const unknownThread = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-404/resume`)
+        );
+        expect(unknownThread).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown thread "thread-404" in session "${id}".` } }
+        });
+
+        // Unknown session: the store's own 404, unchanged by the route.
+        const unknownSession = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'POST', '/v1/harness/sessions/gone/threads/thread-1/resume')
+        );
+        expect(unknownSession).toEqual({ status: 404, body: { error: { message: 'Unknown session "gone".' } } });
+
+        // A session that has never run has no host conversation at all: the default
+        // conversation is `agent:<name>`, and `thread-1` only exists once a submit opens one.
+        const neverOpened = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/resume`)
+        );
+        expect(neverOpened).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown thread "thread-1" in session "${id}".` } }
+        });
+
+        const answered = await jsonOf<TaskReceipt>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, { input: 'answered' })
+        );
+        expect(answered.status).toBe(202);
+        await runtime.store.waitForIdle(id);
+
+        const idle = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/resume`)
+        );
+        expect(idle).toEqual({
+            status: 409,
+            body: { error: { message: 'Thread "thread-1" is idle; only a stopped thread can be resumed.' } }
+        });
+
+        // Stop an IDLE conversation: it is now stopped, but its last turn answered, so the
+        // request's own "as long as the answer isn't reached" bound refuses the replay.
+        expect(
+            (await jsonOf<CancelThreadResult>(
+                await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/cancel`)
+            )).status
+        ).toBe(200);
+
+        const reached = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/threads/thread-1/resume`)
+        );
+        expect(reached).toEqual({
+            status: 409,
+            body: { error: { message: 'Thread "thread-1" already reached its answer (turn 0 is done).' } }
+        });
+    });
+});
+
+
+// ---------------------------------------------------------------------------
 // Delegated child conversations on the server roster
 // ---------------------------------------------------------------------------
 

@@ -3148,6 +3148,7 @@ POST   /sessions/:id/tasks                    { input, attachments?, references?
 GET    /sessions/:id/threads/:threadId/transcript                           -> { transcript }
 PUT    /sessions/:id/threads/:threadId/transcript { messages }              -> { session, transcript }
 POST   /sessions/:id/threads/:threadId/cancel { }                        -> { cancelled, session? }
+POST   /sessions/:id/threads/:threadId/resume { }     -> the submit receipt, re-running the interrupted turn
 DELETE /sessions/:id/threads/:threadId                                  -> { deleted: true, session }
 POST   /sessions/:id/cancel                   { all: true }              -> { cancelled }
 ```
@@ -3598,6 +3599,7 @@ POST   /v1/harness/sessions/:id/cancel    cancel active work ({ all } also drops
 POST   /v1/harness/sessions/:id/actions/:requestId/answer   answer one pending actionRequest
 GET    /v1/harness/sessions/:id/threads/:threadId/transcript       one transcript (editable JSON)
 PUT    /v1/harness/sessions/:id/threads/:threadId/transcript       replace it → { session, transcript }
+POST   /v1/harness/sessions/:id/threads/:threadId/resume           re-run a stopped conversation's interrupted turn → 200 submit receipt
 ```
 
 A `POST …/tasks` whose `input` starts with `/` is executed as a slash command in the

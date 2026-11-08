@@ -2,11 +2,15 @@
 // deletes the thread through the EXISTING `DELETE /sessions/:id/threads/:threadId`
 // endpoint, then reconciles the returned snapshot (focus/tiles/transcript/roster).
 //
-// T26 (the swap): that ONE toolbar is also the only Delete surface. Its children are
-// exactly `Delete` and `Transcript` — no `.tile-header-action` (or
+// T26 (the swap): that ONE toolbar is also the only Delete surface. Its visible children
+// are `Delete` and `Transcript` — no `.tile-header-action` (or
 // `.thread-header-action` / `.thread-focus-head-action`) exists anywhere, and the
 // header's freed right edge carries the elapsed|tokens measurement line instead. Every
 // Delete click here therefore goes through `.tile-transcript-action .thread-delete`.
+// T4/R2 adds a THIRD, permanent child between them: `Resume`, which ui/turns.ts keeps
+// `hidden` unless the roster row says `stopped`. The DOM order pinned below is therefore
+// three children on every surface, while the two actions this fixture's threads need stay
+// exactly Delete and Transcript.
 //
 // T6/R5 makes the NEXT step responsive, and it decides what every test below sees:
 // jsdom has no `matchMedia`, so the board cannot prove a desktop and each press takes the
@@ -272,6 +276,9 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(tile.querySelector('.tile-header-action')).toBeNull();
     expect([...bar.children].map((node) => node.className)).toEqual([
         'thread-delete',
+        // T4/R2: the permanent Resume slot, between Delete and Transcript. This fixture's
+        // thread is `idle` — live but not halted — so it is in the DOM and NOT painted.
+        'resume-open action-resume',
         'transcript-open action-transcript'
     ]);
     // The shell DOES wire the DELETE transport, so the bar's leading action is live here
@@ -287,6 +294,16 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     if (shellTranscript === null) throw new Error('missing toolbar transcript button');
     expect(shellTranscript.getAttribute('aria-label')).toBe('Open the JSON transcript of IN1');
     expect(shellTranscript.querySelector('.action-label')?.textContent).toBe('Transcript');
+    // T4/R2: the shell resolves `resumeThread` for this view exactly like it resolves
+    // `deleteThread`/`stopThread`, so even an UNPAINTED Resume control states the action it
+    // would perform instead of the missing-transport reason the standalone board shows.
+    const shellResume = bar.querySelector<HTMLButtonElement>('.resume-open');
+    if (shellResume === null) throw new Error('missing toolbar resume button');
+    expect(shellResume.hidden).toBe(true);
+    expect(shellResume.getAttribute('aria-label')).toBe('Resume thread IN1');
+    expect(shellResume.title).toBe('Resume this stopped thread');
+    expect(shellResume.querySelector('.action-label')?.textContent).toBe('Resume');
+    expect(shellResume.querySelector('.action-glyph')?.textContent).toBe('▶');
     expect(
         [...(tile.querySelectorAll<HTMLElement>('.tile-identity > *') ?? [])].map((node) => node.className)
     ).toEqual(['tile-thread']);

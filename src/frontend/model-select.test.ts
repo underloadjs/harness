@@ -8,6 +8,10 @@
 //   - a model change PATCHes the complete override map;
 //   - promotion/add preserve the map, removal drops the removed member's key, and
 //     choosing the default deletes that member's entry;
+//   - R1/R2/R3: for a harness TEMPLATE whose card omits `agent_models` (what the real server
+//     publishes), the save merges onto the stored map the dialog RENDERS from, so clearing an
+//     override is never refused as "Nothing changed.", other members' overrides survive, and
+//     clearing the last one sends an explicit empty map;
 //   - a saved session's TEAM is frozen (New session affordance, disabled
 //     promotion/add/remove) but its MODELS are live (R2): the dropdowns stay
 //     enabled and PATCH /sessions/:id, applying the returned snapshot, including
@@ -326,6 +330,115 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     selectConfigured('instruct');
     expect(modelSelects()[0].value).toBe('');
     expect(optionTexts(modelSelects()[0])[0]).toBe('m1');
+});
+
+// R1 + R2 + R3 (the reported "Nothing changed." bug on the Agents · Instruct dialog).
+//
+// The template's card deliberately carries NO `agentModels`, which is what the real server
+// publishes for a `HarnessCard` (../shared/harness-api.ts:418-419): the only publisher of the
+// stored per-agent overrides is the identified read the dialog performs on open,
+// `GET /harnesses/:name`. Every fixture above models an UNREDACTED definition (the card states
+// the map), so the merge baseline and the stored map happened to agree and the bug was invisible.
+// Here they do not, and the three rules the save has to honour become observable:
+//   - R1: choosing the dropdown's default option ('') clears a stored override. That IS a
+//     change, so it must reach the PATCH instead of dying in the "Nothing changed." guard;
+//   - R2: the map that replaces the server's must still carry the OTHER member's stored
+//     override (the server replaces the whole field — the old empty baseline wiped it);
+//   - R3: clearing the LAST remaining override must still send the field, as an explicit empty
+//     map. An omitted field means "no change" server-side (../server/api.ts `patchHarness`), so
+//     the override the reader removed would have stayed stored forever.
+it('saves harness model changes against the stored map the dialog renders from', async () => {
+    // The state the SERVER holds. Only the identified read publishes it; the boot card never
+    // sees it, and a PATCH replaces it with exactly what arrives (omitted = kept).
+    let stored: Record<string, string> = { instruct: 'makora/ds4-flash', summarizer: 'other/model' };
+    const patches: Record<string, unknown>[] = [];
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(
+            viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+
+                if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
+                if (url === '/api/models') return json({ models: ['m1', 'm2', 'm3'] });
+
+                if (url === '/api/harnesses/instruct' && init?.method === 'PATCH') {
+                    // The adapter hands the fixture the body in the fixture's own spelling
+                    // (`agentModels`), which is what every other fixture here asserts on.
+                    const request = JSON.parse(String(init.body)) as {
+                        primary: string;
+                        subagents: string[];
+                        agentModels?: Record<string, string>;
+                    };
+                    patches.push(request);
+                    if (request.agentModels !== undefined) stored = { ...request.agentModels };
+
+                    return json({ harness: descriptor({ agentModels: stored }) });
+                }
+
+                if (url === '/api/harnesses/instruct') return json({ harness: descriptor({ agentModels: stored }) });
+
+                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+            }, { root: '/api' })
+        )
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The dropdown shows the stored override the reader reported — `makora/ds4-flash`, not the
+    // fallback — purely from the dialog's open read. Nothing has been written yet.
+    openDeck();
+    await flush();
+    expect(modelSelects()[0].value).toBe('makora/ds4-flash');
+    expect(patches).toEqual([]);
+
+    // --- R1 + R2: clear Instruct's override by choosing the default option -----------------
+    const instruct = modelSelects()[0];
+    instruct.value = '';
+    instruct.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(patches).toEqual([]);
+
+    applyAction().click();
+    await flush();
+
+    // ONE PATCH, and its map is the intended final state: Instruct's key gone, Summarizer's
+    // stored override restated. `toEqual` distinguishes a present `{}`/map from an omitted
+    // field, so this pins both halves of R2 at once.
+    expect(patches).toEqual([
+        {
+            primary: 'instruct',
+            subagents: ['summarizer'],
+            agentModels: { summarizer: 'other/model' }
+        }
+    ]);
+
+    // --- R3: clear the last remaining override -------------------------------------------
+    selectConfigured('summarizer');
+    const summarizer = modelSelects()[0];
+    expect(summarizer.value).toBe('other/model');
+
+    summarizer.value = '';
+    summarizer.dispatchEvent(new Event('change', { bubbles: true }));
+    applyAction().click();
+    await flush();
+
+    // The field is SENT even though the map is empty (mirror of the instructions half,
+    // `sendsInstructions` in ./main.ts `patchAgents`).
+    expect(patches[1]).toEqual({
+        primary: 'instruct',
+        subagents: ['summarizer'],
+        agentModels: {}
+    });
+
+    // Both members are back on the fallback model, so the dialog restates the saved truth and
+    // has nothing pending: a second save of the same state is the one case that legitimately
+    // answers "Nothing changed."
+    selectConfigured('instruct');
+    expect(modelSelects()[0].value).toBe('');
+    expect(optionTexts(modelSelects()[0])[0]).toBe('m1');
+    expect(applyAction().disabled).toBe(true);
 });
 
 it('names the server fallback when the stored settings model is blank', async () => {

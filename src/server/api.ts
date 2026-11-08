@@ -225,7 +225,7 @@ import type { AgentProfilePatch } from './harnesses/agent-state';
 import { writeHarnessAgentRecords } from './persistence';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
 import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
-import type { SessionRecord, ThreadLaneInfo } from './sessions';
+import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
 // T5 (R2/R3): the plugin settings store's status-carrying failure (404 unknown plugin, 400
 // unknown key / mistyped / out-of-range value). The store itself is reached through
 // `store.pluginSettings`, so this dispatcher never constructs a second one.
@@ -2314,6 +2314,52 @@ export const createHarnessApi = ({
         return json(200, result, (result as { revision?: number }).revision);
     };
 
+    // The 202/200 acceptance receipt of ONE durable submit, extracted so `POST /tasks` and
+    // `POST .../threads/:threadId/resume` cannot state the same acceptance differently (the
+    // resume contract promises the identical `TaskReceipt` shape, R1). Pure: it reads the live
+    // record and the store's answer, and mutates nothing.
+    const taskReceiptOf = (
+        mount: string,
+        sessionId: string,
+        live: SessionRecord,
+        submitted: EnqueuedTask,
+        sessionRevision: number
+    ): TaskReceipt => {
+        // T39 (regression): the contract's `TaskReceipt.queue_position` is an ORDINAL with
+        // `minimum: 1` (./harness.swagger.yaml:5001-5005 — "equal to `GET .../queue`'s
+        // ordering"), while `QueuedTask.position` is the 0-based array slot of the same ordering
+        // (./harness.swagger.yaml:5101-5104). Deriving the receipt figure straight from
+        // `row.position` therefore reported the FIRST queued task as slot `0`, which the contract
+        // forbids and which read as "no place in line". `findIndex` over the same projection keeps
+        // the two figures consistent: receipt N == queue page row N-1.
+        //
+        // A submit that is NOT in a backlog has no position at all: it either became the active
+        // run or was steered into one (both report `status` without `queue_position`), which is
+        // the intended concurrent plain-thread behaviour.
+        const queuedAt = queueRowsOf(live).findIndex((row) => row.turn_id === submitted.turn.id);
+
+        return {
+            session_id: sessionId,
+            turn_id: submitted.turn.id,
+            status: submitted.turn.status,
+            thread_id: submitted.turn.threadId ?? submitted.steeredThreadId ?? submitted.turn.threadId ?? '',
+            ...(submitted.steered === true ? { steered: true } : {}),
+            ...(submitted.steeredThreadId === undefined ? {} : { steered_thread_id: submitted.steeredThreadId }),
+            ...(queuedAt === -1 ? {} : { queue_position: queuedAt + 1 }),
+            session_revision: sessionRevision,
+            accepted_at: Date.now(),
+            links: {
+                turn: `${mount}/sessions/${sessionId}/turns/${submitted.turn.id}`,
+                turns: `${mount}/sessions/${sessionId}/turns`,
+                thread:
+                    submitted.turn.threadId === undefined
+                        ? `${mount}/sessions/${sessionId}/turns`
+                        : `${mount}/sessions/${sessionId}/threads/${submitted.turn.threadId}`,
+                stream: `${mount}/stream`
+            }
+        };
+    };
+
     // The durable submit. 202 + a receipt, never the aggregate: the receipt names the turn,
     // its status, the conversation it landed in, the new session revision, and the links to
     // re-read; the content itself arrives on the stream.
@@ -2337,25 +2383,18 @@ export const createHarnessApi = ({
 
         const live = store.liveSession(record.id);
 
-        // T39 (regression): the contract's `TaskReceipt.queue_position` is an ORDINAL with
-        // `minimum: 1` (./harness.swagger.yaml:5001-5005 — "equal to `GET .../queue`'s
-        // ordering"), while `QueuedTask.position` is the 0-based array slot of the same ordering
-        // (./harness.swagger.yaml:5101-5104). Deriving the receipt figure straight from
-        // `row.position` therefore reported the FIRST queued task as slot `0`, which the contract
-        // forbids and which read as "no place in line". `findIndex` over the same projection keeps
-        // the two figures consistent: receipt N == queue page row N-1.
-        //
-        // A submit that is NOT in a backlog has no position at all: it either became the active
-        // run or was steered into one (both report `status` without `queue_position`), which is
-        // the intended concurrent plain-thread behaviour.
-        const queuedAt = queueRowsOf(live).findIndex((row) => row.turn_id === submitted.turn.id);
-
         const sessionRevision = events.bumpRevision('session', record.id);
 
         // T16 counter domains: the store's own `turn.upsert` signal already moved `turns` and the
         // `turn`/`turn_display`/`turn_events` trio (and the conversation row when a thread was
         // named), so this path moves only what only a request can know: the queue view.
         events.bumpRevision('queue', record.id);
+
+        // The receipt is built from the live backlog BEFORE the publish, exactly as it was
+        // before `taskReceiptOf` existed: the queue ordinal describes the backlog as this
+        // request left it, not as a lane pump may have drained it by the time the frame is
+        // written.
+        const receipt = taskReceiptOf(ctx.mount, record.id, live, submitted, sessionRevision);
 
         // T16: the submit itself does NOT publish a `turn.upsert` body - the store's live signal
         // for the queued row already carries the contract's one-row payload, and a second body for
@@ -2365,28 +2404,50 @@ export const createHarnessApi = ({
             session: sessionStatePatchOf(live, context)
         });
 
-        const receipt: TaskReceipt = {
-            session_id: record.id,
-            turn_id: submitted.turn.id,
-            status: submitted.turn.status,
-            thread_id: submitted.turn.threadId ?? submitted.steeredThreadId ?? submitted.turn.threadId ?? '',
-            ...(submitted.steered === true ? { steered: true } : {}),
-            ...(submitted.steeredThreadId === undefined ? {} : { steered_thread_id: submitted.steeredThreadId }),
-            ...(queuedAt === -1 ? {} : { queue_position: queuedAt + 1 }),
-            session_revision: sessionRevision,
-            accepted_at: Date.now(),
-            links: {
-                turn: `${ctx.mount}/sessions/${record.id}/turns/${submitted.turn.id}`,
-                turns: `${ctx.mount}/sessions/${record.id}/turns`,
-                thread:
-                    submitted.turn.threadId === undefined
-                        ? `${ctx.mount}/sessions/${record.id}/turns`
-                        : `${ctx.mount}/sessions/${record.id}/threads/${submitted.turn.threadId}`,
-                stream: `${ctx.mount}/stream`
-            }
-        };
-
         return json(202, receipt, sessionRevision);
+    };
+
+    // The durable resume of ONE stopped conversation (R1, POST .../threads/:threadId/resume).
+    //
+    // The store owns the whole decision (which turn to replay, and every 404/409 state guard);
+    // this route's only job is to answer with the SAME `TaskReceipt` a normal submit answers with,
+    // so the browser's receipt→`turn.upsert` handling is reused verbatim (the fixed contract).
+    // `200` rather than `202`: the caller asked for one already-recorded task to be re-run, not
+    // for a new one to be accepted — but execution is still server-owned and never awaited, so the
+    // body is the acceptance receipt of the continuation turn, not its answer.
+    const postThreadResume: Handler = async (ctx) => {
+        const record = requireSession(ctx.params.session_id);
+        const threadId = ctx.params.thread_id;
+
+        // An unknown conversation in a known session is 404 here, before the store is asked
+        // anything — the same guard the cancel route runs, so `resume` cannot 404 differently
+        // from `cancel` for one typo'd id.
+        requireThread(record, threadId);
+
+        // R1/R3: the replay itself composes the existing submit path; a refusal (not stopped,
+        // nothing recorded for it to replay, the answer already reached, or a turn/revive already
+        // in flight) is the store's SessionError, and the dispatcher renders its status and
+        // message unchanged so the client shows the server's own sentence.
+        const submitted = await store.resumeThread(record.id, threadId);
+
+        const live = store.liveSession(record.id);
+
+        // Same counter domains as a normal submit: the store's own live signals already moved
+        // `turns`/`turn`/`turn_display`/`turn_events`, and `resumeThread`'s roster signal moved
+        // `threads`/`thread` (a conversation that accepted a continuation is a changed row, so
+        // the observer reads the ONE projected row instead of a second hint body here). What only
+        // this request can know is the session row and the queue view.
+        const sessionRevision = events.bumpRevision('session', record.id);
+
+        events.bumpRevision('queue', record.id);
+
+        const receipt = taskReceiptOf(ctx.mount, record.id, live, submitted, sessionRevision);
+
+        publish('session.updated', [{ resource: 'session', id: record.id }, { resource: 'queue', id: record.id }], {
+            session: sessionStatePatchOf(live, context)
+        });
+
+        return json(200, receipt, sessionRevision);
     };
 
     const postSessionReset: Handler = async (ctx) => {
@@ -4084,6 +4145,8 @@ export const createHarnessApi = ({
         sessionsBySessionIdThreads: { GET: getSessionThreads, POST: postSessionThread },
         sessionsBySessionIdThreadsByThreadId: { GET: getSessionThread, DELETE: deleteSessionThread },
         sessionsBySessionIdThreadsByThreadIdCancel: { POST: postThreadCancel },
+        // R1: the stop's counterpart. Same path shape as `cancel`, one verb, no body.
+        sessionsBySessionIdThreadsByThreadIdResume: { POST: postThreadResume },
         sessionsBySessionIdThreadsByThreadIdTranscript: { GET: getTranscriptMetadata, PUT: putTranscript },
         sessionsBySessionIdThreadsByThreadIdTranscriptMessages: { GET: getTranscriptMessages },
         sessionsBySessionIdThreadsByThreadIdTranscriptDocument: { GET: getTranscriptDocument },

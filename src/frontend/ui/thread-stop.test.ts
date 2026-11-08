@@ -6,8 +6,10 @@
 //   - live work renders `Stop` (glyph `■`, `aria-label "Stop thread <NAME>"`, title
 //     `Stop this thread`), never a disabled Delete with a "wait for it" hint;
 //   - the class is ADDITIVE: `.thread-delete` is retained and `.thread-stop` is added, so
-//     the bar keeps exactly two children, in the same order, reachable by every selector
-//     and stylesheet rule that already works;
+//     the bar keeps its children, in the same order, reachable by every selector
+//     and stylesheet rule that already works (T4/R2 later added a third, permanent
+//     `Resume` child between Delete and Transcript; the Stop morph still never changes the
+//     destructive button's identity or its slot);
 //   - one press sends exactly one `stopThread(sessionId, threadId)` and opens NOTHING —
 //     no dialog, no two-press arming — on a proven desktop AND on every narrow/coarse
 //     surface, because the delete-confirmation waiver (`requiresDeleteConfirmation`)
@@ -276,12 +278,16 @@ describe('the Stop control while work is live', () => {
         const { board, handles } = mount();
         const button = actionOf(at(handles, 0));
 
-        // ONE control, unchanged anatomy: the bar still holds exactly its two actions, in
-        // the same order, and this one keeps `.thread-delete` (the modifier is additive).
+        // ONE destructive control, unchanged anatomy: the Stop press keeps `.thread-delete`
+        // (the modifier is additive) and every child stays in its original slot. T4/R2's
+        // Resume lives BETWEEN them and is hidden here — a running thread is not `stopped` —
+        // so the bar's DOM is three children while the reader still sees exactly two actions.
         expect([...barOf(at(handles, 0)).children].map((node) => node.className)).toEqual([
             'thread-delete thread-stop',
+            'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
+        expect(actionButton(barOf(at(handles, 0)), '.resume-open').hidden).toBe(true);
         expect(button.hidden).toBe(false);
         expect(button.classList.contains('thread-delete')).toBe(true);
         expect(button.classList.contains('thread-stop')).toBe(true);

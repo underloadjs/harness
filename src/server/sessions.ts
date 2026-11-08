@@ -463,6 +463,14 @@ export type ThreadLane = {
     // with its own abort error, and this flag is what classifies the turn as
     // "cancelled" rather than "error" (there is no session-wide flag for lanes).
     stopRequested: boolean;
+    // Set by `resumeThread` for exactly the window between its state check and the
+    // continuation turn that check produces. Needed because neither durable signal
+    // closes that window: `enqueue` pushes its turn only AFTER an await (the steering
+    // probe), and the runtime's `stopped` flag is cleared only when the revived run
+    // actually starts. Without this claim, two resumes accepted in the same tick each
+    // pass the status check and the conversation gets TWO identical continuations.
+    // Runtime-only (never persisted) and always released in a finally.
+    resumePending?: boolean;
     // Progress recorder of the ACTIVE run. Used only as the fallback when the
     // AsyncLocalStorage context is unavailable (a callback the runtime scheduled
     // outside this run's async chain) and exactly one lane is active.
@@ -8175,6 +8183,148 @@ export class SessionStore {
         this.notifyStream({ kind: 'thread.upsert', sessionId: session.id, threadId, at: Date.now() });
 
         return { cancelled, session: this.snapshot(session) };
+    }
+
+    // RESUME ONE STOPPED THREAD (R1, POST /sessions/:id/threads/:threadId/resume).
+    //
+    // WHY IT EXISTS. `cancelThread` leaves the conversation `stopped` and marks the run it
+    // aborted (plus its backlog) `cancelled`, so the answer the user asked for never
+    // arrived. The stop is not the end of the work: this route replays THAT turn's recorded
+    // input as a fresh continuation turn in the same conversation. The interrupted row is
+    // never rewritten — its terminal status is the durable audit of the stop — and the
+    // revival is an ordinary submit whose `turn.upsert` traffic a client handles exactly
+    // like any other submit's.
+    //
+    // WHAT IT COMPOSES (R3: no new runtime verb, no new queue, no new status). The replay
+    // goes through `dispatch`, the exact surface `POST .../tasks` uses, so a continuation
+    // into a STOPPED thread takes the path that already exists: `enqueue` validates, binds
+    // references, allocates the turn id/index/display label, pushes the row into that
+    // thread's own lane, persists it, and pumps it. The pump calls
+    // `harness.sendThreadInput`, which is the runtime's documented host-revival path (an
+    // explicit host turn flips `stopped` back to `idle` and runs, and it is what captures a
+    // NEW M1 generation so this run is not refused by the stop that preceded it). Everything
+    // else a normal run owns comes along for free: the lane's single active turn, worker-mode
+    // lane execution (`threadExecution: 'worker'`), and the stop classification flags.
+    //
+    // FIDELITY (what the interrupted turn durably persists). A `SessionTurn` row carries
+    // `prompt`, `attachments` and `references`, and ./persistence.ts revalidates all three on
+    // load (attachments at :650-665, references at :670-682), so a restart still has the real
+    // bytes and the bound block list. All three are replayed. `prompt` is the trimmed
+    // SUBMITTED text, not the reference-expanded run prompt, so the referenced blocks are
+    // re-expanded at execution the same way the interrupted run expanded them. Nothing new is
+    // persisted and nothing is guessed: a field the record never kept cannot come back.
+    //
+    // REFUSALS. 404 for an unknown session or thread, in `cancelThread`'s exact wording.
+    // Every 409 is a state guard and says "this conversation is not in the one state this
+    // route is for": not stopped; nothing recorded for it to replay; the answer already
+    // reached (`done`); a turn still queued or running; or a revive already claimed by an
+    // earlier call in the same tick.
+    // D4 (worker IO): ASYNC for the same reason `enqueue` is — the continuation turn is
+    // durable before this resolves, so the response that claims a revival happened cannot be
+    // undone by a crash.
+    async resumeThread(id: string, threadId: string): Promise<EnqueuedTask> {
+        const session = this.require(id);
+
+        if (!this.threadsSupported(session)) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        const record = session.harness.thread(threadId);
+
+        if (record === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        // R1: `stopped` is the only resumable state, and it is the state this server's stop
+        // puts a conversation in — whatever opened it (a host submit, the roster route, the
+        // runtime's delegation, or the default `agent:<name>` conversation), because a stop
+        // reaches every one of them. What a conversation can then be replayed FROM is its own
+        // recorded turns, which is the next check. An `idle` thread already takes input
+        // through the submit route; a `running` one has a run in flight; a `paused` one is a
+        // plugin park, not a stop.
+        if (record.status !== 'stopped') {
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" is ${record.status}; only a stopped thread can be resumed.`
+            );
+        }
+
+        // THE INPUT TO REPLAY: this conversation's most recent recorded turn, newest by the
+        // monotonic `index` rather than by array position (a deletion or a restore can
+        // reorder the array; the index is the figure that always states the order).
+        const last = [...session.turns]
+            .filter((turn) => turn.threadId === threadId)
+            .sort((left, right) => left.index - right.index)
+            .pop();
+
+        if (last === undefined) {
+            // A runtime-driven child conversation has no recorded turn of its own: its runs
+            // are recorded inside its PARENT's turn (see `owningTurnOf`), so a cascaded child
+            // stop has no input the server durably holds to replay. Refusing is honest;
+            // inventing a per-child prompt would be new persistence, which this route is not
+            // allowed to add.
+            throw new SessionError(409, `Thread "${threadId}" has no recorded turn to resume.`);
+        }
+
+        // "As long as the answer isn't reached": `done` means it was reached, so re-running
+        // the same prompt would duplicate an answer the user already has.
+        if (last.status === 'done') {
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" already reached its answer (turn ${last.index} is done).`
+            );
+        }
+
+        // `queued`/`running` means work is already in flight — a stop never leaves either
+        // behind on this thread, so reaching here is a concurrent submit, not a resume.
+        if (last.status === 'queued' || last.status === 'running') {
+            throw new SessionError(409, `Thread "${threadId}" still has turn ${last.index} ${last.status}.`);
+        }
+
+        // What is left is exactly the two "no answer" terminal states: `cancelled` (the
+        // stop's own mark, including a backlog entry that never started) and `error` (a run
+        // that failed before an answer). Both are replayable; the record is the input.
+        const lane = this.laneOf(session, threadId);
+
+        // DOUBLE-RESUME CLAIM, taken synchronously before the first await below. Two resumes
+        // dispatched in the same tick both pass the status check above (the runtime flag is
+        // not cleared until the revived run starts, and the continuation turn does not exist
+        // yet — `enqueue` pushes it only after its steering probe awaits), so the SECOND
+        // caller must be refused by this claim rather than queue a duplicate continuation. A
+        // caller that arrives after the claim is released needs no flag: the newest-turn
+        // guards above then read the queued/running row this call just created.
+        if (lane.resumePending === true) {
+            throw new SessionError(409, `Thread "${threadId}" is already being resumed.`);
+        }
+
+        lane.resumePending = true;
+
+        let submitted: EnqueuedTask;
+
+        try {
+            // Full-fidelity replay of the interrupted turn, addressed at the SAME
+            // conversation. `dispatch` rather than `enqueue` so the slash-command rule the
+            // /tasks route applies is applied here too: an interrupted input that WAS a
+            // command re-runs as the same command, not as a prompt that starts with `/`.
+            submitted = await this.dispatch(id, last.prompt, last.attachments, last.references, threadId);
+        } finally {
+            // Released as soon as the replay is accepted or refused, so a later call is
+            // refused by the newest-turn guards above (they read the row this call created)
+            // rather than by this flag; a failed replay (validation, backpressure, a lost
+            // write) records nothing, leaving the thread stopped and fully resumable again.
+            lane.resumePending = false;
+        }
+
+        // T16 (the stop's own rule, run in reverse): the conversation's ROW changed — it went
+        // from parked to holding accepted work — so the roster row is what a client needs
+        // again, and this is the only signal that says so. The projected row carries the
+        // conversation's real status at the moment the frame is written (a lane pump that has
+        // already revived the record reads `running`; one that has not yet reads `stopped`),
+        // which is why the store publishes the row rather than a REST-side hint claiming a
+        // status this call did not itself set.
+        this.notifyStream({ kind: 'thread.upsert', sessionId: session.id, threadId, at: Date.now() });
+
+        return submitted;
     }
 
     // True when `candidate` is (transitively) owned by `ancestor` in the runtime

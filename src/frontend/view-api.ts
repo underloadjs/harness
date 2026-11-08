@@ -103,6 +103,7 @@ import {
     getAttachment,
     getTurn,
     resetSession,
+    resumeSessionThread,
     submitTask,
     updateSession,
     apiUrl,
@@ -1019,6 +1020,12 @@ export const removeConversation = (sessionId: string) => deleteSession(sessionId
 export const removeConversationOnUnload = (sessionId: string) => deleteSessionOnUnload(sessionId);
 
 export const stopThread = (sessionId: string, threadId: string) => cancelSessionThread(sessionId, threadId);
+
+// T4/R2: the resume transport. A stopped thread answers a `TaskReceipt` (the same shape a
+// submit answers), so the caller reconciles the roster the SAME way a stop does and lets
+// the stream's `turn.upsert` frame paint the continuation turn.
+export const resumeThread = (sessionId: string, threadId: string) =>
+    resumeSessionThread(sessionId, threadId);
 
 export const removeThread = (sessionId: string, threadId: string) => deleteSessionThread(sessionId, threadId);
 

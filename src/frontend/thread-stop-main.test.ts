@@ -243,8 +243,13 @@ it('shows Stop for a running thread and cancels it with one press and no dialog'
     const bar = byClass('.tile-transcript-action', 'div');
     expect([...bar.children].map((node) => node.className)).toEqual([
         'thread-delete thread-stop',
+        // T4/R2: the third child is the permanent Resume slot; this thread is `running`,
+        // not `stopped`, so it is unpainted and the Stop/Transcript pair is still what the
+        // reader sees.
+        'resume-open action-resume',
         'transcript-open action-transcript'
     ]);
+    expect(bar.querySelector<HTMLElement>('.resume-open')?.hidden).toBe(true);
 
     const button = actionOf();
     expect(button.hidden).toBe(false);

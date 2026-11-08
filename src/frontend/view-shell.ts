@@ -57,6 +57,7 @@ import {
     removeConversationOnUnload,
     removeThread,
     resetConversation,
+    resumeThread,
     rowFromReceipt,
     // T38: THE directory row normalizer (./view-api.ts:159). `listViews` and the boot
     // document's embedded page both map through it, so a row is one camelCase record.
@@ -177,6 +178,21 @@ export const cancelViewThread = async (sessionId: string, threadId: string): Pro
     const result = await stopThread(sessionId, threadId);
 
     return { cancelled: result.cancelled, view: await refreshRoster(sessionId) };
+};
+
+// T4/R2: the resume half of the same pair. A stopped conversation answers a `TaskReceipt`
+// for its continuation task, and the receipt deliberately carries NO document — the
+// stream's `turn.upsert` frame is what paints the new turn. The shell still re-reads the
+// cheap roster: that is the frame which moves the thread out of `stopped`, i.e. the one
+// thing that honestly retires the Resume control (ui/turns.ts reads visibility from the
+// roster, never from a local flag).
+export const resumeViewThread = async (
+    sessionId: string,
+    threadId: string
+): Promise<{ receipt: TaskReceipt; view: SessionView }> => {
+    const receipt = await resumeThread(sessionId, threadId);
+
+    return { receipt, view: await refreshRoster(sessionId) };
 };
 
 export const deleteViewThread = async (sessionId: string, threadId: string): Promise<{ deleted: true; view: SessionView }> => {

@@ -560,6 +560,19 @@ export type TurnBoardOptions = {
     // does not expose stopping: the control renders Stop-but-disabled with the honest
     // reason instead of pretending to work.
     stopThread?: (sessionId: string, threadId: string) => Promise<unknown>;
+    // T4/R2 resume transport. A roster row that says `stopped` is a conversation the host
+    // halted, not one that answered: while that is true the bar offers a THIRD action,
+    // `Resume`, next to Transcript. One press, no confirmation (resuming is not
+    // irreversible), and the shell's `POST .../threads/{id}/resume` — whose receipt names
+    // the continuation task the stream then paints. The board owns visibility (roster
+    // status only), single-flight dedupe and failure reporting; the shell owns the route and
+    // the roster reconcile that hides the control again. Omitted in an embedding that does
+    // not expose resuming: the control renders Resume-but-disabled with the honest reason,
+    // exactly like an unwired Stop or Delete. `unknown` because the board never reads the
+    // answer — the receipt's continuation turn arrives on the stream, and the roster frame
+    // is what hides the control again (the shell's `resumeThread` in ./main.ts names the
+    // concrete `TaskReceipt`).
+    resumeThread?: (sessionId: string, threadId: string) => Promise<unknown>;
     // C5 transcript editing transport. The dialog owns the editor (local JSON parse,
     // the inline error area, the pending/disable rule and the invalid-transcript
     // banner); the shell owns the PUT plus applying the returned `session` through its
@@ -1531,7 +1544,14 @@ const ACTION_LABELS = {
     // The stop copy uses the ellipsis character, matching what the board already shows
     // for a pending delete; `pending` is the desktop label, the glyph stays `■` so the
     // mobile button never reads as a spinner-only control.
-    stop: { text: 'Stop', glyph: '■', pending: 'Stopping…' }
+    stop: { text: 'Stop', glyph: '■', pending: 'Stopping…' },
+    // T4/R2: the THIRD action, and the only non-destructive one in the bar. Its glyph is
+    // the play triangle — the same character the composer's send button already paints
+    // (main.ts, `actionButton.textContent = '▶'`), because this package ships no icon
+    // library and a text glyph keeps the mobile swap rule uniform. `pending` follows the
+    // stop precedent: the button is disabled while the POST is in flight, and the label
+    // says so instead of silently absorbing a second press.
+    resume: { text: 'Resume', glyph: '▶', pending: 'Resuming…' }
 } as const;
 
 // The hover reasons, in ONE place so the wording cannot drift between the states the
@@ -1548,7 +1568,16 @@ const ACTION_TITLES = {
     // A DELETE already in flight owns the control; a second destructive request for the
     // same conversation is never the answer, and the reason says which one is running.
     stopWhileDeleting: 'Deleting this thread...',
-    stopUnwired: 'Thread stop is not wired in this host.'
+    stopUnwired: 'Thread stop is not wired in this host.',
+    // T4/R2: the Resume hover reasons, same shape as the stop pair. The action states what
+    // it does (continue a conversation the host halted), promises nothing the UI cannot
+    // deliver (no confirmation), and the unwired entry names the missing transport.
+    resume: 'Resume this stopped thread',
+    resumePending: 'Resuming this thread...',
+    // A delete owns the whole conversation, so a resume pressed while it runs is refused
+    // for the same reason a stop is: one destructive request at a time.
+    resumeWhileDeleting: 'Deleting this thread...',
+    resumeUnwired: 'Thread resume is not wired in this host.'
 } as const;
 
 // The row shape delete protection needs: the conversation a turn ran in, and its
@@ -1574,6 +1603,14 @@ const LIVE_THREAD_STATUSES: readonly string[] = ['running', 'paused'];
 // test can pin it without mounting a board.
 export const isLiveThreadStatus = (status: string): boolean =>
     LIVE_THREAD_STATUSES.includes(status);
+
+// T4/R2: the ONE "this conversation is halted and can be put back to work" question the
+// Resume control asks. It is the exact opposite side of `isLiveThreadStatus`, stated
+// separately on purpose: `idle` means live-but-not-working (nothing to resume), so
+// "not live" would be the WRONG predicate here — only the server's own `stopped` status
+// says a host halted this thread. Kept module-level (not exported) because the bar's
+// `sync` and the press guard must ask it identically, and the DOM is the tested surface.
+const isStoppedThreadStatus = (status: string): boolean => status === 'stopped';
 
 export const threadDeleteProtectionOf = (
     entry: SessionThreadEntry,
@@ -1736,6 +1773,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // suppressed while it runs — this set exists only to make the Stop press idempotent
     // while the request is in flight and to repaint the control as `Stopping…`.
     const stoppingRequests = new Set<string>();
+    // T4/R2: in-flight thread RESUMES, keyed exactly like a stop/delete (session + thread,
+    // because a thread id is only unique per session). Like a stop, a resume keeps the
+    // conversation, so nothing else is suppressed while it runs — this set exists only to
+    // make one Resume press idempotent while its POST is in flight and to repaint the
+    // control as `Resuming…`.
+    const resumingRequests = new Set<string>();
     // One token per in-flight confirmed delete. A successful delete closes the
     // transcript through the missing-roster path; that is expected, not a "thread
     // vanished unexpectedly" error. A Set (not a boolean) keeps a stale request's
@@ -1757,6 +1800,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const isStopping = (threadId: string): boolean => {
         const sessionId = currentSessionId();
         return sessionId !== undefined && stoppingRequests.has(deletionKey(sessionId, threadId));
+    };
+    // T4/R2: same session+thread keying as a stop/delete, so a resume of one conversation
+    // is tracked apart from its stop and its delete, and each of them dedupes per session.
+    const isResuming = (threadId: string): boolean => {
+        const sessionId = currentSessionId();
+        return sessionId !== undefined && resumingRequests.has(deletionKey(sessionId, threadId));
     };
     // Every live action bar's sync callback. Expansion, roster, snapshot,
     // confirmation and in-flight changes repaint all of them from one source.
@@ -2124,6 +2173,72 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
     };
 
+    // T4/R2: the Resume press. ONE click, NO confirmation dialog, NO two-press arming —
+    // the same rule the Stop press follows, because `requiresDeleteConfirmation` guards an
+    // IRREVERSIBLE removal while resuming only asks the host to keep working on a
+    // conversation it already holds. Visibility is the roster's job (see the `sync` gate in
+    // `createThreadActionBar`); this guard re-reads the CURRENT roster frame instead of the
+    // copy painted at the last sync, exactly like the Delete↔Stop click path does, so a
+    // frame that settled the thread in between cannot send a stale request.
+    const requestThreadResume = (threadId: string): void => {
+        // Single-flight: a double tap while the POST is in flight is one request, and the
+        // repaint below is what keeps the control honest about that.
+        if (isResuming(threadId)) return;
+
+        const sessionId = currentSessionId();
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (
+            entry === undefined ||
+            // Nothing to resume unless the SERVER says this conversation is halted. A
+            // running/idle thread has no stopped answer to continue, and a frame can settle
+            // (or start) work between the repaint and the click.
+            !isStoppedThreadStatus(entry.status) ||
+            // No transport: the control stays visible-but-disabled with the unwired reason
+            // (see `sync`), and a press does nothing.
+            options.resumeThread === undefined ||
+            // A delete in flight owns the conversation — the bar disables this control for
+            // exactly that reason, and resurrecting a thread the server is about to remove
+            // is never what the reader meant.
+            isDeleting(threadId) ||
+            sessionId === undefined
+        ) {
+            refreshActionBars();
+            return;
+        }
+
+        void confirmThreadResume(threadId, sessionId);
+    };
+
+    // The request itself, the mirror of `confirmThreadStop`. The shell callback owns the
+    // `POST .../threads/{id}/resume` AND the roster reconcile (`applyView`), so this board
+    // only flips its own in-flight flag and reports failure — nothing is hand-painted from
+    // the receipt here. The continuation turn arrives as the stream's `turn.upsert` frame,
+    // the only surface that knows the prompt the server is resuming with.
+    //
+    // Until a newer roster frame lands, the row still says `stopped` and the control stays
+    // visible and pressable again: an optimistic hide would have to be undone on a
+    // rejection, and a stopped thread the reader cannot resume looks broken.
+    const confirmThreadResume = async (threadId: string, sessionId: string): Promise<void> => {
+        const requestKey = deletionKey(sessionId, threadId);
+        if (resumingRequests.has(requestKey)) return;
+
+        resumingRequests.add(requestKey);
+        refreshActionBars();
+
+        try {
+            await options.resumeThread?.(sessionId, threadId);
+        } catch (error) {
+            // Non-destructive by construction, exactly like a failed stop: no tile, focus,
+            // transcript or selection is touched. The reader keeps the same conversation,
+            // sees the server's reason, and can press Resume again.
+            const message = error instanceof Error ? error.message : String(error);
+            notice(`resume thread: ${message}`, 'error');
+        } finally {
+            resumingRequests.delete(requestKey);
+            refreshActionBars();
+        }
+    };
+
     // One action bar shared by the expanded tile, every nested child card and the
     // roster-only focus panel. T26: the two controls SWAPPED homes — Delete now leads the
     // bar (left, where Transcript used to be) and Transcript closes it (right, where
@@ -2145,9 +2260,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // class and its position in the bar never change — a Stop simply adds `.thread-stop`
     // and repaints the copy — so every existing selector, stylesheet rule and layout
     // contract keeps working.
+    //
+    // T4/R2: the bar gains ONE more ordinary child, `Resume`, between Delete and Transcript,
+    // and it is the ONLY one whose visibility depends on the roster status — a `stopped`
+    // conversation is the only thing with an answer that has not been reached. Like the
+    // other two it is created once and lives in the DOM permanently; `sync` toggles its
+    // `hidden`, so all three call sites (expanded tile footer, nested card, roster-only
+    // focus panel) get the control for free and nothing about the two-action anatomy above
+    // changes for a thread that is not stopped.
     type ThreadActionBar = {
         element: HTMLElement;
         transcriptButton: HTMLButtonElement;
+        // T4/R2: the stopped-conversation Resume. It lives in the bar permanently (like the
+        // other two) and `sync` toggles its `hidden` from the roster status, so no call site
+        // has to rebuild a bar when a thread halts.
+        resumeButton: HTMLButtonElement;
         // The ONE destructive action: Delete, or Stop while the thread/subtree is live.
         deleteButton: HTMLButtonElement;
         sync: () => void;
@@ -2197,11 +2324,36 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             requestThreadDelete(threadId, deleteButton);
         });
 
+        // T4/R2: the stopped-conversation Resume, modelled on Transcript (a PERMANENT bar
+        // child whose state `sync` repaints) rather than on Delete (whose MEANING morphs).
+        // `hidden` is the only suppression path — styles.css's global
+        // `[hidden] { display: none !important }` rule — so a thread that is not stopped
+        // shows its usual two buttons and nothing in the bar reflows.
+        const resumeButton = el('button', 'resume-open action-resume');
+        resumeButton.type = 'button';
+        const resumeLabel = el('span', 'action-label', ACTION_LABELS.resume.text);
+        const resumeGlyph = el('span', 'action-glyph', ACTION_LABELS.resume.glyph);
+        resumeButton.append(resumeLabel, resumeGlyph);
+        resumeButton.hidden = true;
+        resumeButton.addEventListener('click', () => {
+            // Same press-time rule as Delete/Stop: the CURRENT roster decides what a click
+            // means, never the copy painted at the last sync.
+            const threadId = input.target();
+            if (threadId === undefined) return;
+
+            requestThreadResume(threadId);
+        });
+
         // T26: Delete leads the bar and Transcript closes it (the two swapped places, and
         // the measurement line took the header's right-edge slot). DOM order is the visual
-        // order; `margin-left: auto` on `.transcript-open` (styles.css) is what pins the
-        // transcript button to the right even when Delete is hidden.
-        bar.append(deleteButton, transcriptButton);
+        // order, and an auto margin (styles.css) is what pins the trailing button to the
+        // right edge even when Delete is hidden.
+        //
+        // T4/R2: Resume is inserted BETWEEN them — literally "next to Transcript" — so the
+        // right-hand group reads `[Delete … gap … Resume Transcript]` with Transcript
+        // rightmost (styles.css moves the flush-right `margin-left: auto` onto the Resume
+        // button, and hands it back to Transcript whenever Resume is hidden).
+        bar.append(deleteButton, resumeButton, transcriptButton);
 
         const sync = (): void => {
             const threadId = input.target();
@@ -2230,6 +2382,54 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 ? `This thread's transcript cannot be read; edit its raw JSON to repair it`
                 : `Open the complete JSON transcript of ${name}`;
             transcriptButton.disabled = transcriptBusy;
+
+            // --- Resume (T4/R2): the stopped-thread control, gated on the ROSTER -------
+            // A `stopped` row is a conversation the host halted whose answer has not been
+            // reached, and that is the ONLY condition under which this control is painted
+            // (`idle` is live-but-not-working and has nothing to resume, and a live thread
+            // already has its Stop). The element is never removed: `sync` toggles `hidden`,
+            // exactly like the bar itself and the Delete↔Stop morph, so the tile footer, the
+            // nested card and the roster-only panel all get it from this one place. Every
+            // field is painted UNCONDITIONALLY (also while hidden) so the node stays
+            // self-describing for a test or an assistive reader — the same rule the hidden
+            // Delete of an undeletable default conversation follows.
+            //
+            // Two deliberate differences from the destructive slot:
+            //   - NO `origin === 'agent'` exclusion. A stop can land on the default
+            //     `agent:<name>` conversation exactly as on a host thread or a delegated
+            //     child, and the server states that any stopped conversation is resumable
+            //     (src/server/harness.swagger.yaml, `resumeSessionThread`), so an unreached
+            //     answer there is user work too — "a stopped thread could be anything";
+            //   - NO client-side guess about whether the ANSWER was reached. That is the
+            //     server's guard (a `done` most-recent-turn is a 409), and the rows on this
+            //     surface can legitimately be absent or stale for a roster-only thread. The
+            //     roster status is the one signal the board can trust, and a press the server
+            //     refuses arrives as an honest error notice on the same control.
+            const resumable = isStoppedThreadStatus(entry.status);
+            const resuming = isResuming(threadId);
+            const resumeWired = options.resumeThread !== undefined;
+
+            resumeButton.hidden = !resumable;
+            resumeLabel.textContent = resuming
+                ? ACTION_LABELS.resume.pending
+                : ACTION_LABELS.resume.text;
+            resumeGlyph.textContent = ACTION_LABELS.resume.glyph;
+            resumeButton.setAttribute(
+                'aria-label',
+                resuming ? `Resuming thread ${name}` : `Resume thread ${name}`
+            );
+            resumeButton.title = resuming
+                ? ACTION_TITLES.resumePending
+                : transcriptBusy
+                  ? ACTION_TITLES.resumeWhileDeleting
+                  : resumeWired
+                    ? ACTION_TITLES.resume
+                    : ACTION_TITLES.resumeUnwired;
+            // Single flight: a press while the POST is in flight must not stack a second
+            // continuation task. A delete in flight owns the conversation (it would remove
+            // what the resume is putting back to work), and an unwired host states its
+            // reason instead of pretending the press does something.
+            resumeButton.disabled = resuming || transcriptBusy || !resumeWired;
 
             const protection = deleteProtectionFor(threadId);
 
@@ -2299,6 +2499,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return {
             element: bar,
             transcriptButton,
+            resumeButton,
             deleteButton,
             sync,
             dispose: () => {
@@ -8779,6 +8980,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // R1: a cleared board tears down the surface a Stop was pressed on; its in-flight
         // flag goes with it (the late answer only ever removes its own key).
         stoppingRequests.clear();
+        // T4/R2: same rule for a Resume in flight — its control is on a bar this board no
+        // longer shows, and a late answer only ever removes its own composite key.
+        resumingRequests.clear();
         // A cleared board is a NEW conversation surface: the next content may be
         // auto-opened (`reconcile` first-content rule). The explicit "no focus" flag
         // is reset with the session, not inherited across it.
@@ -9297,6 +9501,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // R1: same rule for a stop in flight — it belongs to the session being left,
             // and a late resolution removes only its own composite key.
             stoppingRequests.clear();
+            // T4/R2: and the same rule again for a resume in flight.
+            resumingRequests.clear();
         }
 
         for (const record of answerCards.values()) {

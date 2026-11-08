@@ -281,10 +281,13 @@ describe('desktop thread Delete', () => {
 
         expect(calls).toEqual([['s1', 'thread-a']]);
         expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
-        // The bar carries no inline confirmation row either: its children are exactly its
-        // two actions, and nothing else in the document holds that class.
+        // The bar carries no inline confirmation row either: nothing else in the document
+        // holds that class, and its children are its permanent actions in DOM order —
+        // Delete, the T4/R2 Resume slot (hidden, this thread is not `stopped`) and
+        // Transcript.
         expect([...barOf(turn).children].map((node) => node.className)).toEqual([
             'thread-delete',
+            'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
         expect(document.querySelectorAll('.thread-delete-confirm')).toHaveLength(0);

@@ -143,6 +143,7 @@ import {
     observeTurn,
     observeView,
     resetView,
+    resumeViewThread,
     submitViewTask,
     updateThreadTranscript as updateViewThreadTranscript,
     updateView
@@ -920,7 +921,13 @@ const createView = (
     // route (./view-shell.ts `cancelViewThread`) and the roster reconcile that turns the
     // control back into Delete; the board owns single-flight and the no-confirmation rule.
     // Omitted in an embedding without the route: the control renders Stop-but-disabled.
-    stopThread?: (sessionId: string, threadId: string) => Promise<unknown>
+    stopThread?: (sessionId: string, threadId: string) => Promise<unknown>,
+    // T4/R2: the bar's Resume control delegates the per-thread resume to the same pair of
+    // owners — the shell owns the route (./view-shell.ts `resumeViewThread`) and the roster
+    // reconcile that retires the control, the board owns single-flight and failure
+    // reporting. Omitted in an embedding without the route: the control renders
+    // Resume-but-disabled with the honest reason, exactly like an unwired Stop/Delete.
+    resumeThread?: (sessionId: string, threadId: string) => Promise<TaskReceipt>
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -972,6 +979,9 @@ const createView = (
         // R1: same shape as the delete transport — passed through only when the shell can
         // actually reach the cancel route.
         ...(stopThread === undefined ? {} : { stopThread }),
+        // T4/R2: same conditional as Stop — the board renders Resume disabled-with-a-reason
+        // rather than pretending a route exists.
+        ...(resumeThread === undefined ? {} : { resumeThread }),
         ...(saveTranscript === undefined ? {} : { saveThreadTranscript: saveTranscript }),
         ...(loadDetail === undefined ? {} : { loadStepDetail: loadDetail }),
         ...(loadBlock === undefined ? {} : { loadBlockDetail: loadBlock }),
@@ -5570,7 +5580,11 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
                 ),
             // R1: the per-thread Stop the transcript bar offers while a conversation has
             // live work. Same session resolution as the delete below, minus the tombstones.
-            stopThreadForSession
+            stopThreadForSession,
+            // T4/R2: the per-thread Resume the same bar offers while a conversation is
+            // `stopped`. Same session resolution as the stop above; the receipt's
+            // continuation turn arrives through the stream, not from here.
+            resumeThreadForSession
         ),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
@@ -6214,6 +6228,13 @@ const storedInstructionsOf = (display: HarnessDescriptor, instance: Instance): R
 // produced (`instance.harnessModels`, ./api.ts `getHarness`). Both the selects and every
 // harness PATCH restate THIS map: the server replaces the whole field, so writing only
 // what one frame happened to carry would silently drop another member's override.
+//
+// Two writers read it, and that is the contract the sentence above states:
+//   - `agentViewOf` builds `view.models` from it, and `applyAgentConfiguration` merges the
+//     dialog's model deltas onto `view.models` and compares the guard against the same map;
+//   - `patchAgents`'s `sendsModels` flag asks it whether anything is stored, which is what
+//     makes clearing the LAST override send an explicit `agent_models: {}` instead of
+//     omitting the field (R3).
 const storedModelsOf = (display: HarnessDescriptor, instance: Instance): Record<string, string> => ({
     ...(instance.harnessModels ?? {}),
     ...agentModelsOf(display)
@@ -7115,7 +7136,21 @@ const applyAgentConfiguration = async (
     // Merge the deltas onto the stored maps. An explicit '' clears a key, which is how the dialog
     // drops an agent's stored prompt (R4: the one box, cleared by hand) or chooses the default
     // model, without a second protocol verb.
-    const models = { ...agentModelsOf(display) };
+    //
+    // T32 (R1/R2): exactly T11's rule for instructions, now applied to models. The base map is the
+    // one the DIALOG renders from (`view.models`, built at `agentViewOf` from `storedModelsOf`),
+    // NOT the raw document field: a runtime view frame omits `agent_models`
+    // (../shared/harness-api.ts:418-419), so `agentModelsOf(display)` is `{}` here and merging on
+    // it broke the save two ways —
+    //   - clearing an override (the dropdown's default option, value '') deleted a key from `{}`,
+    //     so the guard below compared `{}` with `{}` and answered "Nothing changed." without ever
+    //     reaching the PATCH — the reported bug;
+    //   - any model that DID pass the guard went out as a complete replacement derived from
+    //     nothing, silently wiping every other member's stored override, because the server
+    //     REPLACES `agent_models` with whatever it receives.
+    // `view.models` is already normalized the way the PATCH body must be (member order, empty
+    // values dropped), so the merge and the guard below compare the same shape.
+    const models = { ...view.models };
 
     for (const [name, model] of Object.entries(changes.models)) {
         const value = model.trim();
@@ -7142,10 +7177,15 @@ const applyAgentConfiguration = async (
     // Same server state means the same request would be a pointless round trip. The
     // dialog cannot normally get here (its action stays disabled while nothing is
     // pending), so this is a guard against a stale tab rather than a UX path.
+    //
+    // T32 (R1): both model sides are the SAME stored map the reader sees. The old right-hand side
+    // (`modelsForMembers(agentModelsOf(display), members)`) was a frame that omits the field, so
+    // it read "nothing is overridden" for a template that does override something, and a genuine
+    // clear was refused as a no-op.
     if (
         primary === primaryOf(display) &&
         JSON.stringify(nextMembers) === JSON.stringify(members) &&
-        JSON.stringify(nextModels) === JSON.stringify(modelsForMembers(agentModelsOf(display), members)) &&
+        JSON.stringify(nextModels) === JSON.stringify(view.models) &&
         JSON.stringify(nextInstructions) ===
             JSON.stringify(view.instructions) &&
         !busy
@@ -7390,6 +7430,14 @@ const patchAgents = async (
     // running again. The same condition decides whether this browser may restate its cached
     // map below, so the two can never disagree about what the server now holds.
     const sendsInstructions = includeInstructions || Object.keys(storedInstructionsOf(display, instance)).length > 0;
+    // T32 (R3): the identical rule for the model map, and it needs the identical flag. Clearing
+    // the LAST override leaves `models` empty, so `includeModels` alone would omit the field and
+    // the server would keep the override the reader just removed. `storedModelsOf` is the map the
+    // dialog rendered from (see its comment above), so this asks the real question: was there
+    // anything stored that this request has to restate or clear? Present-but-empty is the
+    // explicit clear server-side (../server/api.ts `patchHarness`: "Present = REPLACE the map;
+    // `{}` is the explicit clear"), so no server change is needed for the clear to land.
+    const sendsModels = includeModels || Object.keys(storedModelsOf(display, instance)).length > 0;
 
     savingAgents = true;
     // R3: `saving` is the visible word; the label says WHAT is being saved in the
@@ -7408,7 +7456,7 @@ const patchAgents = async (
         const updated = await updateHarness(display.name, {
             primary: nextPrimary,
             subagents,
-            ...(includeModels ? { agent_models: models } : {}),
+            ...(sendsModels ? { agent_models: models } : {}),
             ...(sendsInstructions ? { agent_instructions: instructions } : {})
         });
         // descriptorOf is the canonical card/definition -> render descriptor mapping (./api.ts);
@@ -7425,7 +7473,7 @@ const patchAgents = async (
         const live = instances.get(display.name);
 
         if (live !== undefined) {
-            if (includeModels) live.harnessModels = { ...models };
+            if (sendsModels) live.harnessModels = { ...models };
             if (sendsInstructions) live.harnessInstructions = { ...instructions };
         }
 
@@ -10250,6 +10298,36 @@ const stopThreadForSession = async (
     applyView(instance, result.view);
 
     return { cancelled: result.cancelled };
+};
+
+// T4/R2: the per-thread RESUME the transcript bar offers while a conversation's roster row
+// says `stopped` and its answer has not been reached. The mirror of `stopThreadForSession`
+// (and, like it, WITHOUT the delete teardown — the thread survives in both directions):
+//   1. resolve the view that points at this session — an id this page does not hold is a
+//      local error, so no request leaves for a conversation nobody is looking at;
+//   2. POST the empty resume body and get the continuation task's `TaskReceipt` back;
+//   3. apply the roster document `resumeViewThread` reads back through `applyView`, the one
+//      authority path that owns the stale-watermark guard, the tombstones, the reconcile and
+//      the board repaint. `setThreads`/`setSessionView` inside it are what hide the control:
+//      visibility comes from the SERVER's status, never from an optimistic local flag.
+// The continuation turn is NOT painted from the receipt here — the stream's `turn.upsert`
+// frame is the document's update plane and renders it, which is why no `board.begin` is
+// needed (and why inventing prompt text client-side would be a lie: the resume's input
+// lives server-side). A 404/409 rejection travels verbatim to the board, which reports it
+// and leaves every surface intact.
+const resumeThreadForSession = async (
+    sessionId: string,
+    threadId: string
+): Promise<TaskReceipt> => {
+    const instance = [...instances.values()].find(
+        (candidate) => candidate.sessionId === sessionId
+    );
+    if (instance === undefined) throw new Error('Unknown session');
+
+    const result = await resumeViewThread(sessionId, threadId);
+    applyView(instance, result.view);
+
+    return result.receipt;
 };
 
 const deleteThreadForSession = async (

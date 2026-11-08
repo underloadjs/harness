@@ -1249,6 +1249,24 @@ export const cancelSessionThread = (id: string, threadId: string): Promise<{ can
         { method: 'POST' }
     );
 
+// `POST .../threads/{id}/resume` — a STOPPED conversation is not a finished one: as long
+// as its answer has not been reached, the host can put the SAME thread back to work by
+// re-running the input of its most recent unanswered turn. Empty body (the server re-
+// submits the prompt/attachments it recorded on that turn row), and the answer is the SAME
+// `TaskReceipt` shape as `submitTask` — at 200, because the caller asked for an
+// already-recorded task rather than a new one — so the stream's `turn.upsert` frame paints
+// the continuation and no document is re-read for it. 404 (unknown session/thread) and 409
+// (not stopped, nothing recorded to replay, or the answer was already reached) throw with
+// the server's own sentence via `request`; the caller reports it, it is never swallowed.
+export const resumeSessionThread = (id: string, threadId: string): Promise<TaskReceipt> =>
+    request<TaskReceipt>(
+        HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdResume(
+            encodeURIComponent(id),
+            encodeURIComponent(threadId)
+        ),
+        { method: 'POST' }
+    );
+
 export const deleteSessionThread = (id: string, threadId: string): Promise<DeleteThreadResult> =>
     request<DeleteThreadResult>(
         HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadId(encodeURIComponent(id), encodeURIComponent(threadId)),
