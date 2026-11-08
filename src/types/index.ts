@@ -1166,10 +1166,84 @@ export type ToolMediaEnvelope<TContent = unknown> = {
 
 // One stored task. `id` is a decimal string, monotonic within one harness
 // instance (and restarted by reset()).
+//
+// CONCURRENCY FIELDS (T1 — the shared-list fix). The list is ONE store per
+// harness, shared by every agent and every thread, so another agent can edit a
+// record between the moment a caller read it and the moment it writes back. To
+// make that visible instead of silently losing an update, each record carries:
+//   - `rev`        — the CONTENT revision. Starts at 1 on add and increments
+//     ONLY when `text` (post-trim) or `completed` actually changes. Claims,
+//     releases, takeovers and lease renewals never bump it, so a claim can never
+//     invalidate another agent's compare-and-swap.
+//   - `updatedBy` / `updatedThreadId` / `updatedAt` — attribution of the last
+//     writer, taken from the ToolContext (never from tool arguments, so the
+//     model cannot spoof it). Absent for a store that was never written by an
+//     identified caller.
+//   - `owner` / `ownerThreadId` / `leaseUntil` — the optional claim. A holder is
+//     the exact pair `(owner, ownerThreadId)`; `leaseUntil` is epoch ms and an
+//     ABSENT `leaseUntil` means an indefinite claim (never auto-expiring). A
+//     claim blocks content writes by other agents until it expires, is released,
+//     or is taken over.
+//
+// The optional fields stay absent (never `undefined`-valued keys) so a snapshot
+// of an untouched store is byte-identical to the pre-T1 shape.
 export type TaskItem = {
     id: string;
     text: string;
     completed: boolean;
+    // Content revision, >= 1; starts at 1 when the record is added.
+    rev: number;
+    // Agent name of the last writer (content add/update, claim, release, takeover).
+    updatedBy?: string;
+    // Thread id of that last writer.
+    updatedThreadId?: string;
+    // ISO timestamp of that last write.
+    updatedAt?: string;
+    // Agent name holding the claim, when claimed.
+    owner?: string;
+    // Thread id holding the claim, when claimed.
+    ownerThreadId?: string;
+    // Epoch ms the claim expires; absent = indefinite claim (not expired).
+    leaseUntil?: number;
+};
+
+// One compare-and-swap precondition for a guarded write: the revision the caller
+// actually READ for that id. core/task.ts rejects the whole call when the stored
+// `rev` differs, so a concurrent edit surfaces as a readable error instead of a
+// silent lost update.
+export type TaskExpect = {
+    id: string;
+    rev: number;
+};
+
+// The five recorded store events. `claim` covers a first-time claim AND a
+// takeover; `release` covers a voluntary release, an expired-claim clear, and
+// `releaseThread()`.
+export type TaskChangeOp = 'add' | 'update' | 'remove' | 'claim' | 'release';
+
+// One entry of the bounded store change log (see TASK_MAX_CHANGES in
+// ./core/task.ts). `rev` is the STORE event revision after this change, not the
+// record's content revision — the latter is `itemRev` (omitted for
+// remove/claim/release because none of them bump it). `fields` names which
+// content fields an `update` actually changed, in the stable order
+// ['text','completed']; it is what lets an opt-in disjoint merge prove that a
+// concurrent edit touched different fields than the caller's patch.
+export type TaskChange = {
+    // Store event revision after this change (monotonic, unique).
+    rev: number;
+    // The record this change touched.
+    id: string;
+    op: TaskChangeOp;
+    // Calling agent name, omitted when the caller had no identity.
+    by?: string;
+    // Calling thread id, omitted when the call had no thread.
+    threadId?: string;
+    // ISO timestamp of the change.
+    at: string;
+    // `update` only: the content fields that changed.
+    fields?: Array<'text' | 'completed'>;
+    // add: 1. update: the record's new content rev. Omitted otherwise.
+    itemRev?: number;
 };
 
 // One entry of the model-facing `tasks` patch. A new task omits `id` and must
@@ -1184,11 +1258,31 @@ export type TaskInput = {
 
 // The model-facing arguments. Everything is optional: with nothing supplied the
 // call reads the list, and every success answers with the same bounded page.
+//
+// T1 adds the concurrency surface (all optional, so every pre-T1 call keeps
+// working exactly as before):
+//   - `expects`     — the revisions the caller read, required for a guarded
+//     content patch or removal whenever the call has an agent identity;
+//   - `claim` / `release` / `takeover` — the ownership verbs;
+//   - `leaseMs`     — the lease length for `claim`/`takeover` (clamped);
+//   - `since`       — asks for the store change log after that store revision;
+//   - `afterId`     — keyset paging cursor (a decimal id), the removal-safe
+//     alternative to `offset`;
+//   - `mergeDisjoint` — opt-in: apply a stale content patch anyway when the
+//     concurrent edits touched only fields this patch does not set.
 export type TaskParameters = {
     tasks?: TaskInput[];
     remove?: string[];
+    expects?: TaskExpect[];
+    claim?: string[];
+    release?: string[];
+    takeover?: string[];
+    leaseMs?: number;
+    since?: number;
     offset?: number;
     limit?: number;
+    afterId?: string;
+    mergeDisjoint?: boolean;
 };
 
 // Counts are derived on every call so the model does not have to list and count.
@@ -1203,9 +1297,18 @@ export type TaskCounts = {
 // session cannot reuse an id that already exists in `items`; both fields are
 // validated by core/task.ts before a restore mutates anything. The KEY this lives
 // under stays `records.todos` in snapshot version 1 (see HarnessSnapshot.records).
+//
+// T1 adds two OPTIONAL fields, and both are optional ON PURPOSE: a snapshot
+// written before T1 has neither, and restores with `storeRev: 0` / `changes: []`.
+// They stay absent when nothing has happened yet, so the on-disk shape of an
+// untouched store is unchanged.
 export type TaskStoreState = {
     items: TaskItem[];
     nextId: number;
+    // Store event revision; defaults to 0 on an old snapshot.
+    storeRev?: number;
+    // Bounded change log (TASK_MAX_CHANGES), trimmed FIFO; [] on an old snapshot.
+    changes?: TaskChange[];
 };
 
 // Legacy aliases: the tool was `todoManage` before R9-R11. Internal callers (and

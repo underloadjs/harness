@@ -385,7 +385,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "task",
     metadata: {
         name: "task",
-        description: "Maintain the task list for this harness session. Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete. Unknown ids are invalid, an id may not appear twice in `tasks` or in both `tasks` and `remove`, and the whole call is validated before anything changes - so a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls. The list is shared by every agent in this harness, kept across turns, and cleared by reset. EVERY successful call returns the SAME bounded page of the current list: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? } } - 20 items by default, at most 100, and a 64 KiB serialized page budget, so pass page.nextOffset back as `offset` while page.hasMore, or set `offset`/`limit` to choose the page. Caps: 200 tasks, 4000 characters of text each.",
+        description: "Maintain the task list for this harness session. Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`claim`/`release`/`takeover` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), and who last edited it. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove; if it moved on the WHOLE call is rejected with the current rev and the last editor, so you re-read and retry instead of overwriting their work, or pass `mergeDisjoint: true` when the concurrent change touched only fields your patch leaves out. `claim`/`release`/`takeover` reserve a record while you edit it (`leaseMs`, default 15 minutes): a claimed record refuses other agents' writes until it is released, taken over, or the lease expires, and claiming never changes `rev`. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev } - 20 items by default, at most 100, and a 64 KiB serialized page budget. Page by `offset`/`limit`, or by `afterId` (the last id of the previous page) when records may be removed mid-walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the store events since that revision (add/update/remove/claim/release) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text each.",
         tags: [
             "task",
             "tasks",
@@ -399,7 +399,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             properties: {
                 tasks: {
                     type: "array",
-                    description: "Changes to apply, in order. Omit \"id\" to add a task (its \"text\" is required); give a known \"id\" to patch that task, leaving omitted fields unchanged. An empty list is a read.",
+                    description: "Changes to apply, in order. Omit \"id\" to add a task (its \"text\" is required); give a known \"id\" to patch that task, leaving omitted fields unchanged. An empty list is a read. A patch of an existing id needs its \"expects\" token.",
                     items: {
                         type: "object",
                         properties: {
@@ -424,18 +424,82 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     items: {
                         type: "string"
                     },
-                    description: "Exact task ids to delete. Every id must exist; an id may not also appear in \"tasks\"."
+                    description: "Exact task ids to delete. Every id must exist; an id may not also appear in \"tasks\". A deletion needs its \"expects\" token."
+                },
+                expects: {
+                    type: "array",
+                    description: "The revisions you READ, one { id, rev } per id this call patches or removes (required for those writes, optional for \"claim\"/\"release\"/\"takeover\"). A rev that no longer matches rejects the whole call rather than silently dropping the concurrent edit. An id may carry at most one token.",
+                    items: {
+                        type: "object",
+                        properties: {
+                            id: {
+                                type: "string",
+                                description: "Task id you read."
+                            },
+                            rev: {
+                                type: "integer",
+                                minimum: 1,
+                                description: "The \"rev\" that record had when you read it, copied from an earlier result."
+                            }
+                        },
+                        required: [
+                            "id",
+                            "rev"
+                        ],
+                        additionalProperties: false
+                    }
+                },
+                claim: {
+                    type: "array",
+                    items: {
+                        type: "string"
+                    },
+                    description: "Ids to claim for you (your agent + thread) while you work on them. An unowned or expired claim is taken with a lease; re-claiming one you already hold only renews the lease; a live claim by somebody else is rejected. Claims never change \"rev\"."
+                },
+                release: {
+                    type: "array",
+                    items: {
+                        type: "string"
+                    },
+                    description: "Ids to give back: clears your claim, or an expired claim. An unowned id is a no-op success; another agent's live claim is rejected."
+                },
+                takeover: {
+                    type: "array",
+                    items: {
+                        type: "string"
+                    },
+                    description: "Ids to seize from whoever holds them, live lease or not - the deliberate override, for when the holder is gone. Sets the lease to you."
+                },
+                leaseMs: {
+                    type: "integer",
+                    minimum: 60000,
+                    maximum: 86400000,
+                    description: "Lease length for \"claim\"/\"takeover\", 60000-86400000 ms. Defaults to 900000 (15 minutes)."
+                },
+                since: {
+                    type: "integer",
+                    minimum: 0,
+                    description: "Asks for the store change log after this revision: the result also carries \"changes\" (at most 50 entries, oldest first) with \"changesHasMore\" and \"changesTruncated\". Pass the \"storeRev\" of your last read. Must not be ahead of the store."
                 },
                 offset: {
                     type: "integer",
                     minimum: 0,
-                    description: "0-based index of the first returned task. Defaults to 0; use page.nextOffset from the previous page."
+                    description: "0-based index of the first returned task. Defaults to 0; use page.nextOffset from the previous page. Cannot be combined with \"afterId\"."
                 },
                 limit: {
                     type: "integer",
                     minimum: 1,
                     maximum: 100,
                     description: "Page size, 1-100. Defaults to 20."
+                },
+                afterId: {
+                    type: "string",
+                    pattern: "^[0-9]+$",
+                    description: "Keyset cursor: the last id of the previous page. Returns the records with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Sets page.nextAfterId while page.hasMore."
+                },
+                mergeDisjoint: {
+                    type: "boolean",
+                    description: "true applies a stale content patch anyway when every concurrent change since your read touched only fields your patch does not set; an overlapping field still rejects. Never merges a removal."
                 }
             },
             additionalProperties: false

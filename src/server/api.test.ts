@@ -2867,25 +2867,63 @@ describe('manual tool execution', () => {
         const added = await call(runtime, 'POST', executions('task'), {
             parameters: { tasks: [{ text: '  check bounds ' }] }
         });
+        // T1 shape of the SAME result (src/core/task.ts project + copyItem): every
+        // record carries its content `rev` (1 on add) and the write attribution, and
+        // the envelope carries the monotonic `storeRev`. An execution route runs as the
+        // session PRIMARY ("demo") with NO thread, so `updatedBy` is set and
+        // `updatedThreadId` stays absent — never `undefined`.
+        //
+        // This file deliberately never pins the wall clock (unlike ./sessions.test.ts),
+        // so `updatedAt` is asserted BY SHAPE here and BY IDENTITY in the read below:
+        // the follow-up call must report the very same instant.
         expect(added.body).toEqual({
             ok: true,
             result: {
-                tasks: [{ id: '1', text: 'check bounds', completed: false }],
+                tasks: [
+                    {
+                        id: '1',
+                        text: 'check bounds',
+                        completed: false,
+                        rev: 1,
+                        updatedBy: 'demo',
+                        updatedAt: expect.any(String)
+                    }
+                ],
                 counts: { total: 1, completed: 0, pending: 1 },
                 // R9-R11: every successful task call returns the current bounded page.
-                page: { offset: 0, limit: 20, hasMore: false }
+                page: { offset: 0, limit: 20, hasMore: false },
+                storeRev: 1
             },
             duration_ms: expect.any(Number)
         });
 
-        // A second call sees the SAME list: the tool lives in the session harness.
+        // The shape check above is not enough on its own: the value must be the exact
+        // ISO instant the store wrote, which is what the next call re-reads.
+        const writtenAt = (
+            added.body as { result: { tasks: { updatedAt: string }[] } }
+        ).result.tasks[0].updatedAt;
+
+        expect(new Date(writtenAt).toISOString()).toBe(writtenAt);
+
+        // A second call sees the SAME list: the tool lives in the session harness. The
+        // read is not a write, so rev, attribution and storeRev are all unchanged.
         const listed = await call(runtime, 'POST', executions('task'), { parameters: {} });
         expect(listed.body).toEqual({
             ok: true,
             result: {
-                tasks: [{ id: '1', text: 'check bounds', completed: false }],
+                tasks: [
+                    {
+                        id: '1',
+                        text: 'check bounds',
+                        completed: false,
+                        rev: 1,
+                        updatedBy: 'demo',
+                        updatedAt: writtenAt
+                    }
+                ],
                 counts: { total: 1, completed: 0, pending: 1 },
-                page: { offset: 0, limit: 20, hasMore: false }
+                page: { offset: 0, limit: 20, hasMore: false },
+                storeRev: 1
             },
             duration_ms: expect.any(Number)
         });

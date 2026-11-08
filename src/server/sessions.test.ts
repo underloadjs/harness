@@ -492,7 +492,7 @@ describe('SessionStore turns', () => {
                 name: 'task',
                 callId: 'c1',
                 content:
-                    '{"tasks":[],"counts":{"total":0,"completed":0,"pending":0},"page":{"offset":0,"limit":20,"hasMore":false}}',
+                    '{"tasks":[],"counts":{"total":0,"completed":0,"pending":0},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":0}',
                 // Every EXECUTED call reports its span, inline ones included
                 // (harness.ts deliverTask). The clock is pinned at 2_000, so the
                 // inline task round is exactly 0 ms.
@@ -1616,27 +1616,50 @@ describe('SessionStore manual tool calls', () => {
         );
 
     it('runs a core tool in that session and isolates its state', async () => {
+        // The clock is pinned so the task store's write timestamp is an EXACT ISO
+        // string (src/core/task.ts writeAttribution derives `updatedAt` from
+        // Date.now), instead of a loose shape check.
+        pinClock(1_000);
+
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const mine = await store.create('single');
         const other = await store.create('single');
 
-        expect(await store.callTool(mine.id, 'task', { tasks: [{ text: '  only mine ' }] })).toEqual({
-            tasks: [{ id: '1', text: 'only mine', completed: false }],
+        // An operator call runs as the session's PRIMARY agent, so the new record is
+        // attributed to it. There is no `updatedThreadId`: a manual call has no
+        // thread, and the key stays absent rather than `undefined` (copyItem).
+        const onlyMine = {
+            tasks: [
+                {
+                    id: '1',
+                    text: 'only mine',
+                    completed: false,
+                    // T1: content revision +1 on add, and the write attribution.
+                    rev: 1,
+                    updatedBy: 'single',
+                    updatedAt: '1970-01-01T00:00:01.000Z'
+                }
+            ],
             counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
-        });
+            page: { offset: 0, limit: 20, hasMore: false },
+            // Every successful task call answers with the store revision (R9 shape +
+            // T1 change feed): one recorded event so far.
+            storeRev: 1
+        };
 
-        // The state lives in the session's harness: the same session sees the item,
-        // a sibling session does not.
-        expect(await store.callTool(mine.id, 'task', {})).toEqual({
-            tasks: [{ id: '1', text: 'only mine', completed: false }],
-            counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
-        });
+        expect(await store.callTool(mine.id, 'task', { tasks: [{ text: '  only mine ' }] })).toEqual(
+            onlyMine
+        );
+
+        // The state lives in the session's harness: the same session sees the item —
+        // an unchanged read reports the same rev, attribution and storeRev — a
+        // sibling session does not (its own store, still at storeRev 0).
+        expect(await store.callTool(mine.id, 'task', {})).toEqual(onlyMine);
         expect(await store.callTool(other.id, 'task', {})).toEqual({
             tasks: [],
             counts: { total: 0, completed: 0, pending: 0 },
-            page: { offset: 0, limit: 20, hasMore: false }
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 0
         });
     });
 
@@ -1821,7 +1844,9 @@ describe('SessionStore manual tool calls', () => {
         expect(await store.callTool(session.id, 'task', {})).toEqual({
             tasks: [],
             counts: { total: 0, completed: 0, pending: 0 },
-            page: { offset: 0, limit: 20, hasMore: false }
+            page: { offset: 0, limit: 20, hasMore: false },
+            // The turn never touched the task list, so the store is still at 0.
+            storeRev: 0
         });
     });
 });

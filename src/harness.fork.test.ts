@@ -85,6 +85,12 @@ const toolNames = (request: HarnessStreamRequest | undefined): string[] =>
 const brain = (stream: HarnessStream, extra: Record<string, unknown> = {}): Agent =>
     agent({ model: 'merge/ds4-flash', stream, ...extra });
 
+// The frozen instant the task-store tests below pin the (already faked) clock to, so
+// every `updatedAt`/change-feed `at` has ONE exact expected ISO string. See
+// src/core/task.ts, which stamps both from Date.
+const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
+const EPOCH_MS = Date.parse(EPOCH_ISO);
+
 const flush = async (): Promise<void> => {
     for (let pass = 0; pass < 32; pass += 1) {
         await vi.advanceTimersByTimeAsync(0);
@@ -729,6 +735,15 @@ describe('threadFork runtime', () => {
     });
 
     it('suppresses branch transcript persistence noise but keeps shared store notifications', async () => {
+        // THE FROZEN CLOCK. `vi.useFakeTimers()` (beforeEach) freezes Date at the
+        // wall-clock instant the file installed it, which is NOT a fixed value, so
+        // the task store's T1 stamps (`updatedAt`, and the change-feed `at`) would
+        // be unassertable. Pinning the system time gives every write in this test
+        // ONE exact ISO string; a branch runs on the writer's default conversation,
+        // so attribution is `writer` + `agent:writer` (src/core/task.ts reads both
+        // from the ToolContext, never from the arguments).
+        vi.setSystemTime(EPOCH_MS);
+
         const reasons: string[] = [];
 
         const entry = brain(
@@ -774,9 +789,20 @@ describe('threadFork runtime', () => {
         // a persistence-worthy event.
         expect(reasons).toContain('tool_execute:task');
         expect(await writer.executeTool('task', {})).toEqual({
-            tasks: [{ id: '1', text: 'Shared item', completed: false }],
+            tasks: [
+                {
+                    id: '1',
+                    text: 'Shared item',
+                    completed: false,
+                    rev: 1,
+                    updatedBy: 'writer',
+                    updatedThreadId: 'agent:writer',
+                    updatedAt: EPOCH_ISO
+                }
+            ],
             counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1
         });
     });
 

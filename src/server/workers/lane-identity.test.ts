@@ -108,6 +108,21 @@ describe('createIdentityLedger', () => {
         // The real core rule, not a restatement of it.
         expect(() => readTaskStoreState({ items, nextId })).not.toThrow();
         expect(readTaskStoreState({ items, nextId }).nextId).toBe(10_004);
+
+        // T1: a minted block still has the pre-T1 SHAPE (`{ items, nextId }`), and the
+        // core reader completes it rather than guessing - every record starts at content
+        // rev 1 and the store has no history until the session writes one. That default
+        // is what lets a lane-minted store and a core-written one be the same document.
+        expect(readTaskStoreState({ items, nextId })).toEqual({
+            items: [
+                { id: '10001', text: 'task 10001', completed: false, rev: 1 },
+                { id: '10002', text: 'task 10002', completed: false, rev: 1 },
+                { id: '10003', text: 'task 10003', completed: false, rev: 1 }
+            ],
+            nextId: 10_004,
+            storeRev: 0,
+            changes: []
+        });
     });
 
     it('reproduces F2: two lanes never receive the same thread id or invocation id', () => {

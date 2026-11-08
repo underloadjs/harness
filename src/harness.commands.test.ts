@@ -5,8 +5,16 @@
 //   - a harness starts with the five built-ins (/help, /tools, /task, /websearch,
 //     /webfetch) even when `plugins` is absent;
 //   - `/task` mutates THIS harness's task store (the model path and snapshot()
-//     both see it), and add/complete/reopen/remove map onto the tool's real
-//     parameter schema;
+//     both see it), and add/complete/reopen/remove/claim/release/takeover map onto
+//     the tool's real parameter schema. The three content verbs (complete, reopen,
+//     remove) are GUARDED writes: `executeTool` always carries an agent identity,
+//     so the command reads the store first and sends the current `expects` tokens
+//     (src/core/task.ts). An unknown id gets no token and reports the tool's own
+//     unknown-id rejection;
+//   - `/task claim|release|takeover` are OWNERSHIP actions: they move the holder
+//     pair without touching `rev`, so they need no token, and they run unthreaded
+//     (`executeTool` supplies no threadId), which makes the operator a holder that
+//     is distinct from every conversation's;
 //   - `/websearch` and `/webfetch` are pass-throughs to `search`/`fetch`, and when
 //     the tool is absent they answer a helpful error result instead of throwing;
 //   - `commands` entries register after the built-ins and a collision (with a
@@ -25,8 +33,9 @@
 //   - ./core/command-builtins.ts    — the built-in implementations
 //   - ./harness.task.test.ts        — the same scripted-agent conventions
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
+import { TASK_DEFAULT_LEASE_MS } from './core/task';
 import type {
     Agent,
     HarnessCommand,
@@ -37,6 +46,9 @@ import type {
     HarnessStreamEvent,
     HarnessStreamRequest,
     HarnessSnapshot,
+    TaskChange,
+    TaskChangeOp,
+    TaskItem,
     Tool
 } from '@underload/harness';
 
@@ -75,16 +87,85 @@ const quiet = (
 // The five built-ins, in the order the registry sorts them for an assertion.
 const BUILT_INS = ['help', 'task', 'tools', 'webfetch', 'websearch'];
 
-// The task page the `task` tool always returns (src/core/task.ts): one shape for
-// a read, an add, a patch and a removal alike.
-const taskPage = (tasks: unknown[], total: number, completed: number, pending: number) => ({
+// The task store's timestamps are all `Date.now()`/`new Date()` (src/core/task.ts
+// line 1069/1109/1304), so the `/task` block pins the clock: `updatedAt`, the
+// change-feed stamps, and a claim's `leaseUntil = now + TASK_DEFAULT_LEASE_MS`
+// then have ONE exact expected value each instead of "some string". Only Date is
+// faked — the command path schedules no timer, and the model path is not used
+// inside that block.
+const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
+const EPOCH_MS = Date.parse(EPOCH_ISO);
+const LEASE_UNTIL = EPOCH_MS + TASK_DEFAULT_LEASE_MS;
+const LEASE_ISO = new Date(LEASE_UNTIL).toISOString();
+
+// The page every successful `task` call returns (src/core/task.ts): one shape for
+// a read, an add, a patch, a removal and an ownership action alike, now plus
+// `storeRev` — one increment per RECORDED event (a claim renewal, a no-op release
+// and a read record nothing, so they leave it where it was).
+const taskPage = (
+    tasks: unknown[],
+    total: number,
+    completed: number,
+    pending: number,
+    storeRev: number
+) => ({
     tasks,
     counts: { total, completed, pending },
-    page: { offset: 0, limit: 20, hasMore: false }
+    page: { offset: 0, limit: 20, hasMore: false },
+    storeRev
+});
+
+// One stored record as the COMMAND door writes it. Attribution comes from the
+// caller: `executeTool` hands the tool the harness's primary (`writer`) and NO
+// threadId, so `updatedBy` is set and `updatedThreadId` is absent entirely.
+// `rev` is the content revision — 1 on add, +1 only for a real text/completed
+// change, never for a claim.
+const record = (id: string, text: string, completed: boolean, rev: number) => ({
+    id,
+    text,
+    completed,
+    rev,
+    updatedBy: 'writer',
+    updatedAt: EPOCH_ISO
+});
+
+// The same record while the OPERATOR holds it. A claim from an unthreaded caller
+// must not keep a thread tag (core/task.ts setClaim), so `ownerThreadId` is absent
+// and the holder pair is ("writer", undefined).
+const claimedRecord = (id: string, text: string, completed: boolean, rev: number) => ({
+    ...record(id, text, completed, rev),
+    owner: 'writer',
+    leaseUntil: LEASE_UNTIL
+});
+
+// One change-feed entry, in the canonical key order core/task.ts logs
+// (`rev, id, op, by, threadId, at, fields, itemRev`), stamped at the frozen
+// instant. `by`/`threadId` appear only when the caller had that identity, which is
+// why the release `harness.stopThread`/`deleteThread` trigger (core `releaseThread`)
+// is distinguishable from a voluntary one: it names the thread and has no `by`.
+const event = (
+    rev: number,
+    id: string,
+    op: TaskChangeOp,
+    shape: {
+        by?: string;
+        threadId?: string;
+        fields?: Array<'text' | 'completed'>;
+        itemRev?: number;
+    } = {}
+): TaskChange => ({
+    rev,
+    id,
+    op,
+    ...(shape.by === undefined ? {} : { by: shape.by }),
+    ...(shape.threadId === undefined ? {} : { threadId: shape.threadId }),
+    at: EPOCH_ISO,
+    ...(shape.fields === undefined ? {} : { fields: shape.fields }),
+    ...(shape.itemRev === undefined ? {} : { itemRev: shape.itemRev })
 });
 
 const taskUsage =
-    'usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>...]';
+    'usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]';
 
 describe('command registry', () => {
     it('registers the five built-ins on a harness with no commands and no plugins', async () => {
@@ -94,7 +175,7 @@ describe('command registry', () => {
         expect(Object.keys(writer.commands).sort()).toEqual(BUILT_INS);
         expect(writer.commands.task).toMatchObject({
             name: 'task',
-            usage: '/task [list | add <text> | complete <id> | reopen <id> | remove <id>...]'
+            usage: '/task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]'
         });
         // Every built-in carries the description /help renders.
         for (const name of BUILT_INS) {
@@ -348,8 +429,12 @@ describe('command registry', () => {
         expect(seen).toHaveLength(0);
         expect(progress).toEqual([]);
         // The two calls that ran the `task` tool DID fire the ordinary tool
-        // state-change, which is what a server uses to schedule a save.
+        // state-change, which is what a server uses to schedule a save. Three
+        // events, not two: `/task complete` is a GUARDED write, so the command reads
+        // the store (one `tool_execute`) before patching it (the second) — see
+        // src/core/command-builtins.ts `readTaskRevisions`.
         expect(changes).toEqual([
+            { type: 'state_change', reason: 'tool_execute', tool: 'task' },
             { type: 'state_change', reason: 'tool_execute', tool: 'task' },
             { type: 'state_change', reason: 'tool_execute', tool: 'task' }
         ]);
@@ -361,19 +446,33 @@ describe('command registry', () => {
 });
 
 describe('/task', () => {
+    // THE FROZEN CLOCK (see EPOCH_ISO above): every `updatedAt`, every change-feed
+    // `at`, and every claim `leaseUntil` in this block is then one exact value.
+    beforeEach(() => {
+        vi.useFakeTimers();
+        vi.setSystemTime(EPOCH_MS);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
     it('adds, lists, completes, reopens, and removes through the live task store', async () => {
         const seen: HarnessStreamRequest[] = [];
         const writer = quiet(brain(seen));
 
+        // An untouched store records nothing, so `storeRev` is 0 on the first read.
         expect(await writer.executeCommand('/task')).toEqual({
             content: 'No tasks.\n0 total, 0 completed, 0 pending\npage: offset 0, limit 20, showing 0',
-            data: taskPage([], 0, 0, 0)
+            data: taskPage([], 0, 0, 0, 0)
         });
 
-        // `/task add "testing"` — the quoted phrase is ONE task text.
+        // `/task add "testing"` — the quoted phrase is ONE task text. An ADD is not
+        // a guarded write (there is no prior record), so it needs no token; `rev`
+        // starts at 1 and the primary is credited because executeTool has one.
         expect(await writer.executeCommand('/task add "testing"')).toEqual({
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
-            data: taskPage([{ id: '1', text: 'testing', completed: false }], 1, 0, 1)
+            data: taskPage([record('1', 'testing', false, 1)], 1, 0, 1, 1)
         });
 
         // A later add joins the remaining tokens, and `/task` re-reads the list.
@@ -383,21 +482,124 @@ describe('/task', () => {
         expect((await writer.executeCommand('/task list')).content).toBe(
             '#1 [ ] testing\n#2 [ ] fix the build\n2 total, 0 completed, 2 pending\npage: offset 0, limit 20, showing 2'
         );
-        expect((await writer.executeCommand('/task complete 1')).content).toBe(
-            '#1 [x] testing\n#2 [ ] fix the build\n2 total, 1 completed, 1 pending\npage: offset 0, limit 20, showing 2'
-        );
-        expect((await writer.executeCommand('/task reopen 1')).content).toBe(
-            '#1 [ ] testing\n#2 [ ] fix the build\n2 total, 0 completed, 2 pending\npage: offset 0, limit 20, showing 2'
-        );
-        expect((await writer.executeCommand('/task remove 2')).content).toBe(
-            '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1'
-        );
+        expect(await writer.executeCommand('/task complete 1')).toEqual({
+            content: '#1 [x] testing\n#2 [ ] fix the build\n2 total, 1 completed, 1 pending\npage: offset 0, limit 20, showing 2',
+            // One RECORDED event for the flip (storeRev 3), and `rev` moves by
+            // exactly one because one content field changed.
+            data: taskPage(
+                [record('1', 'testing', true, 2), record('2', 'fix the build', false, 1)],
+                2,
+                1,
+                1,
+                3
+            )
+        });
+        expect(await writer.executeCommand('/task reopen 1')).toEqual({
+            content: '#1 [ ] testing\n#2 [ ] fix the build\n2 total, 0 completed, 2 pending\npage: offset 0, limit 20, showing 2',
+            data: taskPage(
+                [record('1', 'testing', false, 3), record('2', 'fix the build', false, 1)],
+                2,
+                0,
+                2,
+                4
+            )
+        });
+        expect(await writer.executeCommand('/task remove 2')).toEqual({
+            content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
+            data: taskPage([record('1', 'testing', false, 3)], 1, 0, 1, 5)
+        });
 
         // The store is THIS harness's: the host tool path and a snapshot both see
         // exactly what the command wrote.
-        expect(await writer.executeTool('task', {})).toEqual(taskPage([{ id: '1', text: 'testing', completed: false }], 1, 0, 1));
+        expect(await writer.executeTool('task', {})).toEqual(
+            taskPage([record('1', 'testing', false, 3)], 1, 0, 1, 5)
+        );
         expect(writer.snapshot().records.todos.items).toEqual([
-            { id: '1', text: 'testing', completed: false }
+            record('1', 'testing', false, 3)
+        ]);
+        expect(seen).toHaveLength(0);
+    });
+
+    it('sends the revision it just read, so a guarded command write is recorded not refused', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const writer = quiet(brain(seen));
+
+        await writer.executeCommand('/task add "testing"');
+        await writer.executeCommand('/task complete 1');
+        await writer.executeCommand('/task remove 1');
+
+        // The change feed is the proof. THREE events, all attributed to the primary
+        // (executeTool's context), and the two guarded writes landed on the first
+        // try — a blind write would have been refused with `guarded write: pass
+        // expects [...]` and recorded nothing. The command's internal revision reads
+        // are silent, so they add no events of their own.
+        const feed = (await writer.executeTool('task', { since: 0 })) as { changes: unknown[] };
+
+        expect(feed.changes).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '1', 'update', { by: 'writer', fields: ['completed'], itemRev: 2 }),
+            event(3, '1', 'remove', { by: 'writer' })
+        ]);
+        expect(seen).toHaveLength(0);
+    });
+
+    it('claims, renews, releases and takes over records without touching rev', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const writer = quiet(brain(seen));
+
+        await writer.executeCommand('/task add "testing"');
+
+        // CLAIM — the holder pair is ("writer", undefined), because a command runs
+        // through executeTool, which supplies no threadId. `rev` stays 1 (core/task
+        // .ts: an ownership action never moves the content revision), and the
+        // listing names the holder so a later refusal is explainable.
+        const claim = await writer.executeCommand('/task claim 1');
+
+        expect(claim).toEqual({
+            content: `#1 [ ] testing (claimed by writer until ${LEASE_ISO})\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1`,
+            data: taskPage([claimedRecord('1', 'testing', false, 1)], 1, 0, 1, 2)
+        });
+
+        // A second claim by the SAME holder is a renewal: the lease is re-armed at
+        // the same frozen instant, nothing is logged, and `storeRev` stays 2.
+        expect(await writer.executeCommand('/task claim 1')).toEqual(claim);
+        // `/task takeover` of a claim the operator already holds is that same
+        // renewal, not an override of somebody else.
+        expect(await writer.executeCommand('/task takeover 1')).toEqual(claim);
+
+        // RELEASE — the three ownership keys are DELETED, not nulled, so a snapshot
+        // never carries an empty holder; the release is one recorded event.
+        const released = {
+            content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
+            data: taskPage([record('1', 'testing', false, 1)], 1, 0, 1, 3)
+        };
+
+        expect(await writer.executeCommand('/task release 1')).toEqual(released);
+        // Releasing an UNCLAIMED record is a no-op success: nothing to lift, so
+        // nothing to log, and `storeRev` stays 3.
+        expect(await writer.executeCommand('/task release 1')).toEqual(released);
+
+        // The holder's own content write is NOT blocked by its own claim: the
+        // operator claimed as ("writer", undefined) and writes as the same pair, so
+        // `/task complete` applies and `rev` moves by exactly one.
+        await writer.executeCommand('/task claim 1');
+
+        expect(await writer.executeCommand('/task complete 1')).toEqual({
+            content: `#1 [x] testing (claimed by writer until ${LEASE_ISO})\n1 total, 1 completed, 0 pending\npage: offset 0, limit 20, showing 1`,
+            data: taskPage([claimedRecord('1', 'testing', true, 2)], 1, 1, 0, 5)
+        });
+
+        // The feed for the whole sequence: add, claim, release, claim, update — a
+        // renewal contributes nothing, which is exactly why a heartbeat cannot knock
+        // another agent off its CAS token.
+        const feed = (await writer.executeTool('task', { since: 0 })) as { changes: unknown[] };
+
+        expect(feed.changes).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '1', 'claim', { by: 'writer' }),
+            event(3, '1', 'release', { by: 'writer' }),
+            event(4, '1', 'claim', { by: 'writer' }),
+            event(5, '1', 'update', { by: 'writer', fields: ['completed'], itemRev: 2 })
         ]);
         expect(seen).toHaveLength(0);
     });
@@ -414,6 +616,9 @@ describe('/task', () => {
             ['/task complete', `/task: "complete" needs a task id.\n${taskUsage}`],
             ['/task reopen', `/task: "reopen" needs a task id.\n${taskUsage}`],
             ['/task remove', `/task: "remove" needs at least one task id.\n${taskUsage}`],
+            ['/task claim', `/task: "claim" needs at least one task id.\n${taskUsage}`],
+            ['/task release', `/task: "release" needs at least one task id.\n${taskUsage}`],
+            ['/task takeover', `/task: "takeover" needs at least one task id.\n${taskUsage}`],
             ['/task list 1', `/task: "list" takes no arguments (got 1).\n${taskUsage}`],
             ['/task complete 1 2', `/task: "complete" takes one id (got 2).\n${taskUsage}`]
         ];
@@ -422,11 +627,26 @@ describe('/task', () => {
             expect(await writer.executeCommand(line)).toEqual({ content, isError: true });
         }
 
-        // An unknown id is a TOOL rejection; a command still reports it as text.
-        expect(await writer.executeCommand('/task complete 99')).toEqual({
-            content: '/task complete: task has no task with id "99".',
-            isError: true
-        });
+        // An unknown id is a TOOL rejection; a command still reports it as text. The
+        // guarded verbs report it too — the command reads first, finds no revision,
+        // and lets the tool name the missing id instead of inventing a CAS token.
+        for (const line of ['/task complete 99', '/task reopen 99', '/task remove 99']) {
+            const action = line.split(' ')[1] as string;
+
+            expect(await writer.executeCommand(line)).toEqual({
+                content: `/task ${action}: task has no task with id "99".`,
+                isError: true
+            });
+        }
+
+        // Same for the three ownership verbs, whose ids are validated by the tool.
+        for (const action of ['claim', 'release', 'takeover']) {
+            expect(await writer.executeCommand(`/task ${action} 99`)).toEqual({
+                content: `/task ${action}: task has no task with id "99".`,
+                isError: true
+            });
+        }
+
         // None of the rejected calls changed the list.
         expect((await writer.executeCommand('/task')).content).toBe(
             '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1'
@@ -483,7 +703,7 @@ describe('/tools and /help', () => {
                 '/help  List the commands in this harness, or show one command.',
                 '  usage: /help [command]',
                 "/task  Read and change this session's task list.",
-                '  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>...]',
+                '  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]',
                 '/tools  List the tools registered in this harness.',
                 '  usage: /tools [filter]',
                 "/webfetch  Fetch one http(s) page through this session's fetch tool.",
@@ -496,10 +716,10 @@ describe('/tools and /help', () => {
         // `/help <name>` — the same renderer over one entry, and the name lookup
         // is as forgiving as the parser.
         expect((await writer.executeCommand('/help task')).content).toBe(
-            "/task  Read and change this session's task list.\n  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>...]"
+            "/task  Read and change this session's task list.\n  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]"
         );
         expect((await writer.executeCommand('/help /TASK')).content).toBe(
-            "/task  Read and change this session's task list.\n  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>...]"
+            "/task  Read and change this session's task list.\n  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]"
         );
         expect(await writer.executeCommand('/help zzz')).toEqual({
             content: '/help: unknown command "/zzz".\nusage: /help [command]',
@@ -688,6 +908,18 @@ describe('/websearch and /webfetch', () => {
 });
 
 describe('snapshot isolation', () => {
+    // The `/task` block's clock rule applies here too (see EPOCH_ISO): this block
+    // runs commands only — never a model turn — so pinning Date makes the
+    // persisted record's `updatedAt` an exact value.
+    beforeEach(() => {
+        vi.useFakeTimers();
+        vi.setSystemTime(EPOCH_MS);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
     it('keeps command state per harness, like every other session store', async () => {
         const seen: HarnessStreamRequest[] = [];
         const first = quiet(brain(seen));
@@ -709,9 +941,12 @@ describe('snapshot isolation', () => {
         expect(((await second.executeCommand('/help')).content as string).startsWith('/help  ')).toBe(true);
 
         const snapshot: HarnessSnapshot = first.snapshot();
-        expect(snapshot.records.todos.items).toEqual([
-            { id: '1', text: 'only here', completed: false }
-        ]);
+
+        // T1: a persisted record carries its content revision and its attribution
+        // (`updatedBy` is the primary, because a command writes through
+        // executeTool), and the store's event revision rides along in `storeRev`.
+        expect(snapshot.records.todos.items).toEqual([record('1', 'only here', false, 1)]);
+        expect(snapshot.records.todos.storeRev).toBe(1);
         expect(seen).toHaveLength(0);
     });
 });

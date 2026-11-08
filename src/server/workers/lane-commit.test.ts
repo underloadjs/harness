@@ -13,7 +13,7 @@
 //   - ../../core/task.ts - readTaskStoreState, the validator a folded store must pass
 
 import { describe, expect, it } from 'vitest';
-import { readTaskStoreState } from '../../core/task';
+import { readTaskStoreState, TASK_DEFAULT_LEASE_MS } from '../../core/task';
 import {
     DEFAULT_BOUNDS,
     applyMutationGroup,
@@ -33,6 +33,12 @@ import { createIdentityLedger } from './lane-identity';
 
 const EPOCH_A = 1;
 const EPOCH_B = 2;
+
+// The frozen instant the T1 fixtures below write into a fold view, so a persisted
+// `updatedAt` and a `leaseUntil` are one exact value each (src/core/task.ts derives
+// both from Date). The fold itself never reads the clock.
+const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
+const EPOCH_MS = Date.parse(EPOCH_ISO);
 
 const context = (
     view: CanonicalView,
@@ -177,6 +183,157 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
         expect(applySharedMutation(view, { kind: 'record:add', store: 'ghosts', record: {} } as never, { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }).rejection?.code).toBe(
             'unknown-store'
         );
+    });
+
+    // T1: the block a lane folds against is the CORE's persisted task store, and from
+    // T1 on that block carries `rev` + attribution per record and `storeRev` + the
+    // change feed per store. Two things have to stay true: the folded store is still
+    // valid to `readTaskStoreState` (a session that restores it must not choke), and
+    // the fold's DIGEST guard still sees every one of those fields - which is exactly
+    // how it differs from the tool's `{ id, rev }` compare-and-swap (a claim moves the
+    // record but never the content revision).
+    it('folds a T1 task store without breaking the core validator', () => {
+        const view = emptyCanonicalView();
+        const todos = view.stores.todos as unknown as {
+            items: Record<string, unknown>[];
+            nextId: number;
+            storeRev: number;
+            changes: Record<string, unknown>[];
+        };
+
+        todos.items.push({
+            id: '1',
+            text: 'shared',
+            completed: false,
+            rev: 1,
+            updatedBy: 'primary',
+            updatedAt: EPOCH_ISO
+        });
+        todos.nextId = 2;
+        todos.storeRev = 2;
+        todos.changes = [
+            {
+                rev: 1,
+                id: '1',
+                op: 'add',
+                by: 'primary',
+                at: EPOCH_ISO,
+                itemRev: 1
+            },
+            {
+                rev: 2,
+                id: '1',
+                op: 'claim',
+                by: 'primary',
+                at: EPOCH_ISO
+            }
+        ];
+
+        expect(() => readTaskStoreState(todos as never)).not.toThrow();
+
+        // Nothing is dropped on the way through the validator: the revision, the
+        // attribution and the feed window all come back, in the canonical key order.
+        expect(readTaskStoreState(todos as never)).toEqual({
+            items: [
+                {
+                    id: '1',
+                    text: 'shared',
+                    completed: false,
+                    rev: 1,
+                    updatedBy: 'primary',
+                    updatedAt: EPOCH_ISO
+                }
+            ],
+            nextId: 2,
+            storeRev: 2,
+            changes: [
+                { rev: 1, id: '1', op: 'add', by: 'primary', at: EPOCH_ISO, itemRev: 1 },
+                { rev: 2, id: '1', op: 'claim', by: 'primary', at: EPOCH_ISO }
+            ]
+        });
+    });
+
+    it('digests the T1 fields, which the tool-level content revision deliberately ignores', () => {
+        const view = emptyCanonicalView();
+        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const leases = createWriterLeaseLedger();
+
+        applySharedMutation(
+            view,
+            { kind: 'record:add', store: 'todos', record: { text: 'shared', completed: false, rev: 1 } },
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }
+        );
+
+        const readDigest = expectsDigestOf(view.stores.todos.items[0]);
+
+        // First the ordinary case, as a baseline: the lane holds the digest it really
+        // read, so its patch lands.
+        const appliedFirst = applySharedMutation(
+            view,
+            {
+                kind: 'record:update',
+                store: 'todos',
+                id: view.stores.todos.items[0].id,
+                patch: { completed: true },
+                expects: readDigest
+            },
+            { laneEpoch: EPOCH_B, leases, identity, opId: 1, seq: 1 }
+        );
+
+        expect(appliedFirst.status).toBe('applied');
+
+        // A CLAIM bumps no content revision, so the tool's `{ id, rev }` token stays
+        // valid - but the stored record DID change, and the fold's digest covers the
+        // whole value. Applying the claim to the fold view is what a routed core claim
+        // does to the next folded snapshot, so this is the realistic concurrent case.
+        const claimed = {
+            ...view.stores.todos.items[0],
+            owner: 'lane-a',
+            leaseUntil: EPOCH_MS + TASK_DEFAULT_LEASE_MS
+        };
+
+        view.stores.todos.items[0] = claimed;
+
+        expect(expectsDigestOf(claimed)).not.toBe(readDigest);
+
+        const refused = applySharedMutation(
+            view,
+            {
+                kind: 'record:update',
+                store: 'todos',
+                id: claimed.id,
+                patch: { text: 'written over a claim' },
+                expects: readDigest
+            },
+            { laneEpoch: EPOCH_B, leases, identity, opId: 2, seq: 1 }
+        );
+
+        // Refused by the FOLD (a `stale-record` receipt carrying the canonical digest),
+        // which is a different mechanism from the canonical store throwing the tool's
+        // CAS sentence. See ./lane-authority.test.ts for that side.
+        expect(refused.status).toBe('rejected');
+        expect(refused.rejection?.code).toBe('stale-record');
+        expect(refused.effect?.digest).toBe(expectsDigestOf(claimed));
+
+        // With the digest of the claimed record, the same patch lands and keeps the T1
+        // fields the core owns - the fold never strips `owner`/`leaseUntil`.
+        const applied = applySharedMutation(
+            view,
+            {
+                kind: 'record:update',
+                store: 'todos',
+                id: claimed.id,
+                patch: { text: 'written over a claim' },
+                expects: expectsDigestOf(claimed)
+            },
+            { laneEpoch: EPOCH_B, leases, identity, opId: 3, seq: 1 }
+        );
+
+        expect(applied.status).toBe('applied');
+        expect(view.stores.todos.items[0]).toEqual({
+            ...claimed,
+            text: 'written over a claim'
+        });
     });
 });
 

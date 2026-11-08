@@ -147,7 +147,9 @@ writer.threads();                                            // default + host r
   QUEUED on that thread (they reject with "was stopped while this turn was
   queued" instead of running and flipping the status back to running). Agents
   cannot run or post into a stopped thread; only a new host `sendThreadInput`
-  revives it, or the host deletes it.
+  revives it, or the host deletes it. A stop also releases every `task` claim that
+  conversation held, so a dead thread cannot keep a shared record reserved until its
+  lease happens to expire.
 - **Delete** — `deleteThread(id)` removes a terminal HOST thread: its record,
   transcript, owned terminal children, its invocation results, and every branch
   (`threadFork`/autoanswer, including nested ones) materialized from that
@@ -155,7 +157,9 @@ writer.threads();                                            // default + host r
   `reset()`). Deletion purges THIS conversation only: it never promises to forget
   what other histories were already told, and it does not undo what this thread
   copied into session-shared memory (tasks, profiles, chapters, locations) or what
-  a connected thread already received through a `#` reference.
+  a connected thread already received through a `#` reference. The one shared write it
+  DOES make is releasing that conversation's `task` claims — nothing else can once the
+  record is gone.
 
 Threads may only be OWNED by an independent host thread: `ownerThreadId` must
 name a `createThread` record, never an implicit `agent:<name>` conversation
@@ -189,7 +193,7 @@ src/
   harness.test.ts   its test, next to it
   index.ts          Node root entry    (library + shared + server + client)
   browser.ts        browser root entry (library + shared + client)
-  core/             agent, tool, discovery, creation, todo, profile, chapter,
+  core/             agent, tool, discovery, creation, task, profile, chapter,
                     location, action, branch   (usable without a harness)
                     tool-discovery + tool-manifest: the AST descriptor scan and its
                     generated data-only table (no tool module is imported for it)
@@ -638,9 +642,11 @@ survive snapshot/restore but are not persisted to disk by the harness.
 
 Every harness registers the `task` tool and declares it on the first request, so
 the model can keep a plan without a discovery round. The tool used to be named
-`task`; R9-R11 renamed it and replaced the action enum with a single
+`todoManage`; R9-R11 renamed it and replaced the action enum with a single
 **patch** shape. It stays **session-scoped** and incremental (ids are stable, and
-a call only carries what it changes):
+a call only carries what it changes). ONE list is shared by every agent and every
+thread of the harness, so it also carries **revisions, claims and a change feed**
+(see [Concurrency and ownership](#concurrency-and-ownership) below):
 
 | Call | Effect |
 |---|---|
@@ -648,37 +654,160 @@ a call only carries what it changes):
 | `tasks` entry **without** `id` | add one task (`text` required, trimmed, max 4000 chars) with the next stable id (`"1"`, `"2"`, …) |
 | `tasks` entry **with** a known `id` | patch that task: `text` and/or `completed`, whichever you send; omitted fields are unchanged |
 | `remove: ["7", "9"]` | remove those ids |
-| `offset` / `limit` | page the returned list (limit 1-100, default 20) |
+| `claim` / `release` / `takeover: ["4"]` | hold a record while you work on it, hand it back, or seize it from whoever holds it (`leaseMs`, default 15 minutes, 1 minute-24 hours) |
+| `expects: [{ id, rev }]` | the revisions you READ, one per id this call patches or removes; required for those writes whenever the runtime knows the caller, optional for the ownership verbs |
+| `since: <storeRev>` | also return the store events after that revision (`changes`) |
+| `offset` / `limit` | index-page the returned list (limit 1-100, default 20) |
+| `afterId: "12"` | keyset-page it: the records with an id above `"12"`; cannot be combined with `offset` |
+| `mergeDisjoint: true` | opt-in: apply a stale content patch when the concurrent change touched only fields this patch leaves out |
 
 ```text
 task({ "tasks": [{ "text": "Draft the plan" }] })
-  -> { tasks: [{ id: "1", text: "Draft the plan", completed: false }],
+  -> { tasks: [{ id: "1", text: "Draft the plan", completed: false, rev: 1,
+                updatedBy: "instruct", updatedThreadId: "agent:instruct",
+                updatedAt: "2026-11-08T09:15:32.772Z" }],
        counts: { total: 1, completed: 0, pending: 1 },
-       page: { offset: 0, limit: 20, hasMore: false } }
+       page: { offset: 0, limit: 20, hasMore: false },
+       storeRev: 1 }
 
-task({ "tasks": [{ "id": "1", "completed": true }], "offset": 20, "limit": 20 })
+task({ "tasks": [{ "id": "1", "completed": true }],
+       "expects": [{ "id": "1", "rev": 1 }], "offset": 20, "limit": 20 })
   -> { tasks: [...], counts: { total: 42, completed: 3, pending: 39 },
-       page: { offset: 20, limit: 20, hasMore: true, nextOffset: 40 } }
+       page: { offset: 20, limit: 20, hasMore: true, nextOffset: 40 },
+       storeRev: 22 }
 ```
 
-- **Every successful call answers the same envelope** — `{ tasks, counts, page }`
-  with no per-action wrapper. `counts` reports `total`, `completed`, and `pending`
-  (`pending` is the count of unfinished tasks; the store itself keeps
-  `completed: boolean` per task). `page.nextOffset` is omitted when `hasMore` is
-  false; loop on it to read the rest. The page is bounded by 100 items and a 64 KiB
-  serialized budget. Caps: 200 tasks, 4000 characters of text each.
+- **Every successful call answers the same envelope** — `{ tasks, counts, page,
+  storeRev }` with no per-action wrapper. `counts` reports `total`, `completed`, and
+  `pending` (`pending` is the count of unfinished tasks; the store itself keeps
+  `completed: boolean` per task) and is always derived from the WHOLE list, never
+  from the page. `page.nextOffset` (offset mode) or `page.nextAfterId` (`afterId`
+  mode) is omitted when `hasMore` is false; loop on it to read the rest. The page is
+  bounded by 100 items and a 64 KiB serialized budget. Caps: 200 tasks, 4000
+  characters of text each.
+- **Each record carries `rev`**, its CONTENT revision: 1 when it is added, +1 only
+  when `text` (after trimming) or `completed` actually changes. The PATCH itself is
+  event-free when the values you send already match — no `rev` bump, no attribution,
+  no store event — so a model that restates the list cannot flood the log. (A no-op
+  patch over an EXPIRED foreign claim is still accompanied by that clear: the claim is
+  lifted first, and the clear is attribution plus one `release` event.) Ownership
+  actions never move `rev` either, so a claim can never knock another agent off its
+  compare-and-swap token. `updatedBy` / `updatedThreadId` / `updatedAt` attribute the
+  last write and come from the tool context (the calling agent and conversation), never
+  from tool arguments, so a model cannot forge who edited what.
+- **The list is shared, so writes are guarded.** A call that HAS an agent identity (a
+  model call, `harness.executeTool`, a slash command, a lane worker) must send
+  `expects` for every id it patches or removes; a call with no identity (a bare
+  `tool()` or driver call) may still write blind, and cannot claim, release or take
+  over at all.
 - The patch is **atomic**: the whole call is validated before anything mutates, so a
-  bad entry leaves the list untouched and names the offending field
+  bad entry leaves the list, the id counter, `storeRev` and the change log exactly as
+  they were, and names the offending field
   (`task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`).
-  Unknown ids, a duplicate id inside one call, an id that appears in both `tasks`
-  and `remove`, a repeated id in `remove`, the 201st task, and a 4001-character
-  text all produce readable, recoverable tool results.
+  Unknown ids, a duplicate id inside one call, an id that appears in two of `tasks` /
+  `remove` / `claim` / `release` / `takeover`, a repeated id in `remove`, the 201st
+  task, a 4001-character text, a stale `expects`, and a blocked claim all produce
+  readable, recoverable tool results.
+- **The change feed is bounded.** The store keeps a FIFO log of 200 recorded events
+  (`add` / `update` / `remove` / `claim` / `release`); `since` returns the events after
+  the revision you pass, at most 50 and inside the same 64 KiB budget, with
+  `changesHasMore` when the feed was cut and `changesTruncated` when the retained
+  window no longer covers the gap. A `since` ahead of the store is an error, not an
+  empty answer.
 - Every result is a defensive copy, never a live reference.
-- The list is **per harness**, shared by the primary and its subagents, kept
-  across turns, and cleared by `reset()` (ids restart at `"1"`). Snapshot/restore
-  carry it: the persisted record stays `records.todos: { items, nextId }` (snapshot
-  v1), so old snapshots still load. Two harnesses — and therefore two server
-  sessions — never share tasks.
+- The list is **per harness**, shared by the primary and its subagents, kept across
+  turns, and cleared by `reset()` (ids restart at `"1"`, `storeRev` restarts at 0, the
+  log empties). Snapshot/restore carry it: the persisted record keeps its snapshot-v1
+  key `records.todos` and is now `{ items, nextId, storeRev?, changes? }`, where each
+  `items` entry is a full `TaskItem` (`id`, `text`, `completed`, `rev`, plus the
+  optional `updatedBy`/`updatedThreadId`/`updatedAt` and the optional claim triple
+  `owner`/`ownerThreadId`/`leaseUntil`). Those additions are OPTIONAL on read, so a
+  pre-T1 snapshot still loads and restores as `storeRev: 0`, `changes: []`, and
+  `rev: 1` per record. Compatibility runs one way only: persisted keys are validated
+  exactly, never ignored (`<label> has an unknown field "<key>".`), and an older build
+  knows only `id`/`text`/`completed`, so a snapshot written by this build is REFUSED
+  there rather than silently downgraded. Claims survive a
+  restart, and a restore drops any claim whose `ownerThreadId` is not part of the
+  restored session (`src/harness.ts`), because no live conversation could ever release
+  it. Two harnesses — and therefore two server sessions — never share tasks.
+
+#### Concurrency and ownership
+
+There is ONE task store per harness and every agent on every thread writes it, and a
+call is not a transaction: you read a record, work on it, and write back, and in
+between somebody else may have written the same record. The store turns that race from
+a silent overwrite into an explicit, recoverable error:
+
+- **A read is a snapshot.** Results are copies, so the `rev` you hold describes the
+  store as it was when you read it, not as it is when your next call lands.
+- **`expects` is the proof of what you read.** Send the `rev` of every id you patch or
+  remove. A mismatch rejects the WHOLE call and names the current revision, the last
+  editor, and (when the log covers the gap) the fields that changed:
+  `task "1" changed since revision 1 (now 2, last edited by "coder"); re-read and
+  retry; changed fields: completed.` A token whose record the store no longer has IS
+  the race you hit, whichever half of the call named it — a `tasks` patch, a `remove`,
+  an ownership verb, or the token alone — and it always answers
+  `task "1" was removed since revision 1; re-read the list.` Only a call that sent no
+  token for that id hears the plainer `task has no task with id "1".`, and a token for
+  a live id this call does not touch is still rejected as a token for nothing.
+- **`rev` is content-only; `storeRev` counts every event.** A concurrent claim
+  therefore never invalidates your token, while `since: <last storeRev>` still shows
+  everything that moved — content and ownership alike.
+- **A claim reserves a record while you edit it**, so a long edit is not stomped and
+  two agents do not do the same work. `claim` sets `owner`/`ownerThreadId`/`leaseUntil`
+  — the holder is the exact pair `(owner, ownerThreadId)`, so the same agent name on
+  another thread is a different holder. The default lease is 15 minutes and the
+  accepted range is 1 minute-24 hours: a model or `executeTool` call outside it is
+  rejected by the schema, a call that bypasses the schema is clamped into it. While a
+  claim is live, a non-holder's content write, claim, or release is refused:
+  `task "1" is claimed by "coder" until 2026-11-08T09:30:53.657Z; release it or take
+  it over first.` Re-claiming a record you
+  already hold only renews the lease (nothing else changes); releasing an unowned
+  record is a no-op success. A claim is expired AT or after `leaseUntil` (`leaseUntil
+  <= now`, so the expiry instant itself frees it), and the next writer then clears it
+  — logged as a `release` — and proceeds. A claim with no `leaseUntil` is indefinite
+  and never auto-expires; it only appears in a restored or hand-edited store.
+- **`takeover` is the deliberate override** of a live claim: it moves the holder to
+  you, re-leases the record, and is logged as a `claim`. It is the answer when the
+  holder is gone; nothing has to expire first.
+- **`mergeDisjoint` is the one escape from a stale rejection**, and only for a content
+  patch: it applies the patch when the change log PROVES every concurrent update since
+  your read touched only fields your patch does not set. An overlapping field still
+  rejects, a removal never merges, and a log that cannot prove full coverage rejects
+  rather than guessing.
+- **A stopped or deleted conversation cannot leave the list locked.** The harness
+  clears every claim tagged with a thread id when that thread stops, is deleted, or
+  loses its default conversation, and a restore sweeps claims whose thread is missing
+  from the snapshot. Content revisions stay untouched; each clear is one `release`
+  event that carries only the thread id.
+
+```ts
+// ONE harness session, two agents: `coder` and `reviewer`. Record "1" sits at
+// content rev 3 and nobody holds it.
+
+// — compare-and-swap: the loser is told, never silently overwritten —
+coder:     task({})                                  // -> tasks[0] = { id: "1", rev: 3, … }
+reviewer:  task({ tasks: [{ id: "1", completed: true }],
+                  expects: [{ id: "1", rev: 3 }] })  // -> applied: content rev 4
+coder:     task({ tasks: [{ id: "1", text: "Rewrite the intro" }],
+                  expects: [{ id: "1", rev: 3 }] })  // -> the WHOLE call is REJECTED:
+                                                     //    task "1" changed since revision 3 (now 4, last edited by "reviewer"); re-read and retry; changed fields: completed.
+coder:     task({})                                  // -> re-read: rev 4, completed true, text untouched
+coder:     task({ tasks: [{ id: "1", text: "Rewrite the intro" }],
+                  expects: [{ id: "1", rev: 4 }] })  // -> applied on top: rev 5
+
+// — claim and release: one record is protected while it is being edited —
+coder:     task({ claim: ["1"] })                    // -> owner/ownerThreadId = coder (+ its thread),
+                                                     //    15-minute lease; rev is STILL 5, so no token broke
+reviewer:  task({ tasks: [{ id: "1", completed: false }],
+                  expects: [{ id: "1", rev: 5 }] })  // -> REJECTED while the lease is live:
+                                                     //    task "1" is claimed by "coder" until 2026-11-08T09:30:53.657Z; release it or take it over first.
+coder:     task({ release: ["1"] })                   // -> coder's own claim clears (one `release` event); rev stays 5
+reviewer:  task({ tasks: [{ id: "1", completed: false }],
+                  expects: [{ id: "1", rev: 5 }] })  // -> applied now: rev 6
+reviewer:  task({ takeover: ["1"] })                  // takeover is the override: it seizes even a LIVE lease —
+coder:     task({ release: ["1"] })                   // -> refused, because reviewer holds it now
+```
 
 **Not OpenCode parity.** OpenCode's current dev branch (`fd8268e`, 2026-10-27)
 ships a different, experimental `todowrite` tool: gated behind `experimental.todo`,
@@ -2040,7 +2169,7 @@ Registration validates the name against `COMMAND_NAME_PATTERN`
 |---|---|
 | `/help [command]` | Every command in this harness, sorted, one `/name  description` line each plus an indented `usage:` line when the command declares one. `/help <name>` prints that one entry through the same renderer; an unknown name is a readable answer with `isError`, never an exception. |
 | `/tools [filter]` | The tools registered in this harness, sorted, as `name — description…` lines. Descriptions are previewed at 200 characters and newlines collapse, because a full `task` description alone is ~1.5 KB. The filter is the raw tail (several words work) and matches the name **or** the description, case-insensitively; no match answers `no registered tool matches "…"` with `isError`. |
-| `/task [list \| add <text> \| complete <id> \| reopen <id> \| remove <id>...]` | This session's task list, through the live `task` tool. See the actions below. |
+| `/task [list \| add <text> \| complete <id> \| reopen <id> \| remove <id>... \| claim <id>... \| release <id>... \| takeover <id>...]` | This session's task list, through the live `task` tool. See the actions below. |
 | `/websearch <query>` | Searches with this session's `search` tool and prints `N result(s) via <provider>:`, then title / URL / snippet / published per hit. The **raw tail** is the query, so quoting an exact phrase survives tokenization. |
 | `/webfetch <url>` | Fetches one page through this session's `fetch` tool and prints `title`, `url`, `content type`, `characters`, then the extracted text. The **first token** is the URL, so a trailing flag cannot corrupt the address. |
 
@@ -2052,15 +2181,34 @@ Registration validates the name against `COMMAND_NAME_PATTERN`
 /task complete <id>      mark one task completed (a patch: the stored text is untouched)
 /task reopen <id>        mark one task pending
 /task remove <id>...     remove one or more ids
+/task claim <id>...      reserve those records for this session's entry agent (15-minute lease)
+/task release <id>...    hand them back — your own claim, or one whose lease has run out
+/task takeover <id>...   seize them from whoever holds them, live lease or not
 ```
 
-Each answers the same readable block: `#<id> [x]/[ ] <text>` rows (or `No tasks.`),
-the `N total, N completed, N pending` tally, and the page cursor
-(`page: offset 0, limit 20, showing 3, next offset 20`). The `#` prefix on each id is
-there so an operator can copy `/task complete 7` straight out of the listing. Because
-these are `harness.executeTool('task', …)` calls and not a private store, the command
-inherits the tool's own bounds (200 tasks, 4000 characters each, 20 per page by
+Each answers the same readable block: `#<id> [x]/[ ] <text>` rows (or `No tasks.`), the
+`N total, N completed, N pending` tally, and the page cursor
+(`page: offset 0, limit 20, showing 3, next offset 20`). A reserved record says WHO
+holds it — `#7 [ ] Fix the parser (claimed by coder@agent:coder until
+2026-11-08T09:30:53.657Z)`, or `(claimed by writer until …)` with no `@thread` for a
+claim the operator itself took through this unthreaded command) — because otherwise a
+rejected `/task complete 7` looks like a bug rather than a lease. The `#` prefix on each
+id is there so an operator can copy `/task complete 7` straight out of the listing.
+Because these are `harness.executeTool('task', …)` calls and not a private store, the
+command inherits the tool's own bounds (200 tasks, 4000 characters each, 20 per page by
 default, 100 maximum) and the next `/task` really lists what `/task add` wrote.
+
+`complete`, `reopen` and `remove` are **guarded writes**: the command reads the store
+first (following `page.nextOffset` until the list is exhausted) and sends the real
+`expects: [{ id, rev }]` tokens, so an edit by another agent between the read and the
+write is the tool's stale error instead of a lost update — never an invented revision.
+An unknown id gets no token, so the tool's own `task has no task with id "99".` is what
+the operator reads. `claim`, `release` and `takeover` send no token at all: an ownership
+action never changes `rev`. They also run **unthreaded**, which makes the holder pair
+`(entry agent, no thread)` — so `/task release` lifts only the operator's own or an
+expired claim, and `/task takeover` is the documented override for a live one. The read
+costs one extra `tool_execute` notification per guarded command (a debounced save, not a
+model turn).
 
 `/websearch` and `/webfetch` are pass-throughs to the **conditional** `search` and
 `fetch` tools, so an unconfigured session gets guidance instead of a registry error:
@@ -2182,7 +2330,7 @@ Everything an operator can get wrong is an answer, not an exception:
 | too many arguments | `/task: "list" takes no arguments (got 1).`, `/task: "complete" takes one id (got 2).`, `/help: "help" takes at most one command name.` |
 | unknown `/task` action | `/task: unknown action "bogus".` plus the usage line |
 | tool not registered | the `/websearch` / `/webfetch` guidance text above, or `/task: the "task" tool is not registered in this harness.` |
-| the tool rejects the call | `<label>: <the tool's own message>` — the label is the command and subaction (`/task add`, `/webfetch`), covering an unknown task id, a failed provider call, or a non-text page |
+| the tool rejects the call | `<label>: <the tool's own message>` — the label is the command and subaction (`/task add`, `/webfetch`), covering an unknown task id, a failed provider call, a non-text page, a stale `expects` (another agent changed the record between the command's read and its write), and a record another agent holds a live claim on |
 
 Only a command that throws on purpose escapes: `executeCommand` does not wrap a host
 command's exception, so a built-in's recoverable failures return

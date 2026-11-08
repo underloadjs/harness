@@ -8,11 +8,19 @@
 // Assertions are exact where the value is known (registry metadata, transcripts,
 // turn records, created-tool results) and identity-based across a restart for
 // server-generated timestamps (the restored record must preserve the original).
+//
+// T1 changed what "the task store" IS: every record now carries a content revision
+// and an attribution, a claim carries the holder pair + a wall-clock `leaseUntil`,
+// and the store carries `storeRev` plus the bounded change feed. All of it lives in
+// the persisted core snapshot, so the task-store tests here PIN the clock
+// (`pinTaskClock`, Date.now only) and then assert those stamps exactly - including
+// that a claim still blocks after a restart and that a lease which expired across
+// the restart is reclaimable.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../harness';
 import type {
     HarnessMessage,
@@ -21,6 +29,7 @@ import type {
     HarnessStream,
     HarnessStreamEvent
 } from '../harness';
+import type { TaskChange, TaskItem, TaskResult } from '../types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { ALL_PRESET_TEMPLATES, createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
@@ -173,8 +182,121 @@ const runtimeOf = (root: string, presets: HarnessPreset[]): HarnessRuntime =>
 
 const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
 
+// Rewrites the claim the FIRST session's first task record carries in the canonical
+// file. Same technique the orphaned-transcript test uses for a transcript: this is a
+// document a DIFFERENT process wrote, which the running session cannot produce
+// through its own tools, and it is the only honest way to ask "does a restored
+// foreign claim still block?".
+const rewriteClaimOwner = (root: string, owner: string, leaseUntil: number): void => {
+    const file = stateFile(root);
+    const database = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        sessions: {
+            core: { records: { todos: { items: { id: string; owner?: string; leaseUntil?: number }[] } } };
+        }[];
+    };
+    const item = database.sessions[0].core.records.todos.items[0];
+
+    if (item === undefined) throw new Error('the persisted task store held no record');
+
+    item.owner = owner;
+    item.leaseUntil = leaseUntil;
+    fs.writeFileSync(file, JSON.stringify(database, null, 2), 'utf8');
+};
+
+// ---------------------------------------------------------------------------
+// T1 clock policy and task-store fixtures
+// ---------------------------------------------------------------------------
+//
+// The task store stamps EVERY write from Date (src/core/task.ts: `updatedAt`, the
+// change-feed `at`, and a claim's `leaseUntil = now + leaseMs`), and T1 moved those
+// stamps INSIDE the persisted snapshot (`records.todos`). A restart assertion about
+// them is only exact if the clock is pinned, so the task tests below fake Date
+// alone: `toFake: ['Date']` leaves `setTimeout` and the microtask queue real, which
+// the gated turns and the 25 ms waits in this file depend on.
+const EPOCH_MS = Date.UTC(2026, 0, 1);
+const EPOCH_ISO = new Date(EPOCH_MS).toISOString();
+
+// Freeze the clock and hand back a mover, so "the lease has expired" is a call
+// rather than a sleep. Only `Date.now` is replaced (the same policy
+// src/server/commands.test.ts uses), so `setTimeout` and the microtask queue stay
+// real for the gated turns and the 25 ms waits elsewhere in this file.
+const pinTaskClock = (): ((next: number) => void) => {
+    let value = EPOCH_MS;
+    vi.spyOn(Date, 'now').mockImplementation(() => value);
+
+    return (next: number) => {
+        value = next;
+    };
+};
+
+afterEach(() => {
+    vi.restoreAllMocks();
+});
+
+// The ONE result shape of the `task` tool (src/core/task.ts), including `storeRev`.
+const taskPage = (
+    tasks: TaskItem[],
+    total: number,
+    completed: number,
+    storeRev: number
+) => ({
+    tasks,
+    counts: { total, completed, pending: total - completed },
+    page: { offset: 0, limit: 20, hasMore: false },
+    storeRev
+});
+
+// One persisted record. `store.callTool` runs `harness.executeTool`, which hands the
+// tool the session's PRIMARY agent and NO thread, so `updatedBy` names that agent
+// and `updatedThreadId` is absent entirely.
+const taskItem = (
+    id: string,
+    agentName: string,
+    text: string,
+    shape: {
+        completed?: boolean;
+        rev?: number;
+        at?: string;
+        owner?: string;
+        ownerThreadId?: string;
+        leaseUntil?: number;
+    } = {}
+): TaskItem => ({
+    id,
+    text,
+    completed: shape.completed ?? false,
+    rev: shape.rev ?? 1,
+    updatedBy: agentName,
+    ...(shape.at === undefined ? {} : { updatedAt: shape.at }),
+    ...(shape.owner === undefined ? {} : { owner: shape.owner }),
+    ...(shape.ownerThreadId === undefined ? {} : { ownerThreadId: shape.ownerThreadId }),
+    ...(shape.leaseUntil === undefined ? {} : { leaseUntil: shape.leaseUntil })
+});
+
+// One change-feed entry, in the canonical key order core/task.ts appends them in.
+const taskEvent = (
+    rev: number,
+    id: string,
+    op: TaskChange['op'],
+    agentName: string,
+    shape: {
+        at?: string;
+        fields?: Array<'text' | 'completed'>;
+        itemRev?: number;
+    } = {}
+): TaskChange => ({
+    rev,
+    id,
+    op,
+    by: agentName,
+    at: shape.at ?? EPOCH_ISO,
+    ...(shape.fields === undefined ? {} : { fields: shape.fields }),
+    ...(shape.itemRev === undefined ? {} : { itemRev: shape.itemRev })
+});
+
 describe('R3b durable harness database', () => {
     it('restores a same-root restart with registry, transcript, turns, models, records, and created tools', async () => {
+        pinTaskClock();
         const root = tempRoot('restart');
         const preset = liveScriptedPreset('one', 'persisted answer');
 
@@ -186,10 +308,14 @@ describe('R3b durable harness database', () => {
         await first.store.run(id, 'remember this', async () => {});
 
         // A durable session record (task) and a durable runtime-created tool.
+        // T1: the record carries its content revision, the writing agent, and the
+        // pinned instant, and the page carries `storeRev` — ALL of which the snapshot
+        // has to bring back, so the clock is pinned for this whole test.
         expect(await first.store.callTool(id, 'task', { tasks: [{ text: 'keep me' }] })).toEqual({
-            tasks: [{ id: '1', text: 'keep me', completed: false }],
+            tasks: [taskItem('1', 'one', 'keep me', { at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1
         });
         expect(
             await first.store.callTool(id, 'toolCreate', {
@@ -221,12 +347,45 @@ describe('R3b durable harness database', () => {
 
         const before = first.store.get(id);
         expect(before.discoveredTools).toEqual(['echoed']);
+        // The change feed is durable session state too. A second event (a guarded
+        // patch) makes the window non-trivial, so a restart that dropped `changes`
+        // cannot pass by accident.
+        expect(
+            await first.store.callTool(id, 'task', {
+                tasks: [{ id: '1', completed: true }],
+                expects: [{ id: '1', rev: 1 }]
+            })
+        ).toEqual(
+            taskPage(
+                [taskItem('1', 'one', 'keep me', { completed: true, rev: 2, at: EPOCH_ISO })],
+                1,
+                1,
+                2
+            )
+        );
+
         const todosBefore = await first.store.callTool(id, 'task', {});
-        expect(todosBefore).toEqual({
-            tasks: [{ id: '1', text: 'keep me', completed: false }],
-            counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
-        });
+        // A read is not a write: re-reading the list leaves `rev`, `storeRev` and the
+        // feed exactly where the patch left them.
+        expect(todosBefore).toEqual(
+            taskPage(
+                [taskItem('1', 'one', 'keep me', { completed: true, rev: 2, at: EPOCH_ISO })],
+                1,
+                1,
+                2
+            )
+        );
+
+        const feedBefore = (await first.store.callTool(id, 'task', {
+            since: 0
+        })) as TaskResult & { changes: TaskChange[] };
+
+        expect(feedBefore.changes).toEqual([
+            taskEvent(1, '1', 'add', 'one', { itemRev: 1 }),
+            taskEvent(2, '1', 'update', 'one', { fields: ['completed'], itemRev: 2 })
+        ]);
+        expect(feedBefore.changesHasMore).toBe(false);
+        expect(feedBefore.changesTruncated).toBe(false);
 
         // No secrets in the canonical file (server key or session model note).
         const raw = fs.readFileSync(stateFile(root), 'utf8');
@@ -263,6 +422,11 @@ describe('R3b durable harness database', () => {
         expect(restored.agentModels).toEqual({ one: 'next/model' });
         expect(restored.harnessDefinition).toEqual(before.harnessDefinition);
         expect(await second.store.callTool(id, 'task', {})).toEqual(todosBefore);
+
+        // The durable feed came back as well: the same two events under the same
+        // store revision, so a resumed session can answer `since` for everything a
+        // reader missed while the process was down.
+        expect(await second.store.callTool(id, 'task', { since: 0 })).toEqual(feedBefore);
         expect(await second.store.callTool(id, 'echoed', 'works')).toBe('WORKS');
 
         // Registry metadata re-created from disk (not from the seed list).
@@ -279,6 +443,176 @@ describe('R3b durable harness database', () => {
     // T3 editable configuration. An instruction override is EXECUTABLE state: a
     // restart must bring back both the map and the prompts the next session runs, or
     // the saved configuration the reader edited would silently revert on reboot.
+    // T1 durability of the CONCURRENCY half of the store. A claim exists to protect
+    // one in-flight edit, and a server restarts in the middle of edits all the time,
+    // so the holder pair, the wall-clock lease and the change feed must all cross the
+    // restart intact — otherwise the resumed session hands back a store that looks
+    // uncontested and lets a second writer stomp the first one's work.
+    it('restores a task claim, its lease and the change feed intact', async () => {
+        const advance = pinTaskClock();
+        const root = tempRoot('claim-restart');
+        const first = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+        const id = (await first.store.create('one')).id;
+
+        await first.store.callTool(id, 'task', { tasks: [{ text: 'Hold this' }] });
+
+        // An unthreaded claim (the tools-tab / command door) records only the owner
+        // half of the holder pair, which is exactly the pair `restore()` is allowed to
+        // keep: src/harness.ts sweeps a claim only when its `ownerThreadId` names a
+        // conversation the snapshot does not carry.
+        expect(await first.store.callTool(id, 'task', { claim: ['1'] })).toEqual(
+            taskPage(
+                [
+                    taskItem('1', 'one', 'Hold this', {
+                        at: EPOCH_ISO,
+                        owner: 'one',
+                        leaseUntil: EPOCH_MS + 900_000
+                    })
+                ],
+                1,
+                0,
+                2
+            )
+        );
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+
+        // Same record, same content revision, same holder, and the lease is still the
+        // exact instant it was issued for — not "some future number".
+        expect(await second.store.callTool(id, 'task', {})).toEqual(
+            taskPage(
+                [
+                    taskItem('1', 'one', 'Hold this', {
+                        at: EPOCH_ISO,
+                        owner: 'one',
+                        leaseUntil: EPOCH_MS + 900_000
+                    })
+                ],
+                1,
+                0,
+                2
+            )
+        );
+
+        // The feed survived event-for-event, so a reader that stopped at storeRev 1
+        // still learns about the claim after the restart.
+        const feed = (await second.store.callTool(id, 'task', { since: 1 })) as TaskResult & {
+            changes: TaskChange[];
+        };
+
+        expect(feed.changes).toEqual([taskEvent(2, '1', 'claim', 'one')]);
+        expect(feed.changesHasMore).toBe(false);
+        expect(feed.changesTruncated).toBe(false);
+        expect(feed.storeRev).toBe(2);
+
+        // A claim is CONTENT-neutral across the restart: the record is still rev 1, so
+        // a token read before the restart is still the right token afterwards.
+        expect(feed.tasks[0].rev).toBe(1);
+
+        // Re-claiming from the same (unthreaded) door is the holder's heartbeat.
+        // src/core/task.ts renews a held claim by writing `leaseUntil` and NOTHING
+        // else: no attribution churn, no `rev`, no change entry, no `storeRev`.
+        advance(EPOCH_MS + 60_000);
+
+        expect(await second.store.callTool(id, 'task', { claim: ['1'] })).toEqual(
+            taskPage(
+                [
+                    taskItem('1', 'one', 'Hold this', {
+                        at: EPOCH_ISO,
+                        owner: 'one',
+                        leaseUntil: EPOCH_MS + 60_000 + 900_000
+                    })
+                ],
+                1,
+                0,
+                2
+            )
+        );
+    });
+
+    // The expiry is a wall-clock instant INSIDE the snapshot, so "the holder died and
+    // its lease ran out" has to be true on the other side of a restart as well.
+    it('reclaims a foreign claim whose lease expired across the restart', async () => {
+        const advance = pinTaskClock();
+        const root = tempRoot('claim-expiry');
+        const first = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+        const id = (await first.store.create('one')).id;
+
+        await first.store.callTool(id, 'task', { tasks: [{ text: 'Contested' }] });
+        first.store.dispose();
+
+        // The persisted claim belongs to an agent this session can never become (the
+        // worker that took it is gone): the file says `ghost`, with the lease this
+        // session would have issued.
+        rewriteClaimOwner(root, 'ghost', EPOCH_MS + 900_000);
+
+        const second = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
+
+        // While the lease is live the restored claim really does block, and the
+        // refusal names the holder and the exact expiry the file carried.
+        await expect(
+            second.store.callTool(id, 'task', {
+                tasks: [{ id: '1', completed: true }],
+                expects: [{ id: '1', rev: 1 }]
+            })
+        ).rejects.toThrow(
+            `task "1" is claimed by "ghost" until ${new Date(EPOCH_MS + 900_000).toISOString()}; release it or take it over first.`
+        );
+
+        // Nothing was written by the refusal: same rev, same storeRev, same feed.
+        expect(await second.store.callTool(id, 'task', { since: 0 })).toEqual(
+            {
+                ...taskPage(
+                    [
+                        taskItem('1', 'one', 'Contested', {
+                            at: EPOCH_ISO,
+                            owner: 'ghost',
+                            leaseUntil: EPOCH_MS + 900_000
+                        })
+                    ],
+                    1,
+                    0,
+                    1
+                ),
+                changes: [taskEvent(1, '1', 'add', 'one', { itemRev: 1 })],
+                changesHasMore: false,
+                changesTruncated: false
+            }
+        );
+
+        // Past the lease the abandoned claim stops blocking, and the next writer CLEARS
+        // it (src/core/task.ts plan.expired → clearClaim). The clear is recorded before
+        // the update it unlocked, so a reader can tell "the lock lifted" from "nothing
+        // happened" without re-reading the list.
+        advance(EPOCH_MS + 900_000 + 1);
+        const at = new Date(EPOCH_MS + 900_000 + 1).toISOString();
+
+        expect(
+            await second.store.callTool(id, 'task', {
+                tasks: [{ id: '1', completed: true }],
+                expects: [{ id: '1', rev: 1 }]
+            })
+        ).toEqual(
+            taskPage(
+                [taskItem('1', 'one', 'Contested', { completed: true, rev: 2, at })],
+                1,
+                1,
+                3
+            )
+        );
+
+        const feed = (await second.store.callTool(id, 'task', { since: 1 })) as TaskResult & {
+            changes: TaskChange[];
+        };
+
+        expect(feed.changes).toEqual([
+            taskEvent(2, '1', 'release', 'one', { at }),
+            taskEvent(3, '1', 'update', 'one', { at, fields: ['completed'], itemRev: 2 })
+        ]);
+    });
+
     it('restores a saved instruction override and applies it to the rebuilt factory', async () => {
         const root = tempRoot('instructions');
         const preset = liveScriptedPreset('one', 'persisted answer');
@@ -812,6 +1146,7 @@ describe('R3b durable harness database', () => {
     });
 
     it('keeps completed tool/store mutations from an interrupted turn (mutation-boundary snapshot)', async () => {
+        pinTaskClock();
         const root = tempRoot('midrun-record');
         let startSecond!: () => void;
         const secondRequest = new Promise<void>((resolve) => {
@@ -876,10 +1211,20 @@ describe('R3b durable harness database', () => {
         const restored = second.store.get(created.id);
 
         expect(restored.turns[0].status).toBe('error');
+        // The record survived with its T1 shape intact: content revision, the agent
+        // AND the conversation that wrote it (this write came from the MODEL path, so
+        // `updatedThreadId` is the mutator's default conversation), and the change
+        // feed behind `storeRev`.
         expect(await second.store.callTool(created.id, 'task', {})).toEqual({
-            tasks: [{ id: '1', text: 'done before crash', completed: false }],
+            tasks: [
+                {
+                    ...taskItem('1', 'mutator', 'done before crash', { at: EPOCH_ISO }),
+                    updatedThreadId: 'agent:mutator'
+                }
+            ],
             counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1
         });
         // Interrupted, not replayed: the restored turn keeps the completed tool
         // exchange and gains no new provider request.
@@ -1029,6 +1374,7 @@ describe('R3b durable harness database', () => {
     });
 
     it('restores an orphaned tool call as interrupted and sends a coherent next prompt, without executing it', async () => {
+        pinTaskClock();
         const root = tempRoot('orphan');
         const requests: HarnessMessage[][] = [];
         const preset = presetOf('probe', (settings, progress, report) =>
@@ -1090,11 +1436,11 @@ describe('R3b durable harness database', () => {
         });
 
         // The orphan call was never executed: only the pre-crash record exists.
-        expect(await second.store.callTool(created.id, 'task', {})).toEqual({
-            tasks: [{ id: '1', text: 'kept record', completed: false }],
-            counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
-        });
+        // The orphan call was never executed: the one record that existed keeps its
+        // revision, its attribution and its single feed entry.
+        expect(await second.store.callTool(created.id, 'task', {})).toEqual(
+            taskPage([taskItem('1', 'probe', 'kept record', { at: EPOCH_ISO })], 1, 0, 1)
+        );
 
         // T4 introduced fresh blocks: every server turn reseeds the agent
         // conversation, so the next prompt sends only the instructions plus THIS
@@ -1221,6 +1567,7 @@ describe('R3b durable harness database', () => {
     // records (todos), the live model map and settings all disappear with it —
     // and a fresh runtime over the same root cannot see it either.
     it('removes a deleted session from state.json and from a same-root reload', async () => {
+        pinTaskClock();
         const root = tempRoot('delete');
         const keepPreset = liveScriptedPreset('one', 'kept answer');
         const doomedPreset = liveScriptedPreset('two', 'deleted answer');
@@ -1236,11 +1583,9 @@ describe('R3b durable harness database', () => {
 
         // Durable session state on the doomed record: a todo (core snapshot), a
         // live per-agent model map and its own settings model.
-        expect(await first.store.callTool(doomed.id, 'task', { tasks: [{ text: 'delete me too' }] })).toEqual({
-            tasks: [{ id: '1', text: 'delete me too', completed: false }],
-            counts: { total: 1, completed: 0, pending: 1 },
-            page: { offset: 0, limit: 20, hasMore: false }
-        });
+        expect(await first.store.callTool(doomed.id, 'task', { tasks: [{ text: 'delete me too' }] })).toEqual(
+            taskPage([taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })], 1, 0, 1)
+        );
         expect((await first.store.setAgentModels(doomed.id, { two: 'next/model' })).agentModels).toEqual({
             two: 'next/model'
         });

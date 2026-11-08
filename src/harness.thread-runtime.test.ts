@@ -16,17 +16,27 @@
 //       it stopped; stopAllThreads aborts every active run; deleteThread purges a
 //       terminal host conversation plus its invocation lookups.
 //
-// Clock policy: no fake timers. The transports are scripted/gated, so every
-// assertion is on exact values rather than elapsed time.
+// Clock policy: the CLOCK is pinned (see EPOCH_MS below), the SCHEDULER is not.
+// Every task-store timestamp (`updatedAt`, the change-feed `at`, a claim's
+// `leaseUntil`) comes from Date in src/core/task.ts, so pinning Date gives each of
+// them ONE exact expected value. `toFake: ['Date']` leaves setTimeout and the
+// microtask queue real, which the gated transports and `flush()` here depend on.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
+import { TASK_DEFAULT_LEASE_MS } from './core/task';
 import type {
     Agent,
+    Harness,
     HarnessAssistantMessage,
+    HarnessSnapshot,
     HarnessStream,
     HarnessStreamEvent,
-    HarnessStreamRequest
+    HarnessStreamRequest,
+    TaskChange,
+    TaskChangeOp,
+    TaskItem,
+    TaskResult
 } from '@underload/harness';
 
 // Replay scripted frames, one list per request; the last list repeats.
@@ -132,6 +142,98 @@ const textOf = (messages: { content?: string }[]): string[] =>
 // conversation it belongs to, so they project the fields they mean.
 const delegationOf = (message: { content: string }): Record<string, any> =>
     JSON.parse(message.content) as Record<string, any>;
+
+// ---------------------------------------------------------------------------
+// T1 (Phase 2) task-claim fixtures
+// ---------------------------------------------------------------------------
+
+// THE FROZEN CLOCK, and the expiry of a claim taken at that instant (the tool's
+// default lease, src/core/task.ts TASK_DEFAULT_LEASE_MS).
+const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
+const EPOCH_MS = Date.parse(EPOCH_ISO);
+const LEASE_UNTIL = EPOCH_MS + TASK_DEFAULT_LEASE_MS;
+const LEASE_ISO = new Date(LEASE_UNTIL).toISOString();
+
+beforeEach(() => {
+    // Date only: the transports, the scheduler and `flush()` keep real timers.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(EPOCH_MS);
+});
+
+afterEach(() => {
+    vi.useRealTimers();
+});
+
+type RecordShape = {
+    completed?: boolean;
+    rev?: number;
+    // The WRITER's identity (attribution), and the HOLDER's pair (the claim). They
+    // are separate facts: a lifecycle release clears the holder and keeps the
+    // writer, and an ownership action never moves `rev`.
+    by?: string;
+    threadId?: string;
+    owner?: string;
+    ownerThreadId?: string;
+    leaseUntil?: number;
+};
+
+// One stored record in the exact key set src/core/task.ts `copyItem` produces.
+// `updatedAt` is always present here because every write in this file has an
+// identity (a run, or a manual executeTool call as the primary).
+const task = (id: string, text: string, shape: RecordShape = {}): TaskItem => ({
+    id,
+    text,
+    completed: shape.completed ?? false,
+    rev: shape.rev ?? 1,
+    ...(shape.by === undefined ? {} : { updatedBy: shape.by }),
+    ...(shape.threadId === undefined ? {} : { updatedThreadId: shape.threadId }),
+    updatedAt: EPOCH_ISO,
+    ...(shape.owner === undefined ? {} : { owner: shape.owner }),
+    ...(shape.ownerThreadId === undefined ? {} : { ownerThreadId: shape.ownerThreadId }),
+    ...(shape.leaseUntil === undefined ? {} : { leaseUntil: shape.leaseUntil })
+});
+
+// One change-feed entry, in the canonical key order (`rev, id, op, by, threadId,
+// at, fields, itemRev`). A lifecycle release (`releaseThread`) is recognisable
+// because it names a `threadId` and carries NO `by`, unlike a voluntary one.
+const event = (
+    rev: number,
+    id: string,
+    op: TaskChangeOp,
+    shape: {
+        by?: string;
+        threadId?: string;
+        fields?: Array<'text' | 'completed'>;
+        itemRev?: number;
+    } = {}
+): TaskChange => ({
+    rev,
+    id,
+    op,
+    ...(shape.by === undefined ? {} : { by: shape.by }),
+    ...(shape.threadId === undefined ? {} : { threadId: shape.threadId }),
+    at: EPOCH_ISO,
+    ...(shape.fields === undefined ? {} : { fields: shape.fields }),
+    ...(shape.itemRev === undefined ? {} : { itemRev: shape.itemRev })
+});
+
+// The live store, read through the host door (identity: the primary, unthreaded).
+const storedTasks = async (writer: Harness): Promise<TaskItem[]> =>
+    ((await writer.executeTool('task', {})) as TaskResult).tasks;
+
+// The whole recorded history of one store (`since: 0`).
+const changeFeed = async (writer: Harness): Promise<TaskChange[]> =>
+    ((await writer.executeTool('task', { since: 0 })) as { changes: TaskChange[] }).changes;
+
+// The recorded tool results of one conversation, in order. A failed call is stored
+// as `Tool "<name>" failed: <message>` (src/harness.ts), which is how a refusal
+// reaches the model — and how these tests read one.
+const toolResultsOf = (messages: { role: string; content?: string }[]): string[] =>
+    messages.filter((message) => message.role === 'tool').map((message) => message.content ?? '');
+
+// A recorded task page, parsed: the assertion names the exact page without
+// depending on key order in the serialized string.
+const pageOf = (content: string): unknown => JSON.parse(content);
 
 describe('persistent agent threads (R2)', () => {
     it('exposes one default conversation per agent and independent host threads', () => {
@@ -325,15 +427,21 @@ describe('persistent agent threads (R2)', () => {
         await writer.sendThreadInput(planner.id, 'plan');
         await writer.sendThreadInput(lister.id, 'list it');
 
-        // The second conversation's tool result is the FIRST conversation's todo:
-        // the store is session state, shared by every thread.
+        // The second conversation's tool result is the FIRST conversation's task:
+        // the store is session state, shared by every thread. T1 adds attribution to
+        // every record (`rev`, `updatedBy`, `updatedThreadId`, `updatedAt`) and
+        // `storeRev` to every page, and the writer recorded is the conversation that
+        // wrote — the same fact a claim is keyed on.
         const toolMessage = writer
             .threadMessages(lister.id)
             .find((message) => message.role === 'tool') as { role: string; content: string };
         expect(toolMessage.role).toBe('tool');
-        expect(toolMessage.content).toBe(
-            '{"tasks":[{"id":"1","text":"Shared plan","completed":false}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false}}'
-        );
+        expect(pageOf(toolMessage.content)).toEqual({
+            tasks: [task('1', 'Shared plan', { by: 'writer', threadId: planner.id })],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1
+        });
 
         // Transcripts stay separate.
         expect(roles(writer.threadMessages(lister.id))).toEqual([
@@ -354,11 +462,15 @@ describe('persistent agent threads (R2)', () => {
             'tool',
             'assistant'
         ]);
+        // R9-R11: every successful task call answers with the same bounded list, so
+        // both conversations recorded the SAME page (one store, one revision).
+        expect(pageOf(toolResultsOf(writer.threadMessages(planner.id))[0])).toEqual(
+            pageOf(toolMessage.content)
+        );
         expect(textOf(writer.threadMessages(planner.id))).toEqual([
             'plan',
             '',
-            // R9-R11: every successful task call answers with the same bounded list.
-            '{"tasks":[{"id":"1","text":"Shared plan","completed":false}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false}}',
+            toolResultsOf(writer.threadMessages(planner.id))[0],
             'added'
         ]);
     });
@@ -575,6 +687,400 @@ describe('selective cancellation (R6)', () => {
         await writer.sendThreadInput(parent.id, 'one');
         expect(writer.thread(parent.id)?.status).toBe('idle');
         expect(writer.thread(third.id)?.status).toBe('stopped');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T1 (Phase 2) — a task claim belongs to a conversation, and the conversation's
+// lifecycle owns the claim.
+// ---------------------------------------------------------------------------
+//
+// A holder is the pair (owner, ownerThreadId) plus a lease (src/core/task.ts). A
+// stopped or deleted conversation can never release or renew what it reserved, so
+// `harness` lifts those claims at the boundary itself: `stopThreadState` (the one
+// call site every stop path passes: stopThread, its owner cascade, stopAllThreads),
+// `purgeThread` (deleteThread and its cascade), `removeAgent` (the default
+// conversation it drops without a purge), and `restore` (a snapshot that carries a
+// claim for a thread the snapshot does not). Each release is one recorded
+// `release` event with the thread id and NO `by`, so the feed says who lifted it.
+describe('task claim ownership across the thread lifecycle', () => {
+    it('blocks a foreign thread while a live claim holds the record and clears it on stop', async () => {
+        const stream = routed(
+            {
+                // A reserves the record from ITS conversation, then walks away.
+                'claim it': scripted([
+                    callTool('c1', 'task', '{"claim":["1"]}'),
+                    answer('claimed')
+                ]),
+                // B tries once while the claim is live (refused) and once after A is
+                // stopped (applies). One route serves both turns because `scripted`
+                // replays its list per REQUEST, and routing keys on the conversation's
+                // FIRST prompt.
+                'try it': scripted([
+                    callTool('c2', 'task', '{"tasks":[{"id":"1","completed":true}],"expects":[{"id":"1","rev":1}]}'),
+                    answer('refused'),
+                    callTool('c3', 'task', '{"tasks":[{"id":"1","completed":true}],"expects":[{"id":"1","rev":1}]}'),
+                    answer('applied')
+                ])
+            },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+
+        // The record exists before either conversation touches it. The host door
+        // writes as the primary with NO thread, so it is not a holder of anything.
+        await writer.executeTool('task', { tasks: [{ text: 'Edit the router' }] });
+
+        const holder = writer.createThread('writer');
+        const other = writer.createThread('writer');
+
+        await writer.sendThreadInput(holder.id, 'claim it');
+
+        // THE CLAIM: holder pair (writer, holder.id) and a default lease; `rev` stays
+        // 1, so no other reader's CAS token moved. The claim is also the latest
+        // write, so attribution follows the claiming conversation.
+        const claimed = task('1', 'Edit the router', {
+            by: 'writer',
+            threadId: holder.id,
+            owner: 'writer',
+            ownerThreadId: holder.id,
+            leaseUntil: LEASE_UNTIL
+        });
+
+        expect(await storedTasks(writer)).toEqual([claimed]);
+
+        // WHILE IT IS LIVE: a different conversation of the SAME agent is a
+        // different holder, so its guarded content write is refused — and the whole
+        // call is atomic, so the record and the log are untouched.
+        await writer.sendThreadInput(other.id, 'try it');
+
+        const refused = `Tool "task" failed: task "1" is claimed by "writer" until ${LEASE_ISO}; release it or take it over first.`;
+        const firstTurn = writer.threadMessages(other.id);
+
+        expect(toolResultsOf(firstTurn)[0]).toBe(refused);
+        expect(await storedTasks(writer)).toEqual([claimed]);
+
+        // The operator door is a foreign holder too: `executeCommand`/`executeTool`
+        // carry the primary with no threadId, so `/task complete` reports the same
+        // refusal instead of stomping the conversation that is mid-edit.
+        expect(await writer.executeCommand('/task complete 1')).toEqual({
+            content: `/task complete: task "1" is claimed by "writer" until ${LEASE_ISO}; release it or take it over first.`,
+            isError: true
+        });
+        expect(await changeFeed(writer)).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '1', 'claim', { by: 'writer', threadId: holder.id })
+        ]);
+
+        // STOP: the conversation is marked stopped, so it can no longer finish the
+        // edit it reserved, and its claim goes with it. `stopThread` returns false
+        // here because no RUN was live — the release happens either way.
+        expect(writer.stopThread(holder.id, 'done here')).toBe(false);
+        expect(writer.thread(holder.id)?.status).toBe('stopped');
+
+        // The holder pair and the lease are GONE (deleted, not nulled, so a snapshot
+        // never carries an empty owner), `rev` and the writer's attribution are
+        // untouched, and the release is its own recorded event.
+        expect(await storedTasks(writer)).toEqual([
+            task('1', 'Edit the router', { by: 'writer', threadId: holder.id })
+        ]);
+        expect(await changeFeed(writer)).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '1', 'claim', { by: 'writer', threadId: holder.id }),
+            event(3, '1', 'release', { threadId: holder.id })
+        ]);
+
+        // THE RECORD IS FREE AGAIN: the sibling's retry applies on the token it
+        // already holds (rev 1 — a claim never moved it), and the operator's command
+        // would apply too.
+        await writer.sendThreadInput(other.id, 'try again');
+
+        const messages = writer.threadMessages(other.id);
+        const results = toolResultsOf(messages);
+
+        expect(pageOf(results[1])).toEqual({
+            // `rev` moved by exactly one: this is a real content change, and the
+            // token the retry carried (rev 1) is what the CAS accepted.
+            tasks: [
+                task('1', 'Edit the router', {
+                    completed: true,
+                    rev: 2,
+                    by: 'writer',
+                    threadId: other.id
+                })
+            ],
+            counts: { total: 1, completed: 1, pending: 0 },
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 4
+        });
+        expect(textOf(messages)).toEqual([
+            'try it',
+            '',
+            refused,
+            'refused',
+            'try again',
+            '',
+            results[1],
+            'applied'
+        ]);
+    });
+
+    it('releases an owner-stopped child conversation with its own claims', async () => {
+        const stream = routed(
+            {
+                'claim it': scripted([callTool('c1', 'task', '{"claim":["1","2"]}'), answer('claimed')])
+            },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        await writer.executeTool('task', { tasks: [{ text: 'One' }, { text: 'Two' }] });
+
+        const parent = writer.createThread('writer', { label: 'parent' });
+        const child = writer.createThread('writer', { ownerThreadId: parent.id });
+
+        await writer.sendThreadInput(child.id, 'claim it');
+        expect((await storedTasks(writer)).map((item) => item.ownerThreadId)).toEqual([
+            child.id,
+            child.id
+        ]);
+
+        // Stopping the OWNER cascades to the linked child (src/harness.ts
+        // `stopThread` -> `ownersOf`), and the cascade releases the CHILD's claims
+        // because the release lives in `stopThreadState`, once per conversation.
+        writer.stopThread(parent.id, 'shutdown');
+
+        expect(writer.thread(parent.id)?.status).toBe('stopped');
+        expect(writer.thread(child.id)?.status).toBe('stopped');
+        expect((await storedTasks(writer)).map((item) => item.owner)).toEqual([
+            undefined,
+            undefined
+        ]);
+        // Content revisions did not move, so any reader's token is still valid.
+        expect((await storedTasks(writer)).map((item) => item.rev)).toEqual([1, 1]);
+        expect(await changeFeed(writer)).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '2', 'add', { by: 'writer', itemRev: 1 }),
+            event(3, '1', 'claim', { by: 'writer', threadId: child.id }),
+            event(4, '2', 'claim', { by: 'writer', threadId: child.id }),
+            event(5, '1', 'release', { threadId: child.id }),
+            event(6, '2', 'release', { threadId: child.id })
+        ]);
+
+        // And the records are writable again for anybody.
+        const after = (await writer.executeTool('task', {
+            tasks: [{ id: '1', completed: true }],
+            expects: [{ id: '1', rev: 1 }]
+        })) as TaskResult;
+
+        expect(after.tasks.map((item) => item.completed)).toEqual([true, false]);
+        expect(after.tasks[0].rev).toBe(2);
+    });
+
+    it('releases every stopped conversation claim under stopAllThreads, but not an unthreaded one', async () => {
+        const stream = routed(
+            {
+                'claim one': scripted([callTool('c1', 'task', '{"claim":["1"]}'), answer('claimed')]),
+                // A second route, so two conversations hold two DIFFERENT records:
+                // one live claim would refuse the other claim outright.
+                'claim two': scripted([callTool('c2', 'task', '{"claim":["2"]}'), answer('claimed')])
+            },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        await writer.executeTool('task', {
+            tasks: [{ text: 'One' }, { text: 'Two' }, { text: 'Three' }]
+        });
+
+        const first = writer.createThread('writer');
+        const second = writer.createThread('writer');
+
+        await writer.sendThreadInput(first.id, 'claim one');
+        await writer.sendThreadInput(second.id, 'claim two');
+
+        // A claim taken through the host door belongs to no conversation, and
+        // `stopAllThreads` stops conversations — so it stays. That is the boundary
+        // of the hook: it clears `ownerThreadId`, never a bare `owner`.
+        await writer.executeTool('task', { claim: ['3'] });
+        expect((await storedTasks(writer)).map((item) => item.ownerThreadId)).toEqual([
+            first.id,
+            second.id,
+            undefined
+        ]);
+
+        // Both runs had already settled, so nothing was ABORTED; every conversation
+        // — the two host threads and each agent's default conversation — is stopped,
+        // and each stopped conversation's claims go with it.
+        expect(writer.stopAllThreads('all stop')).toBe(0);
+        expect(writer.thread(first.id)?.status).toBe('stopped');
+        expect(writer.thread(second.id)?.status).toBe('stopped');
+        expect(writer.thread('agent:writer')?.status).toBe('stopped');
+
+        expect(await storedTasks(writer)).toEqual([
+            task('1', 'One', { by: 'writer', threadId: first.id }),
+            task('2', 'Two', { by: 'writer', threadId: second.id }),
+            task('3', 'Three', { by: 'writer', owner: 'writer', leaseUntil: LEASE_UNTIL })
+        ]);
+        expect(await changeFeed(writer)).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '2', 'add', { by: 'writer', itemRev: 1 }),
+            event(3, '3', 'add', { by: 'writer', itemRev: 1 }),
+            event(4, '1', 'claim', { by: 'writer', threadId: first.id }),
+            event(5, '2', 'claim', { by: 'writer', threadId: second.id }),
+            event(6, '3', 'claim', { by: 'writer' }),
+            event(7, '1', 'release', { threadId: first.id }),
+            event(8, '2', 'release', { threadId: second.id })
+        ]);
+    });
+
+    it('releases the claims of a deleted conversation and leaves its sibling alone', async () => {
+        // One route PER conversation: `routed` builds one `scripted` closure per
+        // route and that closure advances per model REQUEST, so two conversations
+        // sharing a route would get different turns. Each prompt below is claimed by
+        // exactly one conversation.
+        const stream = routed(
+            {
+                'doomed claims': scripted([callTool('c1', 'task', '{"claim":["1"]}'), answer('locked')]),
+                'survivor claims': scripted([callTool('c2', 'task', '{"claim":["2"]}'), answer('locked')]),
+                'child claims': scripted([callTool('c3', 'task', '{"claim":["1"]}'), answer('locked')])
+            },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        await writer.executeTool('task', { tasks: [{ text: 'One' }, { text: 'Two' }] });
+
+        const doomed = writer.createThread('writer');
+        const survivor = writer.createThread('writer');
+
+        await writer.sendThreadInput(doomed.id, 'doomed claims');
+        await writer.sendThreadInput(survivor.id, 'survivor claims');
+
+        // Deleting a conversation is the other half of the story: the record can
+        // never release anything again, so `purgeThread` lifts its claims — and only
+        // its own, so the sibling keeps its lock.
+        writer.deleteThread(doomed.id);
+
+        expect(writer.thread(doomed.id)).toBeUndefined();
+        expect(await storedTasks(writer)).toEqual([
+            task('1', 'One', { by: 'writer', threadId: doomed.id }),
+            task('2', 'Two', {
+                by: 'writer',
+                threadId: survivor.id,
+                owner: 'writer',
+                ownerThreadId: survivor.id,
+                leaseUntil: LEASE_UNTIL
+            })
+        ]);
+
+        // The freed record is claimable by a NEW conversation, and deleting its OWNER
+        // purges the child through the same helper — so the cascade releases the
+        // child's claim too, while the untouched sibling stays locked.
+        const parent = writer.createThread('writer', { label: 'parent' });
+        const child = writer.createThread('writer', { ownerThreadId: parent.id });
+
+        await writer.sendThreadInput(child.id, 'child claims');
+        expect((await storedTasks(writer))[0].ownerThreadId).toBe(child.id);
+
+        writer.deleteThread(parent.id);
+
+        expect(writer.thread(child.id)).toBeUndefined();
+        expect(await storedTasks(writer)).toEqual([
+            task('1', 'One', { by: 'writer', threadId: child.id }),
+            task('2', 'Two', {
+                by: 'writer',
+                threadId: survivor.id,
+                owner: 'writer',
+                ownerThreadId: survivor.id,
+                leaseUntil: LEASE_UNTIL
+            })
+        ]);
+        expect(await changeFeed(writer)).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '2', 'add', { by: 'writer', itemRev: 1 }),
+            event(3, '1', 'claim', { by: 'writer', threadId: doomed.id }),
+            event(4, '2', 'claim', { by: 'writer', threadId: survivor.id }),
+            event(5, '1', 'release', { threadId: doomed.id }),
+            event(6, '1', 'claim', { by: 'writer', threadId: child.id }),
+            event(7, '1', 'release', { threadId: child.id })
+        ]);
+    });
+
+    it('drops a restored claim whose conversation the snapshot does not carry', async () => {
+        const stream = async function* (): AsyncIterable<HarnessStreamEvent> {
+            yield { type: 'text', delta: 'idle' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const source = harness({ agents: { writer: brain(stream) }, presets: false });
+        await source.executeTool('task', { tasks: [{ text: 'Edit the router' }] });
+
+        // A claim for a thread the snapshot does not carry. Every in-process
+        // stop/delete path releases BEFORE it snapshots, so this is the hand-edited
+        // or externally produced file — and in both cases the resumed session has
+        // nobody left to lift the lock. Round-tripped through JSON so the test edits
+        // the persisted shape, not a live object.
+        const snapshot = JSON.parse(JSON.stringify(source.snapshot())) as HarnessSnapshot;
+
+        snapshot.records.todos.items[0] = {
+            ...snapshot.records.todos.items[0],
+            owner: 'writer',
+            ownerThreadId: 'thread-9'
+        };
+
+        const target = harness({ agents: { writer: brain(stream) }, presets: false });
+        target.restore(snapshot);
+
+        // The orphan is gone, the content is exactly what the file said, and the
+        // release is recorded so a reader polling `since` sees the lock lift. The
+        // sweep runs before `notifyStateChange('restore')`, so the snapshot the host
+        // persists next already matches memory.
+        expect(target.snapshot().records.todos.items).toEqual([
+            task('1', 'Edit the router', { by: 'writer' })
+        ]);
+        expect(target.snapshot().records.todos.storeRev).toBe(2);
+        expect((target.snapshot().records.todos.changes ?? []).slice(-1)).toEqual([
+            event(2, '1', 'release', { threadId: 'thread-9' })
+        ]);
+    });
+
+    it('releases the default-conversation claim of a detached agent', async () => {
+        const stream = routed(
+            {
+                'claim it': scripted([callTool('c1', 'task', '{"claim":["1"]}'), answer('claimed')])
+            },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({
+            agents: { writer: brain(stream), helper: brain(stream) },
+            presets: false
+        });
+        await writer.executeTool('task', { tasks: [{ text: 'Edit the router' }] });
+
+        // A run in an agent's OWN conversation — the shape a delegation or a host
+        // turn on `agent:<name>` takes — claims as (writer, 'agent:helper').
+        await writer.sendThreadInput('agent:helper', 'claim it');
+        expect((await storedTasks(writer))[0].ownerThreadId).toBe('agent:helper');
+
+        // `removeAgent` drops that conversation WITHOUT `purgeThread`, so it needs
+        // its own release: after the roster entry and its thread record are gone,
+        // nothing could ever lift the lease.
+        writer.removeAgent('helper');
+
+        expect(writer.thread('agent:helper')).toBeUndefined();
+        // The holder pair is cleared; the attribution stays where the claim left it,
+        // because `releaseThread` is an ownership change and never rewrites a writer.
+        expect(await storedTasks(writer)).toEqual([
+            task('1', 'Edit the router', { by: 'helper', threadId: 'agent:helper' })
+        ]);
+        expect(await changeFeed(writer)).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '1', 'claim', { by: 'helper', threadId: 'agent:helper' }),
+            event(3, '1', 'release', { threadId: 'agent:helper' })
+        ]);
     });
 });
 

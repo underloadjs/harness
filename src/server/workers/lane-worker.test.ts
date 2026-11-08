@@ -367,17 +367,61 @@ describe('worker mode: a turn runs on its own lane', () => {
 });
 
 describe('worker mode: shared state is central, not local', () => {
+    // One page of the canonical task store, as a routed call answers it. T1 put a
+    // content revision, an attribution and a store revision into every answer, and the
+    // worker boundary must not lose any of them: the WRITE happens at the authority
+    // (../../lane-authority.ts `executeRecordTool`), so the record a lane receives IS
+    // the canonical one.
+    type TaskPageShape = {
+        tasks?: Array<Record<string, unknown>>;
+        counts?: { total: number; completed: number; pending: number };
+        page?: { offset: number; limit: number; hasMore: boolean };
+        storeRev?: number;
+    };
+
+    // `updatedAt` (and the change-feed `at`) is the coordinator's wall-clock instant,
+    // and THIS process cannot fake the clock across the worker boundary without
+    // disturbing the lane handshake. It is therefore read out and named, so every
+    // OTHER key of the record and of the persisted block stays an exact assertion.
+    const stampOf = (record: Record<string, unknown> | undefined): string => {
+        const value = record?.updatedAt;
+
+        if (typeof value !== 'string' || Number.isNaN(Date.parse(value))) {
+            throw new Error(`the canonical task record carried no ISO updatedAt: ${JSON.stringify(record)}`);
+        }
+
+        return value;
+    };
+
     it('writes a task through one lane and reads it back on a rebuilt lane', async () => {
         const store = storeOf();
         const session = await store.create('demo');
 
-        const added = (await store.callTool(session.id, 'task', { tasks: [{ text: 'written from a lane' }] })) as {
-            tasks?: { id: string; text: string }[];
-        };
+        const added = (await store.callTool(session.id, 'task', {
+            tasks: [{ text: 'written from a lane' }]
+        })) as TaskPageShape;
 
         // The id was minted by the CORE store on the coordinator, and the answer came back
-        // through the lane: that is the central mutation the requirement asks for.
-        expect(added?.tasks?.[0]).toMatchObject({ id: '1', text: 'written from a lane' });
+        // through the lane: that is the central mutation the requirement asks for. The T1
+        // shape arrives with it - content rev 1, the primary agent as the writer (a manual
+        // call carries no conversation), and `storeRev` 1 for the one recorded event.
+        expect(added).toEqual({
+            tasks: [
+                {
+                    id: '1',
+                    text: 'written from a lane',
+                    completed: false,
+                    rev: 1,
+                    updatedBy: 'demo',
+                    updatedAt: stampOf(added?.tasks?.[0])
+                }
+            ],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1
+        });
+
+        const stamp = stampOf(added?.tasks?.[0]);
 
         // Reclaim EVERY worker of this session, then read again: the NEXT call spawns a fresh
         // lane, rebuilt from the authority's committed state, and it must see the record. A
@@ -385,9 +429,11 @@ describe('worker mode: shared state is central, not local', () => {
         // failure mode.
         hostOf(store).closeSession(session.id, 'test reclaim');
 
-        const reread = (await store.callTool(session.id, 'task', {})) as { tasks?: { id: string; text: string }[] };
+        const reread = (await store.callTool(session.id, 'task', {})) as TaskPageShape;
 
-        expect(reread?.tasks?.map((task) => task.text)).toEqual(['written from a lane']);
+        // Byte-identical to the first answer, stamp included: the rebuilt replica re-read
+        // the canonical store rather than restamping or re-adding anything.
+        expect(reread).toEqual(added);
 
         // A new worker really was created for the read (nothing survived the reclaim).
         expect((await hostReady(store)).lanes().filter((lane) => lane.sessionKey === session.id)).toHaveLength(1);
@@ -395,10 +441,30 @@ describe('worker mode: shared state is central, not local', () => {
         // The durable document also carries it: the store snapshots the canonical harness on
         // every state change, and a lane commit IS a state change. Read the persisted core
         // rather than the client snapshot, because the todo list is harness state and the
-        // client snapshot deliberately does not expose it.
-        const core = (store as unknown as { sessions: Map<string, { core?: unknown }> }).sessions.get(session.id);
+        // client snapshot deliberately does not expose it. The whole T1 block is pinned -
+        // revision, attribution, `storeRev` and the change feed - because a session that
+        // restored only `{ items, nextId }` would silently drop the concurrency contract.
+        const core = (
+            store as unknown as {
+                sessions: Map<string, { core?: { records?: { todos?: unknown } } }>;
+            }
+        ).sessions.get(session.id);
 
-        expect(JSON.stringify(core?.core ?? {})).toContain('written from a lane');
+        expect(core?.core?.records?.todos).toEqual({
+            items: [
+                {
+                    id: '1',
+                    text: 'written from a lane',
+                    completed: false,
+                    rev: 1,
+                    updatedBy: 'demo',
+                    updatedAt: stamp
+                }
+            ],
+            nextId: 2,
+            storeRev: 1,
+            changes: [{ rev: 1, id: '1', op: 'add', by: 'demo', at: stamp, itemRev: 1 }]
+        });
     }, 180_000);
 
     it('sends across threads from a lane and reads the roster from the authority', async () => {

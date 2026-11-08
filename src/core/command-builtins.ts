@@ -17,10 +17,21 @@
 // fetch content-type gate) instead of duplicating them here.
 //
 // The parameter objects below are the tools' real schemas — NOT guesses:
-//   - `task`    -> { tasks?, remove?, offset?, limit? }   (tools/runtime/task.tool.ts,
-//                  patch semantics in core/task.ts)
+//   - `task`    -> { tasks?, remove?, claim? | release? | takeover?, expects?,
+//                    offset?, limit? }                    (tools/runtime/task.tool.ts,
+//                  patch/CAS/ownership semantics in core/task.ts)
 //   - `search`  -> { query, maxResults?, provider? }      (tools/websearch/index.ts)
 //   - `fetch`   -> { url, format?, provider? }            (tools/webfetch/index.ts)
+//
+// THE TASK COMMAND READS BEFORE IT WRITES (T1/Phase 2)
+// ----------------------------------------------------
+// `core/task.ts` requires an `expects: [{ id, rev }]` token for every content
+// patch or removal made by a caller that HAS an agent identity, and `executeTool`
+// always gives one (`agent: primary`). So `/task complete|reopen|remove` reads the
+// store first and sends the real revisions; it never invents a rev. `/task
+// claim|release|takeover` need no token, because an ownership action never changes
+// `rev`. The cost is one extra read (and its `tool_execute` notification) per
+// guarded command — a debounced save, not a model turn.
 //
 // CONDITIONAL TOOLS, HONEST ERRORS
 // --------------------------------
@@ -51,10 +62,12 @@ import { toErrorInfo } from '../util';
 import { MODEL_TOOL_RESULT_BUDGET_BYTES, utf8ByteLength } from './result-budget';
 import { formatCommandHelp, normalizeCommandName } from './command';
 import type {
+    Harness,
     HarnessCommand,
     HarnessCommandContext,
     HarnessCommandResult,
     TaskCounts,
+    TaskExpect,
     TaskItem,
     TaskPageInfo,
     WebSearchMatch,
@@ -135,26 +148,53 @@ const hasTool = (context: HarnessCommandContext, name: string): boolean =>
 // ---------------------------------------------------------------------------
 
 // The page every successful `task` call returns (core/task.ts): the requested
-// slice, the derived counts, and the cursor. Typed locally because the tool's raw
-// result arrives as `unknown` through executeTool.
+// slice, the derived counts, the cursor, and the store revision. Typed locally
+// because the tool's raw result arrives as `unknown` through executeTool.
 type TaskPage = {
     tasks: TaskItem[];
     counts: TaskCounts;
     page: TaskPageInfo;
+    storeRev: number;
 };
+
+// The tool's page ceiling (core/task.ts `TASK_LIST_MAX_LIMIT`): asking for more is
+// clamped, so one request per page is the widest walk available.
+const TASK_READ_PAGE_LIMIT = 100;
+
+// Bound for the revision walk below. The store holds at most 200 records
+// (TASK_MAX_RECORDS), so a normal walk is ONE request; the 64 KiB response budget
+// can cut a page to ~15 records when texts are near TASK_MAX_TEXT, which is the
+// worst case this bound has to cover. It exists only so a cursor that stops
+// advancing cannot spin — a complete store never needs it.
+const TASK_READ_MAX_PAGES = 16;
 
 // Readable rendering of one page: `#<id> [x]/[ ] <text>`, then counts, then the
 // cursor. Ids are shown with "#" so an operator can copy `/task complete <id>`
 // straight out of the listing.
+//
+// A claimed record also shows WHO holds it, because without that an operator
+// looking at a rejected `/task complete` cannot tell the record is reserved — and
+// the fix (`/task takeover <id>`, or waiting for the lease) is the whole point of
+// the ownership feature. `data` still carries the exact machine-readable records.
 const formatTaskPage = (result: unknown): string => {
     const page = (result ?? {}) as Partial<TaskPage>;
     const tasks = Array.isArray(page.tasks) ? page.tasks : [];
     const counts = page.counts ?? { total: 0, completed: 0, pending: 0 };
     const info = page.page ?? { offset: 0, limit: 0, hasMore: false };
 
-    const lines = tasks.map(
-        (task) => `#${task.id} [${task.completed ? 'x' : ' '}] ${task.text}`
-    );
+    const lines = tasks.map((task) => {
+        if (task.owner === undefined) return `#${task.id} [${task.completed ? 'x' : ' '}] ${task.text}`;
+
+        // An indefinite claim (no lease) says so rather than inventing an expiry,
+        // matching the tool's own blocked-write message (core/task.ts claimMessage).
+        const holder = `${task.owner}${task.ownerThreadId === undefined ? '' : `@${task.ownerThreadId}`}`;
+        const until =
+            task.leaseUntil === undefined
+                ? 'forever'
+                : `until ${new Date(task.leaseUntil).toISOString()}`;
+
+        return `#${task.id} [${task.completed ? 'x' : ' '}] ${task.text} (claimed by ${holder} ${until})`;
+    });
 
     if (lines.length === 0) lines.push('No tasks.');
 
@@ -168,11 +208,65 @@ const formatTaskPage = (result: unknown): string => {
     return capText(lines.join('\n'));
 };
 
+// Reads the store and answers `id -> rev`, the token every guarded write needs.
+//
+// WHY A READ FIRST: `harness.executeTool` always hands the tool an agent identity
+// (`agent: primary`, src/harness.ts `executeToolInternal`), and core/task.ts
+// requires an `expects: [{ id, rev }]` entry for EVERY record an identified caller
+// patches or removes. A blind command would die on `guarded write: pass expects
+// [...]`; the read is what makes `/task complete 1` legal again. It is also the
+// compare-and-swap window: if another agent changed the record between the read
+// and the write, the tool rejects the whole call instead of silently dropping
+// their edit.
+//
+// The walk follows `page.nextOffset` while `page.hasMore`; the store's own caps,
+// not the operator, decide how many requests that is.
+const readTaskRevisions = async (harness: Harness): Promise<Map<string, number>> => {
+    const revisions = new Map<string, number>();
+    let offset = 0;
+
+    for (let pass = 0; pass < TASK_READ_MAX_PAGES; pass += 1) {
+        const result = (await harness.executeTool(TASK_TOOL_NAME, {
+            offset,
+            limit: TASK_READ_PAGE_LIMIT
+        })) as Partial<TaskPage>;
+
+        const tasks = Array.isArray(result.tasks) ? result.tasks : [];
+
+        for (const task of tasks) revisions.set(task.id, task.rev);
+
+        const info = result.page;
+        // A page that reports `hasMore` without a usable cursor would loop forever;
+        // falling back to "one more page than we just saw" keeps the walk honest.
+        const next = info?.nextOffset ?? offset + tasks.length;
+
+        if (info?.hasMore !== true || next <= offset) break;
+        offset = next;
+    }
+
+    return revisions;
+};
+
+// Builds the `expects` array for a guarded write, skipping ids the read did not
+// see. A token is only legal for a record that still exists AND is being changed
+// (core/task.ts rejects both a removed id and an untouched one), so an unknown id
+// gets no entry and the tool's own `task has no task with id "99"` message is what
+// the operator reads — inventing a rev would replace it with a CAS error.
+const expectsFor = (
+    ids: readonly string[],
+    revisions: Map<string, number>
+): TaskExpect[] =>
+    ids.flatMap((id) => {
+        const rev = revisions.get(id);
+        return rev === undefined ? [] : [{ id, rev }];
+    });
+
 // `/task` — the session task list, mapped onto the tool's one-patch-call shape.
 const taskCommand: HarnessCommand = {
     name: TASK_COMMAND_NAME,
     description: 'Read and change this session\'s task list.',
-    usage: '/task [list | add <text> | complete <id> | reopen <id> | remove <id>...]',
+    usage:
+        '/task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]',
     execute: async (context) => {
         const [subcommand, ...rest] = context.args;
 
@@ -241,11 +335,17 @@ const taskCommand: HarnessCommand = {
             }
 
             try {
-                // `completed` is a PATCH, so this sets the flag and leaves the
-                // stored text untouched; an unknown id is a tool rejection, which
-                // the catch below turns into a readable error.
+                // `completed` is a PATCH by an IDENTIFIED caller (executeTool always
+                // supplies `agent: primary`), so it needs the rev that is stored right
+                // now — see readTaskRevisions. An id the read did not see gets NO
+                // token, and the tool's own unknown-id rejection is what surfaces.
+                const revisions = await readTaskRevisions(context.harness);
+                const expects = expectsFor([id], revisions);
                 const result = await context.harness.executeTool(TASK_TOOL_NAME, {
-                    tasks: [{ id, completed: subcommand === 'complete' }]
+                    // `completed` is the only field sent, so the stored text stays
+                    // untouched (core/task.ts partial-patch semantics).
+                    tasks: [{ id, completed: subcommand === 'complete' }],
+                    ...(expects.length === 0 ? {} : { expects })
                 });
 
                 return { content: formatTaskPage(result), data: result };
@@ -264,13 +364,53 @@ const taskCommand: HarnessCommand = {
             }
 
             try {
+                // A removal is a guarded write too: one token per id that still
+                // exists. The whole call is atomic (core/task.ts), so a stale token
+                // removes nothing rather than half a batch, and an unknown id still
+                // reports itself as `task has no task with id "N"`.
+                const revisions = await readTaskRevisions(context.harness);
+                const expects = expectsFor(rest, revisions);
                 const result = await context.harness.executeTool(TASK_TOOL_NAME, {
-                    remove: rest
+                    remove: rest,
+                    ...(expects.length === 0 ? {} : { expects })
                 });
 
                 return { content: formatTaskPage(result), data: result };
             } catch (error) {
                 return failure(error, '/task remove');
+            }
+        }
+
+        // `/task claim|release|takeover <id...>` — the Phase 2 ownership verbs. The
+        // parameter key is the verb itself (tools/runtime/task.tool.ts), one list of
+        // exact ids, and NO `expects`: a claim, a release and a takeover move the
+        // holder without touching `rev`, so there is no content revision to guard.
+        // The command runs unthreaded (`executeTool` sets no `threadId`), which
+        // makes its holder pair `(<primary>, undefined)` — an operator's claim is
+        // therefore distinct from any conversation's claim, and `/task release` can
+        // only lift the operator's own or an expired one. A foreign live claim is
+        // the tool's rejection; `/task takeover` is the documented override.
+        if (
+            subcommand === 'claim' ||
+            subcommand === 'release' ||
+            subcommand === 'takeover'
+        ) {
+            if (rest.length === 0) {
+                return usageError(taskCommand, `"${subcommand}" needs at least one task id.`);
+            }
+
+            if (!hasTool(context, TASK_TOOL_NAME)) {
+                return usageError(taskCommand, 'the "task" tool is not registered in this harness.');
+            }
+
+            try {
+                const result = await context.harness.executeTool(TASK_TOOL_NAME, {
+                    [subcommand]: rest
+                });
+
+                return { content: formatTaskPage(result), data: result };
+            } catch (error) {
+                return failure(error, `/task ${subcommand}`);
             }
         }
 

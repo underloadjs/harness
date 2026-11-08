@@ -4383,6 +4383,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // steering the aborted run never consumed.
         state.queue.length = 0;
 
+        // T1 (Phase 2) ownership: a stopped conversation cannot finish the edit it
+        // reserved, so its task claims are dropped HERE — the one place every stop
+        // path passes (stopThread, its owner cascade, stopAllThreads). Without this
+        // a dead thread's lease keeps blocking foreign writes until it happens to
+        // expire (up to TASK_MAX_LEASE_MS). It runs before the abort below on
+        // purpose: the hook and the persisted snapshot should see the store in the
+        // state the record now claims. A tool call that was already in flight can
+        // still re-claim after this line; that orphan is bounded by the lease, and
+        // the thread is refused at its next run boundary.
+        taskStore.releaseThread(state.record.id);
+
         // R2 plugin hook. Emitted HERE rather than in stopThread so every stop path
         // (stopThread, stopAllThreads, an owner-linked cascade) reports the transition
         // exactly once per conversation. A thread that was 'paused' is reported as
@@ -4437,6 +4448,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const purgeThread = (state: ThreadState): void => {
         const threadId = state.record.id;
         threadStates.delete(threadId);
+
+        // T1 (Phase 2) ownership: the conversation is gone, so nothing can ever
+        // release or renew its task claims again — a delete MUST lift them or the
+        // records stay blocked for the rest of the lease. Part of the shared purge
+        // so deleteThread and its cascade cannot drift from each other; already
+        // released (or absent) claims make this a no-op.
+        taskStore.releaseThread(threadId);
 
         // Invocation lookups owned by THIS conversation. Branch runs inherit the
         // persistent owner, so a fork's/autoanswer's result is scoped here too.
@@ -8880,6 +8898,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         chapter.restore(next.records.chapters);
         location.restore(next.records.locations);
 
+        // T1 (Phase 2) ownership: a snapshot can persist a claim whose owning
+        // conversation is NOT part of it — the thread was deleted after the claim
+        // was taken, or the file was edited by hand. Nothing in the resumed session
+        // can ever release or renew such a claim (its thread id is unaddressable),
+        // so the records it holds would stay blocked for the remainder of the lease.
+        // `releaseThread` matches `ownerThreadId` exactly, which leaves an
+        // unthreaded claim (owner set, no thread — the `executeTool`/command door)
+        // alone. This runs AFTER the store restore and BEFORE the notification, so
+        // the snapshot the host persists next already matches memory.
+        const claimedThreads = new Set<string>();
+
+        for (const item of taskStore.snapshot().items) {
+            if (item.ownerThreadId !== undefined) claimedThreads.add(item.ownerThreadId);
+        }
+
+        for (const threadId of claimedThreads) {
+            if (!threadStates.has(threadId)) taskStore.releaseThread(threadId);
+        }
+
         notifyStateChange('restore');
     };
 
@@ -9528,7 +9565,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // The default conversation is the agent's transcript: it goes with the agent. Its
         // sequence number is NOT reused (the counter is monotonic, like thread ids).
-        if (defaultThread !== undefined) threadStates.delete(defaultThreadIdOf(key));
+        if (defaultThread !== undefined) {
+            threadStates.delete(defaultThreadIdOf(key));
+
+            // T1 (Phase 2) ownership: `agent:<name>` is the only conversation this
+            // agent can still hold a task claim on (a host thread of the same agent
+            // is refused above), and `assertRosterIdle` only proves no RUN is live —
+            // a claim from a finished turn outlives it. Nothing else can lift that
+            // claim once the record is gone, so release it with the transcript.
+            taskStore.releaseThread(defaultThreadIdOf(key));
+        }
 
         // Keep the model-facing allowlist in step with the real one.
         syncDelegateDeclaration();

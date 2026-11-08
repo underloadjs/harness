@@ -25,13 +25,14 @@
 //   - ../sessions.ts                   - the caller that owns one authority per session
 //   - ../../../Temp/t5/probe-seams.ts  - the seam probe these expectations came from
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '@underload/harness';
 import type { Harness, HarnessStream, HarnessStreamEvent } from '@underload/harness';
 import { canonicalViewOf, createLaneAuthority } from './lane-authority';
 import { expectsDigestOf } from './lane-commit';
 import type { MutationGroup } from './lane-commit';
 import { ABSENT_DIGEST, digestMemoryValue } from './lane-memory';
+import { TASK_DEFAULT_LEASE_MS } from '../../core/task';
 
 // A scripted stream that never talks to a provider: the authority tests are about state,
 // and a run here would only add latency.
@@ -430,6 +431,242 @@ describe('routed operations: the canonical harness performs the shared work', ()
         await expect(authority.answer(EPOCH_A, { op: 'runtime', method: 'listTools', identity: {} })).rejects.toThrow(
             /is retired; its requests are no longer answered/
         );
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T1: two lanes, ONE canonical task store
+// ---------------------------------------------------------------------------
+//
+// A lane's `record:update` carries a DIGEST `expects` (./lane-commit.ts), which is the
+// commit-group CAS for the fold view. The task tool's OWN compare-and-swap is a
+// different guard entirely: `{ id, rev }` tokens checked by the canonical store
+// (../../core/task.ts) against the record's content revision. Routed `task` writes go
+// to the store, so a stale token must be refused THERE - by the same message the
+// inline path produces - and never by a lane receipt.
+describe('routed task writes: the canonical store owns the compare-and-swap', () => {
+    // The task stamps every write from Date, so the clock is pinned for this block
+    // only (`toFake: ['Date']` leaves the scheduler real): each `updatedAt`, `at` and
+    // `leaseUntil` then has ONE exact value to assert.
+    const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
+    const EPOCH_MS = Date.parse(EPOCH_ISO);
+
+    beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(EPOCH_MS);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    type TaskPageValue = {
+        tasks: Array<Record<string, unknown>>;
+        counts: { total: number; completed: number; pending: number };
+        page: { offset: number; limit: number; hasMore: boolean };
+        storeRev: number;
+        changes?: Array<Record<string, unknown>>;
+    };
+
+    // One routed call, projected to the value the lane received.
+    const routedTask = async (
+        authority: ReturnType<typeof createLaneAuthority>,
+        laneEpoch: number,
+        agent: string,
+        threadId: string,
+        parameters: Record<string, unknown>
+    ): Promise<TaskPageValue> => {
+        const answer = await authority.answer(laneEpoch, {
+            op: 'runtime',
+            method: 'executeRecordTool',
+            name: 'task',
+            parameters,
+            identity: { agent, threadId, runDepth: 1 }
+        });
+
+        return answer.value as TaskPageValue;
+    };
+
+    it('applies one lane write and refuses the other lane stale token, atomically', async () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const threadA = core.createThread('primary');
+        const threadB = core.createThread('primary');
+
+        // Lane A mints the record. The id comes from the CORE store, which is what the
+        // identity ledger then adopts (the T3 F1 prevention above).
+        const added = await routedTask(authority, EPOCH_A, 'primary', threadA.id, {
+            tasks: [{ text: 'shared record' }]
+        });
+
+        expect(added.tasks).toEqual([
+            {
+                id: '1',
+                text: 'shared record',
+                completed: false,
+                rev: 1,
+                updatedBy: 'primary',
+                updatedThreadId: threadA.id,
+                updatedAt: EPOCH_ISO
+            }
+        ]);
+        expect(added.storeRev).toBe(1);
+
+        // Lane B reads the SAME store and takes the token it saw.
+        const readByB = await routedTask(authority, EPOCH_B, 'primary', threadB.id, {});
+
+        expect(readByB.tasks[0].rev).toBe(1);
+        expect(readByB.tasks[0].updatedThreadId).toBe(threadA.id);
+
+        // Lane B writes first, with the token from that read.
+        const bWrote = await routedTask(authority, EPOCH_B, 'primary', threadB.id, {
+            tasks: [{ id: '1', text: 'lane B won' }],
+            expects: [{ id: '1', rev: 1 }]
+        });
+
+        expect(bWrote.tasks).toEqual([
+            {
+                id: '1',
+                text: 'lane B won',
+                completed: false,
+                rev: 2,
+                updatedBy: 'primary',
+                updatedThreadId: threadB.id,
+                updatedAt: EPOCH_ISO
+            }
+        ]);
+        expect(bWrote.storeRev).toBe(2);
+
+        // Lane A, still holding rev 1, is refused BY THE CANONICAL STORE. The error is
+        // the tool's own CAS sentence - the same one the inline path would throw - not
+        // a `stale-record` receipt from the fold, because this write never went through
+        // a commit group.
+        await expect(
+            routedTask(authority, EPOCH_A, 'primary', threadA.id, {
+                tasks: [{ id: '1', completed: true }],
+                expects: [{ id: '1', rev: 1 }]
+            })
+        ).rejects.toThrow(
+            'task "1" changed since revision 1 (now 2, last edited by "primary"); re-read and retry; changed fields: text.'
+        );
+
+        // The refusal moved nothing anywhere: B's text, rev 2 and the two recorded
+        // events are exactly what they were, so the winning lane's work survives.
+        const canonical = await routedTask(authority, EPOCH_A, 'primary', threadA.id, { since: 0 });
+
+        expect(canonical.tasks).toEqual([
+            {
+                id: '1',
+                text: 'lane B won',
+                completed: false,
+                rev: 2,
+                updatedBy: 'primary',
+                updatedThreadId: threadB.id,
+                updatedAt: EPOCH_ISO
+            }
+        ]);
+        expect(canonical.storeRev).toBe(2);
+        expect(canonical.changes).toEqual([
+            { rev: 1, id: '1', op: 'add', by: 'primary', threadId: threadA.id, at: EPOCH_ISO, itemRev: 1 },
+            {
+                rev: 2,
+                id: '1',
+                op: 'update',
+                by: 'primary',
+                threadId: threadB.id,
+                at: EPOCH_ISO,
+                fields: ['text'],
+                itemRev: 2
+            }
+        ]);
+
+        // A re-reads at the canonical revision and its write lands.
+        const retry = await routedTask(authority, EPOCH_A, 'primary', threadA.id, {
+            tasks: [{ id: '1', completed: true }],
+            expects: [{ id: '1', rev: 2 }]
+        });
+
+        expect(retry.tasks).toEqual([
+            {
+                id: '1',
+                text: 'lane B won',
+                completed: true,
+                rev: 3,
+                updatedBy: 'primary',
+                updatedThreadId: threadA.id,
+                updatedAt: EPOCH_ISO
+            }
+        ]);
+        expect(retry.storeRev).toBe(3);
+
+        // The lane's own replica base cannot drift: the answer the authority hands back
+        // IS the canonical page, and the identity ledger still points past the id the
+        // core minted.
+        expect(authority.ledger.publishedOf('record:todos')).toBe(2);
+    });
+
+    it('enforces a lane claim through the canonical store, and takes it over', async () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const threadA = core.createThread('primary');
+        const threadB = core.createThread('primary');
+
+        await routedTask(authority, EPOCH_A, 'primary', threadA.id, { tasks: [{ text: 'one writers edit' }] });
+
+        // Lane A holds the record; lane B's guarded patch is refused with the holder
+        // and the expiry, exactly as an inline refusal reads.
+        const claimed = await routedTask(authority, EPOCH_A, 'primary', threadA.id, { claim: ['1'] });
+
+        expect(claimed.tasks[0]).toEqual({
+            id: '1',
+            text: 'one writers edit',
+            completed: false,
+            rev: 1,
+            updatedBy: 'primary',
+            updatedThreadId: threadA.id,
+            updatedAt: EPOCH_ISO,
+            owner: 'primary',
+            ownerThreadId: threadA.id,
+            // The tool's default lease (src/core/task.ts TASK_DEFAULT_LEASE_MS).
+            leaseUntil: EPOCH_MS + TASK_DEFAULT_LEASE_MS
+        });
+        // A claim is ownership, not content: the token lane B holds is still valid.
+        expect(claimed.storeRev).toBe(2);
+
+        await expect(
+            routedTask(authority, EPOCH_B, 'primary', threadB.id, {
+                tasks: [{ id: '1', completed: true }],
+                expects: [{ id: '1', rev: 1 }]
+            })
+        ).rejects.toThrow(
+            `task "1" is claimed by "primary" until ${new Date(EPOCH_MS + TASK_DEFAULT_LEASE_MS).toISOString()}; release it or take it over first.`
+        );
+
+        // The store is untouched by the refusal, and `takeover` is the override the
+        // other lane has: it moves the holder and leaves `rev` alone.
+        const taken = await routedTask(authority, EPOCH_B, 'primary', threadB.id, { takeover: ['1'] });
+
+        expect(taken.tasks[0]).toEqual({
+            id: '1',
+            text: 'one writers edit',
+            completed: false,
+            rev: 1,
+            updatedBy: 'primary',
+            updatedThreadId: threadB.id,
+            updatedAt: EPOCH_ISO,
+            owner: 'primary',
+            ownerThreadId: threadB.id,
+            leaseUntil: EPOCH_MS + TASK_DEFAULT_LEASE_MS
+        });
+
+        const writable = await routedTask(authority, EPOCH_B, 'primary', threadB.id, {
+            tasks: [{ id: '1', completed: true }],
+            expects: [{ id: '1', rev: 1 }]
+        });
+
+        expect(writable.tasks[0].completed).toBe(true);
+        expect(writable.tasks[0].rev).toBe(2);
+        expect(writable.storeRev).toBe(4);
     });
 });
 

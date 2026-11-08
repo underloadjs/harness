@@ -91,11 +91,37 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const primary = 'instruct';
 
 // The `task` tool's page shape (src/core/task.ts) — the same one the built-in
-// command renders. Hard-coded so a harness-state assertion is exact.
-const taskPage = (tasks: unknown[], total: number, completed: number, pending: number) => ({
+// command renders. Hard-coded so a harness-state assertion is exact. T1 adds
+// `storeRev` to every page: one step per RECORDED event, and `/task add` is one.
+const taskPage = (
+    tasks: unknown[],
+    total: number,
+    completed: number,
+    pending: number,
+    storeRev: number
+) => ({
     tasks,
     counts: { total, completed, pending },
-    page: { offset: 0, limit: 20, hasMore: false }
+    page: { offset: 0, limit: 20, hasMore: false },
+    storeRev
+});
+
+// One stored task as the COMMAND / tools-tab door writes it. `sessions.ts callTool`
+// runs `harness.executeTool`, which hands the tool the session's PRIMARY agent and
+// NO thread, so `updatedBy` names that agent and `updatedThreadId` is absent
+// entirely. `updatedAt` is the pinned instant (see `pinClock`): `new Date(2_000)`.
+const taskRecord = (
+    id: string,
+    text: string,
+    completed = false,
+    rev = 1
+): Record<string, unknown> => ({
+    id,
+    text,
+    completed,
+    rev,
+    updatedBy: primary,
+    updatedAt: new Date(2_000).toISOString()
 });
 
 const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset => ({
@@ -439,7 +465,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         // And the command really mutated THIS session's harness (the live tool sees
         // it; sessions.ts `callTool` refuses a busy session, and this one is idle).
         expect(await runtime.store.callTool(id, 'task', {})).toEqual(
-            taskPage([{ id: '1', text: 'testing', completed: false }], 1, 0, 1)
+            taskPage([taskRecord('1', 'testing')], 1, 0, 1, 1)
         );
 
         // The stored record equals what the wire promised: a reload renders the same turn.
@@ -509,7 +535,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
                 '/help  List the commands in this harness, or show one command.',
                 '  usage: /help [command]',
                 "/task  Read and change this session's task list.",
-                '  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>...]',
+                '  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]',
                 '/tools  List the tools registered in this harness.',
                 '  usage: /tools [filter]',
                 "/webfetch  Fetch one http(s) page through this session's fetch tool.",
@@ -749,7 +775,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
 
         // The restarted harness also still has the task the command added.
         expect(await second.store.callTool(id, 'task', {})).toEqual(
-            taskPage([{ id: '1', text: 'testing', completed: false }], 1, 0, 1)
+            taskPage([taskRecord('1', 'testing')], 1, 0, 1, 1)
         );
 
         expect(fixture.requests).toEqual([]);
@@ -1042,7 +1068,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         // memory, and the answer is recorded in the turn's events). This later save
         // succeeds — the failure was one write, not a dead database.
         expect(await runtime.store.callTool(id, 'task', {})).toEqual(
-            taskPage([{ id: '1', text: 'testing', completed: false }], 1, 0, 1)
+            taskPage([taskRecord('1', 'testing')], 1, 0, 1, 1)
         );
 
         watched.unsubscribe();

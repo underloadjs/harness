@@ -2,7 +2,11 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-03 (documentation review of the server-side slash-command
+> **Last verified:** 2026-11-08 for the shared `task` store and its concurrency
+> contract (`src/core/task.ts`, `src/tools/runtime/task.tool.ts`, the `/task` verbs in
+> `src/core/command-builtins.ts`, and the `records.todos` snapshot/restore path in
+> `src/core/snapshot.ts` and `src/harness.ts`), and 2026-11-03 for the documentation
+> review of the server-side slash-command
 > layer (`src/core/command.ts`, `src/core/command-builtins.ts`, `src/harness.ts`
 > registry, `src/server/sessions.ts` `dispatch`/`executeCommandTurn`,
 > `src/server/cli/commands.ts`) and of editable thread transcripts
@@ -65,8 +69,9 @@ src/
     metadata.ts         core tool metadata (name/description/tags/schema) — one copy for harness.ts, the record factories, and src/harnesses/core.ts
     creation.ts         validate + compile a tool from an async function body
     creation.test.ts
-    todo.ts             per-harness session todo list (factory + reset hook)
-    todo.test.ts
+    task.ts             per-harness session task list (factory + reset/snapshot/
+                        restore/releaseThread hooks, revs, claims, change log)
+    task.test.ts
     profile.ts          per-harness character/people records (add/list/get/update/remove)
     profile.test.ts
     chapter.ts          per-harness chapters (summaries, status, order, body only from get)
@@ -332,7 +337,8 @@ reach into `src/`.
 - [agent](#agent) — The brain, usable on its own
 - [tool](#tool) — An executable action: call it directly, or let the model call it
 - [Tool discovery](#tool-discovery) — Tags, visibility, toolRequest, and the ranking
-- [Session tasks](#session-tasks) — Core task, incremental ids, per-harness state
+- [Session tasks](#session-tasks) — Core task, incremental ids, per-harness state,
+  revisions, claims and the change feed
 - [Session records](#session-records) — Core profileManage/chapterManage/locationManage stores
 - [Agent results](#agent-results-r3) — Core agentManage/agentResult result inspection
 - [toolCreate](#createtool) — Runtime tool creation from an async function body
@@ -725,48 +731,164 @@ bytes (or delete the new file) and surface rollback failure.
 
 ## Session tasks
 
-`src/core/task.ts` builds the `task` tool (R9-R11 renamed it from `task`).
+`src/core/task.ts` builds the `task` tool (R9-R11 renamed it from `todoManage`).
 It is a **deliberate exception to the stateless-tool rule**: the state lives in the
 factory closure, never in a module singleton, so the harness owns exactly one list
 per instance.
 
 ```ts
-const { tool, reset, snapshot } = createTaskTool();   // fresh list + id counter
+// One toolset per harness: the tool plus the persistence and lifecycle hooks.
+const { tool, reset, snapshot, restore, releaseThread } = createTaskTool();
 ```
 
 - The wire shape is one **merge command**, not an action enum: `tasks` holds patch
-  entries, `remove` holds ids, `offset`/`limit` page the answer. No arguments (or
-  `{}`) is a read. An entry **without** `id` adds a task (`text` required); an entry
-  **with** a known `id` patches it — `text` and/or `completed`, whichever are sent;
-  omitted fields are unchanged. An unknown id, an entry with neither `text` nor a
-  known `id`, one id patched twice, or an id in both `tasks` and `remove` are all
-  rejections.
+  entries, `remove` holds ids, `claim`/`release`/`takeover` hold ids for the
+  ownership verbs, and `offset`/`limit`/`afterId`/`since` shape the answer. No
+  arguments (or `{}`) is a read. An entry **without** `id` adds a task (`text`
+  required); an entry **with** a known `id` patches it — `text` and/or `completed`,
+  whichever are sent; omitted fields are unchanged. An unknown id, an entry with
+  neither `text` nor a known `id`, one id in two of the five id lists, or an id
+  patched twice are all rejections.
 - The whole patch is validated **before** anything mutates, so a rejected call
-  leaves the list exactly as it was.
+  leaves the records, the id counter, `storeRev` and the change log exactly as they
+  were. Apply order is fixed: claims → releases → takeovers → expired-claim clears →
+  patches → removals → additions.
 - Ids are decimal strings (`"1"`, `"2"`, …), monotonic per instance; a removed id
-  is never re-used. `reset()` clears both the list and the counter.
+  is never re-used. `reset()` clears the list, the counter, `storeRev` and the log.
+- **Every record carries concurrency state** (T1), on top of `id`/`text`/`completed`:
+  `rev` (its CONTENT revision — 1 on add, `+1` only when trimmed `text` or
+  `completed` actually changes, so a restated value is a silent no-op FOR THE PATCH
+  ITSELF), the write attribution `updatedBy`/`updatedThreadId`/`updatedAt`, and the
+  optional claim triple `owner`/`ownerThreadId`/`leaseUntil`. Attribution comes from the
+  `ToolContext` (`agent?.name`, `threadId`), never from arguments, so a model cannot
+  forge it. Optional fields stay ABSENT rather than `undefined`-valued, so a store
+  nobody has claimed serializes exactly like a pre-T1 store.
+- **Every recorded event also bumps the store**: one `TaskChange` per accepted
+  `add`/`update`/`remove`/`claim`/`release` goes into a FIFO log capped at
+  `TASK_MAX_CHANGES` (200) and `storeRev` advances by one. A no-op patch and a lease
+  renewal record nothing THEMSELVES — the one event such a call can still append is
+  clearing an expired foreign claim on a record it patches or removes — which is why a
+  heartbeat cannot knock a reader off its revision.
 - Every success answers the SAME bounded envelope, with no action wrapper:
   `{ tasks, counts: { total, completed, pending }, page: { offset, limit, hasMore,
-  nextOffset? } }` (20 items by default, hard maximum 100, and a 64 KiB serialized
-  page budget that stops BEFORE an item which would cross it). `tasks` is the
-  current page — including right after an add, a patch, or a remove — and is a
-  defensive copy, so mutating a result can never mutate the session list. Caps:
-  200 tasks and 4000 characters of text each.
+  nextOffset? | afterId? + nextAfterId? }, storeRev }` (20 items by default, hard
+  maximum 100, and a 64 KiB serialized page budget that stops BEFORE an item which
+  would cross it). `tasks` is the current page — including right after an add, a
+  patch, a removal or an ownership action — and is a defensive copy, so mutating a
+  result can never mutate the session list. `counts` always describes the WHOLE
+  store, never the page. Caps: 200 tasks and 4000 characters of text each.
+- **Two cursors, deliberately different.** `offset` is an index; `afterId` is a
+  keyset cursor over the numeric ids ("everything after id 7"), which cannot skip or
+  repeat a record when another agent deletes one mid-walk. Passing an EXPLICIT
+  `offset` alongside `afterId` is a rejection, and a keyset page reports `afterId`
+  plus `nextAfterId` while `hasMore` — never `nextOffset`.
+- **The change feed** is the cheap alternative to re-reading: `since: <storeRev>`
+  adds `changes` (the events after that revision, oldest first, at most
+  `TASK_MAX_CHANGES_IN_RESULT` = 50 entries, added to the result only when the byte
+  budget allows), `changesHasMore` (the feed was cut, by count or by bytes) and
+  `changesTruncated` (the retained window no longer covers `since + 1`, so the reader
+  never saw part of the gap). A `since` ahead of `storeRev` is an error, and those
+  three keys are absent from every other result.
 - Validation names the offending field with a quoted, balanced path
   (`task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`);
   the harness turns the throw into a recoverable tool result.
+- **The model-facing contract lives in `src/tools/runtime/task.tool.ts`**
+  (`TASK_METADATA`: description + JSON Schema + `registration`), and
+  `src/core/metadata.ts` is only the generated-manifest projection the factory
+  consumes. The two must stay in step, and two boundaries are deliberate: the schema's
+  `pattern: '^[0-9]+$'` on `afterId` is DECLARATIVE — the shared validator
+  (`src/core/schema-validation.ts`) implements type/minimum/maximum/
+  `additionalProperties` but not regex, so a non-decimal cursor reaches the store and
+  `readAfterId` is what rejects it — and the `leaseMs` clamp (1 minute..24 hours) only
+  ever fires on a call that bypasses the schema (a bare `tool().execute(...)`), because
+  a model call and a `harness.executeTool` call are both schema-gated and an
+  out-of-range lease is rejected there as `$.leaseMs must be >= 60000.`
 - `src/harness.ts` registers the factory's tool under the exact name `task`, marks
   it core (`alwaysDeclared`, so it is declared to every agent with no discovery),
-  adds it to `RESERVED_TOOL_NAMES`, and calls the returned `reset()` from
-  `harness.reset()`. Because `src/server/sessions.ts` creates one harness per
-  session, tasks are isolated per session and shared by the primary and its
-  subagents within one harness.
-- Snapshot persistence keeps the store's wire key: `records.todos: { items, nextId }`
-  (snapshot v1) with `items` in the `TaskItem` shape (`id`, `text`, `completed`).
-  `readTaskStoreState` validates it and reports duplicate or non-positive integer ids
-  with the persisted field name (`todo state contains the duplicate id "1".`).
-- Beyond the tool result and the snapshot, `getTaskStoreState()` returns a bounded
-  defensive copy for hosts. No UI panel and no dedicated HTTP endpoint.
+  adds it to `RESERVED_TOOL_NAMES`, calls the returned `reset()` from
+  `harness.reset()`, and passes the calling agent + conversation into the tool
+  context on every door (model call, `executeTool`, slash command). Because
+  `src/server/sessions.ts` creates one harness per session, tasks are isolated per
+  session and shared by the primary and its subagents within one harness.
+- Snapshot persistence keeps the store's wire key: `records.todos` (snapshot v1,
+  still version 1) is now `{ items, nextId, storeRev?, changes? }`, where `items`
+  entries are full `TaskItem` records including `rev`, the attribution fields and the
+  claim triple. `readTaskStoreState` validates that block and returns a deep copy; it
+  is the SAME reader `src/core/snapshot.ts` runs the persisted value through before a
+  session is accepted, so a corrupt file cannot half-restore a live store. Duplicate
+  or non-positive integer ids still report with the persisted field name
+  (`todo state contains the duplicate id "1".`).
+- **Old snapshots load, new snapshots do not go backwards.** `storeRev` and
+  `changes` are optional and default to `0` / `[]`, and a record without `rev`
+  defaults to `1` — the revision it was created with — so a pre-T1 file restores
+  unchanged. The reverse is refused: the validator rejects unknown persisted keys
+  (`<label> has an unknown field "<key>".`), so a snapshot written by THIS build —
+  whose records carry `rev` and whose block carries `storeRev`/`changes` — cannot be
+  restored by an older build. It also refuses a `leaseUntil` with no `owner`, a
+  change `rev` outside `1..storeRev`, a change log that is not strictly ascending, a
+  `storeRev` behind its newest event, and an over-cap `items` (200) or `changes` (200)
+  list.
+- **Thread lifecycle clears claims.** `releaseThread(threadId)` drops every claim
+  tagged with that conversation id (content revisions untouched, one `release` event
+  per record carrying only the thread id) and returns how many it freed; the harness
+  calls it when a thread stops (`stopThread` and every path through it), when one is
+  purged/deleted, when an agent's default conversation is dropped from the roster, and
+  on `restore` for any claim whose `ownerThreadId` is absent from the restored session
+  — a claim from a thread that no longer exists could never be renewed or released.
+- Beyond the tool result there is no separate host getter: the store crosses to a
+  host only through `harness.snapshot()`'s `records.todos`, and
+  `readTaskStoreState()` is the exported pure reader that path and `restore()` share.
+  No UI panel and no dedicated HTTP endpoint.
+
+**Concurrency and ownership (T1).** One store is shared by every agent on every
+thread, and a call is not a transaction: a read is a snapshot, and somebody else can
+write the same record before your next call lands. The contract makes that race
+explicit instead of letting the last write win:
+
+- A caller the runtime **knows** (any model call, `executeTool`, a command, a lane
+  worker — anything with `context.agent`) must send `expects: [{ id, rev }]` for
+  every id it patches or removes; that is the GUARDED WRITE rule. A bare `tool()` /
+  driver call has no identity, may write blind (the pre-T1 behaviour hosts and tests
+  rely on), and cannot claim, release or take over at all.
+- A token that does not match the stored `rev` rejects the WHOLE call and names what
+  moved: `task "1" changed since revision 1 (now 2, last edited by "coder"); re-read
+  and retry; changed fields: completed.` A token naming a record the store no longer
+  has always answers `task "1" was removed since revision 1; re-read the list.`:
+  `readPatch` compares the tokens (step 3) BEFORE it runs the existence lookups
+  (step 4), so a `tasks` patch, a `remove`, an ownership verb or a token alone all
+  name the removal the caller actually hit. The generic
+  `task has no task with id "1".` is only what a call that sent NO token for that id
+  hears, and a token for a live id the call does not touch is still rejected as a
+  token for nothing.
+- `rev` is content-only and `storeRev` counts every event, which is exactly why a
+  claim, a release, a takeover or a lease renewal can never break another agent's
+  compare-and-swap.
+- `claim` holds a record for the exact holder pair `(owner, ownerThreadId)` with
+  `leaseUntil = now + leaseMs`; `TASK_DEFAULT_LEASE_MS` is 15 minutes, and a lease
+  outside 1 minute..24 hours is REJECTED on a schema-gated call (model or
+  `executeTool`) and CLAMPED into that range on a call that bypasses the schema.
+  While a claim is live, a non-holder's
+  content write, claim, or release is refused (`task "1" is claimed by "coder" until
+  <ISO>; release it or take it over first.`); a holder re-claiming its own record only
+  renews the lease; releasing an unowned record is a no-op success; a claim stops
+  blocking AT or after `leaseUntil` — `isExpired` is `leaseUntil <= now`, so the expiry
+  instant itself frees it — and the next writer clears it (logged as a `release`)
+  before applying its own change. `owner` with no `leaseUntil` is an indefinite claim
+  that never auto-expires, so only a restored or hand-edited store holds one forever.
+- `takeover` is the DELIBERATE override: it moves the holder to the caller even under
+  a live lease and logs a `claim`. `mergeDisjoint: true` is the one escape from a
+  stale content patch: the patch applies only when the log proves every concurrent
+  update since the caller's read covers `expected+1 … current` with no gap or
+  duplicate and touched none of the fields the patch sets. A logged `remove` of that
+  id, an overlapping field, or an uncovered tail all refuse; a stale `remove` is never
+  merged.
+- Because a claim is a lock, the harness treats a conversation ending as a lock
+  release (the `releaseThread` wiring above), so a crashed or deleted agent cannot
+  hold a record for the remainder of a 24-hour lease.
+- Worker mode changes nothing: a `task` call made on a lane is ROUTED, and the
+  authority rebuilds the tool context from the crossing `LaneCallIdentity`
+  (`src/server/workers/lane-authority.ts`), so a lane's write is attributed to — and
+  guarded by — the same `(agent, threadId)` pair it would have inline.
 
 **Not OpenCode's `todowrite`.** OpenCode's current dev branch (`fd8268e`,
 2026-10-27) has an experimental `todo` plugin tool gated by `experimental.todo`:
@@ -780,11 +902,31 @@ Sources:
 `task` is a partial patch with stable ids, not parity: it never rewrites the whole
 list and it does not carry `in_progress`/`cancelled` states.
 
-**Operator surface.** `/task [list|add|complete|reopen|remove]` is the built-in slash
-command over this SAME tool: it calls `harness.executeTool('task', …)`, so a terminal,
-an HTTP submit, or the composer reads and changes this session's list without spending
-a model turn, and it inherits every bound above. See
-[Slash commands](#slash-commands).
+**Operator surface.** `/task [list|add|complete|reopen|remove|claim|release|takeover]`
+is the built-in slash command over this SAME tool: it calls
+`harness.executeTool('task', …)`, so a terminal, an HTTP submit, or the composer reads
+and changes this session's list without spending a model turn, and it inherits every
+bound above. `complete`/`reopen`/`remove` are guarded writes, so the command first walks
+the store (`offset` paging at `limit: 100`, following `page.nextOffset` until it is
+exhausted) and sends the REAL `expects: [{ id, rev }]` tokens it read — never an invented
+revision — which turns a concurrent edit into the tool's stale error instead of a lost
+update; an id the read did not see gets no token, so the tool's own unknown-id rejection
+is what an operator reads. `claim`/`release`/`takeover` send no token (an ownership
+action never moves `rev`) and run **unthreaded**, so their holder pair is `(entry agent,
+no thread)` — `/task release` can therefore lift only the operator's own or an expired
+claim, and `/task takeover` is the documented override for a live one. The listing marks
+a reserved record — `#1 [ ] testing (claimed by writer until <ISO>)`, with `@<threadId>`
+when the holder is a conversation — because the fix (`/task takeover 1`, or waiting out
+the lease) is otherwise invisible. See [Slash commands](#slash-commands).
+
+Tests: `src/core/task.test.ts` (the store — patch semantics, bounds, keyset and offset
+paging, the change feed, `rev`/attribution, guarded writes and CAS, claims/leases/
+takeover/`releaseThread`, disjoint merges, snapshot/restore and the corrupted-file
+rejections), `src/harness.task.test.ts` (declaration and one shared list in a live
+harness), `src/harness.commands.test.ts` (every `/task` verb, including the
+read-before-write `expects` and the claimed-record rendering), and
+`src/server/workers/lane-authority.test.ts` (a routed `task` call against the canonical
+harness).
 
 ---
 
@@ -817,7 +959,7 @@ maximum 100 per call, and a 64 KiB serialized page budget, so a model reads a lo
 cast one bounded page at a time (`nextOffset` is omitted when `hasMore` is false).
 Caps: 200 records per tool, 200-character names/titles, 4000-character descriptions,
 summaries, chapter bodies and notes, and at most 32 profile traits of 200 characters.
-The paged result types are owned by `core/{todo,profile,chapter,location}.ts` and
+The paged result types are owned by `core/{task,profile,chapter,location}.ts` and
 re-exported from `types/index.ts`, so the public surface cannot drift from what the
 tools return.
 
@@ -1823,8 +1965,9 @@ await writer('tell me about new year');
   name that collides with one — or repeats inside the list — fails construction;
   plugins and `registerCommand` run later and override by name.
   See [Slash commands](#slash-commands).
-- `reset()` clears the entry agent's conversation, the discovered-tool set, the
-  session todo list, the three record stores, and the agent-result archive, so a
+- `reset()` clears the entry agent's conversation, the discovered-tool set, the session
+  task list (records, the id counter, `storeRev` and the change log — `reset()` in
+  `src/core/task.ts`), the three record stores, and the agent-result archive, so a
   reset run starts from the core set and empty session state. The terminal result
   archive is otherwise durable through snapshot/restore (see
   [Agent results](#agent-results-r3)).
@@ -1957,13 +2100,19 @@ implementation per name — which is the invariant this whole layer exists to pr
   only when the command set them, so a host can spread the result safely.
 - **Built-ins (`src/core/command-builtins.ts`, exported as
   `createBuiltinCommands()`).** `/help [command]`, `/tools [filter]`,
-  `/task [list|add|complete|reopen|remove]`, `/websearch <query>` (the RAW tail is the
-  query, so an exact phrase survives), `/webfetch <url>` (the FIRST token is the URL,
-  so a trailing flag cannot corrupt it). The last three are **pass-throughs to the
-  live tools** through `context.harness.executeTool('task' | 'search' | 'fetch', …)`,
-  so they mutate THIS harness's stores and inherit the tools' bounds (200 tasks,
-  4000 characters, 20/page by default; the fetch content-type gate) instead of
-  duplicating them. `search`/`fetch` are conditional, so an unconfigured session
+  `/task [list|add|complete|reopen|remove|claim|release|takeover]`, `/websearch <query>`
+  (the RAW tail is the query, so an exact phrase survives), `/webfetch <url>` (the FIRST
+  token is the URL, so a trailing flag cannot corrupt it). The last three are
+  **pass-throughs to the live tools** through
+  `context.harness.executeTool('task' | 'search' | 'fetch', …)`, so they mutate THIS
+  harness's stores and inherit the tools' bounds (200 tasks, 4000 characters, 20/page by
+  default; the fetch content-type gate) instead of duplicating them. Because
+  `executeTool` always supplies an agent identity, `/task complete|reopen|remove` are
+  GUARDED writes: the command reads the whole store first (`offset` paging at limit 100,
+  bounded to 16 pages) and sends the `expects` revisions it read, so a concurrent edit
+  surfaces as the tool's stale error; `claim|release|takeover` send no token, and the
+  command's own holder pair is `(entry agent, no thread)` (see [Session
+  tasks](#session-tasks)). `search`/`fetch` are conditional, so an unconfigured session
   answers guidance naming the configuration field and the key names rather than
   `Tool "search" is not registered`. Nothing in the built-ins throws: a usage
   mistake, an unregistered tool, or a rejected tool call returns
