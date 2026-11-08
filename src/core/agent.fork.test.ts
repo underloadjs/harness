@@ -197,6 +197,111 @@ describe('Agent.fork', () => {
         ]);
     });
 
+    it('carries the context-inclusion flag through the fork clone and a branch reset', () => {
+        // Stage 1b: `included` is transcript state, so a branch that forgot it
+        // would put a turn the user disabled straight back in front of the model on
+        // EVERY branch request. The flag rides the materialized transcript AND the
+        // detached reset baseline, and only `false` is ever re-emitted.
+        const source = agent({
+            name: 'writer',
+            model: 'model-a',
+            instruction: ['You are A.'],
+            stream: fakeStream(),
+            messages: [
+                { role: 'user', content: 'kept' },
+                { role: 'user', content: 'disabled', included: false },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'origin-a', name: 'read', arguments: '{}' }]
+                },
+                {
+                    role: 'tool',
+                    content: 'ok',
+                    toolCallId: 'origin-a',
+                    name: 'read',
+                    included: false
+                },
+                { role: 'assistant', content: 'done', included: true }
+            ]
+        });
+        const before = JSON.parse(JSON.stringify(source.messages)) as HarnessMessage[];
+
+        const branch = source.fork();
+        const branchId = agentBranchOf(branch)!.branchId;
+        const forked: HarnessMessage[] = [
+            { role: 'system', content: 'You are A.' },
+            { role: 'user', content: 'kept' },
+            { role: 'user', content: 'disabled', included: false },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: `call_${branchId}_1`, name: 'read', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'ok',
+                toolCallId: `call_${branchId}_1`,
+                name: 'read',
+                included: false
+            },
+            // The source entry said `included: true`; the copy drops it, because
+            // absent (never `true`) is the canonical way to say "included".
+            { role: 'assistant', content: 'done' }
+        ];
+
+        expect(branch.messages).toEqual(forked);
+        expect(JSON.stringify(branch.messages)).not.toContain('"included":true');
+        // The source transcript is never mutated by a fork.
+        expect(source.messages).toEqual(before);
+
+        // A branch re-seeds from a CLONED baseline on every reset, so the flags must
+        // be in the baseline itself, not only in the first materialized copy.
+        branch.user('appended after the fork');
+        expect(branch.messages[branch.messages.length - 1]).toEqual({
+            role: 'user',
+            content: 'appended after the fork'
+        });
+
+        branch.reset();
+        expect(branch.messages).toEqual(forked);
+    });
+
+    it('pairs a pending call of a disabled block with a disabled placeholder', () => {
+        // The branch materializer mints a NEW tool message for an unanswered call.
+        // It belongs to that call's unit, so it is disabled with it — otherwise the
+        // branch transcript would hold an enabled answer to a withheld request.
+        const source: HarnessMessage[] = [
+            { role: 'user', content: 'prompt' },
+            {
+                role: 'assistant',
+                content: '',
+                included: false,
+                toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
+            }
+        ];
+
+        const branch = agent({ model: 'm', stream: fakeStream(), messages: source }).fork();
+        const branchId = agentBranchOf(branch)!.branchId;
+
+        expect(branch.messages).toEqual([
+            { role: 'user', content: 'prompt' },
+            {
+                role: 'assistant',
+                content: '',
+                included: false,
+                toolCalls: [{ id: `call_${branchId}_1`, name: 'read', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                toolCallId: `call_${branchId}_1`,
+                name: 'read',
+                included: false
+            }
+        ]);
+    });
+
     it('copies attachments deeply', () => {
         const sourceAttachment = image();
         const source = agent({ model: 'm', stream: fakeStream() });

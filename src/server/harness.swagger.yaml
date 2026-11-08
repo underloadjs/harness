@@ -7996,6 +7996,12 @@ components:
               enum: [system]
             content:
               type: string
+            included:
+              type: boolean
+              description: >-
+                Context-inclusion flag. Absent or `true` sends the entry to the model; `false` withholds it from every
+                later request while the transcript still keeps it, so disabling a turn is reversible rather than a
+                deletion. Only `false` is ever stored, so an unflagged transcript carries no key at all.
         - type: object
           required: [role, content]
           additionalProperties: false
@@ -8010,6 +8016,11 @@ components:
               maxItems: 4
               items:
                 $ref: '#/components/schemas/HarnessAttachment'
+            included:
+              type: boolean
+              description: >-
+                Context-inclusion flag (see the `system` variant): `false` withholds this entry from the model request
+                without removing it from the transcript, and is the only value ever stored.
         - type: object
           required: [role, content]
           additionalProperties: false
@@ -8027,6 +8038,13 @@ components:
             reasoning:
               type: string
               description: Kept out of the provider payload and retained so a turn can be replayed or edited.
+            included:
+              type: boolean
+              description: >-
+                Context-inclusion flag (see the `system` variant). For a turn that requested tools the flag is
+                UNIT-wide: `false` on this entry or on any of its results withholds the assistant message, every
+                result of that call block, and its request-only pending placeholders, because a partial
+                `tool_calls` block is not a valid provider request.
         - type: object
           required: [role, content, toolCallId, name]
           additionalProperties: false
@@ -8053,6 +8071,12 @@ components:
                 block, which keeps strict tool-call pairing intact.
               items:
                 $ref: '#/components/schemas/HarnessAttachment'
+            included:
+              type: boolean
+              description: >-
+                Context-inclusion flag, a UNIT member rather than a standalone choice: `false` on one result withholds
+                the assistant message that requested it, that result, and every other result of the same call block,
+                so the provider never sees a `tool_calls` block with a missing or orphan answer.
     HarnessEvent:
       type: object
       description: >-

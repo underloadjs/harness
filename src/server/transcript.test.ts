@@ -549,6 +549,91 @@ describe('thread transcript read/write (C4)', () => {
         runtime.store.dispose();
     });
 
+    it('round-trips the context-inclusion flag through the transcript routes and keeps it away from the model', async () => {
+        const { root, runtime, sessionId, requests } = await seeded('put-included');
+        const call = callOf(runtime);
+
+        // A disabled standalone turn AND a disabled tool unit (assistant plus its
+        // result), written by the editor in one save. Keys are in the order the
+        // canonical reader emits them, because the document route's pretty text is
+        // part of what is asserted.
+        const submitted: HarnessMessage[] = [
+            { role: 'system', content: 'sys' },
+            { role: 'user', content: 'dropped from context', included: false },
+            {
+                role: 'assistant',
+                content: 'asked',
+                toolCalls: [{ id: 'c1', name: 'read', arguments: '{}' }],
+                included: false
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'read', included: false },
+            { role: 'user', content: 'hello' }
+        ];
+
+        const put = await putTranscript(call, sessionId, 'thread-1', submitted);
+
+        expect(put).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            accepted_as: 'transcript',
+            message_count: 5,
+            revision: put.revision,
+            links: transcriptLinks(sessionId)
+        });
+
+        // The flag is stored, not silently normalized away: a disabled transcript
+        // stays restorable, and every read serves it back.
+        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+            submitted
+        );
+        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+            session_id: sessionId,
+            thread_id: 'thread-1',
+            agent: 'one',
+            transcript_state: 'ok',
+            message_count: 5,
+            chars: charsOf(submitted),
+            bytes: bytesOf(submitted),
+            revision: put.revision,
+            role_counts: roleCounts(submitted)
+        });
+
+        const document = await readTranscriptDocument(call, sessionId, 'thread-1');
+
+        expect(JSON.parse(document.document)).toEqual(submitted);
+        // The editor literally shows the flag, which is how an operator re-enables
+        // a turn by hand.
+        expect(document.document).toContain('"included": false');
+
+        // Durable in exactly that form.
+        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(submitted);
+
+        // The model path runs from the flagged transcript: the disabled user turn
+        // and the disabled tool unit are absent from the provider request, and no
+        // `included` key ever reaches it. The scripted preset answers with the last
+        // USER message it actually received, so the withheld 'dropped from context'
+        // turn also cannot leak into the answer.
+        const continuation = await runtime.store.enqueue(sessionId, 'again', undefined, undefined, 'thread-1');
+        await continuation.settled;
+        await runtime.store.waitForIdle(sessionId);
+
+        expect(requests[requests.length - 1]).toEqual([
+            { role: 'system', content: 'sys' },
+            { role: 'user', content: 'hello' },
+            { role: 'user', content: 'again' }
+        ]);
+        expect(JSON.stringify(requests[requests.length - 1])).not.toContain('included');
+
+        // Canonical history still holds every disabled entry, flagged.
+        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual([
+            ...submitted,
+            { role: 'user', content: 'again' },
+            { role: 'assistant', content: 'answer:again' }
+        ]);
+
+        runtime.store.dispose();
+    });
+
     it('accepts a structurally invalid transcript with 200 and reports it as unreadable', async () => {
         const { root, runtime, sessionId } = await seeded('put-invalid');
         const call = callOf(runtime);

@@ -79,6 +79,73 @@ describe('agent user attachments', () => {
         ).toThrow('attachments[0].size is 99, but its data decodes to 12 bytes.');
     });
 
+    it('normalizes the context-inclusion flag on every seeded copy, attachments included', () => {
+        // Stage 1b invariant: canonical transcript state carries `included` ONLY
+        // when it is exactly `false`. Every seed branch has to uphold it — the
+        // user-media branch, the tool-download-media branch, and the plain spread —
+        // or a host-written `included: true` would linger in canonical state until
+        // some later snapshot/fork copy happened to normalize it.
+        const seed: HarnessMessage[] = [
+            { role: 'user', content: 'upload on [Image 1]', attachments: [image()], included: true },
+            { role: 'user', content: 'upload off [Image 1]', attachments: [image()], included: false },
+            {
+                role: 'tool',
+                content: 'download on',
+                toolCallId: 'c1',
+                name: 'download',
+                attachments: [image()],
+                included: true
+            },
+            {
+                role: 'tool',
+                content: 'download off',
+                toolCallId: 'c2',
+                name: 'download',
+                attachments: [image()],
+                included: false
+            },
+            { role: 'assistant', content: 'plain on', included: true },
+            { role: 'assistant', content: 'plain off', included: false }
+        ];
+        const before = JSON.parse(JSON.stringify(seed)) as HarnessMessage[];
+
+        const brain = agent({ model: 'm', stream: fakeStream([]), messages: seed });
+
+        // `toStrictEqual` is the strict form: a leftover `included: undefined` key
+        // fails it, exactly as a written `included: true` does.
+        expect(brain.messages).toStrictEqual([
+            { role: 'user', content: 'upload on [Image 1]', attachments: [expectedAttachment] },
+            {
+                role: 'user',
+                content: 'upload off [Image 1]',
+                attachments: [expectedAttachment],
+                included: false
+            },
+            {
+                role: 'tool',
+                content: 'download on',
+                toolCallId: 'c1',
+                name: 'download',
+                attachments: [expectedAttachment]
+            },
+            {
+                role: 'tool',
+                content: 'download off',
+                toolCallId: 'c2',
+                name: 'download',
+                attachments: [expectedAttachment],
+                included: false
+            },
+            { role: 'assistant', content: 'plain on' },
+            { role: 'assistant', content: 'plain off', included: false }
+        ]);
+        expect(JSON.stringify(brain.messages)).not.toContain('"included":true');
+
+        // Seeding copies: the caller's own array and message objects are untouched,
+        // so a host may keep or reuse what it passed in.
+        expect(seed).toEqual(before);
+    });
+
     it('keeps the committed transcript when reset revalidation fails', () => {
         // The caller owns `configuration.messages`; mutating it after
         // construction is the documented way a later reset can see a bad seed.

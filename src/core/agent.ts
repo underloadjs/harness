@@ -152,6 +152,36 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
     return openAICompatible(configuration.provider);
 };
 
+// The ONE normalization point for the context-inclusion flag (`HarnessMessage.included`).
+//
+// The invariant this enforces everywhere a message is COPIED into a transcript or
+// handed to a consumer: `included` is present ONLY when it is exactly `false`.
+// "Included" is spelled by the key being ABSENT, so a host-seeded or legacy
+// `included: true` is dropped here rather than riding through canonical state into
+// every later projection, request object, and provider payload a custom transport
+// builds. `false` is preserved verbatim, and every other key keeps the order the
+// caller used (the rest pattern strips `included`, and the override re-adds it in
+// place when it was already there).
+//
+// The input object is never mutated — a new object is always returned, so a caller
+// may keep or reuse its own array. The same rule is applied to untyped records by
+// core/snapshot.ts (`applyIncluded`) and core/branch.ts (`copyIncluded`); this is
+// its typed-message form, used by `seed()` (caller-supplied history entering
+// canonical state) and by the harness's model-facing projection.
+export const withIncluded = (message: HarnessMessage): HarnessMessage => {
+    if (message.included !== false) {
+        const { included: _omitted, ...rest } = message;
+        return rest as HarnessMessage;
+    }
+
+    return { ...message, included: false };
+};
+
+// A branch that forgot the flag would put a turn the user disabled straight back in
+// front of the model on every branch request, so EVERY case below hands its copy to
+// `withIncluded`: the source flag is re-emitted only when it is exactly `false`, and
+// an `included: true` (or `included: undefined`) key never reaches a branch record.
+
 // Deep-copy one baseline message for a fork's reset seed. A fork must be able to
 // reset repeatedly, so the baseline is cloned on EVERY seed rather than handed
 // out as a shared array. Attachments are re-validated by the shared gate (which
@@ -165,40 +195,55 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
 const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
     switch (message.role) {
         case 'user':
-            return message.attachments !== undefined
-                ? {
-                      role: 'user',
-                      content: message.content,
-                      attachments: validateAttachments(message.attachments)
-                  }
-                : { role: 'user', content: message.content };
+            return withIncluded(
+                message.attachments !== undefined
+                    ? {
+                          role: 'user',
+                          content: message.content,
+                          attachments: validateAttachments(message.attachments),
+                          included: message.included
+                      }
+                    : { role: 'user', content: message.content, included: message.included }
+            );
 
         case 'tool':
-            return message.attachments !== undefined
-                ? {
-                      role: 'tool',
-                      content: message.content,
-                      toolCallId: message.toolCallId,
-                      name: message.name,
-                      // Re-validated with the profile the bytes were produced
-                      // under, so a corrupted tool message cannot survive a
-                      // fork/reset boundary quietly.
-                      attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
-                  }
-                : { role: 'tool', content: message.content, toolCallId: message.toolCallId, name: message.name };
+            return withIncluded(
+                message.attachments !== undefined
+                    ? {
+                          role: 'tool',
+                          content: message.content,
+                          toolCallId: message.toolCallId,
+                          name: message.name,
+                          // Re-validated with the profile the bytes were produced
+                          // under, so a corrupted tool message cannot survive a
+                          // fork/reset boundary quietly.
+                          attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS),
+                          included: message.included
+                      }
+                    : {
+                          role: 'tool',
+                          content: message.content,
+                          toolCallId: message.toolCallId,
+                          name: message.name,
+                          included: message.included
+                      }
+            );
 
         case 'assistant':
-            return {
+            return withIncluded({
                 role: 'assistant',
                 content: message.content,
                 ...(message.toolCalls !== undefined
                     ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) }
                     : {}),
-                ...(message.reasoning !== undefined ? { reasoning: message.reasoning } : {})
-            };
+                ...(message.reasoning !== undefined ? { reasoning: message.reasoning } : {}),
+                included: message.included
+            });
 
         default:
-            return { ...message };
+            // A `system` entry: `withIncluded` already returns a detached copy, so
+            // no extra spread is needed here.
+            return withIncluded(message);
     }
 };
 
@@ -383,15 +428,22 @@ const createAgent = (
         }
 
         for (const message of configuration.messages ?? []) {
+            // Every seed entry passes through `withIncluded`, which is where a
+            // host-supplied `included: true` (or `included: undefined`) stops being
+            // a canonical key: absent is the only spelling of "included", so no
+            // later copy, projection or request object has to defend against it.
+            //
             // Seeded user messages may carry attachments too. Validate and copy
             // them now, so a bad seed fails construction instead of reaching a
             // transport (and so the configuration's array is never aliased by
             // live history). Text-only seeds keep their exact old shape.
             if (message.role === 'user' && message.attachments !== undefined) {
-                next.push({
-                    ...message,
-                    attachments: validateAttachments(message.attachments)
-                });
+                next.push(
+                    withIncluded({
+                        ...message,
+                        attachments: validateAttachments(message.attachments)
+                    })
+                );
                 continue;
             }
 
@@ -400,14 +452,16 @@ const createAgent = (
             // before the live array is replaced, so a bad seed fails construction
             // and history never aliases the caller's objects.
             if (message.role === 'tool' && message.attachments !== undefined) {
-                next.push({
-                    ...message,
-                    attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
-                });
+                next.push(
+                    withIncluded({
+                        ...message,
+                        attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
+                    })
+                );
                 continue;
             }
 
-            next.push({ ...message });
+            next.push(withIncluded(message));
         }
 
         // Commit point: everything above succeeded.

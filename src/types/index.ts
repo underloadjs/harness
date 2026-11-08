@@ -113,8 +113,32 @@ export type HarnessToolCall = {
 
 // One transcript entry, in the shape the harness manipulates internally. The
 // transport maps these onto the provider's wire format (see transport.ts).
+//
+// CONTEXT INCLUSION — the shared `included?: boolean` every variant carries.
+// ---------------------------------------------------------------------------
+// It is a PERSISTED, default-true flag that decides whether an entry reaches the
+// MODEL, never whether it stays in the transcript. Context control therefore
+// never deletes a turn: an entry can be disabled, edited or re-enabled, and the
+// change is reversible because canonical history (`agent.messages`) is untouched
+// — src/harness.ts `projectTranscript` filters a shallow copy, request-only.
+//
+// Rules that keep every pre-existing transcript, snapshot, branch record and
+// provider request byte-identical:
+//   - ABSENT means included; only the literal `false` excludes. Re-enabling an
+//     entry DELETES the key, so `included: true` is never written anywhere.
+//   - the transport field-selects per role (src/transport/openai.ts `wireMessage`),
+//     so the flag can never reach a provider payload;
+//   - snapshot restore (src/core/snapshot.ts `readHarnessMessages`) and branch
+//     materialization (src/core/branch.ts `copyMessage`) whitelist keys per role,
+//     so both list `included` explicitly or a flagged transcript fails to load.
+//
+// The exclusion UNIT is the whole tool-call block: an assistant message with
+// non-empty `toolCalls` plus every `tool` message matching one of those call ids.
+// If ANY member says `false` the ENTIRE unit is withheld — dropping a single
+// result would leave a `tool_calls[]` entry with no answer (or an orphan result),
+// which the strict pairing contract of an OpenAI-compatible transport rejects.
 export type HarnessMessage =
-    | { role: 'system'; content: string }
+    | { role: 'system'; content: string; included?: boolean }
     | {
           role: 'user';
           content: string;
@@ -126,6 +150,9 @@ export type HarnessMessage =
           // harness.ts, core/snapshot.ts) and mapped to provider parts by the
           // transport (transport/openai.ts).
           attachments?: HarnessAttachment[];
+          // Withholds this entry from the model request (see the block comment on
+          // the union). Absent means included; `false` is the only excluding value.
+          included?: boolean;
       }
     | {
           role: 'assistant';
@@ -134,6 +161,10 @@ export type HarnessMessage =
           toolCalls?: HarnessToolCall[];
           // Kept out of the wire payload; retained so a UI can replay a turn.
           reasoning?: string;
+          // Withholds this entry from the model request (see the block comment on
+          // the union). For a tool-call turn the flag covers the WHOLE unit: this
+          // message, every matching result, and its pending placeholders.
+          included?: boolean;
       }
     | {
           role: 'tool';
@@ -158,6 +189,11 @@ export type HarnessMessage =
           // DOWNLOAD profile at delivery (core/tool-media.ts), on restore
           // (core/snapshot.ts) and on fork (core/branch.ts).
           attachments?: HarnessAttachment[];
+          // Withholds this RESULT from the model request. It is a UNIT member, not
+          // a standalone choice: `false` on any result drops the assistant message
+          // that asked for it, that result, and every other result of the same
+          // call block (see the block comment on the union).
+          included?: boolean;
       };
 
 // A finished assistant turn. This is the value the harness resolves to and the
@@ -3371,17 +3407,110 @@ export type HarnessRunLifecycleContext = {
     input: string;
 };
 
+// One entry of the CANONICAL transcript, as the `turn.before` context exposes it for
+// context-inclusion control (Stage 1b of the context-control design).
+//
+// Unlike `messages`, this is the committed history ITSELF: an entry that is disabled
+// is still listed here, because context control never DELETES a turn — it hides it
+// from the model, reversibly. A plugin that only saw `messages` could not re-enable
+// anything, since the entries it would need are exactly the ones the projection left
+// out.
+export interface HarnessContextEntry {
+    // Index in the agent's canonical transcript at the moment THIS entry object was
+    // built (the first `entries` access of one handler).
+    // The index is a snapshot, so a handler that calls `replaceHistory()` invalidates
+    // the indices (and the message identities) of every entry captured BEFORE that
+    // call: `setIncluded` then refuses a stale entry loudly instead of writing to the
+    // wrong turn. A plain numeric index is interpreted against the CURRENT transcript.
+    readonly index: number;
+    // The canonical message itself — read-only by contract. Mutating it directly
+    // would bypass the key normalization and the persistence notification, so
+    // inclusion changes go through `setIncluded`.
+    readonly message: HarnessMessage;
+    // EFFECTIVE unit inclusion: `false` when this entry, or ANY other member of its
+    // unit, is disabled. A unit is a standalone message, or a whole tool-call block
+    // (an assistant message with non-empty `toolCalls` plus every `tool` message in
+    // the transcript answering one of those calls, contiguous or spliced in later) —
+    // exactly the unit `projectTranscript` filters, so a hook never has to reason
+    // about provider pairing itself.
+    //
+    // This is a LIVE view of canonical state, not a snapshot: `setIncluded` followed
+    // by re-reading `entry.included` answers what the transcript says NOW, and a
+    // later handler's `entries` reflect what an earlier hook already switched.
+    readonly included: boolean;
+}
+
 // Everything `turn.before` hands a plugin: the exact request that is about to go out,
-// a token estimate for the context limit, and the three controls that make a hook
-// able to ACT rather than only observe.
+// a token estimate for the context limit, and the controls that make a hook able to
+// ACT rather than only observe.
 export type HarnessTurnBeforeContext = {
     threadId: string;
     agent: string;
     // 1-based model-turn counter within this run.
     iteration: number;
     // The PROJECTED transcript (committed history plus a placeholder for every
-    // still-running tool call) — exactly the array the provider is about to receive.
+    // still-running tool call, with every disabled unit already filtered out) — the
+    // array the provider was about to receive WHEN THIS HANDLER WAS ENTERED. It is a
+    // plain value and stays stable for the whole handler, which is the contract
+    // src/harness.plugin.test.ts pins ("the hook sees exactly the projected transcript
+    // … before any rewrite"). It does NOT move when this handler writes: for the list
+    // as it is NOW, read `currentMessages()`.
     messages: readonly HarnessMessage[];
+    // The same projection evaluated AT ACCESS TIME: equal to `messages` until somebody
+    // writes (a `setIncluded` flag change, an explicit `setTranscript`, or
+    // `replaceHistory`, from THIS handler or from an earlier one in the round) and
+    // afterwards the list the provider will actually receive, unless a later write
+    // changes it again. After the round its value is frozen to what the round decided.
+    //
+    // `messages` answers "what am I being asked about", `currentMessages()` answers
+    // "what will the model see if I stop writing now". They are the SAME array object
+    // while nothing has been written, so an observing handler pays nothing for the
+    // distinction, and at most one re-projection per write is ever paid.
+    currentMessages: () => readonly HarnessMessage[];
+    // The FULL canonical transcript, in canonical order, INCLUDING disabled entries
+    // (see `HarnessContextEntry`). Read this to decide what to drop; act through
+    // `setIncluded`. Built on FIRST ACCESS and cached for that handler (repeat reads
+    // return the same array, and its entries stay usable for `setIncluded`), and built
+    // anew for EVERY handler, so a second hook sees the state the first one left.
+    readonly entries: readonly HarnessContextEntry[];
+    // Switch one transcript entry — or, when it belongs to a tool-call block, the
+    // WHOLE block — off or on for the model. `false` stores `included: false`;
+    // `true` REMOVES the key, because only `false` is ever stored (an unflagged
+    // transcript stays byte-identical, and re-enabling is the exact inverse of
+    // disabling). Targeting any member of a unit addresses every member of it, so a
+    // request never ends up with a half-answered `tool_calls[]` or an orphan result.
+    //
+    // THE SAME REQUEST SEEPS IT: after the hook round, a run whose inclusion state
+    // changed is re-projected before the provider call, unless a handler supplied an
+    // explicit transcript (`setTranscript` or a returned `{ transcript }`), which
+    // always wins. `currentMessages()` reports that re-projection from the moment the
+    // write lands.
+    //
+    // PERSISTENCE — PRECISE SCOPE. The write lands on canonical state and is reported
+    // as an `agent_message` transcript change, exactly like `postThreadMessage` and
+    // `writeThreadTranscript`. That notification is the ONLY durability mechanism, and
+    // it buys: later turns of the same conversation, `snapshot()`/`restore()`, and any
+    // store that persists on that notification (the server's `state.json`). Whether it
+    // survives a SERVER RESTART depends on the execution lane: a lane whose authority
+    // holds the transcript receives only APPENDED SLICES (`transcript:append` with
+    // `fromLength`) from the worker today, so an in-place flag change on an
+    // ALREADY-COMMITTED message does not reach the authority until a full-transcript
+    // sync exists — planned for the server-integration stage, NOT in place now. Do not
+    // treat the flag as restart-durable under `threadExecution: 'worker'` until that
+    // lands. A branch run (a fork or an autoanswer, which owns an ephemeral
+    // transcript) applies the flags to that copy — its own request is still filtered —
+    // but has no conversation to persist them into and reports no change.
+    //
+    // `included` must be a boolean, strictly: `'yes'`, `1`, `0`, `null` and `undefined`
+    // are refused rather than coerced, because coercing them silently inverts the
+    // caller's intent (a truthy string used to RE-ENABLE). The value is checked after
+    // the target and before anything is written, so a rejected call never leaves a
+    // half-applied unit.
+    //
+    // Throws a `HarnessError` for an index outside the transcript (the message names
+    // the live bounds), a non-integer index, a non-boolean `included`, or an entry that
+    // is not this turn's entry (including one made stale by `replaceHistory`).
+    setIncluded: (target: HarnessContextEntry | number, included: unknown) => void;
     // Rough size of `messages` in tokens (core/context-estimate.ts). Good enough for
     // a limit check; deliberately not provider-exact, because compaction decisions
     // must not depend on a tokenizer the harness does not own.

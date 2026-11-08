@@ -16,6 +16,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '@underload/harness';
+// Read verbatim from its own module (the internal-import convention
+// src/harness.snapshot.test.ts uses), so the quoted-instruction wording cannot
+// drift between the helper and the assertion.
+import { quotedBranchSystemInstruction } from './core/branch';
 import type {
     Agent,
     HarnessActionChoice,
@@ -70,6 +74,47 @@ const realToolContents = (request: HarnessStreamRequest): string[] =>
 
 const brain = (stream: HarnessStream): Agent =>
     agent({ model: 'merge/ds4-flash', stream });
+
+// The strict pairing invariant an incorporated branch history must keep (the R3
+// check of src/harness.background.test.ts `wireIssues`, restated here because that
+// oracle is not a package export): every assistant `toolCalls` block is followed
+// immediately by exactly one tool message per call, in call order, and no tool
+// message sits outside such a run.
+const pairIssues = (messages: readonly HarnessMessage[]): string[] => {
+    const issues: string[] = [];
+    const claimed = new Set<number>();
+
+    messages.forEach((message, index) => {
+        if (message.role !== 'assistant') return;
+        const requested = message.toolCalls ?? [];
+        if (requested.length === 0) return;
+
+        const expected = requested.map((entry) => entry.id);
+        const actual: string[] = [];
+        let cursor = index + 1;
+
+        while (cursor < messages.length && messages[cursor].role === 'tool') {
+            actual.push((messages[cursor] as Extract<HarnessMessage, { role: 'tool' }>).toolCallId);
+            claimed.add(cursor);
+            cursor += 1;
+        }
+
+        if (actual.join(',') !== expected.join(',')) {
+            issues.push(
+                `assistant#${index}: expected [${expected.join(',')}] but paired [${actual.join(',')}]`
+            );
+        }
+    });
+
+    messages.forEach((message, index) => {
+        if (message.role !== 'tool' || claimed.has(index)) return;
+        issues.push(
+            `orphan tool#${index}: ${(message as Extract<HarnessMessage, { role: 'tool' }>).toolCallId}`
+        );
+    });
+
+    return issues;
+};
 
 const flush = async (): Promise<void> => {
     for (let pass = 0; pass < 32; pass += 1) {
@@ -435,6 +480,105 @@ describe('actionRequest runtime', () => {
                 .map((message) => message.content)
         ).toEqual(['owner start']);
         expect(lead.messages.some((message) => message.content.includes('Which path'))).toBe(false);
+    });
+
+    it('carries the context-inclusion flag into the autoanswer owner fork and keeps disabled turns off its request', async () => {
+        const writerSeen: HarnessStreamRequest[] = [];
+
+        const helper = brain(
+            routed((request) => {
+                const results = realToolContents(request);
+                if (results.some((content) => content.includes('"answeredBy":"auto"'))) {
+                    return answer('child done');
+                }
+                if (latestUser(request) === 'do work') return call('q1', 'actionRequest', REQUEST_ARGS);
+                return answer('waiting');
+            })
+        );
+        // A DISABLED child instruction. Incorporation demotes it to a quoted USER
+        // wrapper, and the wrapper has to inherit the flag or a turn the user turned
+        // off would ride into the owner's context as a fresh, enabled message.
+        helper.system('HELPER SYS');
+        (helper.messages[helper.messages.length - 1] as HarnessMessage).included = false;
+
+        const lead = agent({
+            model: 'merge/ds4-flash',
+            stream: routed((request) => {
+                if (isDirective(request)) return answer('option:fast');
+
+                const results = realToolContents(request);
+                if (results.some((content) => content.includes('child done'))) {
+                    return answer('owner done');
+                }
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return call('d1', 'delegate', '{"agent":"helper","input":"do work"}');
+                }
+                return answer('waiting');
+            }, writerSeen),
+            // A disabled OWNER turn: the owner fork reads the owner's full history,
+            // so the copy must carry the flag and the projection must withhold it.
+            messages: [
+                { role: 'user', content: 'owner seed' },
+                { role: 'user', content: 'owner seed disabled', included: false }
+            ]
+        });
+
+        const writer = harness({
+            agents: { writer: lead, helper },
+            primary: 'writer',
+            subagents: ['helper'],
+            presets: false,
+            interaction: { actionRequest: async () => ({ kind: 'option', optionId: 'fast' }) }
+        });
+        lead.system('OWNER SYS');
+
+        await writer('owner start');
+        await flush();
+
+        const autoBranch = writer.branches().find((record) => record.kind === 'autoanswer');
+        expect(autoBranch).toBeDefined();
+
+        // (1) The autoanswer branch transcript is the incorporated history, flags
+        //     included: the disabled owner turn kept its flag, and the disabled child
+        //     instruction became a flagged quoted wrapper instead of an enabled one.
+        expect(
+            autoBranch!.messages.filter(
+                (message) =>
+                    message.content === 'owner seed disabled' ||
+                    message.content.startsWith('[Quoted system instruction from branch')
+            )
+        ).toEqual([
+            { role: 'user', content: 'owner seed disabled', included: false },
+            {
+                role: 'user',
+                content: quotedBranchSystemInstruction(autoBranch!.branchId, 'HELPER SYS'),
+                included: false
+            }
+        ]);
+        expect(JSON.stringify(autoBranch!.messages)).not.toContain('"included":true');
+
+        // (2) The owner fork's provider request withholds both disabled entries, and
+        //     the incorporated tool-call blocks stay pair-complete (a branch history
+        //     is exactly the transcript where a missing result would hurt).
+        const autoRequest = writerSeen.find(isDirective);
+        expect(autoRequest).toBeDefined();
+
+        expect(autoRequest!.messages.some((message) => message.content === 'owner seed disabled')).toBe(
+            false
+        );
+        expect(
+            autoRequest!.messages.some((message) =>
+                message.content.startsWith('[Quoted system instruction from branch')
+            )
+        ).toBe(false);
+        expect(pairIssues(autoRequest!.messages)).toEqual([]);
+        expect(JSON.stringify(autoRequest!.messages)).not.toContain('included');
+
+        // (3) Only the owner's own system instruction keeps system privilege, and it
+        //     was never flagged.
+        expect(autoRequest!.messages.filter((message) => message.role === 'system')).toEqual([
+            { role: 'system', content: 'OWNER SYS' }
+        ]);
     });
 
     it('fails an invalid or blank owner answer instead of selecting the recommendation', async () => {

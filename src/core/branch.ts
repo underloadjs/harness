@@ -430,6 +430,26 @@ const incorporatedNamespaces = (
     return { owner: `${stem}-o`, child: `${stem}-c` };
 };
 
+// The persisted context-inclusion flag (types/index.ts, `HarnessMessage`). A
+// fork must carry a disabled turn as disabled, otherwise a branch would quietly
+// put a withheld turn back in front of the model. Like the snapshot reader
+// (core/snapshot.ts `applyIncluded`), only the literal `false` is copied and
+// `true` is normalized away, so an unflagged fork stays byte-identical and a
+// flagged one never grows an `included: true` key the runtime never writes.
+const copyIncluded = (
+    raw: Record<string, unknown>,
+    message: HarnessMessage,
+    field: string
+): void => {
+    if (raw.included === undefined) return;
+
+    if (typeof raw.included !== 'boolean') {
+        throw new HarnessError(`Branch history message ${field}.included must be a boolean.`);
+    }
+
+    if (raw.included === false) message.included = false;
+};
+
 // Deep-copy one message and validate its shape. `system` is copied as a system
 // message here; only INCORPORATION demotes child system messages to user data.
 // Attachments are revalidated by the shared gate, which also returns detached
@@ -444,15 +464,25 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
     const role = raw.role;
 
     if (role === 'system') {
-        assertExactKeys(raw, ['role', 'content'], `Branch history message ${field}`);
+        assertExactKeys(raw, ['role', 'content', 'included'], `Branch history message ${field}`);
         if (typeof raw.content !== 'string') {
             throw new HarnessError(`Branch history message ${field}.content must be a string.`);
         }
-        return { role: 'system', content: raw.content };
+
+        const message: Extract<HarnessMessage, { role: 'system' }> = {
+            role: 'system',
+            content: raw.content
+        };
+        copyIncluded(raw, message, field);
+        return message;
     }
 
     if (role === 'user') {
-        assertExactKeys(raw, ['role', 'content', 'attachments'], `Branch history message ${field}`);
+        assertExactKeys(
+            raw,
+            ['role', 'content', 'attachments', 'included'],
+            `Branch history message ${field}`
+        );
         if (typeof raw.content !== 'string') {
             throw new HarnessError(`Branch history message ${field}.content must be a string.`);
         }
@@ -460,16 +490,19 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
         // validateAttachments(undefined) returns []; it throws on malformed bytes.
         const attachments = validateAttachments(raw.attachments as HarnessAttachment[] | undefined);
 
-        // Omit the key for a text-only message, preserving the historical shape.
-        return attachments.length > 0
+        // Text-only messages and unflagged messages keep the historical shape.
+        const message: Extract<HarnessMessage, { role: 'user' }> = attachments.length > 0
             ? { role: 'user', content: raw.content, attachments }
             : { role: 'user', content: raw.content };
+
+        copyIncluded(raw, message, field);
+        return message;
     }
 
     if (role === 'assistant') {
         assertExactKeys(
             raw,
-            ['role', 'content', 'toolCalls', 'reasoning'],
+            ['role', 'content', 'toolCalls', 'reasoning', 'included'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
@@ -516,6 +549,7 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
             });
         }
 
+        copyIncluded(raw, message, field);
         return message;
     }
 
@@ -523,9 +557,11 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
         // `attachments` is the download-media key (core/tool-media.ts). It must
         // be admitted here or every fork, threadFork and actionRequest
         // autoanswer fails on a transcript that merely contains a download.
+        // `included` is the context-inclusion flag; same rule — a fork of a
+        // transcript that disables a turn must admit the key or refuse the fork.
         assertExactKeys(
             raw,
-            ['role', 'content', 'toolCallId', 'name', 'attachments'],
+            ['role', 'content', 'toolCallId', 'name', 'attachments', 'included'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
@@ -565,6 +601,7 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
             }
         }
 
+        copyIncluded(raw, message, field);
         return message;
     }
 
@@ -602,8 +639,10 @@ const materializeMessages = (
     // A pending call is one this branch has already announced but for which no
     // result has appeared yet. `origin` is the source id a later tool message
     // names; `id` is the remapped provider-safe id this branch writes. Kept per
-    // assistant block.
-    let pending: Array<{ origin: string; id: string; name: string }> = [];
+    // assistant block. `included` records that block's context-inclusion state, so
+    // the placeholder paired with it below is disabled WITH its unit instead of
+    // appearing as an enabled answer to a withheld call.
+    let pending: Array<{ origin: string; id: string; name: string; included?: false }> = [];
 
     const nextId = (): string => {
         let candidate: string;
@@ -625,7 +664,8 @@ const materializeMessages = (
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER[reason],
                 toolCallId: call.id,
-                name: call.name
+                name: call.name,
+                ...(call.included === false ? { included: false } : {})
             });
         }
         pending = [];
@@ -698,7 +738,8 @@ const materializeMessages = (
             pending = mapped.map((call, callIndex) => ({
                 origin: copied.toolCalls![callIndex].id,
                 id: call.id,
-                name: call.name
+                name: call.name,
+                ...(copied.included === false ? { included: false as const } : {})
             }));
             continue;
         }
@@ -830,11 +871,17 @@ export const incorporateBranchHistory = (
     // Child system instructions are DATA. Demoting them to user messages is the
     // security boundary: the owner keeps its own system privileges, and nothing
     // the child was told can silently become a system instruction here.
+    //
+    // The wrapper IS the demoted entry, so it inherits that entry's inclusion
+    // state: a child instruction the user disabled must not ride into the owner's
+    // context as a fresh, enabled message. Only `false` is carried, and the two
+    // boundary markers below are always-new framing, so they stay unflagged.
     const childMessages: HarnessMessage[] = child.messages.map((message) =>
         message.role === 'system'
             ? {
                   role: 'user',
-                  content: quotedBranchSystemInstruction(branchId, message.content)
+                  content: quotedBranchSystemInstruction(branchId, message.content),
+                  ...(message.included === false ? { included: false } : {})
               }
             : message
     );

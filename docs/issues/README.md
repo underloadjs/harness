@@ -8,8 +8,8 @@ These are **not** bug reports about behaviour that contradicts the docs. Every
 entry below describes behaviour the package implements on purpose; the issue is
 that the documented design leaves a consumer unable to reach a capability the
 package's own model already implies. Where the omission is deliberate (a
-security rule, a dependency rule, a gateway-compatibility rule) that is stated
-in **Why it is the way it is**, and the proposal works inside the rule instead
+security rule, a dependency rule, a gateway-compatibility rule) that is stated in
+**Why it is the way it is**, and the proposal works inside the rule instead
 of against it.
 
 ## Index
@@ -19,9 +19,9 @@ of against it.
 | [0001](./0001-provider-request-body-extension.md) | transport | Blocking | No extension point for outbound chat-completion request fields: `stream_options.include_usage` cannot be requested and no response format can be enforced. |
 | [0002](./0002-standalone-tool-source-compilation.md) | tools / published surface | Significant | TypeScript tool-source compile/validate is only reachable through a live harness instance; the standalone kernel helper is not published. |
 | [0003](./0003-tool-registry-instance-lifecycle.md) | tools / lifecycle | Significant | The tool registry and the `maxCreatedTools` budget are per-harness-instance state, so a per-conversation host re-registers and recompiles on every conversation. |
-| [0004](./0004-context-window-and-token-budget.md) | context | Significant | No token counter, no context-window guard, no compaction — every host re-implements history trimming with no shared budget semantics. |
-| [0005](./0005-server-api-chat-product-parity.md) | server API | Significant | The built-in session API has no conversation title, no transcript mutation, no transcript seeding/fork, and no per-client session scoping. |
-| [0006](./0006-streaming-and-adapter-ergonomics.md) | server / adapters | Minor | Two independent SSE writers and no request-scoped abort/query surface in the transport-neutral dispatcher. |
+| [0004](./0004-context-window-and-token-budget.md) | context | Minor | No pre-request context-window guard and no provider overflow classification; the estimator exists but is not published. |
+| [0005](./0005-server-api-chat-product-parity.md) | server API | Significant | The built-in session API cannot seed a transcript at creation, and every live preset ships the full toolbox. |
+| [0006](./0006-streaming-and-adapter-ergonomics.md) | server / adapters | Minor | Two independent SSE writers, and the `{ stream }` abort wiring is documented only in the source headers. |
 | [0007](./0007-improvements-review-list.md) | cross-cutting | Review list | Everything else found during review, listed separately for the package owner to triage. |
 
 ## Format
@@ -49,6 +49,12 @@ duplicated code), **Minor** (ergonomics or drift risk), **Review list**
 (no single fix, decisions to make).
 
 Rules of the log: an issue is never edited to hide a regression — a correction
-goes in a `## Update` section with its own date; closing an issue moves it to
-the bottom of the index table with the commit that closed it; a claim without a
-source reference is marked `unconfirmed`.
+goes in a `## Update` section with its own date; **when part of an issue is
+closed, that part is deleted outright — from the title, from **Gap**, from the
+**Evidence** table, from **Proposal**, from **Acceptance criteria** and from
+**Tests to add** — and the header records the reduction with its date. A closed
+item is not kept as a footnote or a changelog entry: the log holds only live
+gaps, and the history of what was removed is git's, not the file's**; when a
+whole issue closes, the file is deleted and its index row dropped, and any
+surviving note moves into a sibling issue or into 0007; a claim without a source
+reference is marked `unconfirmed`.

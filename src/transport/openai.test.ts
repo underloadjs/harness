@@ -178,6 +178,53 @@ describe('openAICompatible', () => {
         expect(JSON.stringify(body)).not.toContain('let me look');
     });
 
+    // Stage 1a: `included` is transcript/projection state, not provider state. The
+    // transport field-selects per role, so a flag that survives onto a SENT entry
+    // (an explicitly-`true` one, which the projection keeps verbatim) can never
+    // become a wire field — strict gateways reject unknown message fields.
+    it('never puts the context-inclusion flag on the provider wire', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    { role: 'system', content: 'ctx', included: true },
+                    { role: 'user', content: 'search', included: true },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        included: true,
+                        toolCalls: [{ id: 'c1', name: 'websearch', arguments: '{"q":"news"}' }]
+                    },
+                    {
+                        role: 'tool',
+                        content: 'results',
+                        toolCallId: 'c1',
+                        name: 'websearch',
+                        included: true
+                    }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages).toEqual([
+            { role: 'system', content: 'ctx' },
+            { role: 'user', content: 'search' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                    { id: 'c1', type: 'function', function: { name: 'websearch', arguments: '{"q":"news"}' } }
+                ]
+            },
+            { role: 'tool', tool_call_id: 'c1', content: 'results' }
+        ]);
+        expect(JSON.stringify(body)).not.toContain('included');
+    });
+
     // The provider answers a non-object `function.arguments` with a bare
     // `500 Internal Server Error` for the WHOLE request, so a tool call that a
     // token-capped generation cut off mid-JSON would otherwise fail every later

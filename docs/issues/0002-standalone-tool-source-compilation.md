@@ -29,8 +29,10 @@ first constructing a harness, and cannot reuse a compilation:
   into that one instance's registry;
 - so "validate without publishing" — an explicitly stated intent in the source —
   is available to the package's own tests but not to a published consumer;
-- nothing is cached across instances: each construction re-transpiles and
-  re-evaluates the same bytes, and top-level evaluation is a real side effect.
+- nothing is cached **across registrations or instances**: each construction re-transpiles and
+  re-evaluates the same bytes, and top-level evaluation is a real side effect. (Within one
+  registration the module graph is evaluated once, which is not the reuse this issue asks
+  for.)
 
 ## Why it is the way it is
 
@@ -54,7 +56,7 @@ naming its limits, which the code already does.
 | The read-only result type already exists and is documented as "a compiled candidate that has NOT been published" | `src/core/tool-source.ts:175-183` (`PreparedTool`) |
 | The root barrel re-exports only `compileToolSource` and `createDynamicTool` from core | `src/harness.ts:7436-7445` |
 | `compileToolSource` / `createDynamicTool` compile a **function body** (`Function` constructor), not a module | `src/core/creation.ts:94`, `:110`, `:188` |
-| Module compilation + candidate preparation live in the Node-only source module | `src/core/tool-source.ts:811-813`, `:1617`, `:1697`, `:1819`, `:1854` |
+| Module compilation + candidate preparation live in the Node-only source module | `src/core/tool-source.ts` (`prepareToolCandidate`, `supportsToolCompilation`) |
 | Accepted module export shapes (so a wrapper is trivial): named tool, default export, named `tool`, or `metadata` + `execute` | `src/core/tool-source.ts:1415-1420` |
 | Published entry points are only `.`, `./server`, `./frontend`, `./shared`, `./package.json` | `package.json:9-40` |
 | Host-side registration surface: `toolCreate` (legacy body) and `registerTool` (candidate, publishes) | `src/types/index.ts:2137-2154` |
@@ -135,3 +137,4 @@ failed".
   diagnostics surface.
 - Sandboxing/isolation (tracked separately, `docs/runtime-tools.md:52-53`).
 - Any change to what `registerTool` publishes.
+

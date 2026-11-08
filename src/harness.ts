@@ -370,6 +370,10 @@ import type { HarnessPluginApiBase, HarnessPluginHostResult } from './plugin';
 import type { HarnessMaybeAsync, HarnessMergedHookResult } from './plugin/hooks';
 // Rough transcript sizing for the per-agent context limit (`turn.before`).
 import { estimateContextTokens } from './core/context-estimate';
+// The single context-inclusion normalizer (core/agent.ts). Direct module import,
+// the same convention as `./core/context-estimate` above: the projection needs it
+// and must not pay for the whole core barrel to get one helper.
+import { withIncluded } from './core/agent';
 import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
@@ -406,6 +410,8 @@ import type {
     HarnessPluginApi,
     HarnessPluginMetadata,
     HarnessTurnBeforeContext,
+    // Stage 1b context-inclusion control (`turn.before` entries / setIncluded).
+    HarnessContextEntry,
     HarnessMessage,
     HarnessPendingTool,
     HarnessProgress,
@@ -554,6 +560,65 @@ type HarnessActorRole = 'primary' | 'subagent';
 
 const cloneMessages = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
     JSON.parse(JSON.stringify(messages)) as HarnessMessage[];
+
+// The unit map behind the `turn.before` context-inclusion API (Stage 1b).
+//
+// A UNIT is what may be switched off without breaking provider pairing:
+//   - a standalone message (system, user, a plain assistant, or an orphan tool
+//     result whose owning block is gone — the projection drops that result anyway);
+//   - an assistant message with non-empty `toolCalls` PLUS every `tool` message in
+//     the transcript that answers one of those calls — contiguous, spliced back
+//     later by `resultInsertIndex`, or parked elsewhere by a host edit. Call ids are
+//     conversation-unique (`assertToolCallIds`), so "the assistant whose toolCalls
+//     contains this toolCallId" is never ambiguous.
+//
+// `units[index]` is the SAME array object for every member of a unit, which is what
+// makes "is this unit included?" answer identically from the assistant's entry and
+// from each of its results. This mirrors the two passes of `projectTranscript`
+// exactly, so an entry's effective `included` and the request's contents cannot
+// disagree — the agreement is pinned by src/harness.inclusion.test.ts.
+const transcriptUnits = (messages: readonly HarnessMessage[]): HarnessMessage[][] => {
+    // Every index starts as its own single-member unit.
+    const units: HarnessMessage[][] = messages.map((message) => [message]);
+
+    // Canonical identity -> index. Two entries sharing one object identity in the
+    // same transcript is pathological; the first occurrence owns the index.
+    const indexByMessage = new Map<HarnessMessage, number>();
+    messages.forEach((message, index) => {
+        if (!indexByMessage.has(message)) indexByMessage.set(message, index);
+    });
+
+    // Which messages ANSWER each call id, wherever they sit. Ownership is resolved in
+    // the loop below (it walks the assistant blocks), so no call-id -> owner index map
+    // is needed here — an ownerless result simply keeps its own single-member unit.
+    const answersByCallId = new Map<string, number[]>();
+    messages.forEach((message, index) => {
+        if (message.role !== 'tool') return;
+        const answers = answersByCallId.get(message.toolCallId) ?? [];
+        answers.push(index);
+        answersByCallId.set(message.toolCallId, answers);
+    });
+
+    messages.forEach((message, index) => {
+        if (message.role !== 'assistant' || !message.toolCalls?.length) return;
+
+        // The unit is built in CALL ORDER, matching what the projection emits.
+        const unit: HarnessMessage[] = [message];
+        for (const call of message.toolCalls) {
+            for (const answerIndex of answersByCallId.get(call.id) ?? []) {
+                unit.push(messages[answerIndex]);
+            }
+        }
+
+        units[index] = unit;
+        for (const member of unit) {
+            const memberIndex = indexByMessage.get(member);
+            if (memberIndex !== undefined) units[memberIndex] = unit;
+        }
+    });
+
+    return units;
+};
 
 const cloneBranchRecord = (record: HarnessBranchRecord): HarnessBranchRecord => ({
     ...record,
@@ -5616,6 +5681,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // arrival order (or interleaved with later assistant turns), so this is also
     // what keeps the wire pairing valid. Placeholders are NEVER committed: they
     // depend on wall-clock elapsed time and would be stale the moment they landed.
+    //
+    // CONTEXT INCLUSION (Stage 1a + 1b). `included === false` on a canonical message
+    // withholds it from THIS request only — `brain.messages` is never mutated, so
+    // re-enabling the flag restores the previous request byte-for-byte. Two rules
+    // keep the strict pairing invariant of transport/openai.ts intact:
+    //   - the unit of exclusion is a whole tool-call block (see the note on
+    //     `HarnessMessage` in types/index.ts), never one message inside it, so a
+    //     withheld block never leaves half its `tool_calls[]` unanswered;
+    //   - filtering is a pure skip in this loop: nothing is rewritten, reordered
+    //     or merged, which makes the projection idempotent (projecting an already
+    //     projected list yields the same list) and keeps the default case (no flag
+    //     anywhere) byte-identical to the pre-flag behaviour.
+    //
+    // Because a `false` entry is always skipped, every copy below goes through
+    // core/agent.ts `withIncluded`, so a request object NEVER carries an `included`
+    // key at all — not even `included: true` on a hand-built message. A custom
+    // `HarnessStream` (not just the shipped transport) can therefore treat the
+    // projection as flag-free data, and `turn.before` hooks receive the same value.
     const projectTranscript = (
         brain: Agent,
         pending: readonly HarnessPendingTool[]
@@ -5623,12 +5706,67 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const pendingById = new Map(pending.map((entry) => [entry.callId, entry]));
         const projected: HarnessMessage[] = [];
 
+        // Pass 1: every call id whose UNIT is withheld. A `false` on a result
+        // excludes the whole block as much as a `false` on the assistant message
+        // that requested it, so results are collected first and then promoted to
+        // every sibling call id of the same block.
+        const excludedCallIds = new Set<string>();
+
+        for (const message of brain.messages) {
+            if (message.role === 'tool' && message.included === false) {
+                excludedCallIds.add(message.toolCallId);
+            }
+        }
+
+        // Pass 2: decide each assistant block. Identity (not index) records the
+        // withheld ones, because the projection loop moves `index` around while it
+        // consumes tool blocks. Call ids are conversation-unique
+        // (`assertToolCallIds`), so widening `excludedCallIds` here can never
+        // reach a different block.
+        const excludedUnits = new Set<HarnessMessage>();
+
+        for (const message of brain.messages) {
+            if (message.role !== 'assistant' || !message.toolCalls?.length) continue;
+
+            if (
+                message.included === false ||
+                message.toolCalls.some((call) => excludedCallIds.has(call.id))
+            ) {
+                excludedUnits.add(message);
+                for (const call of message.toolCalls) excludedCallIds.add(call.id);
+            }
+        }
+
+        // A canonical message is skipped when it is flagged itself, when it owns a
+        // withheld block, or when it is a result of one. The last case matters for
+        // a result that is NOT contiguous with its assistant message (a restored
+        // or hand-edited transcript): without it the orphan would still reach the
+        // wire.
+        const isExcluded = (message: HarnessMessage): boolean =>
+            message.included === false ||
+            excludedUnits.has(message) ||
+            (message.role === 'tool' && excludedCallIds.has(message.toolCallId));
+
         let index = 0;
         while (index < brain.messages.length) {
             const message = brain.messages[index];
             index++;
 
-            projected.push({ ...message });
+            if (isExcluded(message)) {
+                // A withheld ASSISTANT block still has to CONSUME its contiguous
+                // tool run: those results belong to the withheld call block, and
+                // leaving them at the cursor would project them as orphans under
+                // whatever message follows. A withheld standalone message (any
+                // other role, including an orphan result) skips only itself.
+                if (message.role === 'assistant' && message.toolCalls?.length) {
+                    while (index < brain.messages.length && brain.messages[index].role === 'tool') {
+                        index++;
+                    }
+                }
+                continue;
+            }
+
+            projected.push(withIncluded(message));
 
             if (message.role !== 'assistant' || !message.toolCalls?.length) continue;
 
@@ -5649,7 +5787,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 const real = realById.get(call.id);
 
                 if (real !== undefined) {
-                    projected.push({ ...real });
+                    projected.push(withIncluded(real));
                     continue;
                 }
 
@@ -7223,11 +7361,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   - `setTranscript()` writes immediately and is visible to every LATER handler;
     //   - a handler that RETURNS `{ transcript }` is applied after the round, so it wins
     //     over an earlier `setTranscript`, and the LAST returned value wins overall;
-    //   - an empty array is never an override (see plugin/hooks.ts `overrideOf`).
+    //   - an empty array is never an override (see plugin/hooks.ts `overrideOf`);
+    //   - `setIncluded()` is NOT an override: it is a CANONICAL write (it flips
+    //     `included` across the whole tool-call unit of the targeted entry, and
+    //     notifies persistence). After the round, a run whose inclusion state changed
+    //     and whose transcript was never explicitly overridden is RE-PROJECTED, so the
+    //     change lands on THIS request and on every later one. An explicit transcript
+    //     still wins, and a round that did neither hands back the original projection
+    //     array untouched (same identity, same bytes).
     //
-    // NOTHING IS COMMITTED HERE. The override affects this REQUEST only; the agent's
-    // transcript is untouched unless a hook calls `replaceHistory()`, which is what
-    // keeps "compact this turn" and "shrink this conversation" separate decisions.
+    // ORDERING CAVEAT for `entries` and numeric indices: both describe the transcript
+    // as it is at that moment. A handler that calls `replaceHistory()` replaces the
+    // canonical message objects, so an entry captured BEFORE that call is stale —
+    // `setIncluded` then throws instead of writing to the wrong turn — and the index of
+    // a still-present message is only correct if the list did not shift. Re-read
+    // `entries` after any `replaceHistory()`.
+    //
+    // NOTHING ELSE IS COMMITTED HERE. An override affects this REQUEST only; the
+    // agent's transcript is untouched unless a hook calls `replaceHistory()` or
+    // `setIncluded()`, which is what keeps "compact this turn", "rewrite this
+    // conversation" and "hide this turn from the model" three separate decisions.
     //
     // Cost when nobody listens: one `has()` check. The estimate, the record copies and
     // the context object are all behind it, so a harness without a `turn.before` hook
@@ -7262,30 +7415,323 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // built context below.
         let override: readonly HarnessMessage[] | undefined;
 
-        // The factory runs once per handler, so `messages` and `estimatedTokens` always
-        // describe what THIS handler is being asked about.
+        // ------------------------------------------------------------------
+        // Stage 1b — canonical context control (`entries` / `setIncluded`).
+        //
+        // `messages` is the model-facing PROJECTION the handler was entered with,
+        // `currentMessages()` is that projection evaluated NOW, and `entries` is the
+        // canonical transcript itself — so a disabled turn remains visible and can be
+        // switched back on, and `setIncluded` is the only writer of the flag.
+        //
+        // ONE DERIVED PROJECTION, CACHED AND LAZY. A flag change is a canonical write,
+        // so the NEXT handler and THIS request both have to see the transcript the flags
+        // now describe. Rather than rebuilding on every write, the write only marks the
+        // cache dirty (`inclusionChanged`) and the next consumer rebuilds it exactly
+        // once (`currentProjection`). That keeps three properties at once:
+        //   - cross-handler freshness: the context factory calls `currentProjection()`,
+        //     so every handler is ENTERED with the projection an earlier handler's write
+        //     produced;
+        //   - at most ONE rebuild per write, not per read and not per write, which also
+        //     means `requestOf` and `currentMessages()` observe the SAME array;
+        //   - the no-write case is untouched: the cache starts as the caller's exact
+        //     array reference, so `requestOf` hands the provider that same object, by
+        //     identity — an observing plugin cannot perturb the default path.
+        // ------------------------------------------------------------------
+        let projected: readonly HarnessMessage[] = projection;
+        let inclusionChanged = false;
+
+        // `projectTranscript` is a pure function of (canonical flags, pending calls) —
+        // nothing else in the round can move it — so caching is safe: a hit and a fresh
+        // build are the same value by structure.
+        const currentProjection = (): readonly HarnessMessage[] => {
+            if (!inclusionChanged) return projected;
+
+            projected = projectTranscript(brain, runPending(run));
+            inclusionChanged = false;
+
+            return projected;
+        };
+
+        // Entries handed out during THIS round (any handler), so `setIncluded` can
+        // distinguish "an entry I built" from a foreign or fabricated object. A
+        // WeakSet keeps them collectable once every handler has run.
+        const issuedEntries = new WeakSet<HarnessContextEntry>();
+
+        // Set once this round's request has been computed: after it the round's answer
+        // is final, see `closeRoundObservations` below.
+        let roundClosed = false;
+
+        // Every context object this round handed out, so the round can freeze them.
+        const roundContexts: { freezeEntries: () => void }[] = [];
+
+        // The projection this round finally sent. `currentMessages()` and `entries` are
+        // LIVE while a handler runs (that is the point: a hook sees its own writes), but
+        // the round's decision is final — after it, a late read (a plugin that parked
+        // its context in a map, or a test that inspects one after the run) must observe
+        // what the round DECIDED, not a list rebuilt against a transcript that has since
+        // grown or been replaced.
+        let finalProjection: readonly HarnessMessage[] = projection;
+
+        const closeRoundObservations = (): void => {
+            roundClosed = true;
+            finalProjection = currentProjection();
+
+            for (const contextOfRound of roundContexts) contextOfRound.freezeEntries();
+        };
+
+        // Built per handler: indices and identities are only meaningful against the
+        // transcript as it is RIGHT NOW (a `replaceHistory()` between handlers replaces
+        // both, and the entries captured before it become stale on purpose).
+        const createEntries = (): readonly HarnessContextEntry[] => {
+            const canonical = brain.messages;
+            const units = transcriptUnits(canonical);
+
+            return canonical.map((message, index) => {
+                // One shared array per unit (see `transcriptUnits`), captured here so
+                // the getter below costs a member scan, not a graph walk.
+                const unit = units[index];
+                const entry: HarnessContextEntry = {
+                    index,
+                    message,
+                    // LIVE, not a snapshot: it reads the CURRENT flags of every member,
+                    // so `setIncluded(...)` followed by `entry.included` answers what the
+                    // transcript says now, and an earlier hook's change is visible to a
+                    // later one.
+                    get included(): boolean {
+                        return unit.every((member) => member.included !== false);
+                    }
+                };
+
+                issuedEntries.add(entry);
+                return entry;
+            });
+        };
+
+        // The write itself. Canonical messages are harness-owned objects (`seed()` and
+        // the snapshot reader both hand out copies), so an IN-PLACE flag update is the
+        // least invasive change available: it preserves every message identity and the
+        // transcript positions the running turn still depends on (`resultInsertIndex`
+        // locates tool results by assistant position, and committed-turn indices would
+        // move if the array were rebuilt).
+        const writeIncluded = (members: readonly HarnessMessage[], included: boolean): void => {
+            for (const member of members) {
+                if (included) {
+                    // Only `false` is ever stored, so re-enabling REMOVES the key
+                    // instead of writing `true` (core/agent.ts `withIncluded` upholds
+                    // the same rule for every copy).
+                    delete member.included;
+                    continue;
+                }
+
+                member.included = false;
+            }
+        };
+
+        // Which canonical messages the target refers to — a unit, never a lone member.
+        // Purely READ-ONLY by contract: `setIncluded` resolves first and writes only
+        // after every argument has been accepted, so a rejected call can never leave a
+        // half-applied unit.
+        const resolveUnit = (target: HarnessContextEntry | number): readonly HarnessMessage[] => {
+            const canonical = brain.messages;
+
+            if (typeof target === 'number') {
+                if (!Number.isInteger(target)) {
+                    throw new HarnessError(
+                        `turn.before setIncluded needs an integer transcript index; received ${String(target)}.`
+                    );
+                }
+
+                if (target < 0 || target >= canonical.length) {
+                    // An EMPTY transcript has no range to name: "0--1" (and the
+                    // `Math.max` clamp this replaces) claimed index 0 was valid.
+                    const bounds =
+                        canonical.length === 0
+                            ? 'it is empty, so no index is valid'
+                            : `(0-${String(canonical.length - 1)})`;
+
+                    throw new HarnessError(
+                        `turn.before setIncluded index ${String(target)} is outside this transcript ${bounds}.`
+                    );
+                }
+
+                // A numeric index is interpreted against the CURRENT transcript, which
+                // is why `replaceHistory()` makes an index captured earlier unreliable.
+                return transcriptUnits(canonical)[target];
+            }
+
+            if (
+                typeof target !== 'object' ||
+                target === null ||
+                !('message' in target) ||
+                !('index' in target)
+            ) {
+                throw new HarnessError(
+                    'turn.before setIncluded needs a transcript index or an entry from this turn.'
+                );
+            }
+
+            if (!issuedEntries.has(target)) {
+                throw new HarnessError(
+                    'turn.before setIncluded received an entry that does not belong to this turn.'
+                );
+            }
+
+            const index = canonical.indexOf(target.message);
+
+            if (index < 0) {
+                throw new HarnessError(
+                    `turn.before setIncluded received a stale entry (index ${String(target.index)}): its message is no longer in the transcript. Read \`entries\` again after \`replaceHistory()\`.`
+                );
+            }
+
+            // Unit resolution happens against the live transcript, so an entry remains
+            // usable when the transcript merely GREW (a committed tool result) — only a
+            // replaced message list invalidates it.
+            return transcriptUnits(canonical)[index];
+        };
+
+        const setIncluded = (
+            target: HarnessContextEntry | number,
+            included: unknown
+        ): void => {
+            // Target problems are reported before the flag value: a plugin holding a
+            // foreign entry wants to hear about the ENTRY first.
+            const unit = resolveUnit(target);
+
+            // Strictly a boolean. A truthy string or `0` used to be coerced silently —
+            // `'yes'` would have RE-ENABLED the unit and `0` would have disabled it —
+            // which is exactly the kind of typo this surface must refuse.
+            if (typeof included !== 'boolean') {
+                // JSON.stringify quotes strings (so `''` is visibly a string) and keeps
+                // numbers bare; it has no representation for a BigInt, and the error
+                // path must never throw on its own account.
+                let shown: string;
+
+                try {
+                    shown = String(JSON.stringify(included) ?? included);
+                } catch {
+                    shown = String(included);
+                }
+
+                throw new HarnessError(
+                    `turn.before setIncluded needs a boolean for \`included\`; received ${shown}.`
+                );
+            }
+
+            writeIncluded(unit, included as boolean);
+
+            // The cached projection (and therefore `context.messages` for every handler
+            // in this round) is now stale; the next consumer rebuilds it once.
+            inclusionChanged = true;
+
+            // Persistence: the flag change IS transcript state, so a conversation with
+            // a shared store reports it exactly like every other transcript write
+            // (`postThreadMessage`, `writeThreadTranscript`, `restore`) — the observer
+            // snapshots the whole harness, and the server writes it to `state.json`.
+            // A branch run (fork/autoanswer) has `run.threadState === undefined`
+            // (`runAgent`'s `resolvedThread` returns undefined for a branch, so no
+            // threadState is ever put on the run), owns an ephemeral transcript, and is
+            // excluded from snapshot v1, so there is nothing to persist; its own request
+            // is still filtered. The flag write is allowed there precisely because it is
+            // request-shaping and ephemeral, unlike `replaceHistory()` below, which
+            // rewrites PERSISTENT state and is therefore refused on a branch run.
+            if (threadState !== undefined) {
+                notifyStateChange('agent_message', { agent: brain.name });
+            }
+        };
+
+        // The factory runs once per handler, so `messages`, `entries` and
+        // `estimatedTokens` always describe what THIS handler is being asked about.
         // The factory receives the bus's context object (which carries the owning
         // plugin's api), not the api itself.
         const context = ({ api }: { api?: HarnessPluginApi }): HarnessTurnBeforeContext => {
-            const messages = override ?? projection;
+            // WHAT THIS HANDLER WAS ENTERED WITH. `messages` keeps its long-standing
+            // contract (harness.plugin.test.ts "the hook sees EXACTLY what the provider
+            // was about to receive … before any rewrite"): it is the projection (or the
+            // override an earlier handler set) at the moment the handler was entered,
+            // and it does not move underneath it. A handler that writes and wants the
+            // CURRENT list reads `currentMessages()` instead.
+            //
+            // `currentProjection()` here is what preserves the OTHER half of the rule:
+            // the context is built once per handler, so each handler is ENTERED with
+            // the projection the previous handler's flag writes produced (at most one
+            // rebuild per write, and none at all in the default case).
+            const messagesAtEntry = override ?? currentProjection();
+
+            // ONE ENTRIES LIST PER HANDLER, built on first access. Most handlers never
+            // read `entries` (the shipped compactor does not), and building it walks the
+            // whole transcript twice to resolve units, so it must not be paid for by the
+            // handlers that ignore it. Caching per handler also keeps the identity
+            // promise: `context.entries === context.entries`, and a held entry stays
+            // usable for `setIncluded` because every entry it hands out is in
+            // `issuedEntries`.
+            let entriesForThisHandler: readonly HarnessContextEntry[] | undefined;
+
+            // Registered so `closeRoundObservations()` can pin what this handler was
+            // shown once the round decided its request: the list a handler actually
+            // read stays THE list (identity preserved), and a list nobody read is
+            // resolved once, from the request-time state, instead of being rebuilt
+            // against whatever the transcript looks like whenever a late reader asks.
+            roundContexts.push({
+                freezeEntries: () => {
+                    entriesForThisHandler ??= createEntries();
+                }
+            });
 
             return {
-                // A branch run has no persistent conversation, so it reports the actor
-                // identity it is running under rather than a fake thread id.
+                // A branch run has no persistent conversation, but `run.threadId` is
+                // still the id of the conversation that SPAWNED it (`runAgent` builds
+                // it as `runThreadId`, resolved from the parent thread for a branch),
+                // so a branch and its root report the SAME string here; `run.actorKey`
+                // (`branch:<id>`) is only the fallback for a run with no thread at all.
+                // A plugin therefore cannot tell a branch round from a root round by
+                // `threadId` — it has to look at the transcript it is being shown.
                 threadId: run.threadId ?? run.actorKey,
                 agent: brain.name,
                 iteration: run.iteration,
-                messages,
+                // The PROJECTION AT HANDLER ENTRY (see `context` above): stable for the
+                // whole handler, and the value the round started from.
+                messages: messagesAtEntry,
+                // The SAME projection evaluated NOW. Equal to `messages` until somebody
+                // writes — `setIncluded()` (any handler in this round), an explicit
+                // `setTranscript()`, or `replaceHistory()` — and afterwards the list the
+                // provider will actually receive. One rebuild per round at most, because
+                // this is the shared cached projection rather than a fresh projection on
+                // every read.
+                currentMessages: (): readonly HarnessMessage[] =>
+                    override ?? (roundClosed ? finalProjection : currentProjection()),
+                // The CANONICAL transcript (every entry, disabled ones included), in
+                // canonical order — the control surface `setIncluded` acts on. Lazy and
+                // cached per handler (the SAME array for every read of one handler's
+                // context), and rebuilt for EVERY handler, so a second hook sees the
+                // state the first one left.
+                get entries(): readonly HarnessContextEntry[] {
+                    entriesForThisHandler ??= createEntries();
+
+                    return entriesForThisHandler;
+                },
                 // Same ~4 chars/token convention as the UI context bar
                 // (core/context-estimate.ts), plus the agent's leading instruction
                 // blocks: those occupy the provider's context window too, and a limit
                 // that ignored them would compact later than the operator expected.
-                estimatedTokens: estimateContextTokens(messages, brain.instructions),
+                //
+                // Deliberately NOT a getter: `context-compaction` compares this value
+                // against its limit and its cooldown map, and a mid-handler flag write
+                // changing the number underneath those checks would make a compaction
+                // trigger on a transcript it never actually looked at. It reports the
+                // size of the projection this handler was ENTERED with (`messagesAtEntry`
+                // — which already includes every earlier handler's writes, because the
+                // context is rebuilt for each handler).
+                estimatedTokens: estimateContextTokens(messagesAtEntry, brain.instructions),
                 signal: run.signal ?? alwaysActiveSignal,
                 api: api ?? hostPluginApi,
                 setTranscript: (messages): void => {
                     override = messages;
                 },
+                // Context inclusion control (Stage 1b). Mutates canonical state in
+                // place, re-resolves the affected UNIT, re-projects for this same
+                // request, and notifies persistence. See `HarnessTurnBeforeContext`.
+                setIncluded,
                 replaceHistory: (messages): void => {
                     if (threadState === undefined) {
                         throw new HarnessError(
@@ -7322,21 +7768,56 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const requestOf = (merged: HarnessMergedHookResult): HarnessMessage[] => {
             const final = merged.transcript ?? override;
 
+            if (final === undefined || final.length === 0) {
+                // No explicit transcript override, so the CANONICAL flags decide. A
+                // round that called `setIncluded` gets a fresh projection here — that
+                // is what makes the change land on THIS request rather than only the
+                // next turn. The rebuild happens at most once per round, because the
+                // projection lives in one cache (`currentProjection`) shared by the
+                // handlers' `currentMessages()` view and by the request. And a round that
+                // changed NOTHING gets `projected`, which is still the CALLER's array:
+                // the cache starts as that exact reference and only a flag write
+                // replaces it, so the default path keeps its byte-identical IDENTITY as
+                // well as its value, with no rebuild at all.
+                return currentProjection() as HarnessMessage[];
+            }
+
             // A hook hands back a readonly array; `turn()` expects the request's own
             // array, and copying also protects the harness from a hook that keeps
-            // mutating it.
-            if (final === undefined || final.length === 0) return projection as HarnessMessage[];
-
-            return [...final];
+            // mutating it. An explicit transcript WINS over re-projection (the plugin
+            // said exactly what it wants sent), and every entry passes through
+            // `withIncluded` so a plugin-authored `included: true` cannot reach the
+            // provider: the projection itself is always flag-free, and now so is every
+            // override.
+            return final.map(withIncluded);
         };
 
         // SYNC means "no handler yielded": the override is applied here, on the caller's
         // tick, exactly as it was before plugins existed. Only a handler that returned a
         // promise (a real compaction pass) costs a boundary — which is the point of that
         // turn.
-        return round.sync
-            ? { sync: true, value: requestOf(round.value) }
-            : { sync: false, promise: round.promise.then(requestOf) };
+        if (round.sync) {
+            const value = requestOf(round.value);
+
+            closeRoundObservations();
+
+            return { sync: true, value };
+        }
+
+        // The async tail freezes only once the LAST handler has run and the request has
+        // been computed, so a handler that awaited real work still sees live values.
+        // `closeRoundObservations()` returns nothing, hence the braces: the request
+        // value has to survive the tail unchanged.
+        return {
+            sync: false,
+            promise: round.promise
+                .then(requestOf)
+                .then((value) => {
+                    closeRoundObservations();
+
+                    return value;
+                })
+        };
     };
 
     // One model turn, made abort-PREEMPTIVE (T15). The transport may ignore its

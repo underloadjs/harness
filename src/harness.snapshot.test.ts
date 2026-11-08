@@ -37,6 +37,8 @@ import { TASK_DEFAULT_LEASE_MS } from './core/task';
 import type {
     Agent,
     Harness,
+    HarnessAttachment,
+    HarnessMessage,
     HarnessSnapshot,
     HarnessStateChangeEvent,
     HarnessStream,
@@ -793,6 +795,237 @@ describe('harness snapshot/restore', () => {
             page: { offset: 0, limit: 20, hasMore: false },
             storeRev: 1
         });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Context inclusion (Stage 1a) — the flag is PERSISTED state
+// ---------------------------------------------------------------------------
+
+describe('snapshot persistence of the context-inclusion flag', () => {
+    // The transcript under test: a completed tool unit whose RESULT is disabled.
+    // Unit semantics (types/index.ts `HarnessMessage`) then withhold the assistant
+    // block as a whole, so persistence and projection are covered by one fixture.
+    const flaggedWriterMessages = (): HarnessMessage[] => [
+        { role: 'system', content: 'Write.' },
+        { role: 'user', content: 'seed question' },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c1', name: 'bulk01', arguments: '{}' }]
+        },
+        { role: 'tool', content: 'found', toolCallId: 'c1', name: 'bulk01', included: false },
+        { role: 'assistant', content: 'seed answer' }
+    ];
+
+    // The same session, built by inserting the unit into the seeded transcript so
+    // the agent set stays identical to what `buildSession()` restores into.
+    const flaggedSession = (): Harness => {
+        const session = buildSession();
+        const unit = flaggedWriterMessages().slice(2, 4);
+        session.agents.writer.messages.splice(2, 0, ...unit);
+        return session;
+    };
+
+    it('never writes the key while no turn is disabled', async () => {
+        expect(JSON.stringify(buildSession().snapshot())).not.toContain('included');
+    });
+
+    it('persists `included: false`, restores it byte-for-byte, and keeps withholding the unit after a restart', async () => {
+        const snapshot = clone(flaggedSession().snapshot());
+
+        // `snapshot()` runs the SAME reader `restore()` enforces, so the flagged
+        // entry is exactly what a host will find on disk, and its unflagged
+        // neighbours carry no `included` key at all.
+        expect(snapshot.agents.writer.messages).toEqual(flaggedWriterMessages());
+
+        const seen: HarnessStreamRequest[] = [];
+        const target = buildSession({ turns: [answer('after restore')], seen });
+        target.restore(snapshot);
+
+        expect(target.agents.writer.messages).toEqual(flaggedWriterMessages());
+        // Re-saving is lossless and stable: the flag survives, nothing is added.
+        expect(target.snapshot()).toEqual(snapshot);
+
+        // Restore is idempotent for a flagged transcript too (it replaces, never
+        // duplicates, and never normalizes a `false` back to the default).
+        target.restore(snapshot);
+        expect(target.snapshot()).toEqual(snapshot);
+
+        // The restored flag is LIVE state: the next request withholds the whole
+        // unit and nothing else, while the transcript keeps it.
+        await target('continue');
+
+        expect(seen[seen.length - 1].messages).toEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'seed question' },
+            { role: 'assistant', content: 'seed answer' },
+            { role: 'user', content: 'continue' }
+        ]);
+        expect(JSON.stringify(seen[seen.length - 1].messages)).not.toContain('included');
+        expect(target.agents.writer.messages).toEqual([
+            ...flaggedWriterMessages(),
+            { role: 'user', content: 'continue' },
+            { role: 'assistant', content: 'after restore' }
+        ]);
+    });
+
+    it('restores a pre-flag snapshot in which the key never appears', async () => {
+        const snapshot = await seedSmall();
+        const target = buildSession();
+
+        expect(() => target.restore(clone(snapshot))).not.toThrow();
+        expect(target.agents.writer.messages).toEqual(seededWriterMessages);
+        expect(JSON.stringify(target.snapshot())).not.toContain('included');
+    });
+
+    it('normalizes a hand-written `included: true` back to the omitted form', async () => {
+        const edited = clone(await seedSmall());
+        (edited.agents.writer.messages[1] as Record<string, unknown>).included = true;
+
+        const target = buildSession();
+        target.restore(edited);
+
+        // Absent means included, and the runtime never writes `true`, so a re-save
+        // drops the key instead of perpetuating a value the schema does not use.
+        expect(target.agents.writer.messages[1]).toEqual({ role: 'user', content: 'seed question' });
+        expect(JSON.stringify(target.snapshot())).not.toContain('included');
+    });
+
+    it('refuses an `included` value that is not a boolean and leaves the target untouched', async () => {
+        const valid = await seedSmall();
+        const invalid = clone(valid);
+        (invalid.agents.writer.messages[1] as Record<string, unknown>).included = 'nope';
+
+        const target = buildSession();
+        const before = target.snapshot();
+
+        expect(() => target.restore(invalid)).toThrow(
+            'snapshot.agents["writer"].messages[1].included must be a boolean.'
+        );
+        expect(target.snapshot()).toEqual(before);
+    });
+
+    it('refuses an `included` value that is not a boolean INSIDE a host thread too', async () => {
+        const source = agentSession([{ role: 'user', content: 'main' }]);
+        const thread = source.createThread('writer', { label: 'Extra' });
+        source.setThreadMessages(thread.id, [{ role: 'user', content: 'thread off', included: false }]);
+
+        const invalid = clone(source.snapshot());
+        (invalid.threads![0].messages[0] as Record<string, unknown>).included = 'nope';
+
+        const target = agentSession([{ role: 'user', content: 'main' }]);
+        const before = target.snapshot();
+
+        // The thread reader is the one shared `readHarnessMessages`, so its labels
+        // are the thread's own path — and a bad flag is refused there exactly like it
+        // is in an agent transcript.
+        expect(() => target.restore(invalid)).toThrow(
+            `snapshot.threads[0].messages[0].included must be a boolean.`
+        );
+        expect(target.snapshot()).toEqual(before);
+    });
+
+    // One-agent session with a host-seeded transcript: the seed path is where a
+    // caller's `included` enters canonical state (core/agent.ts `withIncluded`).
+    const agentSession = (
+        messages: HarnessMessage[],
+        seen?: HarnessStreamRequest[]
+    ): Harness =>
+        harness({
+            agents: {
+                writer: agent({
+                    model: 'merge/ds4-flash',
+                    messages,
+                    stream: scripted([answer('after restore')], seen)
+                })
+            },
+            presets: false
+        });
+
+    // A minimal valid upload-profile image: the 12-byte PNG signature, the same
+    // fixture shape src/core/snapshot.attachments.test.ts and src/server/transcript.test.ts
+    // use, so a disabled turn can also carry bytes through a file.
+    const PNG = (): HarnessAttachment => ({
+        id: 'img-1',
+        kind: 'image',
+        marker: '[Image 1]',
+        name: 'pixel.png',
+        mime: 'image/png',
+        size: 12,
+        data: 'iVBORw0KGgoAAAAA'
+    });
+
+    it('keeps a disabled turn WITH its attachment through a round trip and still withholds it', async () => {
+        const seeded: HarnessMessage[] = [
+            { role: 'user', content: 'see [Image 1]', attachments: [PNG()], included: false },
+            { role: 'user', content: 'plain' }
+        ];
+
+        const snapshot = clone(agentSession(seeded).snapshot());
+
+        // Exclusion must not be an excuse to drop bytes: the persisted entry keeps
+        // BOTH the attachment list and the flag, in the reader's key order.
+        expect(snapshot.agents.writer.messages).toStrictEqual([
+            { role: 'user', content: 'see [Image 1]', attachments: [PNG()], included: false },
+            { role: 'user', content: 'plain' }
+        ]);
+
+        const seen: HarnessStreamRequest[] = [];
+        const target = agentSession(seeded, seen);
+        target.restore(snapshot);
+
+        expect(target.agent.messages).toStrictEqual([
+            { role: 'user', content: 'see [Image 1]', attachments: [PNG()], included: false },
+            { role: 'user', content: 'plain' }
+        ]);
+        expect(target.snapshot()).toEqual(snapshot);
+
+        await target('next');
+
+        // Still withheld after the restart — and the request carries neither the
+        // flag nor the attachment bytes, because the only message that had them is
+        // absent from the model-facing transcript.
+        const request = JSON.stringify(seen[seen.length - 1].messages);
+        expect(seen[seen.length - 1].messages).toStrictEqual([
+            { role: 'user', content: 'plain' },
+            { role: 'user', content: 'next' }
+        ]);
+        expect(request).not.toContain('included');
+        expect(request).not.toContain('attachments');
+        expect(request).not.toContain('iVBORw0KGgoAAAAA');
+    });
+
+    it('preserves the flag in snapshot().threads[] and restores it with the host thread', async () => {
+        const source = agentSession([{ role: 'user', content: 'main' }]);
+        const thread = source.createThread('writer', { label: 'Extra' });
+        source.setThreadMessages(thread.id, [
+            { role: 'system', content: 'thread sys' },
+            { role: 'user', content: 'thread off', included: false },
+            { role: 'user', content: 'thread on', included: true }
+        ]);
+
+        const snapshot = clone(source.snapshot());
+
+        // A host thread's transcript is persisted through the SAME reader, so the
+        // disabled entry keeps its flag there too, and a hand-written `true` is
+        // already normalized away before the file is ever written.
+        expect(snapshot.threads).toHaveLength(1);
+        expect(snapshot.threads![0].messages).toStrictEqual([
+            { role: 'system', content: 'thread sys' },
+            { role: 'user', content: 'thread off', included: false },
+            { role: 'user', content: 'thread on' }
+        ]);
+
+        const target = agentSession([{ role: 'user', content: 'main' }]);
+        target.restore(snapshot);
+
+        expect(target.snapshot()).toEqual(snapshot);
+        expect(target.threadMessages(thread.id)).toStrictEqual([
+            { role: 'system', content: 'thread sys' },
+            { role: 'user', content: 'thread off', included: false },
+            { role: 'user', content: 'thread on' }
+        ]);
     });
 });
 

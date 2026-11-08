@@ -50,6 +50,7 @@ import { readProfileStoreState } from './profile';
 import {
     isSnapshotRecord,
     readSnapshotArray,
+    readSnapshotBoolean,
     readSnapshotInteger,
     readSnapshotJsonValue,
     readSnapshotKeys,
@@ -205,6 +206,27 @@ const readAgentResults = (
     });
 };
 
+// The persisted context-inclusion flag (types/index.ts, `HarnessMessage`).
+//
+// Only the literal `false` is ever STORED: absent means included, so every
+// pre-flag transcript, snapshot and branch record keeps restoring byte-for-byte,
+// and a writer that re-enables a turn DELETES the key instead of writing true.
+// A snapshot that does carry `included: true` (hand-edited, or written by a host
+// that ignored the omit rule) is accepted and NORMALIZED to the absent form, so
+// `restore -> snapshot` stays idempotent instead of re-adding a key the runtime
+// never writes. A non-boolean value is refused like any other mistyped field.
+const applyIncluded = (
+    message: HarnessMessage,
+    record: Record<string, unknown>,
+    label: string
+): void => {
+    if (record.included === undefined) return;
+
+    if (readSnapshotBoolean(record.included, `${label}.included`) === false) {
+        message.included = false;
+    }
+};
+
 export const readHarnessMessages = (value: unknown, label: string): HarnessMessage[] =>
     readSnapshotArray(value, label).map((entry, index) => {
         const entryLabel = `${label}[${index}]`;
@@ -212,12 +234,24 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
         const role = readSnapshotString(record.role, `${entryLabel}.role`, { min: 1 });
 
         switch (role) {
-            case 'system':
-                readSnapshotKeys(record, ['role', 'content'], entryLabel);
-                return {
+            case 'system': {
+                // `included` is the only optional system key, and it is listed as
+                // OPTIONAL so a pre-flag snapshot (role+content only) still passes.
+                readSnapshotKeys(
+                    record,
+                    ['role', 'content', 'included'],
+                    entryLabel,
+                    ['included']
+                );
+
+                const message: Extract<HarnessMessage, { role: 'system' }> = {
                     role,
                     content: readSnapshotString(record.content, `${entryLabel}.content`)
                 };
+
+                applyIncluded(message, record, entryLabel);
+                return message;
+            }
 
             case 'user': {
                 // Attachments are OPTIONAL: a pre-attachment snapshot has only
@@ -226,9 +260,12 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 // canonical base64, decoded size, magic signature) and returns
                 // detached copies, so a live transcript never aliases a saved
                 // object.
-                readSnapshotKeys(record, ['role', 'content', 'attachments'], entryLabel, [
-                    'attachments'
-                ]);
+                readSnapshotKeys(
+                    record,
+                    ['role', 'content', 'attachments', 'included'],
+                    entryLabel,
+                    ['attachments', 'included']
+                );
 
                 const message: Extract<HarnessMessage, { role: 'user' }> = {
                     role: 'user',
@@ -246,15 +283,16 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                     }
                 }
 
+                applyIncluded(message, record, entryLabel);
                 return message;
             }
 
             case 'assistant': {
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'toolCalls', 'reasoning'],
+                    ['role', 'content', 'toolCalls', 'reasoning', 'included'],
                     entryLabel,
-                    ['toolCalls', 'reasoning']
+                    ['toolCalls', 'reasoning', 'included']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'assistant' }> = {
@@ -273,6 +311,7 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                     );
                 }
 
+                applyIncluded(message, record, entryLabel);
                 return message;
             }
 
@@ -286,9 +325,9 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 // rather than replay garbage to the provider.
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'toolCallId', 'name', 'attachments'],
+                    ['role', 'content', 'toolCallId', 'name', 'attachments', 'included'],
                     entryLabel,
-                    ['attachments']
+                    ['attachments', 'included']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'tool' }> = {
@@ -312,6 +351,7 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                     }
                 }
 
+                applyIncluded(message, record, entryLabel);
                 return message;
             }
 

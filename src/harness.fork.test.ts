@@ -18,6 +18,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
+// The branch placeholder text is asserted verbatim, so the constant is read from
+// its own module (the same internal-import convention src/harness.snapshot.test.ts
+// uses for `./core/task`), never retyped.
+import { BRANCH_PENDING_PLACEHOLDER } from './core/branch';
 import type {
     Agent,
     HarnessEvent,
@@ -84,6 +88,48 @@ const toolNames = (request: HarnessStreamRequest | undefined): string[] =>
 
 const brain = (stream: HarnessStream, extra: Record<string, unknown> = {}): Agent =>
     agent({ model: 'merge/ds4-flash', stream, ...extra });
+
+// The strict pairing invariant a forked transcript must keep (the R3 check of
+// src/harness.background.test.ts `wireIssues`, restated here because that oracle
+// lives inside its own test file and is not a package export): after every
+// assistant message that requests tools there must be exactly one tool message
+// per call, in call order, with no other role between, and no tool message may
+// sit outside such a run.
+const pairIssues = (messages: readonly HarnessMessage[]): string[] => {
+    const issues: string[] = [];
+    const claimed = new Set<number>();
+
+    messages.forEach((message, index) => {
+        if (message.role !== 'assistant') return;
+        const requested = message.toolCalls ?? [];
+        if (requested.length === 0) return;
+
+        const expected = requested.map((entry) => entry.id);
+        const actual: string[] = [];
+        let cursor = index + 1;
+
+        while (cursor < messages.length && messages[cursor].role === 'tool') {
+            actual.push((messages[cursor] as Extract<HarnessMessage, { role: 'tool' }>).toolCallId);
+            claimed.add(cursor);
+            cursor += 1;
+        }
+
+        if (actual.join(',') !== expected.join(',')) {
+            issues.push(
+                `assistant#${index}: expected [${expected.join(',')}] but paired [${actual.join(',')}]`
+            );
+        }
+    });
+
+    messages.forEach((message, index) => {
+        if (message.role !== 'tool' || claimed.has(index)) return;
+        issues.push(
+            `orphan tool#${index}: ${(message as Extract<HarnessMessage, { role: 'tool' }>).toolCallId}`
+        );
+    });
+
+    return issues;
+};
 
 // The frozen instant the task-store tests below pin the (already faked) clock to, so
 // every `updatedAt`/change-feed `at` has ONE exact expected ISO string. See
@@ -364,6 +410,118 @@ describe('threadFork runtime', () => {
         // Detached audit copies: mutating one read never touches the record.
         record.messages.length = 0;
         expect(writer.branch(record.branchId)?.messages.length).toBeGreaterThan(0);
+    });
+
+    it('carries the context-inclusion flag into a branch transcript and keeps the disabled unit off the branch request', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        const entry = brain(
+            routed((request) => {
+                if (latestUser(request) === 'inspect') return answer('branch summary');
+                if (toolContents(request).some((content) => content.includes('branch summary'))) {
+                    return answer('root final');
+                }
+                // The disabled seed unit is withheld, so this stays the first
+                // request that contains an assistant turn.
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return call('f1', 'threadFork', '{"input":"inspect"}');
+                }
+                return answer('waiting');
+            }, seen),
+            {
+                instruction: 'SYS',
+                messages: [
+                    { role: 'user', content: 'seed' },
+                    { role: 'user', content: 'seed disabled', included: false },
+                    {
+                        role: 'assistant',
+                        content: 'asked',
+                        included: false,
+                        toolCalls: [{ id: 'origin-a', name: 'task', arguments: '{}' }]
+                    },
+                    // The RESULT stays as the source wrote it: the unit widening is a
+                    // projection rule, so a copy stays a faithful record.
+                    { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'task' }
+                ]
+            }
+        );
+
+        const writer = harness({ agents: { writer: entry }, presets: false });
+        await writer('root input');
+        await flush();
+
+        const record = writer.branches()[0];
+        const branchId = record.branchId;
+
+        // (1) The branch record is the materialized source transcript plus the
+        //     branch's own turns: every flag the source carried survived the copy,
+        //     tool ids are remapped, and the unanswered threadFork call got the
+        //     created-branch placeholder.
+        expect(record.messages).toEqual([
+            { role: 'system', content: 'SYS' },
+            { role: 'user', content: 'seed' },
+            { role: 'user', content: 'seed disabled', included: false },
+            {
+                role: 'assistant',
+                content: 'asked',
+                included: false,
+                toolCalls: [{ id: `call_${branchId}_1`, name: 'task', arguments: '{}' }]
+            },
+            { role: 'tool', content: 'ok', toolCallId: `call_${branchId}_1`, name: 'task' },
+            { role: 'user', content: 'root input' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: `call_${branchId}_2`, name: 'threadFork', arguments: '{"input":"inspect"}' }
+                ]
+            },
+            {
+                role: 'tool',
+                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                toolCallId: `call_${branchId}_2`,
+                name: 'threadFork'
+            },
+            // The branch's own conversation, appended after the copied baseline.
+            { role: 'user', content: 'inspect' },
+            { role: 'assistant', content: 'branch summary' }
+        ]);
+        expect(JSON.stringify(record.messages)).not.toContain('"included":true');
+
+        // (2) The branch's own provider request runs through the same projection, so
+        //     the disabled standalone turn and the ENTIRE disabled unit are absent —
+        //     and the surviving pending-call pair stays exact.
+        const branchRequest = seen.find((request) => latestUser(request) === 'inspect');
+        expect(branchRequest).toBeDefined();
+        expect(branchRequest!.messages).toEqual([
+            { role: 'system', content: 'SYS' },
+            { role: 'user', content: 'seed' },
+            { role: 'user', content: 'root input' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: `call_${branchId}_2`, name: 'threadFork', arguments: '{"input":"inspect"}' }
+                ]
+            },
+            {
+                role: 'tool',
+                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                toolCallId: `call_${branchId}_2`,
+                name: 'threadFork'
+            },
+            { role: 'user', content: 'inspect' }
+        ]);
+        expect(pairIssues(branchRequest!.messages)).toEqual([]);
+        expect(JSON.stringify(branchRequest!.messages)).not.toContain('included');
+
+        // (3) Forking never mutates the source: both disabled entries are still in
+        //     the origin transcript, flagged, in their original positions.
+        expect(entry.messages.filter((message) => message.role === 'user')).toEqual([
+            { role: 'user', content: 'seed' },
+            { role: 'user', content: 'seed disabled', included: false },
+            { role: 'user', content: 'root input' }
+        ]);
     });
 
     it('gives a subagent fork the subagent role, without delegate or toolCreate', async () => {

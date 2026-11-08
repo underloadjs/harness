@@ -405,8 +405,70 @@ describe('materializeBranchHistory', () => {
                 branchId: 'b'
             })
         ).toThrow(
-            'Branch history message [0] has unknown property "extra". Allowed properties: role, content, attachments.'
+            'Branch history message [0] has unknown property "extra". Allowed properties: role, content, attachments, included.'
         );
+
+        // `included` is admitted, but it is still typed: a string flag is a
+        // hand-edited history, and the materializer refuses rather than guessing.
+        expect(() =>
+            materializeBranchHistory({
+                messages: [
+                    { role: 'user', content: 'x', included: 'nope' } as unknown as HarnessMessage
+                ],
+                branchId: 'b'
+            })
+        ).toThrow('Branch history message [0].included must be a boolean.');
+    });
+
+    it('carries the context-inclusion flag across a fork and never writes `included: true`', () => {
+        const source: HarnessMessage[] = [
+            { role: 'system', content: 'sys', included: false },
+            { role: 'user', content: 'hi', included: true },
+            {
+                role: 'assistant',
+                content: 'call',
+                toolCalls: [{ id: 'origin-a', name: 'read', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'A',
+                toolCallId: 'origin-a',
+                name: 'read',
+                included: false
+            },
+            { role: 'user', content: 'next' }
+        ];
+        const before = JSON.parse(JSON.stringify(source)) as HarnessMessage[];
+
+        const result = materializeBranchHistory({
+            messages: source,
+            branchId: 'branch-1',
+            reason: 'threadFork'
+        });
+
+        // A branch that forgot the flag would put a turn the user disabled right
+        // back in front of the model. `true` normalizes away, exactly like the
+        // snapshot reader, so only `false` survives a fork.
+        expect(result.messages).toEqual([
+            { role: 'system', content: 'sys', included: false },
+            { role: 'user', content: 'hi' },
+            {
+                role: 'assistant',
+                content: 'call',
+                toolCalls: [{ id: 'call_branch-1_1', name: 'read', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'A',
+                toolCallId: 'call_branch-1_1',
+                name: 'read',
+                included: false
+            },
+            { role: 'user', content: 'next' }
+        ]);
+
+        // The source transcript is untouched by the copy.
+        expect(source).toEqual(before);
     });
 
     it('rejects history over maxHistoryBytes without truncating', () => {
@@ -496,6 +558,60 @@ describe('incorporateBranchHistory', () => {
                 content: '',
                 toolCalls: [{ id: 'owner-call', name: 'threadFork', arguments: '{}' }]
             }
+        ]);
+    });
+
+    it('carries a disabled child system entry onto its quoted wrapper', () => {
+        // Demotion turns the child instruction into a NEW user message, so the
+        // wrapper has to inherit the entry's inclusion state: a disabled child
+        // instruction must not re-enter the owner's context as a fresh, enabled
+        // turn. Enabled entries — and the two boundary markers — stay unflagged,
+        // and `true` is never written.
+        const owner: HarnessMessage[] = [
+            { role: 'system', content: 'Owner sys', included: false },
+            { role: 'user', content: 'owner prompt' }
+        ];
+        const child: HarnessMessage[] = [
+            { role: 'system', content: 'Child sys', included: false },
+            { role: 'system', content: 'Other child sys', included: true },
+            { role: 'user', content: 'child prompt', included: false },
+            { role: 'user', content: 'child kept' }
+        ];
+
+        const result = incorporateBranchHistory({
+            ownerMessages: owner,
+            ownerBranchId: 'branch-1',
+            branchMessages: child,
+            branchId: 'branch-2',
+            branchKind: 'autoanswer',
+            reason: 'actionRequest'
+        });
+
+        expect(result.messages).toEqual([
+            { role: 'system', content: 'Owner sys', included: false },
+            { role: 'user', content: 'owner prompt' },
+            { role: 'user', content: branchBoundaryStart('branch-2', 'autoanswer') },
+            {
+                role: 'user',
+                content: quotedBranchSystemInstruction('branch-2', 'Child sys'),
+                included: false
+            },
+            {
+                role: 'user',
+                content: quotedBranchSystemInstruction('branch-2', 'Other child sys')
+            },
+            { role: 'user', content: 'child prompt', included: false },
+            { role: 'user', content: 'child kept' },
+            { role: 'user', content: branchBoundaryEnd('branch-2') }
+        ]);
+        expect(JSON.stringify(result.messages)).not.toContain('"included":true');
+
+        // The inputs are never mutated by the copy.
+        expect(child).toEqual([
+            { role: 'system', content: 'Child sys', included: false },
+            { role: 'system', content: 'Other child sys', included: true },
+            { role: 'user', content: 'child prompt', included: false },
+            { role: 'user', content: 'child kept' }
         ]);
     });
 });
