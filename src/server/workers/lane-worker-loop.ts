@@ -137,6 +137,19 @@ export type LaneWorkerState = {
     // `slice(committedLength)`, and a delta a sibling wrote is inserted AT that index, which
     // is what keeps a re-derivation from duplicating or dropping messages.
     committedLength: number;
+    // pipeline T4.1 — the CONTENT half of that same base. `committedLength` says how much of
+    // canonical state this replica holds; `committedDigest` says what it HELD at the moment it
+    // adopted it, which is the only way to notice that an already-committed entry was rewritten
+    // IN PLACE (`setIncluded` storing/removing `included`, `edit` changing `content`). A flag
+    // write moves no length, so a length-only base cannot see it — finding F6's exact bug.
+    //
+    // Always `digestMemoryValue(replica.threadMessages(targetId)[0..committedLength])`, recomputed
+    // LOCALLY at the four points that move the base (hello, a first turn for a target, an adopted
+    // receipt, a transcript sync). Recomputing rather than adopting the receipt's `effect.digest`
+    // keeps one rule for every point — after an applied op the replica's prefix IS canonical's, so
+    // the two answers are equal by construction, and a locally recomputed digest can never
+    // disagree with the content the next derivation reads.
+    committedDigest: string;
     readDigests: Record<string, string>;
     declaredKeys: string[];
     // Terminal invocations this lane has published, mapped to the CANONICAL digest the
@@ -182,6 +195,10 @@ export type LaneWorkerState = {
 const state: LaneWorkerState = {
     epoch: 0,
     committedLength: 0,
+    // T4.1 — '' means "no content adopted yet", which can never collide with a real digest (the
+    // serializer's shape is 16 hex chars + ':' + a length), so a base that failed to be adopted
+    // produces a NAMED `prefix-moved` refusal rather than a patch that silently matches.
+    committedDigest: '',
     readDigests: {},
     declaredKeys: [],
     archived: new Map(),
@@ -325,9 +342,14 @@ export const installAuthorityRuntime = (replica: Harness): void => {
             });
     };
 
-    // `executeRecordTool(name, context)`: only the DATA part of the context crosses. The
-    // authority fabricates the ToolContext against the canonical harness (./lane-authority.ts).
-    route('executeRecordTool', (name, context) => ({
+    // `executeRecords(name, context)` (records-engine Decision A): the record engine's
+    // routed door. `name` is the CALLING TOOL — `records` or one of the four wrappers — and
+    // only the DATA part of the context crosses, because the authority fabricates the
+    // ToolContext against the canonical harness (./lane-authority.ts) and resolves the
+    // caller from the name the lane reported. This is the registration the classification
+    // loop below depends on: delete it and a lane write stops being routable, which must
+    // throw at startup rather than land on a private copy.
+    route('executeRecords', (name, context) => ({
         name,
         parameters: (context as ToolContext | undefined)?.parameters,
         identity: identityOf(context)
@@ -629,6 +651,36 @@ export type ReplicaReadView = {
     snapshot: () => { agentResults?: HarnessAgentResultSnapshot[] };
 };
 
+// T4.1: the CONTENT half of the committed base, digested from the replica's own read of the
+// conversation this lane writes — the same `digestMemoryValue` (via `expectsDigestOf`) the
+// authority CASes against, and key-order independent, so the two sides agree whenever they hold
+// the same messages.
+//
+// This is what an append-shaped base cannot see: `setIncluded` and `edit` rewrite an
+// already-committed entry IN PLACE (src/harness.ts, src/types/index.ts `edit`), which changes no
+// length, so `transcript.length > committedLength` — the ONLY condition a lane owed an operation
+// for until T4 — stayed false and the change died with the worker process (finding F6).
+export const committedDigestOf = (
+    replica: ReplicaReadView,
+    base: { targetId: string; committedLength: number }
+): string => expectsDigestOf(replica.threadMessages(base.targetId).slice(0, base.committedLength));
+
+// Re-adopt the content base from this replica. Called at every point `committedLength` moves
+// (a first turn for a target, an adopted receipt, a transcript sync), because after any of them
+// the prefix this replica holds IS canonical state — so recomputing locally always equals what
+// the authority's receipt reported, and the NEXT derivation can tell "canonical moved" from
+// "I moved", which is the whole difference between a rebase and losing a plugin's decision.
+const adoptCommittedBase = (): void => {
+    const targetId = state.targetId;
+
+    if (state.replica === undefined || targetId === undefined) {
+        state.committedDigest = '';
+        return;
+    }
+
+    state.committedDigest = committedDigestOf(readView(), { targetId, committedLength: state.committedLength });
+};
+
 // The operations this lane owes the authority, derived from what it actually did since the
 // facts its RECEIPTS reported. Nothing here is a whole-state diff: each op names the prefix,
 // the digest, or the identity it depends on.
@@ -638,6 +690,32 @@ export const deriveOperations = (lane: LaneWorkerState, replica: ReplicaReadView
     // 1. The transcript this lane owns, appended at the length the AUTHORITY last reported.
     const transcript: HarnessMessage[] = replica.threadMessages(lane.targetId as string);
 
+    // 1a. IN-PLACE changes to the committed prefix (pipeline T4.1). The length test below is
+    //     blind to them by construction — a flag write or a text edit does not grow the
+    //     transcript — so the base carries the content it was adopted with, and a digest
+    //     comparison is what makes "I disabled a unit two turns ago" an operation the authority
+    //     has to hear about. Whole prefix, not a sparse diff: see ./lane-commit.ts on why the
+    //     whole-prefix CAS is the honest granularity, and note that this is the SAME serializer
+    //     the authority CASes with (`expectsDigestOf` → `digestMemoryValue`, key-order
+    //     independent), so the fold's view and this replica's read agree on a canonical prefix
+    //     they both got by validating the same messages.
+    const committedPrefix = transcript.slice(0, lane.committedLength);
+    const committedDigest = expectsDigestOf(committedPrefix);
+
+    if (committedDigest !== lane.committedDigest) {
+        ops.push({
+            kind: 'transcript:patch',
+            threadId: lane.targetId as string,
+            expectedLength: lane.committedLength,
+            expects: lane.committedDigest,
+            messages: committedPrefix
+        });
+    }
+
+    // 1b. The append, unchanged. Emitted SECOND on purpose: the fold applies a group in order,
+    //     a patch never changes a length, so an append at `committedLength` lands on the prefix
+    //     the patch above just rewrote — which is what lets one boundary carry a plugin's prune
+    //     of older turns AND the turn it just answered.
     if (transcript.length > lane.committedLength) {
         ops.push({
             kind: 'transcript:append',
@@ -755,14 +833,19 @@ const sendCommit = (ops: SharedMutation[], reason: 'agent_message', turnId?: str
 //   - `applied`  -> adopt what the AUTHORITY wrote (its length/digest, never our guess);
 //   - rejected memory -> adopt the canonical digest the receipt carries, so the next boundary
 //     writes against the real value (this is what makes the retry land);
-//   - rejected transcript append -> the length alone is not enough: the replica needs the
-//     canonical MESSAGES, which `needsRebase` asks for;
+//   - rejected transcript append OR patch -> the length alone is not enough: the replica needs
+//     the canonical MESSAGES, which `needsRebase` asks for;
 //   - rejected archive of a slot another live lane owns -> remember the canonical digest so
 //     this lane stops re-sending an identity it does not hold;
 //   - `group-rolled-back` -> nothing landed, so nothing is adopted.
 const adoptReceipts = (ops: SharedMutation[], receipts: MutationReceipt[]): { needsRebase: boolean; faults: string[] } => {
     const faults: string[] = [];
     let needsRebase = false;
+    // T4.1: whether the CONTENT base needs re-adopting. Only a transcript op that LANDED moves
+    // it; a refused patch or a rolled-back group leaves this replica's prefix exactly where the
+    // authority says it is not, and the base must keep saying that (re-adopting on a refusal
+    // would silently swallow the change the next boundary is supposed to re-send or rebase).
+    let transcriptMoved = false;
 
     for (const receipt of receipts) {
         const op = ops[receipt.opId];
@@ -773,6 +856,13 @@ const adoptReceipts = (ops: SharedMutation[], receipts: MutationReceipt[]): { ne
 
         if (receipt.status === 'applied') {
             if (op.kind === 'transcript:append') state.committedLength = receipt.effect?.length ?? state.committedLength + op.messages.length;
+
+            // T4.1: an applied patch rewrote the committed prefix on CANONICAL state, and this
+            // replica already holds that content (it sent it), so the length does not move while
+            // the content base does. Without this adoption the next boundary would re-derive the
+            // same patch and the plugin's write would be pushed once per tool call forever.
+            if (op.kind === 'transcript:patch') transcriptMoved = true;
+            if (op.kind === 'transcript:append') transcriptMoved = true;
 
             if (op.kind === 'result:archive' && digest !== undefined) {
                 state.archived.set(op.invocationId, digest);
@@ -795,9 +885,16 @@ const adoptReceipts = (ops: SharedMutation[], receipts: MutationReceipt[]): { ne
         if (code === 'group-rolled-back') continue;
 
         if ((op.kind === 'memory:set' || op.kind === 'memory:delete') && digest !== undefined) state.readDigests[op.key] = digest;
-        if (op.kind === 'transcript:append' && code === 'prefix-moved') needsRebase = true;
+        // T4.1: a patch conflicts on the same axis as an append (`prefix-moved`), so it takes the
+        // same action — pull canonical and re-derive. That is also the case where a plugin's
+        // in-place decision is DROPPED in favour of the writer that landed first: the flag is
+        // re-derived from policy on the next round, never merged entry by entry, because a
+        // whole-prefix digest cannot tell the reader which entries it disagreed about.
+        if ((op.kind === 'transcript:append' || op.kind === 'transcript:patch') && code === 'prefix-moved') needsRebase = true;
         if (op.kind === 'result:archive' && code === 'not-writer' && digest !== undefined) state.archived.set(op.invocationId, digest);
     }
+
+    if (transcriptMoved) adoptCommittedBase();
 
     return { needsRebase, faults };
 };
@@ -820,16 +917,30 @@ const syncTranscript = async (): Promise<boolean> => {
 
     if (replica === undefined || targetId === undefined) return false;
 
-    const reply = await raise({ op: 'transcript:sync', threadId: targetId, haveLength: state.committedLength });
+    // T4.1: the pull now states WHAT this replica holds, not only how much, so an in-place
+    // canonical change (a host transcript edit, another lane's committed patch) at the same
+    // length is answered with the whole transcript instead of an empty delta.
+    const reply = await raise({
+        op: 'transcript:sync',
+        threadId: targetId,
+        haveLength: state.committedLength,
+        haveDigest: state.committedDigest
+    });
     const canonical = reply.value as { threadId: string; fromLength: number; length: number; messages: HarnessMessage[]; rebased?: boolean };
+    const rebased = canonical.rebased === true;
 
-    if (canonical.length === state.committedLength) return false;
+    // "Nothing moved" is length AND content: `rebased` says the authority compared this lane's
+    // stated digest against canonical's and they differ, which is exactly the case where the
+    // counts match and the bytes do not.
+    if (canonical.length === state.committedLength && !rebased) return false;
 
     const local = localThreads.messages(targetId);
 
-    // Nothing of ours is waiting to publish: a plain append is enough, and it is legal even
-    // while the run is live (the lane-worker seam deliberately skips the live-run guard).
-    if (local.length === state.committedLength) {
+    // Nothing of ours is waiting to publish, and canonical only got LONGER: a plain append is
+    // enough, and it is legal even while the run is live (the lane-worker seam deliberately
+    // skips the live-run guard). A rebase is NOT that case — the prefix itself moved, so the
+    // answer is the WHOLE transcript and appending it here would duplicate the conversation.
+    if (local.length === state.committedLength && !rebased) {
         try {
             replica.appendThreadMessages(targetId, canonical.messages, state.committedLength);
         } catch {
@@ -837,22 +948,30 @@ const syncTranscript = async (): Promise<boolean> => {
         }
 
         state.committedLength = canonical.length;
+        adoptCommittedBase();
 
         return true;
     }
 
     // Own work is pending, so the delta has to go BETWEEN the adopted prefix and that tail.
-    // `rebased` means canonical got shorter than our base (a reset or an edit): then the whole
-    // canonical transcript is the prefix and our tail follows it.
-    const prefix = canonical.rebased === true ? canonical.messages : [...local.slice(0, canonical.fromLength), ...canonical.messages];
+    // `rebased` means canonical got shorter than our base OR rewrote the part our base covers
+    // (a reset, a host repair, a sibling's patch): then the whole canonical transcript is the
+    // prefix and our tail follows it. The lane's own in-place edit of a committed entry is
+    // dropped by that replace — canonical won the CAS, and the policy that produced the edit
+    // runs again on the next `turn.before` round.
+    const prefix = rebased ? canonical.messages : [...local.slice(0, canonical.fromLength), ...canonical.messages];
 
     try {
         replica.setThreadMessages(targetId, [...prefix, ...local.slice(state.committedLength)]);
     } catch {
+        // Refused while a local run is attached. Nothing is adopted, so the base keeps saying
+        // "my prefix disagrees with canonical", and the next boundary (or the next turn start,
+        // which always syncs before the run attaches) asks again.
         return false;
     }
 
     state.committedLength = prefix.length;
+    adoptCommittedBase();
 
     return true;
 };
@@ -975,6 +1094,16 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
             // boundary, and boundaries are driven by the commit calls below. This callback
             // must never throw: the core swallows observer errors (T3 finding F4's invisibility).
             stateChange: () => undefined,
+            // T1.5's last mile, stated rather than left implied: the HOST has a diagnostic sink
+            // now (../sessions.ts `notePluginDiagnostic`), and this replica does not forward one,
+            // because a report fired inside a hook has no frame to travel on — a closure cannot
+            // cross `worker_threads`, and `protocol.ts` has no diagnostic frame. So a plugin that
+            // throws HERE is still fail-open and still invisible to the authority, exactly like
+            // the plugin-SETTINGS limit documented at ../plugins.ts "WORKER MODE" (both are F5's
+            // one cause: the replica is rebuilt from a record, not from the host's closures). A
+            // lane that cannot run a plugin's shared write says so loudly through its commit
+            // receipts instead; giving the diagnostics a frame is lane-protocol work, not this.
+            diagnostic: () => undefined,
             // N4: an owner question. The runtime registers the request and emits its own
             // action_request / action_answer frames (which ride the event stream), then awaits
             // THIS handler. The question crosses as data, the answer comes back as data, and
@@ -1082,17 +1211,35 @@ const handle = async (frame: LaneCommand): Promise<void> => {
                 for (const brain of Object.values(replica.agents)) brain.reset();
 
                 state.committedLength = localThreads.messages(targetId).length;
+                // T4.1: a reset re-bases the CONTENT half too — the digest of the (now shorter)
+                // prefix this replica holds is the base every later patch is compared against.
+                adoptCommittedBase();
             } else if (firstTurnForTarget) {
                 // A fresh replica was built from the canonical snapshot at hello, so its own
                 // copy IS the canonical prefix at that instant; adopt that length and pull only
                 // what has moved since.
                 state.committedLength = localThreads.messages(targetId).length;
+                // T4.1: and adopt its content. This is the line that makes a RESTARTED lane
+                // correct by construction: the new worker's base is canonical state as of hello,
+                // so the plugin's next `turn.before` decision is diffed against the truth and the
+                // `transcript:patch` it derives lands instead of conflicting with itself.
+                adoptCommittedBase();
             }
 
             // The turn-start delta sync. `frame.fromLength` is the cross-check that proves the
             // two sides may disagree, and the pull closes the gap BEFORE the run starts, so the
             // model context already contains a message another lane sent here.
-            if (state.committedLength !== frame.fromLength) {
+            //
+            // T4.1 adds the CONTENT half of that check. A canonical IN-PLACE change — an operator
+            // repairing one turn's text, or a sibling lane's committed `transcript:patch` — moves
+            // no length at all, so the length test alone would call it "nothing moved" and this
+            // turn would ask the provider with a transcript the authority no longer holds. An
+            // absent `fromDigest` (an older coordinator) keeps the length-only rule, never a guess.
+            const canonicalMoved =
+                state.committedLength !== frame.fromLength ||
+                (frame.fromDigest !== undefined && frame.fromDigest !== state.committedDigest);
+
+            if (canonicalMoved) {
                 await runExclusive(() => syncTranscript());
             }
 

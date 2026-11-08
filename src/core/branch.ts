@@ -38,6 +38,9 @@
 import { HarnessError } from '../util';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import { utf8ByteLength } from './result-budget';
+// The outcome vocabulary + validation for `copyOutcome` below (the branch form of
+// core/snapshot.ts `applyOutcome`). Direct module import, no barrel.
+import { TOOL_OUTCOMES, isToolOutcome } from './tool-outcome';
 import type {
     Agent,
     HarnessAttachment,
@@ -450,6 +453,68 @@ const copyIncluded = (
     if (raw.included === false) message.included = false;
 };
 
+// The stable transcript address (context T1.4): a branch COPIES ids, it never mints or
+// drops one. The fork's entry and the owner's entry are therefore two objects with ONE
+// identity, which is what lets `context.setIncluded(id, …)` name the same turn on the
+// fork round and on the owner round — the addressing the id exists for. Lookup is always
+// scoped to the single transcript this run owns (src/harness.ts `indexOfMessageId`), so
+// the same id repeating in another conversation is not a conflict; the one place a
+// transcript legitimately holds a duplicate is an INCORPORATED branch, where the owner's
+// prefix and the child's copy of that prefix carry the same ids (they name the same
+// turns). Such an id resolves to its first occurrence.
+//
+// Absent stays absent HERE, and the reason is the two-step shape of a fork: this copy
+// produces the MATERIALIZED history (a record, a baseline), and the branch's own framing
+// entries — a pending placeholder (`flushPending`), an incorporation boundary — are
+// created there without an id. They gain one a step later, when that history is seeded as
+// the branch's transcript and core/agent.ts `assignMessageId` mints for an entry that
+// arrived with none (src/harness.fork.test.ts pins both halves: the copied prefix keeps
+// the owner's ids, the branch's own entries are numbered in the branch).
+const copyMessageId = (
+    raw: Record<string, unknown>,
+    message: HarnessMessage,
+    field: string
+): void => {
+    if (raw.messageId === undefined) return;
+
+    if (typeof raw.messageId !== 'string' || raw.messageId.length === 0) {
+        throw new HarnessError(
+            `Branch history message ${field}.messageId must be a non-empty string.`
+        );
+    }
+
+    message.messageId = raw.messageId;
+};
+
+// The persisted tool outcome (compaction T1.4 — the branch form of core/snapshot.ts
+// `applyOutcome`, and the reason a fork can still reason about what a call was). A fork of
+// a transcript that KNOWS a call failed must not silently forget it: `outcome` therefore
+// rides along verbatim, and a fork never re-decides it from the result text (T1.5).
+//
+// The omit rule is the storage rule, so `completed` normalizes to ABSENT exactly like
+// `included: true` does above — the branch materializer must not grow a key the runtime
+// never writes. A value outside the union is REFUSED, not dropped: a mistyped outcome on
+// fork history would otherwise read as a healthy result.
+//
+// A branch's own PENDING PLACEHOLDER (`flushPending`) carries no outcome on purpose: it is
+// not a committed result, and the policy that prunes on an outcome must never see one
+// there (docs/tasks/2026-11-09-progressive-compaction.md T0 Q3).
+const copyOutcome = (
+    raw: Record<string, unknown>,
+    message: Extract<HarnessMessage, { role: 'tool' }>,
+    field: string
+): void => {
+    if (raw.outcome === undefined) return;
+
+    if (!isToolOutcome(raw.outcome)) {
+        throw new HarnessError(
+            `Branch history message ${field}.outcome must be one of: ${TOOL_OUTCOMES.join(', ')} (or be omitted).`
+        );
+    }
+
+    if (raw.outcome !== 'completed') message.outcome = raw.outcome;
+};
+
 // Deep-copy one message and validate its shape. `system` is copied as a system
 // message here; only INCORPORATION demotes child system messages to user data.
 // Attachments are revalidated by the shared gate, which also returns detached
@@ -464,7 +529,7 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
     const role = raw.role;
 
     if (role === 'system') {
-        assertExactKeys(raw, ['role', 'content', 'included'], `Branch history message ${field}`);
+        assertExactKeys(raw, ['role', 'content', 'included', 'messageId'], `Branch history message ${field}`);
         if (typeof raw.content !== 'string') {
             throw new HarnessError(`Branch history message ${field}.content must be a string.`);
         }
@@ -474,13 +539,17 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
             content: raw.content
         };
         copyIncluded(raw, message, field);
+        copyMessageId(raw, message, field);
         return message;
     }
 
     if (role === 'user') {
+        // `messageId` is admitted for the same reason as `included`: a fork of a
+        // transcript whose entries carry ids must COPY them, not refuse the fork
+        // (context T1.4).
         assertExactKeys(
             raw,
-            ['role', 'content', 'attachments', 'included'],
+            ['role', 'content', 'attachments', 'included', 'messageId'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
@@ -496,13 +565,14 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
             : { role: 'user', content: raw.content };
 
         copyIncluded(raw, message, field);
+        copyMessageId(raw, message, field);
         return message;
     }
 
     if (role === 'assistant') {
         assertExactKeys(
             raw,
-            ['role', 'content', 'toolCalls', 'reasoning', 'included'],
+            ['role', 'content', 'toolCalls', 'reasoning', 'included', 'messageId'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
@@ -550,6 +620,7 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
         }
 
         copyIncluded(raw, message, field);
+        copyMessageId(raw, message, field);
         return message;
     }
 
@@ -559,9 +630,11 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
         // autoanswer fails on a transcript that merely contains a download.
         // `included` is the context-inclusion flag; same rule — a fork of a
         // transcript that disables a turn must admit the key or refuse the fork.
+        // `outcome` is the persisted tool outcome (compaction T1.4); same rule
+        // again — a harness that recorded a failure must be forkable at all.
         assertExactKeys(
             raw,
-            ['role', 'content', 'toolCallId', 'name', 'attachments', 'included'],
+            ['role', 'content', 'toolCallId', 'name', 'attachments', 'outcome', 'included', 'messageId'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
@@ -601,7 +674,9 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
             }
         }
 
+        copyOutcome(raw, message, field);
         copyIncluded(raw, message, field);
+        copyMessageId(raw, message, field);
         return message;
     }
 

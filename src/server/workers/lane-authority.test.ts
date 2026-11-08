@@ -13,7 +13,8 @@
 //     refused and the canonical digest comes back (T3 F4/F7);
 //   - routed `runtime` operations mutate the canonical store with a core-minted id (the
 //     central task mutation worker mode promises), and a cross-thread send from a lane
-//     appends into the target conversation (D2 linearizable reads at a committed boundary);
+//     starts the target conversation at the authority (D2 linearizable reads at a
+//     committed boundary);
 //   - a retired epoch changes nothing, ever (T3 F9);
 //   - the identity ledger is seeded with the CORE's units, so a lease can never mint an id
 //     that makes a snapshot invalid (T3 F1).
@@ -27,12 +28,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '@underload/harness';
-import type { Harness, HarnessStream, HarnessStreamEvent } from '@underload/harness';
+import type { Harness, HarnessMessage, HarnessStream, HarnessStreamEvent } from '@underload/harness';
 import { canonicalViewOf, createLaneAuthority } from './lane-authority';
 import { expectsDigestOf } from './lane-commit';
 import type { MutationGroup } from './lane-commit';
 import { ABSENT_DIGEST, digestMemoryValue } from './lane-memory';
-import { TASK_DEFAULT_LEASE_MS } from '../../core/task';
+
 
 // A scripted stream that never talks to a provider: the authority tests are about state,
 // and a run here would only add latency.
@@ -95,8 +96,8 @@ describe('canonical view: built from the REAL snapshot, in the core units', () =
         const authority = authorityFor(core);
 
         // An empty store publishes nextId 1, i.e. "nothing has been issued yet".
-        expect(authority.ledger.watermarkOf('record:todos')).toBe(0);
-        expect(authority.ledger.publishedOf('record:todos')).toBe(1);
+        expect(authority.ledger.watermarkOf('record')).toBe(0);
+        expect(authority.ledger.publishedOf('record')).toBe(1);
         // The thread watermark is the highest existing thread sequence, in last-used units.
         expect(authority.ledger.watermarkOf('thread')).toBeGreaterThanOrEqual(1);
         expect(authority.ledger.publishedOf('thread')).toBe(authority.ledger.watermarkOf('thread'));
@@ -211,6 +212,225 @@ describe('commit: the transcript append is the canonical conversation', () => {
         expect(intruder.complete).toBe(false);
         expect(intruder.receipts[0].rejection?.code).toBe('not-writer');
         expect(core.threadMessages(thread.id)).toHaveLength(0);
+    });
+});
+
+// pipeline T4.1 (and context-inclusion T3, whose acceptance artifact this is): the in-place
+// write a lane's plugin makes on an ALREADY-COMMITTED entry — the `included` flag, and the text
+// `edit` changes — must reach the AUTHORITY's conversation, be reported there so the server
+// persists it, and survive the trip a restart takes. Before T4 the lane owed only appended
+// slices, so this whole class of write died with the worker process (finding F6).
+describe('commit: an in-place change to the committed prefix becomes canonical state (T4.1)', () => {
+    // A conversation this lane already published: a question and its answer, both committed, so
+    // everything the cases below change is inside the lane's ADOPTED prefix.
+    const seed = (core: Harness, threadId: string): HarnessMessage[] => {
+        core.setThreadMessages(threadId, [
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'answer' }
+        ] as never);
+
+        // The canonical form, including the addresses the core minted on the way in: a lane's
+        // replica holds exactly these objects, and its `expects` digest is taken over them.
+        return core.threadMessages(threadId);
+    };
+
+    it('lands a flag and a text edit on the canonical conversation and reports ONE agent_message', () => {
+        const reported: string[] = [];
+        const core = harness({
+            agents: {
+                primary: agent({ name: 'primary', model: 'm', instructions: 'Test primary.', stream: quiet() })
+            },
+            presets: false,
+            // The server's durability mechanism is this observer (../sessions.ts
+            // `noteStateChange`), so the count and the reason are the thing under test: a lane
+            // patch that never notified would land in memory and be lost at the next restart.
+            report: {
+                progress: async () => undefined,
+                stateChange: (event) => reported.push(`${event.reason}:${event.agent ?? ''}`)
+            }
+        });
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+        const committed = seed(core, thread.id);
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+        reported.length = 0;
+
+        const patched = [
+            { ...committed[0], included: false },
+            { ...committed[1], content: 'answer, rewritten by the plugin' }
+        ];
+
+        const outcome = authority.commit(EPOCH_A, group(1, [
+            {
+                kind: 'transcript:patch',
+                threadId: thread.id,
+                expectedLength: 2,
+                expects: digestMemoryValue(committed),
+                messages: patched
+            }
+        ]));
+
+        expect(outcome.complete).toBe(true);
+        // The receipt reports the PREFIX scope (the part this lane holds), not the whole
+        // transcript — the rule ./lane-commit.ts states and the lane's base adopts.
+        expect(outcome.receipts[0].effect).toEqual({ length: 2, digest: digestMemoryValue(patched) });
+
+        // THE AUTHORITY's transcript, read back through the core's own reader: the flag and the
+        // new text are canonical state now, addresses preserved.
+        expect(core.threadMessages(thread.id)).toEqual([
+            { role: 'user', content: 'question', messageId: 'msg-1', included: false },
+            { role: 'assistant', content: 'answer, rewritten by the plugin', messageId: 'msg-2' }
+        ]);
+
+        // And the write is durable-by-notification: exactly one `agent_message`, the same reason
+        // every other transcript write reports (no new reason, no per-entry storm).
+        expect(reported).toEqual(['agent_message:primary']);
+
+        // The restart primitive: the committed snapshot carries the flag and the text, and a
+        // harness restored from it answers the same way. This is the half the contract sentence
+        // used to disclaim (src/types/index.ts `setIncluded`, PERSISTENCE — PRECISE SCOPE).
+        const snapshot = JSON.parse(JSON.stringify(core.snapshot())) as never;
+        // The SAME harness configuration, freshly built and never told a plugin existed: what a
+        // server process looks like after a restart.
+        const rebuilt = harness({
+            agents: {
+                primary: agent({ name: 'primary', model: 'm', instructions: 'Test primary.', stream: quiet() })
+            },
+            presets: false
+        });
+
+        rebuilt.restore(snapshot);
+
+        expect(rebuilt.threadMessages(thread.id)).toEqual([
+            { role: 'user', content: 'question', messageId: 'msg-1', included: false },
+            { role: 'assistant', content: 'answer, rewritten by the plugin', messageId: 'msg-2' }
+        ]);
+    });
+
+    it('refuses a stale digest with prefix-moved and changes neither the transcript or the store', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+        const committed = seed(core, thread.id);
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // Canonical moved first: the coordinator wrote its own answer into entry 1.
+        core.patchThreadMessages(
+            thread.id,
+            [committed[0], { ...committed[1], content: 'answer, written by the host' }],
+            2
+        );
+
+        const outcome = authority.commit(EPOCH_A, group(2, [
+            {
+                kind: 'transcript:patch',
+                threadId: thread.id,
+                expectedLength: 2,
+                // The digest from BEFORE the host write: exactly what a lane holds when canonical
+                // moves under it.
+                expects: digestMemoryValue(committed),
+                messages: [committed[0], { ...committed[1], content: 'answer, from the lane' }]
+            }
+        ]));
+
+        expect(outcome.complete).toBe(false);
+        expect(outcome.receipts[0].status).toBe('rejected');
+        expect(outcome.receipts[0].rejection?.code).toBe('prefix-moved');
+        // The canonical facts ride the refusal so the lane can re-read and re-derive.
+        expect(outcome.receipts[0].effect).toEqual({
+            length: 2,
+            digest: digestMemoryValue(core.threadMessages(thread.id))
+        });
+        expect(core.threadMessages(thread.id).map((message) => message.content)).toEqual([
+            'question',
+            'answer, written by the host'
+        ]);
+    });
+
+    it('refuses a patch that would move a committed entry\'s role or address, and writes nothing', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+        const committed = seed(core, thread.id);
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // Same digest, same length — the CAS passes and the CORE seam is what refuses, so the
+        // group is partial and the canonical transcript is untouched (T10's bounded-prefix rule).
+        const roleSwap = authority.commit(EPOCH_A, group(2, [
+            {
+                kind: 'transcript:patch',
+                threadId: thread.id,
+                expectedLength: 2,
+                expects: digestMemoryValue(committed),
+                messages: [
+                    // entry 0 turns into an assistant message: provider pairing and the exclusion
+                    // unit both resolve on role, so this is a different turn, not an edit.
+                    { ...committed[0], role: 'assistant' },
+                    committed[1]
+                ]
+            }
+        ]));
+
+        expect(roleSwap.complete).toBe(false);
+        expect(roleSwap.receipts[0].rejection?.code).toBe('invalid-mutation');
+        expect(roleSwap.receipts[0].rejection?.message).toBe(
+            'Thread "' + thread.id + '" patch would change entry 0 from "user" to "assistant"; a committed entry keeps its role.'
+        );
+
+        const movedAddress = authority.commit(EPOCH_A, group(3, [
+            {
+                kind: 'transcript:patch',
+                threadId: thread.id,
+                expectedLength: 2,
+                expects: digestMemoryValue(committed),
+                messages: [
+                    // An address is how a LATER round names this turn (`setIncluded(messageId)`);
+                    // rewriting it would silently re-point the caller's own decision.
+                    { ...committed[0], messageId: 'msg-9' },
+                    committed[1]
+                ]
+            }
+        ]));
+
+        expect(movedAddress.complete).toBe(false);
+        expect(movedAddress.receipts[0].rejection?.message).toBe(
+            'Thread "' + thread.id + '" patch would move entry 0 from address "msg-1" to "msg-9"; a committed entry keeps its address.'
+        );
+
+        expect(core.threadMessages(thread.id)).toEqual(committed);
+    });
+
+    it('keeps the tail a coordinator appended after this lane read its prefix', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+        const committed = seed(core, thread.id);
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // A sibling's send grew the conversation after the lane adopted its 2-entry base.
+        core.appendThreadMessages(thread.id, [{ role: 'user', content: 'from a sibling lane' }], 2);
+
+        const outcome = authority.commit(EPOCH_A, group(2, [
+            {
+                kind: 'transcript:patch',
+                threadId: thread.id,
+                expectedLength: 2,
+                expects: digestMemoryValue(committed),
+                messages: [{ ...committed[0], included: false }, committed[1]]
+            }
+        ]));
+
+        expect(outcome.complete).toBe(true);
+        // The patch rewrote [0..2] and left the sibling's message exactly where canonical put it.
+        expect(core.threadMessages(thread.id)).toEqual([
+            { role: 'user', content: 'question', messageId: 'msg-1', included: false },
+            { role: 'assistant', content: 'answer', messageId: 'msg-2' },
+            { role: 'user', content: 'from a sibling lane', messageId: 'msg-3' }
+        ]);
     });
 });
 
@@ -341,8 +561,8 @@ describe('routed operations: the canonical harness performs the shared work', ()
 
         const first = await authority.answer(EPOCH_A, {
             op: 'runtime',
-            method: 'executeRecordTool',
-            name: 'task',
+            method: 'executeRecords',
+            name: 'tasks',
             parameters: { tasks: [{ text: 'from lane A' }] },
             identity: { agent: 'primary', threadId: 'thread-1', runDepth: 1 }
         });
@@ -353,8 +573,8 @@ describe('routed operations: the canonical harness performs the shared work', ()
         // minted, which is the whole point of routing instead of merging.
         const second = await authority.answer(EPOCH_B, {
             op: 'runtime',
-            method: 'executeRecordTool',
-            name: 'task',
+            method: 'executeRecords',
+            name: 'tasks',
             parameters: {},
             identity: { agent: 'primary', threadId: 'thread-2', runDepth: 1 }
         });
@@ -364,8 +584,8 @@ describe('routed operations: the canonical harness performs the shared work', ()
 
         // The ledger ADOPTED the id the core minted, so the next lease this session hands a
         // lane starts after it (T3 finding F1's collision, prevented at the source).
-        expect(authority.ledger.publishedOf('record:todos')).toBe(2);
-        expect(first.sync?.identities?.['record:todos']).toBe(1);
+        expect(authority.ledger.publishedOf('record')).toBe(2);
+        expect(first.sync?.identities?.['record']).toBe(1);
     });
 
     it('delivers a cross-thread message into the target conversation', async () => {
@@ -383,14 +603,37 @@ describe('routed operations: the canonical harness performs the shared work', ()
             identity: { agent: 'primary', threadId: 'thread-1' }
         });
 
-        expect(sent.value).toMatchObject({ threadId: target.id, delivered: 'appended', sender: 'primary' });
+        // STATE-AWARE delivery (delegate-stress T3.2/T3.6, src/harness.ts
+        // `postThreadMessage`): an idle target is no longer an inert append, so the
+        // authority reports that it STARTED a run. Routing is unchanged — the send is
+        // still answered at the canonical harness, never in the calling replica — and
+        // the receipt is still non-blocking, which is what keeps `threadSend` out of
+        // the nested-run door set (./capability.ts `NESTED_RUN_ARMED_DOORS`).
+        expect(sent.value).toEqual({
+            threadId: target.id,
+            delivered: 'started',
+            sender: 'primary'
+        });
 
-        // The delivered message is the core's own format (it attributes the sender inside the
-        // text), so the assertion is containment, not an invented exact string.
-        const delivered = core.threadMessages(target.id).map((message) => (message as { content: string }).content);
+        // The delivered message is the run's own root prompt, so it appears as the
+        // first user turn the moment the run commits it. The receipt did NOT wait for
+        // the answer, hence the bounded wait for the scripted run to settle below —
+        // exact assertions, not a race with the run's own appends.
+        const deliveredUpTo = async (): Promise<string[]> =>
+            core.threadMessages(target.id).map((message) => (message as { content: string }).content);
 
-        expect(delivered).toHaveLength(1);
-        expect(String(delivered[0])).toContain('hello from a lane');
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+            if (core.thread(target.id)?.status === 'idle' && (await deliveredUpTo()).length > 0) break;
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+
+        // The delivered text is the core's own attribution format, stated exactly.
+        const delivered = await deliveredUpTo();
+
+        expect(delivered).toEqual([
+            'from agent "primary":\nhello from a lane',
+            'unused'
+        ]);
 
         // The roster read is answered from the canonical state, so a lane never needs to
         // guess what conversations exist (decision D2).
@@ -478,8 +721,8 @@ describe('routed task writes: the canonical store owns the compare-and-swap', ()
     ): Promise<TaskPageValue> => {
         const answer = await authority.answer(laneEpoch, {
             op: 'runtime',
-            method: 'executeRecordTool',
-            name: 'task',
+            method: 'executeRecords',
+            name: 'tasks',
             parameters,
             identity: { agent, threadId, runDepth: 1 }
         });
@@ -547,7 +790,13 @@ describe('routed task writes: the canonical store owns the compare-and-swap', ()
                 expects: [{ id: '1', rev: 1 }]
             })
         ).rejects.toThrow(
-            'task "1" changed since revision 1 (now 2, last edited by "primary"); re-read and retry; changed fields: text.'
+            // The engine's ONE CAS sentence (src/core/records.ts `staleRecordError`), whose
+            // message starts with the `stale-record:` code: current rev, last editor AND the
+            // instant, the changed fields, then R9's recovery hint and the current record.
+            // The label is the TOOL name, because the lane called the `tasks` wrapper.
+            'tasks "1" changed since revision 1 (now 2, last edited by "primary" at ' +
+                EPOCH_ISO +
+                '); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true.'
         );
 
         // The refusal moved nothing anywhere: B's text, rev 2 and the two recorded
@@ -602,71 +851,7 @@ describe('routed task writes: the canonical store owns the compare-and-swap', ()
         // The lane's own replica base cannot drift: the answer the authority hands back
         // IS the canonical page, and the identity ledger still points past the id the
         // core minted.
-        expect(authority.ledger.publishedOf('record:todos')).toBe(2);
-    });
-
-    it('enforces a lane claim through the canonical store, and takes it over', async () => {
-        const core = coreOf();
-        const authority = authorityFor(core);
-        const threadA = core.createThread('primary');
-        const threadB = core.createThread('primary');
-
-        await routedTask(authority, EPOCH_A, 'primary', threadA.id, { tasks: [{ text: 'one writers edit' }] });
-
-        // Lane A holds the record; lane B's guarded patch is refused with the holder
-        // and the expiry, exactly as an inline refusal reads.
-        const claimed = await routedTask(authority, EPOCH_A, 'primary', threadA.id, { claim: ['1'] });
-
-        expect(claimed.tasks[0]).toEqual({
-            id: '1',
-            text: 'one writers edit',
-            completed: false,
-            rev: 1,
-            updatedBy: 'primary',
-            updatedThreadId: threadA.id,
-            updatedAt: EPOCH_ISO,
-            owner: 'primary',
-            ownerThreadId: threadA.id,
-            // The tool's default lease (src/core/task.ts TASK_DEFAULT_LEASE_MS).
-            leaseUntil: EPOCH_MS + TASK_DEFAULT_LEASE_MS
-        });
-        // A claim is ownership, not content: the token lane B holds is still valid.
-        expect(claimed.storeRev).toBe(2);
-
-        await expect(
-            routedTask(authority, EPOCH_B, 'primary', threadB.id, {
-                tasks: [{ id: '1', completed: true }],
-                expects: [{ id: '1', rev: 1 }]
-            })
-        ).rejects.toThrow(
-            `task "1" is claimed by "primary" until ${new Date(EPOCH_MS + TASK_DEFAULT_LEASE_MS).toISOString()}; release it or take it over first.`
-        );
-
-        // The store is untouched by the refusal, and `takeover` is the override the
-        // other lane has: it moves the holder and leaves `rev` alone.
-        const taken = await routedTask(authority, EPOCH_B, 'primary', threadB.id, { takeover: ['1'] });
-
-        expect(taken.tasks[0]).toEqual({
-            id: '1',
-            text: 'one writers edit',
-            completed: false,
-            rev: 1,
-            updatedBy: 'primary',
-            updatedThreadId: threadB.id,
-            updatedAt: EPOCH_ISO,
-            owner: 'primary',
-            ownerThreadId: threadB.id,
-            leaseUntil: EPOCH_MS + TASK_DEFAULT_LEASE_MS
-        });
-
-        const writable = await routedTask(authority, EPOCH_B, 'primary', threadB.id, {
-            tasks: [{ id: '1', completed: true }],
-            expects: [{ id: '1', rev: 1 }]
-        });
-
-        expect(writable.tasks[0].completed).toBe(true);
-        expect(writable.tasks[0].rev).toBe(2);
-        expect(writable.storeRev).toBe(4);
+        expect(authority.ledger.publishedOf('record')).toBe(2);
     });
 });
 
@@ -962,6 +1147,86 @@ describe('answer: the canonical transcript delta and the routed thread read (T10
         expect(behind.value).toMatchObject({ fromLength: 0, length: 2, rebased: true });
     });
 
+    // pipeline T4.1: the PULL half now sees CONTENT, not only counts. An in-place canonical
+    // change — an operator repairing one turn's text, or a sibling lane's committed
+    // `transcript:patch` — moves no length, so the delta rule above answers "nothing missing" and
+    // the replica would run its next turn on a transcript the authority no longer holds.
+    it('rebases when the prefix this replica holds changed IN PLACE at the same length (T4.1)', async () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        authority.commit(EPOCH_A, group(1, [
+            {
+                kind: 'transcript:append',
+                threadId: thread.id,
+                fromLength: 0,
+                messages: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'second' }]
+            }
+        ]));
+
+        const adopted = core.threadMessages(thread.id);
+        const levelDigest = digestMemoryValue(adopted);
+
+        // The pre-T4 answer at the lane's own length: an empty delta, "you are level".
+        const level = await authority.answer(EPOCH_A, {
+            op: 'transcript:sync',
+            threadId: thread.id,
+            haveLength: 2,
+            haveDigest: levelDigest
+        });
+
+        expect((level.value as { messages: unknown[]; rebased?: boolean }).messages).toEqual([]);
+        expect((level.value as { rebased?: boolean }).rebased).toBeUndefined();
+
+        // An operator edits entry 1 without changing the length — the exact write the digest
+        // exists to see.
+        core.patchThreadMessages(
+            thread.id,
+            [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'second, repaired by the host', messageId: 'msg-2' }],
+            2
+        );
+
+        const moved = await authority.answer(EPOCH_A, {
+            op: 'transcript:sync',
+            threadId: thread.id,
+            haveLength: 2,
+            haveDigest: levelDigest
+        });
+        const rebased = moved.value as { fromLength: number; length: number; rebased?: boolean; messages: { content: string }[] };
+
+        expect(rebased.rebased).toBe(true);
+        expect(rebased.fromLength).toBe(0);
+        expect(rebased.length).toBe(2);
+        expect(rebased.messages.map((message) => message.content)).toEqual(['first', 'second, repaired by the host']);
+
+        // A stale digest with canonical AHEAD of the lane still answers the delta it is missing,
+        // and a lane that states no digest at all keeps the pre-T4 answer: an older worker is
+        // never refused for not knowing the field.
+        core.appendThreadMessages(thread.id, [{ role: 'user', content: 'third' }], 2);
+
+        const ahead = await authority.answer(EPOCH_A, {
+            op: 'transcript:sync',
+            threadId: thread.id,
+            haveLength: 2,
+            haveDigest: levelDigest
+        });
+
+        expect((ahead.value as { rebased?: boolean }).rebased).toBe(true);
+        expect((ahead.value as { messages: { content: string }[] }).messages.map((message) => message.content)).toEqual([
+            'first',
+            'second, repaired by the host',
+            'third'
+        ]);
+
+        const unstatement = await authority.answer(EPOCH_A, { op: 'transcript:sync', threadId: thread.id, haveLength: 2 });
+
+        expect((unstatement.value as { fromLength: number; length: number; rebased?: boolean }).rebased).toBeUndefined();
+        expect((unstatement.value as { messages: { content: string }[] }).messages.map((message) => message.content)).toEqual(['third']);
+    });
+
     it('reads a conversation this lane never created from the canonical harness (S1)', async () => {
         const core = coreOf();
         const authority = authorityFor(core);
@@ -1022,7 +1287,7 @@ describe('refusals a lane can act on (T10 S5/S8)', () => {
         const core = coreOf();
         const authority = authorityFor(core);
 
-        await expect(authority.answer(EPOCH_A, { op: 'execute:tool', name: 'task', parameters: {} })).rejects.toThrow(/operator invocation frame/);
+        await expect(authority.answer(EPOCH_A, { op: 'execute:tool', name: 'tasks', parameters: {} })).rejects.toThrow(/operator invocation frame/);
         await expect(authority.answer(EPOCH_A, { op: 'execute:command', line: '/reset' })).rejects.toThrow(/executes it on its own CPU/);
     });
 });

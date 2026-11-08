@@ -731,7 +731,7 @@ describe('SessionStore task queue', () => {
         expect(() => store.assertRunnable(created.id)).toThrow(
             'A task is already running in this session.'
         );
-        await expect(store.callTool(created.id, 'task', {})).rejects.toMatchObject({
+        await expect(store.callTool(created.id, 'tasks', {})).rejects.toMatchObject({
             status: 409,
             message: 'A task is running in this session; try again when it finishes.'
         });
@@ -1502,14 +1502,14 @@ describe('queue HTTP contract', () => {
 
         expect(watched.snapshot.turns).toEqual([]);
 
-        const taskStarted = fixture.started('task');
-        const task = await runtime.store.enqueue(id, 'task');
+        const taskStarted = fixture.started('tasks');
+        const task = await runtime.store.enqueue(id, 'tasks');
         const taskId = task.turn.id;
 
         // The task parks on its gate until this test releases it; the queue drain
         // only happens after that, so release before waiting for idle.
         await taskStarted.promise;
-        fixture.gate('task').resolve();
+        fixture.gate('tasks').resolve();
 
         await runtime.store.waitForIdle(id);
         unsubscribeHub();
@@ -1518,12 +1518,12 @@ describe('queue HTTP contract', () => {
         // One ordered publish per change: row, run, three events, terminal row, drain
         // snapshot — the same sequence a client would page through.
         expect(recorded.map(frameKey)).toEqual([
-            'turn:queued:task',
-            'turn:running:task',
+            'turn:queued:tasks',
+            'turn:running:tasks',
             `event:start:${taskId}`,
             `event:text:${taskId}`,
             `event:done:${taskId}`,
-            'turn:done:task',
+            'turn:done:tasks',
             'snapshot'
         ]);
 

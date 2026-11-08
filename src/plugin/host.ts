@@ -10,8 +10,10 @@
 //     needs async work does it in a lifecycle hook (the bus AWAITS handlers) or lazily
 //     on first use — either way the call site does not change shape.
 //   - Setup receives a HarnessPluginApi: the live registries, createAgent/addTool/
-//     addCommand, the lifecycle bus (`on`), THIS plugin's scoped `settings`, and the
-//     harness-control surface (`threads`, enable/disable tool, `async`, `config`).
+//     addCommand, the lifecycle bus (`on`), THIS plugin's scoped `settings` (read, and one
+//     namespaced write — `setOwn`, T3.5), the harness-control surface (`threads`,
+//     enable/disable tool, `async`, `config`), and the host's own persisted-state read
+//     (`snapshot`, T3.5 — a detached document, safe mid-run).
 //
 // APPLICATION ORDER (the part that must never be surprising)
 // ----------------------------------------------------------
@@ -44,10 +46,14 @@ import { HarnessError } from '../util';
 import { createPluginSettingsView } from './settings';
 import type { HarnessHookBus } from './hooks';
 import type {
+    HarnessHookOptions,
+    HarnessLifecycleEvent,
+    HarnessLifecycleHandler,
     HarnessPlugin,
     HarnessPluginApi,
     HarnessPluginMetadata,
-    HarnessPluginSettingsProvider
+    HarnessPluginSettingsProvider,
+    HarnessWildcardHandler
 } from '../types';
 
 // The shared half of the api: everything except the two per-plugin members. The
@@ -149,10 +155,34 @@ export const runPlugins = (options: HarnessPluginHostOptions): HarnessPluginHost
         const api: HarnessPluginApi = {
             ...apiBase,
             settings: createPluginSettingsView(plugin.name, settings, declared.settings),
+            // T4.5 — the diagnostic channel, attributed. The base api is shared by every
+            // plugin and reports as 'harness'; a policy report has to name the plugin that
+            // made it, or an operator reading one stream cannot tell the compactor's decisions
+            // from a host subscription's. Everything else (the sink, the empty-message drop,
+            // the throw-proof wrapper) stays the base implementation.
+            report: {
+                diagnostic: (report) => apiBase.report.diagnostic({ ...report, owner: plugin.name })
+            },
             // `api` is passed back to the bus so `turn.before` hands THIS plugin its
             // own scoped api. Declared-before-assignment is fine: the bus only reads it
-            // during an emit, which cannot happen before setup() has returned.
-            on: (event, handler) => hooks.on(event, handler, { owner: plugin.name, api })
+            // when it runs, which cannot happen before setup() has returned.
+            //
+            // T1.3/T1.4 — the author's `{ priority, timeoutMs }` ride through into the
+            // bus registration unchanged; the bus owns every default (0, unbounded), so
+            // an author who passes nothing gets exactly what every plugin has always
+            // gotten. The cast is only because `api.on` is an OVERLOAD pair (named vs
+            // `'*'`, T1.1) and an implementation arrow cannot be inferred against two
+            // signatures at once — the runtime body is the same for both forms.
+            on: ((
+                event: HarnessLifecycleEvent | '*',
+                handler: HarnessLifecycleHandler<HarnessLifecycleEvent> | HarnessWildcardHandler,
+                options?: HarnessHookOptions
+            ) =>
+                hooks.on(
+                    event as HarnessLifecycleEvent,
+                    handler as HarnessLifecycleHandler<HarnessLifecycleEvent>,
+                    { owner: plugin.name, api, ...(options ?? {}) }
+                )) as unknown as HarnessPluginApi['on']
         };
 
         plugin.setup?.(api);

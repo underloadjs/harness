@@ -75,13 +75,14 @@ describe('tools folder consolidation (R7)', () => {
             'actionRequest.tool.ts',
             'agentManage.tool.ts',
             'agentResult.tool.ts',
-            'chapterManage.tool.ts',
+            'chapters.tool.ts',
             'delegate.tool.ts',
             'fetch.tool.ts',
-            'locationManage.tool.ts',
-            'profileManage.tool.ts',
+            'locations.tool.ts',
+            'profiles.tool.ts',
+            'records.tool.ts',
             'search.tool.ts',
-            'task.tool.ts',
+            'tasks.tool.ts',
             'threadFork.tool.ts',
             'threadList.tool.ts',
             'threadRead.tool.ts',
@@ -106,10 +107,12 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'delegate',
@@ -264,10 +267,12 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'delegate',
@@ -464,7 +469,7 @@ describe('generated manifest parity (R9)', () => {
         // 30 generated rows: the 29 package entries before this change (including
         // the `download` preset, order 235) plus the `threadRead` runtime entry
         // (order 265) that reads a thread transcript.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(30);
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(31);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');
@@ -511,7 +516,7 @@ describe('compatibility facade (R9)', () => {
     it('keeps the historical always-declared core order', () => {
         expect(coreToolMetadata().map((row) => row.name)).toEqual([
         'toolRequest',
-        'task',
+        'tasks',
         'search',
         'fetch',
         ]);

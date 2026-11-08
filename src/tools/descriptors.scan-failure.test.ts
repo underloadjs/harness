@@ -62,7 +62,7 @@ describe('live catalogue scan failures (T24)', () => {
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
         // 30 package rows: the 29 historical entries plus the `threadRead` runtime
         // entry (order 265).
-        expect(TOOL_DESCRIPTORS).toHaveLength(30);
+        expect(TOOL_DESCRIPTORS).toHaveLength(31);
         expect(PRESET_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual([
             'syntax',
             'read',

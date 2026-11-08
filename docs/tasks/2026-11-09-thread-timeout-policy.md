@@ -1,6 +1,8 @@
 # Thread time limits — the default must be "no limit"
 
-Status: **open — policy change, not a defect report.** Written from a source audit
+Status: **closed 2026-11-09 — policy change, implemented; T0-T9 all CLOSED (the dated
+`LANDED` / `ANSWERED` notes under each task name the file and the test; nothing is
+committed, the work sits in the package working tree).** Written from a source audit
 (no live session was run for this entry, see *Not tested*), against revision
 `44cdbbe` ("Upgraded Task Logic") of the **`@underload/harness` package repository**
 (which is its own git repo at `packages/underload/harness/.git`, not the workspace
@@ -12,6 +14,17 @@ and line numbers will move.
 Written for an agent that did not do the audit and that must **verify the premises
 before implementing** — this document is a specification of intent plus a map of the
 surface, not a guarantee that the surface still looks like this.
+
+**STATUS 2026-11-09 — IMPLEMENTED (working tree of the package repo; nothing
+committed, per the assignment).** Every task T0-T9 is closed and each task section
+below carries a dated `LANDED` / `ANSWERED` note naming the file and the test that
+closes it. The drift check re-ran clean against HEAD `afb38f1` ("Updated List", the
+commit after the `44cdbbe` this entry was written against) with **one premise
+overturned**: the `toolCancel`-discoverability claim F5/T7 inherited from the sibling
+entry had already been fixed at `44cdbbe` itself (see the `corrected` note at F5).
+The verification actually run is recorded at T5 and T9; the two `test:package:tools`
+failures are pre-existing at `afb38f1` (proved by a fresh build in a pristine
+worktree of HEAD) and are unrelated to this change.
 
 ## Date / Method / Scope
 
@@ -166,6 +179,15 @@ surface that applies to must be decided, not averaged (T6).
 
 ### F5. Dropping the finite default re-opens exactly the hole T28 closed, and today the only recovery is a control the model reportedly cannot find
 
+**CORRECTED 2026-11-09 (the second half of this heading is no longer true).** The
+recovery is a control the model CAN now find: sibling tasks **T1.2** (report
+conditionally-declared core tools in `alreadyAvailable`) and **T1.3** (name
+`toolCancel` in the `status: 'pending'` envelope) had already landed at `44cdbbe`,
+before this entry was written — see the corrected note under the two sharp edges and
+at T7. The first half of the heading (the hole T28 closed) stands: an unbounded child
+is only recoverable because those two fixes exist, which is why they are a
+precondition of this policy rather than an unrelated improvement.
+
 T28's own comment (`src/core/agent-limits.ts:29-33`) says the finite default exists
 because a frozen child otherwise "sat `running` indefinitely" and `toolCancel` was
 the only recovery. Making the default unbounded moves that risk back out, so the
@@ -192,11 +214,25 @@ Two sharp edges to verify rather than assume:
   (`matched: 0` by name, regex, and tag; absent from `alreadyAvailable`) —
   `2026-11-08-delegate-stress-test.md:70-110`, tasks T1.1-T1.4. With no default clock,
   an undiscoverable `toolCancel` means a stuck child has **no practical recovery**.
+  **CORRECTED 2026-11-09 — it is discoverable.** `declaredForDiscovery`
+  (`src/harness.ts`, the "T28: the set toolRequest reports as `alreadyAvailable`"
+  helper) appends the pending-only control to the declared set under exactly the
+  condition `offerDeclarations` declares it, excluding the asking `toolRequest` call
+  itself, and the projection placeholder for a still-running call says *"use toolCancel
+  with this callId to abandon it"*. Pinned by
+  `src/harness.already-available.test.ts` (`toolCancel discovery (T28)`) and, for the
+  delegation envelope, by the new
+  `src/harness.delegation.test.ts` › *pending delegation placeholder
+  (delegate-stress T1.3/T1.4)*.
 - The wake is a **plugin**, so a deployment that disables `async-ping` (or a settings
   document that pins its `intervalMs`) can make an unbounded child invisible. Whether
   the child's *own* hung tool call gets its wake, or only the parent's, is untested
   here (`async-ping` keys its per-agent timer on scheduler identity,
   `src/plugins/async-ping.plugin.ts:100-105`).
+  **MEASURED 2026-11-09 (T8): the child gets its own wake.** The plugin arms per
+  scheduler identity, and a delegated child is its own actor, so the child is woken
+  and its own inspecting turn declares `toolCancel` — see the dated result at T8 for
+  both configurations (heartbeat shipped vs replaced).
 
 Related: a run's pending work is **interrupted, not resumed, across a restart**
 (`knowledge.md:1901-1903`, `README.md:1661-1665`). An unbounded child that was
@@ -217,6 +253,26 @@ the 16-request ceiling the thing that actually ends a long child.
 speak only about time, so the recommendation is to leave it alone and say so in the
 docs (T4.3). If the requester meant "no bound of any kind", that is a different,
 larger change and must come back as a new finding rather than being folded in.
+
+**LIST AMENDED 2026-11-09 (T2.5 of
+[2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) landed).** A
+`turn.before` **`stop` decision** (`HarnessTurnDecision`,
+`src/types/index.ts`; consumed in `requestTurn` via `applyTurnDecision` in
+`src/harness.ts`) is now a **fourth** way a run can end before its final answer, next
+to `maxIterations`, `MAX_RUN_DEPTH` and the record caps. It does **not** touch R1/R2:
+it is not a clock — no timer, no deadline, nothing that expires — it is a *policy*
+assertion made by code the application shipped, at a boundary where the run is already
+parked. The thread still stops when its agent gives its final answer unless a plugin
+says otherwise, and the wall clock stays infinite everywhere. What a `stop` does is
+take the run's existing abort path: the conversation records `stopped`, the invocation
+records `cancelled`, `run.failed` (not `run.finished`) carries the plugin's reason, and
+everything the run appended is rolled back, so no orphan assistant message appears.
+The closed list now reads: **the agent's final answer, a `maxIterations` count
+exhaustion, a caller/host abort (`stopThread`, a signal, session teardown), or a
+plugin's `stop` decision** — plus the structural bounds (`MAX_RUN_DEPTH`, the record
+caps) that refuse work rather than end it. `README.md` / `knowledge.md` /
+`src/core/agent-limits.ts` carry the same list and gain this member when the plugin
+docs stage (T5.3 of the pipeline entry) lands; until then this paragraph is the record.
 
 ## Tasks
 
@@ -241,6 +297,21 @@ child stops in 5 minutes; with an unbounded default, a stuck child means
 docs, so a reader is never surprised by a never-resolving callable. Recommended: (a),
 with (b)'s placeholder semantics already covering the "parent keeps working" case.
 
+**ANSWERED 2026-11-09 — (a), the drain stays.** A delegated run has no wall-clock
+limit, so `await writer(input)` may legitimately never resolve while a child is still
+working, and that is the intended shape rather than a defect: the recovery for a stuck
+child is (1) the **tools inside it**, each of which keeps its own time bound, (2)
+`maxIterations` as the **count** bound that ends a run that keeps requesting, and (3)
+an explicit **`toolCancel`** on the child's pending `callId`, which the placeholder and
+the schema text both name. The unbounded default is therefore CORRECT, not an oversight
+to paper over with a wait-only bound: option (b) would reintroduce exactly the clock R1
+forbids, just relocated to the callable. Written where a reader meets it:
+`src/tools/runtime/delegate.tool.ts` (the `timeoutMs` description: *"A child that is
+still running is abandoned with toolCancel using the callId from its pending
+placeholder"*), `README.md` (the *periodic wake* bullet under *The loop*, and the
+delegation section), and `knowledge.md` (the *A thread has no wall-clock limit* bullet
+next to the *Callable* bullet, which is where the drain contract is stated).
+
 ### T1 — Make "no limit" the default for a delegated child
 
 - Keep the exported name and its re-exports (`src/core/agent-limits.ts:37`,
@@ -263,6 +334,19 @@ precisely to avoid wall-clock assertions), a `delegate` with **no** `timeoutMs`
 advanced well past 300_000 ms is still `running` and then completes normally; the
 existing explicit-timeout test still passes untouched.
 
+**LANDED 2026-11-09 — the recommendation is taken verbatim.** The exported name and its
+re-exports are untouched; `DELEGATE_TIMEOUT_MS` is now `Number.POSITIVE_INFINITY`
+(`src/core/agent-limits.ts`), with the original T28 comment kept above the dated
+correction so the reasoning stays auditable. In `delegateFor`, `timeoutController`
+stays unconditional (the caller-signal path and the `timedOut` verdict are unchanged)
+and the `setTimeout`/`unref`/`clearTimeout` trio moved inside
+`if (Number.isFinite(timeoutMs))`; the handle is `let timeoutTimer … | undefined` and
+`finally` clears it only when it exists, so the unbounded path arms and clears
+nothing. An explicit `Infinity` (and `NaN`/`-Infinity`, which the pre-existing
+`Number.isFinite` guard already rejects) resolves to the default — still unbounded,
+never 0 ms — and is pinned by the test
+*treats an explicit non-finite bound as unbounded, never as 0 ms*.
+
 ### T2 — Settle the argument contract for `timeoutMs`
 
 - **T2.1 — omitted ⇒ unbounded.** State it in the schema description
@@ -279,6 +363,22 @@ existing explicit-timeout test still passes untouched.
 
 *Check:* one new validation test per choice (over-ceiling model value; over-ceiling
 host value), and the schema text matches whichever behaviour the test asserts.
+
+**LANDED 2026-11-09.** **T2.1:** omitted ⇒ unbounded, stated in the `timeoutMs`
+description ("OMIT IT FOR NO TIME LIMIT, which is the default"). **T2.2:** `minimum: 1`
+and `maximum: 3600000` kept, and the description now names the range and says it
+"bounds what you may ask for, never the absence of a bound"; the "0 means infinity"
+spelling is REJECTED and the rejection is tested — a model that sends `timeoutMs: 0` is
+refused by the schema gate before the child runs. **T2.3 — the host path is documented
+as tool-argument-only, NOT clamped.** The runtime applies no upper clamp (it never did)
+and `runtime.delegate` is not schema-validated, so a host bound above 3600000 is
+honoured exactly as given; that is now stated in the `delegateFor` comment, in the
+`HarnessRuntime.delegate` signature comment in `src/types/index.ts`, and in
+`README.md`/`knowledge.md`, so the half-implemented disagreement F1 recorded is gone:
+both halves now say the same thing, and the tests assert it. Validation tests added:
+*refuses a model bound above the ceiling before the child runs*, *refuses a zero
+bound: the floor is real and 0 does not mean infinity*, *honours a host bound above the
+model ceiling instead of clamping it*.
 
 ### T3 — Rewrite the model-facing text, in the one place that owns it
 
@@ -308,6 +408,21 @@ the child calls carry their own time bounds.
 `src/core/metadata.ownership.test.ts:329-381` passes (catalogue/allowlist derivation
 equality and the parameter-name list); `src/harness.metadata.test.ts:529-536` passes.
 
+**LANDED 2026-11-09.** The rewritten text lives only in the entry literal's `timeoutMs`
+property description (`src/tools/runtime/delegate.tool.ts`); the allowlist form DERIVES
+its schema from that literal, so the catalogue row, the live declaration and
+`src/core/metadata.ts` carry it from one place, and a property description is where a
+model reads an argument's contract anyway. It is a plain literal holding number
+LITERALS (no interpolation, no computation), in the order this task asked for: no time
+limit by default → an optional bound the caller sets when it believes one is warranted →
+the same structured `status: "cancelled"` envelope with `partialContent` and
+`cancelledAtMessage` on expiry → `toolCancel` named at the moment the model holds a
+`callId` → the child's tools keep their own time bounds. `src/core/tool-manifest.ts` was
+REGENERATED with `npm run tools:manifest` and never hand-edited; the plugin manifest is
+untouched. `scope`/`scope.tools` each gained one clause for the sibling entry's
+finding-2 escape hatch, so the schema no longer promises a door that is really open.
+All three checks were run and pass.
+
 ### T4 — Document the policy where a reader will actually look
 
 - `README.md:1661-1665` and `knowledge.md:1899-1903` already say "no automatic hard
@@ -328,6 +443,26 @@ equality and the parameter-name list); `src/harness.metadata.test.ts:529-536` pa
 *Check:* no sentence in `README.md` or `knowledge.md` still claims a delegated child
 is time-bounded by default; the 600000 wake is still described as liveness, not a
 timeout.
+
+**LANDED 2026-11-09.** `README.md` — the *A periodic wake keeps a turn honest* bullet
+under *The loop* carries the thread-level rule, the retired 300000 ms default marked
+CORRECTED IN PLACE, `maxIterations` named as the count bound, and the restart rule (a
+HOST prompt revives a stopped thread; `threadSend` does not). The README delegation
+section gained a two-control paragraph (time, then scope). `knowledge.md` — a new
+*A thread has no wall-clock limit (policy 2026-11-09)* bullet sits directly under the
+*Callable* bullet that states the drain contract, which is where a reader meets the
+never-resolving-callable question; the pre-existing *no automatic hard tool timeout*
+bullet is extended rather than rewritten; and the *Delegation* section now records the
+pending-placeholder control and the scope escape hatch. **T4.2** — there is no
+`delegate` row in the tool-timeout tables, and the grep this entry predicted is
+confirmed: `knowledge.md`'s timeout rows are `shell`, the web tools and task leases.
+The only places that ever said "Defaults to 300000 (5 minutes)" were
+`delegate.tool.ts:81`, `tool-manifest.ts:888` and the T28 comments; all three now state
+the new rule, and `src/core/metadata.ownership.test.ts` forbids the retired wording
+from returning to either the literal or the generated mirror. **T4.3** — what stays
+bounded is written out as a list in `README.md`, in `knowledge.md`, and in the
+`src/core/agent-limits.ts` comment: tool clocks, `maxIterations` (a COUNT bound),
+`MAX_RUN_DEPTH`, the record caps, and the 600000 ms wake described as liveness only.
 
 ### T5 — Tests, including the guard that the policy does not rot
 
@@ -359,6 +494,23 @@ manifest checks plus `vitest run`). Report the counts and the failing test names
 treat a green focused run as evidence for those files only — never as the final
 verification.
 
+**LANDED 2026-11-09 — every item, with the test that closes it.**
+
+| Item | Where | What it proves |
+|---|---|---|
+| T5.1 default unbounded | `src/harness.delegation.test.ts` › *delegation time limits (policy 2026-11-09)* › `runs a delegated child with no clock at all when timeoutMs is omitted` | `vi.getTimerCount() === 0` while the child runs (it was 1 before the change); still `running` at exactly 300000 ms and at 1800000 ms; ends on its own answer with `status: "completed"`, no `error`, no `partialContent` |
+| T5.2 explicit bound unchanged | same file, *delegation timeout (T28)* › `stops a frozen child and reports its partial work` | passes UNMODIFIED (only its heading comment gained a dated note that this is now the OPTIONAL behaviour); the mechanism's own timer is additionally proven by *honours a host bound above the model ceiling instead of clamping it*, which asserts `getTimerCount() === 1` and the exact `…exceeded its 5400000ms timeout…` error text |
+| T5.3 no clock on the other threads | `src/harness.fork.test.ts` › `runs a branch with no clock when its own tool is parked (policy 2026-11-09 T5.3)`; `src/harness.thread-runtime.test.ts` › `a host turn has no wall-clock bound (policy 2026-11-09 T5.3)` | the fork half advances a fake clock that owns BOTH timers and Date (300001 ms, then 1500000 ms) with `getTimerCount() === 0` and no `branch_end`; the host-thread half moves DATE only via `vi.setSystemTime`, which is the probe for the other shape a limit takes — a `Date.now() - startedAt` deadline check — and the turn still ends on its own answer |
+| T5.4 tool clocks untouched | `src/tools/command/shell.test.ts`, `src/tools/files/grep.test.ts`, `src/tools/runtime/threadRead.test.ts` | green and UNEDITED, inside the focused run alongside `src/server/workers/protocol.test.ts` |
+| T5.5 source-shape guard | `src/harness.delegation.test.ts` › `harness source shape (policy 2026-11-09 T5.5)` | exactly ONE non-comment `setTimeout(` in `src/harness.ts`, and its line is immediately after `if (Number.isFinite(timeoutMs)) {`; exactly ONE `clearTimeout(`, guarded by `timeoutTimer !== undefined`; exactly ONE `: DELEGATE_TIMEOUT_MS` fallback. A future "safety timeout" must edit this test on purpose |
+| T5.6 pin the constant | `src/core/metadata.ownership.test.ts` › `pins DELEGATE_TIMEOUT_MS by number and keeps the schema prose honest` | `DELEGATE_TIMEOUT_MS === Number.POSITIVE_INFINITY` — the claim at `agent-limits.ts:14-18`/`:35-36` is now TRUE because the assertion exists; the catalogue projection equals the entry literal; the schema still says `integer / 1 / 3600000`; its description names `1-3600000`, the unbounded default and `toolCancel`; and neither the literal nor the generated manifest may say "Defaults to 300000" |
+
+Focused run, 2026-11-09, from `packages/underload/harness`, using the exact command
+above: **7 files / 164 tests passed**. (`src/runtime/tools/delegate.test.ts` named in
+this document's command does not exist — vitest skipped the missing path; the delegate
+tests live at `src/harness.delegation.test.ts`, which is in the list.) The full-suite
+result is recorded in the assignment report, not claimed here.
+
 ### T6 — Reconcile R3 with the sibling entry's T3.3 before either lands
 
 F4's conflict is between two open task documents that both touch
@@ -377,6 +529,19 @@ sibling entry is overturned and must be marked `corrected` there (README rule).
 *Check:* one sentence in each document naming the same owner, and a test asserting the
 chosen behaviour for a `stopped` thread.
 
+**ANSWERED 2026-11-09 — the HOST owns stopping and reviving a stopped thread.**
+R3 means the host surface (`createThread` + `sendThreadInput`, i.e. the operator's Stop
+and the next host prompt), NOT the agent-facing `threadSend`: a model may not undo a
+Stop the operator pressed. The sibling entry's **T3.3 is ratified, not overturned** —
+`postThreadMessage` keeps throwing for `stopped` ("Thread \"...\" is stopped; it
+cannot receive messages until a host resumes or deletes it"), and the sentence naming
+that owner now appears in BOTH documents (here, and in the sibling entry's finding-3
+status note). Test: `src/harness.thread-runtime.test.ts` ›
+*a stopped thread is revived by a host only (policy 2026-11-09 T6)* — the agent message
+is refused, the record stays `stopped`, nothing is appended to the transcript, and the
+next HOST turn revives it to `idle`. No production behaviour changed: the code already
+implemented the chosen reading, and both documents now agree on who owns it.
+
 ### T7 — Fix the discovery precondition (depends on the sibling entry)
 
 F5 says the recovery for an unbounded child is `toolCancel`, and the sibling entry says
@@ -388,6 +553,26 @@ invisible-and-uncancellable child is exactly the regression T28 was written for.
 
 *Check:* with a delegate call pending, `toolRequest` for `"cancel"` lists `toolCancel`
 under `alreadyAvailable`, **or** the pending envelope names it (sibling T1.3).
+
+**CLOSED 2026-11-09 — `corrected`: the precondition was already satisfied.** This task
+asked for sibling **T1.2/T1.3** to land with or before T1. Both had landed at
+`44cdbbe`, the very revision this entry was written against; what this entry inherited
+was the sibling entry's measurement of an EARLIER tree (its *Date / Method* line names
+`7e9892d2`, "Upgraded Harness Configuration") together with that entry's own
+`Unconfirmed` note saying the root cause was unsettled. Current source:
+`declaredForDiscovery` (`src/harness.ts`, "T28: the set toolRequest reports as
+`alreadyAvailable`") appends the pending-only control under exactly the condition
+`offerDeclarations` declares it — excluding the asking `toolRequest` call so a query
+cannot make itself cancellable — and the projection placeholder for a still-running
+call says *"use toolCancel with this callId to abandon it"*. The check is satisfied on
+BOTH halves: `src/harness.already-available.test.ts` › `toolCancel discovery (T28)`
+(pending call → `alreadyAvailable` lists `toolCancel`, with nothing enabled and no cap
+slot spent; idle caller → an honest miss) and the new
+`src/harness.delegation.test.ts` › *pending delegation placeholder (delegate-stress
+T1.3/T1.4)*. The engine half is pinned in `src/core/discovery.test.ts`
+(reports a conditionally-declared control in both directions, sibling **T1.4**).
+Consequence for this policy: an unbounded child is not the T28 regression, because the
+escape hatch the policy depends on is reachable.
 
 ### T8 — Verify the wake actually covers a child (F5's untested edge)
 
@@ -401,6 +586,32 @@ disabled still has a stated recovery path.
 
 *Check:* a written result for both configurations (plugin on / plugin off) recorded in
 this file, marked `unconfirmed` if the probe was not run.
+
+**MEASURED 2026-11-09 — both configurations, settled by test rather than by probe.**
+
+- **Plugin on (the shipped default): the CHILD is covered.** A delegated child whose
+  OWN tool call is parked receives its own wake —
+  `agent: "researcher"`, `reason: "pending-tools"`,
+  `pending: [{ callId: "r1", name: "hang", elapsedMs: 250 }]`, attributed to the
+  child's run by `thread: { id: "2", callId: "c1" }` (the delegation call that spawned
+  it) — and the child's own inspecting request declares `toolCancel`, so the wake is
+  actionable for the child, not only for its parent. The plugin keys its timer on
+  scheduler identity, and a delegated child IS a separate actor; that is exactly why it
+  is covered rather than shared away. Test: `src/harness.delegation.test.ts` ›
+  `wakes the CHILD agent while its own tool is parked and offers it toolCancel`
+  (`wakeIntervalMs: 250`, so the cadence itself is asserted at 249 vs 250 ms).
+- **Plugin replaced (a deployment that disables the heartbeat): no wake, no timer, and
+  the child stays `running`.** Advancing three historical 600000 ms intervals produces
+  zero wakeups for either actor, `vi.getTimerCount() === 0`, and the child is still
+  `running`. The stated recovery in that configuration is the caller's explicit
+  `toolCancel` (named in the placeholder and in the schema text) or an optional
+  `timeoutMs` set up front. Test: same file,
+  `leaves an unbounded child running with no wake when the ping plugin is replaced`.
+
+Neither configuration is `unconfirmed` any more. One caveat worth carrying forward: a
+deployment that pins `async-ping.intervalMs` very large behaves in practice like the
+plugin-off case, which the schema text already anticipates by keeping `timeoutMs`
+available to the caller.
 
 ### T9 — Housekeeping the repo rules require
 
@@ -418,6 +629,26 @@ this file, marked `unconfirmed` if the probe was not run.
 
 *Check:* `npm run test:package:tools` (`package.json:101`) and
 `npm run tools:manifest:check` (`:105`) both pass.
+
+**LANDED 2026-11-09.** `docs/tasks/README.md`'s index row for this file now describes
+the policy as implemented. In the sibling entry, the lines that carry the old default —
+its *Scope* line listing `timeoutMs` among the controls exercised, and the `timeoutMs`
+row of *Controls that work* — are annotated in place as still VALID FOR AN EXPLICIT
+VALUE while the *default* they describe has changed; its finding-1 `Unconfirmed` note,
+its finding-2 candidate fixes, its unresolved-ordering anomaly and its retest notes are
+all settled in place there too. The other index rows were left alone (their summaries
+are not materially wrong).
+
+Verification actually run (2026-11-09, package working tree at `afb38f1` plus these
+edits): `npm run tools:manifest:check` **passes** ("tool-manifest.ts is current
+(30 descriptors)"). `npm run test:package:tools` reports **exactly the two failures a
+pristine worktree of `afb38f1` reports with a fresh build** — `scripted model registers
+and invokes a tool without a discovery round` and `all tool contexts saw one
+strict-identical harness and intact state` (`0 !== 1`: the `modelProbe` capture never
+happened) — so this change did not cause them, and this task does NOT claim that gate
+green: it is a pre-existing failure at the base revision, disclosed rather than
+smoothed over. The entry literal stayed dependency-free (`dependencies: []`), and the
+duplicated ceiling is left duplicated on purpose, with the equality pin as the fix.
 
 ## What stays bounded on purpose (R4 — do not remove any of these)
 
@@ -477,6 +708,36 @@ npm run tools:manifest:check                        # committed manifest is curr
 npm run test:package:tools                      # entry-literal / dependencies:[] contract
 ```
 
+**RE-RUN 2026-11-09, before any edit, from `packages/underload/harness` at HEAD
+`afb38f1` ("Updated List"):** `git rev-parse --show-toplevel` is the package (its own
+repo) ✔; `DELEGATE_TIMEOUT_MS` still appears only in `core/agent-limits.ts`,
+`core/index.ts`, `core/metadata.ts` and `harness.ts`, with **no test hit** ✔;
+`agent-limits.ts` still carried `300_000` and still claimed a pin that did not exist ✔
+(F1 accurate); `grep -n "setTimeout" src/harness.ts` returned exactly ONE arm site (the
+delegation branch) plus one prose mention ✔ (the premise T5.5 needed); the schema /
+manifest / host-signature `timeoutMs` rows were all where F1 said they were ✔;
+`README.md`/`knowledge.md` grep for `300000`/`5 minutes` found only shell, web-tool and
+task-lease values ✔ (T4.2 accurate); the BASELINE was **green** — `npx vitest run
+src/harness.delegation.test.ts src/core/metadata.ownership.test.ts
+src/harness.metadata.test.ts` = **3 files / 40 tests passed** ✔;
+`npm run tools:manifest:check` passed ✔. Line numbers had drifted exactly as this file
+warned (e.g. the timer moved from `:3591` to `:3590`, `postThreadMessage` from
+`:4219`/`:4232` to `:4284`/`:4297`, `sendThreadInput` from `:4705` to `:4698`); every
+edit was anchored on the identifiers instead.
+
+**Stop-and-recheck conditions — outcome:** (1) did not fire — the constant was still
+finite, so F1 stands and nothing had done the work; (2) no thread-level timeout option
+appeared on `HarnessConfiguration`, `HarnessForkConfiguration` or `HarnessRunOptions`;
+(3) `threadFork` still takes only `input`/`label` — no `timeoutMs`; (4) no server turn
+deadline exists (`src/server/sessions.ts` still contains no `setTimeout`), so F3's
+justification holds at the API edge; (5) `async-ping` is still seeded by default
+(`src/harness.ts`, `'async-ping': { intervalMs: wakeIntervalMs }`), so T8 stayed
+advisory — and is now closed by test anyway; (6) the manifest/package gates are
+unchanged (`package.json` `test` / `test:package:tools` / `tools:manifest:check`), and
+they were run before any prose was written, as instructed. ONE premise of this entry
+was overturned by the re-check — F5/T7's `toolCancel` discoverability claim, marked
+`corrected` where it appears.
+
 Stop-and-recheck conditions:
 
 1. **`DELEGATE_TIMEOUT_MS` is gone or already infinite** — R1 is partly satisfied by
@@ -503,11 +764,26 @@ Stop-and-recheck conditions:
 - **No live session was run for this entry.** Everything is read from source and from
   the sibling entry's measurements. In particular the never-resolving-callable risk
   (T0) is inferred from `knowledge.md:1893-1895`, not observed.
+
+  **PARTLY SUPERSEDED 2026-11-09:** still no LIVE session, but the risk is now
+  measured rather than inferred — `src/harness.delegation.test.ts` and
+  `src/harness.fork.test.ts` / `src/harness.thread-runtime.test.ts` hold the caller
+  pinned in `probe()` state while the clock is advanced minutes past the old default,
+  proving the promise does hang and that nothing else ends it. What remains genuinely
+  unobserved is a real provider stream (below) and a real model's behaviour under the
+  new schema text.
 - **Whether the wake reaches the child**, and what happens with `async-ping` disabled —
   F5, T8. Unconfirmed.
+
+  **CLOSED 2026-11-09: confirmed for both configurations by test** — see the dated
+  result at T8.
 - **Whether `toolCancel` is discoverable while a delegate is pending** — inherited from
   the sibling entry's own `Unconfirmed` note
   (`2026-11-08-delegate-stress-test.md:105-110`), not re-settled here.
+
+  **CLOSED 2026-11-09 — settled, and the inheritance was stale:** it IS discoverable
+  (alreadyAvailable + the placeholder note), which had already landed at `44cdbbe`; the
+  sibling entry has updated its own `Unconfirmed` note in place.
 - **Behaviour of an unbounded child under `threadExecution: 'worker'`** — nested runs are
   refused there (`src/server/workers/capability.ts:342`), so the case may be
   unreachable; not probed.

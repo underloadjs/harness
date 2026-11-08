@@ -46,7 +46,7 @@ const turn = (
     overrides: Partial<SessionTurn> & { id: string; index: number; threadId: string; threadLabel: string }
 ): SessionTurn =>
     ({
-        prompt: 'task',
+        prompt: 'tasks',
         status: 'running',
         startedAt: 1,
         updatedAt: 2,

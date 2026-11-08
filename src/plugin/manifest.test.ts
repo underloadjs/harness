@@ -126,7 +126,7 @@ describe('plugin manifest parity', () => {
                 name: 'context-compaction',
                 title: 'Context Compaction',
                 description:
-                    'Watches each agent conversation against a context limit and, when the limit is reached, compacts the transcript at the turn boundary before the next model request is sent.',
+                    'Watches each agent conversation against a context limit and, when the limit is reached, prunes the tool units a later success already answered at the turn boundary before the next model request is sent. Nothing is deleted: a pruned unit keeps its place in history and can be switched back on.',
                 version: '1.0.0',
                 tags: ['context', 'compaction', 'lifecycle'],
                 builtin: true,
@@ -140,8 +140,44 @@ describe('plugin manifest parity', () => {
                         min: 1000,
                         step: 1000,
                         description:
-                            'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the same ~4 characters/token estimate the UI context bar uses.'
-                    }
+                            'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost.'
+                    },
+{
+                        key: "enabled",
+                        label: "Compact conversations",
+                        type: "boolean",
+                        default: true,
+                        description:
+                            "Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in."
+                        },
+{
+                        key: "minTokens",
+                        label: "Minimum saving per pass (tokens)",
+                        type: "number",
+                        default: 200,
+                        min: 0,
+                        step: 50,
+                        description:
+                            "A pass must withhold at least this many estimated tokens, or it does nothing at all \u2014 no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count."
+                        },
+{
+                        key: "safetyTurns",
+                        label: "Recent units to protect",
+                        type: "number",
+                        default: 6,
+                        min: 0,
+                        step: 1,
+                        description:
+                            "How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon."
+                        },
+{
+                        key: "mode",
+                        label: "Compaction mode",
+                        type: "string",
+                        default: "exclude",
+                        description:
+                            "What a compaction does with a unit it removes. Only \"exclude\" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. \"annotate\" \u2014 replace the result with a one-line handle back to the full text \u2014 is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than \"exclude\" (including that one) behaves as \"exclude\" until it lands. The value actually used is reported in the pass diagnostic."
+                        }
                 ]
             }
         ]);

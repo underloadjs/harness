@@ -28,6 +28,32 @@ import type {
     HarnessUsage
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // A transport that replays a scripted list of turns, one per request. Each entry
 // is the set of frames for a single turn, so a test can script
 // "tool call -> tool call -> answer". Pass `seen` to record every request, which
@@ -77,7 +103,7 @@ describe('harness', () => {
         expect(message.content).toBe('Once upon a time.');
         expect(writer.name).toBe('writer');
         expect(writer.agent).toBe(writer.agents.writer);
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'Write an opening.' },
             { role: 'assistant', content: 'Once upon a time.' }
         ]);
@@ -133,7 +159,7 @@ describe('harness', () => {
         expect(writer.tools.searchable.name).toBe('searchable');
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             // A configured core tool is a LATER registration, so it follows the
             // baseline in declaration order (later registration wins).
             'core'
@@ -167,7 +193,7 @@ describe('harness', () => {
         // harness-owned set.
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'read',
             'write',
             'edit',
@@ -179,7 +205,7 @@ describe('harness', () => {
 
         expect(writer.tools.download.visibility).toBe('searchable');
         expect(writer.tools.agentManage.visibility).toBe('searchable');
-        expect(writer.tools.task.visibility).toBe('core');
+        expect(writer.tools.tasks.visibility).toBe('core');
     });
 
     it('never returns the core file tools from toolRequest', async () => {
@@ -200,7 +226,7 @@ describe('harness', () => {
         // searchable manager (list/move/copy/delete/mkdir), and `download` is
         // searchable under R9-R11, so the 'file' tag offers it here.
         const fileSearch = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(fileSearch.enabled).toEqual(['files', 'download', 'profileManage']);
+        expect(fileSearch.enabled).toEqual(['files', 'download', 'profiles', 'records']);
         expect(fileSearch.tools).toEqual([
             {
                 name: 'files',
@@ -225,12 +251,21 @@ describe('harness', () => {
                 tags: ['download', 'file', 'image', 'pdf', 'media', 'binary', 'web', 'url']
             },
             {
-                name: 'profileManage',
+                name: 'profiles',
                 description: expect.stringContaining('Manage character and people profiles'),
                 tags: ['profile', 'profiles', 'character', 'characters', 'person', 'people']
+            },
+            {
+                name: 'records',
+                // The engine rides along at the 1-point DESCRIPTION rung (src/core/discovery.ts
+                // `scoreTool`): T6 requires its description to name the built-in collections,
+                // so a wrapper word finds the escalation surface too — always LAST, because a
+                // wrapper's own tag always outscores it.
+                description: expect.stringContaining('The one session store'),
+                tags: ['records', 'record', 'store', 'entries', 'define']
             }
         ]);
-        expect(fileSearch.matched).toBe(3);
+        expect(fileSearch.matched).toBe(4);
         expect(fileSearch.omitted).toBe(0);
 
         // "javascript" finds the searchable syntax AND the runtime rows that now
@@ -302,9 +337,10 @@ describe('harness', () => {
             'file-d',
             'file-e',
             'file-f',
-            'profileManage'
+            'profiles',
+            'records'
         ]);
-        expect(broad.matched).toBe(7);
+        expect(broad.matched).toBe(8);
         expect(broad.omitted).toBe(0);
 
         // Tag breadth remains a tiebreak: file-f has two matching query tags, so
@@ -317,10 +353,13 @@ describe('harness', () => {
             'file-c',
             'file-d',
             'file-e',
-            'profileManage',
+            'profiles',
+            'records',
+            'chapters',
+            'locations',
             'toolManage'
         ]);
-        expect(refined.matched).toBe(8);
+        expect(refined.matched).toBe(11);
         expect(refined.omitted).toBe(0);
 
         // The newest selection leads the current order; all eight still fit.
@@ -331,7 +370,10 @@ describe('harness', () => {
             'file-c',
             'file-d',
             'file-e',
-            'profileManage',
+            'profiles',
+            'records',
+            'chapters',
+            'locations',
             'toolManage'
         ]);
     });
@@ -349,10 +391,11 @@ describe('harness', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -382,7 +425,7 @@ describe('harness', () => {
         // `download` is searchable (R9-R11), so it does not ride on the request.
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'read',
             'write',
             'edit',
@@ -427,26 +470,36 @@ describe('harness', () => {
         // declarations, and the unrelated tool stayed out.
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
         ]);
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'read',
-            'profileManage'
+            'profiles',
+            'records'
         ]);
 
         // The discovery result is what the model sees: names plus metadata.
         // R9-R11 moved profileManage into the candidate set, so a "files" query
         // answers with the fixture and the demoted row in rank order.
         const discovery = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(discovery.enabled).toEqual(['read', 'profileManage']);
+        expect(discovery.enabled).toEqual(['read', 'profiles', 'records']);
         expect(discovery.tools).toEqual([
             { name: 'read', description: 'Read a text file.', tags: ['files', 'read'] },
             {
-                name: 'profileManage',
+                name: 'profiles',
                 description: expect.stringContaining('Manage character and people profiles'),
                 tags: ['profile', 'profiles', 'character', 'characters', 'person', 'people']
+            },
+            {
+                name: 'records',
+                // The engine rides along at the 1-point DESCRIPTION rung (src/core/discovery.ts
+                // `scoreTool`): T6 requires its description to name the built-in collections,
+                // so a wrapper word finds the escalation surface too — always LAST, because a
+                // wrapper's own tag always outscores it.
+                description: expect.stringContaining('The one session store'),
+                tags: ['records', 'record', 'store', 'entries', 'define']
             }
         ]);
 
@@ -505,7 +558,7 @@ describe('harness', () => {
         // The transcript shows the whole arc: user -> assistant(tool call) ->
         // tool result -> assistant(answer).
         expect(entry.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);
-        expect(entry.messages[2]).toEqual({
+        expect(withoutIds(entry.messages[2])).toEqual({
             role: 'tool',
             content: '{"hits":["fireworks","countdown"]}',
             toolCallId: 'call_1',
@@ -666,7 +719,7 @@ describe('harness', () => {
         ]);
 
         // The model's transcript holds the underlying content only.
-        expect(writer.agent.messages.filter((message) => message.role === 'tool')).toEqual([
+        expect(withoutIds(writer.agent.messages.filter((message) => message.role === 'tool'))).toEqual([
             { role: 'tool', content: '{"answer":42}', toolCallId: 'c1', name: 'uiTool' },
             { role: 'tool', content: '{"answer":7}', toolCallId: 'c2', name: 'plainTool' }
         ]);
@@ -691,7 +744,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: toolRequest, task, read, write, edit, glob, grep. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: toolRequest, tasks, read, write, edit, glob, grep. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -862,7 +915,7 @@ describe('harness', () => {
         await writer('go');
 
         expect((writerAgent.messages[2] as { content: string }).content).toBe('researched facts');
-        expect(researcher.messages).toEqual([
+        expect(withoutIds(researcher.messages)).toEqual([
             { role: 'user', content: 'find facts' },
             { role: 'assistant', content: 'researched facts' }
         ]);
@@ -991,7 +1044,7 @@ describe('harness', () => {
         expect(seen).toHaveLength(21);
         // user + (assistant tool call + tool result) * 20 + assistant answer.
         expect(writer.agent.messages).toHaveLength(42);
-        expect(writer.agent.messages.at(-1)).toEqual({ role: 'assistant', content: 'finished' });
+        expect(withoutIds(writer.agent.messages.at(-1))).toEqual({ role: 'assistant', content: 'finished' });
     });
 
     it('fails at the configured bound and names it in the error', async () => {
@@ -1049,7 +1102,7 @@ describe('harness', () => {
         const message = await writer('go');
 
         expect(message.content).toBe('immediate');
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'immediate' }
         ]);
@@ -1090,7 +1143,7 @@ describe('harness', () => {
 
         writer.reset();
 
-        expect(writer.agent.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
+        expect(withoutIds(writer.agent.messages)).toEqual([{ role: 'system', content: 'You are a writer.' }]);
         expect(writer.tools.search.name).toBe('search');
     });
 
@@ -1114,11 +1167,12 @@ describe('harness', () => {
         await writer('go');
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'hidden',
-            'profileManage'
+            'profiles',
+            'records'
         ]);
-        expect(writer.discoveredTools).toEqual(['hidden', 'profileManage']);
+        expect(writer.discoveredTools).toEqual(['hidden', 'profiles', 'records']);
 
         writer.reset();
         expect(writer.discoveredTools).toEqual([]);
@@ -1128,7 +1182,7 @@ describe('harness', () => {
         // Back to the core set: discovery is part of "start over".
         expect(declaredNames(seen[2])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
         ]);
     });
 
@@ -1161,17 +1215,29 @@ describe('harness', () => {
         await writer('first');
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'reader',
             'threadFork',
             'agentManage',
-            'agentResult'
+            'agentResult',
+            // The rest are 1-point description hits on the same query word (the record
+            // wrappers and the engine all say "read"), in name order.
+            'chapters',
+            'locations',
+            'profiles',
+            'records',
+            'toolCreate'
         ]);
         expect(writer.discoveredTools).toEqual([
             'reader',
             'threadFork',
             'agentManage',
-            'agentResult'
+            'agentResult',
+            'chapters',
+            'locations',
+            'profiles',
+            'records',
+            'toolCreate'
         ]);
 
         // A second call starts a NEW turn but not a new catalogue: toolRequest
@@ -1181,17 +1247,29 @@ describe('harness', () => {
         await writer('second');
         expect(declaredNames(seen[3])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'reader',
             'threadFork',
             'agentManage',
-            'agentResult'
+            'agentResult',
+            // The rest are 1-point description hits on the same query word (the record
+            // wrappers and the engine all say "read"), in name order.
+            'chapters',
+            'locations',
+            'profiles',
+            'records',
+            'toolCreate'
         ]);
         expect(writer.discoveredTools).toEqual([
             'reader',
             'threadFork',
             'agentManage',
-            'agentResult'
+            'agentResult',
+            'chapters',
+            'locations',
+            'profiles',
+            'records',
+            'toolCreate'
         ]);
     });
 
@@ -1550,7 +1628,7 @@ describe('executeTool', () => {
         await writer('go');
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
         ]);
     });
 
@@ -1569,7 +1647,7 @@ describe('executeTool', () => {
             omitted: 0,
             alreadyAvailable: [
                 {
-                    name: 'task',
+                    name: 'tasks',
                     tags: ['task', 'tasks', 'todo', 'todos', 'checklist', 'plan']
                 }
             ]

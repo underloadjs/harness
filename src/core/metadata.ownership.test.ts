@@ -42,6 +42,7 @@ import {
     AGENT_RESULT_PAGE_CHARS,
     AGENT_RESULT_PAGE_MAX_CHARS,
     AGENT_RESULT_RETENTION,
+    DELEGATE_TIMEOUT_MS,
     TOOL_MANAGE_METADATA,
     TOOL_REQUEST_METADATA,
     coreToolMetadata
@@ -51,10 +52,13 @@ import * as toolListEntry from '../tools/runtime/toolList.tool';
 import * as toolManageEntry from '../tools/runtime/toolManage.tool';
 import * as toolCreateEntry from '../tools/runtime/toolCreate.tool';
 import * as toolRegistryEntry from '../tools/runtime/toolRegistry.tool';
-import * as taskEntry from '../tools/runtime/task.tool';
-import * as profileManageEntry from '../tools/runtime/profileManage.tool';
-import * as chapterManageEntry from '../tools/runtime/chapterManage.tool';
-import * as locationManageEntry from '../tools/runtime/locationManage.tool';
+import * as tasksEntry from '../tools/runtime/tasks.tool';
+// The engine's own entry (T3): authoritative like the wrappers, so it belongs in this
+// matrix — its literals are owned by the entry and projected by core/metadata.ts.
+import * as recordsEntry from '../tools/runtime/records.tool';
+import * as profilesEntry from '../tools/runtime/profiles.tool';
+import * as chaptersEntry from '../tools/runtime/chapters.tool';
+import * as locationsEntry from '../tools/runtime/locations.tool';
 import * as agentManageEntry from '../tools/runtime/agentManage.tool';
 import * as agentResultEntry from '../tools/runtime/agentResult.tool';
 import * as agentDelegateEntry from '../tools/runtime/delegate.tool';
@@ -123,32 +127,39 @@ const runtimeEntries: RuntimeEntry[] = [
         aggregated: coreMetadata.TOOL_REGISTRY_METADATA
     },
     {
-        wireName: 'task',
-        sourcePath: '../tools/runtime/task.tool.ts',
-        metadata: taskEntry.TASK_METADATA,
-        moduleMetadata: taskEntry.metadata,
-        aggregated: coreMetadata.TASK_METADATA
+        wireName: 'records',
+        sourcePath: '../tools/runtime/records.tool.ts',
+        metadata: recordsEntry.RECORDS_METADATA,
+        moduleMetadata: recordsEntry.metadata,
+        aggregated: coreMetadata.RECORDS_METADATA
     },
     {
-        wireName: 'profileManage',
-        sourcePath: '../tools/runtime/profileManage.tool.ts',
-        metadata: profileManageEntry.PROFILE_MANAGE_METADATA,
-        moduleMetadata: profileManageEntry.metadata,
-        aggregated: coreMetadata.PROFILE_MANAGE_METADATA
+        wireName: 'tasks',
+        sourcePath: '../tools/runtime/tasks.tool.ts',
+        metadata: tasksEntry.TASKS_METADATA,
+        moduleMetadata: tasksEntry.metadata,
+        aggregated: coreMetadata.TASKS_METADATA
     },
     {
-        wireName: 'chapterManage',
-        sourcePath: '../tools/runtime/chapterManage.tool.ts',
-        metadata: chapterManageEntry.CHAPTER_MANAGE_METADATA,
-        moduleMetadata: chapterManageEntry.metadata,
-        aggregated: coreMetadata.CHAPTER_MANAGE_METADATA
+        wireName: 'profiles',
+        sourcePath: '../tools/runtime/profiles.tool.ts',
+        metadata: profilesEntry.PROFILES_METADATA,
+        moduleMetadata: profilesEntry.metadata,
+        aggregated: coreMetadata.PROFILES_METADATA
     },
     {
-        wireName: 'locationManage',
-        sourcePath: '../tools/runtime/locationManage.tool.ts',
-        metadata: locationManageEntry.LOCATION_MANAGE_METADATA,
-        moduleMetadata: locationManageEntry.metadata,
-        aggregated: coreMetadata.LOCATION_MANAGE_METADATA
+        wireName: 'chapters',
+        sourcePath: '../tools/runtime/chapters.tool.ts',
+        metadata: chaptersEntry.CHAPTERS_METADATA,
+        moduleMetadata: chaptersEntry.metadata,
+        aggregated: coreMetadata.CHAPTERS_METADATA
+    },
+    {
+        wireName: 'locations',
+        sourcePath: '../tools/runtime/locations.tool.ts',
+        metadata: locationsEntry.LOCATIONS_METADATA,
+        moduleMetadata: locationsEntry.metadata,
+        aggregated: coreMetadata.LOCATIONS_METADATA
     },
     {
         wireName: 'agentManage',
@@ -415,6 +426,50 @@ describe('runtime entry metadata ownership', () => {
         );
     });
 
+    it('pins DELEGATE_TIMEOUT_MS by number and keeps the schema prose honest', () => {
+        // POLICY DOC T5.6 (2026-11-09). `core/agent-limits.ts` claimed the equality
+        // list above pinned this constant, and it did NOT — only the four AGENT_*
+        // bounds were in it, so the wall-clock default was specified by prose alone.
+        // It is pinned by NUMBER here, which also makes the comment true.
+        //
+        // The value is `Number.POSITIVE_INFINITY` on purpose: "no limit" is one
+        // readable fact rather than an absent fallback, and `delegateFor` arms its
+        // timer only when the resolved value is finite (see the source-shape guard in
+        // src/harness.delegation.test.ts, policy doc T5.5).
+        //
+        // The entry cannot value-import this constant — scripts/check-package-tools.mjs
+        // requires `dependencies: []` for a runtime entry — so the literal ceiling in
+        // its schema is duplicated BY NECESSITY and this pin is the fix. Do not
+        // "solve" the duplication with an import.
+        expect(DELEGATE_TIMEOUT_MS).toBe(Number.POSITIVE_INFINITY);
+        expect(coreMetadata.DELEGATE_TIMEOUT_MS).toBe(DELEGATE_TIMEOUT_MS);
+
+        const timeout = (agentDelegateEntry.metadata.parameters.properties as Record<string, any>)
+            .timeoutMs;
+        expect([timeout.type, timeout.minimum, timeout.maximum]).toEqual([
+            'integer',
+            1,
+            3600000
+        ]);
+
+        // The prose and the runtime agree in both directions: the description names
+        // the range the schema enforces, states the unbounded default, points at the
+        // recovery, and no longer claims the retired finite default.
+        expect(timeout.description).toContain('1-3600000');
+        expect(timeout.description).toContain('OMIT IT FOR NO TIME LIMIT');
+        expect(timeout.description).toContain('toolCancel');
+        expect(timeout.description).not.toContain('Defaults to 300000');
+
+        // The catalogue projection (core/metadata.ts, generated manifest) carries the
+        // same row, so the server-facing description cannot lag the live one.
+        expect(
+            (coreMetadata.agentDelegateMetadata().parameters as Record<string, any>).properties
+                .timeoutMs
+        ).toEqual(timeout);
+        expect(sourceOf('./tool-manifest.ts')).toContain('OMIT IT FOR NO TIME LIMIT');
+        expect(sourceOf('./tool-manifest.ts')).not.toContain('Defaults to 300000 (5 minutes)');
+    });
+
     it('inlines the actionRequest/threadFork bounds equal to ACTION_REQUEST_LIMITS', () => {
         // Same reason as the agent bounds: the entries may not value-import
         // ../core, so the schema numbers are literals pinned against the one gate
@@ -457,7 +512,7 @@ describe('runtime entry metadata ownership', () => {
     it('keeps the always-registered projection in its historical order', () => {
         expect(coreToolMetadata().map((metadata) => metadata.name)).toEqual([
         'toolRequest',
-        'task',
+        'tasks',
         'search',
         'fetch',
         ]);

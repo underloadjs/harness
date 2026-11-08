@@ -48,7 +48,7 @@ const presetOf = (template?: 'live' | 'flaky' | 'scripted', name = 'instruct'): 
     primary: name,
     subagents: ['research'],
     agents: [name, 'research'],
-    tools: ['read', 'task'],
+    tools: ['read', 'tasks'],
     builtin: true,
     editable: true,
     ...(template === undefined ? {} : { template }),
@@ -165,8 +165,8 @@ describe('assessWorkerToolSurface', () => {
     // a body that reaches the canonical document or an unbounded memory view is REFUSED
     // before the run rather than executed against a private copy of the session.
     it('routes the shared-state core tools to the authority', () => {
-        expect(assessWorkerToolSurface({ name: 'task', source: 'export const execute = () => 1;' })).toEqual({
-            name: 'task',
+        expect(assessWorkerToolSurface({ name: 'tasks', source: 'export const execute = () => 1;' })).toEqual({
+            name: 'tasks',
             placement: 'authority-proxy',
             reasons: [],
             warnings: [],
@@ -177,7 +177,7 @@ describe('assessWorkerToolSurface', () => {
         // The set must cover every tool whose RESULT is session state. `threadRead` and
         // `toolCancel` are deliberately NOT here: a roster read is answered by `threadList`
         // (routed) and a cancellation belongs to the run that owns it (lane-local).
-        for (const name of ['profileManage', 'chapterManage', 'locationManage', 'toolCreate', 'toolManage', 'toolRegistry', 'toolRequest', 'toolList', 'threadSend', 'threadList', 'agentManage', 'agentResult']) {
+        for (const name of ['profiles', 'chapters', 'locations', 'toolCreate', 'toolManage', 'toolRegistry', 'toolRequest', 'toolList', 'threadSend', 'threadList', 'agentManage', 'agentResult']) {
             expect(assessWorkerToolSurface({ name, source: 'x' }).placement).toBe('authority-proxy');
         }
 
@@ -300,7 +300,7 @@ describe('planWorkerToolSurfaces', () => {
     it('lists the routed tools, the bounded memory window, and every refusal', () => {
         const plan = planWorkerToolSurfaces([
             { name: 'read', source: 'x' },
-            { name: 'task', source: 'x' },
+            { name: 'tasks', source: 'x' },
             { name: 'noteSearch', source: "harness.memory.get('noteSearch.cache');" },
             { name: 'threadSend', source: 'x' },
             // A source-less tool is a WARNING, not a refusal: it is rebuilt identically.
@@ -308,7 +308,7 @@ describe('planWorkerToolSurfaces', () => {
             { name: 'deepCopy', source: 'const core = context.harness.snapshot();' }
         ]);
 
-        expect(plan.proxied).toEqual(['task', 'threadSend']);
+        expect(plan.proxied).toEqual(['tasks', 'threadSend']);
         expect(plan.memoryKeys).toEqual(['noteSearch.cache']);
         expect(plan.unsupported.map((surface) => surface.name)).toEqual(['deepCopy']);
         expect(plan.placements.read.placement).toBe('lane-local');
@@ -362,10 +362,13 @@ describe('the real shipped toolbox through the capability lens', () => {
         expect(plan.proxied).toEqual([
             'agentManage',
             'agentResult',
-            'chapterManage',
-            'locationManage',
-            'profileManage',
-            'task',
+            'chapters',
+            'locations',
+            'profiles',
+            // `records` is the low-level engine surface (T3): same route, same reason — a
+            // lane that wrote a record locally would lose it the moment the lane died.
+            'records',
+            'tasks',
             // The thread trio registers on the first createThread, which the fixture does on
             // purpose - a roster read that is not routed is a read of a private copy.
             'threadList',

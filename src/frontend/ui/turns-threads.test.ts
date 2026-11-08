@@ -59,7 +59,7 @@ const serverTurn = (
 ): SessionTurn => ({
     id: options.id ?? 'turn-1',
     index: options.index ?? 0,
-    prompt: options.prompt ?? 'task',
+    prompt: options.prompt ?? 'tasks',
     status: options.status ?? 'done',
     startedAt: 5,
     updatedAt: 10,
@@ -620,8 +620,8 @@ describe('invocation thread entries', () => {
 
         const events: HarnessEvent[] = [
             { type: 'start', agent: 'writer', model: 'm1' },
-            delegateCall('helper', 'task', 'd1'),
-            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'task' }),
+            delegateCall('helper', 'tasks', 'd1'),
+            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'tasks' }),
             withThread({ type: 'text', agent: 'helper', delta: 'hello' }, { id: 't1' })
         ];
         for (const event of events) turn.apply(event);
@@ -988,9 +988,9 @@ describe('invocation thread entries', () => {
         const turn = board.begin('mirror');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        turn.apply(delegateCall('helper', 'task', 'd1'));
+        turn.apply(delegateCall('helper', 'tasks', 'd1'));
         turn.apply(
-            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'task' })
+            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'tasks' })
         );
 
         const row = threadRows(turn)[0];

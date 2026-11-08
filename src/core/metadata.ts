@@ -10,10 +10,11 @@
 //   tools/runtime/toolManage.tool.ts       TOOL_MANAGE_NAME / TOOL_MANAGE_METADATA
 //   tools/runtime/toolCreate.tool.ts       TOOL_CREATE_NAME / TOOL_CREATE_METADATA
 //   tools/runtime/toolRegistry.tool.ts     TOOL_REGISTRY_NAME / TOOL_REGISTRY_METADATA
-//   tools/runtime/task.tool.ts             TASK_NAME / TASK_METADATA
-//   tools/runtime/profileManage.tool.ts    PROFILE_MANAGE_NAME / PROFILE_MANAGE_METADATA
-//   tools/runtime/chapterManage.tool.ts    CHAPTER_MANAGE_NAME / CHAPTER_MANAGE_METADATA
-//   tools/runtime/locationManage.tool.ts   LOCATION_MANAGE_NAME / LOCATION_MANAGE_METADATA
+//   tools/runtime/records.tool.ts            RECORDS_NAME / RECORDS_METADATA
+//   tools/runtime/tasks.tool.ts              TASKS_NAME / TASKS_METADATA
+//   tools/runtime/profiles.tool.ts           PROFILES_NAME / PROFILES_METADATA
+//   tools/runtime/chapters.tool.ts           CHAPTERS_NAME / CHAPTERS_METADATA
+//   tools/runtime/locations.tool.ts          LOCATIONS_NAME / LOCATIONS_METADATA
 //   tools/runtime/agentManage.tool.ts      AGENT_MANAGE_NAME / AGENT_MANAGE_METADATA
 //   tools/runtime/agentResult.tool.ts      AGENT_RESULT_NAME / AGENT_RESULT_METADATA
 //   tools/runtime/delegate.tool.ts    AGENT_DELEGATE_NAME / agentDelegateMetadata
@@ -136,10 +137,11 @@ export const TOOL_LIST_NAME = descriptorOf('toolList').name;
 export const TOOL_MANAGE_NAME = descriptorOf('toolManage').name;
 export const TOOL_CREATE_NAME = descriptorOf('toolCreate').name;
 export const TOOL_REGISTRY_NAME = descriptorOf('toolRegistry').name;
-export const TASK_NAME = descriptorOf('task').name;
-export const PROFILE_MANAGE_NAME = descriptorOf('profileManage').name;
-export const CHAPTER_MANAGE_NAME = descriptorOf('chapterManage').name;
-export const LOCATION_MANAGE_NAME = descriptorOf('locationManage').name;
+export const TASKS_NAME = descriptorOf('tasks').name;
+export const RECORDS_NAME = descriptorOf('records').name;
+export const PROFILES_NAME = descriptorOf('profiles').name;
+export const CHAPTERS_NAME = descriptorOf('chapters').name;
+export const LOCATIONS_NAME = descriptorOf('locations').name;
 export const AGENT_MANAGE_NAME = descriptorOf('agentManage').name;
 export const AGENT_RESULT_NAME = descriptorOf('agentResult').name;
 export const AGENT_DELEGATE_NAME = descriptorOf('delegate').name;
@@ -161,11 +163,12 @@ export const TOOL_MANAGE_METADATA = coreMetadataOf(TOOL_MANAGE_NAME);
 export const TOOL_CREATE_METADATA = coreMetadataOf(TOOL_CREATE_NAME);
 export const TOOL_REGISTRY_METADATA = coreMetadataOf(TOOL_REGISTRY_NAME);
 
-// Session record tools.
-export const TASK_METADATA = coreMetadataOf(TASK_NAME);
-export const PROFILE_MANAGE_METADATA = coreMetadataOf(PROFILE_MANAGE_NAME);
-export const CHAPTER_MANAGE_METADATA = coreMetadataOf(CHAPTER_MANAGE_NAME);
-export const LOCATION_MANAGE_METADATA = coreMetadataOf(LOCATION_MANAGE_NAME);
+// Session record tools: the engine plus its four wrappers (records-engine T3).
+export const RECORDS_METADATA = coreMetadataOf(RECORDS_NAME);
+export const TASKS_METADATA = coreMetadataOf(TASKS_NAME);
+export const PROFILES_METADATA = coreMetadataOf(PROFILES_NAME);
+export const CHAPTERS_METADATA = coreMetadataOf(CHAPTERS_NAME);
+export const LOCATIONS_METADATA = coreMetadataOf(LOCATIONS_NAME);
 
 // Agent inspection and delegation.
 export const AGENT_MANAGE_METADATA = coreMetadataOf(AGENT_MANAGE_NAME);

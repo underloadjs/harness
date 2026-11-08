@@ -18,7 +18,11 @@
 //   7. MICROTASK NEUTRALITY: `turn.before` always HAS a subscriber (the shipped
 //      context-compaction plugin), so an inert one must produce exactly the frames and
 //      the provider requests a hook-less harness produces, while a synchronous override
-//      still reaches the provider (src/plugin/hooks.ts rule 6).
+//      still reaches the provider (src/plugin/hooks.ts rule 6);
+//   8. THE T3.5 SURFACE: `api.snapshot()` is the host's own document (detached, safe
+//      mid-run, reports nothing), and `api.settings.setOwn()` writes only the calling
+//      plugin's declared namespace, through the host's provider, under the server's own
+//      write-edge rules — including the stated "no writer" refusal.
 //
 // Every expected value below is written out in full, so a change in event ordering,
 // payload shape, or the token estimate fails with a diff instead of a shrug.
@@ -26,6 +30,7 @@
 import { describe, expect, it } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type {
+    HarnessDiagnosticEvent,
     HarnessEvent,
     HarnessPluginMetadata,
     HarnessStream,
@@ -33,6 +38,32 @@ import type {
     HarnessStreamRequest,
     HarnessTurnBeforeContext
 } from '@underload/harness';
+
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
 
 // ---------------------------------------------------------------------------
 // Scripted transport (same shape as harness.test.ts: turns are replayed in order)
@@ -89,8 +120,44 @@ describe('plugin auto-discovery', () => {
                 min: 1000,
                 step: 1000,
                 description:
-                    'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the same ~4 characters/token estimate the UI context bar uses.'
-            }
+                    'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost.'
+            },
+{
+                key: "enabled",
+                label: "Compact conversations",
+                type: "boolean",
+                default: true,
+                description:
+                    "Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in."
+                },
+{
+                key: "minTokens",
+                label: "Minimum saving per pass (tokens)",
+                type: "number",
+                default: 200,
+                min: 0,
+                step: 50,
+                description:
+                    "A pass must withhold at least this many estimated tokens, or it does nothing at all \u2014 no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count."
+                },
+{
+                key: "safetyTurns",
+                label: "Recent units to protect",
+                type: "number",
+                default: 6,
+                min: 0,
+                step: 1,
+                description:
+                    "How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon."
+                },
+{
+                key: "mode",
+                label: "Compaction mode",
+                type: "string",
+                default: "exclude",
+                description:
+                    "What a compaction does with a unit it removes. Only \"exclude\" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. \"annotate\" \u2014 replace the result with a one-line handle back to the full text \u2014 is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than \"exclude\" (including that one) behaves as \"exclude\" until it lands. The value actually used is reported in the pass diagnostic."
+                }
         ]);
         expect(writer.pluginMetadata.map((entry) => entry.builtin)).toEqual([true, true]);
     });
@@ -240,7 +307,7 @@ describe('turn.before interception', () => {
 
         // ...while committed history is untouched. This is the difference between
         // "shrink this request" and "rewrite this conversation".
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'ABCDEFGH' },
             { role: 'assistant', content: 'replied' }
         ]);
@@ -274,7 +341,7 @@ describe('turn.before interception', () => {
         await writer('go');
 
         expect(seen[0].messages).toEqual([{ role: 'user', content: 'from-later-return' }]);
-        expect(writer.agent.messages[0]).toEqual({ role: 'user', content: 'go' });
+        expect(withoutIds(writer.agent.messages[0])).toEqual({ role: 'user', content: 'go' });
     });
 
     it('replaceHistory rewrites committed history through the validating write path', async () => {
@@ -306,7 +373,7 @@ describe('turn.before interception', () => {
         // IS history by then). A real compactor therefore re-states the newest turn in
         // its replacement instead of dropping it — pinning that here, because the
         // alternative (silently keeping the old prompt) would defeat the whole rewrite.
-        expect(writer.threadMessages(thread.id)).toEqual([
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
             { role: 'system', content: 'summarized' },
             { role: 'user', content: 'oldest question' },
             { role: 'assistant', content: 'ok' }
@@ -426,7 +493,7 @@ describe('turn.before interception', () => {
         expect(message.content).toBe('survived');
         // Two broken hooks, then the healthy one, in registration order.
         expect(seen).toEqual(['saw:1', 'after:survived']);
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'survived' }
         ]);
@@ -561,7 +628,7 @@ describe('turn.before microtask neutrality', () => {
         expect(message.content).toBe('replied');
         // Committed history keeps the original prompt: an override is per-request, which
         // is the difference between this hook and `replaceHistory()`.
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'replied' }
         ]);
@@ -825,6 +892,746 @@ describe('lifecycle event order', () => {
             'turn.before',
             'run.failed',
             'thread.idle'
+        ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T1 — the event bus in PRODUCTION (the reporter the harness installs, the wildcard,
+// the host plane bridge, and the teardown the catalogue promised)
+// ---------------------------------------------------------------------------
+
+describe('plugin diagnostics in production (T1.5)', () => {
+    it('reports a throwing hook to the host without failing the run', async () => {
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('carried on')])) },
+            plugins: [
+                {
+                    name: 'broken-policy',
+                    setup: (api) => {
+                        api.on('turn.before', () => {
+                            throw new Error('compactor crashed');
+                        });
+                    }
+                }
+            ],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const message = await writer('go');
+
+        // Fail-open is unchanged (rule 2) — what T1.5 adds is that the drop is no
+        // longer invisible.
+        expect(message.content).toBe('carried on');
+        expect(diagnostics).toEqual([
+            {
+                type: 'plugin_diagnostic',
+                kind: 'handler-threw',
+                event: 'turn.before',
+                owner: 'broken-policy',
+                message: 'compactor crashed'
+            }
+        ]);
+    });
+
+    it('drops a hook that never resolves at its budget, reports it, and still answers', async () => {
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('answered anyway')])) },
+            plugins: [
+                {
+                    name: 'slow-policy',
+                    setup: (api) => {
+                        // A summarizer call that never comes back. Without a budget this
+                        // turn was parked forever; the run had no way to notice.
+                        api.on('turn.before', () => new Promise<never>(() => undefined), {
+                            timeoutMs: 5
+                        });
+                    }
+                }
+            ],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('answered anyway');
+        expect(diagnostics).toEqual([
+            {
+                type: 'plugin_diagnostic',
+                kind: 'handler-timed-out',
+                event: 'turn.before',
+                owner: 'slow-policy',
+                message:
+                    'A "slow-policy" handler for "turn.before" timed out after 5ms and was dropped (fail-open).'
+            }
+        ]);
+    });
+
+    it('a diagnostic sink that throws cannot fail the run either', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('fine')])) },
+            plugins: [
+                {
+                    name: 'broken-policy',
+                    setup: (api) => {
+                        api.on('turn.before', () => {
+                            throw new Error('first failure');
+                        });
+                    }
+                }
+            ],
+            report: {
+                diagnostic: () => {
+                    throw new Error('the reporter is itself broken');
+                }
+            }
+        });
+
+        await expect(writer('go')).resolves.toMatchObject({ content: 'fine' });
+    });
+});
+
+describe('wildcard subscription and the host plane (T1.1, T1.7)', () => {
+    it('one "*" handler sees a whole session in the run\'s real order, once each', async () => {
+        const seen: string[] = [];
+        const stateChanges: string[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            plugins: [
+                {
+                    name: 'auditor',
+                    setup: (api) => {
+                        api.on('*', (context) => {
+                            seen.push(context.event);
+                        });
+                        // T1.7: the state-change plane is opt-in BY NAME, so this second
+                        // subscription is the only reason this plugin sees it at all.
+                        api.on('host.state_change', (event) => {
+                            stateChanges.push(event.reason);
+                        });
+                    }
+                }
+            ]
+        });
+
+        const thread = writer.createThread('writer', { label: 'Audited' });
+        await writer.sendThreadInput(thread.id, 'go');
+        writer.stopThread(thread.id);
+        writer.deleteThread(thread.id);
+
+        // Identical to the named-handler ordering the file already pins, reached with
+        // ONE subscription — which is the whole requirement (R3).
+        expect(seen).toEqual([
+            'thread.created',
+            'thread.started',
+            'run.started',
+            'turn.before',
+            'turn.after',
+            'run.finished',
+            'thread.idle',
+            'thread.stopped',
+            'thread.deleted'
+        ]);
+
+        // Exactly the reasons this session's mutations produce, in order: the create,
+        // the two transcript appends of the run (user, then the assistant answer), the
+        // stop, and the delete. A run start/finish deliberately contributes NOTHING
+        // here (harness.ts: the per-turn `agent_message` already covers it), which is
+        // why this list is five and not nine.
+        expect(stateChanges).toEqual([
+            'thread',
+            'agent_message',
+            'agent_message',
+            'thread',
+            'thread'
+        ]);
+
+        writer.dispose();
+
+        // Teardown is part of what an auditor is entitled to see.
+        expect(seen[seen.length - 1]).toBe('harness.dispose');
+    });
+
+    it('a "*" subscriber that wants host.state_change by name gets it, and no duplicate', async () => {
+        const wild: string[] = [];
+        const named: string[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            plugins: [
+                {
+                    name: 'both-ways',
+                    setup: (api) => {
+                        api.on('*', (context) => void wild.push(context.event));
+                        api.on('host.state_change', (event) => void named.push(event.reason));
+                    }
+                }
+            ]
+        });
+
+        await writer('go');
+
+        // The wildcard fan-out carried no `host.state_change`, so the named
+        // subscription cannot be double-delivered: it sees exactly the run's two
+        // transcript appends (the user prompt and the committed answer) and nothing else.
+        expect(wild).toEqual([
+            'thread.started',
+            'run.started',
+            'turn.before',
+            'turn.after',
+            'run.finished',
+            'thread.idle'
+        ]);
+        expect(named).toEqual(['agent_message', 'agent_message']);
+        expect(wild.filter((event) => event === 'host.state_change')).toEqual([]);
+    });
+});
+
+describe('harness.dispose (T1.6)', () => {
+    it('fires exactly once on dispose, clears the bus, and survives a second call', async () => {
+        const events: string[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('one'), answer('two')])) },
+            plugins: [
+                {
+                    name: 'auditor',
+                    setup: (api) => {
+                        api.on('harness.dispose', () => void events.push('harness.dispose'));
+                        api.on('turn.before', () => void events.push('turn.before'));
+                        api.on('run.finished', () => void events.push('run.finished'));
+                    }
+                }
+            ]
+        });
+
+        await writer('first');
+
+        expect(events).toEqual(['turn.before', 'run.finished']);
+
+        writer.dispose();
+
+        expect(events).toEqual(['turn.before', 'run.finished', 'harness.dispose']);
+
+        // Idempotent (guarantee 1), and the bus is CLEARED: the next run works and fires
+        // no hook at all, which is what "subscriptions die with the harness" means.
+        writer.dispose();
+        await writer('second');
+
+        expect(events).toEqual(['turn.before', 'run.finished', 'harness.dispose']);
+        expect(writer.agent.messages.map((message) => message.role)).toEqual([
+            'user',
+            'assistant',
+            'user',
+            'assistant'
+        ]);
+    });
+
+    it('a dispose() that lands mid-run waits for the last run, after its terminal hooks', async () => {
+        const events: string[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            plugins: [
+                {
+                    name: 'auditor',
+                    setup: (api) => {
+                        for (const event of ['run.finished', 'thread.idle', 'harness.dispose']) {
+                            api.on(event as 'run.finished', () => void events.push(event));
+                        }
+                    }
+                }
+            ]
+        });
+
+        const running = writer('go');
+
+        writer.dispose();
+
+        // Parked: the teardown event must never be raced against a live run (F8).
+        expect(events).toEqual([]);
+
+        await running;
+
+        expect(events).toEqual(['run.finished', 'thread.idle', 'harness.dispose']);
+
+        writer.dispose();
+
+        expect(events).toEqual(['run.finished', 'thread.idle', 'harness.dispose']);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T2 — the turn decision pipeline
+// ---------------------------------------------------------------------------
+//
+// The four actions of `HarnessTurnDecision`, consumed where the transcript is decided
+// (`requestTurn`, right after `emitTurnBefore`), plus the fail-open rule for a
+// malformed one. Every expected value is written out, so an action that silently became
+// a no-op — or a rollback that stopped rolling back — fails with a diff.
+describe('turn decision pipeline (T2)', () => {
+    // A core tool (no discovery round) so a scripted tool round reaches the provider.
+    const coreClock = () =>
+        tool({
+            description: 'Read the clock.',
+            tags: ['time'],
+            visibility: 'core',
+            execute: () => 'noon'
+        });
+
+    // The committed transcript of the ROOT conversation, as `role:content` lines.
+    const transcriptOf = (messages: readonly { role: string; content?: unknown }[]): string[] =>
+        messages.map((message) => `${message.role}:${message.content ?? ''}`);
+
+    it('a continue decision sends the projected transcript and changes nothing', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('normal')], seen)) },
+            plugins: [
+                {
+                    name: 'agreeing-policy',
+                    setup: (api) => {
+                        api.on('turn.before', () => ({ decision: { action: 'continue' } }));
+                    }
+                }
+            ]
+        });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('normal');
+        expect(seen.map((request) => transcriptOf(request.messages))).toEqual([['user:go']]);
+        expect(transcriptOf(writer.agent.messages)).toEqual([
+            'user:go',
+            'assistant:normal'
+        ]);
+    });
+
+    it('a replace decision sends what it says, and only for this request', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('replied')], seen)) },
+            plugins: [
+                {
+                    name: 'rewriter',
+                    setup: (api) => {
+                        api.on('turn.before', () => ({
+                            decision: {
+                                action: 'replace',
+                                transcript: [{ role: 'user', content: 'compacted request' }]
+                            }
+                        }));
+                    }
+                }
+            ]
+        });
+
+        const message = await writer('go');
+
+        // The provider saw the replacement...
+        expect(seen.map((request) => transcriptOf(request.messages))).toEqual([
+            ['user:compacted request']
+        ]);
+        // ...and committed history still holds the original prompt: a decision about the
+        // REQUEST is not a write to the transcript (that is `replaceHistory`).
+        expect(transcriptOf(writer.agent.messages)).toEqual(['user:go', 'assistant:replied']);
+        expect(message.content).toBe('replied');
+    });
+
+    it('a pause decision parks the conversation, still sends the turn, and resume continues it', async () => {
+        const lifecycle: string[] = [];
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([callTool('c1', 'clock', '{}'), answer('second turn')], seen))
+            },
+            tools: { clock: coreClock() },
+            presets: false,
+            plugins: [
+                {
+                    name: 'pauser',
+                    setup: (api) => {
+                        api.on('thread.paused', (record) => void lifecycle.push(`paused:${record.status}`));
+                        api.on('thread.resumed', (record) => void lifecycle.push(`resumed:${record.status}`));
+                        api.on('turn.before', async (payload) => {
+                            if (payload.iteration === 1) {
+                                return { decision: { action: 'pause', reason: 'compacting' } };
+                            }
+
+                            // A later boundary un-parks it. Pause is a ROSTER signal, so
+                            // the parked run kept going the whole time.
+                            await payload.resume();
+
+                            return { decision: { action: 'continue' } };
+                        });
+                    }
+                }
+            ]
+        });
+
+        const thread = writer.createThread('writer', { label: 'Pausable' });
+        const message = await writer.sendThreadInput(thread.id, 'go');
+
+        expect(message.content).toBe('second turn');
+        // BOTH turns went out: a pause never withheld a request.
+        expect(seen.map((request) => transcriptOf(request.messages))).toEqual([
+            ['user:go'],
+            ['user:go', 'assistant:', 'tool:noon']
+        ]);
+        expect(lifecycle).toEqual(['paused:paused', 'resumed:running']);
+        // The park did not end the run, and the resume returned the conversation to the
+        // status the run loop owns.
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+    });
+
+    it('a stop decision mid-run ends the run with the plugin reason and leaves no orphan assistant message', async () => {
+        const events: string[] = [];
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([callTool('c1', 'clock', '{}'), answer('never requested')], seen))
+            },
+            tools: { clock: coreClock() },
+            presets: false,
+            plugins: [
+                {
+                    name: 'budget',
+                    setup: (api) => {
+                        api.on('run.finished', () => void events.push('run.finished'));
+                        api.on('run.failed', (context) => void events.push(`run.failed:${context.error.message}`));
+                        api.on('thread.stopped', (record) => void events.push(`thread.stopped:${record.status}`));
+                        api.on('turn.before', (payload) => {
+                            if (payload.iteration < 2) return undefined;
+
+                            return { decision: { action: 'stop', reason: 'plugin budget exhausted' } };
+                        });
+                    }
+                }
+            ]
+        });
+
+        const failure = await writer('go').then(
+            () => undefined,
+            (error: Error) => error
+        );
+
+        // The reason the plugin gave is the reason the caller and `run.failed` report —
+        // open decision 2: the abort path, not a fabricated answer.
+        expect((failure as Error).message).toBe('plugin budget exhausted');
+        expect(events).toEqual([
+            'thread.stopped:stopped',
+            'run.failed:plugin budget exhausted'
+        ]);
+        // ONE provider request: the decision lands before the second request is built,
+        // and the run never claimed an answer.
+        expect(seen.map((request) => transcriptOf(request.messages))).toEqual([['user:go']]);
+        // THE orphan check: the assistant message and the tool result the first turn
+        // committed are rolled back with the run, exactly like the `maxIterations`
+        // guard's rollback, so a stopped conversation shows nothing but what it had
+        // before the run.
+        expect(transcriptOf(writer.agent.messages)).toEqual([]);
+        expect(writer.thread('agent:writer')?.status).toBe('stopped');
+    });
+
+    it('a malformed decision is ignored AND reported while the round\'s transcript override still applies', async () => {
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('replied')], seen)) },
+            plugins: [
+                {
+                    name: 'typo-policy',
+                    setup: (api) => {
+                        // `halt` is not an action. The rewrite in the SAME object is
+                        // real work and must survive the typo.
+                        api.on('turn.before', () => ({
+                            transcript: [{ role: 'user', content: 'still sent' }],
+                            decision: { action: 'halt' }
+                        }));
+                    }
+                }
+            ],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const message = await writer('go');
+
+        expect(seen.map((request) => transcriptOf(request.messages))).toEqual([
+            ['user:still sent']
+        ]);
+        expect(message.content).toBe('replied');
+        expect(diagnostics).toEqual([
+            {
+                type: 'plugin_diagnostic',
+                kind: 'invalid-decision',
+                event: 'turn.before',
+                owner: 'typo-policy',
+                message:
+                    'A "typo-policy" handler for "turn.before" returned a decision this contract cannot parse and it was ignored: {"action":"halt"}.'
+            }
+        ]);
+    });
+
+    it('a synchronous decision costs no microtask: the frames match a hook-less run', async () => {
+        const events: HarnessEvent[] = [];
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([callTool('c1', 'clock', '{}'), answer('final')], seen))
+            },
+            presets: false,
+            tools: { clock: coreClock() },
+            plugins: [
+                {
+                    name: 'sync-decision',
+                    setup: (api) => {
+                        api.on('turn.before', () => ({ decision: { action: 'continue' } }));
+                    }
+                }
+            ],
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const message = await writer('go');
+
+        // The SAME literal ordering the hook-less baseline is pinned to above (the
+        // `turn.before microtask neutrality` section): a plain function returning a
+        // decision must not have moved a frame.
+        expect(events.map((event) => (event.type === 'done' ? `done:${event.message.content}` : event.type))).toEqual([
+            'start',
+            'tool_call',
+            'attempt_commit',
+            'tool_result',
+            'text',
+            'done:final'
+        ]);
+        expect(seen.map((request) => transcriptOf(request.messages))).toEqual([
+            ['user:go'],
+            ['user:go', 'assistant:', 'tool:noon']
+        ]);
+        expect(message.content).toBe('final');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Pipeline T3.5 — `api.snapshot()` and `api.settings.setOwn()`
+// ---------------------------------------------------------------------------
+
+describe('plugin persistence and settings write surface (T3.5)', () => {
+    it('api.snapshot() is the host document, safe mid-run, and read-only in effect', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        // What the hook saw at the turn boundary (a CLONE, so the mutation experiment
+        // below cannot rewrite the evidence), and what a fresh read returns afterwards.
+        let midRun: unknown;
+        let afterMutation: unknown;
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')], seen)) },
+            plugins: [
+                {
+                    name: 'auditor',
+                    setup: (api) => {
+                        api.on('turn.before', (context) => {
+                            // T3.5: the SAME document `harness.snapshot()` hands a host,
+                            // taken while a run is live. The user turn of this run is
+                            // already committed at this boundary, so it is in here.
+                            const doc = api.snapshot();
+                            midRun = JSON.parse(JSON.stringify(doc));
+
+                            // Read-only IN EFFECT, not just by comment: this is a detached
+                            // document, so pushing into it changes nothing the harness or a
+                            // later read will ever see.
+                            doc.agents.writer.messages.push({ role: 'user', content: 'injected' });
+                            afterMutation = JSON.parse(JSON.stringify(api.snapshot()));
+                        });
+                    }
+                }
+            ]
+        });
+
+        await writer('go');
+
+        // Snapshot version 2: the record store collapsed into ONE collection map with one
+        // id counter (records-engine T4/R5), which is a shape change the version must show.
+        expect(midRun).toEqual(expect.objectContaining({ version: 2 }));
+        expect(withoutIds((midRun as { agents: { writer: { messages: unknown[] } } }).agents.writer.messages)).toEqual([
+            { role: 'user', content: 'go' }
+        ]);
+
+        // A fresh read is unaffected by the caller mutating the copy it was handed.
+        expect(withoutIds((afterMutation as { agents: { writer: { messages: unknown[] } } }).agents.writer.messages)).toEqual([
+            { role: 'user', content: 'go' }
+        ]);
+        expect(JSON.stringify(afterMutation)).not.toContain('injected');
+        expect(withoutIds(writer.agent.messages)).toEqual([
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'hi' }
+        ]);
+        // The request the provider got is the projected committed transcript, unchanged
+        // by a read-only call: `snapshot()` reports state, it never mutates it.
+        expect(seen.map((request) => request.messages)).toEqual([
+            [{ role: 'user', content: 'go' }]
+        ]);
+    });
+
+    it('a snapshot taken from a hook costs no persistence notification at all', async () => {
+        const reasons: string[] = [];
+        const plain: string[] = [];
+
+        const build = (withAuditor: boolean, sink: string[]) =>
+            harness({
+                agents: { writer: brain(scripted([answer('hi')])) },
+                ...(withAuditor
+                    ? {
+                          plugins: [
+                              {
+                                  name: 'auditor',
+                                  setup: (api) => {
+                                      api.on('turn.before', () => {
+                                          api.snapshot();
+                                      });
+                                  }
+                              }
+                          ]
+                      }
+                    : {}),
+                report: { stateChange: (event) => void sink.push(`${event.reason}:${event.agent ?? '-'}`) }
+            });
+
+        await build(false, plain)('go');
+        await build(true, reasons)('go');
+
+        // The user append and the committed answer, and nothing else: a read reports no
+        // change, which is what keeps it safe to call once per turn.
+        expect(plain).toEqual(['agent_message:writer', 'agent_message:writer']);
+        expect(reasons).toEqual(plain);
+    });
+
+    it('api.settings.setOwn() writes ONLY its own namespace, through the host provider', async () => {
+        // A host provider with the optional writer — the proof the write goes THROUGH the
+        // provider rather than around it, and the only way to see what a host would store.
+        const stored: Record<string, unknown> = {};
+        const writes: Array<[string, string, unknown]> = [];
+        const refusals: string[] = [];
+        const perTurn: string[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('one'), answer('two')])) },
+            pluginSettings: {
+                get: (plugin, key) => stored[`${plugin}.${key}`],
+                set: (plugin, key, value) => {
+                    writes.push([plugin, key, value]);
+                    stored[`${plugin}.${key}`] = value;
+                }
+            },
+            plugins: [
+                {
+                    name: 'policy',
+                    metadata: {
+                        name: 'policy',
+                        title: 'Policy',
+                        settings: [
+                            { key: 'note', label: 'Note', type: 'string', default: 'unset' },
+                            { key: 'limit', label: 'Limit', type: 'number', default: 10, min: 5, max: 20 }
+                        ]
+                    },
+                    setup: (api) => {
+                        api.on('turn.before', () => {
+                            perTurn.push(api.settings.string('note'));
+                            api.settings.setOwn('note', 'written');
+                            // The write is live IMMEDIATELY: the view re-reads the
+                            // provider on every access (the same property that makes an
+                            // operator's PATCH reach a running session), so a plugin sees
+                            // its own change without a rebuild or a restart.
+                            perTurn.push(api.settings.string('note'));
+                            // A number for a string setting is refused, not stringified.
+                            try {
+                                api.settings.setOwn('note', 7);
+                            } catch (error) {
+                                refusals.push((error as Error).message);
+                            }
+
+                            // Out of the published bounds, so refused.
+                            try {
+                                api.settings.setOwn('limit', 99);
+                            } catch (error) {
+                                refusals.push((error as Error).message);
+                            }
+
+                            // Another plugin's namespace is not reachable from this view.
+                            try {
+                                api.settings.setOwn('intervalMs', 1);
+                            } catch (error) {
+                                refusals.push((error as Error).message);
+                            }
+                        });
+                    }
+                }
+            ]
+        });
+
+        await writer('go');
+
+        // Written exactly once, normalized to the declared type, under THIS plugin's name.
+        expect(writes).toEqual([['policy', 'note', 'written']]);
+        // The declared default, then the plugin's own write — same view, no rebuild.
+        expect(perTurn).toEqual(['unset', 'written']);
+        expect(refusals).toEqual([
+            '"note" of plugin "policy" must be a string (it is declared "string").',
+            '"limit" of plugin "policy" must be at most 20; 99 was submitted.',
+            'settings.setOwn received "intervalMs", which plugin "policy" does not declare (declared: "note", "limit").'
+        ]);
+        expect(stored['policy.note']).toBe('written');
+        expect(stored['async-ping.intervalMs']).toBeUndefined();
+    });
+
+    it('a host whose provider has no writer is told so, and the write is not silently kept', async () => {
+        const refusals: string[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            // The shipped server's live provider is exactly this: read-only, because its
+            // store's own PATCH edge stays the one that validates and persists.
+            pluginSettings: { get: () => undefined },
+            plugins: [
+                {
+                    name: 'policy',
+                    metadata: {
+                        name: 'policy',
+                        title: 'Policy',
+                        settings: [{ key: 'note', label: 'Note', type: 'string', default: 'unset' }]
+                    },
+                    setup: (api) => {
+                        api.on('turn.before', () => {
+                            try {
+                                api.settings.setOwn('note', 'written');
+                            } catch (error) {
+                                refusals.push((error as Error).message);
+                            }
+
+                            // The refusal is a plugin-level throw inside a hook, so the
+                            // bus fail-open rule keeps the run alive either way.
+                            api.settings.setOwn('missing', 'x');
+                        });
+                    }
+                }
+            ]
+        });
+
+        expect((await writer('go')).content).toBe('hi');
+        expect(refusals).toEqual([
+            'settings.setOwn cannot store "note" of plugin "policy": this harness\'s plugin-settings provider is read-only (no writer).'
         ]);
     });
 });

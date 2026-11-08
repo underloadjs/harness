@@ -52,7 +52,7 @@ const descriptor = (name: string, overrides: Partial<HarnessDescriptor> = {}): H
         requiresEndpoint: true,
         agents: ['instruct', 'summarizer'],
         tools: [],
-        coreTools: ['toolRequest', 'task', 'delegate'],
+        coreTools: ['toolRequest', 'tasks', 'delegate'],
         primary: 'instruct',
         subagents: ['summarizer'],
         builtin: true,

@@ -223,17 +223,17 @@ describe('PATCH /sessions/{id}/tools/{tool_id} with enabled only', () => {
         const created = await call(api, 'POST', `${MOUNT}/sessions`, { harness: 'tooling' });
         const sessionId = created.body.session.id as string;
 
-        const row = await rowOf(api, sessionId, 'task');
+        const row = await rowOf(api, sessionId, 'tasks');
 
         expect(row).toMatchObject({ protected: true });
 
-        const refused = await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/tools/task`, { enabled: false });
+        const refused = await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/tools/tasks`, { enabled: false });
 
         expect(refused.status).toBe(403);
         expect(refused.body.error.message).toContain('harness-owned');
 
         // The refusal is a refusal, not a partial write: the row is unchanged.
-        expect(await rowOf(api, sessionId, 'task')).toMatchObject({ protected: true, enabled: row!.enabled });
+        expect(await rowOf(api, sessionId, 'tasks')).toMatchObject({ protected: true, enabled: row!.enabled });
     });
 
     it('rejects a non-boolean gate and an empty patch', async () => {
@@ -330,11 +330,11 @@ describe('DELETE /sessions/{id}/tools/{tool_id}', () => {
         const created = await call(api, 'POST', `${MOUNT}/sessions`, { harness: 'tooling' });
         const sessionId = created.body.session.id as string;
 
-        const refused = await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/tools/task`);
+        const refused = await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/tools/tasks`);
 
         expect(refused.status).toBe(403);
         expect(refused.body.error.message).toContain('cannot be unregistered');
-        expect(await rowOf(api, sessionId, 'task')).toMatchObject({ protected: true });
+        expect(await rowOf(api, sessionId, 'tasks')).toMatchObject({ protected: true });
     });
 });
 

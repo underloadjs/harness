@@ -1,8 +1,8 @@
 // task in the harness — declaration, turns, sharing, isolation, and names.
 //
 // These tests sit next to harness() because they pin harness integration, while
-// src/core/task.test.ts covers the tool implementation itself:
-//   - task is core and available on the very first request (no discovery);
+// src/core/records.test.ts covers the unified store engine itself:
+//   - `tasks` is core and available on the very first request (no discovery);
 //   - the list persists across harness calls and across agents in one harness;
 //   - a mutation returns the CURRENT bounded list in the same round trip;
 //   - a second harness (a second server session) starts empty;
@@ -11,29 +11,29 @@
 //   - invalid input becomes a readable, recoverable tool result;
 //   - R9-R11: the demoted runtime rows (the record tools, the tool* inventory set,
 //     threadFork) stay REGISTERED but are no longer DECLARED, so only
-//     toolRequest + task are advertised up front.
+//     toolRequest + tasks are advertised up front (Decision I keeps `tasks` core).
 //
 // T1 (concurrency) is pinned HERE at the harness level, because the whole change
 // exists for the multi-agent case and only the harness has two identities to
 // interleave:
 //   - every record carries `rev` + attribution, and every page carries `storeRev`;
 //   - a call that has an agent identity may not patch or remove blind — it needs
-//     the `expects` token it read (src/core/task.ts guarded writes);
+//     the `expects` token it read (src/core/records.ts guarded writes);
 //   - a concurrent edit rejects the WHOLE stale call atomically, leaves the store
 //     AND the change feed untouched, and the caller succeeds after a re-read;
-//   - `claim` blocks a foreign content write until it is released / taken over /
-//     expired, and an ownership action never moves `rev`;
+//   - there are no locks and no claims (records-engine Decision P): EVERY patch is
+//     accepted unless it is stale, and a stale rejection carries the CURRENT entry
+//     (R9) so the caller recovers in one round trip;
 //   - `afterId` walks every record even when another agent removes one mid-walk;
 //   - `since` returns the events a caller missed, with `changesHasMore` and
 //     `changesTruncated` stated honestly.
 //
 // Expectations come from the approved wire design (one patch call, one bounded
 // result `{ tasks, counts { total, completed, pending }, page, storeRev }` and the
-// exact messages in src/core/task.ts), not from the implementation's output.
+// exact coded messages in src/core/records.ts), not from the implementation's output.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
-import { TASK_DEFAULT_LEASE_MS } from './core/task';
 import type {
     Agent,
     Harness,
@@ -50,16 +50,14 @@ import type {
 // ---------------------------------------------------------------------------
 // Clock policy
 // ---------------------------------------------------------------------------
-// THE FROZEN CLOCK. Every task-store timestamp (`updatedAt`, the change-feed `at`,
-// a claim's `leaseUntil = Date.now() + leaseMs`) comes from Date in
-// src/core/task.ts, so pinning Date gives each of them ONE exact expected value.
+// THE FROZEN CLOCK. Every store timestamp (`updatedAt`, the change-feed `at`) comes
+// from Date in src/core/records.ts, so pinning Date gives each of them ONE exact
+// expected value.
 // `toFake: ['Date']` leaves setTimeout and the microtask queue REAL, which the
 // scripted transports and the run loop here depend on (the same policy
 // src/harness.thread-runtime.test.ts uses).
 const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
 const EPOCH_MS = Date.parse(EPOCH_ISO);
-const LEASE_UNTIL = EPOCH_MS + TASK_DEFAULT_LEASE_MS;
-const LEASE_ISO = new Date(LEASE_UNTIL).toISOString();
 
 beforeEach(() => {
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -141,9 +139,6 @@ type RecordShape = {
     by?: string;
     threadId?: string;
     at?: string;
-    owner?: string;
-    ownerThreadId?: string;
-    leaseUntil?: number;
 };
 
 // One stored record, in the exact key set `copyItem` emits (src/core/task.ts).
@@ -159,9 +154,6 @@ const task = (id: string, text: string, shape: RecordShape = {}): TaskItem => ({
     ...(shape.by === undefined ? {} : { updatedBy: shape.by }),
     ...(shape.threadId === undefined ? {} : { updatedThreadId: shape.threadId }),
     ...(shape.at === undefined ? {} : { updatedAt: shape.at }),
-    ...(shape.owner === undefined ? {} : { owner: shape.owner }),
-    ...(shape.ownerThreadId === undefined ? {} : { ownerThreadId: shape.ownerThreadId }),
-    ...(shape.leaseUntil === undefined ? {} : { leaseUntil: shape.leaseUntil })
 });
 
 // One change-feed entry in the canonical key order (`rev, id, op, by, threadId, at,
@@ -205,7 +197,7 @@ const callAs = (
     threadId: string,
     parameters: TaskParameters
 ): Promise<TaskResult> =>
-    writer.callTool('task', parameters, asCaller(who, threadId)) as Promise<TaskResult>;
+    writer.callTool('tasks', parameters, asCaller(who, threadId)) as Promise<TaskResult>;
 
 // The runtime rows R9-R11 demoted to demand discovery. They stay registered (so
 // toolRequest can enable them) but must never appear in a declaration.
@@ -214,29 +206,32 @@ const DEMOTED_RUNTIME_TOOLS = [
     'toolCreate',
     'toolManage',
     'toolList',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
+    // The engine surface joins the demoted set (Decision I): registered, searchable, and
+    // reachable by toolRequest - while 'tasks' stays core.
+    'records',
+    'profiles',
+    'chapters',
+    'locations',
     'agentManage',
     'agentResult',
     'threadFork'
 ] as const;
 
-describe('task', () => {
+describe('tasks', () => {
     it('is core and available on the first request without discovery', async () => {
         const seen: HarnessStreamRequest[] = [];
         const entry = brain(
-            scripted([callTool('c1', 'task', '{"tasks":[{"text":"Draft plan"}]}'), answer('added')], seen)
+            scripted([callTool('c1', 'tasks', '{"tasks":[{"text":"Draft plan"}]}'), answer('added')], seen)
         );
         const writer = quiet(entry);
 
-        expect(writer.tools.task.visibility).toBe('core');
+        expect(writer.tools.tasks.visibility).toBe('core');
 
         await writer('start a plan');
 
         // toolRequest is never called, yet task was declared and executed. R9-R11
         // leaves exactly the discovery bootstrap plus the session plan declared.
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'task']);
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'tasks']);
 
         // The mutation answer IS the current list: no `{ todo, counts }` wrapper.
         // T1 adds the content revision, the attribution of THIS run (the primary
@@ -249,9 +244,9 @@ describe('task', () => {
     it('keeps the list across harness calls and re-reads with no arguments', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'task', '{"tasks":[{"text":"Draft plan"}]}'),
+                callTool('c1', 'tasks', '{"tasks":[{"text":"Draft plan"}]}'),
                 answer('added'),
-                callTool('c2', 'task', '{}'),
+                callTool('c2', 'tasks', '{}'),
                 answer('listed')
             ])
         );
@@ -278,19 +273,19 @@ describe('task', () => {
     it('patches one field and removes by id, each time returning the list', async () => {
         const writer = quiet(brain(scripted([answer('hi')])));
 
-        await writer.executeTool('task', { tasks: [{ text: 'One' }, { text: 'Two' }] });
+        await writer.executeTool('tasks', { tasks: [{ text: 'One' }, { text: 'Two' }] });
 
         // GUARDED WRITE. `executeTool` runs as the primary agent, so a patch of an
         // existing id must carry the token the caller READ (src/core/task.ts
         // guardedWriteMessage). The read first, then the write with that rev.
-        const before = (await writer.executeTool('task', {})) as TaskResult;
+        const before = (await writer.executeTool('tasks', {})) as TaskResult;
 
         expect(before.tasks.map((item) => item.rev)).toEqual([1, 1]);
 
         // A partial patch leaves the untouched text in place, moves ONLY that
         // record's `rev`, and records exactly one store event.
         expect(
-            await writer.executeTool('task', {
+            await writer.executeTool('tasks', {
                 tasks: [{ id: '1', completed: true }],
                 expects: [{ id: '1', rev: 1 }]
             })
@@ -309,15 +304,15 @@ describe('task', () => {
         // Removals answer the same way, with the survivor list. A removal is a
         // guarded write too, so it needs the CURRENT token for the id it deletes.
         expect(
-            await writer.executeTool('task', { remove: ['1'], expects: [{ id: '1', rev: 2 }] })
+            await writer.executeTool('tasks', { remove: ['1'], expects: [{ id: '1', rev: 2 }] })
         ).toEqual(taskPage([task('2', 'Two', { by: 'writer', at: EPOCH_ISO })], 1, 0, 4));
 
         // A rejected patch does not move the store — not the records, not the id
         // counter, and not `storeRev`.
-        await expect(writer.executeTool('task', { tasks: [{ id: '9', completed: true }] })).rejects.toThrow(
-            'task has no task with id "9".'
+        await expect(writer.executeTool('tasks', { tasks: [{ id: '9', completed: true }] })).rejects.toThrow(
+            'unknown-record: tasks has no task with id "9".'
         );
-        expect(await writer.executeTool('task', {})).toEqual(
+        expect(await writer.executeTool('tasks', {})).toEqual(
             taskPage([task('2', 'Two', { by: 'writer', at: EPOCH_ISO })], 1, 0, 4)
         );
     });
@@ -328,7 +323,7 @@ describe('task', () => {
 
         const researcher = brain(
             scripted(
-                [callTool('r1', 'task', '{}'), answer('saw the shared list')],
+                [callTool('r1', 'tasks', '{}'), answer('saw the shared list')],
                 researcherSeen
             )
         );
@@ -345,7 +340,7 @@ describe('task', () => {
         const entry = brain(
             scripted(
                 [
-                    callTool('c1', 'task', '{"tasks":[{"text":"Shared item"}]}'),
+                    callTool('c1', 'tasks', '{"tasks":[{"text":"Shared item"}]}'),
                     callTool('c2', 'peek', '{}'),
                     answer('done')
                 ],
@@ -365,8 +360,8 @@ describe('task', () => {
 
         // Both brains see task (and the bootstrap) as core; the primary additionally
         // sees delegate. `peek` was configured later than the baseline, so it follows.
-        expect(declaredNames(writerSeen[0])).toEqual(['toolRequest', 'task', 'delegate', 'peek']);
-        expect(declaredNames(researcherSeen[0])).toEqual(['toolRequest', 'task', 'peek']);
+        expect(declaredNames(writerSeen[0])).toEqual(['toolRequest', 'tasks', 'delegate', 'peek']);
+        expect(declaredNames(researcherSeen[0])).toEqual(['toolRequest', 'tasks', 'peek']);
     });
 
     it('declares only toolRequest and task, and keeps the demoted rows discoverable', () => {
@@ -389,10 +384,11 @@ describe('task', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -405,20 +401,20 @@ describe('task', () => {
         const writerB = quiet(brain(scripted([answer('hi')])));
 
         // Separate factory instances per harness: not the same tool object.
-        expect(writerA.tools.task).not.toBe(writerB.tools.task);
+        expect(writerA.tools.tasks).not.toBe(writerB.tools.tasks);
 
         // Session-bound core tools execute through the harness so they receive the
         // live reference and that harness's record store.
-        await writerA.executeTool('task', { tasks: [{ text: 'Only A' }] });
+        await writerA.executeTool('tasks', { tasks: [{ text: 'Only A' }] });
 
-        expect(await writerB.executeTool('task', {})).toEqual(empty);
+        expect(await writerB.executeTool('tasks', {})).toEqual(empty);
 
         // A reset is a clean start, including the id sequence AND the store
         // revision (the change log is part of "start over").
         writerA.reset();
 
-        expect(await writerA.executeTool('task', {})).toEqual(empty);
-        expect(await writerA.executeTool('task', { tasks: [{ text: 'After reset' }] })).toEqual(
+        expect(await writerA.executeTool('tasks', {})).toEqual(empty);
+        expect(await writerA.executeTool('tasks', { tasks: [{ text: 'After reset' }] })).toEqual(
             taskPage([task('1', 'After reset', { by: 'writer', at: EPOCH_ISO })], 1, 0, 1)
         );
     });
@@ -428,12 +424,12 @@ describe('task', () => {
 
         const configured = harness({
             agents: { writer: brain(scripted([answer('hi')])) },
-            tools: { task: custom },
+            tools: { tasks: custom },
             presets: false
         });
-        expect(configured.tools.task).not.toBe(custom);
-        expect(configured.tools.task.description).toBe('Mine.');
-        await expect(configured.executeTool('task', {})).resolves.toBe('ok');
+        expect(configured.tools.tasks).not.toBe(custom);
+        expect(configured.tools.tasks.description).toBe('Mine.');
+        await expect(configured.executeTool('tasks', {})).resolves.toBe('ok');
 
         const plugin = harness({
             agents: { writer: brain(scripted([answer('hi')])) },
@@ -442,7 +438,7 @@ describe('task', () => {
                 {
                     name: 'claim',
                     setup: (api) => {
-                        api.addTool('task', {
+                        api.addTool('tasks', {
                             description: 'Mine.',
                             tags: ['task'],
                             execute: () => 'plugin'
@@ -451,7 +447,7 @@ describe('task', () => {
                 }
             ]
         });
-        await expect(plugin.executeTool('task', {})).resolves.toBe('plugin');
+        await expect(plugin.executeTool('tasks', {})).resolves.toBe('plugin');
 
         const writer = quiet(brain(scripted([answer('hi')])));
         const creation = {
@@ -460,9 +456,9 @@ describe('task', () => {
             source: 'return 1;'
         };
 
-        const created = writer.createTool({ ...creation, name: 'task' });
+        const created = writer.createTool({ ...creation, name: 'tasks' });
         expect(created.description).toBe('Mine.');
-        await expect(writer.executeTool('task', {})).resolves.toBe(1);
+        await expect(writer.executeTool('tasks', {})).resolves.toBe(1);
 
         // The replaced row is still the same slot in the same registration order.
         expect(Object.keys(writer.tools)).toEqual([
@@ -471,10 +467,11 @@ describe('task', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -490,18 +487,18 @@ describe('task', () => {
         const entry = brain(
             scripted([
                 // 1. The read that establishes the revision the model will believe.
-                callTool('c1', 'task', '{}'),
+                callTool('c1', 'tasks', '{}'),
                 // 2. The write made with the token from BEFORE the host renamed the
                 //    record, so the whole call is refused.
                 callTool(
                     'c2',
-                    'task',
+                    'tasks',
                     '{"tasks":[{"id":"1","completed":true}],"expects":[{"id":"1","rev":1}]}'
                 ),
                 // 3. The same write with the revision the first result reported.
                 callTool(
                     'c3',
-                    'task',
+                    'tasks',
                     '{"tasks":[{"id":"1","completed":true}],"expects":[{"id":"1","rev":2}]}'
                 ),
                 answer('recovered')
@@ -512,8 +509,8 @@ describe('task', () => {
         // Seed the record, then move it through the host door so the model's token is
         // genuinely stale: `executeTool` is the unthreaded PRIMARY identity, so the
         // writer it attributes is the same agent name the run will carry.
-        await writer.executeTool('task', { tasks: [{ text: 'Shared' }] });
-        await writer.executeTool('task', {
+        await writer.executeTool('tasks', { tasks: [{ text: 'Shared' }] });
+        await writer.executeTool('tasks', {
             tasks: [{ id: '1', text: 'Renamed by the host' }],
             expects: [{ id: '1', rev: 1 }]
         });
@@ -534,7 +531,7 @@ describe('task', () => {
 
         // 2. The refusal, word for word, exactly as the model receives it.
         expect(results[1]).toBe(
-            'Tool "task" failed: task "1" changed since revision 1 (now 2, last edited by "writer"); re-read and retry; changed fields: text.'
+            'Tool "tasks" failed: stale-record: tasks "1" changed since revision 1 (now 2, last edited by "writer" at 2026-01-01T00:00:00.000Z); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: {"id":"1","text":"Renamed by the host","completed":false,"rev":2,"updatedBy":"writer","updatedAt":"2026-01-01T00:00:00.000Z"}'
         );
 
         // 3. The retry lands, and the host's text survives a `completed`-only patch.
@@ -557,7 +554,7 @@ describe('task', () => {
 
         // Nothing was written by the refusal, so the successful retry is the store's
         // third and last event.
-        const feed = (await writer.executeTool('task', { since: 0 })) as TaskResult & {
+        const feed = (await writer.executeTool('tasks', { since: 0 })) as TaskResult & {
             changes: TaskChange[];
         };
 
@@ -575,7 +572,7 @@ describe('task', () => {
 
     it('turns invalid task input into a recoverable tool result', async () => {
         const entry = brain(
-            scripted([callTool('c1', 'task', '{"tasks":[{"text":"   "}]}'), answer('recovered')])
+            scripted([callTool('c1', 'tasks', '{"tasks":[{"text":"   "}]}'), answer('recovered')])
         );
         const writer = quiet(entry);
 
@@ -583,9 +580,9 @@ describe('task', () => {
 
         expect(message.content).toBe('recovered');
         expect((entry.messages[2] as { content: string }).content).toBe(
-            'Tool "task" failed: task "tasks[0]" requires a non-empty "text" string.'
+            'Tool "tasks" failed: invalid-field: tasks "text" requires a non-empty string.'
         );
-        expect(await writer.executeTool('task', {})).toEqual(empty);
+        expect(await writer.executeTool('tasks', {})).toEqual(empty);
     });
 });
 
@@ -608,7 +605,7 @@ describe('task concurrency across harness callers', () => {
         const editor = secondBrain();
         const writer = harness({ agents: { writer: author, researcher: editor }, presets: false });
 
-        await writer.executeTool('task', { tasks: [{ text: 'Shared' }] });
+        await writer.executeTool('tasks', { tasks: [{ text: 'Shared' }] });
 
         return {
             writer,
@@ -625,10 +622,10 @@ describe('task concurrency across harness callers', () => {
         // store is touched — the pre-T1 blind write is what lost concurrent work.
         await expect(
             callAs(writer, author, 'thread-author', { tasks: [{ id: '1', completed: true }] })
-        ).rejects.toThrow('guarded write: pass expects [{ id, rev }] for task "1" (read it first).');
+        ).rejects.toThrow('guarded-write: guarded write: pass "expects" [{ id, rev }] for task "1" (read it first).');
 
         await expect(callAs(writer, editor, 'thread-editor', { remove: ['1'] })).rejects.toThrow(
-            'guarded write: pass expects [{ id, rev }] for task "1" (read it first).'
+            'guarded-write: guarded write: pass "expects" [{ id, rev }] for task "1" (read it first).'
         );
 
         // Untouched: same record, same rev, same storeRev, and one log entry (the add).
@@ -677,7 +674,7 @@ describe('task concurrency across harness callers', () => {
                 expects: [{ id: '1', rev: 1 }]
             })
         ).rejects.toThrow(
-            'task "1" changed since revision 1 (now 2, last edited by "researcher"); re-read and retry; changed fields: text.'
+            'stale-record: tasks "1" changed since revision 1 (now 2, last edited by "researcher" at 2026-01-01T00:00:00.000Z); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: {"id":"1","text":"Rewritten by the researcher","completed":false,"rev":2,"updatedBy":"researcher","updatedThreadId":"thread-editor","updatedAt":"2026-01-01T00:00:00.000Z"}'
         );
 
         // ATOMIC, both ways: the record still holds B's text with B's attribution,
@@ -739,7 +736,7 @@ describe('task concurrency across harness callers', () => {
     it('refuses a token for a record another agent removed', async () => {
         const { writer, author, editor } = await seededHarness();
 
-        await writer.executeTool('task', { tasks: [{ text: 'Second' }] });
+        await writer.executeTool('tasks', { tasks: [{ text: 'Second' }] });
 
         // B removes id "1" with the token it read.
         await callAs(writer, editor, 'thread-editor', { remove: ['1'], expects: [{ id: '1', rev: 1 }] });
@@ -755,7 +752,7 @@ describe('task concurrency across harness callers', () => {
                     { id: '2', rev: 1 }
                 ]
             })
-        ).rejects.toThrow('task "1" was removed since revision 1; re-read the list.');
+        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1; the id is free again — re-read the list and add or retry.');
 
         // THE SAME RACE, NAMED THE SAME WAY (T1 precedence fix). The token, not the
         // half of the call that spelled the id, is what proves which record is gone:
@@ -767,191 +764,24 @@ describe('task concurrency across harness callers', () => {
                 tasks: [{ id: '1', completed: true }],
                 expects: [{ id: '1', rev: 1 }]
             })
-        ).rejects.toThrow('task "1" was removed since revision 1; re-read the list.');
+        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1; the id is free again — re-read the list and add or retry.');
 
         await expect(
             callAs(writer, author, 'thread-author', {
                 remove: ['1'],
                 expects: [{ id: '1', rev: 1 }]
             })
-        ).rejects.toThrow('task "1" was removed since revision 1; re-read the list.');
+        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1; the id is free again — re-read the list and add or retry.');
 
         // Without the token the caller has proven nothing about id "1", so it is the
         // ordinary unknown-id rejection — and still not a guarded-write complaint.
         await expect(
             callAs(writer, author, 'thread-author', { tasks: [{ id: '1', completed: true }] })
-        ).rejects.toThrow('task has no task with id "1".');
+        ).rejects.toThrow('unknown-record: tasks has no task with id "1".');
 
         // None of the four rejections changed anything: id "2" is still open at rev 1.
         expect((await callAs(writer, author, 'thread-author', {})).tasks).toEqual([
             task('2', 'Second', { by: 'writer', at: EPOCH_ISO })
-        ]);
-    });
-
-    it('keeps a claim across agents: the holder writes, a foreign write is refused', async () => {
-        const { writer, author, editor, read } = await seededHarness();
-
-        // A claims the record for its own (agent, thread) pair with the default
-        // lease. A claim is an OWNERSHIP event: `rev` stays 1 and only `storeRev`
-        // moves, so nobody else's CAS token is invalidated by the claim itself. The
-        // claim IS attributed (src/core/task.ts writeAttribution), which is how an
-        // operator can tell who reserved it.
-        const claimed = await callAs(writer, author, 'thread-author', { claim: ['1'] });
-
-        expect(claimed.tasks).toEqual([
-            task('1', 'Shared', {
-                by: 'writer',
-                threadId: 'thread-author',
-                at: EPOCH_ISO,
-                owner: 'writer',
-                ownerThreadId: 'thread-author',
-                leaseUntil: LEASE_UNTIL
-            })
-        ]);
-        expect(claimed.tasks[0].rev).toBe(1);
-        expect(claimed.storeRev).toBe(2);
-
-        // B's guarded patch is refused — with the token it would otherwise have had
-        // — and the message names the holder and the exact expiry.
-        await expect(
-            callAs(writer, editor, 'thread-editor', {
-                tasks: [{ id: '1', completed: true }],
-                expects: [{ id: '1', rev: 1 }]
-            })
-        ).rejects.toThrow(
-            `task "1" is claimed by "writer" until ${LEASE_ISO}; release it or take it over first.`
-        );
-
-        // The claim did not cost A anything: the record still reads rev 1, and the
-        // only new event is the claim itself.
-        const afterRefusal = await callAs(writer, editor, 'thread-editor', { since: 1 });
-
-        expect(afterRefusal.tasks).toEqual([
-            task('1', 'Shared', {
-                by: 'writer',
-                threadId: 'thread-author',
-                at: EPOCH_ISO,
-                owner: 'writer',
-                ownerThreadId: 'thread-author',
-                leaseUntil: LEASE_UNTIL
-            })
-        ]);
-        expect(afterRefusal.storeRev).toBe(2);
-        expect(afterRefusal.changes).toEqual([
-            event(2, '1', 'claim', { by: 'writer', threadId: 'thread-author' })
-        ]);
-        expect(afterRefusal.changesHasMore).toBe(false);
-        expect(afterRefusal.changesTruncated).toBe(false);
-
-        // The holder is never blocked by its own claim.
-        const byHolder = await callAs(writer, author, 'thread-author', {
-            tasks: [{ id: '1', completed: true }],
-            expects: [{ id: '1', rev: 1 }]
-        });
-
-        expect(byHolder.tasks).toEqual([
-            task('1', 'Shared', {
-                completed: true,
-                rev: 2,
-                by: 'writer',
-                threadId: 'thread-author',
-                at: EPOCH_ISO,
-                owner: 'writer',
-                ownerThreadId: 'thread-author',
-                leaseUntil: LEASE_UNTIL
-            })
-        ]);
-        expect(byHolder.storeRev).toBe(3);
-
-        // A releases: the ownership keys disappear entirely (not `undefined` keys),
-        // `rev` is still untouched by the release, and the lift is logged so a
-        // polling reader can see it.
-        const released = await callAs(writer, author, 'thread-author', { release: ['1'] });
-
-        expect(released.tasks).toEqual([
-            task('1', 'Shared', {
-                completed: true,
-                rev: 2,
-                by: 'writer',
-                threadId: 'thread-author',
-                at: EPOCH_ISO
-            })
-        ]);
-        expect(released.storeRev).toBe(4);
-        expect(
-            (await callAs(writer, author, 'thread-author', { since: 3 })).changes
-        ).toEqual([event(4, '1', 'release', { by: 'writer', threadId: 'thread-author' })]);
-
-        // B is free now.
-        const afterRelease = await callAs(writer, editor, 'thread-editor', {
-            tasks: [{ id: '1', text: 'Finished by the researcher' }],
-            expects: [{ id: '1', rev: 2 }]
-        });
-
-        expect(afterRelease.tasks).toEqual([
-            task('1', 'Finished by the researcher', {
-                completed: true,
-                rev: 3,
-                by: 'researcher',
-                threadId: 'thread-editor',
-                at: EPOCH_ISO
-            })
-        ]);
-        expect(afterRelease.storeRev).toBe(5);
-    });
-
-    it('takes a live claim over, and an expired claim clears itself for the next writer', async () => {
-        const { writer, author, editor, read } = await seededHarness();
-
-        await callAs(writer, author, 'thread-author', { claim: ['1'] });
-
-        // `takeover` is the deliberate override: B moves in while A's lease is live.
-        const taken = await callAs(writer, editor, 'thread-editor', { takeover: ['1'] });
-
-        expect(taken.tasks).toEqual([
-            task('1', 'Shared', {
-                by: 'researcher',
-                threadId: 'thread-editor',
-                at: EPOCH_ISO,
-                owner: 'researcher',
-                ownerThreadId: 'thread-editor',
-                leaseUntil: LEASE_UNTIL
-            })
-        ]);
-        expect(taken.tasks[0].rev).toBe(1);
-        // A takeover reads as a `claim` to everybody else: the holder changed.
-        expect(taken.changes).toBeUndefined();
-        expect((await read()).storeRev).toBe(3);
-
-        // Past the lease, a FOREIGN writer is no longer refused — and the abandoned
-        // claim is cleared and LOGGED before the update it unlocked
-        // (src/core/task.ts plan.expired → clearClaim). A's (agent, thread) pair is
-        // not the current holder, so A is that foreign writer here.
-        vi.setSystemTime(EPOCH_MS + TASK_DEFAULT_LEASE_MS + 1_000);
-
-        const afterExpiry = await callAs(writer, author, 'thread-author', {
-            tasks: [{ id: '1', completed: true }],
-            expects: [{ id: '1', rev: 1 }]
-        });
-        const at = '2026-01-01T00:15:01.000Z';
-
-        // No `owner`/`ownerThreadId`/`leaseUntil` keys survive: the clear deleted them.
-        expect(afterExpiry.tasks).toEqual([
-            task('1', 'Shared', { completed: true, rev: 2, by: 'writer', threadId: 'thread-author', at })
-        ]);
-        expect(afterExpiry.storeRev).toBe(5);
-        expect(afterExpiry.changes).toBeUndefined();
-        expect(
-            (await callAs(writer, author, 'thread-author', { since: 3 })).changes
-        ).toEqual([
-            event(4, '1', 'release', { by: 'writer', threadId: 'thread-author', at }),
-            event(5, '1', 'update', {
-                by: 'writer',
-                threadId: 'thread-author',
-                at,
-                fields: ['completed'],
-                itemRev: 2
-            })
         ]);
     });
 
@@ -960,7 +790,7 @@ describe('task concurrency across harness callers', () => {
         const editor = secondBrain();
         const writer = harness({ agents: { writer: author, researcher: editor }, presets: false });
 
-        await writer.executeTool('task', {
+        await writer.executeTool('tasks', {
             tasks: Array.from({ length: 6 }, (_, index) => ({ text: `Step ${index + 1}` }))
         });
 
@@ -1012,38 +842,38 @@ describe('task concurrency across harness callers', () => {
         const author = brain(scripted([answer('unused')]));
         const writer = quiet(author);
 
-        // Four recorded events: add, update, claim, remove. Every content write
+        // Three recorded events: add, update, remove. Decision P deleted the claim
+        // event with the lock, so an ownership action can no longer appear between a
+        // caller's read and its write. Every content write
         // carries the token its caller read — `executeTool` is an identified caller.
-        await writer.executeTool('task', { tasks: [{ text: 'One' }] });
-        await writer.executeTool('task', {
+        await writer.executeTool('tasks', { tasks: [{ text: 'One' }] });
+        await writer.executeTool('tasks', {
             tasks: [{ id: '1', completed: true }],
             expects: [{ id: '1', rev: 1 }]
         });
-        await writer.executeTool('task', { claim: ['1'] });
-        await writer.executeTool('task', { remove: ['1'], expects: [{ id: '1', rev: 2 }] });
+        await writer.executeTool('tasks', { remove: ['1'], expects: [{ id: '1', rev: 2 }] });
 
-        const feed = (await writer.executeTool('task', { since: 0 })) as TaskResult & {
+        const feed = (await writer.executeTool('tasks', { since: 0 })) as TaskResult & {
             changes: TaskChange[];
         };
 
         expect(feed.changes).toEqual([
             event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
             event(2, '1', 'update', { by: 'writer', fields: ['completed'], itemRev: 2 }),
-            event(3, '1', 'claim', { by: 'writer' }),
-            event(4, '1', 'remove', { by: 'writer' })
+            event(3, '1', 'remove', { by: 'writer' })
         ]);
         expect(feed.changesHasMore).toBe(false);
         expect(feed.changesTruncated).toBe(false);
-        expect(feed.storeRev).toBe(4);
+        expect(feed.storeRev).toBe(3);
 
-        // A reader that already saw three of them gets exactly the fourth: the feed
+        // A reader that already saw two of them gets exactly the third: the feed
         // is per-event, not a snapshot of the list.
-        expect(((await writer.executeTool('task', { since: 3 })) as TaskResult).changes).toEqual([
-            event(4, '1', 'remove', { by: 'writer' })
+        expect(((await writer.executeTool('tasks', { since: 2 })) as TaskResult).changes).toEqual([
+            event(3, '1', 'remove', { by: 'writer' })
         ]);
 
         // Nothing new since the watermark the reader holds.
-        const idle = (await writer.executeTool('task', { since: 4 })) as TaskResult & {
+        const idle = (await writer.executeTool('tasks', { since: 3 })) as TaskResult & {
             changes: TaskChange[];
         };
 
@@ -1052,8 +882,8 @@ describe('task concurrency across harness callers', () => {
         expect(idle.changesTruncated).toBe(false);
 
         // A watermark ahead of the store is a bug, not an empty answer.
-        await expect(writer.executeTool('task', { since: 5 })).rejects.toThrow(
-            'task "since" is revision 5, ahead of the store (storeRev 4); read the list first.'
+        await expect(writer.executeTool('tasks', { since: 5 })).rejects.toThrow(
+            'invalid-input: tasks "since" is revision 5, ahead of the store (storeRev 3); read the list first.'
         );
     });
 
@@ -1063,13 +893,13 @@ describe('task concurrency across harness callers', () => {
 
         // 200 additions (the record cap) is 200 events; one more event pushes the
         // window past TASK_MAX_CHANGES, so the oldest entry is dropped FIFO.
-        await writer.executeTool('task', {
+        await writer.executeTool('tasks', {
             tasks: Array.from({ length: 200 }, (_, index) => ({ text: `T${index + 1}` }))
         });
-        expect(((await writer.executeTool('task', {})) as TaskResult).storeRev).toBe(200);
+        expect(((await writer.executeTool('tasks', {})) as TaskResult).storeRev).toBe(200);
 
         // 51 entries are asked for at once: the feed is capped at 50 and says so.
-        const capped = (await writer.executeTool('task', { since: 2 })) as TaskResult & {
+        const capped = (await writer.executeTool('tasks', { since: 2 })) as TaskResult & {
             changes: TaskChange[];
         };
 
@@ -1083,11 +913,11 @@ describe('task concurrency across harness callers', () => {
         expect(capped.changesTruncated).toBe(false);
 
         // One more event overflows the 200-entry window, dropping rev 1.
-        await writer.executeTool('task', {
+        await writer.executeTool('tasks', {
             tasks: [{ id: '1', completed: true }],
             expects: [{ id: '1', rev: 1 }]
         });
-        const trimmed = (await writer.executeTool('task', { since: 0 })) as TaskResult & {
+        const trimmed = (await writer.executeTool('tasks', { since: 0 })) as TaskResult & {
             changes: TaskChange[];
         };
 
@@ -1098,5 +928,142 @@ describe('task concurrency across harness callers', () => {
         expect(trimmed.changesHasMore).toBe(true);
         expect(trimmed.changesTruncated).toBe(true);
         expect(trimmed.storeRev).toBe(201);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// records-engine T8 — the harness-level half of the engine contract.
+//
+// src/core/records.test.ts pins the store in isolation; these three pin what only a
+// LIVE harness can show:
+//   - Decision L: an agent leaving the roster never erases who wrote (attribution is a
+//     fact, not a foreign key into the agent registry, so there is nothing to validate);
+//   - Decision P restated as its simplest honest form: the engine owns no lock, so the
+//     three lifecycle paths that used to need a sweep (stop / delete / restore) have
+//     nothing to strand — proven by the SHAPE, not by a cleanup routine;
+//   - Decision O + R9: a wrapper re-throws the engine's CODE and its payload, so a
+//     caller that switches on `code` still works through the ergonomic door.
+// ---------------------------------------------------------------------------
+describe('record engine at the harness boundary (T8)', () => {
+    it('keeps the departed writer named on the record after removeAgent', async () => {
+        const author = brain(scripted([answer('unused')]));
+        const editor = secondBrain();
+        const writer = harness({ agents: { writer: author, researcher: editor }, presets: false });
+
+        // `researcher` is the writer of record: the attribution the store keeps whether
+        // or not the roster still carries that name.
+        await callAs(writer, editor, 'thread-editor', { tasks: [{ text: 'Cartography' }] });
+
+        const before = await callAs(writer, author, 'thread-author', {});
+
+        expect(before.tasks).toEqual([
+            task('1', 'Cartography', { by: 'researcher', threadId: 'thread-editor', at: EPOCH_ISO })
+        ]);
+
+        writer.removeAgent('researcher');
+        expect(writer.agents.researcher).toBeUndefined();
+
+        // A read after the roster changed answers with the SAME record, same writer name:
+        // no rewrite, no blanking, and no restore-time rejection of an unknown agent.
+        const after = await callAs(writer, author, 'thread-author', {});
+
+        expect(after.tasks).toEqual(before.tasks);
+
+        // The change feed is the other half of the audit trail, and it never roster-checks
+        // either — the event still names the departed writer.
+        expect((await callAs(writer, author, 'thread-author', { since: 0 })).changes).toEqual([
+            event(1, '1', 'add', { by: 'researcher', threadId: 'thread-editor', itemRev: 1 })
+        ]);
+    });
+
+    it('strands nothing across stop, delete and restore, because there is no lock to strand', async () => {
+        const author = brain(scripted([answer('unused')]));
+        const writer = harness({ agents: { writer: author }, presets: false });
+
+        // A record written INSIDE a real conversation, so the thread pair is populated and
+        // a stranded holder would be visible.
+        const thread = writer.createThread('writer');
+
+        await callAs(writer, author, thread.id, { tasks: [{ text: 'From a conversation' }] });
+
+        // The schema half of the guarantee: no verb could take a lock, and no field could
+        // hold one (Decision P deleted `claim`/`release`/`takeover` and `leaseMs`).
+        const properties = Object.keys(
+            (writer.tools.tasks.parameters as { properties: Record<string, unknown> }).properties
+        );
+
+        expect(properties).not.toContain('claim');
+        expect(properties).not.toContain('release');
+        expect(properties).not.toContain('takeover');
+        expect(properties).not.toContain('leaseMs');
+
+        // All three former sweep paths, in order: stop the conversation, delete it, take a
+        // snapshot and restore it into a second harness.
+        writer.stopThread(thread.id, 't8 stop');
+        writer.deleteThread(thread.id);
+
+        const checkpoint = writer.snapshot();
+
+        // Nothing ownership-shaped survives anywhere in the persisted block: the sweep is
+        // gone because the STATE it swept is gone, so this is the whole guarantee.
+        expect(JSON.stringify(checkpoint.records)).not.toContain('"owner"');
+        expect(JSON.stringify(checkpoint.records)).not.toContain('leaseUntil');
+        expect((checkpoint.records.collections.tasks.changes as Array<{ op: string }>).map((change) => change.op)).toEqual(['add']);
+
+        const target = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+
+        target.restore(checkpoint);
+
+        // And the restored record is exactly the canonical key set — an old file that DID
+        // carry a claim is refused as an unknown field instead of silently re-locking the
+        // session (the check lives in src/harness.snapshot.test.ts).
+        expect(
+            (target.snapshot().records.collections.tasks.items as Array<Record<string, unknown>>).map((item) =>
+                Object.keys(item)
+            )
+        ).toEqual([['id', 'text', 'completed', 'rev', 'updatedBy', 'updatedThreadId', 'updatedAt']]);
+    });
+
+    it('surfaces the engine code and the R9 payload through the wrapper', async () => {
+        const author = brain(scripted([answer('unused')]));
+        const editor = secondBrain();
+        const writer = harness({ agents: { writer: author, researcher: editor }, presets: false });
+
+        await callAs(writer, author, 'thread-author', { tasks: [{ text: 'Shared' }] });
+
+        // editor lands first, holding the token it read.
+        await callAs(writer, editor, 'thread-editor', {
+            tasks: [{ id: '1', text: 'editor won' }],
+            expects: [{ id: '1', rev: 1 }]
+        });
+
+        // author is now stale. `tasks` is a WRAPPER, so the question is what crosses the
+        // wrapper boundary: Decision O says the same code and the same payload.
+        const failure = (await callAs(writer, author, 'thread-author', {
+            tasks: [{ id: '1', completed: true }],
+            expects: [{ id: '1', rev: 1 }]
+        }).catch((error: unknown) => error)) as {
+            code?: string;
+            message: string;
+            details?: { currentRev?: number; changedFields?: string[]; entry?: TaskItem };
+        };
+
+        expect(failure.code).toBe('stale-record');
+        // The code is the FIRST token of the message, so a host that only reads text can
+        // still classify it (src/core/records.ts `recordError`).
+        expect(failure.message.startsWith('stale-record: ')).toBe(true);
+        expect(failure.details?.currentRev).toBe(2);
+        expect(failure.details?.changedFields).toEqual(['text']);
+        // R9: the CURRENT record rides in the rejection — the caller recovers without a
+        // second round trip, through the wrapper exactly as through `records`.
+        expect(failure.details?.entry).toEqual(
+            task('1', 'editor won', {
+                completed: false,
+                rev: 2,
+                by: 'researcher',
+                threadId: 'thread-editor',
+                at: EPOCH_ISO
+            })
+        );
     });
 });

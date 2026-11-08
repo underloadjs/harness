@@ -93,10 +93,12 @@ const ALL_PACKAGE_NAMES = [
     'toolList',
     'toolManage',
     'toolCreate',
-    'task',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
+    'records',
+
+    'tasks',
+    'profiles',
+    'chapters',
+    'locations',
     'agentManage',
     'agentResult',
     'delegate',
@@ -153,7 +155,7 @@ describe('live Node descriptor catalogue (T24)', () => {
         // `syntax`, so 29 is the stale table this simulation really contains. Kept
         // exact on purpose: a row count that silently moves is how a new `.tool.ts`
         // stops being covered by this file.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(29);
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(30);
 
         // The live scan still reports the whole package tree, in scan order. The
         // generated table is one row shorter: it lost `syntax` to the filter above.
@@ -288,10 +290,12 @@ describe('live Node descriptor catalogue (T24)', () => {
         'toolList',
         'toolManage',
         'toolCreate',
-        'task',
-        'profileManage',
-        'chapterManage',
-        'locationManage',
+        'records',
+
+        'tasks',
+        'profiles',
+        'chapters',
+        'locations',
         'agentManage',
         'agentResult',
         'delegate',

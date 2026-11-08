@@ -878,13 +878,20 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
             }
 
             try {
+                // ONE canonical read for both halves of the base the lane is about to write
+                // against: the length it appends at, and (T4.1) the content digest that lets an
+                // IN-PLACE canonical change — a host transcript edit, a sibling's committed patch
+                // — be seen at the same length instead of running the turn on a stale context.
+                const head = request.authority.canonicalHeadOf(lane.targetId ?? canonicalTargetId(request.target));
+
                 post(lane, {
                     kind: 'turn',
                     laneEpoch: lane.epoch,
                     turnId: request.turnId,
                     target: request.target,
                     prompt: request.prompt,
-                    fromLength: request.authority.canonicalLengthOf(lane.targetId ?? canonicalTargetId(request.target)),
+                    fromLength: head.length,
+                    fromDigest: head.digest,
                     ...(request.attachments === undefined ? {} : { attachments: request.attachments }),
                     ...(request.reset === undefined ? {} : { reset: request.reset })
                 });

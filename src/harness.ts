@@ -125,8 +125,10 @@
 // invocation/branch lookups without pretending to erase what other histories
 // already learned from it (its invocation results and every branch materialized
 // from it go with it). `threadSend` lets an agent post into another thread
-// (sender identity is runtime-derived, so it cannot be spoofed) and its paired
-// `threadList` roster exposes the live ids of this session only.
+// (sender identity is runtime-derived, so it cannot be spoofed); it is
+// STATE-AWARE — it steers a running conversation, starts a turn in a dormant one,
+// and refuses a stopped one — and always returns a receipt without waiting for the
+// answer. Its paired `threadList` roster exposes the live ids of this session only.
 //
 // Ownership and stop invariants (review corrections): only a HOST thread may own
 // another thread (`agent:<name>` is implicit and cannot be persisted as an owner);
@@ -193,10 +195,13 @@
 //     try/catch's reach.
 //
 // Model-facing output cap (R10): every serialized tool result AND tool error is
-// passed through `boundToolResult` (64 KiB UTF-8 by default, core/result-budget.ts).
-// Small outputs are byte-exact; a large one becomes a small, valid JSON truncation
-// envelope. The cap is post-serialization, so it bounds conversation cost, not the
-// process's peak memory; UI panels are bounded separately (core/tool-ui.ts).
+// bounded by the run's per-turn ledger (`createToolResultTurnBudget`, which applies
+// `boundToolResult`'s per-result cap and then the aggregate per-turn cap; 256 KiB and
+// 512 KiB of UTF-8, core/result-budget.ts). Small outputs are byte-exact; a large one
+// becomes a small, valid JSON envelope with a head preview, a tail preview and a note
+// naming what was cut and how to re-fetch it. The cap is post-serialization, so it
+// bounds conversation cost, not the process's peak memory; UI panels are bounded
+// separately (core/tool-ui.ts).
 //
 // Arguments (R11): the model's JSON is validated against the tool's schema before
 // `execute` sees it (core/schema-validation.ts), then unwrapped by the
@@ -242,7 +247,8 @@
 //   - core/tool      — what gets executed, and where tags/visibility live
 //   - core/discovery — the tag ranking behind toolRequest
 //   - core/creation  — compile-and-register behind toolCreate
-//   - core/task      — the per-harness task list behind the task tool
+//   - core/records   — the ONE per-harness session store behind records/tasks/
+//                    chapters/profiles/locations
 //   - types          — Harness, HarnessEvent, HarnessConfiguration
 //
 // This is the only source file at the root of src/. Everything else lives in a
@@ -262,7 +268,11 @@ import {
     toolMediaDescriptors,
     unwrapToolResult,
     resolveToolParameters,
-    boundToolResult,
+    // T5.1/T5.2 — the per-turn tool-result ledger. Every committed result goes
+    // through the run's instance, which applies the per-result cap (the T5.1
+    // head/tail envelope) and then the aggregate per-turn budget.
+    createToolResultTurnBudget,
+    type ToolResultTurnBudget,
     DEFAULT_CREATED_TOOLS_LIMIT,
     // T2/R2: the documented turn-policy default ('sync'). The registry and the
     // discovery rows both leave an undeclared tool WITHOUT a mode, so this constant is
@@ -270,10 +280,7 @@ import {
     DEFAULT_TOOL_MODE,
     cloneToolSourceRecord,
     supportsToolCompilation,
-    createTaskTool,
-    createProfileTool,
-    createChapterTool,
-    createLocationTool,
+    createRecordEngine,
     HARNESS_SNAPSHOT_VERSION,
     cloneToolCreation,
     readHarnessMessages,
@@ -367,13 +374,36 @@ import {
 import type { HarnessPluginApiBase, HarnessPluginHostResult } from './plugin';
 // The maybe-sync round types `turn.before` needs at the call site (plugin/hooks.ts
 // rule 6). Imported from the module directly; the barrel re-exports the same names.
-import type { HarnessMaybeAsync, HarnessMergedHookResult } from './plugin/hooks';
-// Rough transcript sizing for the per-agent context limit (`turn.before`).
-import { estimateContextTokens } from './core/context-estimate';
+// `HarnessHookErrorContext` is the shape the bus reports a dropped handler in (T1.5),
+// mapped onto the public `HarnessDiagnosticEvent` right above the bus below.
+import type {
+    HarnessHookErrorContext,
+    HarnessMaybeAsync,
+    HarnessMergedHookResult
+} from './plugin/hooks';
+// Rough transcript sizing for the per-agent context limit (`turn.before`), plus the
+// T5.4 hybrid: the provider's reported `usage.input` anchors the prefix and only the
+// text appended since that request is still extrapolated at chars/4.
+import {
+    anchorFromUsage,
+    estimateContextTokensHybrid,
+    transcriptChars,
+    type ContextTokenAnchor
+} from './core/context-estimate';
 // The single context-inclusion normalizer (core/agent.ts). Direct module import,
 // the same convention as `./core/context-estimate` above: the projection needs it
 // and must not pay for the whole core barrel to get one helper.
 import { withIncluded } from './core/agent';
+// Stable transcript addresses (context T1.2): the minting rule for the one canonical
+// creation point that lives HERE — a committed tool result. `setIncluded`'s new
+// `messageId` target reads the ids this mints (see `indexOfMessageId` in `emitTurnBefore`);
+// resolving one needs no helper beyond a scan, so only the minting rule is imported.
+import { assignMessageId } from './core/message-id';
+// The persisted tool outcome (compaction T1): the one writer of the storage form (a
+// non-completed outcome, and nothing for `completed`) and the one projection of outcome →
+// `isError`. Direct module import, same convention as the two helpers above — the runtime
+// needs these two rules, not the whole core barrel.
+import { isErrorOutcome, storedOutcomeEntry } from './core/tool-outcome';
 import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
@@ -407,11 +437,22 @@ import type {
     // declared plugin catalogue (the handle's `pluginMetadata`), and the `turn.before`
     // context built in requestTurn.
     HarnessLifecycleEvent,
+    // T1: the bus subscription surface (`api.on`), including the wildcard handler and
+    // the per-registration `{ priority, timeoutMs }` options. `HarnessDiagnosticEvent`
+    // is what the production reporter hands `report.diagnostic` (T1.5).
+    HarnessDiagnosticEvent,
+    HarnessLifecycleHandler,
+    HarnessHookOptions,
+    HarnessWildcardHandler,
     HarnessPluginApi,
     HarnessPluginMetadata,
     HarnessTurnBeforeContext,
-    // Stage 1b context-inclusion control (`turn.before` entries / setIncluded).
+    // T2 — the run-level decision a `turn.before` round returns, consumed in requestTurn.
+    HarnessTurnDecision,
+    // Stage 1b context-inclusion control (`turn.before` entries / setIncluded), plus the
+    // pipeline-T3 text patch `context.edit` accepts.
     HarnessContextEntry,
+    HarnessContextEditPatch,
     HarnessMessage,
     HarnessPendingTool,
     HarnessProgress,
@@ -439,6 +480,7 @@ import type {
     HarnessMemory,
     HarnessToolRuntime,
     NestedRunPolicy,
+    RecordsToolName,
     Tool,
     ToolContext,
     ToolCreation,
@@ -620,6 +662,67 @@ const transcriptUnits = (messages: readonly HarnessMessage[]): HarnessMessage[][
     return units;
 };
 
+// The rules behind the `turn.before` context-EDIT API (pipeline T3.1) — module level, so
+// a `turn.before` round allocates nothing for them on a hot path that runs every turn.
+//
+// A patch may change TEXT and nothing else, and which text a role owns is what makes the
+// edit "role-safe":
+//   - `content`   — every role (system, user, assistant, tool result).
+//   - `reasoning` — assistant only. It is the model's thinking text, kept out of the
+//     provider payload; the snapshot reader (core/snapshot.ts) and the branch copier
+//     (core/branch.ts) whitelist it for the assistant role alone, so writing it on any
+//     other role would produce a transcript that no longer loads.
+//
+// Everything else on an entry is STRUCTURE or BYTES, and refusing it is what keeps the
+// provider-pairing invariant (F8 of the pipeline entry / R2 of the context-inclusion
+// entry) unbreakable from a plugin: `transcriptUnits` above and the transport both
+// resolve a unit by CALL ID, so a patch that could add, drop or rename a call could split
+// an assistant block from its results — the exact bug the exclusion UNIT exists to
+// prevent. `included` is refused for a different reason: it is the other axis of context
+// control, one that cascades to a whole unit, and it already has its own control.
+const EDITABLE_FIELDS: readonly string[] = ['content', 'reasoning'];
+
+// The editable-field list for one role, as it appears in every refusal ("editable:
+// content, reasoning"), so the message always states what the caller MAY do.
+const editableFieldsOf = (role: HarnessMessage['role']): string =>
+    role === 'assistant' ? 'content, reasoning' : 'content';
+
+// The article in front of a role name in a refusal ("a user message", "an assistant
+// message"), so the three messages below read as prose without each spelling a table.
+const roleArticle = (role: HarnessMessage['role']): string =>
+    role === 'assistant' ? 'an' : 'a';
+
+// Why a named key cannot be edited on this role — or `undefined` when it can. Each
+// refusal says WHY rather than only "not allowed", because the failure being prevented is
+// a plugin re-pairing a tool block by hand and believing the transcript is still valid.
+const editRefusalOf = (key: string, role: HarnessMessage['role']): string | undefined => {
+    switch (key) {
+        case 'role':
+            return 'a role is not text; a patch cannot turn one entry into another';
+        case 'toolCalls':
+            return 'a patch may not change tool-call membership — unit resolution and provider pairing both key on call ids';
+        case 'toolCallId':
+            return 'the call id pairs this result with its assistant block; changing it re-pairs the transcript by hand';
+        case 'name':
+            return 'the tool name is part of the call identity the transport re-emits';
+        case 'attachments':
+            return 'attachments are validated bytes, not text';
+        case 'included':
+            return 'inclusion is a different axis and switches the WHOLE unit; use setIncluded';
+        case 'messageId':
+            // The stable address (context T1). Refused for the same reason the flag is:
+            // it is not text, and rewriting it by hand re-points every later
+            // `setIncluded(id, …)` at whatever turn happens to hold the new id.
+            return "the messageId is this entry's address, not its text; the runtime mints and copies it";
+        case 'reasoning':
+            return role === 'assistant'
+                ? undefined
+                : 'only an assistant message carries reasoning, and no other role whitelists it';
+    }
+
+    return undefined;
+};
+
 const cloneBranchRecord = (record: HarnessBranchRecord): HarnessBranchRecord => ({
     ...record,
     toolCallIds: record.toolCallIds.map((entry) => ({ ...entry })),
@@ -756,7 +859,8 @@ const WIRE_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
 // Tool results are text on the wire. Strings pass through untouched so a tool
 // can return prose; everything else is JSON. The model-facing cap is applied by
-// boundToolResult at the ONE place a result is committed (see deliverTask).
+// `boundDelivery` (the run's per-turn ledger, core/result-budget.ts) at the ONE
+// place a result is committed — see deliverTask and immediateResult.
 const serialize = (value: unknown): string => {
     if (value === undefined) return '';
     if (typeof value === 'string') return value;
@@ -1128,6 +1232,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         reason: HarnessStateChangeReason,
         detail: { agent?: string; tool?: string } = {}
     ): void => {
+        // T1.7 — the SAME transition, bridged into the plugin bus.
+        //
+        // Behind an explicit subscription and NEVER part of the `'*'` fan-out
+        // (plugin/hooks.ts `WILDCARD_DELIVERABLE`): this plane fires on every transcript,
+        // tool, and thread mutation, so delivering it to an audit plugin by default would
+        // put a handler on every tool execution — the reason the bus's `has()` says
+        // "nobody listens" for a wildcard-only harness here.
+        //
+        // `fire`, not `emit`: `notifyStateChange` is synchronous and sits inside commit
+        // points, so an await here would move observable event order (plugin/hooks.ts
+        // rules 4 and 5). A handler that throws is dropped by the bus (rule 2), exactly
+        // like the observer's throw is swallowed below.
+        //
+        // Re-entrancy is the AUTHOR's contract, not a hidden guard: a handler that writes
+        // transcript state through `api` re-enters this function, and a handler that
+        // writes on EVERY state change recurses until the stack ends — the same trap a
+        // `report.stateChange` observer has, and the reason this event is opt-in.
+        if (hookBus.has('host.state_change')) {
+            hookBus.fire('host.state_change', { type: 'state_change', reason, ...detail });
+        }
+
         const observer = configuration.report?.stateChange;
         if (!observer) return;
 
@@ -1147,7 +1272,120 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // writer, so a test harness never inherits another test's hooks. Every emit site
     // below is fail-open (plugin/hooks.ts), which is what lets the harness call the bus
     // from a run loop without a try/catch of its own.
-    const hookBus = createHookBus();
+    //
+    // T1.5 — the bus's drop reporter is WIRED, and it can never fail a run: every
+    // handler the bus discards (it threw, rejected, outlived its `timeoutMs`, or
+    // returned a decision the contract cannot parse) reaches the host through
+    // `report.diagnostic`. Before this, `onHandlerError` had no production caller, so a
+    // broken policy plugin was indistinguishable from a plugin that decided to do
+    // nothing — fail-open with no visibility is a silent policy failure.
+    //
+    // `toErrorInfo` (util/errors.ts) is TOTAL, so a handler that threw a primitive, a
+    // Proxy, or a hostile object with a throwing `message` getter still produces a
+    // serializable message here; the diagnostic callback itself is wrapped because a
+    // reporter that throws must not become the failure it reports (same rule the
+    // state-change observer follows above).
+    // Bus drop-reason → the public diagnostic kind. The bus leaves `kind` ABSENT for a
+    // plain throw (the historical shape of its context, and the reason every pre-existing
+    // bus test stayed green), so `undefined` means "it threw". Written as an exhaustive
+    // switch, so a NEW bus kind fails to typecheck HERE instead of silently reporting
+    // "handler-threw" for something the host should be able to tell apart.
+    const diagnosticKindOf = (context: HarnessHookErrorContext): HarnessDiagnosticEvent['kind'] => {
+        switch (context.kind) {
+            case undefined:
+                return 'handler-threw';
+            case 'timed-out':
+                return 'handler-timed-out';
+            case 'invalid-decision':
+                return 'invalid-decision';
+        }
+    };
+
+    const notifyPluginDiagnostic = (context: HarnessHookErrorContext): void => {
+        const diagnostic = configuration.report?.diagnostic;
+        if (diagnostic === undefined) return;
+
+        try {
+            const info = toErrorInfo(context.error);
+
+            diagnostic({
+                type: 'plugin_diagnostic',
+                kind: diagnosticKindOf(context),
+                event: context.event,
+                owner: context.owner,
+                // A synthetic bus error always has a message; a handler that threw
+                // something message-less still gets a usable string from `toErrorInfo`.
+                message: info.message
+            });
+        } catch {
+            // Diagnostics never become the failure they report.
+        }
+    };
+
+    const hookBus = createHookBus({ onHandlerError: notifyPluginDiagnostic });
+
+    // ------------------------------------------------------------------
+    // T1.6 — teardown: `harness.dispose`, exactly once, after the last run
+    // ------------------------------------------------------------------
+    //
+    // The event existed in the catalogue with no emitter (the shipped `async-ping`
+    // plugin registered it as a forward-looking guard and was inert), and `harness()`
+    // had no teardown at all, so a library-only consumer had no way to say "this
+    // harness is done". Open decision 5 is resolved in favour of a HANDLE MEMBER (plus
+    // the server binding below), because emitting only from server teardown would leave
+    // every non-server consumer exactly as stuck as before.
+    //
+    // THREE guarantees, in this order:
+    //   1. EXACTLY ONCE — `disposeEmitted` is the single latch; a second `dispose()`,
+    //      the deferred path, and the server calling it for a session it also removed
+    //      all land on the same latch.
+    //   2. AFTER THE LAST RUN — `harness.dispose` is emitted on a settled boundary,
+    //      never raced against a live run (F8: event ordering is observable). A run
+    //      still going when `dispose()` is called defers the event to the finally of
+    //      the last one, so a teardown hook can still read a coherent roster and a
+    //      snapshot.
+    //   3. THE BUS IS CLEARED — immediately after the emit, so a handler that
+    //      (re)subscribes during teardown is dropped with the harness rather than
+    //      outliving it, and every later emit finds no listeners (rule 5's free path).
+    //
+    // `fire`, not `emit`: teardown is synchronous and must not add a microtask to the
+    // run it closes (plugin/hooks.ts rule 4).
+    //
+    // NOT an abort (the handle says so): a host that wants live work gone calls
+    // `stopAllThreads()` first — that is exactly what the server's session teardown
+    // does — and the deferred emit then lands on the first settled boundary after.
+    let disposed = false;
+    let disposeEmitted = false;
+    // Set when `dispose()` arrived while a run was still live; drained by the last run.
+    let disposePending = false;
+
+    const emitDispose = (): void => {
+        if (disposeEmitted) return;
+        disposeEmitted = true;
+
+        hookBus.fire('harness.dispose', {});
+
+        // After the emit on purpose: a teardown handler still needs its own `on`
+        // unsubscribe and its timers to work while the event is being delivered.
+        hookBus.clear();
+    };
+
+    const dispose = (): void => {
+        // Idempotent (guarantee 1) and total: teardown code runs in finally blocks, so
+        // this must never throw and must never double-fire.
+        if (disposed) return;
+        disposed = true;
+
+        // Guarantee 2: park while any run is live. `activeRuns` counts every run this
+        // harness owns, including delegated children, so "zero" really is the last one.
+        if (activeRuns > 0) {
+            disposePending = true;
+            return;
+        }
+
+        emitDispose();
+    };
+
 
     // Plugin settings. A host supplies its own provider (the server will read a stored
     // session document); without one, the in-memory provider answers from each plugin's
@@ -1233,6 +1471,51 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 setThreadMessages(threadId, [...messages]),
             setStatus: (threadId, status) => setThreadStatus(threadId, status)
         },
+        // T3.5 — the host's persisted-state read, exposed read-only to a plugin. An
+        // ARROW, not a reference: `snapshot` is declared far below (the same
+        // temporal-dead-zone rule the tool-switch members above follow), and a plugin can
+        // only reach it after construction anyway. Read-only means exactly what the type
+        // says: this is the same detached document `harness.snapshot()` hands a host, safe
+        // to take mid-run, and mutating the copy changes nothing.
+        snapshot: () => snapshot(),
+        // T4.5 — a plugin's own diagnostic voice, on the SAME host channel the framework
+        // uses for handler failures (`configuration.report?.diagnostic`, ~1290 above). The
+        // base has no plugin name of its own, so it attributes to 'harness'; the per-plugin
+        // api in ./plugin/host.ts overrides this member and stamps the real owner.
+        //
+        // Three guards, each one the reason the channel can be advisory at all:
+        //   - NO sink installed (a CLI that does not care) is a silent no-op, exactly like
+        //     `report.stateChange`, so a plugin never has to ask whether anyone is listening;
+        //   - an empty `message` is dropped: `HarnessDiagnosticEvent.message` is documented
+        //     as never empty, and a report with nothing to say would only train an operator
+        //     to ignore this plugin;
+        //   - the sink is wrapped, because a diagnostic must never become the failure it is
+        //     reporting — the same rule `onHandlerError` follows above.
+        report: {
+            diagnostic: (report) => {
+                const sink = configuration.report?.diagnostic;
+
+                if (sink === undefined || report === null || typeof report !== 'object') return;
+
+                const message = typeof report.message === 'string' ? report.message : '';
+
+                if (message.length === 0) return;
+
+                try {
+                    sink({
+                        type: 'plugin_diagnostic',
+                        kind: report.kind ?? 'policy',
+                        owner: typeof report.owner === 'string' && report.owner.length > 0
+                            ? report.owner
+                            : 'harness',
+                        message,
+                        ...(report.data === undefined ? {} : { data: report.data })
+                    });
+                } catch {
+                    // Advisory: a reporter that throws cannot fail the turn it is watching.
+                }
+            }
+        },
         // Arrows, not direct references: `pluginApiBase` is built high in the
         // constructor while the switch helpers are declared further down, and an eager
         // property read of a block-scoped const would be a temporal-dead-zone crash at
@@ -1263,8 +1546,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const hostPluginApi: HarnessPluginApi = {
         ...pluginApiBase,
         settings: createPluginSettingsView('harness', pluginSettings),
-        on: (event, handler) =>
-            hookBus.on(event, handler, { owner: 'harness', api: hostPluginApi })
+        // Same overload pair as the per-plugin `on` in plugin/host.ts (the cast is only
+        // because a single arrow cannot be inferred against two signatures), and the same
+        // pass-through of the author's `{ priority, timeoutMs }` (T1.3/T1.4).
+        on: ((
+            event: HarnessLifecycleEvent | '*',
+            handler: HarnessLifecycleHandler<HarnessLifecycleEvent> | HarnessWildcardHandler,
+            options?: HarnessHookOptions
+        ) =>
+            hookBus.on(
+                event as HarnessLifecycleEvent,
+                handler as HarnessLifecycleHandler<HarnessLifecycleEvent>,
+                { owner: 'harness', api: hostPluginApi, ...(options ?? {}) }
+            )) as unknown as HarnessPluginApi['on']
     };
 
     // Shared identity block for every `run.*` / `turn.*` / `tool.*` payload. `threadId`
@@ -2892,23 +3186,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     }
 
-    // Session tasks (R1/R2, renamed from todoManage by R9-R11). One instance per
-    // harness: the store closes over its own list and id counter, so two harnesses
-    // (and therefore two server sessions) can never share tasks. Every agent in
-    // this harness calls the same tool, so the primary and its subagents see one
-    // list. reset() below clears it with the conversation, and the snapshot keeps
-    // persisting it under the historical `records.todos` key (version 1 shape).
-    const taskStore = createTaskTool();
-
-    // Session records (profiles, chapters, locations). Same lifecycle as the task
-    // list: one factory instance per harness, shared by every agent here, and
-    // cleared by reset(). Separate closets and separate id sequences, so a
-    // profile id and a chapter id may both be "1" without ambiguity.
-    const profile = createProfileTool();
-
-    const chapter = createChapterTool();
-
-    const location = createLocationTool();
+    // THE session store (records-engine T3). One engine instance per harness, so two
+    // harnesses (and therefore two server sessions) can never share records, and every
+    // agent in this harness — primary or subagent, on any thread — writes the same
+    // collections. It owns `tasks`, `chapters`, `profiles` and `locations` plus anything
+    // an agent `define`s, with ONE id counter across all of them (F3: a profile id and
+    // a chapter id can no longer both be "1" without colliding). reset() below clears it
+    // with the conversation, and snapshot()/restore() persist it as ONE `records` map.
+    const recordEngine = createRecordEngine();
 
     // Per-harness network closures. They are populated during startup from the
     // `websearch`/`webfetch` configuration and carry the credentials; the compiled
@@ -2948,21 +3233,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             return operation.execute(context);
         },
-        executeRecordTool: (
-            name: 'task' | 'profileManage' | 'chapterManage' | 'locationManage',
-            context: ToolContext
-        ) => {
-            switch (name) {
-                case 'task':
-                    return taskStore.tool.execute(context);
-                case 'profileManage':
-                    return profile.tool.execute(context);
-                case 'chapterManage':
-                    return chapter.tool.execute(context);
-                case 'locationManage':
-                    return location.tool.execute(context);
-            }
-        }
+        // The routed record surface (Decision A). All five record tools — `records`
+        // and its four wrappers — end their source entry with exactly this call, and
+        // the engine maps the tool name to its collection and response shape. Routing
+        // rather than `context.callTool` is what makes a lane write land on the
+        // canonical harness (F5), because ../server/workers/lane-authority.ts answers
+        // this method and ../server/workers/lane-worker-loop.ts refuses any runtime key
+        // it cannot classify.
+        executeRecords: (name: RecordsToolName, context: ToolContext) =>
+            recordEngine.executeRecords(name, context)
     };
 
     // -----------------------------------------------------------------------
@@ -3576,27 +3855,56 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return records.find((record) => !knownInvocations.has(record.invocationId));
         };
 
-        // T28 TIMEOUT. A delegation used to have no wall-clock bound at all: a child
-        // that ran `sleep 600` sat `running` indefinitely, and the only recovery was
-        // `toolCancel` (which then destroyed the transcript). `timeoutMs` bounds the
-        // CHILD only — the calling run keeps its own signal, so the structured result
-        // below still reaches the parent instead of the whole parent turn rolling back.
+        // T28 TIMEOUT (original intent, kept auditable): "a delegation used to have no
+        // wall-clock bound at all: a child that ran `sleep 600` sat `running`
+        // indefinitely, and the only recovery was `toolCancel` (which then destroyed
+        // the transcript). `timeoutMs` bounds the CHILD only — the calling run keeps
+        // its own signal, so the structured result below still reaches the parent
+        // instead of the whole parent turn rolling back."
+        //
+        // POLICY 2026-11-09 (docs/tasks/2026-11-09-thread-timeout-policy.md R1/R2/R5):
+        // that mechanism survives, but its DEFAULT is now "no limit". `timeoutMs` is
+        // omitted → `DELEGATE_TIMEOUT_MS` → `Number.POSITIVE_INFINITY` → no timer is
+        // armed, so the child ends only on its own answer (or on a tool's own clock,
+        // `maxIterations`, an explicit `toolCancel`, or the caller aborting).
+        //
+        // The host path is deliberately NOT clamped (T2.3): the schema's 3600000
+        // maximum bounds what a MODEL may ask for, and `runtime.delegate` is not
+        // schema-validated, so a host may pass any finite bound it wants — including
+        // one above the ceiling. Only an OMITTED value changes meaning, and it now
+        // means "unbounded" rather than "5 minutes".
+        //
+        // An explicit non-finite value (`Infinity`, and today also `NaN`/`-Infinity`,
+        // which the `Number.isFinite` guard rejects) resolves to the default, i.e.
+        // unbounded. It must never collapse to a 0 ms timer.
         const timeoutMs =
             typeof parameters?.timeoutMs === 'number' && Number.isFinite(parameters.timeoutMs)
                 ? Math.max(1, Math.floor(parameters.timeoutMs))
                 : DELEGATE_TIMEOUT_MS;
 
+        // Kept UNCONDITIONAL so the caller-signal path and the `timedOut` verdict below
+        // work exactly as before; with no timer armed this controller can only abort if
+        // something aborts it, and nothing does.
         const timeoutController = new AbortController();
-        const timer = setTimeout(() => {
-            timeoutController.abort(
-                new HarnessError(
-                    `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
-                )
-            );
-        }, timeoutMs);
 
-        // Node keeps the process alive for a pending timer; a delegation must not.
-        (timer as { unref?: () => void }).unref?.();
+        // THE ONE TURN-BOUNDING TIMER IN THIS FILE, and it is guarded by a finiteness
+        // check. `src/harness.delegation.test.ts` asserts both facts against this
+        // source text so a future "safety timeout" cannot silently reintroduce a
+        // thread limit (policy doc, T5.5).
+        let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+        if (Number.isFinite(timeoutMs)) {
+            timeoutTimer = setTimeout(() => {
+                timeoutController.abort(
+                    new HarnessError(
+                        `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
+                    )
+                );
+            }, timeoutMs);
+
+            // Node keeps the process alive for a pending timer; a delegation must not.
+            (timeoutTimer as { unref?: () => void }).unref?.();
+        }
 
         const childSignal = linkSignals(callerSignal, timeoutController.signal);
 
@@ -3656,7 +3964,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     : { cancelledAtMessage: record.cancelledAtMessage })
             };
         } finally {
-            clearTimeout(timer);
+            // No timer means nothing to clear; the guard keeps the unbounded path free
+            // of any timer work at all (and `vi.getTimerCount()` stays 0 for it).
+            if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
         }
 
         // Only the answer crosses back: the subagent keeps its own transcript and
@@ -3812,6 +4122,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         createWebFetchTool(configuration.webfetch === true ? {} : (configuration.webfetch as never))
     );
 
+    // THE SCOPE ESCAPE HATCH (delegate-stress finding 2, landed 2026-11-09).
+    //
+    // `delegate`'s `scope.tools` is a hard allowlist and it used to apply to
+    // `toolRequest` itself. A child scoped to `["read","glob"]` and told to write
+    // therefore had no way to discover the capability it was missing and no clean
+    // denial to fail on: it looped on `glob` for 45 messages / 132 s until its caller
+    // noticed and killed it, and with `scope: { tools: [] }` it produced ZERO messages
+    // (docs/tasks/2026-11-08-delegate-stress-test.md, finding 2). Its own system
+    // prompt instructs it to "call toolRequest … before concluding that something
+    // cannot be done" — the one instruction a restrictive scope made impossible.
+    //
+    // So `toolRequest` is exempt from the allowlist on BOTH halves of the gate (the
+    // declaration filter in `declared` and the launch gate in `launchToolCall`): an
+    // escape hatch a caller can scope away is not an escape hatch. The exemption is
+    // by NAME, deliberately, not by a marker on the resolved definition: the point is
+    // that the wire name the model was told to call is always reachable, and a host
+    // that replaces the entry under the same name replaces the escape hatch, not the
+    // rule. The scope still bounds everything the child can DO — a scoped child that
+    // enables a tool outside its allowlist is refused at launch with a readable
+    // result, which is the clean denial the finding asked for.
+    const isScopeEscapeHatch = (name: string): boolean => name === TOOL_REQUEST;
+
     // The tools a request may declare: every core tool first (file tools, a
     // configured search, and the harness-owned set), then everything discovered
     // so far. Everything else stays out of the context window on purpose.
@@ -3837,7 +4169,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (scope === undefined) return all;
 
         const allowed = new Set(scope);
-        return all.filter((definition) => allowed.has(definition.name));
+        return all.filter((definition) => allowed.has(definition.name) || isScopeEscapeHatch(definition.name));
     };
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
@@ -3975,6 +4307,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         active: boolean;
         aborted: boolean;
         iteration: number;
+        // T5.2 — the tool-result bytes committed SINCE the last model request, under
+        // the aggregate per-turn cap. Reset at the top of `requestTurn`, so one
+        // window covers exactly the deliveries of one turn (the loop drains the
+        // mailbox before the next request). See core/result-budget.ts.
+        turnResultBudget: ToolResultTurnBudget;
+        // T5.4 — hybrid context estimate bookkeeping, per run.
+        // `tokenAnchor`: the provider's own prompt-token count for a prefix of THIS
+        // conversation, committed when that request's `usage` frame arrived.
+        // `pendingRequestChars`: the character weight of the request now in flight,
+        // measured BEFORE its response is appended, so a reported count is paired
+        // with the exact prefix it counts. Both are caches, never history: a new run
+        // (and a branch run) starts from the plain chars/4 heuristic again.
+        tokenAnchor?: ContextTokenAnchor;
+        pendingRequestChars?: number;
         // Root-prompt attachments (T3). Validated once at runAgent entry and
         // consumed by runAgentCore when it appends the user message. Always
         // empty for delegated/ctx.run children: the root's bytes are never
@@ -4002,6 +4348,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // behaviour), so keep the first one and prefer it over the generic
         // AbortError.
         abortError?: unknown;
+        // T2.3 — true when a plugin's `turn.before` `stop` decision ended this run.
+        // `runAgentCore`'s catch recomputes `run.aborted` from the run signal, and a
+        // branch run has no signal of its own (its parent's must stay untouched), so
+        // this marker is what makes a plugin stop record as `cancelled` rather than
+        // `failed` on every run shape.
+        pluginStopped: boolean;
         // `abortError` may legitimately BE `undefined` (a tool that rejected with
         // undefined). This sentinel distinguishes "recorded undefined" from "no
         // tool error was recorded"; without it throwIfAborted would wrongly
@@ -4281,28 +4633,69 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Deliver one cross-thread message. The text is attributed explicitly, so the
     // receiving model can tell another conversation's data from its own owner's
     // instructions.
+    //
+    // STATE-AWARE (delegate-stress T3.2) — the runtime, not the HTTP layer, decides
+    // what "deliver" means for the target's CURRENT status. This is the merge the
+    // finding asked for: the product already behaves this way for a human, because
+    // `src/server/sessions.ts` `steerIntoThread` steers a running thread and the
+    // caller enqueues a continuation turn when it returns undefined. Moving the
+    // decision down here gives a model the same one-operation behaviour the host
+    // has, and leaves `steerThread`/`sendThreadInput` alone (T3.5: the TOOL is
+    // merged, not the handle methods).
+    //
+    //   running  → STEER  (queue + wake; drained before the next request is built)
+    //   paused   → RESUME through the same path `sendThreadInput` uses, then START
+    //              a turn — exactly what the server does for a submit to a parked
+    //              thread, and what the finding's `paused` gap asked for.
+    //   idle     → START a turn whose prompt is the attributed message.
+    //   stopped  → REFUSE. T3.3, ratified: the host owns stopping and reviving, and
+    //              `threadSend` is not the host ("stopped must mean stopped for
+    //              agents", see `sendThreadInput` below and policy 2026-11-09 T6).
+    //
+    // NON-BLOCKING, always (T3.2/T3.4). The receipt returns before the target's
+    // answer exists; `runAgent` is fired, never awaited. Awaiting the answer would
+    // turn a chat primitive into a nested run, and a nested run is what
+    // `NESTED_RUN_ARMED_DOORS` refuses on a lane worker
+    // (src/server/workers/capability.ts) — so `threadSend` stays an authority-routed
+    // read/deliver (`AUTHORITY_RUNTIME_METHODS`) instead of moving to that set.
     const postThreadMessage = (
         sender: { agent: string; threadId?: string },
         targetThreadId: string,
         message: string
     ): HarnessThreadMessageResult => {
         const target = threadStateOf(targetThreadId);
-        const receipt: HarnessThreadMessageResult = {
-            threadId: targetThreadId,
-            delivered: target.record.status === 'running' ? 'queued' : 'appended',
-            sender: sender.agent,
-            ...(sender.threadId === undefined ? {} : { senderThreadId: sender.threadId })
-        };
 
+        // The refusal is FIRST and mutates nothing: a stopped conversation gets no
+        // queue entry, no transcript append, and no run (the sibling test in
+        // src/harness.thread-runtime.test.ts pins all three).
         if (target.record.status === 'stopped') {
             throw new HarnessError(
                 `Thread "${targetThreadId}" is stopped; it cannot receive messages until a host resumes or deletes it.`
             );
         }
 
+        // R2/R3: a plugin park is not a stop. Lifting it is what makes the parked
+        // conversation addressable again — the SAME call `sendThreadInput` makes for
+        // a host submit, so `thread.resumed` fires for the plugin that parked it and
+        // no second revival path is invented.
+        if (target.record.status === 'paused') {
+            resumeThreadState(target);
+        }
+
         const content = `from agent "${sender.agent}"${
             sender.threadId === undefined ? '' : ` (thread ${sender.threadId})`
         }:\n${message}`;
+
+        // Every field of a receipt is the target plus the SENDER's own identity; only
+        // `delivered` varies by state, and it has exactly two values (T3.6).
+        const receipt = (
+            delivered: HarnessThreadMessageResult['delivered']
+        ): HarnessThreadMessageResult => ({
+            threadId: targetThreadId,
+            delivered,
+            sender: sender.agent,
+            ...(sender.threadId === undefined ? {} : { senderThreadId: sender.threadId })
+        });
 
         if (target.record.status === 'running' && target.run !== undefined) {
             // Running: land at the next model boundary, never inside the request
@@ -4310,14 +4703,47 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             target.queue.push(content);
             notifyStateChange('thread');
             markRunDirty(target.run);
-            return receipt;
+            return receipt('queued');
         }
 
-        // Idle: append immediately. Nothing is executing, so the message is
-        // visible on the thread's next run without any scheduling work.
-        target.agent.user(content);
-        notifyStateChange('agent_message', { agent: target.agent.name });
-        return receipt;
+        // Dormant: `idle`, or a `paused` record the resume above just cleared. A
+        // `running` record with NO run attached would land here too; the pair is
+        // written and cleared together in `runAgent` (`resolvedThread.run = run` beside
+        // `status = 'running'`, both released in its `finally`), so that combination is
+        // not reachable through any path in this file, and starting a run is the safe
+        // reading of it anyway. The message IS the new prompt, so it is not appended
+        // here — the run appends it as its own root user message (`runAgentCore`),
+        // exactly like a host turn, which is what keeps one append per delivered
+        // message.
+        //
+        // The call mirrors `sendThreadInput`'s positional contract: no signal (the
+        // SENDER's cancellation must not abort a conversation it only spoke to), no
+        // parent (a parent would put the sender's brain in the lineage, and two
+        // threads of the SAME agent — the common case — would then be refused as a
+        // "delegation cycle"), no attachments, and the target as the thread state.
+        //
+        // `runAgent` is declared far below in this same closure; the reference is
+        // resolved at CALL time, never at definition time, exactly as `threadSendFor`
+        // already does with this function.
+        //
+        // A later failure is deliberately not surfaced to the sender: the run
+        // reports its own failure through `run.failed`, `finishInvocation` archives
+        // it for `agentResult`, and the thread returns to `idle` in the finally
+        // block. The `catch` exists only so a fire-and-forget rejection is never an
+        // unhandled rejection in the host process.
+        void runAgent(
+            target.agent,
+            content,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            target
+        ).catch(() => undefined);
+
+        return receipt('started');
     };
 
     // Create one host thread and return its LIVE state. Shared by the public
@@ -4448,16 +4874,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // steering the aborted run never consumed.
         state.queue.length = 0;
 
-        // T1 (Phase 2) ownership: a stopped conversation cannot finish the edit it
-        // reserved, so its task claims are dropped HERE — the one place every stop
-        // path passes (stopThread, its owner cascade, stopAllThreads). Without this
-        // a dead thread's lease keeps blocking foreign writes until it happens to
-        // expire (up to TASK_MAX_LEASE_MS). It runs before the abort below on
-        // purpose: the hook and the persisted snapshot should see the store in the
-        // state the record now claims. A tool call that was already in flight can
-        // still re-claim after this line; that orphan is bounded by the lease, and
-        // the thread is refused at its next run boundary.
-        taskStore.releaseThread(state.record.id);
+        // Decision P (round 7): the claim sweep that used to sit here is gone with the
+        // claim. A stopped conversation strands nothing in the record store, because no
+        // record can be locked — so this path stays exactly as it was apart from the
+        // deleted call, and the plugin hook below still fires once per stop.
 
         // R2 plugin hook. Emitted HERE rather than in stopThread so every stop path
         // (stopThread, stopAllThreads, an owner-linked cascade) reports the transition
@@ -4514,12 +4934,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const threadId = state.record.id;
         threadStates.delete(threadId);
 
-        // T1 (Phase 2) ownership: the conversation is gone, so nothing can ever
-        // release or renew its task claims again — a delete MUST lift them or the
-        // records stay blocked for the rest of the lease. Part of the shared purge
-        // so deleteThread and its cascade cannot drift from each other; already
-        // released (or absent) claims make this a no-op.
-        taskStore.releaseThread(threadId);
+        // Decision P (round 2 of the note): a delete used to have to lift this
+        // conversation's claims. Records are not lockable any more, so there is
+        // nothing to lift and the purge below is unchanged.
 
         // Invocation lookups owned by THIS conversation. Branch runs inherit the
         // persistent owner, so a fork's/autoanswer's result is scoped here too.
@@ -4783,8 +5200,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // Shared-store persistence: the transcript IS harness state, so the
         // session's state-change observer must capture it. `agent_message` + the
-        // owning agent's name is exactly what `postThreadMessage` reports for an
-        // idle append (line ~3460); no new reason is introduced.
+        // owning agent's name is the SAME notification every other transcript append
+        // makes (a run's root user message in `runAgentCore`, and `drainThreadQueue`),
+        // so no new reason is introduced.
         notifyStateChange('agent_message', { agent: target.agent.name });
     };
 
@@ -4840,7 +5258,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     ): HarnessMessage[] => {
         const target = threadStateOf(threadId);
 
-        const validated = readHarnessMessages(messages, `thread "${threadId}" messages`);
+        // An APPEND is the one read whose array is a SLICE, so the entries it joins are
+        // passed to the reader as well: an appended message with no address of its own is
+        // minted one above everything this conversation already owns, never a number the
+        // transcript is already using (context T1.3, core/snapshot.ts).
+        const validated = readHarnessMessages(
+            messages,
+            `thread "${threadId}" messages`,
+            target.agent.messages
+        );
 
         // Checked BEFORE any mutation: a refused append must leave the transcript
         // (and every observer) untouched.
@@ -4865,6 +5291,124 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         notifyStateChange('agent_message', { agent: target.agent.name });
 
         return cloneMessages(target.agent.messages);
+    };
+
+    // T4.1 lane-worker seam: REWRITE the committed prefix of a conversation IN PLACE.
+    //
+    // WHY THIS EXISTS AND WHY AN APPEND CANNOT DO IT (finding F6): a lane's plugin writes an
+    // already-committed message in place (`setIncluded` removing/storing the `included` key,
+    // `edit` changing `content`/`reasoning`) WITHOUT changing the transcript length, so the
+    // append condition a worker derives from (`transcript.length > committedLength`) never
+    // fires for it, and the change used to die with the worker process. This seam is the
+    // targeted canonical write the authority replays a `transcript:patch` op through: ONE call
+    // per committed change, validating its own input, no wholesale `restore()`.
+    //
+    // The CAS lives with the authority (./lane-authority.ts owns `digestMemoryValue` and
+    // compares the digest of the prefix it is being asked to replace), so this seam validates
+    // the shape and the length only. Keeping the digest OUT of the core is deliberate: the
+    // core has no serializer for it and must not grow one just to police a worker protocol.
+    //
+    // Guards, all checked BEFORE anything moves (a refused write mutates nothing):
+    //   - a run attached IN THIS harness refuses, like `setThreadStatus`: the authority's own
+    //     run loop is reading this transcript (`resultInsertIndex`, `transcriptUnits`), and a
+    //     prefix replace under it could tear that read. A mirror record saying 'running' is
+    //     NOT a refusal — that is the lane's copy of the truth, and the append seam above
+    //     exists for exactly the same reason;
+    //   - `messages.length` must equal `expectedLength`, the committed prefix the lane says it
+    //     is rewriting — a whole-prefix operation either carries the whole prefix or is a bug;
+    //   - `expectedLength` must not exceed the live length (canonical got shorter: a reset or
+    //     a host repair landed first, and there is nothing at those positions any more);
+    //   - every entry must keep its `role`, and its `messageId` when both sides have one. Role
+    //     is what the unit resolver and the transport pair on, and an address is an IDENTITY
+    //     field (context T1) — rewriting either would silently move a turn the operator, the
+    //     UI, or a later plugin round still points at. A plugin's own contract (`edit`,
+    //     `setIncluded`) can never produce such a patch; this refuses one anyway so a future
+    //     writer cannot split an assistant block from its results.
+    //
+    // The validated entries REPLACE the canonical objects (positions kept, array identity
+    // kept — `agent.messages` is exposed by reference, so `splice`, never reassign). Object
+    // identity is a lane-local concern: no run is attached to the authority's copy while a
+    // lane writes it (the first guard above), so nothing here is holding an entry.
+    //
+    // Returns the detached canonical transcript, like `appendThreadMessages`, so the caller
+    // can publish the committed digest without a second read. Notifies `agent_message` — the
+    // same reason every other transcript write reports, and the ONLY durability mechanism:
+    // it is what makes the server snapshot this conversation into `state.json`, which is the
+    // restart half of the claim this seam exists for.
+    const patchThreadMessages = (
+        threadId: string,
+        messages: HarnessMessage[],
+        expectedLength: number
+    ): HarnessMessage[] => {
+        const target = threadStateOf(threadId);
+
+        if (target.run !== undefined) {
+            throw new HarnessError(
+                `Thread "${threadId}" is running in this harness; a lane cannot replace its committed prefix under that run.`
+            );
+        }
+
+        if (!Number.isInteger(expectedLength) || expectedLength < 0) {
+            throw new HarnessError(
+                `Thread "${threadId}" patch needs a non-negative committed-prefix length; received ${JSON.stringify(expectedLength)}.`
+            );
+        }
+
+        if (messages.length !== expectedLength) {
+            throw new HarnessError(
+                `Thread "${threadId}" patch names ${expectedLength} committed entries but carries ${messages.length}.`
+            );
+        }
+
+        const current = target.agent.messages;
+
+        if (current.length < expectedLength) {
+            throw new HarnessError(
+                `Thread "${threadId}" holds ${current.length} messages, not ${expectedLength}; re-read before patching.`
+            );
+        }
+
+        // The same reader snapshot()/restore()/append enforce, so a lane can never install a
+        // transcript this harness's own snapshot would refuse. `current` goes in as
+        // `surrounding` for the id rule `appendThreadMessages` documents: an entry with no
+        // address of its own is minted one above everything this conversation already owns.
+        const validated = readHarnessMessages(messages, `thread "${threadId}" messages`, current);
+
+        // Structural identity checks, BEFORE the write, naming the position that broke the rule.
+        // The RAW entry is what the address check reads, because the reader backfills an absent
+        // `messageId` with a freshly minted one (`createMessageIdAllocator`, core/snapshot.ts) and
+        // a mint would look like a moved address.
+        for (const [index, message] of validated.entries()) {
+            if (message.role !== current[index]?.role) {
+                throw new HarnessError(
+                    `Thread "${threadId}" patch would change entry ${index} from ${JSON.stringify(current[index]?.role)} to ${JSON.stringify(message.role)}; a committed entry keeps its role.`
+                );
+            }
+
+            const before = (current[index] as { messageId?: string } | undefined)?.messageId;
+            const incoming = (messages[index] as { messageId?: unknown } | undefined)?.messageId;
+
+            // An address belongs to the TURN, not to the write: a caller that names none keeps
+            // the one already at that position, rather than being minted a number the transcript
+            // is about to lose. A caller that DOES name one must name the same one — a
+            // `messageId` is how `setIncluded` and the UI point at this entry from another round
+            // or another process, so moving it under a patch would silently re-point them.
+            if (incoming === undefined) {
+                if (before !== undefined) message.messageId = before;
+            } else if (before !== undefined && typeof incoming === 'string' && before !== incoming) {
+                throw new HarnessError(
+                    `Thread "${threadId}" patch would move entry ${index} from address ${JSON.stringify(before)} to ${JSON.stringify(incoming)}; a committed entry keeps its address.`
+                );
+            }
+        }
+
+        // IN PLACE: one range replaced, every reference to the array (the run loop, the server
+        // roster, `agent.messages` holders) still points at the live transcript.
+        current.splice(0, expectedLength, ...validated);
+
+        notifyStateChange('agent_message', { agent: target.agent.name });
+
+        return cloneMessages(current);
     };
 
     // Record the roster-side state of a conversation that is running (or has finished)
@@ -5643,6 +6187,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // The bytes are stored, NOT serialized into `content`, so the 64 KiB
     // model-facing text budget never truncates them and the transcript never
     // pays JSON-escaped base64 twice.
+    //
+    // `outcome` follows the SAME omission rule for the SAME reason (compaction T1):
+    // only a NON-`completed` classification is written, so a healthy result keeps the
+    // historical shape byte-for-byte and an absent key reads back as `completed`
+    // (core/tool-outcome.ts `storedOutcomeEntry`/`toolOutcomeOf`). It is passed in from the
+    // delivery that computed it and never inferred from `content` — the point of the field
+    // is that no rule has to read prose again.
     const insertToolMessage = (
         brain: Agent,
         call: HarnessToolCall,
@@ -5650,20 +6201,43 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // N6: branch transcripts are ephemeral (snapshot v1 excludes them), so a
         // branch delivery must not ask a server to persist an agent_message.
         notify = true,
-        media?: HarnessAttachment[]
+        media?: HarnessAttachment[],
+        // Compaction T1.2 — the classification the DELIVERY already computed, carried
+        // through verbatim. This is the one canonical writer of the key, and it does not
+        // re-derive anything from the result text (T1.5): a delivery that classified
+        // `failed` says `failed`, and a `completed` delivery writes NO key.
+        outcome?: HarnessToolOutcome
     ): boolean => {
         if (hasToolResult(brain, call.id)) return false;
 
         const index = resultInsertIndex(brain, call.id);
         if (index < 0) return false;
 
-        brain.messages.splice(index, 0, {
-            role: 'tool',
-            content,
-            toolCallId: call.id,
-            name: call.name,
-            ...(media === undefined || media.length === 0 ? {} : { attachments: media })
-        });
+        // T1.2 — a canonical creation point: a committed tool RESULT, the one transcript
+        // message the HARNESS (rather than core/agent.ts) creates. The id is minted
+        // against the transcript as it is BEFORE the splice, and it is what lets a LATER
+        // round disable one answered call block by id (`setIncluded` cascades the id's
+        // UNIT, so the assistant entry and every result of that block) instead of by an
+        // index that has since moved. See core/message-id.ts.
+        brain.messages.splice(
+            index,
+            0,
+            assignMessageId(
+                {
+                    role: 'tool',
+                    content,
+                    toolCallId: call.id,
+                    name: call.name,
+                    ...(media === undefined || media.length === 0 ? {} : { attachments: media }),
+                    // T1.1/T1.2 — written ONLY for a non-completed delivery, so a completed
+                    // result keeps the exact pre-change shape. Key order mirrors the type
+                    // declaration (attachments, outcome, included, messageId); `messageId` is
+                    // appended by assignMessageId itself.
+                    ...storedOutcomeEntry(outcome)
+                },
+                brain.messages
+            )
+        );
 
         // Snapshot-managed mutation: notify after the splice, exactly like the
         // synchronous path used to.
@@ -5856,6 +6430,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // T5.1/T5.2 — the ONE shape a tool result's text takes on its way to the model.
+    // It runs the per-result cap (the head/tail envelope, core/result-budget.ts) AND
+    // the run's aggregate per-turn budget, and it names the producing call so the
+    // envelope can say what to re-run. Every delivery site uses it, so the transcript,
+    // the `tool_result` event and the `tool.after` payload all carry byte-identical
+    // text (a client and a reload must agree).
+    const boundDelivery = (run: RunState, call: HarnessToolCall, content: string): string =>
+        run.turnResultBudget.commit(content, { source: { name: call.name, callId: call.id } }).content;
+
     // Deliver one settled task. Runs inside the agent's mailbox, so the insert and
     // the event are one serialized step. A task whose run has already ended (or
     // was aborted) is discarded: the transcript it would touch was rolled back.
@@ -5910,18 +6493,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the provider projection would keep a placeholder forever. It is
             // error-SHAPED (no usable value exists) but classified `cancelled`, so
             // a UI renders it as a control outcome instead of a tool failure.
-            content = boundToolResult(
+            content = boundDelivery(
+                run,
+                call,
                 `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
-            ).content;
+            );
             outcome = 'cancelled';
         } else if (task.failed) {
             // `toErrorInfo` is total (see util/errors.ts): a compiled tool may throw
             // a primitive/object/proxy, and this failure reporter must never throw
             // while describing that value. `task.failed` (not `task.error`) decides
             // failure so `throw undefined` is still an error result.
-            content = boundToolResult(
+            content = boundDelivery(
+                run,
+                call,
                 `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
-            ).content;
+            );
             outcome = 'failed';
         } else {
             // A tool can RESOLVE successfully with a value the harness cannot put on
@@ -5937,24 +6524,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // The bytes are NOT serialized here, so `boundToolResult` can
                 // never truncate a downloaded file into a filename.
                 const unwrapped = unwrapToolResult(task.result);
-                content = boundToolResult(serialize(unwrapped.content)).content;
+                content = boundDelivery(run, call, serialize(unwrapped.content));
                 panels = unwrapped.panels;
                 media = unwrapped.media;
                 outcome = 'completed';
             } catch (error) {
-                content = boundToolResult(
+                content = boundDelivery(
+                    run,
+                    call,
                     `Tool "${call.name}" completed but its result could not be serialized: ${toErrorInfo(error).message}`
-                ).content;
+                );
                 outcome = 'failed';
             }
         }
 
-        // The provider/transcript-facing boolean is DERIVED, never set separately:
-        // a consumer that ignores `outcome` still gets an honest answer, and the
-        // two fields cannot drift apart.
-        const isError = outcome !== 'completed';
+        // The provider/transcript-facing boolean is DERIVED, never set separately (T1.3):
+        // a consumer that ignores `outcome` still gets an honest answer, and the two
+        // fields cannot drift apart because only the outcome is stored.
+        const isError = isErrorOutcome(outcome);
 
-        insertToolMessage(brain, call, content, run.branch === undefined, media);
+        // T1.2 — the classification is persisted on the canonical message at the single
+        // insertion point, so it survives a restart/snapshot/fork. `completed` writes no
+        // key; nothing here re-reads `content` to decide what happened.
+        insertToolMessage(brain, call, content, run.branch === undefined, media, outcome);
 
         // The outcome is CANONICAL at this point (P1-A). Wake the loop BEFORE the
         // reporter runs: a slow progress callback must not be able to keep
@@ -6044,8 +6636,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         outcome: HarnessToolOutcome,
         withDuration = false
     ): Promise<void> => {
-        const content = boundToolResult(raw).content;
-        insertToolMessage(run.agent, call, content, run.branch === undefined);
+        const content = boundDelivery(run, call, raw);
+        // T1.2 — same single writer. A rejection/cancel is persisted as the key the
+        // delivery classified; a `completed` acknowledgement writes none.
+        insertToolMessage(run.agent, call, content, run.branch === undefined, undefined, outcome);
 
         const pending = scheduler.pendingList(run.actorKey);
 
@@ -6055,7 +6649,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             name: call.name,
             callId: call.id,
             content,
-            isError: outcome !== 'completed',
+            isError: isErrorOutcome(outcome),
             outcome,
             ...(withDuration ? { durationMs: 0 } : {}),
             ...(pending.length === 0 ? {} : { pending })
@@ -6173,7 +6767,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // this is the defence-in-depth half for a model that GUESSES a name — the same
         // shape as the primary-only gate below, and it answers with a readable result
         // instead of failing the run.
-        if (run.toolScope !== undefined && !run.toolScope.includes(call.name)) {
+        //
+        // The ONE exemption is `toolRequest` (see `isScopeEscapeHatch`): the discovery
+        // door stays open so a restricted child can report what it needs instead of
+        // spinning. Everything else still needs a name in the allowlist.
+        if (run.toolScope !== undefined && !run.toolScope.includes(call.name) && !isScopeEscapeHatch(call.name)) {
             await fail(
                 `Tool "${call.name}" is outside this run's scope. Allowed: ${run.toolScope.join(', ') || 'none'}.`
             );
@@ -7350,8 +7948,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // R2/R3 plugin hook: the turn boundary
     // ------------------------------------------------------------------
     //
-    // Builds and emits one `turn.before` round and returns the transcript the provider
-    // must actually receive — synchronously when every handler stayed synchronous, as a
+    // Builds and emits one `turn.before` round and returns what the round DECIDED: the
+    // transcript the provider must actually receive, plus the run-level decision when a
+    // plugin returned one — synchronously when every handler stayed synchronous, as a
     // promise only when one of them did real work (see the maybe-sync note below). Kept
     // as a helper (rather than inlined) because the context has to be rebuilt PER HANDLER
     // — that is the only way a second hook can see what the first one already rewrote,
@@ -7361,7 +7960,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   - `setTranscript()` writes immediately and is visible to every LATER handler;
     //   - a handler that RETURNS `{ transcript }` is applied after the round, so it wins
     //     over an earlier `setTranscript`, and the LAST returned value wins overall;
-    //   - an empty array is never an override (see plugin/hooks.ts `overrideOf`);
+    //   - an empty array is never an override (see plugin/hooks.ts `contributionOf`);
     //   - `setIncluded()` is NOT an override: it is a CANONICAL write (it flips
     //     `included` across the whole tool-call unit of the targeted entry, and
     //     notifies persistence). After the round, a run whose inclusion state changed
@@ -7369,6 +7968,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //     change lands on THIS request and on every later one. An explicit transcript
     //     still wins, and a round that did neither hands back the original projection
     //     array untouched (same identity, same bytes).
+    //   - `edit()` is a canonical write in exactly the same sense and with exactly the
+    //     same consequences (pipeline T3): it re-words one entry's TEXT in place, marks
+    //     the SAME projection cache dirty so THIS request carries the new text, and reports
+    //     the same single `agent_message` change. It changes no structure, so it cascades to
+    //     no unit — a unit is a PAIRING question, and an edit cannot move a pairing key.
+    //   - a returned `{ decision }` (T2) rides ALONGSIDE all of the above: `replace` is
+    //     the same statement as a returned `{ transcript }` and is normalized into that
+    //     channel by the reducer, so `requestOf` below has one thing to read; `pause` and
+    //     `stop` say nothing about the request at all — they are consumed by
+    //     `applyTurnDecision` in `requestTurn`, and the transcript this round decided is
+    //     still the transcript that goes out (precedence rule 3).
     //
     // ORDERING CAVEAT for `entries` and numeric indices: both describe the transcript
     // as it is at that moment. A handler that calls `replaceHistory()` replaces the
@@ -7378,9 +7988,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // `entries` after any `replaceHistory()`.
     //
     // NOTHING ELSE IS COMMITTED HERE. An override affects this REQUEST only; the
-    // agent's transcript is untouched unless a hook calls `replaceHistory()` or
-    // `setIncluded()`, which is what keeps "compact this turn", "rewrite this
-    // conversation" and "hide this turn from the model" three separate decisions.
+    // agent's transcript is untouched unless a hook calls `replaceHistory()`,
+    // `setIncluded()` or `edit()`, which is what keeps "compact this turn", "rewrite
+    // this conversation", "hide this turn from the model" and "re-word one turn" four
+    // separate decisions — each with its own scope, its own durability, and no implicit
+    // effect on the others.
     //
     // Cost when nobody listens: one `has()` check. The estimate, the record copies and
     // the context object are all behind it, so a harness without a `turn.before` hook
@@ -7401,12 +8013,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // at all (plugin/hooks.ts rule 6).
     const alwaysActiveSignal = new AbortController().signal;
 
+    // What one `turn.before` round decided, in the shape the run loop consumes (T2.3):
+    // the request body the round settled on, plus the run-level decision ONLY when a
+    // plugin actually returned one. The `decision` key stays ABSENT on the hot path —
+    // `requestTurn` then reads one `undefined` and changes nothing else, which is what
+    // keeps a no-decision turn byte-identical to today (T2.4).
+    type TurnBeforeOutcome = {
+        transcript: HarnessMessage[];
+        decision?: HarnessTurnDecision;
+    };
+
     const emitTurnBefore = (
         run: RunState,
         projection: readonly HarnessMessage[]
-    ): HarnessMaybeAsync<HarnessMessage[]> => {
+    ): HarnessMaybeAsync<TurnBeforeOutcome> => {
         if (!hookBus.has('turn.before')) {
-            return { sync: true, value: projection as HarnessMessage[] };
+            return { sync: true, value: { transcript: projection as HarnessMessage[] } };
         }
 
         const threadState = run.threadState;
@@ -7423,11 +8045,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // canonical transcript itself — so a disabled turn remains visible and can be
         // switched back on, and `setIncluded` is the only writer of the flag.
         //
-        // ONE DERIVED PROJECTION, CACHED AND LAZY. A flag change is a canonical write,
-        // so the NEXT handler and THIS request both have to see the transcript the flags
-        // now describe. Rather than rebuilding on every write, the write only marks the
-        // cache dirty (`inclusionChanged`) and the next consumer rebuilds it exactly
-        // once (`currentProjection`). That keeps three properties at once:
+        // ONE DERIVED PROJECTION, CACHED AND LAZY. A canonical write — a flag change
+        // (`setIncluded`) or a text edit (`edit`) — moves what the model must receive, so
+        // the NEXT handler and THIS request both have to see the transcript the flags and
+        // the text now describe. Rather than rebuilding on every write, the write only
+        // marks the cache dirty (`inclusionChanged`) and the next consumer rebuilds it
+        // exactly once (`currentProjection`). That keeps three properties at once:
         //   - cross-handler freshness: the context factory calls `currentProjection()`,
         //     so every handler is ENTERED with the projection an earlier handler's write
         //     produced;
@@ -7461,6 +8084,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // is final, see `closeRoundObservations` below.
         let roundClosed = false;
 
+        // -----------------------------------------------------------------------
+        // Notification coalescing (context-inclusion T4 / compaction T4.4) — ONE
+        // `agent_message` per turn.before ROUND instead of one per canonical WRITE.
+        //
+        // WHY IT EXISTS. The state-change observer is the ONLY durability mechanism a
+        // plugin flag write has (../types `HarnessTurnBeforeContext.setIncluded`), and the
+        // server turns each one into a WHOLE-document atomic rewrite — stage + fsync +
+        // rename (./server/persistence.ts). A policy that prunes 40 units therefore paid 40
+        // full saves for one logical change (context doc F6); the event's own `reason` is
+        // documented as "a coarse hint for coalescing/debouncing a save", so the contract
+        // asked for this and nothing took it.
+        //
+        // WHY THIS BOUNDARY IS THE SAFE ONE. A write marks the round dirty; the flush is
+        // `closeRoundObservations()`, which runs at the round boundary — AFTER every handler
+        // has had its say and BEFORE the request goes out. So durability is never LATER than
+        // it was (the transcript is already written in place; only the report moves), and it
+        // never crosses a run boundary, which is the one thing the context entry's T4.3
+        // forbids: a "flush later" that never arrives because the run died would silently
+        // lose a write. No timer, no debounce, no cross-round state — the round IS the batch.
+        //
+        // A WRITE THAT ARRIVES AFTER THE ROUND CLOSED (a plugin that parked its context and
+        // acts on a later tick) can no longer join a batch, so it reports on the spot rather
+        // than being dropped: one write, one notification, exactly the old behaviour.
+        // -----------------------------------------------------------------------
+        let roundWritesToReport = false;
+
         // Every context object this round handed out, so the round can freeze them.
         const roundContexts: { freezeEntries: () => void }[] = [];
 
@@ -7477,6 +8126,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             finalProjection = currentProjection();
 
             for (const contextOfRound of roundContexts) contextOfRound.freezeEntries();
+
+            // The coalesced report (see `roundWritesToReport` above): the whole round's
+            // canonical writes become ONE transcript-change notification. A branch run owns
+            // an ephemeral transcript, so — exactly as per-write used to — nothing is
+            // reported at all there.
+            if (!roundWritesToReport) return;
+
+            roundWritesToReport = false;
+
+            if (threadState !== undefined) {
+                notifyStateChange('agent_message', { agent: brain.name });
+            }
+        };
+
+        // One canonical write happened in this round. Called by `setIncluded` and `edit`;
+        // both are flag/text writes on the SAME transcript, so both belong to the same batch
+        // and the same one save.
+        const reportCanonicalWrite = (): void => {
+            if (threadState === undefined) return;
+
+            // The batch window already closed (a late writer), so report directly: the flush
+            // point will not come again, and losing the report would lose the write.
+            if (roundClosed) {
+                notifyStateChange('agent_message', { agent: brain.name });
+                return;
+            }
+
+            roundWritesToReport = true;
         };
 
         // Built per handler: indices and identities are only meaningful against the
@@ -7493,6 +8170,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 const entry: HarnessContextEntry = {
                     index,
                     message,
+                    // THE DURABLE ADDRESS (context T1.5): hoisted out of the canonical
+                    // message so a handler can name this turn in a LATER round. Written
+                    // only when the message has one — a message a host pushed into
+                    // `agent.messages` directly, or a branch's own framing block, has no
+                    // id, and an entry must not grow a `messageId: undefined` key a
+                    // `toStrictEqual` consumer would have to special-case.
+                    ...(message.messageId === undefined
+                        ? {}
+                        : { messageId: message.messageId }),
                     // LIVE, not a snapshot: it reads the CURRENT flags of every member,
                     // so `setIncluded(...)` followed by `entry.included` answers what the
                     // transcript says now, and an earlier hook's change is visible to a
@@ -7527,15 +8213,101 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
         };
 
+        // A value shown inside a refusal message: JSON.stringify quotes strings (so `''`
+        // is visibly a string) and keeps numbers bare; it has no representation for a
+        // BigInt or a circular object, and the error path must never throw on its own
+        // account. Shared by both mutation controls so a bad value reads identically
+        // whichever control refused it.
+        const shownValue = (value: unknown): string => {
+            try {
+                return String(JSON.stringify(value) ?? value);
+            } catch {
+                return String(value);
+            }
+        };
+
+        // The entry guards EVERY entry-target control shares, in one place and one order:
+        // shaped like an entry, handed out by THIS round (`issuedEntries` — a fabricated
+        // lookalike is refused, so a plugin cannot address a message the round never saw),
+        // and still present in the canonical transcript by object IDENTITY (a
+        // `replaceHistory()` between handlers makes a captured entry stale, and the
+        // refusal names the cure). Returns the LIVE index, which is what both controls
+        // then act on.
+        //
+        // `label` names the operation in the two messages that differ only by it, and
+        // `shapeMessage` is passed whole because only `setIncluded` may ALSO accept a
+        // numeric index — reusing its "needs a transcript index or an entry" wording for a
+        // control that takes an entry alone would tell the caller a lie. Every string here
+        // is pinned by src/harness.inclusion.test.ts, so changing one is a contract change.
+        const indexOfIssuedEntry = (
+            target: HarnessContextEntry,
+            label: string,
+            shapeMessage: string
+        ): number => {
+            const canonical = brain.messages;
+
+            if (
+                typeof target !== 'object' ||
+                target === null ||
+                !('message' in target) ||
+                !('index' in target)
+            ) {
+                throw new HarnessError(shapeMessage);
+            }
+
+            if (!issuedEntries.has(target)) {
+                throw new HarnessError(
+                    `turn.before ${label} received an entry that does not belong to this turn.`
+                );
+            }
+
+            const index = canonical.indexOf(target.message);
+
+            if (index < 0) {
+                throw new HarnessError(
+                    `turn.before ${label} received a stale entry (index ${String(target.index)}): its message is no longer in the transcript. Read \`entries\` again after \`replaceHistory()\`.`
+                );
+            }
+
+            return index;
+        };
+
+        // The THIRD target form (context T1.5): a canonical `messageId` string, resolved
+        // by a scan of the live transcript — the same shape of refusal as the stale-entry
+        // rule above, worded the same way, and naming the same cure.
+        //
+        // WHY A SCAN AND NO EXTRA INDEX: an id is a durable address, not a lookup table.
+        // A Map would have to be invalidated on every canonical rewrite (`replaceHistory`,
+        // a rollback splice, a restore, a lane append) and would be one more state that
+        // can disagree with the transcript; scanning is O(n) once per control call, the
+        // same order `indexOfIssuedEntry` already pays for the entry form, and it can
+        // never be stale. Duplicate ids inside ONE transcript (only a host push or a
+        // crafted document can produce one) resolve to the FIRST entry, which the
+        // snapshot reader normalizes by backfilling anyway.
+        const indexOfMessageId = (id: string): number => {
+            const canonical = brain.messages;
+
+            for (let index = 0; index < canonical.length; index += 1) {
+                if (canonical[index].messageId === id) return index;
+            }
+
+            return -1;
+        };
+
         // Which canonical messages the target refers to — a unit, never a lone member.
         // Purely READ-ONLY by contract: `setIncluded` resolves first and writes only
         // after every argument has been accepted, so a rejected call can never leave a
         // half-applied unit.
-        const resolveUnit = (target: HarnessContextEntry | number): readonly HarnessMessage[] => {
+        const resolveUnit = (
+            target: HarnessContextEntry | number | string
+        ): readonly HarnessMessage[] => {
             const canonical = brain.messages;
 
             if (typeof target === 'number') {
                 if (!Number.isInteger(target)) {
+                    // `String`, not `shownValue`: JSON.stringify turns NaN into "null",
+                    // and the pinned refusal says `received NaN.` — the number the caller
+                    // actually passed, not its JSON form.
                     throw new HarnessError(
                         `turn.before setIncluded needs an integer transcript index; received ${String(target)}.`
                     );
@@ -7559,39 +8331,41 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 return transcriptUnits(canonical)[target];
             }
 
-            if (
-                typeof target !== 'object' ||
-                target === null ||
-                !('message' in target) ||
-                !('index' in target)
-            ) {
-                throw new HarnessError(
-                    'turn.before setIncluded needs a transcript index or an entry from this turn.'
-                );
-            }
+            if (typeof target === 'string') {
+                // Empty and whitespace-only ids are refused as a MISTAKE, not treated as
+                // "not found": the caller means an id, and a silent stale refusal would
+                // send it looking for a lost turn instead of a mistyped argument.
+                if (target.trim().length === 0) {
+                    throw new HarnessError(
+                        'turn.before setIncluded needs a non-empty messageId; received an empty string.'
+                    );
+                }
 
-            if (!issuedEntries.has(target)) {
-                throw new HarnessError(
-                    'turn.before setIncluded received an entry that does not belong to this turn.'
-                );
-            }
+                const index = indexOfMessageId(target);
 
-            const index = canonical.indexOf(target.message);
+                if (index < 0) {
+                    throw new HarnessError(
+                        `turn.before setIncluded received a stale messageId ${JSON.stringify(target)}: no entry with that id is in the transcript. Read \`entries\` again after \`replaceHistory()\`.`
+                    );
+                }
 
-            if (index < 0) {
-                throw new HarnessError(
-                    `turn.before setIncluded received a stale entry (index ${String(target.index)}): its message is no longer in the transcript. Read \`entries\` again after \`replaceHistory()\`.`
-                );
+                return transcriptUnits(canonical)[index];
             }
 
             // Unit resolution happens against the live transcript, so an entry remains
             // usable when the transcript merely GREW (a committed tool result) — only a
             // replaced message list invalidates it.
-            return transcriptUnits(canonical)[index];
+            return transcriptUnits(canonical)[
+                indexOfIssuedEntry(
+                    target,
+                    'setIncluded',
+                    'turn.before setIncluded needs a transcript index, an entry from this turn, or a messageId.'
+                )
+            ];
         };
 
         const setIncluded = (
-            target: HarnessContextEntry | number,
+            target: HarnessContextEntry | number | string,
             included: unknown
         ): void => {
             // Target problems are reported before the flag value: a plugin holding a
@@ -7602,19 +8376,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // `'yes'` would have RE-ENABLED the unit and `0` would have disabled it —
             // which is exactly the kind of typo this surface must refuse.
             if (typeof included !== 'boolean') {
-                // JSON.stringify quotes strings (so `''` is visibly a string) and keeps
-                // numbers bare; it has no representation for a BigInt, and the error
-                // path must never throw on its own account.
-                let shown: string;
-
-                try {
-                    shown = String(JSON.stringify(included) ?? included);
-                } catch {
-                    shown = String(included);
-                }
-
                 throw new HarnessError(
-                    `turn.before setIncluded needs a boolean for \`included\`; received ${shown}.`
+                    `turn.before setIncluded needs a boolean for \`included\`; received ${shownValue(included)}.`
                 );
             }
 
@@ -7626,8 +8389,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             // Persistence: the flag change IS transcript state, so a conversation with
             // a shared store reports it exactly like every other transcript write
-            // (`postThreadMessage`, `writeThreadTranscript`, `restore`) — the observer
-            // snapshots the whole harness, and the server writes it to `state.json`.
+            // (`runAgentCore`'s root append, `writeThreadTranscript`, `restore`) — the
+            // observer snapshots the whole harness, and the server writes it to
+            // `state.json`.
             // A branch run (fork/autoanswer) has `run.threadState === undefined`
             // (`runAgent`'s `resolvedThread` returns undefined for a branch, so no
             // threadState is ever put on the run), owns an ephemeral transcript, and is
@@ -7635,9 +8399,108 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // is still filtered. The flag write is allowed there precisely because it is
             // request-shaping and ephemeral, unlike `replaceHistory()` below, which
             // rewrites PERSISTENT state and is therefore refused on a branch run.
-            if (threadState !== undefined) {
-                notifyStateChange('agent_message', { agent: brain.name });
+            reportCanonicalWrite();
+        };
+
+        // Context editing (pipeline T3.1/T3.2) — the second half of "switch inclusion,
+        // edit an entry within its role's rules, and nothing else" (R4). Deliberately NOT
+        // a new mechanism: it reuses `setIncluded`'s shipped primitive shape point for
+        // point — the same entry resolution, validation BEFORE any write, the same
+        // in-place write onto a harness-owned canonical object, the same projection-cache
+        // invalidation so the change lands on THIS request, and the same single
+        // `agent_message` notification, which is the only durability mechanism there is.
+        //
+        // No delete, and no wholesale rewrite either (T3.3): history is never removed
+        // here, so a plugin that wants the model to stop seeing a turn disables it, and a
+        // plugin that wants to replace the transcript still has exactly one way to do it —
+        // `replaceHistory()`, with the persistent-state guard that refuses it on a branch.
+        const edit = (entry: HarnessContextEntry, patch: HarnessContextEditPatch): void => {
+            // ENTRY, not an index: an edit rewrites the text of one specific message, and
+            // the stage's own finding is that a numeric index is re-read against the
+            // CURRENT transcript, so a shifted index would silently re-word the wrong
+            // turn. `entries` is the address this control understands.
+            const canonical = brain.messages;
+            const index = indexOfIssuedEntry(
+                entry,
+                'edit',
+                'turn.before edit needs an entry from this turn.'
+            );
+            const message = canonical[index];
+
+            if (
+                patch === null ||
+                typeof patch !== 'object' ||
+                typeof patch === 'function' ||
+                Array.isArray(patch)
+            ) {
+                throw new HarnessError(
+                    `turn.before edit needs a patch object for entry ${String(index)}; received ${shownValue(patch)}.`
+                );
             }
+
+            // OWN keys only, so an inherited key cannot smuggle a field past the checks.
+            const keys = Object.keys(patch);
+
+            if (keys.length === 0) {
+                throw new HarnessError(
+                    `turn.before edit received an empty patch; name at least one editable field (${editableFieldsOf(message.role)}).`
+                );
+            }
+
+            // Every field is checked before ANY is written, and nothing is written that
+            // the checks did not accept — the all-or-nothing order R5 pins for this
+            // surface. A caller that names a field with an explicit `undefined` is
+            // refused rather than ignored: naming a field says "write it", and quietly
+            // skipping it would be a coercion in the other direction (the same reasoning
+            // that makes `setIncluded(target, undefined)` a refusal).
+            for (const key of keys) {
+                const refusal = editRefusalOf(key, message.role);
+
+                if (refusal !== undefined) {
+                    throw new HarnessError(
+                        `turn.before edit cannot change \`${key}\` on ${roleArticle(message.role)} ${message.role} message: ${refusal}.`
+                    );
+                }
+
+                if (!EDITABLE_FIELDS.includes(key)) {
+                    throw new HarnessError(
+                        `turn.before edit received \`${key}\`, which is not a field of ${roleArticle(message.role)} ${message.role} transcript entry (editable: ${editableFieldsOf(message.role)}).`
+                    );
+                }
+
+                const value = (patch as Record<string, unknown>)[key];
+
+                if (typeof value !== 'string') {
+                    throw new HarnessError(
+                        `turn.before edit needs a string for \`${key}\` on ${roleArticle(message.role)} ${message.role} message; received ${shownValue(value)}.`
+                    );
+                }
+            }
+
+            // THE WRITE, in place, for the same reason `writeIncluded` is in place
+            // (see above): canonical messages are harness-owned objects, and the running
+            // turn still depends on their identities and positions. `content` exists on
+            // every role, so this assigns an EXISTING key — no new key, no key-order
+            // change, and nothing for the snapshot or branch whitelists to learn about
+            // (T3.6). `reasoning` is assistant-only: the loop above refused it anywhere
+            // else, so the cast only tells the compiler what the checks already proved.
+            if (patch.content !== undefined) message.content = patch.content;
+
+            if (patch.reasoning !== undefined) {
+                (message as Extract<HarnessMessage, { role: 'assistant' }>).reasoning =
+                    patch.reasoning;
+            }
+
+            // The new text IS the projection, so the cached request is stale exactly as a
+            // flag write makes it stale: one rebuild, shared by every later handler's
+            // `currentMessages()` and by this round's request.
+            inclusionChanged = true;
+
+            // One persistence notification, the SAME reason as `setIncluded`: a root edit
+            // moves a persistent conversation; a branch edit moved an ephemeral copy that
+            // snapshot v1 excludes, so it reports nothing (T3.6). Batched with the round's
+            // other writes exactly like `setIncluded` now is (T4.4).
+            reportCanonicalWrite();
         };
 
         // The factory runs once per handler, so `messages`, `entries` and
@@ -7657,6 +8520,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the projection the previous handler's flag writes produced (at most one
             // rebuild per write, and none at all in the default case).
             const messagesAtEntry = override ?? currentProjection();
+
+            // THE ANCHOR THIS HANDLER IS ENTERED WITH (T5.4). Captured for the same
+            // reason `messagesAtEntry` is: `currentEstimatedTokens()` keeps answering
+            // about THIS round's request even when a test (or a parked handler) calls
+            // it after the round closed, and a `usage` frame that landed since then
+            // would otherwise move the number underneath a frozen projection.
+            const anchorAtEntry = run.tokenAnchor;
+
+            // THE LIVE REQUEST VIEW, in one place, so `currentMessages()` and
+            // `currentEstimatedTokens()` (context T5) can never answer about two
+            // different lists: the explicit override an earlier handler set wins, then
+            // the round's frozen decision once the request is computed, then the cached
+            // re-projection of canonical state as it is RIGHT NOW.
+            const currentRequestMessages = (): readonly HarnessMessage[] =>
+                override ?? (roundClosed ? finalProjection : currentProjection());
 
             // ONE ENTRIES LIST PER HANDLER, built on first access. Most handlers never
             // read `entries` (the shipped compactor does not), and building it walks the
@@ -7679,16 +8557,33 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             });
 
             return {
-                // A branch run has no persistent conversation, but `run.threadId` is
-                // still the id of the conversation that SPAWNED it (`runAgent` builds
-                // it as `runThreadId`, resolved from the parent thread for a branch),
-                // so a branch and its root report the SAME string here; `run.actorKey`
-                // (`branch:<id>`) is only the fallback for a run with no thread at all.
-                // A plugin therefore cannot tell a branch round from a root round by
-                // `threadId` — it has to look at the transcript it is being shown.
+                // The SPAWNING conversation for a branch run: `run.threadId` is built as
+                // `runThreadId`, resolved from the parent thread, so a branch and its root
+                // report the SAME string here and a run with no thread at all falls back
+                // to its scheduling key. That meaning is unchanged (the shipped
+                // `context-compaction` plugin keys its cooldown map on it) — the round's
+                // OWN identity is the two fields below, added so a plugin no longer has to
+                // infer a branch from the transcript it happens to be shown (pipeline F7 /
+                // context F11, closed by T3.4/T8 as ONE change).
                 threadId: run.threadId ?? run.actorKey,
                 agent: brain.name,
                 iteration: run.iteration,
+                // THE BRANCH DISCRIMINATOR (pipeline T3.4 / context T8): the run's
+                // scheduling identity — the same key `serializeTurn` and the mailbox
+                // already isolate this run by. A registered agent's display name for an
+                // ordinary run, `thread:<id>` for a host thread, `branch:<id>` for a
+                // fork/autoanswer. It is ALWAYS different between a root round and a
+                // branch round of one conversation, which is what `threadId` cannot
+                // promise, and it is exposure rather than invention: `RunState.actorKey`
+                // has carried it since the branch scheduler existed.
+                actorKey: run.actorKey,
+                // Present ONLY when this run IS a branch, and then the branch's own id —
+                // the same `branch-<n>` string the state-change plane already reports
+                // (`HarnessStateChangeEvent.branchId`); `run.branch` is set by `runAgent`
+                // exactly when the run is a branch. Spread as an absent key rather than a
+                // `branchId: undefined` one, so an ordinary round's context carries no key
+                // that snapshot/JSON-shaped consumers would have to special-case.
+                ...(run.branch === undefined ? {} : { branchId: run.branch.branchId }),
                 // The PROJECTION AT HANDLER ENTRY (see `context` above): stable for the
                 // whole handler, and the value the round started from.
                 messages: messagesAtEntry,
@@ -7698,8 +8593,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // provider will actually receive. One rebuild per round at most, because
                 // this is the shared cached projection rather than a fresh projection on
                 // every read.
-                currentMessages: (): readonly HarnessMessage[] =>
-                    override ?? (roundClosed ? finalProjection : currentProjection()),
+                currentMessages: currentRequestMessages,
                 // The CANONICAL transcript (every entry, disabled ones included), in
                 // canonical order — the control surface `setIncluded` acts on. Lazy and
                 // cached per handler (the SAME array for every read of one handler's
@@ -7710,10 +8604,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                     return entriesForThisHandler;
                 },
-                // Same ~4 chars/token convention as the UI context bar
-                // (core/context-estimate.ts), plus the agent's leading instruction
-                // blocks: those occupy the provider's context window too, and a limit
-                // that ignored them would compact later than the operator expected.
+                // The same ~4 chars/token convention as the UI context bar
+                // (core/context-estimate.ts) when the provider has said nothing yet,
+                // and the provider's OWN count once this run has a `usage` frame to
+                // anchor on (T5.4). Plus the agent's leading instruction blocks: those
+                // occupy the provider's context window too, and a limit that ignored
+                // them would compact later than the operator expected.
                 //
                 // Deliberately NOT a getter: `context-compaction` compares this value
                 // against its limit and its cooldown map, and a mid-handler flag write
@@ -7722,7 +8618,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // size of the projection this handler was ENTERED with (`messagesAtEntry`
                 // — which already includes every earlier handler's writes, because the
                 // context is rebuilt for each handler).
-                estimatedTokens: estimateContextTokens(messagesAtEntry, brain.instructions),
+                estimatedTokens: estimateContextTokensHybrid(messagesAtEntry, brain.instructions, anchorAtEntry),
+                // THE LIVE VIEW OF THE SAME NUMBER (context T5). `estimatedTokens` above
+                // stays entry-time on purpose — the shipped compactor's limit and cooldown
+                // checks must not move underneath the transcript they measured — so this is
+                // how a handler sees what ITS OWN writes just saved: the same estimator
+                // (`core/context-estimate.ts`) with the SAME anchor this handler entered
+                // with, over exactly what `currentMessages()` returns, plus the same
+                // leading instruction blocks. The two numbers agree whenever nothing has
+                // been written, which is the property a minimum-savings floor needs, and
+                // after the round both are frozen to what the round decided.
+                currentEstimatedTokens: (): number =>
+                    estimateContextTokensHybrid(currentRequestMessages(), brain.instructions, anchorAtEntry),
                 signal: run.signal ?? alwaysActiveSignal,
                 api: api ?? hostPluginApi,
                 setTranscript: (messages): void => {
@@ -7732,6 +8639,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // place, re-resolves the affected UNIT, re-projects for this same
                 // request, and notifies persistence. See `HarnessTurnBeforeContext`.
                 setIncluded,
+                // Context editing (pipeline T3). Same primitive shape as `setIncluded`
+                // (resolve → validate → write in place → re-project → notify), text-only,
+                // and role-checked so no patch can reach a pairing key. See
+                // `HarnessTurnBeforeContext.edit` and `HarnessContextEditPatch`.
+                edit,
                 replaceHistory: (messages): void => {
                     if (threadState === undefined) {
                         throw new HarnessError(
@@ -7762,9 +8674,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const round = hookBus.emitMaybeSync('turn.before', context);
 
-        // One round's merged result becomes the request body. `setTranscript()` (the
-        // live `override`) and a returned `{ transcript }` keep their documented
-        // precedence: a returned value wins over an earlier `setTranscript`.
+        // One round's merged result becomes the request body AND, when a plugin asked
+        // for it, the run-level decision. `setTranscript()` (the live `override`) and a
+        // returned `{ transcript }` keep their documented precedence: a returned value
+        // wins over an earlier `setTranscript`.
         const requestOf = (merged: HarnessMergedHookResult): HarnessMessage[] => {
             const final = merged.transcript ?? override;
 
@@ -7792,12 +8705,35 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return final.map(withIncluded);
         };
 
+        // The run-level part of the round's answer (T2.2 rule 3): `pause`/`stop` are
+        // consumed by `requestTurn`; `continue` and `replace` need NO action here — a
+        // `replace` decision already became `merged.transcript` in the bus reducer
+        // (plugin/hooks.ts `contributionOf`), so reading it twice could only invent a
+        // disagreement between the two spellings of the same statement.
+        const decisionOf = (merged: HarnessMergedHookResult): HarnessTurnDecision | undefined => {
+            const decision = merged.decision;
+
+            return decision === undefined || decision.action === 'continue' || decision.action === 'replace'
+                ? undefined
+                : decision;
+        };
+
+        // The ONE place the round's two channels become one value, so the sync and async
+        // branches cannot drift (the `decision` key is added only when it exists).
+        const outcomeOf = (merged: HarnessMergedHookResult): TurnBeforeOutcome => {
+            const decision = decisionOf(merged);
+
+            return decision === undefined
+                ? { transcript: requestOf(merged) }
+                : { transcript: requestOf(merged), decision };
+        };
+
         // SYNC means "no handler yielded": the override is applied here, on the caller's
         // tick, exactly as it was before plugins existed. Only a handler that returned a
         // promise (a real compaction pass) costs a boundary — which is the point of that
         // turn.
         if (round.sync) {
-            const value = requestOf(round.value);
+            const value = outcomeOf(round.value);
 
             closeRoundObservations();
 
@@ -7811,13 +8747,88 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return {
             sync: false,
             promise: round.promise
-                .then(requestOf)
+                .then(outcomeOf)
                 .then((value) => {
                     closeRoundObservations();
 
                     return value;
                 })
+                // T4.4 — the flush must not depend on the bus staying fail-open. If the
+                // chain rejects (a handler the bus could not swallow, or a `requestOf`
+                // refusal), the writes that DID land still need their one durability report:
+                // flush, then re-raise unchanged so the run sees the same failure it saw
+                // before. Dropping the report here is how a coalescer would lose a write.
+                .catch((error: unknown) => {
+                    closeRoundObservations();
+
+                    throw error;
+                })
         };
+    };
+
+    // T2.3 — act on the round's run-level decision, at the turn boundary and nowhere
+    // else. Only ever called when a plugin actually returned one, so a turn with no
+    // decision pays nothing at all (T2.4).
+    //
+    // `pause` — parks the CONVERSATION through the same `pauseThreadState` the
+    // `context.pause()` control uses, and the turn STILL goes out. The park is a roster
+    // signal (the host and every other plugin observe `thread.paused`), not a break in
+    // control flow, and `resume()` already returns the record to 'running' — a run
+    // parked by a decision keeps running until something resumes or stops it, exactly
+    // like a run parked by the explicit control.
+    //
+    // `stop` — ends the RUN without pretending an answer exists (open decision 2,
+    // resolved 2026-11-09: reuse the abort path rather than invent a `plugin-stopped`
+    // status, so the UI and `threadRead` keep one vocabulary for "this run did not
+    // answer"):
+    //   - a conversation run goes through `stopThreadState`, the ONE path every stop
+    //     already takes (stopThread, stopAllThreads, the owner-linked cascade), so the
+    //     record says 'stopped', queued guidance is discarded, task claims are released,
+    //     and `thread.stopped` fires exactly once for the transition;
+    //   - the abort REASON is the plugin's `reason`, which is what the caller's
+    //     rejection and `agentResult` report — a stop that loses "why" is undebuggable;
+    //   - `throwIfAborted` then throws, so the run unwinds through `runAgentCore`'s
+    //     catch: the transcript is truncated back to where the run started (the same
+    //     rollback the `maxIterations` guard uses, so an orphan assistant message is
+    //     impossible), the invocation records as `cancelled`, `run.failed` fires and
+    //     `run.finished` does not, and the caller sees the plugin's error.
+    // A branch run (fork/autoanswer) owns an ephemeral transcript and must NOT abort
+    // its parent's signal, so it takes the marker path and throws the reason directly.
+    const applyTurnDecision = (run: RunState, decision: HarnessTurnDecision): void => {
+        if (decision.action === 'pause') {
+            // A branch has no persistent conversation to park (nothing can address it),
+            // so the decision is a no-op there — the same answer `context.pause()` gives.
+            if (run.threadState !== undefined) pauseThreadState(run.threadState);
+            return;
+        }
+
+        if (decision.action !== 'stop') return;
+
+        const reason = new HarnessError(
+            decision.reason ?? `A plugin stopped this run at turn ${String(run.iteration)}.`
+        );
+
+        // Set BEFORE the abort fires: `runAgentCore`'s catch recomputes `run.aborted`
+        // from the run signal, and a branch run has no signal of its own to abort, so
+        // without this marker its record would come back `failed` rather than
+        // `cancelled`.
+        run.pluginStopped = true;
+
+        const state = run.threadState;
+
+        if (state !== undefined && state.controller !== undefined) {
+            stopThreadState(state, reason);
+        } else {
+            run.aborted = true;
+        }
+
+        // The canonical boundary check: with the controller aborted this throws the
+        // plugin's own reason, which is the historical cancellation contract. The
+        // explicit throw below is the branch path (and a defensive belt for a run whose
+        // controller had already been released), never a second kind of failure.
+        throwIfAborted(run);
+
+        throw reason;
     };
 
     // One model turn, made abort-PREEMPTIVE (T15). The transport may ignore its
@@ -7865,7 +8876,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // yields. Awaiting unconditionally moved an observer-visible event frame in
             // src/server/queue.test.ts.
             const before = emitTurnBefore(run, projection);
-            const requestTranscript = before.sync ? before.value : await before.promise;
+            const { transcript: requestTranscript, decision } = before.sync ? before.value : await before.promise;
+
+            // T5.4 — remember the character weight of EXACTLY what this request sends
+            // (post-override: a plugin's `setTranscript`/`replace` is part of it),
+            // measured BEFORE the response is appended. When this request's `usage`
+            // frame arrives, the pair becomes the anchor the next turn extrapolates
+            // from. One pass over the transcript per turn, no allocation.
+            run.pendingRequestChars = transcriptChars(requestTranscript, brain.instructions);
+
+            // T5.2 — a new turn starts a new aggregate window: everything committed
+            // between this request and the next one is what the model will newly
+            // receive, and that total is what the per-turn cap bounds.
+            run.turnResultBudget.reset();
+
+            // T2 — the run-level decision, consumed on the SAME tick the request was
+            // decided and BEFORE a single provider byte is sent. `stop` throws here, so
+            // nothing below it runs; `pause` falls through and this turn still goes out.
+            // The guard is the whole cost a decision-free turn pays: one `undefined`
+            // read, no await, no allocation (T2.4).
+            if (decision !== undefined) applyTurnDecision(run, decision);
 
             const iterator = brain
                 .turn({
@@ -8221,7 +9251,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     });
                 };
 
+                // T5.4 — the anchor. `pendingRequestChars` was measured from the exact
+                // transcript this request SENT (see `requestTurn`), so pairing it with
+                // the count the provider reports for THAT request gives the next turn
+                // a real number for everything the chars/4 heuristic cannot see (tool
+                // schemas, message framing, the tokenizer's actual rate). A provider
+                // that reports nothing — or a number outside the sanity band — keeps
+                // the previous anchor rather than inventing one, and the `usage` event
+                // itself is untouched: this is a read, never a rewrite.
                 if (message.usage !== undefined) {
+                    const anchor = anchorFromUsage(message.usage, run.pendingRequestChars ?? 0);
+
+                    if (anchor !== undefined) run.tokenAnchor = anchor;
+
                     await emit(run, { type: 'usage', agent: brain.name, usage: message.usage });
                 }
 
@@ -8339,7 +9381,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Mark the run dead BEFORE any await: a completion racing this catch
             // must not insert into the transcript that is about to be truncated.
             run.active = false;
-            run.aborted = run.signal?.aborted === true;
+            // A plugin `stop` (T2.3) is a cancellation even for a branch run, which has
+            // no signal of its own — without the marker its invocation would record as
+            // `failed` while the caller was told "stopped", and the rollback below is
+            // the same either way.
+            run.aborted = run.pluginStopped || run.signal?.aborted === true;
             scheduler.abandonScope(run.scope);
 
             // T28 FORENSICS, captured BEFORE the rollback below. The splice is what
@@ -8716,8 +9762,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 active: true,
                 aborted: false,
                 abortErrorSet: false,
+                // T2.3: a run starts un-stopped; only a `stop` decision sets it.
+                pluginStopped: false,
                 iteration: 0,
                 dirty: false,
+                // T5.2 — this run's per-turn tool-result tally, on the shared
+                // aggregate cap. Created per run so two concurrent threads never
+                // spend one another's budget.
+                turnResultBudget: createToolResultTurnBudget(),
                 waiters: [],
                 // T2/R3: empty at launch; the batch gate fills it as sync calls are
                 // scheduled and drains it as their outcomes are delivered.
@@ -8915,6 +9967,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 }
 
                 unlinkThreadAbort?.();
+
+                // T1.6 guarantee 2: a `dispose()` that arrived while this run was live
+                // fires HERE — the LAST settled boundary of the last run, after this
+                // run's `run.finished`/`run.failed` and after the thread's terminal
+                // hook, and only when no run is left. Any earlier (for example right at
+                // `activeRuns--`) would put the teardown event in front of a
+                // `thread.idle` for the same conversation, and event order is observable
+                // (F8). The `finally` also means a run that threw still drains it, so a
+                // deferred dispose can never be stranded.
+                if (disposePending && activeRuns === 0) emitDispose();
             }
         } finally {
             releaseAgent();
@@ -9052,12 +10114,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // fixture) keeps its exact prior shape.
             ...(agentResults.length === 0 ? {} : { agentResults }),
             ...threadFields,
-            records: {
-                todos: taskStore.snapshot(),
-                profiles: profile.snapshot(),
-                chapters: chapter.snapshot(),
-                locations: location.snapshot()
-            }
+            // ONE collection map (T3): each entry carries its own definition, entries,
+            // store revision and change window, and the whole store carries one id counter.
+            records: recordEngine.snapshot()
         };
     };
 
@@ -9374,29 +10433,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // point (possibly all deleted); those tools were prepared and published
         // above without compiling after mutation.
 
-        taskStore.restore(next.records.todos);
-        profile.restore(next.records.profiles);
-        chapter.restore(next.records.chapters);
-        location.restore(next.records.locations);
+        recordEngine.restore(next.records);
 
-        // T1 (Phase 2) ownership: a snapshot can persist a claim whose owning
-        // conversation is NOT part of it — the thread was deleted after the claim
-        // was taken, or the file was edited by hand. Nothing in the resumed session
-        // can ever release or renew such a claim (its thread id is unaddressable),
-        // so the records it holds would stay blocked for the remainder of the lease.
-        // `releaseThread` matches `ownerThreadId` exactly, which leaves an
-        // unthreaded claim (owner set, no thread — the `executeTool`/command door)
-        // alone. This runs AFTER the store restore and BEFORE the notification, so
-        // the snapshot the host persists next already matches memory.
-        const claimedThreads = new Set<string>();
-
-        for (const item of taskStore.snapshot().items) {
-            if (item.ownerThreadId !== undefined) claimedThreads.add(item.ownerThreadId);
-        }
-
-        for (const threadId of claimedThreads) {
-            if (!threadStates.has(threadId)) taskStore.releaseThread(threadId);
-        }
+        // Decision P (round 7) deleted the sweep this block used to run. A restored
+        // snapshot could carry a claim whose owning conversation was gone — the thread
+        // was deleted after the claim, or the file was edited by hand — and nothing in
+        // the resumed session could lift it, so those records stayed blocked for the
+        // remainder of a lease that could run to 24 hours. There is no lease and no
+        // owner field any more, so every record in every collection is writable by every
+        // thread the moment the store is restored. What Decision L still requires here is
+        // that the ATTRIBUTION survives the round trip untouched — `updatedBy`,
+        // `updatedThreadId` and `updatedAt` are restored as written, name a departed
+        // agent when they were written by one, and are never re-validated against the
+        // roster.
 
         notifyStateChange('restore');
     };
@@ -10049,12 +11098,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (defaultThread !== undefined) {
             threadStates.delete(defaultThreadIdOf(key));
 
-            // T1 (Phase 2) ownership: `agent:<name>` is the only conversation this
-            // agent can still hold a task claim on (a host thread of the same agent
-            // is refused above), and `assertRosterIdle` only proves no RUN is live —
-            // a claim from a finished turn outlives it. Nothing else can lift that
-            // claim once the record is gone, so release it with the transcript.
-            taskStore.releaseThread(defaultThreadIdOf(key));
+            // Decision P (round 7): the claim release that used to sit here is gone —
+            // a removed agent strands no record, because a record holds no lock.
+            // Decision L still binds on the OTHER half: every record that agent wrote
+            // keeps its `updatedBy` forever, and a later stale rejection still names
+            // the departed agent as the last editor.
         }
 
         // Keep the model-facing allowlist in step with the real one.
@@ -10214,6 +11262,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T5 lane-worker seams: targeted canonical writes the coordinator applies for a
         // conversation that ran on a lane (no wholesale restore per commit).
         appendThreadMessages,
+        // T4.1: the in-place companion of the append above (a committed prefix rewrite).
+        patchThreadMessages,
         setThreadStatus,
         archiveInvocation,
         reserveIdentity,
@@ -10233,6 +11283,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // and recompiles created-tool sources without executing them.
         snapshot,
         restore,
+        // T1.6: the teardown point. Emits `harness.dispose` once and clears the hook
+        // bus; see the `Harness` contract for the exactly-once / after-the-last-run
+        // guarantees and for why this is NOT an abort.
+        dispose,
         // reset() is "start over": EVERY agent's conversation goes back to its
         // seeded instructions (R12 — a subagent used to keep its transcript, which
         // leaked one session into the next), tool discovery is forgotten, the
@@ -10263,10 +11317,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             for (const brain of Object.values(agents)) brain.reset();
             activeTools.clear();
             discoveryOffsets.clear();
-            taskStore.reset();
-            profile.reset();
-            chapter.reset();
-            location.reset();
+            recordEngine.reset();
             invocationRecords.clear();
             // R2: host conversations belong to the session's conversation state,
             // so they are removed with it. The id high-water mark is NOT restored
@@ -10373,15 +11424,20 @@ export type { ToolMediaExtraction, ToolResultExtraction } from './core';
 // state types are part of `export type * from './types'` below.
 export { HARNESS_SNAPSHOT_VERSION } from './core';
 // R10/R11/R12 shared helpers. `boundToolResult` + MODEL_TOOL_RESULT_BUDGET_BYTES
-// are the model-facing 64 KiB cap, exported so a server can apply the SAME cap
+// are the model-facing per-result cap, exported so a server can apply the SAME cap
 // when it serializes a manual `executeTool` result, and so a tool author can
-// quote the number. `resolveToolParameters` is the canonical unwrap/validate
+// quote the number; `createToolResultTurnBudget` +
+// MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES are its per-turn aggregate sibling
+// (compaction T5.2), exported so a host that batches results itself can apply the
+// same rule. `resolveToolParameters` is the canonical unwrap/validate
 // helper (the manual path and the model path both use it); the schema helpers
 // let a host validate arguments before a run. DEFAULT_CREATED_TOOLS_LIMIT is the
 // lifetime toolCreate budget.
 export {
     MODEL_TOOL_RESULT_BUDGET_BYTES,
+    MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES,
     boundToolResult,
+    createToolResultTurnBudget,
     utf8ByteLength,
     resolveToolParameters,
     validateSchemaValue,
@@ -10391,12 +11447,19 @@ export {
     MAX_CREATED_SCHEMA_BYTES,
     DEFAULT_CREATED_TOOLS_LIMIT
 } from './core';
-export type { BoundedToolResult, SchemaCheck, ToolArgumentMode } from './core';
+export type {
+    BoundedToolResult,
+    SchemaCheck,
+    ToolArgumentMode,
+    ToolResultBoundOptions,
+    ToolResultSource,
+    ToolResultTurnBudget
+} from './core';
 // The session record factories are public too, so a host can build the same
 // stores the harness registers (e.g. for a server-side tool or a test). They
 // mirror the core/index.ts exports; task's factory stays internal to keep
 // this change scoped.
-export { createProfileTool, createChapterTool, createLocationTool } from './core';
+export { createRecordEngine } from './core';
 // R4 cross-thread chat descriptor. The tool is registered CONDITIONALLY (once a
 // session owns an independent thread), so a server catalogue can quote the same
 // name/description/schema the runtime uses without advertising it up front.

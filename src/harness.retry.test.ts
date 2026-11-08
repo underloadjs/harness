@@ -16,6 +16,32 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const done = (): HarnessStreamEvent => ({ type: 'done', stopReason: 'stop', toolCalls: [] });
 
 const answer = (text: string): HarnessStreamEvent[] => [{ type: 'text', delta: text }, done()];
@@ -170,7 +196,7 @@ describe('harness model-request retries', () => {
         ).toEqual(['probe-result']);
 
         // History holds one user turn, one tool-call turn, its result, and the answer.
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'probe', arguments: '{}' }] },
             { role: 'tool', content: 'probe-result', toolCallId: 'c1', name: 'probe' },
@@ -220,7 +246,7 @@ describe('harness model-request retries', () => {
 
         expect(message.content).toBe('safe answer');
         expect(executed).toEqual([]);
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'safe answer' }
         ]);
@@ -376,7 +402,7 @@ describe('harness model-request retries', () => {
 
         // History: the committed tool round survived, and the failed attempt's prose
         // was never committed.
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'probe', arguments: '{}' }] },
             { role: 'tool', content: 'probe-result', toolCallId: 'c1', name: 'probe' },
@@ -546,7 +572,7 @@ describe('harness model-request retries', () => {
 
         // The transcript really did keep that response: the boundary describes a
         // committed answer, not a discarded one.
-        expect(writer.agent.messages).toEqual([
+        expect(withoutIds(writer.agent.messages)).toEqual([
             { role: 'user', content: 'go' },
             {
                 role: 'assistant',

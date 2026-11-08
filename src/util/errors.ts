@@ -3,11 +3,35 @@
 // One class is enough while the surface is small: callers either catch it for
 // the message or let it fail the process. `cause` is preserved so a transport
 // failure keeps its original fetch/parse error for debugging.
+//
+// MACHINE CODES (records-engine Decision O / F17). A rejection that a caller must
+// *act* on carries a stable code. `code` is the machine name and `name` is set to
+// the same value, following the `nested-runs.ts` precedent (`error.name =
+// NESTED_RUN_LIMITATION_CODE`): "so the model, the HTTP surface, the worker report
+// and the operator all quote ONE identifiable name", and "a host that catches it
+// can classify without parsing prose". Prose is the human half; a wrapper switches
+// on the code and re-words the message (it never swallows the rejection). The code
+// is ALSO the first token of the message, because `harness.ts` renders a thrown
+// error as `Tool "<name>" failed: <message>` and only the message reaches the
+// model, an event consumer or a worker report.
 
 export class HarnessError extends Error {
-    constructor(message: string, options?: { cause?: unknown }) {
+    // Stable machine name of the rejection class (e.g. `stale-record`). Absent for
+    // the plain "this call is malformed" errors that have always existed.
+    readonly code?: string;
+    // Structured payload for the caller that has to recover (e.g. R9's current
+    // entry on a stale write). Optional, and never a substitute for the message.
+    readonly details?: unknown;
+
+    constructor(
+        message: string,
+        options?: { cause?: unknown; code?: string; details?: unknown }
+    ) {
         super(message);
-        this.name = 'HarnessError';
+        this.name = options?.code ?? 'HarnessError';
+
+        if (options?.code !== undefined) this.code = options.code;
+        if (options?.details !== undefined) this.details = options.details;
 
         // `ErrorOptions` needs lib es2022.error, which this package does not
         // pull in. Assign the cause directly instead of widening the lib just
@@ -17,6 +41,24 @@ export class HarnessError extends Error {
         }
     }
 }
+
+// Total classifier for a coded rejection (records-engine Decision O): a wrapper
+// must be able to switch on the code of an engine error it caught WITHOUT becoming
+// a new crash path, and a thrown value may be hostile (see `isInstanceOf` above).
+// Returns `undefined` when the thrown value carries no code, so the caller falls
+// back to the message exactly as before.
+export const errorCodeOf = (error: unknown): string | undefined => {
+    try {
+        if (!isInstanceOf(error, HarnessError)) return undefined;
+
+        const code = error.code;
+
+        return typeof code === 'string' && code.length > 0 ? code : undefined;
+    } catch {
+        // Reporting an error must never throw another one.
+        return undefined;
+    }
+};
 
 // The one fallback message. Kept stable because it is a wire value on an error
 // event, not an internal diagnostic.
@@ -55,10 +97,17 @@ const messageOf = (error: Error): string => {
 // The old implementation answered "Unknown harness error" for every non-Error,
 // which hid the failure from the model. This formatter is deliberately total:
 // every branch is guarded, so a catch handler that calls it cannot itself throw.
-export const toErrorInfo = (error: unknown): { message: string } => {
+export const toErrorInfo = (error: unknown): { message: string; code?: string } => {
+    // Decision O: the code travels beside the message so an RPC/CLI consumer can
+    // branch without parsing prose. Read through `errorCodeOf` (total), and only
+    // added when present, so every pre-existing `{ message }` payload is unchanged.
+    const code = errorCodeOf(error);
+    const withCode = (message: string): { message: string; code?: string } =>
+        code === undefined ? { message } : { message, code };
+
     try {
         if (error instanceof Error) {
-            return { message: messageOf(error) };
+            return withCode(messageOf(error));
         }
 
         if (typeof error === 'string') {

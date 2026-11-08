@@ -31,6 +31,32 @@ import type {
     ToolMediaEnvelope
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
 
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
@@ -149,7 +175,7 @@ describe('harness tool media', () => {
 
         const [committed] = toolMessages(brain.messages);
 
-        expect(committed).toEqual({
+        expect(withoutIds(committed)).toEqual({
             role: 'tool',
             content: JSON.stringify(PNG_SUMMARY),
             toolCallId: 'c1',
@@ -238,8 +264,16 @@ describe('harness tool media', () => {
 
         // The medialess call keeps its exact historical 4-key message.
         const [zipMessage, plainMessage] = toolMessages(brain.messages);
-        expect(plainMessage).toEqual({ role: 'tool', content: '{"echo":"ok"}', toolCallId: 'c2', name: 'plain' });
-        expect(Object.keys(plainMessage)).toEqual(['role', 'content', 'toolCallId', 'name']);
+        expect(withoutIds(plainMessage)).toEqual({ role: 'tool', content: '{"echo":"ok"}', toolCallId: 'c2', name: 'plain' });
+        // The key set is closed per role (context T1.3): a medialess result is exactly
+        // its four historical keys plus the minted `messageId`, and no attachment key.
+        expect(Object.keys(plainMessage)).toEqual([
+            'role',
+            'content',
+            'toolCallId',
+            'name',
+            'messageId'
+        ]);
         expect(zipMessage.attachments).toEqual([zipMedia()]);
     });
 
@@ -530,7 +564,14 @@ describe('harness tool media', () => {
 
         const plainMessage = toolMessages(plainWriter.snapshot().agents.writer.messages)[0];
 
-        expect(Object.keys(plainMessage)).toEqual(['role', 'content', 'toolCallId', 'name']);
+        // The snapshot form carries the same closed set, id included (core/snapshot.ts).
+        expect(Object.keys(plainMessage)).toEqual([
+            'role',
+            'content',
+            'toolCallId',
+            'name',
+            'messageId'
+        ]);
         expect(JSON.stringify(plainMessage)).not.toContain('attachments');
     });
 

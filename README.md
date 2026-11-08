@@ -56,10 +56,10 @@ same way (R18): `read`, `write`, `edit`, `glob`, and `grep` are core, while
 `files`, `shell`, `gitDiff`, `syntax`, and the always-registered
 `download` are discovered through the
 core `toolRequest` tool — see [Tool discovery](#tool-discovery). The harness-owned
-`toolRequest` and `task` (plus `delegate` when
+`toolRequest` and `tasks` (plus `delegate` when
 subagents exist) are also declared up front and are the only session-bound core
 tools. Every other harness-owned row — `toolRegistry`, `toolList`, `toolManage`,
-`toolCreate`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, and
+`toolCreate`, `records`, `profiles`, `chapters`, `locations`, `agentManage`, and
 `agentResult` — stays registered so `toolRequest` can enable it, but is searchable,
 not declared (R9-R11). Two conditional harness-owned
 tools are registered the same way: `actionRequest` when `interaction` is configured, and `threadFork`
@@ -147,9 +147,11 @@ writer.threads();                                            // default + host r
   QUEUED on that thread (they reject with "was stopped while this turn was
   queued" instead of running and flipping the status back to running). Agents
   cannot run or post into a stopped thread; only a new host `sendThreadInput`
-  revives it, or the host deletes it. A stop also releases every `task` claim that
-  conversation held, so a dead thread cannot keep a shared record reserved until its
-  lease happens to expire.
+  revives it, or the host deletes it. **Corrected in place (records-engine Decision P,
+  2026-11-09):** a stop used to release every `task` CLAIM the conversation held, so a dead
+  thread could not keep a shared record reserved until its lease expired. There are no
+  claims, so a stop strands nothing — the only conflict control is the `expects` revision
+  token a write carries.
 - **Delete** — `deleteThread(id)` removes a terminal HOST thread: its record,
   transcript, owned terminal children, its invocation results, and every branch
   (`threadFork`/autoanswer, including nested ones) materialized from that
@@ -158,8 +160,8 @@ writer.threads();                                            // default + host r
   what other histories were already told, and it does not undo what this thread
   copied into session-shared memory (tasks, profiles, chapters, locations) or what
   a connected thread already received through a `#` reference. The one shared write it
-  DOES make is releasing that conversation's `task` claims — nothing else can once the
-  record is gone.
+  makes any shared write is **nothing** at all (Decision P deleted the claims this used to
+  release: `releaseThread` and its four call sites are gone).
 
 Threads may only be OWNED by an independent host thread: `ownerThreadId` must
 name a `createThread` record, never an implicit `agent:<name>` conversation
@@ -174,9 +176,14 @@ threads satisfy this automatically.
   the calling run's own conversation), and `threadSend` posts into one of them. Ids
   are therefore observed, never invented by a model or injected by the server;
   deleted threads are absent, and only this session is visible. The runtime records
-  the REAL sender (agent + thread from the calling run, not a tool argument). An
-  idle target receives the message immediately; a running target receives it at its
-  next boundary.
+  the REAL sender (agent + thread from the calling run, not a tool argument). The
+  post is STATE-AWARE and the receipt names the outcome: a RUNNING target is
+  steered (`delivered: 'queued'` — the message lands at its next safe boundary, in
+  the turn already in flight), a DORMANT target — `idle`, or `paused` by a plugin
+  and resumed here — is started (`delivered: 'started'`, the message is its prompt),
+  and a STOPPED one is refused. Neither path waits for the answer.
+  CORRECTED IN PLACE: an idle target used to get an inert append
+  (`delivered: 'appended'`) that no run was obliged to read.
 
 Threads persist through snapshot v1 as an optional `threads`/`threadSequence`
 pair (absent while only default conversations exist). See `src/harness.ts` and
@@ -243,6 +250,10 @@ src/frontend/
                         action-request (owner question card)
   styles.css            the app stylesheet
   index.html            the app entry document
+
+docs/                   the package documents (index: docs/README.md): the plugin
+                        authoring guide (plugins.md), the runtime-tools
+                        integration doc, and the issue + task logs
 ```
 
 The transcript is one compact row per user turn. A delegated agent adds an ENTRY
@@ -519,9 +530,9 @@ true`), so its tools are available with no imports at all. The five core file to
 (`read`, `write`, `edit`, `glob`, `grep`)
 plus a configured `search` (and `fetch` when the harness opted into `webfetch`) are
 declared from the first request, together with the harness-owned `toolRequest` and
-`task` (and `delegate` when subagents exist). Every other harness-owned row —
-`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profileManage`,
-`chapterManage`, `locationManage`, `agentManage`, and `agentResult` — plus the
+`tasks` (and `delegate` when subagents exist). Every other harness-owned row —
+`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `records`, `profiles`,
+`chapters`, `locations`, `agentManage`, and `agentResult` — plus the
 conditional `actionRequest` (`interaction` configured) and `threadFork`
 (`forks.enabled`, the default) stays registered but searchable: the model enables
 them with `toolRequest`, and a manual server call still runs them directly.
@@ -566,15 +577,15 @@ claiming nothing matched. These entries are never enabled, never count against
 |---|---|
 | Query shape | `names` (exact, case-sensitive), `regex` (bare source or `/source/flags`), and `tags` are OR-ed into one union; each match appears once. An empty query enables nothing and returns the vocabulary. |
 | Tags | Trimmed, lowercased, deduplicated. Not required when `names` or `regex` is supplied. |
-| Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`task`, a configured `search`/`fetch`, and `delegate` on a primary with subagents. Everything else is demand-discovered: `files`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
+| Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`tasks`, a configured `search`/`fetch`, and `delegate` on a primary with subagents. Everything else is demand-discovered: `files`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools, `download`, `search`, and `fetch` run directly. |
 | Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
 | Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are always declared and never count. |
-| Already available | Core tools the caller already has (`delegate` with subagents, `task`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. |
+| Already available | Core tools the caller already has (`delegate` with subagents, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding (docs/tasks/2026-11-08-delegate-stress-test.md, finding 1). |
 | No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full searchable `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
-| Reserved names | `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `task`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, and `agentResult` belong to the harness, and `delegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
+| Reserved names | `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, and `agentResult` belong to the harness, and `delegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
 | Manual call | an operator may run any registered tool through `harness.executeTool()` / `POST /tools/:name`; discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
 
 `selectTools(tools, query, options?)` is the uncapped selector without a harness;
@@ -638,15 +649,18 @@ Disk-backed create/update does not enter `createdToolRecords` or spend
 `maxCreatedTools` because a restart re-scans the folder. Runtime-only revisions
 survive snapshot/restore but are not persisted to disk by the harness.
 
-### Session tasks (`task`)
+### Session tasks (`tasks`)
 
-Every harness registers the `task` tool and declares it on the first request, so
+Every harness registers the `tasks` tool and declares it on the first request, so
 the model can keep a plan without a discovery round. The tool used to be named
 `todoManage`; R9-R11 renamed it and replaced the action enum with a single
 **patch** shape. It stays **session-scoped** and incremental (ids are stable, and
 a call only carries what it changes). ONE list is shared by every agent and every
-thread of the harness, so it also carries **revisions, claims and a change feed**
-(see [Concurrency and ownership](#concurrency-and-ownership) below):
+thread of the harness, so it also carries **revisions and a change feed** — and, since
+records-engine Decision P, **no claims and no lease** (see
+[Concurrency and ownership](#concurrency-and-ownership) below). `tasks` is one collection of
+ONE session store: `records` is the low-level surface over that same store, and ids come from
+a single counter, so the first profile of a session that already holds one task is `"2"`:
 
 | Call | Effect |
 |---|---|
@@ -816,12 +830,12 @@ call, has no ids, and its list is derived by the UI from the last call. Sources:
 [`plugin/todo.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/todo.ts),
 [`todowrite.txt`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/todowrite.txt),
 [`tool-todo.test.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/test/tool-todo.test.ts).
-`task` deliberately uses a partial patch with stable ids instead: it never rewrites
+`tasks` deliberately uses a partial patch with stable ids instead: it never rewrites
 the list, it does not copy that API, and it does not claim compatibility.
 
-### Session records (`profileManage`, `chapterManage`, `locationManage`)
+### Session records (`profiles`, `chapters`, `locations`)
 
-Three more harness-owned stores follow `task`'s lifecycle exactly - registered,
+Three more harness-owned stores follow `tasks`' lifecycle exactly - registered,
 searchable, and opened by `toolRequest` (R9-R11) - one store per
 harness (therefore per server session), shared by the primary and its subagents,
 stable decimal-string ids from `"1"`, and cleared by `reset()` (ids restart at
@@ -845,9 +859,9 @@ readable errors naming the tool and field.
 
 | Tool | Required on `add` | Optional | `counts` |
 |---|---|---|---|
-| `profileManage` | `name`, `description` | `traits` (string[]; trimmed, deduplicated), `notes` | `{ total }` |
-| `chapterManage` | `title`, `summary` | `content` (default `""`), `status` (`planned`/`draft`/`complete`, default `planned`), `order` (integer) | `{ total, planned, draft, complete }` |
-| `locationManage` | `name`, `description` | `notes` | `{ total }` |
+| `profiles` | `name`, `description` | `traits` (string[]; trimmed, deduplicated), `notes` | `{ total }` |
+| `chapters` | `title`, `summary` | `content` (default `""`), `status` (`planned`/`draft`/`complete`, default `planned`), `order` (integer) | `{ total, planned, draft, complete }` |
+| `locations` | `name`, `description` | `notes` | `{ total }` |
 
 Chapter-specific rules: `list` and every mutation result carry **summaries**
 without the body — only `get` returns `content`; `update` rejects a blank
@@ -855,7 +869,7 @@ without the body — only `get` returns `content`; `update` rejects a blank
 list (ordered chapters ascending first, unordered ones after in insertion order)
 and the live store is never re-sorted. There is no move action: update `order`.
 Profiles and locations return whole records, so an empty `notes` is a normal
-stored value, and `traits: []` clears a profile's traits. Like `task`,
+stored value, and `traits: []` clears a profile's traits. Like `tasks`,
 nothing is persisted and no HTTP/UI surface reads these stores: the tool result
 is the record.
 
@@ -907,8 +921,8 @@ A tool is named for **what it does best**. Where ONE action is the capability, t
 name is that action - `read`, `write`, `edit`, `glob`, `grep`, `shell`, `search`,
 `fetch`, `download` - because those are the words a model already types. Where a tool
 owns a DOMAIN of related operations, the name is the domain: `files` manages files and
-folders (list, move, copy, delete, mkdir), exactly as `task` is the task list and
-`profileManage` the profile store. `<namespace><action>` is a useful convention for
+folders (list, move, copy, delete, mkdir), exactly as `tasks` is the task list and
+`profiles` the profile store. `<namespace><action>` is a useful convention for
 grouping a large catalogue, not a requirement: forcing it here would name the
 capability after its weakest operation (`fileMove`) and split one coherent bundle
 across several rows the model then sequences by hand - the harness launches a
@@ -920,7 +934,7 @@ share one.
 |---|---|---|
 | `requestTools` | `toolRequest` | core; always declared |
 | `createTool` (tool) | `toolCreate` | core; the host method is `harness.createTool()` |
-| `createTaskTool` | `task` | core; always declared (R9-R11: renamed from `todoManage`, and its action enum became one patch command) |
+| `createTaskTool` | `tasks` (one collection of the one store) | core; always declared (R9-R11 renamed the tool from `todoManage` and made its action enum ONE patch command; records-engine Decision J renamed `task` → `tasks`, and T3 deleted the factory — `core/task.ts` is now the collection SPEC and `core/records.ts` is the store) |
 | `delegate` | `delegate` | core; primary only, when subagents exist |
 | `readFile` | `read` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }` |
 | `writeFile` / `fileWrite` | `write` | **batched**: `({ path, content }[])` → `{ path, bytes }[]` |
@@ -938,7 +952,7 @@ share one.
 | `summarize` | `textSummarize` | app tool |
 | `flaky` (tool) | `testFlaky` | the `flaky` **harness/preset id** is unchanged |
 
-`profileManage`, `chapterManage`, and `locationManage` were added under their final
+`profiles`, `chapters`, and `locations` were added under their final
 names, so they have no removed-name row. All three are core session tools with the
 same incremental action set — see
 [Session records](#session-records-profilemanage-chaptermanage-locationmanage).
@@ -1507,7 +1521,7 @@ const writer = harness({
 | `webfetch` | `true` or `{ env?, exa?, linkup? }`. Registers the `fetch` tool even with no key at all, because the default provider is the keyless native GET; `EXA_API_KEY` / `LINKUP_API_KEY` only add the per-call hosted crawlers. Absent or `false` means no tool. A configured `tools.fetch` wins. |
 | `report.progress` | Awaited for every step — a UI or `console.log`. |
 | `commands` | Slash commands this harness can run: `{ name, description, usage?, execute }`. Registered **after** the built-ins (`/help`, `/tools`, `/task`, `/websearch`, `/webfetch`), so a name that collides with one — or repeats inside the list — fails construction. See [Slash commands](#slash-commands). |
-| `plugins` | Optional programmatic extension (`createAgent`, `addTool`, `addCommand`). The plugin phase runs after the built-ins and `commands`, so a plugin **replaces** a name rather than colliding with it — the same override semantics `addTool` has. |
+| `plugins` | Optional programmatic extension (`createAgent`, `addTool`, `addCommand`, and lifecycle subscriptions through `api.on` — including a `turn.before` handler that can rewrite the request or return a `HarnessTurnDecision` for the run). The plugin phase runs after the built-ins and `commands`, so a plugin **replaces** a name rather than colliding with it — the same override semantics `addTool` has. Authoring rules, precedence, and the decision semantics: [`docs/plugins.md`](./docs/plugins.md). |
 
 The registry key is the identity: `writer: agent({...})` names the agent
 `writer` and `search: tool({...})` is the name the model calls. You never
@@ -1520,7 +1534,7 @@ repeat the name inside the definition.
 | `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
 | `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
-| `writer.tools` | Every registered tool, keyed by wire name: the preset/app catalogue plus the harness-owned set (`toolRequest`, `toolList`, `toolManage`, `toolCreate`, `task`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `delegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured). Registration is not declaration: `tool.visibility` and `toolRequest` say which half a name is in. |
+| `writer.tools` | Every registered tool, keyed by wire name: the preset/app catalogue plus the harness-owned set (`toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured). Registration is not declaration: `tool.visibility` and `toolRequest` say which half a name is in. |
 | `writer.discoveredTools` | Names `toolRequest` has enabled, in discovery order. Read-only copy; `reset()` empties it. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
 | `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `delegate`); an unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |
@@ -1529,7 +1543,7 @@ repeat the name inside the definition.
 | `writer.registerCommand(command)` | Register or **replace** one command at runtime, with `registerTool`'s replace semantics. Validates the name and the definition and throws `HarnessError` without touching the registry when either is invalid. |
 | `writer.branches()` | Detached copies of retained branch audit records (`HarnessBranchRecord[]`), newest terminal records within `maxBranchRecords`; active records are never evicted. Ephemeral: not part of the snapshot. |
 | `writer.branch(id)` | One detached branch record by id, or `undefined`. |
-| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `task`, `profileManage`, `chapterManage`, `locationManage`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
+| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `tasks`, `profiles`, `chapters`, `locations`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
 | `writer.nestedRuns()` / `writer.nestedRuns('refuse')` | Read, or arm once, this instance's **nested-run policy** (`'allow'` by default; armed on EVERY lane worker replica at hello, whatever preset that lane rebuilt). Under `'refuse'` every door that could start a CHILD conversation throws the named `nested-run-unsupported` limitation before the child, its transcript or its provider request exists: a tool's `context.run(...)`, a `harness(...)` call made from inside a tool body, `harness.sendThreadInput(...)`, a sibling brain run through `context.agents`, `delegate`, and a `threadFork` branch. On a refusing instance those doors are refused at the SURFACES a tool is handed, not at a stack depth: `context.harness` is a guarded view of the live handle (`src/harness.ts` `toolHandleView`) whose callable, `sendThreadInput` and sibling-brain members throw whenever they are reached — a reference the body stores and fires after its own call settled is refused just the same, while every plain read and every routed `harness.runtime` operation passes through. An inline harness still receives the strict-identical live handle. A tool reads the same policy from its own context (`context.nestedRuns`) and takes its local path when it says `'refuse'`. Arming a value the build does not recognise throws, and only a lane worker arms it — an inline harness never changes, see [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker). |
 
 ### Runtime tool creation
@@ -1602,6 +1616,16 @@ model-visible delegation. Under `threadExecution: "worker"` a lane refuses it �
 child a tool body starts would exist only inside that lane; see
 [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker).
 
+Two controls shape a child without changing that rule. **Time:** a delegated child has
+no wall-clock limit — `timeoutMs` is an optional bound the caller sets when it wants
+one (see [The loop](#the-loop)), and a child that is still running is abandoned with
+`toolCancel` on the `callId` its pending placeholder names. **Scope:**
+`scope: { tools: [...] }` is a hard allowlist the child neither sees nor calls outside
+of — with one door that can never be locked, `toolRequest`, so a restricted child can
+always report the capability it is missing instead of looping on what it has. Enabling
+a tool through discovery is not the same as being scoped to it: a tool the allowlist
+omits is still refused at launch, with the refusal as a readable result.
+
 What that means for the shipped roles:
 
 - **The primary delegates; a subagent never re-delegates.** Drop the `summarizer`
@@ -1663,6 +1687,29 @@ state after waking. This changes four things a caller must know:
   can be killed instead of blocking forever. There is **no automatic hard tool
   timeout**: pending calls are interrupted, not resumed, on restart, and a hanging
   call ends only through an explicit cancel (or the tool's own configured timeout).
+  - **A THREAD has no wall-clock limit either (policy 2026-11-09).** A conversation —
+    a delegated child, a `threadFork` branch, a host thread, a steered turn — stops
+    when its agent gives its final answer, and nothing external ends it on a clock.
+    `delegate`'s `timeoutMs` is an **optional, caller-set** bound with **no limit as
+    its default**: pass one (a model may ask for 1..3600000 ms) when you believe a
+    limit is warranted, and the child that hits it comes back as the structured
+    `status: "cancelled"` result with `partialContent` and `cancelledAtMessage`.
+    CORRECTED IN PLACE: the default used to be a finite **300000 ms (5 minutes)**;
+    the mechanism stays, the finite default does not. What still ends a long run is a
+    tool's own timeout, the `maxIterations` **request count** (16 by default — a
+    count bound, deliberately untouched by a policy about time), the run-depth and
+    record caps, `toolCancel`, and — ADDED 2026-11-09 when the plugin-pipeline
+    user-facing lists landed — an explicit **`stop` decision** from a `turn.before`
+    plugin ([`docs/plugins.md`](./docs/plugins.md)): a policy assertion made by code
+    the application shipped, at a boundary the run is already parked at, not a clock
+    — nothing expires — and it takes the run's own abort path (the conversation
+    records `stopped`, the invocation records `cancelled`, and everything the run
+    appended is rolled back). A child that is stuck is abandoned by naming its
+    pending `callId` to `toolCancel`; the placeholder the model receives while the
+    child runs says so. And because a thread is unbounded, a stopped conversation is
+    restarted by a **host** prompt (`sendThreadInput`), never by an agent's
+    `threadSend` — the host owns stopping and reviving, so a model cannot undo a
+    Stop the operator pressed.
 - **Ordering is completion order.** Concurrent side effects are not ordered: two
   file writes or two commands may interleave, and results come back in the order
   they finish, not the order the model asked for them. Tools are async promises
@@ -2168,8 +2215,8 @@ Registration validates the name against `COMMAND_NAME_PATTERN`
 | Command | Behavior |
 |---|---|
 | `/help [command]` | Every command in this harness, sorted, one `/name  description` line each plus an indented `usage:` line when the command declares one. `/help <name>` prints that one entry through the same renderer; an unknown name is a readable answer with `isError`, never an exception. |
-| `/tools [filter]` | The tools registered in this harness, sorted, as `name — description…` lines. Descriptions are previewed at 200 characters and newlines collapse, because a full `task` description alone is ~1.5 KB. The filter is the raw tail (several words work) and matches the name **or** the description, case-insensitively; no match answers `no registered tool matches "…"` with `isError`. |
-| `/task [list \| add <text> \| complete <id> \| reopen <id> \| remove <id>... \| claim <id>... \| release <id>... \| takeover <id>...]` | This session's task list, through the live `task` tool. See the actions below. |
+| `/tools [filter]` | The tools registered in this harness, sorted, as `name — description…` lines. Descriptions are previewed at 200 characters and newlines collapse, because a full `tasks` description alone is ~1.5 KB. The filter is the raw tail (several words work) and matches the name **or** the description, case-insensitively; no match answers `no registered tool matches "…"` with `isError`. |
+| `/task [list \| add <text> \| complete <id> \| reopen <id> \| remove <id>...]` | This session's task list, through the live `tasks` tool. The command name kept the singular (Decision J); the three ownership verbs are gone with the lock (Decision P) — `/task claim 1` now answers the usage line. See the actions below. |
 | `/websearch <query>` | Searches with this session's `search` tool and prints `N result(s) via <provider>:`, then title / URL / snippet / published per hit. The **raw tail** is the query, so quoting an exact phrase survives tokenization. |
 | `/webfetch <url>` | Fetches one page through this session's `fetch` tool and prints `title`, `url`, `content type`, `characters`, then the extracted text. The **first token** is the URL, so a trailing flag cannot corrupt the address. |
 
@@ -2181,18 +2228,21 @@ Registration validates the name against `COMMAND_NAME_PATTERN`
 /task complete <id>      mark one task completed (a patch: the stored text is untouched)
 /task reopen <id>        mark one task pending
 /task remove <id>...     remove one or more ids
-/task claim <id>...      reserve those records for this session's entry agent (15-minute lease)
-/task release <id>...    hand them back — your own claim, or one whose lease has run out
-/task takeover <id>...   seize them from whoever holds them, live lease or not
 ```
+
+**Corrected in place (records-engine Decision P, 2026-11-09):** `/task claim <id>...`,
+`/task release <id>...` and `/task takeover <id>...` are DELETED, with the tool's `claim` /
+`release` / `takeover` / `leaseMs` parameters and the `owner` / `ownerThreadId` /
+`leaseUntil` fields. There is no ownership to move: any agent may write any record, and the
+conflict control is the `expects: [{ id, rev }]` token the command builds from the read it
+just did.
 
 Each answers the same readable block: `#<id> [x]/[ ] <text>` rows (or `No tasks.`), the
 `N total, N completed, N pending` tally, and the page cursor
-(`page: offset 0, limit 20, showing 3, next offset 20`). A reserved record says WHO
-holds it — `#7 [ ] Fix the parser (claimed by coder@agent:coder until
-2026-11-08T09:30:53.657Z)`, or `(claimed by writer until …)` with no `@thread` for a
-claim the operator itself took through this unthreaded command) — because otherwise a
-rejected `/task complete 7` looks like a bug rather than a lease. The `#` prefix on each
+(`page: offset 0, limit 20, showing 3, next offset 20`). A row carries NO ownership suffix
+(the `(claimed by …)` suffix went with the lock, Decision P), so a rejected
+`/task complete 7` reads as what it is: a stale revision token, answered with the current
+record. The `#` prefix on each
 id is there so an operator can copy `/task complete 7` straight out of the listing.
 Because these are `harness.executeTool('task', …)` calls and not a private store, the
 command inherits the tool's own bounds (200 tasks, 4000 characters each, 20 per page by
@@ -2214,7 +2264,7 @@ model turn).
 `fetch` tools, so an unconfigured session gets guidance instead of a registry error:
 `/websearch` names `websearch: true` plus `EXA_API_KEY` / `TAVILY_API_KEY` /
 `LINKUP_API_KEY`, `/webfetch` names `webfetch: true` and notes that its native
-provider needs no key, and `/task` in a harness without the `task` tool says the tool
+provider needs no key, and `/task` in a harness without the `tasks` tool says the tool
 is not registered. Every command body is capped at the same 64 KiB the model path uses
 (`MODEL_TOOL_RESULT_BUDGET_BYTES`) with a plain `… truncated: …` marker, because a
 command result is human-facing rather than a JSON envelope for a model.
@@ -2525,13 +2575,13 @@ toolbox is identical: all nine package tools (`syntax`, the six file tools
 `read`/`write`/`edit`/`files`/`glob`/`grep`,
 `shell`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `search`, and the harness-owned tools
-(`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`,
-`locationManage`, `agentManage`, `agentResult`, plus `delegate` only when the
+(`toolRequest`, `toolCreate`, `tasks`, `profiles`, `chapters`,
+`locations`, `agentManage`, `agentResult`, plus `delegate` only when the
 preset declares a subagent,
 `threadFork` when forks are enabled, and `actionRequest` when the host supplies an
 interaction handler).
 R18 splits declarations: the five core file tools, the harness-owned
-`toolRequest`/`task`, and the environment pair it actually registered (a configured
+`toolRequest`/`tasks`, and the environment pair it actually registered (a configured
 `search`, an enabled `fetch`) are always declared, while `download`, `files`,
 `shell`, `gitDiff`, `syntax`, and the app tools are discovered. Choosing a harness
 changes the agents, not the tools.
@@ -2620,7 +2670,7 @@ frozen `harnessDefinition.agentModels` remains the creation-time record. Team
 editing (primary/subagents) still applies to the next session you start. Sessions
 are in memory and are lost when the server restarts. Created tools live in the
 session's harness: they survive `reset()` (which clears the conversation,
-discovery, `task`, and the three record stores) and disappear with the
+discovery, `tasks`, and the three record stores) and disappear with the
 session.
 
 Every submit — queued (`/tasks`) or legacy (`/messages`) — is also the server's
@@ -2657,9 +2707,9 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `DELETE /api/harnesses/:name` | Remove one harness — `200 { deleted: true }`; `404` for an unknown name or a repeat delete. Any harness is removable, including a shipped built-in (its name is remembered in the database's `deleted` list so a restart does not re-ship it). Existing and saved sessions are untouched: each runs and restores from the definition it captured |
 | `GET /api/harnesses/:name` | Read ONE harness definition — `200 { harness }`, the same projection the index lists, including `agentInstructions` when the card overrides any (the compiled `/views` document omits that map, so the configuration dialog reads the one card it is about to show). A legacy alias resolves to the card it redirects to; `404` for an unknown name |
 | `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
-| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `search` always appears with `availability` |
+| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `search` always appears with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
-| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) needs `sessionId`; every other tool - including the core file tools - keeps its session-less runner. `actionRequest`/`threadFork` are refused because they need the owning run. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
+| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) needs `sessionId`; every other tool - including the core file tools - keeps its session-less runner. `actionRequest`/`threadFork` are refused because they need the owning run. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
 | `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
 | `POST /api/models` | Server-side `GET {baseURL}/models`; returns `{ models: string[] }` for the UI dropdown |
 | `POST /api/sessions` | Create a session for a preset |
@@ -2837,8 +2887,8 @@ decides each one against the canonical harness:
 - a terminal run **archives its invocation** with ids the authority **leased** at
   startup, and the authority reassigns the completion order, so two lanes can both
   claim to be "latest finished" without colliding;
-- every session-shared operation a core tool performs (`task`, `profileManage`,
-  `chapterManage`, `locationManage`, `toolCreate`, `toolManage`, `toolRegistry`,
+- every session-shared operation a core tool performs (`tasks`, `profiles`,
+  `chapters`, `locations`, `toolCreate`, `toolManage`, `toolRegistry`,
   `toolRequest`, `toolList`, `threadSend`, `threadList`, `agentManage`,
   `agentResult`) is **routed**, not executed locally: the lane replica's own
   `harness.runtime` object is replaced, so the canonical harness performs the work
@@ -3170,6 +3220,30 @@ is a legal transcript, and a **stopped** thread is writable — repairing a brok
 conversation is the whole point. The write notifies `agent_message`, the existing
 persistence reason, and emits no progress event: a host edit is not model output.
 
+**Two keys the reader owns on the way in.** Every transcript read and write speaks
+`HarnessMessage` entries, and two of their keys are the harness's to normalize:
+
+- `included` — the context-inclusion flag a `turn.before` policy writes
+  (`context.setIncluded`). **Only the literal `false` is storage**: absent means
+  included, and re-enabling DELETES the key. A submitted `included: true` is therefore
+  accepted and silently normalized to the absent form — at the agent seed, at this
+  transcript write, at the lane append, at `restore()`, and at a fork — rather than
+  rejected, because rejecting would break a host that round-trips its own JSON. The rule
+  for a host that persists its OWN copy of a transcript follows from that storage form:
+  **omit the key, do not write `true`**. The one place nothing can normalize is a direct
+  edit of the public mutable `agent.messages` array (the state-change observer cannot see
+  it, `HarnessStateChangeEvent`), where a hand-written `true` stays visible to every read
+  surface until the next copy. No `included` key ever reaches a provider request.
+- `messageId` — the stable transcript address (`msg-<n>` within one conversation). The
+  runtime mints one when it creates a canonical entry, COPIES it across a fork, a branch
+  and a snapshot (never re-mints), and BACKFILLS one when a document predates ids, so a
+  restored conversation is addressable from its first round and `restore → snapshot`
+  returns the same document. It is what `context.setIncluded(id, …)` accepts, so a policy
+  can disable the same turn in a later round, after a restart, or after a
+  `replaceHistory()` that kept the entry — the things an index or a message identity
+  cannot survive. Like `included`, it never reaches a provider request, and a host may
+  carry its own non-empty string in the key if it wants one.
+
 **Reload is tolerant per thread and fatal per document.** A transcript broken by hand
 in `state.json` cannot cost the whole session: the store validates every host thread's
 `messages` before `harness.restore()` and neutralises the unreadable ones with the same
@@ -3267,8 +3341,8 @@ session registers, including `shell`, the file tools, and a configured
 `search` (they may be `visibility: 'core'` but are not session-bound). The
 **Core tools** group is different by design: those entries are `sessionBound`, their
 call must carry the selected `sessionId`, and they execute inside that session's
-harness, so a manual `toolRequest`, `toolCreate`, `task`, `profileManage`,
-`chapterManage`, `locationManage`, `agentManage`, `agentResult`, or `delegate`
+harness, so a manual `toolRequest`, `toolCreate`, `tasks`, `profiles`,
+`chapters`, `locations`, `agentManage`, `agentResult`, or `delegate`
 call changes the conversation the user is looking at (and is refused with `409` while any session
 operation is in flight: a chat turn, queued work, a reset, or another manual call). A manual
 call is not a turn - it never changes `status` or appends a turn, only a private
@@ -3384,7 +3458,7 @@ create sessions and drive tools, so use this only on a trusted network.
 ```json
 {
     "rootPath": "/v1/harness",
-    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "task", "profileManage", "chapterManage", "locationManage", "agentManage", "agentResult", "threadFork"], "builtin": true, "editable": true }],
+    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "task", "profiles", "chapters", "locations", "agentManage", "agentResult", "threadFork"], "builtin": true, "editable": true }],
     "agents": [{ "name": "instruct", "title": "Instruct", "description": "…", "instruction": "…", "guidelines": ["…"] }],
     "tools": [{ "name": "toolRequest", "group": "Core tools", "tags": ["discovery"], "visibility": "core", "sessionBound": true, "parameters": {}, "availability": { "state": "available", "hint": "Runs inside a session harness: send a sessionId with the call." } }, { "name": "read", "group": "Package presets", "tags": ["files"], "visibility": "core", "parameters": {} }],
     "defaults": { "baseURL": "…", "model": "…", "hasApiKey": true },

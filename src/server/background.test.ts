@@ -62,6 +62,32 @@ import { SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
 import { INTERRUPTED_TOOL_RESULT_TEXT } from './persistence';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // ---------------------------------------------------------------------------
 // Deterministic scaffolding
 // ---------------------------------------------------------------------------
@@ -1063,7 +1089,7 @@ describe('background run — restart and restore', () => {
                 // explicit synthetic result (never a replay, never a silent pairing).
                 const calls = probeCalls('bg-restore', ['call-1', 'call-2']);
 
-                expect(restored.messages).toEqual([
+                expect(withoutIds(restored.messages)).toEqual([
                     { role: 'system', content: INSTRUCTION },
                     { role: 'user', content: 'bg-restore' },
                     { role: 'assistant', content: '', toolCalls: calls },

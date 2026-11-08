@@ -78,7 +78,7 @@ const TOOLS: readonly ToolDescriptor[] = [
     // the current list. That is why its curated presets matter: the schema alone can only
     // describe the read.
     {
-        name: 'task',
+        name: 'tasks',
         group: 'Core tools',
         description: 'The task list for this chat.',
         tags: ['tasks', 'planning'],
@@ -196,7 +196,7 @@ const TOOLS: readonly ToolDescriptor[] = [
         parameters: object({ input: str({ minLength: 1 }), label: str({ minLength: 1, maxLength: 120 }) }, ['input'])
     },
     {
-        name: 'profileManage',
+        name: 'profiles',
         group: 'Core tools',
         description: 'Story profiles.',
         tags: ['story'],
@@ -205,7 +205,7 @@ const TOOLS: readonly ToolDescriptor[] = [
         parameters: storySchema(['add', 'list', 'get', 'update', 'remove'])
     },
     {
-        name: 'chapterManage',
+        name: 'chapters',
         group: 'Core tools',
         description: 'Story chapters.',
         tags: ['story'],
@@ -214,7 +214,7 @@ const TOOLS: readonly ToolDescriptor[] = [
         parameters: storySchema(['add', 'list', 'get', 'update', 'remove'])
     },
     {
-        name: 'locationManage',
+        name: 'locations',
         group: 'Core tools',
         description: 'Story locations.',
         tags: ['story'],
@@ -263,7 +263,7 @@ const TOOLS: readonly ToolDescriptor[] = [
 const EXPECTED_PRESETS: Record<string, readonly string[]> = {
     // The `{}` read is BOTH the curated first payload and the schema-derived fallback,
     // so it is offered once (the dedupe below), and the four buttons are the whole set.
-    task: ['Current tasks', 'Add a task', 'Complete a task (edit id)', 'Remove a task (edit id)'],
+    tasks: ['Current tasks', 'Add a task', 'Complete a task (edit id)', 'Remove a task (edit id)'],
     toolList: ['Full inventory'],
     toolManage: ['List registered', 'Details for read', 'Source of read'],
     toolRegistry: ['Install shoutText (body)', 'Empty call'],
@@ -272,9 +272,9 @@ const EXPECTED_PRESETS: Record<string, readonly string[]> = {
     threadList: ['Thread roster'],
     threadSend: ['Send to thread (edit id)', 'Required thread + message'],
     threadFork: ['Fork an alternate take', 'Required input'],
-    profileManage: ['List profiles', 'Add a profile', 'Get by id (edit id)', 'Required action'],
-    chapterManage: ['List chapters', 'Add a draft chapter', 'Get by id (edit id)', 'Required action'],
-    locationManage: ['List locations', 'Add a location', 'Get by id (edit id)', 'Required action'],
+    profiles: ['List profiles', 'Add a profile', 'Get by id (edit id)', 'Required action'],
+    chapters: ['List chapters', 'Add a draft chapter', 'Get by id (edit id)', 'Required action'],
+    locations: ['List locations', 'Add a location', 'Get by id (edit id)', 'Required action'],
     actionRequest: ['Ask which path to take', 'Required fields'],
     gitDiff: ['Working tree', 'Against HEAD~1', 'Staged index', 'Only src, against main'],
     fetch: ['Fetch example.com', 'Only url'],
@@ -541,7 +541,7 @@ it('fills payloads that satisfy each tool real schema, not a blank skeleton', as
     // `task` (R9-R11) merge shapes, spelled out exactly: a read names nothing, an add
     // carries the `text` a new entry needs, a patch names only the id it changes plus the
     // flag, and a removal is an id list under `remove`.
-    const tasks = await presetsFor('task');
+    const tasks = await presetsFor('tasks');
     expect(payloadOf(tasks[0])).toEqual({});
     expect(payloadOf(tasks[1])).toEqual({ tasks: [{ text: 'Review the change' }] });
     expect(payloadOf(tasks[2])).toEqual({ tasks: [{ id: '<id from the list above>', completed: true }] });
@@ -549,7 +549,7 @@ it('fills payloads that satisfy each tool real schema, not a blank skeleton', as
 
     // The specific regressions this correction targets, spelled out: the runtime and
     // command tools no longer start from a payload their own schema refuses.
-    const profiles = await presetsFor('profileManage');
+    const profiles = await presetsFor('profiles');
     expect(payloadOf(profiles[1])).toEqual({
         action: 'add',
         name: 'Iris',
@@ -617,7 +617,7 @@ it('builds dynamic presets from the playground harness roster only', async () =>
 it('sends the edited preset verbatim, with the playground session id', async () => {
     const calls = await boot();
 
-    const buttons = await presetsFor('profileManage');
+    const buttons = await presetsFor('profiles');
     // Pressing a preset fills the box and calls nothing.
     buttons[2].click();
     expect(document.querySelector<HTMLTextAreaElement>('.tool-args')?.value).toBe(
@@ -634,9 +634,9 @@ it('sends the edited preset verbatim, with the playground session id', async () 
     await flush();
 
     expect(
-        calls.find((call) => call.url === '/api/tools/profileManage' && call.method === 'POST')
+        calls.find((call) => call.url === '/api/tools/profiles' && call.method === 'POST')
     ).toEqual({
-        url: '/api/tools/profileManage',
+        url: '/api/tools/profiles',
         method: 'POST',
         body: { parameters: { action: 'get', id: 'p-7' }, sessionId: 's1' }
     });

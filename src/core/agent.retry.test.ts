@@ -24,6 +24,32 @@ import type {
     HarnessStreamRequest
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // The documented default sequence: ten retries after the initial attempt.
 const DEFAULT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000];
 
@@ -128,9 +154,9 @@ describe('agent model-request retries', () => {
         // The retry re-sent the SAME request payload.
         expect(seen).toHaveLength(2);
         expect(seen[1]).toEqual(seen[0]);
-        expect(seen[1].messages).toEqual([{ role: 'user', content: 'go' }]);
+        expect(withoutIds(seen[1].messages)).toEqual([{ role: 'user', content: 'go' }]);
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'second' }
         ]);
@@ -282,7 +308,7 @@ describe('agent model-request retries', () => {
 
         // Only the successful attempt is committed: no partial text and no reasoning
         // from the abandoned attempt.
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'clean answer' }
         ]);
@@ -321,7 +347,7 @@ describe('agent model-request retries', () => {
             message: { toolCalls: [{ id: 'call_ok', name: 'real', arguments: '{}' }] }
         });
         expect(seen).toHaveLength(1);
-        expect(brain.messages.at(-1)).toEqual({
+        expect(withoutIds(brain.messages.at(-1))).toEqual({
             role: 'assistant',
             content: '',
             toolCalls: [{ id: 'call_ok', name: 'real', arguments: '{}' }]
@@ -367,7 +393,7 @@ describe('agent model-request retries', () => {
         expect(calls).toBe(1);
 
         // ONE assistant message: the answer was never replayed into a duplicate.
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'answer' }
         ]);
@@ -421,7 +447,7 @@ describe('agent model-request retries', () => {
         ]);
         expect(events.filter((event) => event.type === 'retry')).toEqual([]);
         expect(calls).toBe(1);
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: '' }
         ]);
@@ -465,7 +491,7 @@ describe('agent model-request retries', () => {
             }
         ]);
         expect(calls).toBe(2);
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'recovered' }
         ]);

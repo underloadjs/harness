@@ -36,7 +36,7 @@ const turnRecord = (options: {
     ({
         id: options.id,
         index: options.index,
-        prompt: options.prompt ?? 'task',
+        prompt: options.prompt ?? 'tasks',
         status: options.status ?? 'done',
         startedAt: 5,
         updatedAt: 10,

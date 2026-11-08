@@ -51,16 +51,17 @@ import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS
 // Every id space whose counter otherwise lives inside a harness replica.
 // `record:<store>` exists because a model mints records from inside a lane; the rest
 // are minted by the run loop itself (a delegation child, a fork, a terminal result).
+// The record space is ONE space, not four (records-engine F3): the session store has
+// a single id counter shared by every collection, so a lane that mints a chapter id and
+// a lane that mints a task id draw from the same range and can never hand the same
+// number out twice.
 export const ID_SPACES = [
     'thread',
     'invocation',
     'resultSequence',
     'completedOrder',
     'createdToolCount',
-    'record:todos',
-    'record:profiles',
-    'record:chapters',
-    'record:locations'
+    'record'
 ] as const;
 
 export type IdSpace = (typeof ID_SPACES)[number];
@@ -73,11 +74,9 @@ export const isIdSpace = (value: unknown): value is IdSpace =>
 export type CounterSemantics = 'next-id' | 'last-used';
 
 const COUNTER_SEMANTICS: Record<IdSpace, CounterSemantics> = {
-    // A store's `nextId` is the value the NEXT add will use.
-    'record:todos': 'next-id',
-    'record:profiles': 'next-id',
-    'record:chapters': 'next-id',
-    'record:locations': 'next-id',
+    // The store's counter is the value the NEXT add will use — one counter for every
+    // collection (F3).
+    record: 'next-id',
     // The core increments before use, so the persisted field is the last used value.
     thread: 'last-used',
     invocation: 'last-used',

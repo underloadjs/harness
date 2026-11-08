@@ -49,6 +49,32 @@ import {
 } from './index';
 import { AGENT_PROFILES, agentInstruction } from '../../agents';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // Provider settings are never used by construction; they only feed `agent(...)`.
 const SETTINGS = {
     baseURL: 'http://provider.test/v1',
@@ -111,10 +137,12 @@ const CORE = [
     'toolList',
     'toolManage',
     'toolCreate',
-    'task',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
+    'records',
+
+    'tasks',
+    'profiles',
+    'chapters',
+    'locations',
     'agentManage',
     'agentResult'
 ];
@@ -424,7 +452,7 @@ describe('one toolbox, different agents', () => {
         expect(harness.tools.fetch.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
         expect(harness.tools.toolRequest.visibility).toBe('core');
         expect(harness.tools.toolCreate.visibility).toBe('searchable');
-        expect(harness.tools.task.visibility).toBe('core');
+        expect(harness.tools.tasks.visibility).toBe('core');
         expect(harness.tools.delegate.visibility).toBe('core');
         expect(presetOf('demo').create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
@@ -478,7 +506,7 @@ describe('one toolbox, different agents', () => {
         // core file presets, and the configured search are declared up front.
         expect(describeHarness(presetOf('instruct'), configured).coreTools).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'delegate',
             'read',
             'write',
@@ -593,10 +621,10 @@ describe('one toolbox, different agents', () => {
         // and the role ran on its identity sentence alone (../../agents/index.ts).
         // The same composition runs for the summarizer, so a guideline cannot be
         // documentation that never reaches a model.
-        expect(research.agents.research.messages.slice(0, 1)).toEqual([
+        expect(withoutIds(research.agents.research.messages.slice(0, 1))).toEqual([
             { role: 'system', content: agentInstruction(AGENT_PROFILES.research) }
         ]);
-        expect(research.agents.summarizer.messages.slice(0, 1)).toEqual([
+        expect(withoutIds(research.agents.summarizer.messages.slice(0, 1))).toEqual([
             { role: 'system', content: agentInstruction(AGENT_PROFILES.summarizer) }
         ]);
 
@@ -607,7 +635,7 @@ describe('one toolbox, different agents', () => {
 
         // The joined text byte for byte: identity sentence, a BLANK line, then
         // `Guidelines:` with one `- ` bullet per profile guideline, in profile order.
-        expect(research.agents.research.messages[0]).toEqual({
+        expect(withoutIds(research.agents.research.messages[0])).toEqual({
             role: 'system',
             content: [
                 'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',

@@ -45,7 +45,7 @@ describe('browser baseline fallback', () => {
         expect(writer.tools.toolList.visibility).toBe('searchable');
         expect(writer.tools.toolManage.visibility).toBe('searchable');
         expect(writer.tools.toolCreate.visibility).toBe('searchable');
-        expect(writer.tools.task.visibility).toBe('core');
+        expect(writer.tools.tasks.visibility).toBe('core');
         expect(writer.tools.read.name).toBe('read');
         expect(writer.tools.read.visibility).toBe('core');
         // No source record is claimed for a prepared-definition fallback.
@@ -58,7 +58,9 @@ describe('browser baseline fallback', () => {
         const result = await writer('go');
         expect(result.content).toBe('browser-ok');
         expect(await writer.executeTool('toolRequest', { tags: ['files'] })).toMatchObject({
-            enabled: ['files', 'download', 'profileManage']
+            // `records` rides along on the 1-point description rung (its text names the
+            // built-in collections), behind the wrapper that matches by tag.
+            enabled: ['files', 'download', 'profiles', 'records']
         });
     });
 

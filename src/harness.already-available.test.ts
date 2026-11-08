@@ -90,7 +90,6 @@ const AGENT_QUERY_TOOLS = [...AGENT_MATCHES, TOOL_CREATE_MATCH];
 const SEARCHABLE_TAGS = [
     'agents',
     'answer',
-    'book',
     'branch',
     'catalogue',
     'chapter',
@@ -99,8 +98,10 @@ const SEARCHABLE_TAGS = [
     'characters',
     'compile',
     'create',
+    'define',
     'dynamic',
     'edit',
+    'entries',
     'extension',
     'fork',
     'history',
@@ -119,14 +120,19 @@ const SEARCHABLE_TAGS = [
     'preview',
     'profile',
     'profiles',
+    'record',
+    'records',
     'registry',
     'reload',
     'research',
     'result',
     'results',
+    'scene',
     'self-modifying',
     'setting',
+    'settings',
     'source',
+    'store',
     'story',
     'subagent',
     'summarize',
@@ -289,7 +295,7 @@ describe('toolRequest already-available core tools', () => {
         // the discovery set, and the next request declares the core pair, the
         // configured fixtures, then the enabled rows in discovery order.
         expect(writer.discoveredTools).toEqual(enabledNames);
-        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'task', ...enabledNames]);
+        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'tasks', ...enabledNames]);
     });
 });
 

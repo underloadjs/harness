@@ -13,7 +13,13 @@
 //   - ../../core/task.ts - readTaskStoreState, the validator a folded store must pass
 
 import { describe, expect, it } from 'vitest';
-import { readTaskStoreState, TASK_DEFAULT_LEASE_MS } from '../../core/task';
+import {
+    CHAPTERS_COLLECTION,
+    LOCATIONS_COLLECTION,
+    PROFILES_COLLECTION,
+    TASKS_COLLECTION,
+    readRecordsStoreState
+} from '../../core';
 import {
     DEFAULT_BOUNDS,
     applyMutationGroup,
@@ -35,10 +41,32 @@ const EPOCH_A = 1;
 const EPOCH_B = 2;
 
 // The frozen instant the T1 fixtures below write into a fold view, so a persisted
-// `updatedAt` and a `leaseUntil` are one exact value each (src/core/task.ts derives
-// both from Date). The fold itself never reads the clock.
+// `updatedAt` is one exact value (the core derives it from Date). The fold itself never
+// reads the clock — and since Decision P there is no `leaseUntil` to pin alongside it.
 const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
-const EPOCH_MS = Date.parse(EPOCH_ISO);
+
+// The unified store validator (records-engine T3): the fold's minted ids must leave a
+// store the CORE snapshot reader accepts, and that reader now takes ONE collection map.
+// The assertions were written against the per-store shape, so the helper hands back the
+// `tasks` collection with the store-level counter folded in — same facts, one level up.
+const validateTasks = (state: { items: unknown[]; nextId: number }) => () => {
+    const store = readRecordsStoreState({
+        nextId: state.nextId,
+        collections: {
+            tasks: {
+                definition: TASKS_COLLECTION,
+                items: state.items,
+                storeRev: (state as { storeRev?: number }).storeRev ?? 0,
+                changes: (state as { changes?: unknown[] }).changes ?? []
+            },
+            chapters: { definition: CHAPTERS_COLLECTION, items: [], storeRev: 0, changes: [] },
+            profiles: { definition: PROFILES_COLLECTION, items: [], storeRev: 0, changes: [] },
+            locations: { definition: LOCATIONS_COLLECTION, items: [], storeRev: 0, changes: [] }
+        }
+    });
+
+    return { ...store.collections.tasks, nextId: store.nextId };
+};
 
 const context = (
     view: CanonicalView,
@@ -47,7 +75,7 @@ const context = (
 ): Parameters<typeof applySharedMutation>[2] => ({
     laneEpoch,
     leases: createWriterLeaseLedger(),
-    identity: createIdentityLedger({ thread: 1, invocation: 1, 'record:todos': 1, 'record:profiles': 1 }),
+    identity: createIdentityLedger({ thread: 1, invocation: 1, 'record': 1, 'record': 1 }),
     opId: 0,
     seq: 1,
     ...overrides
@@ -73,64 +101,64 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
     it('reproduces F1: three lane-created records leave a nextId readTaskStoreState accepts', () => {
         const view = emptyCanonicalView();
         const leases = createWriterLeaseLedger();
-        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const identity = createIdentityLedger({ 'record': 1 });
 
         for (let added = 0; added < 3; added += 1) {
             const receipt = applySharedMutation(
                 view,
-                { kind: 'record:add', store: 'todos', record: { text: `task ${added}`, completed: false } },
+                { kind: 'record:add', store: 'tasks', record: { text: `task ${added}`, completed: false } },
                 { laneEpoch: EPOCH_A, leases, identity, opId: added, seq: 1 }
             );
 
             expect(receipt.status).toBe('applied');
         }
 
-        expect(view.stores.todos.items.map((item) => item.id)).toEqual(['2', '3', '4']);
+        expect(view.stores.tasks.items.map((item) => item.id)).toEqual(['2', '3', '4']);
         // The reviewer's failure mode: nextId left at the block start, below the
         // largest id, and the core REJECTED the snapshot.
-        expect(view.stores.todos.nextId).toBe(5);
-        expect(() => readTaskStoreState(view.stores.todos as never)).not.toThrow();
+        expect(view.stores.tasks.nextId).toBe(5);
+        expect(() => validateTasks(view.stores.tasks)()).not.toThrow();
     });
 
     it('never lets two lanes mint the same record id', () => {
         const view = emptyCanonicalView();
-        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const identity = createIdentityLedger({ 'record': 1 });
 
         const first = applySharedMutation(
             view,
-            { kind: 'record:add', store: 'todos', record: { text: 'from lane A', completed: false } },
+            { kind: 'record:add', store: 'tasks', record: { text: 'from lane A', completed: false } },
             { laneEpoch: EPOCH_A, leases: createWriterLeaseLedger(), identity, opId: 0, seq: 1 }
         );
         const second = applySharedMutation(
             view,
-            { kind: 'record:add', store: 'todos', record: { text: 'from lane B', completed: false } },
+            { kind: 'record:add', store: 'tasks', record: { text: 'from lane B', completed: false } },
             { laneEpoch: EPOCH_B, leases: createWriterLeaseLedger(), identity, opId: 0, seq: 1 }
         );
 
         expect(first.status).toBe('applied');
         expect(second.status).toBe('applied');
-        expect(view.stores.todos.items.map((item) => item.id)).toEqual(['2', '3']);
-        expect(view.stores.todos.items.map((item) => item.text)).toEqual(['from lane A', 'from lane B']);
+        expect(view.stores.tasks.items.map((item) => item.id)).toEqual(['2', '3']);
+        expect(view.stores.tasks.items.map((item) => item.text)).toEqual(['from lane A', 'from lane B']);
     });
 
     it('reproduces the lost update: a concurrent edit is REFUSED with the canonical digest, not overwritten', () => {
         const view = emptyCanonicalView();
-        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const identity = createIdentityLedger({ 'record': 1 });
         const leases = createWriterLeaseLedger();
 
         applySharedMutation(
             view,
-            { kind: 'record:add', store: 'todos', record: { text: 'shared', completed: false } },
+            { kind: 'record:add', store: 'tasks', record: { text: 'shared', completed: false } },
             { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }
         );
 
-        const created = view.stores.todos.items[0];
+        const created = view.stores.tasks.items[0];
         const readDigest = expectsDigestOf(created);
 
         // Lane B renames it first.
         const bWins = applySharedMutation(
             view,
-            { kind: 'record:update', store: 'todos', id: created.id, patch: { text: 'lane B won' }, expects: readDigest },
+            { kind: 'record:update', store: 'tasks', id: created.id, patch: { text: 'lane B won' }, expects: readDigest },
             { laneEpoch: EPOCH_B, leases, identity, opId: 1, seq: 1 }
         );
 
@@ -139,43 +167,43 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
         // Lane A, still holding the digest it read, must not silently overwrite B.
         const aLoses = applySharedMutation(
             view,
-            { kind: 'record:update', store: 'todos', id: created.id, patch: { completed: true }, expects: readDigest },
+            { kind: 'record:update', store: 'tasks', id: created.id, patch: { completed: true }, expects: readDigest },
             { laneEpoch: EPOCH_A, leases, identity, opId: 2, seq: 1 }
         );
 
         expect(aLoses.status).toBe('rejected');
         expect(aLoses.rejection?.code).toBe('stale-record');
-        expect(aLoses.effect?.digest).toBe(expectsDigestOf(view.stores.todos.items[0]));
+        expect(aLoses.effect?.digest).toBe(expectsDigestOf(view.stores.tasks.items[0]));
         // B's text is intact; A's patch is not applied at all (the lane re-reads and
         // re-applies against the new value).
-        expect(view.stores.todos.items[0].text).toBe('lane B won');
-        expect(view.stores.todos.items[0].completed).toBe(false);
+        expect(view.stores.tasks.items[0].text).toBe('lane B won');
+        expect(view.stores.tasks.items[0].completed).toBe(false);
 
         // With the fresh digest, A's change lands and nothing is lost.
         const aRetries = applySharedMutation(
             view,
             {
                 kind: 'record:update',
-                store: 'todos',
+                store: 'tasks',
                 id: created.id,
                 patch: { completed: true },
-                expects: expectsDigestOf(view.stores.todos.items[0])
+                expects: expectsDigestOf(view.stores.tasks.items[0])
             },
             { laneEpoch: EPOCH_A, leases, identity, opId: 3, seq: 2 }
         );
 
         expect(aRetries.status).toBe('applied');
-        expect(view.stores.todos.items[0]).toEqual({ id: created.id, text: 'lane B won', completed: true });
+        expect(view.stores.tasks.items[0]).toEqual({ id: created.id, text: 'lane B won', completed: true });
     });
 
     it('refuses a removal or update of a record that is gone', () => {
         const view = emptyCanonicalView();
-        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const identity = createIdentityLedger({ 'record': 1 });
         const leases = createWriterLeaseLedger();
 
         const removed = applySharedMutation(
             view,
-            { kind: 'record:remove', store: 'todos', id: '9', expects: expectsDigestOf(undefined) },
+            { kind: 'record:remove', store: 'tasks', id: '9', expects: expectsDigestOf(undefined) },
             { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }
         );
 
@@ -188,30 +216,32 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
     // T1: the block a lane folds against is the CORE's persisted task store, and from
     // T1 on that block carries `rev` + attribution per record and `storeRev` + the
     // change feed per store. Two things have to stay true: the folded store is still
-    // valid to `readTaskStoreState` (a session that restores it must not choke), and
-    // the fold's DIGEST guard still sees every one of those fields - which is exactly
-    // how it differs from the tool's `{ id, rev }` compare-and-swap (a claim moves the
-    // record but never the content revision).
-    it('folds a T1 task store without breaking the core validator', () => {
+    // valid to the core reader `readRecordsStoreState` (a session that restores it must
+    // not choke), and the fold's DIGEST guard still sees every one of those fields —
+    // which is exactly how it differs from the tool's `{ id, rev }` compare-and-swap
+    // (attribution moves while the content revision deliberately does not).
+    it('folds a task store without breaking the core validator', () => {
         const view = emptyCanonicalView();
-        const todos = view.stores.todos as unknown as {
+        const tasks = view.stores.tasks as unknown as {
             items: Record<string, unknown>[];
             nextId: number;
             storeRev: number;
             changes: Record<string, unknown>[];
         };
 
-        todos.items.push({
+        tasks.items.push({
             id: '1',
             text: 'shared',
-            completed: false,
-            rev: 1,
+            completed: true,
+            rev: 2,
             updatedBy: 'primary',
             updatedAt: EPOCH_ISO
         });
-        todos.nextId = 2;
-        todos.storeRev = 2;
-        todos.changes = [
+        // The counter is the STORE's (F3), so it rides the store-level fold value while
+        // `storeRev` and the window stay the collection's.
+        tasks.nextId = 2;
+        tasks.storeRev = 2;
+        tasks.changes = [
             {
                 rev: 1,
                 id: '1',
@@ -220,51 +250,66 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
                 at: EPOCH_ISO,
                 itemRev: 1
             },
+            // Decision P deleted the claim, so the second event is an ordinary content
+            // update: the feed now has exactly three ops — add, update, remove.
             {
                 rev: 2,
                 id: '1',
-                op: 'claim',
+                op: 'update',
                 by: 'primary',
-                at: EPOCH_ISO
+                at: EPOCH_ISO,
+                fields: ['completed'],
+                itemRev: 2
             }
         ];
 
-        expect(() => readTaskStoreState(todos as never)).not.toThrow();
+        expect(() => validateTasks(tasks)()).not.toThrow();
 
         // Nothing is dropped on the way through the validator: the revision, the
         // attribution and the feed window all come back, in the canonical key order.
-        expect(readTaskStoreState(todos as never)).toEqual({
+        expect(validateTasks(tasks)()).toEqual({
+            // A persisted collection carries its definition (Decision M) — that is what
+            // lets a restarted session validate entries without re-declaring the spec.
+            definition: TASKS_COLLECTION,
             items: [
                 {
                     id: '1',
                     text: 'shared',
-                    completed: false,
-                    rev: 1,
+                    completed: true,
+                    rev: 2,
                     updatedBy: 'primary',
                     updatedAt: EPOCH_ISO
                 }
             ],
-            nextId: 2,
             storeRev: 2,
             changes: [
                 { rev: 1, id: '1', op: 'add', by: 'primary', at: EPOCH_ISO, itemRev: 1 },
-                { rev: 2, id: '1', op: 'claim', by: 'primary', at: EPOCH_ISO }
-            ]
+                {
+                    rev: 2,
+                    id: '1',
+                    op: 'update',
+                    by: 'primary',
+                    at: EPOCH_ISO,
+                    fields: ['completed'],
+                    itemRev: 2
+                }
+            ],
+            nextId: 2
         });
     });
 
     it('digests the T1 fields, which the tool-level content revision deliberately ignores', () => {
         const view = emptyCanonicalView();
-        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const identity = createIdentityLedger({ 'record': 1 });
         const leases = createWriterLeaseLedger();
 
         applySharedMutation(
             view,
-            { kind: 'record:add', store: 'todos', record: { text: 'shared', completed: false, rev: 1 } },
+            { kind: 'record:add', store: 'tasks', record: { text: 'shared', completed: false, rev: 1 } },
             { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }
         );
 
-        const readDigest = expectsDigestOf(view.stores.todos.items[0]);
+        const readDigest = expectsDigestOf(view.stores.tasks.items[0]);
 
         // First the ordinary case, as a baseline: the lane holds the digest it really
         // read, so its patch lands.
@@ -272,8 +317,8 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
             view,
             {
                 kind: 'record:update',
-                store: 'todos',
-                id: view.stores.todos.items[0].id,
+                store: 'tasks',
+                id: view.stores.tasks.items[0].id,
                 patch: { completed: true },
                 expects: readDigest
             },
@@ -282,27 +327,29 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
 
         expect(appliedFirst.status).toBe('applied');
 
-        // A CLAIM bumps no content revision, so the tool's `{ id, rev }` token stays
-        // valid - but the stored record DID change, and the fold's digest covers the
-        // whole value. Applying the claim to the fold view is what a routed core claim
-        // does to the next folded snapshot, so this is the realistic concurrent case.
-        const claimed = {
-            ...view.stores.todos.items[0],
-            owner: 'lane-a',
-            leaseUntil: EPOCH_MS + TASK_DEFAULT_LEASE_MS
+        // Decision P deleted the claim, so the fields that move WITHOUT the tool's
+        // `{ id, rev }` token are now the ATTRIBUTION pair: the same content revision,
+        // written by someone else. The fold's digest covers the WHOLE value, so it sees
+        // that difference and the lane's token does not — which is the point of pinning
+        // the two mechanisms apart.
+        const reattributed = {
+            ...view.stores.tasks.items[0],
+            updatedBy: 'lane-a',
+            updatedThreadId: 'thread-lane-a',
+            updatedAt: EPOCH_ISO
         };
 
-        view.stores.todos.items[0] = claimed;
+        view.stores.tasks.items[0] = reattributed;
 
-        expect(expectsDigestOf(claimed)).not.toBe(readDigest);
+        expect(expectsDigestOf(reattributed)).not.toBe(readDigest);
 
         const refused = applySharedMutation(
             view,
             {
                 kind: 'record:update',
-                store: 'todos',
-                id: claimed.id,
-                patch: { text: 'written over a claim' },
+                store: 'tasks',
+                id: reattributed.id,
+                patch: { text: 'written over a re-attributed record' },
                 expects: readDigest
             },
             { laneEpoch: EPOCH_B, leases, identity, opId: 2, seq: 1 }
@@ -313,26 +360,26 @@ describe('record ops: the authority mints, and the result is a VALID store', () 
         // CAS sentence. See ./lane-authority.test.ts for that side.
         expect(refused.status).toBe('rejected');
         expect(refused.rejection?.code).toBe('stale-record');
-        expect(refused.effect?.digest).toBe(expectsDigestOf(claimed));
+        expect(refused.effect?.digest).toBe(expectsDigestOf(reattributed));
 
-        // With the digest of the claimed record, the same patch lands and keeps the T1
-        // fields the core owns - the fold never strips `owner`/`leaseUntil`.
+        // With the digest the lane ACTUALLY holds, the same patch lands and keeps the T1
+        // fields the core owns: the fold writes the patch, it never rewrites the record.
         const applied = applySharedMutation(
             view,
             {
                 kind: 'record:update',
-                store: 'todos',
-                id: claimed.id,
-                patch: { text: 'written over a claim' },
-                expects: expectsDigestOf(claimed)
+                store: 'tasks',
+                id: reattributed.id,
+                patch: { text: 'written over a re-attributed record' },
+                expects: expectsDigestOf(reattributed)
             },
             { laneEpoch: EPOCH_B, leases, identity, opId: 3, seq: 1 }
         );
 
         expect(applied.status).toBe('applied');
-        expect(view.stores.todos.items[0]).toEqual({
-            ...claimed,
-            text: 'written over a claim'
+        expect(view.stores.tasks.items[0]).toEqual({
+            ...reattributed,
+            text: 'written over a re-attributed record'
         });
     });
 });
@@ -435,6 +482,309 @@ describe('transcript ops: append-safe, leased, and never an overwrite', () => {
         );
 
         expect(allowed.status).toBe('applied');
+    });
+
+    // pipeline T4.1 — the committed prefix may be rewritten IN PLACE, compare-and-set against the
+    // digest this lane adopted. Every case here is the condition finding F6 named: an append is
+    // blind to a change that does not grow the transcript, so a plugin's `setIncluded`/`edit` on
+    // an already-committed entry used to die with the worker process.
+    describe('transcript:patch rewrites the committed prefix under a whole-prefix CAS', () => {
+        // The two-entry conversation every case below starts from: a user turn and its answer,
+        // the smallest shape that can carry both kinds of in-place write (a flag, and text).
+        const conversation = () => [
+            { role: 'user', content: 'question', messageId: 'msg-1' },
+            { role: 'assistant', content: 'answer', messageId: 'msg-2' }
+        ];
+
+        it('rewrites the prefix in place and reports the digest this lane must now adopt', () => {
+            const before = conversation();
+            const view = viewWith('thread-1', before);
+            const after = [
+                // A compactor disabled the user turn...
+                { ...before[0], included: false },
+                // ...and a plugin rewrote the answer's text.
+                { ...before[1], content: 'answer, edited' }
+            ];
+
+            const receipt = applySharedMutation(
+                view,
+                {
+                    kind: 'transcript:patch',
+                    threadId: 'thread-1',
+                    expectedLength: 2,
+                    expects: expectsDigestOf(before),
+                    messages: after
+                },
+                { laneEpoch: EPOCH_A, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }), opId: 0, seq: 1 }
+            );
+
+            expect(receipt).toEqual({
+                opId: 0,
+                seq: 1,
+                laneEpoch: EPOCH_A,
+                status: 'applied',
+                // The effect is the PREFIX scope, not the whole transcript: a patch never changes
+                // a length, and canonical may legitimately be longer than the part this lane holds.
+                effect: { length: 2, digest: expectsDigestOf(after) }
+            });
+            expect(view.threads['thread-1'].messages).toEqual(after);
+        });
+
+        it('refuses a stale digest with prefix-moved, moves NOTHING, and hands back the canonical facts', () => {
+            const view = viewWith('thread-1', conversation());
+            // Somebody else already rewrote entry 2 — the coordinator, or a sibling lane's patch.
+            view.threads['thread-1'].messages[1] = { role: 'assistant', content: 'answer, canonical', messageId: 'msg-2' };
+
+            const receipt = applySharedMutation(
+                view,
+                {
+                    kind: 'transcript:patch',
+                    threadId: 'thread-1',
+                    expectedLength: 2,
+                    // digested BEFORE that move, so it no longer describes canonical state
+                    expects: expectsDigestOf(conversation()),
+                    messages: conversation().map((message) => ({ ...message, included: false }))
+                },
+                { laneEpoch: EPOCH_A, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }), opId: 0, seq: 1 }
+            );
+
+            expect(receipt.status).toBe('rejected');
+            expect(receipt.rejection?.code).toBe('prefix-moved');
+            expect(receipt.rejection?.message).toBe(
+                'The first 2 messages of thread "thread-1" changed since this lane read them; re-read before patching.'
+            );
+            // The SAME facts an append refusal carries, so one rebase path covers both (T4.1's
+            // stated preference over a second conflict story).
+            expect(receipt.effect).toEqual({
+                length: 2,
+                digest: expectsDigestOf(view.threads['thread-1'].messages)
+            });
+            // And the refusal is not a silent filter: canonical state never moved.
+            expect(view.threads['thread-1'].messages[1]).toEqual({
+                role: 'assistant',
+                content: 'answer, canonical',
+                messageId: 'msg-2'
+            });
+        });
+
+        it('refuses a patch longer than canonical when the conversation got shorter under this lane', () => {
+            const before = conversation();
+            const view = viewWith('thread-1', [before[0]]);
+
+            const receipt = applySharedMutation(
+                view,
+                {
+                    kind: 'transcript:patch',
+                    threadId: 'thread-1',
+                    expectedLength: 2,
+                    expects: expectsDigestOf(before),
+                    messages: before
+                },
+                { laneEpoch: EPOCH_A, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }), opId: 0, seq: 1 }
+            );
+
+            expect(receipt.status).toBe('rejected');
+            expect(receipt.rejection?.code).toBe('prefix-moved');
+            expect(receipt.rejection?.message).toBe(
+                'Thread "thread-1" holds 1 messages, not 2; re-read before patching.'
+            );
+            expect(view.threads['thread-1'].messages).toEqual([before[0]]);
+        });
+
+        it('names a payload that does not carry the whole prefix as invalid-mutation, not a conflict', () => {
+            const before = conversation();
+            const view = viewWith('thread-1', before);
+            const identity = createIdentityLedger({ thread: 1 });
+            const leases = claiming(EPOCH_A, 'thread-1');
+
+            // Only half the prefix: a whole-prefix operation either names all of it or is a bug,
+            // and `prefix-moved` must keep meaning exactly "canonical moved, re-read".
+            const short = applySharedMutation(
+                view,
+                { kind: 'transcript:patch', threadId: 'thread-1', expectedLength: 2, expects: expectsDigestOf(before), messages: [before[0]] },
+                { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }
+            );
+
+            expect(short.rejection).toEqual({
+                code: 'invalid-mutation',
+                message: 'Thread "thread-1" patch names 2 committed entries but carries 1.'
+            });
+
+            const malformed = applySharedMutation(
+                view,
+                {
+                    kind: 'transcript:patch',
+                    threadId: 'thread-1',
+                    expectedLength: 1.5,
+                    expects: expectsDigestOf(before),
+                    messages: [before[0], before[1]]
+                },
+                { laneEpoch: EPOCH_A, leases, identity, opId: 1, seq: 1 }
+            );
+
+            expect(malformed.rejection?.code).toBe('invalid-mutation');
+            expect(view.threads['thread-1'].messages).toEqual(before);
+        });
+
+        it('needs the same writer lease as an append, on a host thread and on an agent conversation', () => {
+            const view = viewWith('thread-1', conversation());
+            const scope = leaseScopeOf(
+                { kind: 'transcript:patch', threadId: 'thread-1', expectedLength: 2, expects: '', messages: conversation() },
+                view
+            );
+
+            expect(leaseKeyOf(scope!)).toBe('thread:thread-1');
+
+            const refused = applySharedMutation(
+                view,
+                {
+                    kind: 'transcript:patch',
+                    threadId: 'thread-1',
+                    expectedLength: 2,
+                    expects: expectsDigestOf(view.threads['thread-1'].messages),
+                    // A disabled entry, the write a compactor actually makes.
+                    messages: [{ ...view.threads['thread-1'].messages[0], included: false }, view.threads['thread-1'].messages[1]]
+                },
+                // Lane B holds no lease here; a flag write is not a weaker claim than a message.
+                { laneEpoch: EPOCH_B, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }), opId: 0, seq: 1 }
+            );
+
+            expect(refused.rejection?.code).toBe('not-writer');
+            expect(view.threads['thread-1'].messages.every((message) => message.included === undefined)).toBe(true);
+
+            const agentView: CanonicalView = {
+                ...emptyCanonicalView(),
+                threads: {
+                    'agent:research': {
+                        id: 'agent:research',
+                        agent: 'research',
+                        status: 'idle',
+                        sequence: 0,
+                        messages: [{ role: 'user', content: 'shared brain' }]
+                    }
+                }
+            };
+
+            expect(
+                leaseKeyOf(
+                    leaseScopeOf(
+                        { kind: 'transcript:patch', threadId: 'agent:research', expectedLength: 1, expects: '', messages: [] },
+                        agentView
+                    )!
+                )
+            ).toBe('agent:research');
+        });
+
+        it('still lands when canonical only grew: the CAS binds the prefix, not the whole transcript', () => {
+            const before = conversation();
+            // Taken BEFORE the sibling write below mutates the array `view` shares with it: this
+            // is the digest a lane holds, i.e. the prefix as it was when the lane read it.
+            const adopted = expectsDigestOf(before);
+            const view = viewWith('thread-1', before);
+
+            // A coordinator append (a `threadSend`, a host write) landed after this lane read its
+            // prefix. The part this lane is rewriting is untouched, so refusing it would be a
+            // false conflict — and an append in the same group still CASes on its own `fromLength`.
+            view.threads['thread-1'].messages.push({ role: 'user', content: 'from a sibling', messageId: 'msg-3' });
+
+            const patched = [{ ...before[0], included: false }, before[1]];
+            const receipt = applySharedMutation(
+                view,
+                { kind: 'transcript:patch', threadId: 'thread-1', expectedLength: 2, expects: adopted, messages: patched },
+                { laneEpoch: EPOCH_A, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }), opId: 0, seq: 1 }
+            );
+
+            expect(receipt.status).toBe('applied');
+            expect(receipt.effect).toEqual({ length: 2, digest: expectsDigestOf(patched) });
+            // The rewrite stayed INSIDE the prefix, and the sibling's message is exactly where
+            // canonical put it: a patch never moves or drops what came after the base.
+            expect(view.threads['thread-1'].messages).toEqual([
+                ...patched,
+                { role: 'user', content: 'from a sibling', messageId: 'msg-3' }
+            ]);
+        });
+
+        it('lands a patch and an append in ONE group, in order — a prune and the answer that follows it', () => {
+            const before = conversation();
+            const view = viewWith('thread-1', before);
+            const patched = [{ ...before[0], included: false }, before[1]];
+
+            const { view: folded, outcome } = applyMutationGroup(
+                view,
+                {
+                    laneEpoch: EPOCH_A,
+                    seq: 1,
+                    ops: [
+                        // The order is what `deriveOperations` emits: the in-place rewrite of the
+                        // committed prefix FIRST, then the tail this turn appended at that prefix.
+                        {
+                            kind: 'transcript:patch',
+                            threadId: 'thread-1',
+                            expectedLength: 2,
+                            expects: expectsDigestOf(before),
+                            messages: patched
+                        },
+                        {
+                            kind: 'transcript:append',
+                            threadId: 'thread-1',
+                            fromLength: 2,
+                            messages: [{ role: 'assistant', content: 'the new answer', messageId: 'msg-3' }]
+                        }
+                    ]
+                },
+                { laneEpoch: EPOCH_A, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }) }
+            );
+
+            expect(outcome.complete).toBe(true);
+            expect(outcome.receipts.map((receipt) => receipt.status)).toEqual(['applied', 'applied']);
+            // Both facts a lane adopts: the new prefix digest, and the canonical length.
+            expect(outcome.receipts[0].effect).toEqual({ length: 2, digest: expectsDigestOf(patched) });
+            expect(outcome.receipts[1].effect?.length).toBe(3);
+            expect(folded.threads['thread-1'].messages).toEqual([
+                ...patched,
+                { role: 'assistant', content: 'the new answer', messageId: 'msg-3' }
+            ]);
+        });
+
+        it('rolls the whole group back when the patch conflicts, so a half-rewritten prefix never lands', () => {
+            const before = conversation();
+            const view = viewWith('thread-1', before);
+            const groupOps: SharedMutation[] = [
+                {
+                    kind: 'transcript:patch',
+                    threadId: 'thread-1',
+                    // A digest this lane never read: canonical still holds `before`.
+                    expectedLength: 2,
+                    expects: expectsDigestOf([{ role: 'user', content: 'stale', messageId: 'msg-1' }, before[1]]),
+                    messages: [{ ...before[0], included: false }, before[1]]
+                },
+                { kind: 'transcript:append', threadId: 'thread-1', fromLength: 2, messages: [{ role: 'user', content: 'and a tail' }] }
+            ];
+
+            const { view: kept, outcome } = applyMutationGroup(
+                view,
+                { laneEpoch: EPOCH_A, seq: 1, ops: groupOps },
+                { laneEpoch: EPOCH_A, leases: claiming(EPOCH_A, 'thread-1'), identity: createIdentityLedger({ thread: 1 }) }
+            );
+
+            expect(outcome.complete).toBe(false);
+            expect(outcome.status).toBe('partial');
+
+            // The STAGED fold answered each op on its own — which is exactly the trap T10 finding
+            // M2 found: receipt 1 says `applied` although the rollback means it never landed. The
+            // caller rewrites those, and only the authority's `commit()` may hand the lane anything
+            // else, so that is what is asserted here.
+            expect(outcome.receipts.map((receipt) => receipt.status)).toEqual(['rejected', 'applied']);
+
+            const honest = rolledBackReceipts(outcome.receipts, groupOps, EPOCH_A, 1);
+
+            // NOTHING moved, every receipt says so, and the refusal that caused the rollback keeps
+            // the canonical facts the next boundary re-bases on.
+            expect(honest.map((receipt) => receipt.rejection?.code)).toEqual(['prefix-moved', 'group-rolled-back']);
+            expect(honest[1].effect).toBeUndefined();
+            expect(kept).toBe(view);
+            expect(view.threads['thread-1'].messages).toEqual(before);
+        });
     });
 
     it('refuses an unknown thread and an oversized transcript', () => {
@@ -727,11 +1077,11 @@ describe('mutation groups and the journal', () => {
     it('applies a whole group atomically, and rolls back when one op is refused', () => {
         const view = emptyCanonicalView();
         const leases = createWriterLeaseLedger();
-        const identity = createIdentityLedger({ 'record:todos': 1 });
+        const identity = createIdentityLedger({ 'record': 1 });
 
         const added = applySharedMutation(
             view,
-            { kind: 'record:add', store: 'todos', record: { text: 'kept', completed: false } },
+            { kind: 'record:add', store: 'tasks', record: { text: 'kept', completed: false } },
             { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 }
         );
 
@@ -742,8 +1092,8 @@ describe('mutation groups and the journal', () => {
         const outcome = applyMutationGroup(
             view,
             group(2, [
-                { kind: 'record:add', store: 'todos', record: { text: 'in the failed group', completed: false } },
-                { kind: 'record:update', store: 'todos', id: 'does-not-exist', patch: { text: 'x' }, expects: 'whatever' }
+                { kind: 'record:add', store: 'tasks', record: { text: 'in the failed group', completed: false } },
+                { kind: 'record:update', store: 'tasks', id: 'does-not-exist', patch: { text: 'x' }, expects: 'whatever' }
             ]),
             { laneEpoch: EPOCH_A, leases, identity }
         );

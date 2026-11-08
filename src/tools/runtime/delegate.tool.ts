@@ -32,6 +32,23 @@
 // description, not this file, so the description states all three facts: a caller
 // that assumes the old two-field shape would silently drop the identity and the
 // continuation offset.
+//
+// TIME POLICY (2026-11-09, docs/tasks/2026-11-09-thread-timeout-policy.md)
+// ------------------------------------------------------------------------
+// `timeoutMs` used to default to 300000 (5 minutes). The DEFAULT is now "no time
+// limit" and `timeoutMs` is an optional, caller-set bound; the property description
+// below says so, in the order the policy doc requires (unbounded default → optional
+// bound → the structured `cancelled` envelope on expiry → `toolCancel` as the
+// recovery for a stuck child → the child's TOOLS keep their own clocks).
+// Two constraints keep that text exactly where it is:
+//   - it must stay a plain literal holding number LITERALS, because the startup
+//     scanner reads this object out of the AST and scripts/check-package-tools.mjs
+//     requires `dependencies: []` for this entry — so it cannot import
+//     `DELEGATE_TIMEOUT_MS` from ../core;
+//   - src/core/metadata.ownership.test.ts pins the inlined ceiling against the
+//     canonical constants, which is the fix for that duplication.
+// The schema `maximum` bounds a MODEL argument only; `runtime.delegate` (the host
+// path) is not schema-validated and may pass any finite bound.
 import type { CoreToolMetadata } from '../../core';
 import type { ToolContext } from '../../types';
 
@@ -78,18 +95,18 @@ export const metadata = {
                 minimum: 1,
                 maximum: 3600000,
                 description:
-                    'Wall-clock bound for the child run, in milliseconds. Defaults to 300000 (5 minutes). On expiry the child is stopped and the result reports status "cancelled" with its partialContent and cancelledAtMessage, so a frozen child cannot hold the session open.'
+                    'Optional wall-clock bound for the child run, in integer milliseconds (1-3600000). OMIT IT FOR NO TIME LIMIT, which is the default: the child runs until it gives its own final answer, and nothing external ends it on a clock. Set a value only when you believe a limit is warranted; the 1-3600000 range bounds what you may ask for, never the absence of a bound. On expiry the child is stopped and the result reports status "cancelled" with its partialContent and cancelledAtMessage, exactly as for any other unfinished child. A child that is still running is abandoned with toolCancel using the callId from its pending placeholder. The tools the child calls carry their own time bounds, which is what keeps an unbounded child from hanging on I/O.'
             },
             scope: {
                 type: 'object',
                 description:
-                    'Restrict what the child may do. `tools` is an allowlist of wire names: the child neither sees nor can call anything outside it, so a planning or review delegation can be read-only by construction instead of by instruction. Omit for the historical unrestricted child.',
+                    'Restrict what the child may do. `tools` is an allowlist of wire names: the child neither sees nor can call anything outside it, so a planning or review delegation can be read-only by construction instead of by instruction. One door is never restricted: toolRequest stays available to a scoped child so it can report what it is missing instead of looping. Omit for the historical unrestricted child.',
                 properties: {
                     tools: {
                         type: 'array',
                         items: { type: 'string' },
                         description:
-                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all.'
+                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all; toolRequest is still available to it as the discovery door.'
                     }
                 },
                 additionalProperties: false

@@ -62,6 +62,32 @@ import {
     type CanonicalCall
 } from './canonical-reads.test-support';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
 // Scratch roots for this task live under the repo-root `Temp/C4/` directory.
@@ -275,6 +301,21 @@ const resultOf = (body: Record<string, unknown>): UpdateThreadTranscriptResult =
 // `JSON.stringify(value, null, 2)`).
 const pretty = (value: unknown): string => JSON.stringify(value, null, 2);
 
+// The STORED form of a transcript: every entry carries the address the runtime minted
+// for it (context T1.3), so the transcript routes serve it and the editor shows it.
+// Anything that asserts the DOCUMENT — `bytes`, a page's items, the pretty editor text,
+// the persisted `state.json` entry — is written against this; anything that asserts
+// CONTENT keeps the id-less fixture and the `withoutIds` normalizer.
+//
+// The numbers are exact, not a range: the runtime mints `msg-1`, `msg-2`, ... per
+// transcript in creation order (src/core/message-id.ts), and a transcript replaced by a
+// PUT mints from the top of the new list.
+const withIds = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
+    messages.map(
+        (message, index) =>
+            ({ ...message, messageId: `msg-${String(index + 1)}` }) as HarnessMessage
+    );
+
 const transcriptPath = (id: string, threadId = 'thread-1'): string =>
     `/v1/harness/sessions/${id}/threads/${threadId}/transcript`;
 
@@ -393,20 +434,20 @@ describe('thread transcript read/write (C4)', () => {
 
         // The baseline every later assertion here is written against: the provider
         // received the seeded system message plus the prompt.
-        expect(requests.map(plain)).toEqual([
+        expect(withoutIds(requests.map(plain))).toEqual([
             [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hello' }]
         ]);
 
         // Canonical split (T13/T14): one transcript is THREE reads of different sizes —
         // a metadata head, a paged message slice, and the whole document for the editor.
-        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+        expect(withoutIds(await readTranscriptMetadata(call, sessionId, 'thread-1'))).toEqual({
             session_id: sessionId,
             thread_id: 'thread-1',
             agent: 'one',
             transcript_state: 'ok',
             message_count: 3,
             chars: 20,
-            bytes: 115,
+            bytes: bytesOf(withIds(SEEDED_TRANSCRIPT)),
             revision: hubRevision(runtime, 'transcript', sessionId, 'thread-1'),
             role_counts: { system: 1, user: 1, assistant: 1, tool: 0 }
         });
@@ -414,7 +455,7 @@ describe('thread transcript read/write (C4)', () => {
         const page = await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 });
 
         expect(page).toEqual({
-            items: SEEDED_TRANSCRIPT,
+            items: withIds(SEEDED_TRANSCRIPT),
             // `limit` echoes the EFFECTIVE page size, not the requested bound
             // (api-paging.ts `pageMeta`) — that is how a client spots a short final page.
             limit: 3,
@@ -440,7 +481,7 @@ describe('thread transcript read/write (C4)', () => {
             agent: 'one',
             revision: hubRevision(runtime, 'transcript', sessionId, 'thread-1'),
             transcript_state: 'ok',
-            document: pretty(SEEDED_TRANSCRIPT),
+            document: pretty(withIds(SEEDED_TRANSCRIPT)),
             content_type: 'application/json'
         });
 
@@ -493,25 +534,25 @@ describe('thread transcript read/write (C4)', () => {
         const messages = [{ role: 'user', content: 'rewritten' }] as HarnessMessage[];
 
         // The replacement is what every transcript read now serves...
-        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+        expect(withoutIds(await readTranscriptMetadata(call, sessionId, 'thread-1'))).toEqual({
             session_id: sessionId,
             thread_id: 'thread-1',
             agent: 'one',
             transcript_state: 'ok',
             message_count: 1,
             chars: charsOf(messages),
-            bytes: bytesOf(messages),
+            bytes: bytesOf(withIds(messages)),
             revision: put.revision,
             role_counts: roleCounts(messages)
         });
         expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
-            messages
+            withIds(messages)
         );
 
         // Exact editor text: key order and the 2-space indent are what the user reads back
         // after saving.
         expect((await readTranscriptDocument(call, sessionId, 'thread-1')).document).toBe(
-            '[\n  {\n    "role": "user",\n    "content": "rewritten"\n  }\n]'
+            '[\n  {\n    "role": "user",\n    "content": "rewritten",\n    "messageId": "msg-1"\n  }\n]'
         );
 
         // The roster still addresses the conversation, and says how many entries it holds.
@@ -526,8 +567,8 @@ describe('thread transcript read/write (C4)', () => {
 
         // Visible to the harness immediately (the roster is a live read), and
         // durable: the committed core snapshot holds the replacement.
-        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual(messages);
-        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(messages);
+        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual(withIds(messages));
+        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(withIds(messages));
 
         // The next turn of the SAME conversation starts from the edited value: the
         // request the provider actually receives is the replacement plus the new
@@ -540,11 +581,13 @@ describe('thread transcript read/write (C4)', () => {
             { role: 'user', content: 'rewritten' },
             { role: 'user', content: 'again' }
         ]);
-        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual([
-            { role: 'user', content: 'rewritten' },
-            { role: 'user', content: 'again' },
-            { role: 'assistant', content: 'answer:again' }
-        ]);
+        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual(
+            withIds([
+                { role: 'user', content: 'rewritten' },
+                { role: 'user', content: 'again' },
+                { role: 'assistant', content: 'answer:again' }
+            ])
+        );
 
         runtime.store.dispose();
     });
@@ -583,30 +626,30 @@ describe('thread transcript read/write (C4)', () => {
 
         // The flag is stored, not silently normalized away: a disabled transcript
         // stays restorable, and every read serves it back.
-        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+        expect(withoutIds((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items)).toEqual(
             submitted
         );
-        expect(await readTranscriptMetadata(call, sessionId, 'thread-1')).toEqual({
+        expect(withoutIds(await readTranscriptMetadata(call, sessionId, 'thread-1'))).toEqual({
             session_id: sessionId,
             thread_id: 'thread-1',
             agent: 'one',
             transcript_state: 'ok',
             message_count: 5,
             chars: charsOf(submitted),
-            bytes: bytesOf(submitted),
+            bytes: bytesOf(withIds(submitted)),
             revision: put.revision,
             role_counts: roleCounts(submitted)
         });
 
         const document = await readTranscriptDocument(call, sessionId, 'thread-1');
 
-        expect(JSON.parse(document.document)).toEqual(submitted);
+        expect(JSON.parse(document.document)).toEqual(withIds(submitted));
         // The editor literally shows the flag, which is how an operator re-enables
         // a turn by hand.
         expect(document.document).toContain('"included": false');
 
         // Durable in exactly that form.
-        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(submitted);
+        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(withIds(submitted));
 
         // The model path runs from the flagged transcript: the disabled user turn
         // and the disabled tool unit are absent from the provider request, and no
@@ -625,10 +668,105 @@ describe('thread transcript read/write (C4)', () => {
         expect(JSON.stringify(requests[requests.length - 1])).not.toContain('included');
 
         // Canonical history still holds every disabled entry, flagged.
-        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual([
-            ...submitted,
-            { role: 'user', content: 'again' },
-            { role: 'assistant', content: 'answer:again' }
+        expect(threadOf(runtime.store.get(sessionId)).messages).toEqual(
+            withIds([
+                ...submitted,
+                { role: 'user', content: 'again' },
+                { role: 'assistant', content: 'answer:again' }
+            ])
+        );
+
+        runtime.store.dispose();
+    });
+
+    // Compaction T1.4 — the transcript routes are where a HOST (the editor, a CLI, a
+    // reconnecting client) learns WHY a call ended, so the persisted outcome has to survive
+    // a PUT, a paged read, the editable document and the durable file exactly as submitted.
+    // Two things are pinned together here:
+    //   * the three spellings stay distinct — a `failed` result, a `cancelled` result, and a
+    //     completed one that carries NO key. The route must not invent a `"completed"`
+    //     string for healthy entries, or every stored transcript grows a second truth;
+    //   * unlike `included` (test above), the outcome DOES ride into the projected request,
+    //     because that is how a `turn.before` policy sees it. The provider wire stays
+    //     field-selected — pinned in src/transport/openai.test.ts.
+    it('round-trips the persisted tool outcome through the transcript routes', async () => {
+        const { root, runtime, sessionId, requests } = await seeded('put-outcome');
+        const call = callOf(runtime);
+
+        const submitted: HarnessMessage[] = [
+            { role: 'system', content: 'sys' },
+            {
+                role: 'assistant',
+                content: 'asked',
+                toolCalls: [
+                    { id: 'c1', name: 'read', arguments: '{}' },
+                    { id: 'c2', name: 'read', arguments: '{"path":"x"}' },
+                    { id: 'c3', name: 'read', arguments: '{"path":"y"}' }
+                ]
+            },
+            { role: 'tool', content: 'Tool "read" failed: kaput', toolCallId: 'c1', name: 'read', outcome: 'failed' },
+            {
+                role: 'tool',
+                content: 'Tool "read" was cancelled before it produced a value.',
+                toolCallId: 'c2',
+                name: 'read',
+                outcome: 'cancelled'
+            },
+            { role: 'tool', content: 'ok', toolCallId: 'c3', name: 'read' },
+            { role: 'user', content: 'hello' }
+        ];
+
+        const put = await putTranscript(call, sessionId, 'thread-1', submitted);
+
+        // Accepted as a valid transcript, i.e. the tool allowlist admits the key: without the
+        // T1.4 update this very document would be refused as `has an unknown field`.
+        expect(put.accepted_as).toBe('transcript');
+        expect(put.message_count).toBe(6);
+
+        expect(
+            withoutIds((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items)
+        ).toEqual(submitted);
+
+        const document = await readTranscriptDocument(call, sessionId, 'thread-1');
+
+        expect(JSON.parse(document.document)).toEqual(withIds(submitted));
+        // The editor shows the classification verbatim, and never a `completed` string the
+        // writer would not have produced.
+        expect(document.document).toContain('"outcome": "failed"');
+        expect(document.document).toContain('"outcome": "cancelled"');
+        expect(document.document).not.toContain('"outcome": "completed"');
+
+        // Durable in exactly that form.
+        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(withIds(submitted));
+
+        // The next model turn runs from the stored document and its projection KEEPS the
+        // outcome (core/agent.ts `withIncluded` strips only `included`/`messageId`).
+        const continuation = await runtime.store.enqueue(sessionId, 'again', undefined, undefined, 'thread-1');
+        await continuation.settled;
+        await runtime.store.waitForIdle(sessionId);
+
+        expect(requests[requests.length - 1]).toEqual([
+            { role: 'system', content: 'sys' },
+            {
+                role: 'assistant',
+                content: 'asked',
+                toolCalls: [
+                    { id: 'c1', name: 'read', arguments: '{}' },
+                    { id: 'c2', name: 'read', arguments: '{"path":"x"}' },
+                    { id: 'c3', name: 'read', arguments: '{"path":"y"}' }
+                ]
+            },
+            { role: 'tool', content: 'Tool "read" failed: kaput', toolCallId: 'c1', name: 'read', outcome: 'failed' },
+            {
+                role: 'tool',
+                content: 'Tool "read" was cancelled before it produced a value.',
+                toolCallId: 'c2',
+                name: 'read',
+                outcome: 'cancelled'
+            },
+            { role: 'tool', content: 'ok', toolCallId: 'c3', name: 'read' },
+            { role: 'user', content: 'hello' },
+            { role: 'user', content: 'again' }
         ]);
 
         runtime.store.dispose();
@@ -713,7 +851,7 @@ describe('thread transcript read/write (C4)', () => {
         expect(storedSession(root, sessionId).invalidThreads).toEqual({
             'thread-1': { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }], agent: 'one' }
         });
-        expect(storedThreadMessages(root, sessionId, 'thread-1')).toEqual(placeholder(BAD_ROLE));
+        expect(withoutIds(storedThreadMessages(root, sessionId, 'thread-1'))).toEqual(placeholder(BAD_ROLE));
 
         runtime.store.dispose();
     });
@@ -795,7 +933,7 @@ describe('thread transcript read/write (C4)', () => {
         const snapshot = second.store.get(sessionId);
 
         expect(second.store.restoreErrors).toEqual([]);
-        expect(threadOf(snapshot).messages).toEqual(placeholder(NOT_AN_ARRAY));
+        expect(withoutIds(threadOf(snapshot).messages)).toEqual(placeholder(NOT_AN_ARRAY));
         expect(snapshot.invalidThreads).toEqual([
             { id: 'thread-1', agent: 'one', error: NOT_AN_ARRAY, messages: 'broken' }
         ]);
@@ -824,7 +962,7 @@ describe('thread transcript read/write (C4)', () => {
         await continuation.settled;
         await second.store.waitForIdle(sessionId);
 
-        expect(threadOf(second.store.get(sessionId)).messages).toEqual([
+        expect(withoutIds(threadOf(second.store.get(sessionId)).messages)).toEqual([
             ...placeholder(NOT_AN_ARRAY),
             { role: 'user', content: 'still here' },
             { role: 'assistant', content: 'answer:still here' }
@@ -858,7 +996,7 @@ describe('thread transcript read/write (C4)', () => {
             [0, 'hello', 'done']
         ]);
         expect(threadOf(restored).id).toBe('thread-1');
-        expect(threadOf(restored).messages).toEqual(placeholder(BAD_ROLE));
+        expect(withoutIds(threadOf(restored).messages)).toEqual(placeholder(BAD_ROLE));
         expect(restored.invalidThreads).toEqual([
             { id: 'thread-1', agent: 'one', error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
         ]);
@@ -877,8 +1015,8 @@ describe('thread transcript read/write (C4)', () => {
         // Third process: the repaired session loads with nothing unreadable.
         second.store.dispose();
         const third = runtimeOf(root, scriptedPreset('one').preset);
-        expect(third.store.get(sessionId).invalidThreads).toBeUndefined();
-        expect(threadOf(third.store.get(sessionId)).messages).toEqual([
+        expect(withoutIds(third.store.get(sessionId).invalidThreads)).toBeUndefined();
+        expect(withoutIds(threadOf(third.store.get(sessionId)).messages)).toEqual([
             { role: 'user', content: 'fixed after restart' }
         ]);
         third.store.dispose();
@@ -902,7 +1040,7 @@ describe('thread transcript read/write (C4)', () => {
         expect(second.store.list().map((entry) => entry.id)).toEqual([sessionId]);
 
         const restored = second.store.get(sessionId);
-        expect(threadOf(restored).messages).toEqual(placeholder(BAD_ROLE));
+        expect(withoutIds(threadOf(restored).messages)).toEqual(placeholder(BAD_ROLE));
         expect(restored.invalidThreads).toEqual([
             { id: 'thread-1', agent: 'one', error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
         ]);
@@ -926,7 +1064,7 @@ describe('thread transcript read/write (C4)', () => {
         const second = runtimeOf(root, scriptedPreset('one').preset);
 
         expect(second.store.restoreErrors).toEqual([]);
-        expect(threadOf(second.store.get(sessionId)).messages).toEqual([
+        expect(withoutIds(threadOf(second.store.get(sessionId)).messages)).toEqual([
             { role: 'user', content: 'hand repaired' }
         ]);
         // The persisted raw value no longer describes the transcript, so it is gone.
@@ -976,7 +1114,7 @@ describe('thread transcript read/write (C4)', () => {
         expect(restored.invalidThreads).toEqual([
             { id: 'agent:one', agent: 'one', error: DEFAULT_NOT_ARRAY, messages: 'broken' }
         ]);
-        expect(restored.messages).toEqual(placeholder(DEFAULT_NOT_ARRAY));
+        expect(withoutIds(restored.messages)).toEqual(placeholder(DEFAULT_NOT_ARRAY));
 
         const secondCall = callOf(second);
 
@@ -1004,8 +1142,8 @@ describe('thread transcript read/write (C4)', () => {
 
         expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 1 });
         expect(repaired).not.toHaveProperty('invalid');
-        expect(fs.readFileSync(stateFile(root), 'utf8')).not.toContain('invalidThreads');
-        expect(second.store.get(sessionId).messages).toEqual([
+        expect(withoutIds(fs.readFileSync(stateFile(root), 'utf8'))).not.toContain('invalidThreads');
+        expect(withoutIds(second.store.get(sessionId).messages)).toEqual([
             { role: 'user', content: 'fixed after restart' }
         ]);
 
@@ -1213,7 +1351,7 @@ describe('thread transcript route status contract (C4)', () => {
         const repaired = await putTranscript(call, sessionId, 'thread-1', SEEDED_TRANSCRIPT);
 
         expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 3 });
-        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+        expect(withoutIds((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items)).toEqual(
             SEEDED_TRANSCRIPT
         );
 
@@ -1225,12 +1363,12 @@ describe('thread transcript route status contract (C4)', () => {
         });
 
         expect(stale.status).toBe(409);
-        expect(stale.body).toEqual({
+        expect(withoutIds(stale.body)).toEqual({
             error: {
                 message: `This transcript is at revision ${repaired.revision}; the write expected ${repaired.revision - 1}. Re-read before writing.`
             }
         });
-        expect((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items).toEqual(
+        expect(withoutIds((await readTranscriptMessages(call, sessionId, 'thread-1', { limit: 25 })).items)).toEqual(
             SEEDED_TRANSCRIPT
         );
 
@@ -1305,7 +1443,7 @@ describe('thread transcript route status contract (C4)', () => {
             messages: [{ role: 'user', content: 'after the run' }]
         });
         expect(settled.status).toBe(200);
-        expect(threadOf(runtime.store.get(created.id)).messages).toEqual([
+        expect(withoutIds(threadOf(runtime.store.get(created.id)).messages)).toEqual([
             { role: 'user', content: 'after the run' }
         ]);
 
@@ -1333,7 +1471,7 @@ describe('thread transcript route status contract (C4)', () => {
         const stopped = await runtime.store.updateThreadTranscript(sessionId, 'thread-1', [
             { role: 'user', content: 'repaired while stopped' }
         ]);
-        expect(stopped.transcript.messages).toEqual([{ role: 'user', content: 'repaired while stopped' }]);
+        expect(withoutIds(stopped.transcript.messages)).toEqual([{ role: 'user', content: 'repaired while stopped' }]);
         expect(threadOf(stopped.session).status).toBe('stopped');
 
         runtime.store.dispose();
@@ -1400,7 +1538,7 @@ describe('document-level corruption stays fatal (C4 regression)', () => {
         const second = runtimeOf(root, scriptedPreset('one').preset);
         expect(second.store.restoreErrors).toEqual([]);
         expect(second.store.get(sessionId).invalidThreads).toBeUndefined();
-        expect(threadOf(second.store.get(sessionId)).messages).toEqual(SEEDED_TRANSCRIPT);
+        expect(withoutIds(threadOf(second.store.get(sessionId)).messages)).toEqual(SEEDED_TRANSCRIPT);
 
         second.store.dispose();
     });

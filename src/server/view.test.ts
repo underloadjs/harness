@@ -141,7 +141,7 @@ const toolRoundPreset = (name = 'worker', instruction = WORKER_INSTRUCTION): Har
                                 toolCalls: [
                                     {
                                         id: 'call-1',
-                                        name: 'task',
+                                        name: 'tasks',
                                         arguments: JSON.stringify({ tasks: [{ text: HUGE }] })
                                     }
                                 ],
@@ -302,7 +302,7 @@ describe('lazy step detail (R2)', () => {
         // A copy: mutating the answer cannot rewrite the server's record.
         (detail.opening.event as { call?: { name?: string } }).call = { name: 'tampered' };
 
-        expect((store.stepDetail(created.id, turn.id, step.id).opening.event as { call?: { name?: string } }).call?.name).toBe('task');
+        expect((store.stepDetail(created.id, turn.id, step.id).opening.event as { call?: { name?: string } }).call?.name).toBe('tasks');
     });
 
     it('refuses an unknown turn, an unknown step, and a malformed step id', async () => {
@@ -922,7 +922,7 @@ describe('the canonical session surface (R3)', () => {
         const tool = bar[2];
 
         expect(tool).toMatchObject({
-            name: 'task',
+            name: 'tasks',
             state: 'ok',
             argsChars: args.length,
             resultChars: result.length,

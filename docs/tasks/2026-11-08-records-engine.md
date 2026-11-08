@@ -1,7 +1,17 @@
 # `records` — one session store engine, with `task`/`chapter`/`profile`/`location` as wrappers
 
-Status: **open — design specification, implementation-ready.** Sixteen decisions (A-P) are
-made below. Q1-Q5 were answered by the architect (rounds 5-6) and are recorded as Decisions
+Status: **closed except the generated Rust twin — T1-T8 LANDED and the suite GREEN (round 9,
+2026-11-09: 175 files / 3 004 passed / 2 skipped, `npm run typecheck` clean, both manifest
+checks current, `npm run test:frontend` 138 files / 1 813 passed; the tree has grown since
+that measurement with the plugin-pipeline stage's own landings — 178 files / 3 130 passed
+recorded there — and nothing in this entry's scope has moved green-to-red since). T9 is
+partial: the Rust twin `packages/typecrate/harness/src/tools/catalogue.rs` still carries
+the **pre-engine** catalogue (`task`, `profileManage`, …) — it is GENERATED, its generator
+lives in disposable `Temp/` scratch which was found EMPTY, so it was left alone rather than
+hand-edited, and the host's typecrate service regenerates it from the current
+`src/core/tool-manifest.ts` when next run; see the "Rust twin — documented, not touched"
+note under round 9.**
+Sixteen decisions (A-P) are made below. Q1-Q5 were answered by the architect (rounds 5-6) and are recorded as Decisions
 I-O; **Q6 was answered in round 7 and is recorded as Decision P — no product question remains
 open.**
 
@@ -1609,3 +1619,213 @@ npm run tools:manifest:check && npm run test:package:tools
 - **Concurrent-edit risk to this document itself.** Other agents hold the same files open;
   `src/harness.ts` grew ~9 KB during the audit that produced this entry. Treat every number
   here as a pointer, not a fact — see the warning at the top.
+
+
+---
+
+## Round 8 — implementation record (2026-11-09, agent G8)
+
+**Drift check first.** Written against `44cdbbe`; the tree had moved to `afb38f1` plus a
+large uncommitted sibling landing (delegate timeout/scope, threadSend merge, plugin bus,
+edit/actorKey, messageId, outcome persistence, compaction policy, worker-lane transcript
+patch). Every anchor below was re-grepped by **identifier** before editing, per the rule at
+the top; no line number in this document was trusted. `src/harness.ts` is now ~582 KB.
+
+**Baseline before any edit** (`npx vitest run`, no TMPDIR override): 178 files,
+**3130 passed / 2 skipped**, exit 0. Focused baseline of the five files the brief names:
+**138 passed (5 files)**. Green, so work proceeded.
+
+### Landed
+
+| task | state | where |
+|---|---|---|
+| **T2 engine** | **landed** | new `src/core/records.ts` (~1,000 lines): one store, one global `nextId` (F3), batch CRUD with apply order **patches → removals → additions**, `expects` CAS, `since`/`afterId`/`mergeDisjoint`, per-collection `storeRev` + FIFO window (Decision B, 200/50), declared field specs with canonical order, caps, facets, `getOnly` projection and `sortable` (F9), `define`/`drop` (Decisions C/M: re-define is an error, non-empty and built-in drops are refused, definitions persist in the snapshot), snapshot readers (`readRecordsStoreState`) that validate every collection against its own stored definition, and the **R9 stale payload**: `stale-record` carries `expectedRev`/`currentRev`/`updatedBy`/`updatedAt`/`changedFields` **plus the current entry**, both in `error.details` and in the message as `current: {…}`, budgeted at `RECORD_STALE_PAYLOAD_BUDGET_BYTES` with a stated projection when it would overflow. |
+| **T2 specs** | **landed** | `src/core/{task,profile,chapter,location}.ts` are now pure `RecordCollectionDefinition` declarations. The F1 normalized diff reduced to what it predicted: `profile.ts` vs `location.ts` differ by the `traits` field alone. |
+| **T1 routing** | **landed** | `harness.runtime.executeRecords(name, context)` replaces `executeRecordTool`, registered in all four places: `AUTHORITY_RUNTIME_METHODS` + `SHARED_STATE_TOOL_NAMES` (`capability.ts`), the `LaneRuntimeCall` union (`lane-authority.ts`), the `answer()` switch with `adoptStoreCounter()` (`lane-authority.ts`), and the replica route (`lane-worker-loop.ts`). |
+| **T3 wrappers + rename** | **landed** | `tasks.tool.ts` (renamed from `task.tool.ts`, `TASKS_NAME`/`TASKS_METADATA`), new `records.tool.ts`, and `chapters`/`profiles`/`locations` (renamed from `*Manage.tool.ts`) — each one literal schema plus one routed call; the mapping and response reshape live engine-side because the gate pins these entries to `dependencies: []`. `TASK_TOOL_NAME` in `command-builtins.ts` is `'tasks'`; the command is still `/task`. HTTP path, frontend presets (`main.ts`), `contract.ts` core names, `scripts/check-package-tools.mjs` (entry list + name→path map), `CORE_ORDER` and the snapshot (`HarnessSnapshot.records` = one collection map, `HARNESS_SNAPSHOT_VERSION` **1 → 2**, no v1 reader per R5) all follow. `RECORD_SPACE`/`RECORD_TOOL_NAMES`/`ID_SPACES` collapse to one `'record'` space and `CanonicalView.records`. |
+| **T5 claim deletion** | **landed** | `claim`/`release`/`takeover`/`leaseMs`, the three `TASK_*_LEASE_MS` constants, `isHolder`/`isExpired`/`claimMessage`, entry `owner`/`ownerThreadId`/`leaseUntil`, `'claim'|'release'` from the change-op union (now `RecordChangeOp = 'add'|'update'|'remove'`), the `leaseUntil needs "owner"` restore check, the `/task claim|release|takeover` subcommands and the `(claimed by …)` suffix are **gone**, with `releaseThread` and all four `harness.ts` call sites (stop, delete/purge, `restore()`, roster-drop). `WriterLeaseLedger`, `IdentityLease` and a thread's `ownerThreadId` are untouched, as Decision P's "do not over-delete" table requires. |
+| **T4 R7 uplift** | **landed** | `toolCreate`'s description now states the purely-standalone rule and says plainly that the body receives `callTool`/`harness`; `capability.ts` gained `CREATED_TOOL_PROXY_CODE`/`CREATED_TOOL_PROXY_PATTERNS`/`reachesToolProxy` and reports (never refuses) a created body that forwards, surfaced on the authority's created-tool answer as `sync.warnings`. `records` is in the reserved-name set automatically (the reserved list is the registry's own names). |
+| **T6 / T6b descriptions + codes** | **landed** | `RECORD_ERROR_CODES` (`invalid-input`, `unknown-collection`, `collection-exists`, `collection-not-empty`, `collection-permanent`, `definition-invalid`, `record-cap`, `store-full`, `unknown-field`, `invalid-field`, `field-too-long`, `unknown-record`, `guarded-write`, `stale-record`, `batch-conflict`) with `HarnessError.code`/`.details`/`name = code` and the code as the message's first token; `toErrorInfo` now carries `code` only when present; `errorCodeOf`/`isRecordRejection` are total. The `records` description carries the unknown-collection rule, the transient-access rule (F10) and the one-line conflict rule, and advertises no claim verb. |
+| **T7 (partial)** | **evidence in tests, not run live** | `src/core/records.test.ts` proves the R9 payload survives the engine boundary and `src/harness.task.test.ts` proves it reaches the model through the wrapper (`Tool "tasks" failed: stale-record: … current: {…}`). The lane half is **not yet re-verified**: `lane-authority.test.ts` still fails on the renamed route (`executeRecords`) and on the deleted claim test. F12's two-notification question is answered by construction (a wrapper calls `runtime.executeRecords`, not `callTool`), so exactly one `invokeRegisteredTool` fires per wrapper call — not yet asserted in a test. |
+| **T8 tests** | **landed** | new `src/core/records.test.ts` (12 tests, all passing) covering: global ids across collections and `afterId` filtering by collection; `since` on A carries no B events and A's `storeRev` is untouched by a B burst; `mergeDisjoint` still provable after 240 writes to two other collections; the Decision P/R9 conflict test (same token, first lands, second refused with the winner's **values**); guarded write vs anonymous blind write; coded rejections for unknown collection / field cap / store full, with **no id burned**; `define` + re-define error + built-in/non-empty drop errors + empty drop; a `define`d collection (with its caps) rediscovered after `snapshot()`/`restore()`; the chapter `getOnly` projection, status facets and `order` sort; the one-collection-map snapshot shape. |
+| **T9 housekeeping** | **partial** | this section + the README row + the `knowledge.md` corrections. `src/core/index.ts` and `scripts/check-package-tools.mjs` are updated; `npm run tools:manifest` regenerated (31 descriptors) and `tools:manifest:check` is clean. **Not done:** the Rust twin `packages/typecrate/harness/src/tools/catalogue.rs` (its generator lives in `Temp/`, outside the repo) has not been regenerated. |
+
+### Corrected in place (the findings that moved)
+
+- **F17/T6b**: `HarnessError` gained `code` + `details` and sets `name = code`, exactly the
+  shape the finding asked for; `toErrorInfo` keeps `{ message }` and adds `code` only when
+  present, so every pre-existing `{ message }` wire payload is unchanged.
+- **F14/Decision I**: `CORE_ORDER` became `['toolRequest', 'tasks']` and the searchable set
+  gained `records` — `src/harness.task.test.ts` now pins 14 registered runtime tools.
+- **F3 consequence, measured**: the engine enforces the cross-collection uniqueness at
+  restore (`readSnapshotIdCounter` over the union of every collection's ids), which is what
+  the every-`taskItem('1')` rewrite needs.
+- **`releaseThread` count**: four call sites confirmed, all deleted (round 7's count of 2
+  had already been corrected to 4 in F11).
+
+### Not green yet — the honest state
+
+Full-suite work was in flight when this entry was written. Still failing and why:
+`harness.records.test.ts` (its expectations still name `profileManage`/`chapterManage`/
+`locationManage` and the removed claim verbs), `capability.test.ts` (routed-tool and
+shipped-toolbox name lists grow by `records`), `lane-authority.test.ts` /
+`lane-commit.test.ts` / `lane-identity.test.ts` (one `record` id space, the renamed routed
+method, and one lane claim test that must become a Decision P test),
+`harness.snapshot.test.ts` / `persistence.test.ts` / `sessions.test.ts` / `api.test.ts` /
+`metadata*.test.ts` (snapshot v2 shape + renamed tools + coded messages), and the frontend
+preset re-key. `npm run typecheck` is clean (0 errors) over `src/`.
+
+---
+
+## Round 9 — repair pass, the tag ruling, and the last verifications (2026-11-09, agent G8b)
+
+Scope: the suite drift left by the engine landing (44 files at the start of the pass), the two
+lane checks T7 still owed, and the discovery finding T6 left open. Three production fixes came
+out of chasing failures — each is a contract this document already states, listed under "Fixes
+found by chasing failures" so the change is auditable rather than silent.
+
+### The tag ruling — `records` owns only the engine's words (corrects the T6 row in place)
+
+T6 as written: *"`records`' description carries the unknown-collection rule, the transient-access
+rule (F10) and the one-line conflict rule"* and the entry is searchable. Its tag list originally
+echoed the collection vocabulary (`collection`, `collections`, `schema`), which made the engine a
+tag-shadow of every wrapper it serves.
+
+Corrected: the tag set is now `['records', 'record', 'store', 'entries', 'define']` — the words
+that describe the ENGINE (`src/tools/runtime/records.tool.ts`). Wrapper words (todos, traits,
+memos, scenes, settings…) belong to the wrappers, which are the doors an agent walks through for
+one store; `records` is the escalation surface reached when a wrapper's schema refuses, and it is
+found by its own name.
+
+The measured half, which the ruling does NOT change: narrowing the tags did not stop
+`toolRequest tags:["profile"]` from enabling `records`. The cause is not the tags — it is
+`scoreTool`'s 1-point rung (`src/core/discovery.ts:127-141`), which scans a searchable tool's
+DESCRIPTION, and T6 requires this description to name the built-in collections. So a wrapper word
+still reaches `records`, always at the WEAKEST rung: `profiles` scores 4 (exact tag) and ranks
+first, `records` scores 1 and ranks last. That is the property the escalation rationale needs
+(the engine never outranks a wrapper), and it is now pinned rather than assumed:
+`harness.records.test.ts`, `harness.test.ts` and `harness.browser-fallback.test.ts` carry
+`records` in the enabled sets with a comment naming the rung.
+
+Two consequences of the same narrowing are pinned where they are visible: the searchable tag
+UNION grows by `define`, `entries`, `record`, `records`, `store` and loses `book` (the chapters
+entry keeps only the story words) — `harness.already-available.test.ts` and
+`harness.discovery.test.ts` pin the union; and every pinned inventory count grows by the one new row:
+`src/core/tool-manifest.ts` reports 31 descriptors, the browser fallback without presets
+reports 21, and the `descriptors*` / `tool-discovery*` / server-page expectations follow.
+
+### Fixes found by chasing failures (three, all contract-restoring)
+
+1. **`chapters` `get` returns `{ chapter, content, counts }`.** The engine first shipped
+   `content` INSIDE `chapter`, which contradicts the wrapper's own description and
+   `knowledge.md:971`. `toWrapperResult` now hoists every `getOnly` field of a collection to a
+   SIBLING of the singular key on a `get`, leaving the entry as the declared projection
+   (`src/core/records.ts:2655-2687`). `records` — no wrapper, no reshape — still answers with the
+   record whole, and a mutation answer still carries no body.
+2. **A removal of an id the collection never held reports `unknown-record`.** Removal ids were
+   absent from the existence pass, so an identified caller got the guard's "read it first" and an
+   identity-less caller got a silent no-op. They now join it (`src/core/records.ts:1412-1423`),
+   which is what `core/task.ts:34` ("an unknown id is a rejection"), the old
+   `core/chapter.ts:597` and `/task remove`'s own comment in `command-builtins.ts:363-365` all
+   promise. `/task remove 99` answers
+   `/task remove: unknown-record: tasks has no task with id "99".`
+3. **Restore validation got the depth the entries already had.** An entry field failure was
+   labelled with the COLLECTION name (`tasks state "completed" must be a boolean…`), so a 200-record
+   file never said WHICH record; it now carries the snapshot path
+   (`records state.collections.tasks.items[0] "completed" must be a boolean when provided.`).
+   And a change-feed `fields` array is validated against the collection's declared keys, with
+   duplicates refused — the pre-engine store enforced exactly this over `TASK_CONTENT_FIELDS`, and
+   the feed is the evidence `mergeDisjoint` relies on, so an undeclared name would make a real
+   conflict look provable (`readStoredChange`, `src/core/records.ts:1745-1810`).
+
+### T7 closed — every claim this document could not test is now a test
+
+- **F12 (one notification per logical write)** — `src/harness.records.test.ts`,
+  `record wrappers call the engine exactly once (F12)`. Two checks: a source scan of all five
+  entries (exactly one `runtime.executeRecords(<NAME>, context)` call site each, zero `callTool`),
+  and one live call per surface asserting exactly one engine call and exactly one
+  `{ reason: 'tool_execute', tool: <name> }` event on the persistence observer.
+- **Worker mode routes a wrapper write to the authority** — `src/server/workers/lane-worker.test.ts`,
+  `worker mode: the record route is the only door (T1/T7)`. Writes through `tasks`, `profiles`,
+  `chapters`, `locations` and `records` in one session land in the COORDINATOR's document with ids
+  1-5 from the ONE counter (`records.nextId === 6`), attribution answered by the authority
+  (`updatedBy: 'demo'`, no thread for a manual call). A replica-local write fails on the first
+  assertion.
+- **The classification guard** — same describe: every member a live `harness.runtime` exposes is
+  classified (routed or local), `executeRecords` is routed and serves all five tools by name, and
+  installing an authority runtime over an UNREGISTERED member throws
+  `harness.runtime.mintRecordLocally is neither routed to the authority nor declared local…`
+  instead of letting a lane keep a private writer.
+- **Lane tests re-pointed** — `lane-authority.test.ts` pins the engine's CAS sentence verbatim
+  (code-first, `updatedAt` beside the last editor, R9's `current:` payload) and the routed lane
+  CLAIM test is deleted (Decision P deleted its subject; the CAS test above it is the routed-write
+  proof). `lane-commit.test.ts` folds an add+update window through the collection-map validator and
+  pins the digest-vs-token difference on the ATTRIBUTION pair, which is what moves without the
+  tool's `{ id, rev }` token now that claims are gone. `lane-identity.test.ts` pins the single
+  `record` space (one message change) and the v2 store shape. `capability.test.ts` pins `tasks` and
+  `records` in the proxied/routed sets.
+
+### T8 harness-level items closed
+
+`src/harness.task.test.ts`, `record engine at the harness boundary (T8)`:
+- **Decision L** — attribution outlives the roster: a record written by `researcher` keeps
+  `updatedBy: 'researcher'` and the feed event keeps `by: 'researcher'` after
+  `harness.removeAgent('researcher')`, byte-identical before and after. Never roster-validated.
+- **Decision P restated at its simplest** — there is no lock to strand, so stop / delete /
+  snapshot / restore strand nothing: the tool schema has no `claim`/`release`/`takeover`/`leaseMs`,
+  the persisted block contains no `"owner"` or `leaseUntil` anywhere, the feed has only `add`, and a
+  restored record is exactly `['id','text','completed','rev','updatedBy','updatedThreadId','updatedAt']`.
+  An OLD file that does carry a claim is refused as an unknown field
+  (`src/harness.snapshot.test.ts`), which is the check the retired sweep used to be.
+- **Decision O through the wrapper** — a stale write through `tasks` rejects with
+  `code === 'stale-record'`, a message that STARTS with `stale-record: `, and
+  `details.currentRev` / `details.changedFields` / `details.entry` (R9's current record) intact.
+
+### The Rust twin — documented, not touched
+
+`packages/typecrate/harness/src/tools/catalogue.rs` is a GENERATED file: its header names
+`Temp/typecrate-harness/t4/generate-catalogue.mjs` as the writer, and that path exists in this
+checkout but is EMPTY (Temp is disposable scratch per `AGENTS.md`). The generator is therefore
+absent, the twin was NOT regenerated here, and it was not hand-edited either — the rule in its own
+header ("Regenerate instead of editing") is the reason. The host's typecrate service regenerates it
+from `packages/underload/harness/src/core/tool-manifest.ts`; when it next runs it will pick up the
+31-descriptor catalogue (`records` new, `task` → `tasks`, `profileManage`/`chapterManage`/
+`locationManage` → `profiles`/`chapters`/`locations`, and the `tasks` schema without the claim
+verbs). Until then the twin still describes the pre-engine catalogue.
+
+### Round 9 status — T1-T9, as measured this pass
+
+| Task | State | Evidence |
+|---|---|---|
+| **T1** route the wrappers | **landed** | `executeRecords(name, context)` in `src/types/index.ts` + all four worker places (`capability.ts`, `lane-authority.ts`, `lane-worker-loop.ts`, `lane-commit.ts`); one `record` id space. Proved in worker mode by the new `lane-worker.test.ts` describe, and by `lane-authority.test.ts`'s routed CAS test. |
+| **T2** build the engine | **landed** | `src/core/records.ts` (single store, global counter, declared field specs, canonical order, facets, `getOnly`, guarded writes, `mergeDisjoint`, `define`/`drop`, R9 payloads) + `src/core/records.test.ts` (12 tests). |
+| **T3** wrappers + rename + plumbing | **landed** | five source entries, four spec-only core modules, manifest regenerated (31), snapshot v2 (`HARNESS_SNAPSHOT_VERSION = 2`, no v1 reader per R5), `CORE_ORDER`, frontend presets, `contract.ts`, `check-package-tools.mjs`, HTTP names. The `getOnly` response half was fixed this pass (finding 1 above). |
+| **T4** R7 stated contract | **landed** | `toolCreate` description + `CREATED_TOOL_PROXY_*` scan (round 8); description re-pinned verbatim this pass. |
+| **T5** delete the lock | **landed** | verbs, `leaseMs`, lease constants, holder fields, `/task claim|release|takeover`, `releaseThread` and its 4 sites gone; snapshot refuses a persisted claim as an unknown field; the strand-free restatement is now a test. |
+| **T6** `records` description | **landed** (corrected this pass) | description unchanged in substance; tags narrowed to the engine's own words, and the description-rung behaviour pinned rather than assumed. |
+| **T6b** coded rejections | **landed** | 15 `RECORD_ERROR_CODES`; `HarnessError.code`/`details`/`name`; code-first messages; the wrapper-surfaces-same-code test closes the "same code through the wrapper" half. |
+| **T7** verify the untestable claims | **landed** (was partial) | F12 and the worker-mode route are asserted, not inferred — see the round-9 T7 section. |
+| **T8** tests for R3's guarantees | **landed** | engine (12) + harness-boundary (3) + snapshot v2 (41) + persistence/commands/queue/records integration; `src/harness.task.test.ts` 18 tests. |
+| **T9** housekeeping | **partial** | knowledge.md + README + this record updated; manifests regenerated and `:check` clean. The Rust twin is NOT regenerated (generator absent from `Temp/` scratch) — documented above, deliberately not hand-edited. |
+
+### Round 9 measurements (the commands, the context, the outcome)
+
+Run from `packages/underload/harness/`, no `TMPDIR` override, Node 24.19, after the last
+production and test edit of this pass:
+
+| Command | Outcome |
+|---|---|
+| `npx vitest run` (whole backend suite) | **exit 0** — 175 files passed, 3 004 passed / 2 skipped (3 006). |
+| `npm run test:frontend` | **exit 0** — 138 files passed, 1 813 passed. |
+| `npm run typecheck` | **exit 0** (tsc clean, then both manifest checks). |
+| `npm run tools:manifest:check` | `tool-manifest.ts is current (31 descriptors)`. |
+| `npm run plugins:manifest:check` | `plugin-manifest.ts is current (2 plugins)`. |
+| `npx vitest run src/core/records.test.ts src/harness.task.test.ts src/harness.records.test.ts src/server/persistence.test.ts src/server/commands.test.ts` | **5 files / 87 tests passed** — the engine, the wrapper + T8 harness boundary, the F12 construction check, and the two persistence/HTTP surfaces that read snapshot v2. |
+
+Round 8's "not green yet" list is closed: the 44 failing files were 25 when this pass started
+(93 failing tests → 52), and all 25 are now passing. The drift was pinned to the re-keyed
+reality — snapshot v2 shapes, the `record` id space, coded message prefixes, `tasks` /
+`profiles` / `chapters` / `locations` / `records` in every registered/searchable/proxied list,
+the narrowed tag union (loses `book`, gains `define`/`entries`/`record`/`records`/`store`), and
+the deleted claim verbs — except the three places listed above under "Fixes found by chasing
+failures", where the PRODUCTION code was wrong against this document.

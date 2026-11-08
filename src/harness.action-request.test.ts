@@ -32,6 +32,32 @@ import type {
     HarnessStreamRequest
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const routed = (
     route: (request: HarnessStreamRequest) => HarnessStreamEvent[],
     seen?: HarnessStreamRequest[]
@@ -244,7 +270,7 @@ describe('actionRequest runtime', () => {
         // The root declaration list includes both branch controls.
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
             'toolRequest',
-            'task'
+            'tasks'
         ]);
     });
 
@@ -541,13 +567,13 @@ describe('actionRequest runtime', () => {
         // (1) The autoanswer branch transcript is the incorporated history, flags
         //     included: the disabled owner turn kept its flag, and the disabled child
         //     instruction became a flagged quoted wrapper instead of an enabled one.
-        expect(
+        expect(withoutIds(
             autoBranch!.messages.filter(
                 (message) =>
                     message.content === 'owner seed disabled' ||
                     message.content.startsWith('[Quoted system instruction from branch')
             )
-        ).toEqual([
+        )).toEqual([
             { role: 'user', content: 'owner seed disabled', included: false },
             {
                 role: 'user',

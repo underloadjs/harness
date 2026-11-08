@@ -46,7 +46,8 @@
 //   - ./lane-worker.ts   - the worker side that raises the requests
 //   - ./protocol.ts      - the frames and the epoch / seq / callId rules
 //   - ../../harness.ts   - the targeted seams used below: appendThreadMessages,
-//                          setThreadStatus, archiveInvocation, reserveIdentity
+//                          patchThreadMessages, setThreadStatus, archiveInvocation,
+//                          reserveIdentity
 //   - ../sessions.ts     - noteStateChange (the inline snapshot this matches), action
 //                          broker, and the session that owns one authority per session id
 
@@ -84,9 +85,11 @@ import type { MemoryWindow } from './lane-memory';
 // shared reach the plan could not bound.
 import { assessWorkerToolSurface, toolScanTextOf } from './capability';
 
-// The record-store tool names the authority can execute. Matches the core's own union
-// (`HarnessToolRuntime['executeRecordTool']`), stated here so the wire type is explicit.
-export const RECORD_TOOL_NAMES = ['task', 'profileManage', 'chapterManage', 'locationManage'] as const;
+// The record-tool names the authority can execute: the engine surface plus its four
+// wrappers. Matches the core's own union (`HarnessToolRuntime['executeRecords']` and
+// `RECORDS_TOOL_NAMES` in ../../types), stated here so the wire type is explicit. The
+// engine maps a tool name to its collection, so the authority needs no per-store table.
+export const RECORD_TOOL_NAMES = ['records', 'tasks', 'chapters', 'profiles', 'locations'] as const;
 
 export type RecordToolName = (typeof RECORD_TOOL_NAMES)[number];
 
@@ -102,7 +105,7 @@ export type LaneCallIdentity = {
 
 // One routed `harness.runtime` call, as it crosses the boundary.
 export type LaneRuntimeCall =
-    | { op: 'runtime'; method: 'executeRecordTool'; name: RecordToolName; parameters: unknown; identity: LaneCallIdentity }
+    | { op: 'runtime'; method: 'executeRecords'; name: RecordToolName; parameters: unknown; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'manageTool'; parameters: unknown; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'createToolForAgent'; creation: unknown; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'requestTools'; parameters: unknown; identity: LaneCallIdentity }
@@ -126,7 +129,14 @@ export type LaneAuthorityRequest =
     // T10 finding M4: the lane asks for the canonical transcript tail it has not adopted.
     // `haveLength` is the prefix THIS replica already holds (and has published), so the
     // answer is exactly what moved - a sibling `threadSend`, or another lane's append.
-    | { op: 'transcript:sync'; threadId: string; haveLength: number }
+    //
+    // T4.1 adds `haveDigest`: the digest of that same prefix, as this replica holds it. Length
+    // alone cannot see an IN-PLACE canonical change (a host transcript edit, another lane's
+    // committed `transcript:patch`), and a lane whose prefix content moved must re-read the
+    // whole prefix rather than append a delta of zero messages. Absent means "the caller states
+    // no content", which keeps the pre-T4 question answerable - a digest the replica never
+    // tracked must not be invented on its behalf.
+    | { op: 'transcript:sync'; threadId: string; haveLength: number; haveDigest?: string }
     | { op: 'brain:claim'; agent: string }
     | { op: 'brain:release'; agent: string }
     | { op: 'action:request'; requestId: string; agent: string; threadId?: string; request: HarnessActionRequest }
@@ -156,6 +166,11 @@ export type LaneAuthorityAnswer = {
         // declared window with these and pulls the digests, so a model-created tool's memory
         // write is committed instead of silently dropped by the derivation.
         memoryKeys?: string[];
+        // R7 (records-engine Decision F): non-blocking findings about a revision the
+        // authority just installed — today only `created-tool-proxy`, which tells the
+        // author its body forwards to another tool instead of computing its own result.
+        // Reported, never refused, so the install stands and the model can act on it.
+        warnings?: string[];
     };
 };
 
@@ -208,6 +223,18 @@ export type LaneAuthority = {
     // Defensive by design: a conversation deleted mid-turn reads as 0 here, and the append
     // that follows is refused with a name rather than throwing inside the dispatch.
     canonicalLengthOf: (threadId: string) => number;
+    // pipeline T4.1: the length AND the content of the canonical transcript, in ONE read. The
+    // host ships both on the `turn` frame (`fromLength`/`fromDigest`) so a lane can tell an
+    // IN-PLACE canonical change (a host transcript edit, a sibling's committed
+    // `transcript:patch`) from "nothing moved" — the length alone cannot, and the digest is the
+    // same `digestMemoryValue` the lane's own base and the patch CAS use. It is also CHEAPER than
+    // calling `canonicalLengthOf` and then a digest separately: `canonicalTranscriptOf` clones the
+    // whole conversation once, and the retired length-only read threw that copy away.
+    //
+    // Same defensive rule as `canonicalLengthOf`: a conversation that is gone reports
+    // `{ length: 0, digest: <the digest of an empty transcript> }`, which the lane answers with a
+    // rebase rather than an exception inside the dispatch.
+    canonicalHeadOf: (threadId: string) => { length: number; digest: string };
     // T10 finding M4: the canonical transcript itself, in canonical order. Length alone is
     // not a sync primitive - a replica can be behind by N messages it never saw, and the
     // only honest fix is to ship those messages. Throws for an id this harness never had
@@ -220,30 +247,34 @@ export type LaneAuthority = {
 // rejected op can never be validated against a stale projection.
 // ---------------------------------------------------------------------------
 
-const asRecords = (value: unknown): { items: { id: string }[]; nextId: number } => {
-    const source = (value ?? { items: [], nextId: 1 }) as { items: { id: string }[]; nextId: number };
+// One collection of the unified store, detached. `nextId` is filled in by `storesOf`
+// with the STORE-level counter, because since F3 there is exactly one counter and it
+// lives above the collections.
+const asRecords = (value: unknown, nextId: number): { items: { id: string }[]; nextId: number } => {
+    const source = (value ?? { items: [] }) as { items?: { id: string }[] };
 
     return {
         // Detached: the fold mutates its copy, never the snapshot's arrays.
         items: structuredClone(source.items ?? []),
-        nextId: source.nextId ?? 1
+        nextId
     };
 };
 
-// The snapshot shape (src/types/index.ts HarnessSnapshot) uses `stores` for the record
-// stores and `records` for the todo list; both spellings are read here so a view is total
-// whatever the shipped snapshot version names, and a missing section is an empty store
-// rather than a crash.
-const storesOf = (snapshot: HarnessSnapshot): CanonicalView['stores'] => {
-    const section = (snapshot as unknown as { stores?: Record<string, unknown>; records?: Record<string, unknown> });
-    const source = { ...(section.records ?? {}), ...(section.stores ?? {}) } as Record<string, unknown>;
+// The unified store, read out of a snapshot (src/types/index.ts `HarnessSnapshot.records`
+// → `RecordsStoreState`): one `collections` map plus the store-level `nextId`. A missing
+// collection is an EMPTY store rather than a crash, so a view is total whatever the
+// caller's snapshot happened to persist.
+const recordsOf = (snapshot: HarnessSnapshot): { stores: CanonicalView['stores']; nextId: number } => {
+    const section = (snapshot as unknown as { records?: { nextId?: number; collections?: Record<string, unknown> } });
+    const nextId = section.records?.nextId ?? 1;
+    const collections = section.records?.collections ?? {};
     const stores = {} as CanonicalView['stores'];
 
-    for (const name of ['todos', 'profiles', 'chapters', 'locations'] as const) {
-        stores[name] = asRecords(source[name]) as CanonicalView['stores'][typeof name];
+    for (const name of ['tasks', 'chapters', 'profiles', 'locations'] as const) {
+        stores[name] = asRecords(collections[name], nextId) as CanonicalView['stores'][typeof name];
     }
 
-    return stores;
+    return { stores, nextId };
 };
 
 // Threads the authority can address. A HOST thread is a snapshot record; an agent's DEFAULT
@@ -294,6 +325,10 @@ export const canonicalViewOf = (
     resultOwners: ReadonlyMap<string, number> = new Map()
 ): CanonicalView => {
     const snapshot = harness.snapshot();
+    // ONE read of the record store for this view: the collections and the id counter come
+    // from the same snapshot section, and `recordsOf` detaches (clones) the items, so
+    // calling it twice would double the copy for every fold.
+    const recordStore = recordsOf(snapshot);
     const results: CanonicalView['results'] = {};
 
     for (const record of (snapshot as unknown as { agentResults?: CanonicalView['results'][string][] }).agentResults ?? []) {
@@ -315,7 +350,10 @@ export const canonicalViewOf = (
 
     return {
         threads: threadsOf(snapshot),
-        stores: storesOf(snapshot),
+        stores: recordStore.stores,
+        // The ONE record id counter (F3), read straight from the persisted store rather
+        // than inferred from any collection.
+        records: { nextId: recordStore.nextId },
         results,
         resultOwners: Object.fromEntries(resultOwners.entries()),
         tools,
@@ -338,10 +376,10 @@ const seedsOf = (view: CanonicalView, harness: Harness): Partial<Record<IdSpace,
     const identities: Partial<Record<IdSpace, number>> = {};
 
     for (const space of ID_SPACES) {
-        if (space.startsWith('record:')) {
-            const store = view.stores[space.slice(7) as RecordStoreName];
-
-            identities[space] = seedFromCounter(space, store?.nextId ?? 1);
+        // ONE record space (F3): every collection draws from this counter, so the seed
+        // is the store-level number rather than a per-store one.
+        if (space === 'record') {
+            identities.record = seedFromCounter('record', view.records?.nextId ?? 1);
             continue;
         }
 
@@ -433,25 +471,19 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         }
     };
 
-    // Which identity space each record tool's store draws from. The mapping is explicit
-    // because the tool names and the store names differ (`task` owns `todos`).
-    const RECORD_SPACE: Record<RecordToolName, IdSpace> = {
-        task: 'record:todos',
-        profileManage: 'record:profiles',
-        chapterManage: 'record:chapters',
-        locationManage: 'record:locations'
-    };
+    // Fold the canonical store's id counter into the ledger after a routed record
+    // operation. ONE space for every collection (F3), so this no longer takes a tool
+    // name: a routed `tasks` write and a routed `chapters` write move the same counter.
+    // Units are converted with `seedFromCounter`, since the store counts the NEXT id
+    // while the ledger counts the highest ISSUED one.
+    //
+    // The core minted the id inside ITS store, so the ledger must adopt that counter:
+    // without this a later lane lease could hand out an id the authority already used,
+    // which is exactly the invalid-snapshot failure T3 finding F1 reported.
+    const adoptStoreCounter = (): void => {
+        const space: IdSpace = 'record';
 
-    // Fold the canonical store's `nextId` into the ledger after a routed record operation.
-    // Units are converted with `seedFromCounter`, since a store counts the NEXT id while the
-    // ledger counts the highest ISSUED one.
-    const adoptStoreCounter = (name: RecordToolName): void => {
-        const space = RECORD_SPACE[name];
-        const store = view().stores[space.slice(7) as RecordStoreName];
-
-        if (store === undefined) return;
-
-        ledger.observe(space, seedFromCounter(space, store.nextId));
+        ledger.observe(space, seedFromCounter(space, view().records.nextId));
     };
 
     // Resolve the caller's Agent from the NAME the lane reported, against the canonical
@@ -501,6 +533,24 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         }
     };
 
+    // T4.1: length AND content, from one canonical read. The digest is over the WHOLE transcript
+    // (see `LaneCommand['turn']`'s `fromDigest` for why that scope is the only one that can be
+    // compared), computed by the same serializer the patch CAS and the lane's own base use, so
+    // the three sides of this protocol agree about what "the same transcript" means.
+    const canonicalHeadOf = (threadId: string): { length: number; digest: string } => {
+        try {
+            const messages = canonicalTranscriptOf(threadId);
+
+            return { length: messages.length, digest: digestMemoryValue(messages) };
+        } catch {
+            // A conversation that is gone: an EMPTY transcript's digest, not ABSENT_DIGEST. The
+            // lane's base for a brand-new conversation is `digestMemoryValue([])` too, so the two
+            // sides still agree that "nothing here yet" is a comparable state; `ABSENT_DIGEST`
+            // means "this key never existed" on the memory axis and would be a different fact.
+            return { length: 0, digest: digestMemoryValue([]) };
+        }
+    };
+
     // T10 finding S6: the memory window handed to the fold. An EMPTY session window means
     // "this session declares no keys at all" (the same unrestricted reading `memory:window`
     // already uses), so `undefined` is passed and nothing is refused on that axis; a
@@ -519,20 +569,20 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         switch (request.op) {
             case 'runtime': {
                 // Every method here mutates or reads SESSION-SHARED state, so the canonical
-                // harness performs it. `executeRecordTool` needs a context (the core record
+                // harness performs it. `executeRecords` needs a context (the core record
                 // tools take one), which is why it is fabricated below rather than shipped
                 // across the boundary as an argument.
                 const runtime = harness.runtime;
 
                 switch (request.method) {
-                    case 'executeRecordTool': {
-                        const value = await runtime.executeRecordTool(request.name as RecordToolName, contextFor(request.parameters, request.identity));
+                    case 'executeRecords': {
+                        // The engine resolves the wrapper name to its collection, applies the
+                        // write, and mints any new id from the store's own counter — all on the
+                        // CANONICAL harness, which is the whole point of routing here (F5: a lane
+                        // must never write a record against its private copy).
+                        const value = await runtime.executeRecords(request.name as RecordToolName, contextFor(request.parameters, request.identity));
 
-                        // The core minted the id inside ITS store, so the ledger must adopt
-                        // that counter: without this a later lane lease could hand out an id
-                        // the authority already used, which is exactly the invalid-snapshot
-                        // failure T3 finding F1 reported.
-                        adoptStoreCounter(request.name as RecordToolName);
+                        adoptStoreCounter();
 
                         return { value, sync: { identities: ledger.watermarks() } };
                     }
@@ -552,7 +602,9 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         const creationText = toolScanTextOf(creation as unknown as Parameters<typeof toolScanTextOf>[0]);
                         const candidate = assessWorkerToolSurface({
                             name: creation?.name ?? 'created tool',
-                            source: creationText
+                            source: creationText,
+                            // R7: this IS a created tool, so the standalone rule applies.
+                            created: true
                         });
 
                         if (candidate.reasons.length > 0) {
@@ -627,7 +679,17 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                                     registry: [change],
                                     enabled: enabledNow(),
                                     identities: ledger.watermarks(),
-                                    ...(gained.length === 0 ? {} : { memoryKeys: gained })
+                                    ...(gained.length === 0 ? {} : { memoryKeys: gained }),
+                                    // R7's report (Decision F): a created body that proxies
+                                    // another tool is told to the lane that created it —
+                                    // named, and NOT a refusal. The install stands.
+                                    ...(candidate.warnings.length === 0
+                                        ? {}
+                                        : {
+                                              warnings: candidate.warnings.map(
+                                                  (warning) => warning.message
+                                              )
+                                          })
                                 }
                             };
                         }
@@ -705,17 +767,33 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
             case 'transcript:sync': {
                 const messages = canonicalTranscriptOf(request.threadId);
                 const have = Math.max(0, Math.trunc(request.haveLength));
+                const whole = (): unknown => ({
+                    threadId: request.threadId,
+                    fromLength: 0,
+                    length: messages.length,
+                    // The whole canonical transcript is the only honest answer once the lane's
+                    // base cannot be extended in place: it got shorter, or the part it holds
+                    // changed under it.
+                    rebased: true,
+                    messages
+                });
 
                 if (have > messages.length) {
-                    return {
-                        value: {
-                            threadId: request.threadId,
-                            fromLength: 0,
-                            length: messages.length,
-                            rebased: true,
-                            messages
-                        }
-                    };
+                    return { value: whole() };
+                }
+
+                // T4.1: the SAME question asked about CONTENT. A canonical IN-PLACE change
+                // (a host transcript edit, or another lane's committed `transcript:patch`) moves
+                // the prefix without moving the length, so the delta below would answer "no
+                // messages missing" and the replica would keep serving a transcript the
+                // authority no longer holds. `haveDigest` absent means the caller states no
+                // content, and the length rule alone decides - which is exactly the pre-T4
+                // answer, so an older worker is not refused for not knowing the new field.
+                if (
+                    request.haveDigest !== undefined &&
+                    request.haveDigest !== digestMemoryValue(messages.slice(0, have))
+                ) {
+                    return { value: whole() };
                 }
 
                 return {
@@ -762,11 +840,16 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
 
     // Replay ONE applied op onto the canonical harness. `effect` is what the receipt
     // reported; a divergence between the fold and the live object is reported, not hidden.
+    //
+    // `code` is for the case where the LIVE refusal is NOT the conflict the kind usually means:
+    // a `transcript:patch` whose CAS passes but whose payload the core seam refuses (a role or an
+    // address moving, a malformed entry) is an `invalid-mutation`, not a `prefix-moved`, and
+    // sending the lane to re-read canonical would send it somewhere pointless.
     const replay = (
         laneEpoch: number,
         mutation: Parameters<typeof applySharedMutation>[1],
         receiptStatus: string
-    ): { ok: boolean; digest?: string; length?: number; reason?: string } => {
+    ): { ok: boolean; digest?: string; length?: number; reason?: string; code?: MutationRejectionCode } => {
         if (receiptStatus !== 'applied') return { ok: true };
 
         switch (mutation.kind) {
@@ -777,6 +860,58 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                     return { ok: true, length: messages.length, digest: digestMemoryValue(messages) };
                 } catch (error) {
                     return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+                }
+            }
+
+            // pipeline T4.1: the live half of the committed-prefix patch. The FOLD already
+            // compare-and-set against the snapshot it was built from, and `commit()` is fully
+            // synchronous, so the live object cannot have moved between the two in this process.
+            // The check is repeated HERE anyway for the same reason `appendThreadMessages`
+            // re-checks `fromLength` in the core: the LIVE object gets the final word, and a
+            // divergence is reported, never hidden (the module header). It also digests the
+            // LIVE transcript, which is the exact lineage the lane's own `expects` was taken
+            // from (`threadMessages`), so a fold-vs-live projection difference can only ever
+            // produce a named refusal and a re-read — never a silently wrong base.
+            case 'transcript:patch': {
+                try {
+                    const live = canonicalTranscriptOf(mutation.threadId);
+
+                    if (live.length < mutation.expectedLength) {
+                        return {
+                            ok: false,
+                            length: live.length,
+                            digest: digestMemoryValue(live),
+                            reason: `Thread "${mutation.threadId}" holds ${live.length} messages, not ${mutation.expectedLength}; re-read before patching.`
+                        };
+                    }
+
+                    const livePrefix = digestMemoryValue(live.slice(0, mutation.expectedLength));
+
+                    if (livePrefix !== mutation.expects) {
+                        return {
+                            ok: false,
+                            length: live.length,
+                            digest: digestMemoryValue(live),
+                            reason: `The first ${mutation.expectedLength} messages of thread "${mutation.threadId}" changed since this lane read them; re-read before patching.`
+                        };
+                    }
+
+                    const messages = harness.patchThreadMessages(mutation.threadId, mutation.messages, mutation.expectedLength);
+
+                    return {
+                        ok: true,
+                        length: mutation.expectedLength,
+                        digest: digestMemoryValue(messages.slice(0, mutation.expectedLength))
+                    };
+                } catch (error) {
+                    // Everything the CAS above already accepted, the core seam refused: a role
+                    // moving, an address moving, or an entry the reader refuses. That is a bad
+                    // OPERATION, not a moved base, so it is named as one.
+                    return {
+                        ok: false,
+                        code: 'invalid-mutation',
+                        reason: error instanceof Error ? error.message : String(error)
+                    };
                 }
             }
 
@@ -842,7 +977,10 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
     // whose code names the wrong conflict sends the lane to the wrong fix).
     const liveRejectionCodeOf = (mutation: Parameters<typeof applySharedMutation>[1]): MutationRejectionCode => {
         if (mutation.kind === 'memory:set' || mutation.kind === 'memory:delete') return 'stale-memory';
-        if (mutation.kind === 'transcript:append') return 'prefix-moved';
+        // T4.1: the in-place prefix patch conflicts on the SAME axis as the append (the
+        // committed base moved), so it conflicts with the SAME code — one rebase path, not two
+        // conflict stories (pipeline T4.1's stated preference).
+        if (mutation.kind === 'transcript:append' || mutation.kind === 'transcript:patch') return 'prefix-moved';
         if (mutation.kind === 'thread:status' || mutation.kind === 'result:archive') return 'stale-record';
 
         return 'invalid-mutation';
@@ -954,7 +1092,9 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                 ...receipt,
                 status: 'rejected' as const,
                 rejection: {
-                    code: liveRejectionCodeOf(mutation),
+                    // The op kind's usual live conflict, unless the replay named a more honest one
+                    // (a `transcript:patch` the CAS accepted but the core seam refused).
+                    code: applied.code ?? liveRejectionCodeOf(mutation),
                     message: applied.reason ?? 'the canonical state moved between the fold and the write'
                 },
                 effect: { ...receipt.effect, ...(applied.digest === undefined ? {} : { digest: applied.digest }) }
@@ -985,6 +1125,7 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         answer,
         commit,
         canonicalLengthOf,
+        canonicalHeadOf,
         canonicalTranscriptOf
     };
 };

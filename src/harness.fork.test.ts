@@ -15,6 +15,12 @@
 //   - branch records are detached, bounded audit state and are excluded from
 //     snapshot v1;
 //   - the manual executeTool path refuses threadFork.
+//
+// Policy 2026-11-09 (docs/tasks/2026-11-09-thread-timeout-policy.md T5.3) adds the
+// other half of one contract: a branch has NO wall-clock bound — it ends on its own
+// answer, never on a clock. The whole file already owns the fake clock, so the test
+// named for that task advances timers AND Date minutes past the 300000 ms a delegated
+// child used to be given, with `vi.getTimerCount() === 0` proving nothing is armed.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
@@ -26,10 +32,37 @@ import type {
     Agent,
     HarnessEvent,
     HarnessMessage,
+    HarnessPluginApi,
     HarnessStream,
     HarnessStreamEvent,
     HarnessStreamRequest
 } from '@underload/harness';
+
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
 
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
     let index = 0;
@@ -144,6 +177,14 @@ const flush = async (): Promise<void> => {
     }
 };
 
+// Move the fake clock by an exact amount and let the resulting work settle. Used by
+// the 2026-11-09 "no wall-clock bound" policy test, where the point is that time
+// passes and nothing acts on it.
+const advanceBy = async (ms: number): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await flush();
+};
+
 const deferred = <T>() => {
     let settle!: (value: T) => void;
     const promise = new Promise<T>((resolve) => {
@@ -234,7 +275,7 @@ describe('threadFork runtime', () => {
         expect(entry.messages.filter((message) => message.role === 'user')).toHaveLength(1);
         // R9-R11: the requester's own declaration list is the bootstrap pair; the
         // fork grant adds the runtime controls without declaring them.
-        expect(toolNames(seen[seen.length - 1])).toEqual(['toolRequest', 'task']);
+        expect(toolNames(seen[seen.length - 1])).toEqual(['toolRequest', 'tasks']);
 
         // Every branch frame is labelled with its branch thread.
         const branchStarts = events.filter((event) => event.type === 'branch_start');
@@ -389,12 +430,12 @@ describe('threadFork runtime', () => {
         });
         // R9-R11: the branch copies the requester's declaration list, which is now
         // the bootstrap pair; threadFork is searchable and simply not in it.
-        expect(toolNames(branchRequest)).toEqual(['toolRequest', 'task']);
+        expect(toolNames(branchRequest)).toEqual(['toolRequest', 'tasks']);
 
         const record = writer.branches()[0];
         expect(record.model).toBe('copy/model');
-        expect(record.messages[0]).toEqual({ role: 'system', content: 'SYS' });
-        expect(record.messages[1]).toEqual({
+        expect(withoutIds(record.messages[0])).toEqual({ role: 'system', content: 'SYS' });
+        expect(withoutIds(record.messages[1])).toEqual({
             role: 'user',
             content: 'seed',
             attachments: [ATTACHMENT]
@@ -437,11 +478,11 @@ describe('threadFork runtime', () => {
                         role: 'assistant',
                         content: 'asked',
                         included: false,
-                        toolCalls: [{ id: 'origin-a', name: 'task', arguments: '{}' }]
+                        toolCalls: [{ id: 'origin-a', name: 'tasks', arguments: '{}' }]
                     },
                     // The RESULT stays as the source wrote it: the unit widening is a
                     // projection rule, so a copy stays a faithful record.
-                    { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'task' }
+                    { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'tasks' }
                 ]
             }
         );
@@ -457,7 +498,7 @@ describe('threadFork runtime', () => {
         //     branch's own turns: every flag the source carried survived the copy,
         //     tool ids are remapped, and the unanswered threadFork call got the
         //     created-branch placeholder.
-        expect(record.messages).toEqual([
+        expect(withoutIds(record.messages)).toEqual([
             { role: 'system', content: 'SYS' },
             { role: 'user', content: 'seed' },
             { role: 'user', content: 'seed disabled', included: false },
@@ -465,9 +506,9 @@ describe('threadFork runtime', () => {
                 role: 'assistant',
                 content: 'asked',
                 included: false,
-                toolCalls: [{ id: `call_${branchId}_1`, name: 'task', arguments: '{}' }]
+                toolCalls: [{ id: `call_${branchId}_1`, name: 'tasks', arguments: '{}' }]
             },
-            { role: 'tool', content: 'ok', toolCallId: `call_${branchId}_1`, name: 'task' },
+            { role: 'tool', content: 'ok', toolCallId: `call_${branchId}_1`, name: 'tasks' },
             { role: 'user', content: 'root input' },
             {
                 role: 'assistant',
@@ -517,11 +558,196 @@ describe('threadFork runtime', () => {
 
         // (3) Forking never mutates the source: both disabled entries are still in
         //     the origin transcript, flagged, in their original positions.
-        expect(entry.messages.filter((message) => message.role === 'user')).toEqual([
+        expect(withoutIds(entry.messages.filter((message) => message.role === 'user'))).toEqual([
             { role: 'user', content: 'seed' },
             { role: 'user', content: 'seed disabled', included: false },
             { role: 'user', content: 'root input' }
         ]);
+    });
+
+    // Context T1.4 — the BRANCH POLICY for transcript addresses. A fork COPIES them:
+    // the branch's entry for a turn the owner already had is a different OBJECT with the
+    // SAME id, which is what lets one `setIncluded(id, ...)` name the same turn on either
+    // side. Ids are only ever scoped to one transcript (src/harness.ts `indexOfMessageId`),
+    // so the numbers a branch mints for its OWN entries may repeat numbers the owner used
+    // for different turns — that is the accepted consequence of the policy, and it is why
+    // the API never claims a conversation-global id.
+    it('copies transcript addresses into a branch, and numbers the branch\'s own entries itself', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        const entry = brain(
+            routed((request) => {
+                if (latestUser(request) === 'inspect') return answer('branch summary');
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return call('f1', 'threadFork', '{"input":"inspect"}');
+                }
+
+                return answer('root final');
+            }, seen),
+            {
+                instruction: 'SYS',
+                messages: [
+                    { role: 'user', content: 'seed' },
+                    { role: 'user', content: 'seed disabled', included: false }
+                ]
+            }
+        );
+
+        const writer = harness({ agents: { writer: entry }, presets: false });
+        await writer('root input');
+        await flush();
+
+        // The owner: instruction, two seeds, the prompt, the fork request, the fork
+        // result, the final answer. Seven creations, seven addresses, in order.
+        expect(entry.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4',
+            'msg-5',
+            'msg-6',
+            'msg-7'
+        ]);
+
+        const record = writer.branches()[0];
+
+        // (1) Copied, not re-minted — every entry the branch cloned from the owner still
+        //     answers to the OWNER'S id, and none of them is the owner's object.
+        expect(record.messages.slice(0, 5).map((message) => message.messageId)).toEqual(
+            entry.messages.slice(0, 5).map((message) => message.messageId)
+        );
+        expect(record.messages.slice(0, 5)).not.toBe(entry.messages.slice(0, 5));
+        for (let index = 0; index < 5; index += 1) {
+            expect(record.messages[index]).not.toBe(entry.messages[index]);
+        }
+
+        // (2) The branch's own numbering starts above what it cloned. The pending
+        //     placeholder for the unanswered `threadFork` call is materialized without an
+        //     id (core/branch.ts `flushPending`) and is minted one when the branch seeds
+        //     its baseline, and the branch's prompt and answer follow it — so `msg-6`
+        //     names the owner's fork RESULT and the branch's PLACEHOLDER, each inside
+        //     its own transcript.
+        expect(record.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4',
+            'msg-5',
+            'msg-6',
+            'msg-7',
+            'msg-8'
+        ]);
+        expect(record.messages[2]).toStrictEqual({
+            role: 'user',
+            content: 'seed disabled',
+            included: false,
+            messageId: 'msg-3'
+        });
+
+        // (3) Neither key reaches the branch's provider request: the projection strips
+        //     the flag and the address together (core/agent.ts `withIncluded`).
+        const branchRequest = seen.find((request) => latestUser(request) === 'inspect');
+        expect(branchRequest).toBeDefined();
+        expect(JSON.stringify(branchRequest!.messages)).not.toContain('messageId');
+        expect(JSON.stringify(branchRequest!.messages)).not.toContain('included');
+    });
+
+    // Pipeline T3 — an ENTRY EDIT is canonical text, so the copy a fork is built from
+    // carries it. `copyMessage` (src/core/branch.ts) whitelists `content` per role and
+    // an edit introduces no new key, so nothing had to be added to that whitelist for
+    // this to hold — the persistence rule T3.6 states, pinned here rather than asserted
+    // in a comment.
+    it('carries an edited entry into the branch transcript and the branch request', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        const entry = brain(
+            routed((request) => {
+                if (latestUser(request) === 'inspect') return answer('branch summary');
+                if (toolContents(request).some((content) => content.includes('branch summary'))) {
+                    return answer('root final');
+                }
+
+                // Nothing is disabled in this fixture, so the copied assistant turn is
+                // already in the FIRST request: the fork must be keyed on whether the
+                // threadFork RESULT exists yet, not on whether an assistant turn does.
+                const forked = request.messages.some(
+                    (message) => message.role === 'tool' && message.name === 'threadFork'
+                );
+                if (!forked) return call('f1', 'threadFork', '{"input":"inspect"}');
+
+                return answer('waiting');
+            }, seen),
+            {
+                instruction: 'SYS',
+                messages: [
+                    { role: 'user', content: 'seed' },
+                    {
+                        role: 'assistant',
+                        content: 'asked',
+                        toolCalls: [{ id: 'origin-a', name: 'tasks', arguments: '{}' }]
+                    },
+                    { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'tasks' }
+                ]
+            }
+        );
+
+        // One host plugin re-words the seeded turn through the REAL control surface. The
+        // `find` guard makes it a one-shot write: once the text is edited no entry still
+        // matches, so no later round (root or branch) writes again.
+        const writer = harness({
+            agents: { writer: entry },
+            presets: false,
+            plugins: [
+                {
+                    name: 'seed-editor',
+                    setup: (api: HarnessPluginApi) => {
+                        api.on('turn.before', (context) => {
+                            const target = context.entries.find(
+                                (candidate) => candidate.message.content === 'seed'
+                            );
+
+                            if (target === undefined) return;
+
+                            context.edit(target, { content: 'seed, edited' });
+                        });
+                    }
+                }
+            ]
+        });
+
+        await writer('root input');
+        await flush();
+
+        // (1) Canonical source: the edited text is there ONCE, and the old text is gone.
+        expect(entry.messages.filter((message) => message.content === 'seed, edited')).toHaveLength(1);
+        expect(entry.messages.some((message) => message.content === 'seed')).toBe(false);
+
+        // (2) The branch record is a materialization of the transcript AS IT IS NOW, so
+        //     the copied baseline carries the edit at the same position.
+        const record = writer.branches()[0];
+        expect(withoutIds(record.messages[1])).toStrictEqual({ role: 'user', content: 'seed, edited' });
+
+        // (3) The branch's own request was projected from that copy — edited text,
+        //     remapped call ids, and a pair that is still complete.
+        const branchRequest = seen.find((request) => latestUser(request) === 'inspect');
+        expect(branchRequest).toBeDefined();
+        expect(branchRequest!.messages.slice(0, 4)).toEqual([
+            { role: 'system', content: 'SYS' },
+            { role: 'user', content: 'seed, edited' },
+            {
+                role: 'assistant',
+                content: 'asked',
+                toolCalls: [{ id: `call_${record.branchId}_1`, name: 'tasks', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'ok',
+                toolCallId: `call_${record.branchId}_1`,
+                name: 'tasks'
+            }
+        ]);
+        expect(pairIssues(branchRequest!.messages)).toEqual([]);
+        expect(JSON.stringify(branchRequest!.messages)).not.toContain('included');
     });
 
     it('gives a subagent fork the subagent role, without delegate or toolCreate', async () => {
@@ -575,7 +801,7 @@ describe('threadFork runtime', () => {
         expect(names).not.toContain('toolCreate');
         // R9-R11: threadFork is searchable for every role, so a subagent fork's
         // declarations are exactly the bootstrap pair.
-        expect(names).toEqual(['toolRequest', 'task']);
+        expect(names).toEqual(['toolRequest', 'tasks']);
     });
 
     it('rejects a branch that answers with no substantive text', async () => {
@@ -916,7 +1142,7 @@ describe('threadFork runtime', () => {
                     if (results.some((content) => content.includes('"tasks"'))) {
                         return answer('branch done');
                     }
-                    return call('t1', 'task', '{"tasks":[{"text":"Shared item"}]}');
+                    return call('t1', 'tasks', '{"tasks":[{"text":"Shared item"}]}');
                 }
                 if (!request.messages.some((message) => message.role === 'assistant')) {
                     return call('f1', 'threadFork', '{"input":"mutate"}');
@@ -945,8 +1171,8 @@ describe('threadFork runtime', () => {
 
         // The branch shared the harness todo store, so its tool mutation is still
         // a persistence-worthy event.
-        expect(reasons).toContain('tool_execute:task');
-        expect(await writer.executeTool('task', {})).toEqual({
+        expect(reasons).toContain('tool_execute:tasks');
+        expect(await writer.executeTool('tasks', {})).toEqual({
             tasks: [
                 {
                     id: '1',
@@ -1005,5 +1231,119 @@ describe('threadFork runtime', () => {
         );
 
         expect(writer.branch('branch-missing')).toBeUndefined();
+    });
+
+    // -------------------------------------------------------------------------
+    // Policy doc T5.3 (2026-11-09) — a branch has no wall-clock bound.
+    //
+    // `docs/tasks/2026-11-09-thread-timeout-policy.md` F2 claims every
+    // thread-running path except `delegate` already runs without a timer, and names
+    // the fork layer as the cleanest confirmation (its four frozen bounds are COUNT,
+    // DEPTH and SIZE only — MAX_FORK_DEPTH / MAX_FORK_CONCURRENT /
+    // MAX_FORK_HISTORY_BYTES / MAX_BRANCH_RECORDS in src/core/branch.ts). This is the
+    // regression guard for that claim: the whole file already owns the fake clock, so
+    // an advanced clock here moves BOTH timers and Date, which rules out a timer-shaped
+    // bound AND a deadline check. The host-thread half of the same requirement is in
+    // src/harness.thread-runtime.test.ts.
+    //
+    // `async-ping` is replaced (the documented override path) so the ONLY thing that
+    // could end the branch would be a turn bound, and `vi.getTimerCount()` proves
+    // nothing is armed while it is parked.
+    // -------------------------------------------------------------------------
+    it('runs a branch with no clock when its own tool is parked (policy 2026-11-09 T5.3)', async () => {
+        const events: HarnessEvent[] = [];
+        const parked = deferred<string>();
+
+        const entry = brain(
+            routed((request) => {
+                const results = toolContents(request);
+
+                // The branch, after its parked tool settled.
+                if (results.some((content) => content.includes('B-parked'))) return answer('branch done');
+                // The origin, once the branch answer crossed back as its tool result.
+                if (results.some((content) => content.includes('branch done'))) return answer('root done');
+                // The branch's inspecting turn while the call is still parked: it must
+                // NOT re-issue the call, so the assistant turn carrying it is the key.
+                if (
+                    request.messages.some(
+                        (message) =>
+                            message.role === 'assistant' &&
+                            (message.toolCalls ?? []).some((entry) => entry.name === 'hold')
+                    )
+                ) {
+                    return answer('waiting');
+                }
+                // The branch's first turn: park on a tool of its own.
+                if (latestUser(request) === 'park') return call('h1', 'hold', '{}');
+                // The origin's first turn.
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return call('f1', 'threadFork', '{"input":"park"}');
+                }
+                return answer('waiting');
+            })
+        );
+
+        const writer = harness({
+            agents: { writer: entry },
+            tools: {
+                hold: tool({
+                    description: 'Park until released.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    mode: 'async',
+                    execute: () => parked.promise
+                })
+            },
+            presets: false,
+            plugins: [{ name: 'async-ping', setup: () => undefined }],
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const state: { status: 'pending' | 'resolved' | 'rejected'; value?: { content: string } } = {
+            status: 'pending'
+        };
+        writer('go').then(
+            (value) => {
+                state.status = 'resolved';
+                state.value = value;
+            },
+            (error) => {
+                state.status = 'rejected';
+                state.error = error;
+            }
+        );
+        await flush();
+
+        const starts = () => events.filter((event) => event.type === 'branch_start');
+        const ends = () => events.filter((event) => event.type === 'branch_end');
+
+        // The branch is running with one parked call, and nothing is armed.
+        expect(starts()).toHaveLength(1);
+        expect(ends()).toHaveLength(0);
+        expect(vi.getTimerCount()).toBe(0);
+
+        // Well past the 300000 ms a delegated child used to be given, on a clock this
+        // file owns completely.
+        await advanceBy(300_001);
+        expect(ends()).toHaveLength(0);
+        expect(state.status).toBe('pending');
+        expect(vi.getTimerCount()).toBe(0);
+
+        await advanceBy(1_500_000);
+        expect(ends()).toHaveLength(0);
+        expect(state.status).toBe('pending');
+
+        // It ends because its OWN answer arrived, with no error and no cancellation.
+        parked.resolve('B-parked');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('root done');
+        expect(ends()).toHaveLength(1);
+
+        const record = writer.branch(writer.branches()[0].branchId);
+        expect(record?.status).toBe('completed');
+        expect(record?.result?.content).toBe('branch done');
+        expect(record?.error).toBeUndefined();
     });
 });

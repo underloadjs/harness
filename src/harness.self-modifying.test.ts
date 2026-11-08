@@ -386,7 +386,7 @@ describe('self-modifying tool kernel', () => {
         expect(registry?.sourcePath).toBe('tools/runtime/toolRegistry.tool.ts');
         expect(registry?.revision).toMatch(/^[0-9a-f]{16}$/);
         // Harness-owned controls are source entries too.
-        expect(writer.toolSource('task')?.sourcePath).toBe('tools/runtime/task.tool.ts');
+        expect(writer.toolSource('tasks')?.sourcePath).toBe('tools/runtime/tasks.tool.ts');
         expect(writer.toolSource('toolCancel')?.sourcePath).toBe('tools/runtime/toolCancel.tool.ts');
     });
 

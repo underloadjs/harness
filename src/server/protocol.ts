@@ -524,14 +524,48 @@ export type SessionInvalidThread = {
     messages: unknown;
 };
 
+// One PLUGIN DIAGNOSTIC the server received for this session (pipeline T1.5's last mile).
+//
+// WHY THE SERVER KEEPS ANY: the library already reports a plugin that threw, timed out, or
+// returned an unparseable decision — `harness({ report.diagnostic })`, plus a plugin's own
+// `api.report.diagnostic` policy report (compaction T4.5) — but until this surface existed the
+// host had nowhere to put it, so "the compactor is broken" was indistinguishable from "the
+// compactor did nothing". This is the durable, readable answer to that, recorded on the session
+// that produced it.
+//
+// Fields are the library event's, copied (never aliased), plus `at`:
+//   - `owner`   — the plugin that registered the failing hook ('' when a subscription carried
+//                 no owner name), i.e. WHO to blame;
+//   - `kind`    — `handler-threw` | `handler-timed-out` | `invalid-decision` | `policy`;
+//   - `event`   — the lifecycle event whose handler failed; ABSENT for a `policy` report, which
+//                 is not tied to one hook;
+//   - `message` — the complete human view (never empty);
+//   - `data`    — the structured payload a `policy` report carries (a compaction pass names the
+//                 units it withheld). Absent for a framework failure.
+export type SessionPluginDiagnostic = {
+    at: number;
+    kind: 'handler-threw' | 'handler-timed-out' | 'invalid-decision' | 'policy';
+    owner: string;
+    event?: string;
+    message: string;
+    data?: Record<string, unknown>;
+};
+
+// How many plugin diagnostics one session keeps, oldest dropped first. The cap exists because
+// the journal is DURABLE (`HarnessSessionRecord.pluginDiagnostics`): a plugin that throws on
+// every turn would otherwise grow `state.json` without bound, and the entries an operator needs
+// are the newest ones. Owned by this file, not by ./sessions.ts, because ./persistence.ts has to
+// honour the same bound when it restores a journal that grew past it on disk — and persistence
+// cannot import the store (the store imports persistence).
+export const PLUGIN_DIAGNOSTIC_LIMIT = 24;
+
 // A conversation held by the server. `messages` is the entry agent's transcript.
 //
 // `turns` is the authoritative renderable record and is always present (an empty
 // array for a new or reset session). It is the only source a client needs to draw
 // the transcript after a reload: list() and get() both carry it, including a turn
 // that is still running.
-export type SessionSnapshot = {
-    id: string;
+export type SessionSnapshot = {    id: string;
     harness: string;
     status: SessionStatus;
     // Number of tasks waiting in the server queue (turns with status 'queued');
@@ -567,6 +601,13 @@ export type SessionSnapshot = {
     // transcript; this list is where the raw, broken value lives so a client can
     // show it and edit it back into something readable.
     invalidThreads?: SessionInvalidThread[];
+    // ADDITIVE (pipeline T1.5 last mile): the plugin diagnostics this session produced, oldest
+    // first, capped (see `SessionPluginDiagnostic` and `PLUGIN_DIAGNOSTIC_LIMIT` in
+    // ./sessions.ts). Omitted entirely when the session has never reported one, so a healthy
+    // session's snapshot is byte-identical to its pre-T4 shape — the same discipline
+    // `invalidThreads` above follows. This is the surface that makes a broken or misbehaving
+    // plugin observable from `GET /sessions` instead of only from the server's stderr.
+    pluginDiagnostics?: SessionPluginDiagnostic[];
     // Conversation-scoped label counters AT THE START of each turn, keyed by turn
     // id (see shared/agent-results.ts). A client that projects result-block labels
     // seeds its allocator from the entry, so deleting a thread (and its turns)
@@ -717,6 +758,11 @@ export type SessionView = {
     // transcript-bearing roster; `/views` omits it (see `SessionThreadView`).
     threadViews?: SessionThreadView[];
     invalidThreads?: SessionInvalidThread[];
+    // ADDITIVE, same rule as `SessionSnapshot.pluginDiagnostics`: omitted when the session has
+    // never reported one. Present on BOTH session headers on purpose — a client reading the
+    // compiled display view and one reading the legacy aggregate must not disagree about
+    // whether a plugin on this session is broken.
+    pluginDiagnostics?: SessionPluginDiagnostic[];
     // Counters only (see `SessionSnapshot.labelSeeds`/`labelHighWater`, lines
     // 466-476). A client never mints a label from these any more — the server owns
     // `TurnSummary.blocks` — but they stay so the raw and display surfaces agree.

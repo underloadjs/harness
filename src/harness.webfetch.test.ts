@@ -208,10 +208,12 @@ describe('live toolbox harness', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'delegate',
@@ -247,7 +249,7 @@ describe('live toolbox harness', () => {
         // runtime rows, and every other preset are absent.
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'delegate',
             'read',
             'write',
@@ -336,7 +338,7 @@ describe('live toolbox harness', () => {
         // No team means no delegate; fetch is still declared, keyless and unmoved.
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'read',
             'write',
             'edit',

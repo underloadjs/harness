@@ -419,7 +419,18 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
         const plugins = createPluginSettingsStore();
 
         expect(plugins.get('context-compaction', 'contextLimit')).toBeUndefined();
-        expect(plugins.values('context-compaction')).toEqual({ contextLimit: 100000 });
+        expect(
+            // All FIVE declared defaults (compaction T4.6), in the order the descriptors are
+            // declared: this is the map the UI renders and the plugin reads when the host has
+            // stored nothing.
+            plugins.values('context-compaction')
+        ).toEqual({
+            contextLimit: 100000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
         expect(plugins.values('async-ping')).toEqual({ intervalMs: 600000 });
         expect(plugins.snapshot()).toEqual({});
     });
@@ -432,8 +443,15 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
         );
 
         // `max` is undeclared, so any larger finite limit is a legitimate operator choice.
+        // `update` answers with the FULL effective map, so a UI that re-renders the row after
+        // a PATCH shows every declared setting at its effective value: the override for
+        // `contextLimit`, and the declared default for the other four.
         expect(plugins.update('context-compaction', { contextLimit: 250000 })).toEqual({
-            contextLimit: 250000
+            contextLimit: 250000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
         });
         expect(plugins.provider.get('context-compaction', 'contextLimit')).toBe(250000);
         expect(plugins.snapshot()).toEqual({ 'context-compaction': { contextLimit: 250000 } });

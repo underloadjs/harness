@@ -31,8 +31,10 @@
 //     Teardowns that release work WITHOUT a delivery (a run abort or a rollback
 //     releases the whole scope silently through `abandonScope`) never reach the
 //     delivery path, so no `async.drained` fires for them.
-//   - `harness.dispose` → clear everything. Reserved today (no harness path emits it
-//     yet), so registering it is a forward-looking guard, not live behaviour.
+//   - `harness.dispose` → clear everything. LIVE since T1.6: `harness()` exposes
+//     `dispose()` and emits this exactly once on a settled boundary (`emitDispose` in
+//     ../harness.ts), and the server reaches it through `disposeSession` in
+//     ../server/sessions.ts — so this handler is real teardown behaviour, not a guard.
 //
 // WHY THE SETTING DEFAULT IS 600000
 // ---------------------------------
@@ -241,8 +243,10 @@ export const setup: NonNullable<HarnessPlugin['setup']> = (api: HarnessPluginApi
         releaseThread(payload.threadId);
     });
 
-    // Reserved: `harness()` has no dispose method yet, so this is inert today and is
-    // registered so the plugin is already correct when the event starts firing.
+    // The teardown point, LIVE since T1.6: `harness()` exposes `dispose()` and emits this
+    // exactly once on a settled boundary (`emitDispose`, ../harness.ts), and the server
+    // reaches it through `disposeSession` (../server/sessions.ts) — so this clears every
+    // heartbeat at the real end of the process, matching the header above.
     api.on('harness.dispose', () => {
         clearAll();
     });

@@ -137,8 +137,40 @@ export type HarnessToolCall = {
 // If ANY member says `false` the ENTIRE unit is withheld — dropping a single
 // result would leave a `tool_calls[]` entry with no answer (or an orphan result),
 // which the strict pairing contract of an OpenAI-compatible transport rejects.
+//
+// HOST HYGIENE (context T6.1/T6.3) — the rule a host that stores its OWN copy of a
+// transcript has to keep: because only `false` is storage, a persisted copy should
+// OMIT the key rather than write `included: true`. The runtime does not reject a
+// submitted `true`; every entry point that accepts whole messages (the agent seed,
+// the transcript write/append, `restore`, a fork) silently normalizes it to the
+// absent form, because rejecting would break a host that round-trips its own JSON.
+// The one path that cannot be normalized is a DIRECT edit of the public mutable
+// `agent.messages` (src/types/index.ts `HarnessStateChangeEvent` disclaims it: the
+// observer cannot see it) — such a `true` is invisible to the model and to snapshots
+// but stays visible to every read surface until the next copy, so never write it.
+//
+// STABLE ADDRESSING — the shared optional `messageId?: string` (context T1). A
+// canonical entry the runtime created carries an id that names THIS turn, so a plugin
+// can address it in a later round of the same conversation, after a restart, and
+// across a `replaceHistory()` (which invalidates indices and message identities but
+// re-reads the same ids). Rules that keep it an identity:
+//   - minted EXACTLY ONCE, where a canonical message is created (core/agent.ts seed
+//     and appends, src/harness.ts `insertToolMessage`), by core/message-id.ts;
+//   - COPIED, never re-minted, by every copy path: a fork/branch carries its source's
+//     ids (T1.4 — two objects, one identity, and lookup is scoped to one agent's
+//     transcript), and a snapshot carries them back verbatim;
+//   - a pre-id transcript (an older `state.json`, a host-pushed message) restores with
+//     the key ABSENT on read and gets ids BACKFILLED by the snapshot reader
+//     (core/snapshot.ts) — `restore -> snapshot` is idempotent;
+//   - it NEVER reaches a provider request: `withIncluded` (core/agent.ts) strips it
+//     from every projection copy, exactly as it strips the flag, so the request path
+//     stays byte-identical and the transport's field selection is untouched.
+//   - it IS visible to the host read surfaces — `threadMessages()`, the transcript
+//     routes, `snapshot()` — because those report canonical state, and that is exactly
+//     how an id survives a restart. A host that stores its own copy of a transcript
+//     should carry the key back; dropping it only means the reader mints new ones.
 export type HarnessMessage =
-    | { role: 'system'; content: string; included?: boolean }
+    | { role: 'system'; content: string; included?: boolean; messageId?: string }
     | {
           role: 'user';
           content: string;
@@ -153,6 +185,10 @@ export type HarnessMessage =
           // Withholds this entry from the model request (see the block comment on
           // the union). Absent means included; `false` is the only excluding value.
           included?: boolean;
+          // Stable transcript address for THIS turn (see the block comment on the
+          // union). Minted once by the runtime, copied by every copy path, and
+          // stripped from every projection copy, so it is never a provider field.
+          messageId?: string;
       }
     | {
           role: 'assistant';
@@ -165,6 +201,11 @@ export type HarnessMessage =
           // the union). For a tool-call turn the flag covers the WHOLE unit: this
           // message, every matching result, and its pending placeholders.
           included?: boolean;
+          // Stable transcript address for THIS turn (see the block comment on the
+          // union), and therefore for the whole tool-call UNIT it opens: an id on the
+          // assistant entry addresses its results too, through `setIncluded`'s unit
+          // cascade.
+          messageId?: string;
       }
     | {
           role: 'tool';
@@ -189,11 +230,43 @@ export type HarnessMessage =
           // DOWNLOAD profile at delivery (core/tool-media.ts), on restore
           // (core/snapshot.ts) and on fork (core/branch.ts).
           attachments?: HarnessAttachment[];
+          // WHY this call ended — the SAME classification the progress event and the
+          // `tool.after` hook carry (`HarnessToolOutcome` below), now persisted on the
+          // transcript entry so it survives a restart, a snapshot, a fork and a
+          // `threadRead`. Before it, the committed entry carried only the result TEXT, so
+          // any rule of the form "this call failed" was forced to string-match English
+          // prose the harness wrote — exactly what this union's own header forbids.
+          //
+          // Storage rule, the minimal-delta one `included` and `attachments` follow:
+          // **only a NON-`completed` outcome is stored.** A completed result carries no key
+          // at all, so every pre-outcome transcript, snapshot, branch record and test
+          // fixture keeps its exact previous shape, and ABSENT reads as `completed`
+          // (core/tool-outcome.ts `toolOutcomeOf` is the one place that says so). There is
+          // deliberately NO migration bridge that re-derives an outcome from the failure
+          // text: a pre-outcome transcript simply reads as `completed`, which is why a
+          // prune policy must additionally require a SUPERSEDING later success and must
+          // never touch a unit with no committed result
+          // (docs/tasks/2026-11-09-progressive-compaction.md T0 Q3).
+          //
+          // It is also why `isError` stays DERIVED rather than stored beside it
+          // (core/tool-outcome.ts `toolResultIsError`): the two can only disagree if a
+          // writer keeps both.
+          //
+          // NOT model-facing: the transport field-selects the tool wire shape
+          // (`role`/`tool_call_id`/`content`, transport/openai.ts), so a provider payload
+          // is byte-identical with or without this key. A branch's request-only PENDING
+          // PLACEHOLDER carries no outcome either — it is not a committed result, and the
+          // placeholder text is structural, not a classification.
+          outcome?: HarnessToolOutcome;
           // Withholds this RESULT from the model request. It is a UNIT member, not
           // a standalone choice: `false` on any result drops the assistant message
           // that asked for it, that result, and every other result of the same
           // call block (see the block comment on the union).
           included?: boolean;
+          // Stable transcript address for THIS result (see the block comment on the
+          // union). It is minted at insertion (src/harness.ts `insertToolMessage`), so
+          // a result committed in one round is still addressable in the next.
+          messageId?: string;
       };
 
 // A finished assistant turn. This is the value the harness resolves to and the
@@ -247,7 +320,14 @@ export type HarnessPendingTool = {
 // `completed` and `cancelled` are both healthy control outcomes; only `failed`
 // says the tool broke, and only `rejected` says the call itself was wrong. The
 // `tool_result` event's `isError` is always derived from this value
-// (`outcome !== 'completed'`), so the two can never disagree.
+// (`isErrorOutcome` in core/tool-outcome.ts), so the two can never disagree.
+//
+// It is ALSO persisted (compaction T1): the committed `tool` transcript entry carries
+// this value as its optional `outcome` key, so the classification survives a restart, a
+// snapshot, a fork and a `threadRead` rather than existing only on the live event. Only a
+// NON-`completed` outcome is stored — absent means `completed` — and the three rules
+// (write/read/derive) live in core/tool-outcome.ts. See the field's own comment on the
+// `tool` message variant above for the storage and migration contract.
 export type HarnessToolOutcome = 'completed' | 'failed' | 'rejected' | 'cancelled';
 
 // Token accounting, normalized from the provider's `usage` block.
@@ -839,6 +919,13 @@ export type HarnessToolRuntime = {
     // harness runner from ToolContext (never a captured implementation).
     // `callerSignal` is the CALLING run's signal, so a child cancellation can be told
     // apart from a caller rollback (see harness.ts `delegateFor`).
+    //
+    // `parameters.timeoutMs` (policy 2026-11-09, thread-timeout task doc): OPTIONAL and
+    // UNBOUNDED when omitted — the child runs to its own final answer and no clock ends
+    // it. This host path is NOT schema-validated, so the delegate TOOL schema's
+    // 1..3600000 range bounds a model argument only; a host may pass any finite bound
+    // (including one above the ceiling) and it is honoured as given. Passing a
+    // non-finite number is treated as "omitted".
     delegate: (
         caller: Agent | undefined,
         parameters: {
@@ -869,13 +956,20 @@ export type HarnessToolRuntime = {
     // use the configured provider can ignore them.
     search: (context: ToolContext) => Promise<unknown>;
     fetch: (context: ToolContext) => Promise<unknown>;
-    // Session record stores (task/profile/chapter/location) executed by their
-    // source entries. State stays harness-owned and is cleared by reset().
-    // R9-R11: `task` is now `task`; the other three names are unchanged.
-    executeRecordTool: (
-        name: 'task' | 'profileManage' | 'chapterManage' | 'locationManage',
-        context: ToolContext
-    ) => Promise<unknown>;
+    // The unified session store (records-engine Decision A). Every record-tool
+    // source entry — `records` itself plus the four wrappers `tasks`, `chapters`,
+    // `profiles`, `locations` — ends with exactly this call, so the store lives in
+    // ONE place (the harness's record engine) and, in worker mode, the write is
+    // performed by the AUTHORITY on the canonical harness rather than on a lane
+    // replica. `name` is the CALLING TOOL's wire name; the engine maps it to its
+    // collection and to that wrapper's response shape. State stays harness-owned
+    // and is cleared by reset().
+    //
+    // Why a routed runtime method rather than `context.callTool('records', …)`:
+    // `lane-worker-loop.ts` throws for any `harness.runtime` key that is neither
+    // routed to the authority nor declared local, so forgetting one registration
+    // fails at worker startup instead of losing the write silently (F5).
+    executeRecords: (name: RecordsToolName, context: ToolContext) => Promise<unknown>;
 };
 
 // Options for a nested/registered-tool invocation through `harness.callTool`.
@@ -1191,129 +1285,303 @@ export type ToolMediaEnvelope<TContent = unknown> = {
 };
 
 // ---------------------------------------------------------------------------
-// task (per-harness session task list — renamed from todoManage)
+// records — the ONE session store engine (records-engine.md, Decisions A-P)
 // ---------------------------------------------------------------------------
 //
-// A harness-specific patch API. It is intentionally NOT OpenCode's experimental
-// `todowrite`: one call carries a partial patch (add/patch by entry, delete by
-// id), ids are stable strings, and the list is session state rather than
-// full-list replacement. See src/core/task.ts and README.md for the source-backed
-// reference.
+// Everything the model stores about the session lives here: one store, one id
+// counter, one entry shape, one set of race controls. `tasks`, `chapters`,
+// `profiles` and `locations` are thin wrappers over it (Decision E: schema +
+// collection mapping + response shape, no state and no logic of their own), and
+// `records` is the low-level surface the model escalates to when a wrapper's
+// schema refuses a request (Decision R4/R6).
+//
+// The rules the types below encode:
+//   - ONE id space (F3): ids are globally unique ACROSS collections, drawn from
+//     one monotonic counter, so a chapter id and a task id can never collide and
+//     the first task is not necessarily "1";
+//   - per-collection `storeRev` + per-collection FIFO change window (Decision B):
+//     the disjoint-merge proof needs a gap-free window, which a shared log across
+//     collections would break with unrelated writes;
+//   - NO locks and NO claims (Decision P): every patch is accepted unless it is
+//     stale, so an entry carries no `owner`, no `ownerThreadId` and no
+//     `leaseUntil`. Attribution (`updatedBy`/`updatedThreadId`/`updatedAt`) is an
+//     immutable fact and is never re-validated against the agent roster
+//     (Decision L: "if Person A writes a memo and he dies, the memo was still
+//     written by Person A");
+//   - a stale rejection returns the CURRENT entry (R9), not just a sentence, so a
+//     conflict costs one round trip;
+//   - collections are declared in code and extensible by `define` (Decision C),
+//     persist in the snapshot (Decision M), and are permanent once non-empty.
+//
+// Cross-references:
+//   - ../core/records.ts        — the engine that reads and writes all of this
+//   - ../core/{task,profile,chapter,location}.ts — the built-in collection specs
+//   - ../tools/runtime/*.tool.ts — the five source entries (models + routing)
+//   - ../core/snapshot.ts       — persists it as `snapshot.records`
+//   - ../server/workers/lane-authority.ts — the routed write path in worker mode
 
-// One stored task. `id` is a decimal string, monotonic within one harness
-// instance (and restarted by reset()).
+// The value types a collection field may declare. `strings` is a bounded,
+// trimmed, de-duplicated string array (the `traits` shape).
+export type RecordFieldType = 'text' | 'boolean' | 'integer' | 'enum' | 'strings';
+
+// One declared field. `key` order in a collection definition IS the canonical
+// order: it decides the order of every emitted entry, every persisted entry (a
+// store always serializes to the same byte size) and every `fields` array in the
+// change log — which is what lets a caller compare change entries without
+// sorting them (F9).
+export type RecordFieldDefinition = {
+    key: string;
+    type: RecordFieldType;
+    // True when an ADD must supply it (non-empty). A patch may still omit any
+    // field, which leaves the stored value unchanged.
+    required?: boolean;
+    // `text` / `strings` element cap. Enforced engine-side so `records` and every
+    // wrapper write are bounded, and mirrored in the wrapper's JSON Schema so a
+    // model is refused before the call runs (Decision G).
+    maxLength?: number;
+    // `strings`: how many entries the array may carry.
+    maxItems?: number;
+    // `enum`: the closed value set. A typo cannot create a value the counts do
+    // not know about.
+    values?: readonly string[];
+    // `integer`: the inclusive upper bound. Absent means "any safe integer".
+    max?: number;
+    // The value an ADD stores when the caller omits the field. Absent means the
+    // field is optional and simply missing until written (chapters' `order`).
+    default?: unknown;
+    // True when the field is only ever returned by a single-entry `get`
+    // (chapters' `content`): lists, pages and mutation results carry a
+    // projection without it, so a long body cannot flood the context window.
+    getOnly?: boolean;
+    // `integer`: an ascending sort key for the collection's list order.
+    sortable?: boolean;
+    // Count facets derived from the whole store on every call:
+    //   - `boolean` with `count: { key, complement }` → `{ [key]: n, [complement]: total-n }`
+    //     (tasks' `completed` + `pending`);
+    //   - `enum` with `count: true` → one count per declared value
+    //     (chapters' `planned`/`draft`/`complete`).
+    count?: { key: string; complement?: string } | true;
+};
+
+// How a wrapper reshapes the engine envelope into its own domain contract.
+//   - 'batch'  — `tasks`: input IS the engine input and the answer is the engine
+//     page under the collection's plural name (the historical task wire design);
+//   - 'action' — `chapters`/`profiles`/`locations`: the model passes
+//     `{ action, id, ...fields }` and gets back `{ <plural>, counts, page }` for a
+//     list, `{ <singular>, counts }` for a mutation, `{ removed, counts }` for a
+//     removal (the historical record-tool contract).
+export type RecordWrapperStyle = 'batch' | 'action';
+
+// One collection: the engine cannot infer any of this (F9), so it is declared.
+export type RecordCollectionDefinition = {
+    name: string;
+    fields: readonly RecordFieldDefinition[];
+    // Engine-owned store bound (Decision G / F13): an unbounded store is an
+    // unbounded context risk, not a freedom.
+    maxRecords: number;
+    // Page budget, STRICTLY below the outer model-facing cap so an inner page can
+    // never report `hasMore: false` while the outer envelope truncates (F13).
+    responseBudgetBytes: number;
+    // The wrapper that serves this collection, when it has one.
+    wrapper?: { tool: string; plural: string; singular: string; style: RecordWrapperStyle };
+};
+
+// One stored record in any collection: identity + content revision + attribution,
+// then the collection's declared fields. `rev` starts at 1 and increments ONLY
+// when a declared field actually changes. There is no lock field — Decision P.
 //
-// CONCURRENCY FIELDS (T1 — the shared-list fix). The list is ONE store per
-// harness, shared by every agent and every thread, so another agent can edit a
-// record between the moment a caller read it and the moment it writes back. To
-// make that visible instead of silently losing an update, each record carries:
-//   - `rev`        — the CONTENT revision. Starts at 1 on add and increments
-//     ONLY when `text` (post-trim) or `completed` actually changes. Claims,
-//     releases, takeovers and lease renewals never bump it, so a claim can never
-//     invalidate another agent's compare-and-swap.
-//   - `updatedBy` / `updatedThreadId` / `updatedAt` — attribution of the last
-//     writer, taken from the ToolContext (never from tool arguments, so the
-//     model cannot spoof it). Absent for a store that was never written by an
-//     identified caller.
-//   - `owner` / `ownerThreadId` / `leaseUntil` — the optional claim. A holder is
-//     the exact pair `(owner, ownerThreadId)`; `leaseUntil` is epoch ms and an
-//     ABSENT `leaseUntil` means an indefinite claim (never auto-expiring). A
-//     claim blocks content writes by other agents until it expires, is released,
-//     or is taken over.
-//
-// The optional fields stay absent (never `undefined`-valued keys) so a snapshot
-// of an untouched store is byte-identical to the pre-T1 shape.
-export type TaskItem = {
+// The attribution triple is read from the ToolContext, never from tool arguments,
+// so the model cannot forge who edited what. Keys stay ABSENT (never
+// `undefined`-valued) when unknown, so an untouched store serializes byte-for-byte
+// like the pre-T1 shape and the page budget measures the real payload.
+export type RecordEntry = {
     id: string;
-    text: string;
-    completed: boolean;
-    // Content revision, >= 1; starts at 1 when the record is added.
     rev: number;
-    // Agent name of the last writer (content add/update, claim, release, takeover).
     updatedBy?: string;
-    // Thread id of that last writer.
     updatedThreadId?: string;
-    // ISO timestamp of that last write.
     updatedAt?: string;
-    // Agent name holding the claim, when claimed.
-    owner?: string;
-    // Thread id holding the claim, when claimed.
-    ownerThreadId?: string;
-    // Epoch ms the claim expires; absent = indefinite claim (not expired).
-    leaseUntil?: number;
-};
+} & Record<string, unknown>;
 
-// One compare-and-swap precondition for a guarded write: the revision the caller
-// actually READ for that id. core/task.ts rejects the whole call when the stored
-// `rev` differs, so a concurrent edit surfaces as a readable error instead of a
-// silent lost update.
-export type TaskExpect = {
+// One compare-and-swap precondition: the revision the caller actually READ for
+// that id. The engine rejects the WHOLE call when the stored rev differs, and the
+// rejection carries the current entry (R9).
+export type RecordExpect = {
     id: string;
     rev: number;
 };
 
-// The five recorded store events. `claim` covers a first-time claim AND a
-// takeover; `release` covers a voluntary release, an expired-claim clear, and
-// `releaseThread()`.
-export type TaskChangeOp = 'add' | 'update' | 'remove' | 'claim' | 'release';
+// The three recorded store events. `claim`/`release` are GONE (Decision P deleted
+// the lock, so there is no ownership event to log and nothing to sweep when a
+// thread dies).
+export type RecordChangeOp = 'add' | 'update' | 'remove';
 
-// One entry of the bounded store change log (see TASK_MAX_CHANGES in
-// ./core/task.ts). `rev` is the STORE event revision after this change, not the
-// record's content revision — the latter is `itemRev` (omitted for
-// remove/claim/release because none of them bump it). `fields` names which
-// content fields an `update` actually changed, in the stable order
-// ['text','completed']; it is what lets an opt-in disjoint merge prove that a
-// concurrent edit touched different fields than the caller's patch.
-export type TaskChange = {
-    // Store event revision after this change (monotonic, unique).
+// One entry of a collection's bounded change window. `rev` is the STORE event
+// revision after this change (per collection — Decision B), `itemRev` is the
+// record's content revision. `fields` names which fields an `update` actually
+// changed, in the collection's canonical order; that is what lets an opt-in
+// disjoint merge PROVE the concurrent edit touched different fields.
+export type RecordChange = {
     rev: number;
-    // The record this change touched.
     id: string;
-    op: TaskChangeOp;
-    // Calling agent name, omitted when the caller had no identity.
+    op: RecordChangeOp;
     by?: string;
-    // Calling thread id, omitted when the call had no thread.
     threadId?: string;
-    // ISO timestamp of the change.
     at: string;
-    // `update` only: the content fields that changed.
-    fields?: Array<'text' | 'completed'>;
-    // add: 1. update: the record's new content rev. Omitted otherwise.
+    fields?: string[];
     itemRev?: number;
 };
 
+// One page cursor. Offset mode keeps `nextOffset`; keyset mode (`afterId`) echoes
+// the cursor and answers with `nextAfterId`, because a numeric-id cursor survives
+// another agent removing a record mid-walk while an index cannot.
+export type RecordsPageInfo = {
+    offset: number;
+    limit: number;
+    hasMore: boolean;
+    nextOffset?: number;
+    afterId?: string;
+    nextAfterId?: string;
+};
+
+// Counts are always derived from the whole collection, never from the page: a
+// caller listing page 2 must still see how many records exist in total. The facet
+// keys come from the collection definition.
+export type RecordCounts = Record<string, number>;
+
+// THE engine result — ONE shape for every success (Decision D): the page, the
+// counts, the cursor, the collection's store revision, and (when the call is a
+// single-id read or a one-record mutation) `entry`. `removed` names the records
+// this call deleted. The three change keys appear only when the call passed
+// `since`. `storeRev` lets a caller poll `since: storeRev` next time and get only
+// what it missed.
+export type RecordsResult = {
+    entries?: RecordEntry[];
+    entry?: RecordEntry;
+    removed?: RecordEntry[];
+    counts: RecordCounts;
+    page: RecordsPageInfo;
+    storeRev: number;
+    changes?: RecordChange[];
+    changesHasMore?: boolean;
+    changesTruncated?: boolean;
+    // `define`/`drop` only: the collection this call registered or removed.
+    collection?: string;
+};
+
+// The generic model-facing arguments for `records`. `collection` is a STRING, not
+// an enum, on purpose (Decision C): an enum cannot grow at runtime, which
+// forecloses `define`; so the engine validates the name against the registered set
+// BEFORE dispatch and throws naming the defined collections. A typo must never
+// resolve to a plausible-looking empty list — discovery fuzziness (../core/
+// discovery.ts) applies to tool NAMES, never to parameter values, so nothing else
+// in the system would rescue `collection: 'tsak'`.
+export type RecordsParameters = {
+    collection?: string;
+    // Batch add/patch: an entry with no `id` adds, an entry with a known `id`
+    // patches, and every field it omits keeps its stored value.
+    entries?: Record<string, unknown>[];
+    // Exact ids to delete.
+    remove?: string[];
+    // Exact ids to read (one → `entry`, several → `entries`).
+    ids?: string[];
+    expects?: RecordExpect[];
+    since?: number;
+    offset?: number;
+    limit?: number;
+    afterId?: string;
+    mergeDisjoint?: boolean;
+    // Registers a NEW collection (Decision C/M). A name that already exists is an
+    // ERROR, never a silent merge.
+    define?: {
+        name: string;
+        fields: RecordFieldDefinition[];
+        maxRecords?: number;
+    };
+    // Drops the named collection — only when it is empty, and only if an agent
+    // defined it (Decision M: dropping a non-empty collection would itself mutate
+    // history).
+    drop?: boolean;
+};
+
+// The five tool names the record engine serves: the engine surface plus its four
+// wrappers. Names are the wire names, identical to the collection keys except
+// `records` itself (Decisions I, J and K).
+export const RECORDS_TOOL_NAMES = [
+    'records',
+    'tasks',
+    'chapters',
+    'profiles',
+    'locations'
+] as const;
+
+export type RecordsToolName = (typeof RECORDS_TOOL_NAMES)[number];
+
+// The built-in collection keys (Decision K: plural, identical to their wrapper's
+// tool name).
+export const RECORD_COLLECTION_NAMES = ['tasks', 'chapters', 'profiles', 'locations'] as const;
+
+export type RecordCollectionName = (typeof RECORD_COLLECTION_NAMES)[number];
+
+// One collection's restorable state (Decision M): the DEFINITION travels with the
+// entries, so a collection an agent `define`d mid-session is rediscovered after a
+// restart, and a restored definition is itself validated before anything mutates.
+export type RecordCollectionState = {
+    definition: RecordCollectionDefinition;
+    items: RecordEntry[];
+    storeRev: number;
+    changes: RecordChange[];
+};
+
+// The whole store as one collection map (T3). This replaces the four separate
+// `records.todos` / `records.profiles` / `records.chapters` / `records.locations`
+// sections of snapshot v1 — one map, because one store owns one id counter (F3).
+// Greenfield: nothing is in production, so v1 is not migrated (R5); the version
+// constant in ../core/snapshot.ts says the shape changed.
+export type RecordsStoreState = {
+    // The GLOBAL id counter: monotonic across every collection for the life of the
+    // harness, restarted at 1 by reset().
+    nextId: number;
+    collections: Record<string, RecordCollectionState>;
+};
+
+// The shared CRUD action set the 'action'-style wrappers accept. `add` creates,
+// `list` reads a page, `get` reads one record (the only action that returns a
+// `getOnly` field), `update` patches one (partial), `remove` deletes one.
+export type RecordAction = 'add' | 'list' | 'get' | 'update' | 'remove';
+
+// ---------------------------------------------------------------------------
+// `tasks` — the core wrapper over the engine (Decision I keeps it core)
+// ---------------------------------------------------------------------------
+//
+// The historical task wire design survives unchanged apart from Decision P: one
+// call carries a partial patch (add/patch by entry, delete by id), ids are stable
+// strings, every success answers with the same bounded page, and `claim`/`release`/
+// `takeover`/`leaseMs` are gone.
+
+// One stored task. `text` and `completed` are the collection's two declared
+// fields, in that canonical order.
+export type TaskItem = RecordEntry & {
+    text: string;
+    completed: boolean;
+};
+
+export type TaskExpect = RecordExpect;
+
 // One entry of the model-facing `tasks` patch. A new task omits `id` and must
-// carry `text`; an entry that names a known `id` patches that task, and every
-// field it omits keeps its stored value. A tool call may pass no arguments at all
-// (or `{}`), which is a read of the current page.
+// carry `text`; an entry naming a known `id` patches that task and every field it
+// omits keeps its stored value.
 export type TaskInput = {
     id?: string;
     text?: string;
     completed?: boolean;
 };
 
-// The model-facing arguments. Everything is optional: with nothing supplied the
-// call reads the list, and every success answers with the same bounded page.
-//
-// T1 adds the concurrency surface (all optional, so every pre-T1 call keeps
-// working exactly as before):
-//   - `expects`     — the revisions the caller read, required for a guarded
-//     content patch or removal whenever the call has an agent identity;
-//   - `claim` / `release` / `takeover` — the ownership verbs;
-//   - `leaseMs`     — the lease length for `claim`/`takeover` (clamped);
-//   - `since`       — asks for the store change log after that store revision;
-//   - `afterId`     — keyset paging cursor (a decimal id), the removal-safe
-//     alternative to `offset`;
-//   - `mergeDisjoint` — opt-in: apply a stale content patch anyway when the
-//     concurrent edits touched only fields this patch does not set.
+// The wrapper's arguments: the engine input minus `collection` (the wrapper names
+// it) and minus the claim verbs (Decision P).
 export type TaskParameters = {
     tasks?: TaskInput[];
     remove?: string[];
     expects?: TaskExpect[];
-    claim?: string[];
-    release?: string[];
-    takeover?: string[];
-    leaseMs?: number;
     since?: number;
     offset?: number;
     limit?: number;
@@ -1322,226 +1590,26 @@ export type TaskParameters = {
 };
 
 // Counts are derived on every call so the model does not have to list and count.
-// R9-R11 names the not-yet-complete bucket `pending` (it was `remaining`).
 export type TaskCounts = {
     total: number;
     completed: number;
     pending: number;
 };
 
-// The complete restorable task store (R3a). `nextId` is persisted so a resumed
-// session cannot reuse an id that already exists in `items`; both fields are
-// validated by core/task.ts before a restore mutates anything. The KEY this lives
-// under stays `records.todos` in snapshot version 1 (see HarnessSnapshot.records).
-//
-// T1 adds two OPTIONAL fields, and both are optional ON PURPOSE: a snapshot
-// written before T1 has neither, and restores with `storeRev: 0` / `changes: []`.
-// They stay absent when nothing has happened yet, so the on-disk shape of an
-// untouched store is unchanged.
-export type TaskStoreState = {
-    items: TaskItem[];
-    nextId: number;
-    // Store event revision; defaults to 0 on an old snapshot.
-    storeRev?: number;
-    // Bounded change log (TASK_MAX_CHANGES), trimmed FIFO; [] on an old snapshot.
-    changes?: TaskChange[];
+export type TaskChangeOp = RecordChangeOp;
+export type TaskChange = RecordChange;
+export type TaskPageInfo = RecordsPageInfo;
+
+// THE tasks result: the engine envelope under the collection's plural key. Every
+// successful call returns exactly this shape — read, add, patch and removal alike
+// — which is what makes "mutate and instantly return the list" one round trip and
+// what removes the read-first dance `/task` used to pay for a rev token (F7).
+export type TaskResult = Omit<RecordsResult, 'entries' | 'counts'> & {
+    tasks: TaskItem[];
+    counts: TaskCounts;
 };
 
-// Legacy aliases: the tool was `todoManage` before R9-R11. Internal callers (and
-// any host that imported these names) keep compiling; the wire contract above is
-// the one the harness declares and executes.
-export type TodoItem = TaskItem;
-export type TodoCounts = TaskCounts;
-export type TodoStoreState = TaskStoreState;
-
-// Every task result is one bounded page of the current list; the canonical result
-// and toolset shapes live in ./core/task.ts and are re-exported below (R9).
-
-// ---------------------------------------------------------------------------
-// profileManage / chapterManage / locationManage (per-harness session records)
-// ---------------------------------------------------------------------------
-//
-// Three session record tools follow task's lifecycle exactly:
-//   - one factory closure per harness (src/core/profile.ts, chapter.ts,
-//     location.ts), never a module singleton;
-//   - state is shared by every agent in that harness and cleared by reset();
-//   - ids are stable decimal strings, monotonic per instance, restarting at "1"
-//     after reset();
-//   - every mutating action validates completely before touching the store, so a
-//     rejected call leaves the records exactly as they were;
-//   - every result is a defensive copy: `item`, `item.traits`, and the collection
-//     snapshot never alias live state.
-//
-// The action set is identical for all three tools. `update` is partial: only the
-// fields present in the arguments change. `get` returns one record, and for
-// chapters it is the ONLY action that returns the body (lists and mutation
-// results carry summaries, so a long chapter cannot flood the context).
-//
-// Cross-references:
-//   - ../core/profile.ts, ../core/chapter.ts, ../core/location.ts — implementations
-//   - ../core/metadata.ts — names, descriptions, and JSON Schemas
-//   - ../harness.ts — registration, reservation, and reset wiring
-
-// The shared CRUD action set. `add` creates, `list` snapshots, `get` reads one,
-// `update` patches one (partial), `remove` deletes one.
-export type RecordAction = 'add' | 'list' | 'get' | 'update' | 'remove';
-
-// ---------------------------------------------------------------------------
-// profileManage — characters / people
-// ---------------------------------------------------------------------------
-
-// A stored profile. `traits` and `notes` are always present (empty when the
-// caller did not supply them) so a model sees one stable shape. `traits` are
-// trimmed and deduplicated on write; `notes` is free-form text.
-export type ProfileItem = {
-    id: string;
-    name: string;
-    description: string;
-    traits: string[];
-    notes: string;
-};
-
-// Model-facing arguments. `action` is the only required property; each action
-// reads the fields it needs (add → name + description, get/update/remove → id,
-// update → at least one mutable field).
-export type ProfileParameters = {
-    action: RecordAction;
-    id?: string;
-    name?: string;
-    description?: string;
-    traits?: string[];
-    notes?: string;
-};
-
-// Counts are derived on every call, like TodoCounts.
-export type ProfileCounts = {
-    total: number;
-};
-
-// The complete restorable profile store (R3a), matching TodoStoreState.
-export type ProfileStoreState = {
-    items: ProfileItem[];
-    nextId: number;
-};
-
-// R9: result and toolset shapes are OWNED by ./core/todo.ts, ./core/profile.ts,
-// ./core/chapter.ts, and ./core/location.ts (they build the bounded pages), and
-// re-exported here so the public surface cannot drift. Type-only, so there is no
-// runtime cycle even though those modules import their item/parameter types from
-// this file.
-export type { TaskPageInfo, TaskResult, TaskToolset } from '../core/task';
-export type {
-    ProfilePageInfo,
-    ProfileListResult,
-    ProfileChangeResult,
-    ProfileResult,
-    ProfileToolset
-} from '../core/profile';
-export type {
-    ChapterPageInfo,
-    ChapterListResult,
-    ChapterChangeResult,
-    ChapterResult,
-    ChapterToolset
-} from '../core/chapter';
-export type {
-    LocationPageInfo,
-    LocationListResult,
-    LocationChangeResult,
-    LocationResult,
-    LocationToolset
-} from '../core/location';
-
-// ---------------------------------------------------------------------------
-// chapterManage — ordered chapter tracking
-// ---------------------------------------------------------------------------
-
-// The three lifecycle states a chapter can be in. No other values are accepted.
-export type ChapterStatus = 'planned' | 'draft' | 'complete';
-
-// A chapter as it appears in a LIST or in a mutation result: metadata only. The
-// body is deliberately absent so a long chapter does not flood the context;
-// `get` supplies it separately. `order` is optional and omitted when unset.
-export type ChapterSummary = {
-    id: string;
-    title: string;
-    summary: string;
-    status: ChapterStatus;
-    order?: number;
-};
-
-// The full stored chapter, including the body. Only createChapterTool()'s
-// internal store and the `get` action ever touch `content`.
-export type ChapterItem = ChapterSummary & {
-    content: string;
-};
-
-// Model-facing arguments. `add` requires title + summary; content, status, and
-// order are optional (status defaults to 'planned').
-export type ChapterParameters = {
-    action: RecordAction;
-    id?: string;
-    title?: string;
-    summary?: string;
-    content?: string;
-    status?: ChapterStatus;
-    order?: number;
-};
-
-// Per-status totals derived on every call.
-export type ChapterCounts = {
-    total: number;
-    planned: number;
-    draft: number;
-    complete: number;
-};
-
-// The complete restorable chapter store (R3a). `content` is included here even
-// though lists and mutation results carry summaries: a resumed session must not
-// lose chapter bodies.
-export type ChapterStoreState = {
-    items: ChapterItem[];
-    nextId: number;
-};
-
-// Every chapterManage result is a bounded page of summaries or one mutation
-// result; `content` is present only for `get`. Canonical types: ./core/chapter.ts.
-
-// ---------------------------------------------------------------------------
-// locationManage — places / settings
-// ---------------------------------------------------------------------------
-
-// A stored location. `notes` is always present (empty when not supplied) for a
-// stable shape.
-export type LocationItem = {
-    id: string;
-    name: string;
-    description: string;
-    notes: string;
-};
-
-// Model-facing arguments. `add` requires name + description; notes is optional.
-export type LocationParameters = {
-    action: RecordAction;
-    id?: string;
-    name?: string;
-    description?: string;
-    notes?: string;
-};
-
-// Counts are derived on every call, like TodoCounts.
-export type LocationCounts = {
-    total: number;
-};
-
-// The complete restorable location store (R3a), matching TodoStoreState.
-export type LocationStoreState = {
-    items: LocationItem[];
-    nextId: number;
-};
-
-// Every locationManage result is a bounded page or one mutation result; canonical
-// types live in ./core/location.ts and are re-exported above (R9).
+// The shared CRUD action set is declared above with the engine types.
 
 // What a tool implementation is handed when the model calls it.
 //
@@ -1593,14 +1661,18 @@ export type ToolContext<TParameters = any> = {
     // inside a harness.
     //
     // `options.signal` (T28) lets the CALLER bound the child independently of the
-    // calling run: `delegate` uses it to enforce `timeoutMs` without aborting its own
-    // tool call (which would discard the structured result it wants to return).
+    // calling run: `delegate` uses it to enforce an EXPLICIT `timeoutMs` without
+    // aborting its own tool call (which would discard the structured result it wants
+    // to return). With no `timeoutMs` supplied the child is unbounded
+    // (2026-11-09 policy) and this link exists only to carry the caller's abort.
     // Omitted, the child inherits the calling run's signal exactly as before.
     //
     // `options.tools` (T28) is an ALLOWLIST of wire names the child may see and call.
     // It is the scope a delegation needs: a pure-reasoning child gets no file or shell
     // tools, so a "planning" run cannot leave artifacts in the user's checkout. Omitted
-    // means "no restriction" (the historical behaviour).
+    // means "no restriction" (the historical behaviour). `toolRequest` is exempt from
+    // the allowlist (the scope escape hatch, delegate-stress finding 2), so a scoped
+    // child can always name the capability it is missing.
     run?: (
         agentName: string,
         input: string,
@@ -2147,9 +2219,12 @@ export type HarnessThreadOrigin = 'agent' | 'host';
 // boundary, not a suspension of the process. A plugin that pauses and never resumes
 // leaves the thread parked: the run's finally-block only clears 'running', and the
 // next explicit host `sendThreadInput` revives a parked conversation exactly like a
-// stopped one. 'paused' is NEVER persisted — snapshot() maps it to 'idle' (a parked
-// thread has no live run after a restart), which is why HarnessThreadSnapshot keeps
-// its narrower 'idle' | 'stopped' union.
+// stopped one — and an agent's `threadSend` lifts the park through that same
+// `resumeThreadState` path before starting a turn in it (delegate-stress T3.2),
+// which is the difference from `stopped`: a park is not the host's intent, so a
+// message may clear it and a stop may not. 'paused' is NEVER persisted — snapshot()
+// maps it to 'idle' (a parked thread has no live run after a restart), which is why
+// HarnessThreadSnapshot keeps its narrower 'idle' | 'stopped' union.
 export type HarnessThreadStatus = 'idle' | 'running' | 'paused' | 'stopped';
 
 export type HarnessThreadRecord = {
@@ -2210,11 +2285,24 @@ export type HarnessThreadRoster = {
 // itself — while `threadId` is the target conversation.
 export type HarnessThreadMessageResult = {
     threadId: string;
-    // 'appended' — the target was idle, so the message is already in its
-    // transcript and will be visible on its next run.
-    // 'queued'   — the target is running; the message lands at its next model
-    // boundary.
-    delivered: 'appended' | 'queued';
+    // STATE-AWARE delivery (delegate-stress T3.2/T3.6). `threadSend` used to report
+    // the same bare word for a message that changed a live run and one that only
+    // sat in a transcript, and that ambiguity is what the finding was built on; each
+    // value below names one outcome, and each is reachable in
+    // src/harness.thread-runtime.test.ts. A `stopped` target is neither: it throws.
+    //
+    // 'queued'  — the target was RUNNING. The message joins the live run's queue and
+    //   is applied as a user message at its next safe model boundary (never inside
+    //   the request already in flight). No new run was started.
+    // 'started' — the target was DORMANT: `idle`, or `paused` by a plugin and resumed
+    //   here. A run has been STARTED with the attributed message as its prompt. The
+    //   receipt is non-blocking: it reports the start, not the answer, and the run
+    //   may still fail afterwards (its failure is reported to the harness listeners
+    //   and archived for `agentResult`, not to this sender).
+    //
+    // 'appended' is RETIRED: nothing is ever parked in a transcript without a run to
+    // read it, which was the inert delivery this finding reported.
+    delivered: 'queued' | 'started';
     // The agent name the runtime attributed the message to.
     sender: string;
     // The sender's persistent thread id, when the sender ran inside one.
@@ -2486,7 +2574,13 @@ export type HarnessRunOptions = {
 //
 // `version` gates the schema. restore() rejects any other version rather than
 // guessing; a newer/older snapshot is a migration problem, not a silent drop.
-export type HarnessSnapshotVersion = 1;
+//
+// v2 is the records-engine shape change (T3): `records` went from four sibling stores
+// (`todos`, `profiles`, `chapters`, `locations`, each with its own id counter) to ONE
+// collection map with a single store-level counter and a persisted definition per
+// collection (F3, Decision M). R5 says nothing is in production, so no v1 reader is
+// kept: a v1 file is refused by the version gate instead of half-migrated.
+export type HarnessSnapshotVersion = 2;
 
 // One agent's resolvable state. `messages` is the ENTIRE transcript (seeded
 // instructions plus turns and tool results), and `model` is the model accessor's
@@ -2637,12 +2731,15 @@ export type HarnessSnapshot = {
     // High-water mark for generated host thread ids. Present together with
     // `threads`; restore validates it against the persisted records.
     threadSequence?: number;
-    records: {
-        todos: TodoStoreState;
-        profiles: ProfileStoreState;
-        chapters: ChapterStoreState;
-        locations: LocationStoreState;
-    };
+    // The ONE session store (records-engine T3): a collection map with a global id
+    // counter, replacing snapshot v1's four sibling sections (`records.todos`,
+    // `records.profiles`, `records.chapters`, `records.locations`). Definitions
+    // persist with their entries (Decision M) so a collection an agent `define`d is
+    // rediscovered after a restart. The shape change is why
+    // `HARNESS_SNAPSHOT_VERSION` moved: R5 states nothing is in production, so no v1
+    // migration is written — a v1 file is refused by the version gate rather than
+    // half-read.
+    records: RecordsStoreState;
 };
 
 // ---------------------------------------------------------------------------
@@ -2855,6 +2952,13 @@ export type HarnessConfiguration = {
         // thrown by it are ignored. See HarnessStateChangeEvent for what it does
         // and does not cover.
         stateChange?: (event: HarnessStateChangeEvent) => void;
+        // Plugin diagnostics (T1.5). Synchronous and advisory, exactly like
+        // `stateChange`: errors thrown by it are ignored, and it can never fail a run.
+        // This is the channel that makes a BROKEN plugin visible — before it existed,
+        // a handler that threw, timed out, or returned an unparseable decision was
+        // dropped silently, so "the plugin is broken" and "the plugin decided to do
+        // nothing" looked identical from outside. See HarnessDiagnosticEvent.
+        diagnostic?: (event: HarnessDiagnosticEvent) => void;
     };
     // Slash commands available through the harness command registry.
     // Registered AFTER the built-ins (/help, /tools, /task, /websearch,
@@ -3009,6 +3113,23 @@ export type Harness = {
     // snapshot is idempotent: tools previously restored here are replaced, not
     // duplicated. Throws HarnessError while an agent run is in progress.
     restore: (snapshot: HarnessSnapshot) => void;
+    // Teardown (T1.6, the missing counterpart of `harness.dispose` in the event
+    // catalogue). Emits `harness.dispose` ONCE and clears every plugin subscription.
+    //
+    // It never aborts work: a run that is still going is a run the caller started, so
+    // when one is live the event is DEFERRED to the boundary after the last run settles
+    // — which is what "fires exactly once, after the last run of every thread" means.
+    // The call itself is synchronous and idempotent; a second call does nothing, and a
+    // harness that was disposed while a run was live still fires exactly once.
+    //
+    // Ordering is observable (F8): the emit happens on a settled boundary, never raced
+    // against a run. A host that wants the runs GONE calls `stopAllThreads()` (the
+    // server's session teardown does) and then `dispose()`.
+    //
+    // Deliberately NOT snapshot state: a dispose is a process fact. A restored harness
+    // has a fresh bus with its plugins re-registered by construction, so snapshotting
+    // "disposed" would describe a state the restore cannot reproduce.
+    dispose: () => void;
     // Names of the searchable tools enabled right now: the newest toolRequest /
     // toolManage selection first, then retained prior entries, capped at
     // maxEnabledTools. Persists for the harness's lifetime (not just one call),
@@ -3099,6 +3220,42 @@ export type Harness = {
         threadId: string,
         messages: HarnessMessage[],
         fromLength: number
+    ) => HarnessMessage[];
+    // T4.1 lane-worker seam: REWRITE the committed PREFIX of one conversation in place — the
+    // in-place companion of the append above, which can only ever extend a transcript.
+    //
+    // A lane's plugin writes an ALREADY-committed message without changing the length (the
+    // `included` flag, or `edit` changing its text), so the append condition never fires for
+    // it and the change used to die with the worker process. This is the targeted canonical
+    // write the authority replays a `transcript:patch` op through: one call per committed
+    // change, validating its own input, never a wholesale `restore()`.
+    //
+    // `messages` is the whole prefix — `messages.length` MUST equal `expectedLength`, the
+    // committed length the lane holds — and it replaces `agent.messages[0..expectedLength]`
+    // in place, leaving everything the conversation gained since that prefix untouched.
+    //
+    //   - unknown/deleted `threadId`                    → HarnessError;
+    //   - a run attached IN THIS harness                → HarnessError (the authority's own run
+    //     loop is reading this transcript; a lane's run living on another thread is NOT a
+    //     refusal, exactly like the append above);
+    //   - `messages.length !== expectedLength`, a negative or fractional length, canonical
+    //     shorter than `expectedLength`                 → HarnessError, NOTHING mutated;
+    //   - an entry that would change a committed position's `role`, or move its `messageId`
+    //     when both sides carry one                      → HarnessError, NOTHING mutated.
+    //     Role is what provider tool-call pairing and the exclusion unit resolve on, and a
+    //     `messageId` is a turn's address (it is how `setIncluded` names an entry from another
+    //     round), so neither may move under a text edit.
+    //
+    // The compare-and-set itself is the AUTHORITY's job (`src/server/workers/lane-authority.ts`
+    // digests the prefix it is about to replace and refuses a stale one), because the digest
+    // serializer is a worker-protocol concern and the core has no reason to own one.
+    //
+    // Returns the detached canonical transcript, and notifies `agent_message` — the only
+    // durability mechanism a flag or text edit has (src/types/index.ts `setIncluded`).
+    patchThreadMessages: (
+        threadId: string,
+        messages: HarnessMessage[],
+        expectedLength: number
     ) => HarnessMessage[];
     // T5 lane-worker seam: mirror a lane conversation's roster state onto the canonical
     // record (status, and the invocation the roster joins a turn to). Refused when a run
@@ -3252,7 +3409,8 @@ export type Harness = {
 //               tree; `threadId` is absent for a branch run, which owns an
 //               ephemeral transcript instead of a conversation.
 //   turn.*    — one model request. `turn.before` is the ONLY hook whose return value
-//               matters (it may replace the transcript the provider is about to see)
+//               matters (it may replace the transcript the provider is about to see AND
+//               return a `HarnessTurnDecision` for the run — continue/replace/pause/stop)
 //               and the only one that carries control methods; that is what makes
 //               context compaction and the per-agent context limit possible.
 //   tool.*    — one tool call: `before` at launch, `after` when its result is
@@ -3260,9 +3418,13 @@ export type Harness = {
 //   async.*   — background tool work: `pending` when a call joins the board,
 //               `drained` when an agent's board became empty (the replacement for
 //               the hardcoded recurring wake).
-//   harness.dispose — reserved for a future explicit teardown. NO harness path emits
-//               it yet: harness() has no dispose/close method, so registering this
-//               hook is legal but currently inert (reported, not silently ignored).
+//   host.*    — the host's own planes bridged into the bus (T1.7). Deliberately NOT
+//               part of the `'*'` fan-out: see `HARNESS_WILDCARD_EXCLUDED_EVENTS`.
+//   harness.dispose — the teardown point. `harness.dispose()` (the handle member,
+//               T1.6) emits it exactly once, after the last run of every thread has
+//               settled, and clears the bus right after; the server binds it to
+//               session teardown (SessionStore.disposeSession). A plugin that only
+//               needs "the harness is going away" subscribes HERE.
 export type HarnessLifecycleEvent =
     | 'thread.created'
     | 'thread.started'
@@ -3280,7 +3442,20 @@ export type HarnessLifecycleEvent =
     | 'tool.after'
     | 'async.pending'
     | 'async.drained'
+    // T1.7: the persistence/state-change plane (`report.stateChange`) bridged into the
+    // bus. Explicit-subscription ONLY and never delivered through `'*'`, because it
+    // fires on every transcript/tool/thread mutation — far more often than any run
+    // event — so a bridge that reached the default fan-out would put a handler on every
+    // tool execution. A `'*'` subscriber that wants it asks for it by name.
+    | 'host.state_change'
     | 'harness.dispose';
+
+// The events a `'*'` subscription does NOT receive: `host.state_change` only. It is a
+// host plane bridged for observers that opt in by name, not a run event, and the
+// Plugins pane's live-vs-declared report is built from the SAME rule (the bus expands
+// a wildcard into exactly the events it will be delivered — `createHookBus().live()`).
+// The rule itself lives in src/plugin/hooks.ts (`WILDCARD_EXCLUDED`), because this file
+// stays a types-only module (no runtime export goes through the declaration build).
 
 // One declared setting of a plugin. `key` is the stable id the harness reads back
 // through HarnessPluginSettingsProvider; `label`/`description` are for the UI. The
@@ -3347,6 +3522,14 @@ export type HarnessPlugin = {
 // a wrong settings read must not be silently defaulted).
 export type HarnessPluginSettingsProvider = {
     get(plugin: string, key: string): unknown;
+    // Optional WRITE capability (T3.5). A provider that does not implement it is a pure
+    // read model, and `api.settings.setOwn` refuses it with the stated "no writer"
+    // answer instead of keeping a private copy the host would never see. A host that
+    // DOES implement it receives an already-validated value: the plugin view checks the
+    // descriptor and normalizes to the declared type before calling this, so a writer
+    // never has to accept a numeric string for a `number` setting (src/plugin/settings.ts
+    // `setOwnValue`, mirroring src/server/plugins.ts `checkValue`).
+    set?(plugin: string, key: string, value: number | string | boolean): void;
 };
 
 // What one plugin's `api.settings` looks like. Every accessor coerces: a stored value
@@ -3359,6 +3542,38 @@ export type HarnessPluginSettings = {
     number: (key: string, fallback?: number) => number;
     string: (key: string, fallback?: string) => string;
     boolean: (key: string, fallback?: boolean) => boolean;
+    // Store one of THIS plugin's own settings (T3.5 — the only write this surface has).
+    //
+    // SCOPE: the view is built per plugin (src/plugin/host.ts), so `key` is always
+    // namespaced by the plugin that owns the view — a plugin cannot read OR write
+    // another plugin's namespace, and there is no `set(plugin, key)` spelling.
+    //
+    // VALIDATION: the same rules the server applies at its PATCH write edge
+    // (src/server/plugins.ts, header "VALIDATION AT THE WRITE EDGE, COERCION AT THE
+    // READ EDGE"), because a write must say what it means while a read stays
+    // permissive: the key must be one this plugin DECLARES (an unknown key is refused
+    // with the declared set named, never stored and then ignored), the value must match
+    // the declared `type` — a number, or a numeric string, or the words 'true'/'false'
+    // for a boolean, and a string ONLY for a `string` setting — and a number must be
+    // finite and inside the published `min`/`max`. `step` stays a UI hint and is NOT
+    // enforced, exactly as the descriptor comment says. The value is NORMALIZED to the
+    // declared type before it is written, so a stored value is always JSON-shaped.
+    //
+    // DURABILITY: a write goes THROUGH the host's provider, never around it, and what
+    // survives is whatever the provider does. Two answers, both stated rather than
+    // discovered: (1) a harness built with no `configuration.pluginSettings` gets the
+    // library's in-memory provider, so `setOwn` works for the lifetime of the process
+    // and persists NOTHING — it is not in `snapshot()` and does not survive a restart;
+    // (2) a host whose provider implements `get` only — which is the shipped server's
+    // live provider, deliberately read-only so the store's own PATCH edge stays the
+    // one that validates, bumps the revision and schedules the save — has NO writer, and
+    // `setOwn` throws a `HarnessError` saying so rather than silently dropping the
+    // write. Wiring a host store's write path is host work, not a library fallback.
+    //
+    // `null`/`undefined` are refused, not treated as "reset": a reset is the host's
+    // documented PATCH semantic (an explicit `null` removes the override) and this
+    // surface has no way to express "delete the key" without inventing a second rule.
+    setOwn: (key: string, value: unknown) => void;
 };
 
 // The ONE payload shape per lifecycle event. Keyed by event so `api.on` is typed
@@ -3391,7 +3606,93 @@ export type HarnessLifecyclePayloads = {
     };
     'async.pending': HarnessAsyncLifecycleContext;
     'async.drained': HarnessAsyncLifecycleContext;
+    // T1.7 — the host's persistence/state-change plane, bridged verbatim. Same reason
+    // union and same detail fields the `report.stateChange` observer gets, so a plugin
+    // and a host see ONE vocabulary.
+    'host.state_change': HarnessStateChangeEvent;
     'harness.dispose': Record<string, never>;
+};
+
+// ---------------------------------------------------------------------------
+// Event bus v2 (T1): wildcard subscription
+// ---------------------------------------------------------------------------
+
+// What a `'*'` handler receives: ONE discriminated union, built by mapping the payload
+// map, so `event` and `payload` narrow together (`if (context.event === 'turn.before')
+// context.payload.estimatedTokens` typechecks) and no `any` appears at the boundary
+// (open decision 6 — a plain `payload: unknown` would put the `any` back).
+//
+// Identity fields are NOT copied onto the envelope: every payload that has a thread or
+// an agent already carries them (`HarnessRunLifecycleContext`, `HarnessThreadRecord`),
+// so a second copy would be a value that can disagree with the payload.
+export type HarnessWildcardEventContext = {
+    [E in HarnessLifecycleEvent]: { event: E; payload: HarnessLifecyclePayloads[E] };
+}[HarnessLifecycleEvent];
+
+// A wildcard handler observes; it does not decide. Its result is always discarded,
+// INCLUDING for a `turn.before` frame — an audit plugin that subscribed to everything
+// must not silently rewrite one event's request because that event happens to have a
+// result channel. Async is allowed (the bus awaits it, sequentially, fail-open).
+export type HarnessWildcardHandler = (
+    context: HarnessWildcardEventContext
+) => void | Promise<void>;
+
+// One dropped plugin handler, reported to the host (T1.5). JSON-shaped on purpose: the
+// server can log it or show it in the Plugins pane without owning an Error graph. The
+// three kinds are every way a handler can stop being useful WITHOUT failing the run —
+// fail-open is the invariant, this is the visibility that makes it safe:
+//   - `handler-threw`     — it threw or rejected; its result is discarded.
+//   - `handler-timed-out` — it outlived its `timeoutMs` budget; its result (whenever it
+//                         finally arrives) is discarded too.
+//   - `invalid-decision`  — it returned a `decision` the contract cannot parse (T2.2
+//                         rule 5); the rest of its result still applies.
+//   - `policy`            — NOT a failure. A plugin's own decision report, authored through
+//                         `api.report.diagnostic` (compaction T4.5). The three kinds above
+//                         are produced by the FRAMEWORK about a plugin; this one is produced
+//                         BY a plugin about what it did. It shares the channel because the
+//                         channel is the answer to "what is this plugin doing that I cannot
+//                         see", and an operator looking at one stream should not have to
+//                         know which half of the harness wrote it.
+export type HarnessDiagnosticEvent = {
+    type: 'plugin_diagnostic';
+    kind: 'handler-threw' | 'handler-timed-out' | 'invalid-decision' | 'policy';
+    // The event whose handler failed, and the plugin that registered it (the bus's
+    // `owner`, which is the plugin name; '' for a subscription with no owner).
+    //
+    // OPTIONAL for a `policy` report: a decision is not tied to one hook. The compactor
+    // runs inside `turn.before` but reports WHICH UNITS IT WITHHELD, and naming the hook
+    // would claim a failure that did not happen. Every framework diagnostic names its
+    // event, so a consumer that only handles failures keeps reading this field.
+    event?: HarnessLifecycleEvent;
+    owner: string;
+    // Human-readable, from the thrown value's message or the synthetic one the bus
+    // builds for a timeout / unparseable decision. Never empty.
+    message: string;
+    // The structured form of a `policy` report (compaction T4.5: each withheld unit, its
+    // estimated tokens, and the id of the unit that superseded it). Absent for a framework
+    // failure, which has nothing to structure — `message` is the complete human view of the
+    // fact either way, so a host that only prints text loses nothing.
+    data?: Record<string, unknown>;
+};
+
+// What a plugin may author on the diagnostic channel (`api.report.diagnostic`). Deliberately
+// narrow: the framework owns `type`, `owner` and (for a failure) `event`, so a plugin cannot
+// forge a report about another plugin or about a hook it never ran.
+export type HarnessPluginDiagnosticReport = {
+    // Defaults to `'policy'`, the only authorable kind: a plugin reports DECISIONS, and a
+    // failure it caused is already reported by the bus when the handler throws.
+    kind?: 'policy';
+    // Self-contained human-readable text. It has to survive being printed alone: a host
+    // with no structured sink still sees which units left the context and why.
+    message: string;
+    // JSON-shaped payload (units, token counts, ids). Kept `unknown`-valued like every other
+    // diagnostic surface: the plugin decides what an operator needs to see.
+    data?: Record<string, unknown>;
+    // Who authored the report. The plugin HOST stamps this with the plugin's own name
+    // (`plugin/host.ts`), which is the one piece of context a scoped api cannot see; a
+    // subscriber using the fallback api (a host hook, a test) may name itself, and an
+    // unnamed report attributes to the framework.
+    owner?: string;
 };
 
 // `run.*` / `turn.*` share this identity block. `threadId` is absent only for a
@@ -3427,6 +3728,20 @@ export interface HarnessContextEntry {
     // would bypass the key normalization and the persistence notification, so
     // inclusion changes go through `setIncluded`.
     readonly message: HarnessMessage;
+    // THE DURABLE ADDRESS (context T1.5) — `message.messageId`, hoisted so a handler
+    // can name this turn without holding the object. Unlike `index` and the message
+    // identity, it survives `replaceHistory()`, a snapshot/restore, and a whole run:
+    // `setIncluded(id, …)` in a LATER round re-resolves this same turn, and so does one
+    // captured before a `replaceHistory()` that kept the entry.
+    //
+    // Present for every entry the runtime created, and for a branch's own framing too:
+    // a materialized placeholder or incorporation boundary enters the branch transcript
+    // without an id and is minted one when that transcript is seeded
+    // (core/agent.ts `assignMessageId`). ABSENT only for a message that reached canonical
+    // state with none — a hand-pushed `agent.messages` edit by a host or a tool — and an
+    // entry must not grow a `messageId: undefined` key a `toStrictEqual` consumer would
+    // have to special-case. Address those by entry.
+    readonly messageId?: string;
     // EFFECTIVE unit inclusion: `false` when this entry, or ANY other member of its
     // unit, is disabled. A unit is a standalone message, or a whole tool-call block
     // (an assistant message with non-empty `toolCalls` plus every `tool` message in
@@ -3440,14 +3755,53 @@ export interface HarnessContextEntry {
     readonly included: boolean;
 }
 
+// The patch `context.edit(entry, patch)` accepts (pipeline T3.1) — the CLOSED set of
+// text fields a transcript entry may change, and nothing else.
+//
+// Both fields are optional so a caller names only what it means to change, and a field
+// it does not name is left exactly as it was (`edit` never clears a field the patch is
+// silent about). `reasoning` exists on the assistant variant only, and the runtime
+// refuses it for any other role rather than writing a key the snapshot whitelist would
+// then refuse to load.
+//
+// `unknown` at the edges: the type is the DECLARATION, the runtime is the authority. A
+// JS caller may still hand back a parsed JSON object carrying `toolCalls` or a number
+// for `content`, and both are refused before anything is written.
+export type HarnessContextEditPatch = {
+    // The entry's text — the model-facing content of every role.
+    content?: string;
+    // The assistant's thinking text (kept out of the provider payload).
+    reasoning?: string;
+};
+
 // Everything `turn.before` hands a plugin: the exact request that is about to go out,
 // a token estimate for the context limit, and the controls that make a hook able to
 // ACT rather than only observe.
 export type HarnessTurnBeforeContext = {
+    // The conversation this run belongs to — for a BRANCH run (a fork or an
+    // autoanswer) that is the conversation that SPAWNED it, so a branch and its root
+    // report the SAME string here. That is the shipped meaning and it is deliberately
+    // unchanged (src/plugins/context-compaction.plugin.ts keys its cooldown on it);
+    // use `actorKey`/`branchId` below to tell the two rounds apart. A run with no
+    // thread at all falls back to its scheduling key.
     threadId: string;
     agent: string;
     // 1-based model-turn counter within this run.
     iteration: number;
+    // THE BRANCH DISCRIMINATOR (pipeline T3.4 / context T8) — the run's scheduling
+    // identity, exposed rather than invented: this is the same key the scheduler and
+    // the mailbox already isolate the run by (a registered agent's display name,
+    // `thread:<id>` for a host thread, `branch:<id>` for a fork/autoanswer). It is
+    // ALWAYS different between a root round and a branch round of one conversation,
+    // which is exactly what `threadId` cannot promise.
+    actorKey: string;
+    // The branch's own id (`branch-<n>`, core/branch.ts `createBranchId`) — PRESENT
+    // only when this run IS a branch, absent for every ordinary run. Same value the
+    // state-change plane already reports (`HarnessStateChangeEvent.branchId`), so a
+    // plugin and the host name a branch identically. A policy that must not prune a
+    // transcript that is about to be incorporated into its owner checks THIS, not
+    // `threadId`.
+    branchId?: string;
     // The PROJECTED transcript (committed history plus a placeholder for every
     // still-running tool call, with every disabled unit already filtered out) — the
     // array the provider was about to receive WHEN THIS HANDLER WAS ENTERED. It is a
@@ -3467,6 +3821,15 @@ export type HarnessTurnBeforeContext = {
     // while nothing has been written, so an observing handler pays nothing for the
     // distinction, and at most one re-projection per write is ever paid.
     currentMessages: () => readonly HarnessMessage[];
+    // The SAME estimate `estimatedTokens` carries, re-evaluated against
+    // `currentMessages()` — the projection as it is NOW. Entry-time and live views, one
+    // pair: `estimatedTokens` answers "how big was the context I was asked about",
+    // `currentEstimatedTokens()` answers "how big will it be if I stop writing now", so
+    // a compactor can measure what ITS OWN prune just saved inside the same handler
+    // (context T5). Frozen to the round's decision after the round, exactly like
+    // `currentMessages()`, and counted by the same estimator over the same leading
+    // instruction blocks, so the two numbers agree whenever nothing has been written.
+    currentEstimatedTokens: () => number;
     // The FULL canonical transcript, in canonical order, INCLUDING disabled entries
     // (see `HarnessContextEntry`). Read this to decide what to drop; act through
     // `setIncluded`. Built on FIRST ACCESS and cached for that handler (repeat reads
@@ -3490,14 +3853,20 @@ export type HarnessTurnBeforeContext = {
     // as an `agent_message` transcript change, exactly like `postThreadMessage` and
     // `writeThreadTranscript`. That notification is the ONLY durability mechanism, and
     // it buys: later turns of the same conversation, `snapshot()`/`restore()`, and any
-    // store that persists on that notification (the server's `state.json`). Whether it
-    // survives a SERVER RESTART depends on the execution lane: a lane whose authority
-    // holds the transcript receives only APPENDED SLICES (`transcript:append` with
-    // `fromLength`) from the worker today, so an in-place flag change on an
-    // ALREADY-COMMITTED message does not reach the authority until a full-transcript
-    // sync exists — planned for the server-integration stage, NOT in place now. Do not
-    // treat the flag as restart-durable under `threadExecution: 'worker'` until that
-    // lands. A branch run (a fork or an autoanswer, which owns an ephemeral
+    // store that persists on that notification (the server's `state.json`) — in BOTH
+    // execution lanes. Under `threadExecution: 'worker'` a lane used to owe the authority
+    // only APPENDED SLICES, so an in-place flag change on an already-committed message
+    // died with the worker process (finding F6); it now pushes that change too, as a
+    // `transcript:patch` operation (pipeline T4.1, src/server/workers/lane-commit.ts): the
+    // whole committed prefix, compare-and-set against the digest this lane adopted, which
+    // the authority replays on the canonical harness through `patchThreadMessages` — the
+    // same targeted-seam family as the append — and reports as the same `agent_message`
+    // change, which is what puts it in `state.json`. A flag a plugin writes in worker mode
+    // is therefore restart-durable. What the CAS costs: if canonical rewrote that prefix
+    // first, the patch is REFUSED whole, the lane re-reads canonical, and this round's
+    // write is dropped — the policy that made it runs again on the next `turn.before`,
+    // because a whole-prefix digest cannot name which entries it disagreed about. A
+    // branch run (a fork or an autoanswer, which owns an ephemeral
     // transcript) applies the flags to that copy — its own request is still filtered —
     // but has no conversation to persist them into and reports no change.
     //
@@ -3507,13 +3876,96 @@ export type HarnessTurnBeforeContext = {
     // the target and before anything is written, so a rejected call never leaves a
     // half-applied unit.
     //
+    // TARGETS — three, and the first two are the shipped ones, unchanged:
+    //   - an ENTRY from this round (`context.entries[i]`) — resolved by message
+    //     identity against the live transcript, so it stays usable when the transcript
+    //     merely GREW and is refused when the list was replaced;
+    //   - a NUMBER — the index, interpreted against the CURRENT transcript;
+    //   - a `messageId` STRING (context T1.5) — the durable address, looked up by id in
+    //     this agent's transcript, so it resolves in a LATER round of the same
+    //     conversation, after `restore()`, and even after a `replaceHistory()` that kept
+    //     the entry. It names the SAME UNIT, so the cascade rule is identical. An id
+    //     that is no longer in the transcript is refused like a stale entry, with the
+    //     cure named. A fork's round resolves the ids its source carries, because a fork
+    //     COPIES ids (T1.4) — lookup is always scoped to the one transcript this run
+    //     owns, so an id repeating in another conversation is not a conflict.
+    //
     // Throws a `HarnessError` for an index outside the transcript (the message names
-    // the live bounds), a non-integer index, a non-boolean `included`, or an entry that
-    // is not this turn's entry (including one made stale by `replaceHistory`).
-    setIncluded: (target: HarnessContextEntry | number, included: unknown) => void;
+    // the live bounds), a non-integer index, a non-boolean `included`, an empty
+    // `messageId`, an entry that is not this turn's entry (including one made stale by
+    // `replaceHistory`), or a `messageId` that no longer names a transcript entry.
+    setIncluded: (target: HarnessContextEntry | number | string, included: unknown) => void;
+    // Edit the TEXT of one canonical transcript entry in place (pipeline T3). The other
+    // half of R4 — "switch inclusion, edit an entry within its role's rules, and
+    // nothing else": history is never deleted (T3.3), so the only mutation besides a
+    // flag is a text change.
+    //
+    // WHAT A PATCH MAY NAME (role-safe by construction, T3.1):
+    //   - `content`   — every role. For `system`/`user`/`assistant` this is the text the
+    //     model reads. For a `tool` RESULT it is the answer text, and it is the ONLY
+    //     thing editable there: `toolCallId` and `name` are the PAIRING KEYS the unit
+    //     resolver and the transport both trust (src/harness.ts `transcriptUnits`,
+    //     src/transport/openai.ts `wireMessage`), so a patch that touches them is
+    //     refused rather than re-paired.
+    //   - `reasoning` — `assistant` only. It is the model's own thinking text; the
+    //     transport keeps it out of the wire payload, so editing it changes what a
+    //     snapshot and a UI replay carry WITHOUT changing what the next request says.
+    //
+    // WHAT IS REFUSED: any other key (`role`, `toolCalls`, `toolCallId`, `name`,
+    // `attachments`) and `included`. A structural edit could change `toolCalls`
+    // MEMBERSHIP, which would split an assistant block from its results — the exact bug
+    // the exclusion unit exists to prevent (R2) — and attachments are validated bytes,
+    // not text. `included` is refused here because it is a different axis with a
+    // different rule (it cascades to the whole unit): use `setIncluded`. An empty patch
+    // is refused too, because "I edited nothing" is nearly always a typo in the key.
+    //
+    // ALL-OR-NOTHING, like `setIncluded` (T3.2): the entry is resolved and the patch is
+    // validated BEFORE a single field is written, so a rejected call leaves the
+    // transcript byte-identical. A legal one writes IN PLACE on the canonical message
+    // (identity and transcript positions preserved, which is what the running turn's
+    // `resultInsertIndex` still depends on), marks the round's projection cache dirty so
+    // THE SAME REQUEST carries the new text, and reports one `agent_message` transcript
+    // change — the same notification, and therefore the same durability, a flag write
+    // has: later turns, `snapshot()`/`restore()`, a store that persists on that
+    // notification, and a fork or branch materialization that copies the text. A branch
+    // run edits its own EPHEMERAL copy and reports nothing, exactly like `setIncluded`.
+    //
+    // THE SAME WORKER-LANE RULE APPLIES, because it is the same CLASS of write: under
+    // `threadExecution: 'worker'` an in-place change to an already-committed message — a
+    // flag or text — is pushed to the authority as one `transcript:patch` operation over the
+    // committed prefix (pipeline T4.1), so an edit lands on canonical state, is reported
+    // there, and survives a server restart exactly like an inline edit does. The refusal
+    // rule is shared too: when canonical rewrote that prefix first, this round's edit is
+    // dropped in favour of the writer that landed, and the policy re-derives it on the next
+    // `turn.before` round.
+    //
+    // NO NEW MESSAGE FIELD IS INTRODUCED, which is the persistence rule that matters
+    // (T3.6): the snapshot reader and the branch copier whitelist keys per role
+    // (src/core/snapshot.ts, src/core/branch.ts), and `content`/`reasoning` are already
+    // listed for the roles that carry them, so an edited transcript loads unchanged. A
+    // future per-message field would have to be added to every one of those lists or the
+    // flagged/edited transcript would stop restoring.
+    //
+    // Throws a `HarnessError` for a patch that is not an object, a key the role cannot
+    // edit, a non-string value, a foreign entry, or an entry made stale by
+    // `replaceHistory()`.
+    edit: (entry: HarnessContextEntry, patch: HarnessContextEditPatch) => void;
     // Rough size of `messages` in tokens (core/context-estimate.ts). Good enough for
-    // a limit check; deliberately not provider-exact, because compaction decisions
-    // must not depend on a tokenizer the harness does not own.
+    // a limit check. Since compaction T5.4 it is HALF provider-exact: once this run has
+    // a request that reported `usage`, the prefix is the provider's own `input` count
+    // and only the text appended since that request is extrapolated at ~4 chars/token;
+    // before the first report (and on a usage-blind provider) it is the same chars/4
+    // estimate the UI context bar uses. It still never depends on a tokenizer the
+    // harness does not own.
+    //
+    // ENTRY-TIME, DELIBERATELY (context T5). This is a plain value, not a getter: it is
+    // the size of the projection THIS HANDLER WAS ENTERED WITH — the same list
+    // `messages` shows — and it does NOT move when this handler writes a flag or edits an
+    // entry. That is a shipped choice with a stated reason (src/harness.ts `context`):
+    // `context-compaction` compares this number against its limit and its cooldown map,
+    // and a mid-handler write changing it underneath those checks would let a compaction
+    // trigger on a transcript it never measured. To see what your own write just saved,
+    // call `currentEstimatedTokens()`.
     estimatedTokens: number;
     // The run's cancellation signal.
     signal: AbortSignal;
@@ -3566,9 +4018,48 @@ export type HarnessAsyncLifecycleContext = {
     pending: readonly HarnessPendingTool[];
 };
 
-// What a `turn.before` handler may return: `{ transcript }` is merged as an
-// override of the request's message list; every other event ignores results.
-export type HarnessHookResult = { transcript?: readonly HarnessMessage[] } | void;
+// ---------------------------------------------------------------------------
+// Turn decision pipeline (T2)
+// ---------------------------------------------------------------------------
+
+// What a `turn.before` handler may DECIDE about the run, not only rewrite. One
+// boundary, four closed outcomes (T2.1 — `respond`/`retry` stay deferred: both change
+// what the terminal `done` frame and the run record mean, and neither has a consumer):
+//
+//   - `continue` — the default: send what this round resolved and keep running. Saying
+//     it out loud is how a later plugin CLEARS an earlier plugin's `pause`/`stop`
+//     (precedence is last-wins by priority then registration order, T2.2 rule 4).
+//   - `replace` — send `transcript` instead. Identical to the shipped `{ transcript }`
+//     sugar below; it exists so one returned object can carry BOTH the request and a
+//     decision about the run.
+//   - `pause`  — park the CONVERSATION (the roster goes 'paused', exactly what
+//     `context.pause()` does) and still send this request. A pause is a roster signal
+//     for the host and other plugins, not a control-flow break: `resume()` returns it.
+//   - `stop`   — end the RUN without pretending an answer exists (open decision 2):
+//     the run's own abort path is taken, so the invocation records as `cancelled` and a
+//     conversation reports `stopped`, `run.failed` (not `run.finished`) fires, and
+//     `reason` is what the caller and `agentResult` see. Nothing this run appended
+//     survives — the same rollback the `maxIterations` guard uses, so an orphan
+//     assistant message is impossible.
+//
+// A malformed decision (unknown `action`, a `replace` with no usable transcript) is
+// ignored AND reported through `report.diagnostic` (fail-open, T2.2 rule 5) — it can
+// never throw into the run.
+export type HarnessTurnDecision =
+    | { action: 'continue' }
+    | { action: 'replace'; transcript: readonly HarnessMessage[] }
+    | { action: 'pause'; reason?: string }
+    | { action: 'stop'; reason?: string };
+
+// What a `turn.before` handler may return: `{ transcript }` is merged as an override of
+// the request's message list, `{ decision }` is the run-level decision above, and both
+// may ride in one object. `{ transcript }` alone stays the shipped sugar for
+// `{ decision: { action: 'replace', ... } }` — it is a published contract and keeps
+// working. Every other event ignores results.
+export type HarnessHookResult = {
+    transcript?: readonly HarnessMessage[];
+    decision?: HarnessTurnDecision;
+} | void;
 
 // Result type per event. Only `turn.before` can contribute one.
 export type HarnessLifecycleResult<E extends HarnessLifecycleEvent> =
@@ -3579,6 +4070,36 @@ export type HarnessLifecycleResult<E extends HarnessLifecycleEvent> =
 export type HarnessLifecycleHandler<E extends HarnessLifecycleEvent> = (
     payload: HarnessLifecyclePayloads[E]
 ) => HarnessLifecycleResult<E> | Promise<HarnessLifecycleResult<E>>;
+
+// Per-subscription options (T1.3 / T1.4). Both optional, both default to today's
+// behaviour, so an existing plugin changes nothing by not passing them.
+export type HarnessHookOptions = {
+    // Dispatch rank WITHIN one event: higher runs first, default 0, and STABLE within a
+    // priority (registration order breaks ties). It reorders nothing ACROSS events —
+    // the run's own sequence is what orders events, and a priority cannot move a
+    // `tool.before` handler in front of the `turn.before` that precedes it.
+    priority?: number;
+    // Per-handler budget in ms. Fail-OPEN by design: a handler that outlives it is
+    // dropped and reported (`report.diagnostic`), never allowed to hold the turn open.
+    // Only an ASYNC handler can hit it — the timer is armed at the moment a handler
+    // returns a thenable, so a synchronous handler costs no timer at all. A dropped
+    // handler's late result is ignored, and a side effect it already made (a flag
+    // write, say) stays made: a budget bounds the WAIT, not the damage.
+    timeoutMs?: number;
+};
+
+// The subscription call, overloaded so `'*'` does NOT widen `E`: an overload keeps
+// `on('turn.before', …)` payload-typed exactly as before, while a widened `E | '*'`
+// would collapse the per-event typing of every named subscription (open decision 6).
+// The bus uses the same shape with its own extra registration fields.
+export type HarnessHookSubscribe<Options> = {
+    <E extends HarnessLifecycleEvent>(
+        event: E,
+        handler: HarnessLifecycleHandler<E>,
+        options?: Options
+    ): () => void;
+    (event: '*', handler: HarnessWildcardHandler, options?: Options): () => void;
+};
 
 // What a plugin is handed at setup time.
 export type HarnessPluginApi = {
@@ -3597,14 +4118,22 @@ export type HarnessPluginApi = {
     // built-in out. Throws HarnessError for an invalid name or definition.
     addCommand: (name: string, definition: Omit<HarnessCommand, 'name'>) => HarnessCommand;
 
-    // Subscribe to one lifecycle stage. Registration order is execution order, and
-    // the returned function unsubscribes (idempotent). A handler that throws is
-    // skipped and the run continues (fail-open); a `turn.before` handler that
-    // returns `{ transcript }` overrides the request (last non-empty wins).
-    on: <E extends HarnessLifecycleEvent>(
-        event: E,
-        handler: HarnessLifecycleHandler<E>
-    ) => () => void;
+    // Subscribe to one lifecycle stage — or to ALL of them with `'*'` (T1.1).
+    //
+    // Named: registration order is execution order (within one priority — see the
+    // `priority` option), and the returned function unsubscribes (idempotent). A handler
+    // that throws is skipped and the run continues (fail-open); a `turn.before` handler
+    // that returns `{ transcript }` overrides the request (last non-empty wins) and one
+    // that returns `{ decision }` decides what happens to the run.
+    //
+    // `'*'`: one handler for every event, delivered `{ event, payload }` narrowed
+    // together — for an audit or telemetry plugin that must not enumerate the catalogue.
+    // Two honest limits: `host.state_change` is NOT part of the fan-out (subscribe to it
+    // by name if you want it; it fires on every mutation), and a wildcard handler's
+    // result is always DISCARDED, including on a `turn.before` frame. A wildcard counts
+    // in `live()` as the events it will actually receive, so the Plugins pane keeps
+    // telling the truth about it.
+    on: HarnessHookSubscribe<HarnessHookOptions>;
 
     // This plugin's settings, scoped to its own name and backed by
     // `configuration.pluginSettings` (or the declared defaults when absent).
@@ -3640,6 +4169,38 @@ export type HarnessPluginApi = {
         replaceMessages: (threadId: string, messages: readonly HarnessMessage[]) => void;
         // Move the roster state of a conversation that is NOT running here.
         setStatus: (threadId: string, status: HarnessThreadStatus) => HarnessThreadRecord;
+    };
+
+    // The harness's persisted state, read-only (T3.5). This is the SAME value the host's
+    // `harness.snapshot()` returns and `harness.restore()` accepts — one vocabulary, no
+    // private view — and it carries the whole document (agents and their transcripts,
+    // discovery state, created tools, thread records, the record stores), so a plugin
+    // that wants to know what a store would save asks the host's own question.
+    //
+    // Safe MID-RUN: like the host's, it is a synchronous read at the instant it is
+    // called and records only COMMITTED state — partial provider text is a progress
+    // event, never snapshot state, and branch transcripts are ephemeral and excluded.
+    // A branch run therefore snapshots the persistent harness, not its own copy.
+    //
+    // READ-ONLY BY CONTRACT, and honest about what that means (T3.6): this hands out a
+    // detached document, so mutating the returned object changes nothing — the way to
+    // change persisted state is a write the harness reports (`edit`, `setIncluded`,
+    // `replaceHistory`, `replaceMessages`), not an edit of a copy. There is no
+    // `api.restore`: a restore replaces the registries under a running harness and is
+    // refused while any run is live, which is a host decision, not a plugin's.
+    snapshot: () => HarnessSnapshot;
+
+    // Plugin diagnostics (compaction T4.5) — the plugin's own voice on the SAME advisory
+    // channel the framework uses for handler failures (`harness({ report.diagnostic })`).
+    // Before it existed, a policy that DID something was as invisible as one that did
+    // nothing: the compactor could withhold a dozen units and the operator had no way to
+    // tell "compacted well" from "compacted wrongly and the agent is now lost".
+    //
+    // `diagnostic` is synchronous, never awaited, and cannot fail a run — a missing reporter
+    // is a silent no-op, exactly like `report.stateChange`, and an error thrown by the sink is
+    // swallowed by the harness rather than reaching the plugin that only tried to talk.
+    report: {
+        diagnostic: (report: HarnessPluginDiagnosticReport) => void;
     };
 
     // Progressive-discovery gate. Both REFUSE a core declaration (it is always in

@@ -225,6 +225,68 @@ describe('openAICompatible', () => {
         expect(JSON.stringify(body)).not.toContain('included');
     });
 
+    // Compaction T1: the persisted tool outcome is transcript state exactly like the flag
+    // above — the harness keeps it so a later round, a snapshot or a fork can read WHY a
+    // call ended, and the wire keeps only what a provider accepts. A strict gateway rejects
+    // unknown message fields, so a tool result must serialize to the same three keys with
+    // or without the key, which is also the proof that persisting an outcome cannot change
+    // a replayed request or break a cache prefix.
+    it('never puts the persisted tool outcome on the provider wire', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [
+                            { id: 'c1', name: 'websearch', arguments: '{"q":"news"}' },
+                            { id: 'c2', name: 'websearch', arguments: '{"q":"weather"}' }
+                        ]
+                    },
+                    {
+                        role: 'tool',
+                        content: 'Tool "websearch" failed: kaput',
+                        toolCallId: 'c1',
+                        name: 'websearch',
+                        outcome: 'failed'
+                    },
+                    {
+                        role: 'tool',
+                        content: 'Tool "websearch" was cancelled before it produced a value.',
+                        toolCallId: 'c2',
+                        name: 'websearch',
+                        outcome: 'cancelled'
+                    }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages).toEqual([
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                    { id: 'c1', type: 'function', function: { name: 'websearch', arguments: '{"q":"news"}' } },
+                    { id: 'c2', type: 'function', function: { name: 'websearch', arguments: '{"q":"weather"}' } }
+                ]
+            },
+            { role: 'tool', tool_call_id: 'c1', content: 'Tool "websearch" failed: kaput' },
+            {
+                role: 'tool',
+                tool_call_id: 'c2',
+                content: 'Tool "websearch" was cancelled before it produced a value.'
+            }
+        ]);
+        // Nothing but the result text distinguishes a failed call on the wire today.
+        expect(JSON.stringify(body)).not.toContain('outcome');
+        expect(JSON.stringify(body)).not.toContain('isError');
+    });
+
     // The provider answers a non-object `function.arguments` with a bare
     // `500 Internal Server Error` for the WHOLE request, so a tool call that a
     // token-capped generation cut off mid-JSON would otherwise fail every later

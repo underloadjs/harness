@@ -41,7 +41,7 @@ const definition = (overrides: Partial<HarnessDefinition> = {}): HarnessDefiniti
     tools: ['read'],
     builtin: true,
     definition_revision: 3,
-    core_tools: ['toolRequest', 'task'],
+    core_tools: ['toolRequest', 'tasks'],
     agent_models: { instruct: 'gpt-5' },
     instruction_summary: [{ agent: 'instruct', source: 'catalogue', overridden: false, chars: 28 }],
     ...overrides

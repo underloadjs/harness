@@ -552,7 +552,7 @@ describe('canonical REST contract', () => {
         // (`toolRequest`, `task`), and no `delegate` because this definition has no subagent
         // allowlist. Same rule the frozen session copies use, so a card and a session cannot
         // disagree.
-        expect(definition.body.harness.core_tools).toEqual(['toolRequest', 'task']);
+        expect(definition.body.harness.core_tools).toEqual(['toolRequest', 'tasks']);
         expect(definition.body.harness.instruction_summary).toEqual([
             { agent: 'worker', source: 'catalogue', overridden: false, chars: 0 }
         ]);

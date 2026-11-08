@@ -136,10 +136,12 @@ const TOOL_NAMES = [
     'toolList',
     'toolManage',
     'toolCreate',
-    'task',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
+    'records',
+
+    'tasks',
+    'profiles',
+    'chapters',
+    'locations',
     'agentManage',
     'agentResult',
     'delegate',
@@ -188,7 +190,7 @@ const TOOLBOX = [
 
 // The declared core of a live card WITH subagents (R9-R11 visibility): the bootstrap pair, the
 // session plan, delegation, the five file tools, and the credential-free fetch row.
-const LIVE_CORE_TOOLS = ['toolRequest', 'task', 'delegate', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
+const LIVE_CORE_TOOLS = ['toolRequest', 'tasks', 'delegate', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
 // ---------------------------------------------------------------------------
 // The trusted prompt text (src/agents), as it reaches the wire.
@@ -1009,7 +1011,7 @@ describe('harness catalogue reads', () => {
 
         // The scripted fixture declares only what its own registry can run.
         const demo = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('demo'));
-        expect(demo.body.harness.core_tools).toEqual(['toolRequest', 'task']);
+        expect(demo.body.harness.core_tools).toEqual(['toolRequest', 'tasks']);
         expect(demo.body.harness.tools).toEqual(['timeNow']);
         expect(demo.body.harness.instruction_summary).toEqual([
             { agent: 'demo', source: 'catalogue', overridden: false, chars: 86 }
@@ -1145,7 +1147,7 @@ describe('harness catalogue reads', () => {
         // R9-R11 visibility stays honest in the row projection: the bootstrap pair and the session
         // plan are `core`, the demoted runtime rows are `searchable`.
         expect(rows.get('toolRequest').visibility).toBe('core');
-        expect(rows.get('task').visibility).toBe('core');
+        expect(rows.get('tasks').visibility).toBe('core');
         expect(rows.get('delegate').visibility).toBe('core');
         expect(rows.get('toolList').visibility).toBe('searchable');
         expect(rows.get('read').visibility).toBe('core');
@@ -1510,7 +1512,7 @@ describe('canonical sessions', () => {
         expect(definition.definition.title).toBe('Scripted demo');
         expect(definition.definition.requires_endpoint).toBe(false);
         expect(definition.definition.tools).toEqual(['timeNow']);
-        expect(definition.definition.core_tools).toEqual(['toolRequest', 'task']);
+        expect(definition.definition.core_tools).toEqual(['toolRequest', 'tasks']);
         expect(definition.definition.current).toBe(true);
         // `agent_models` rides the definition ONLY when the card held an override map; the
         // effective per-agent models are stated on the session resource, and attribution of what the
@@ -1951,7 +1953,7 @@ describe('task submit and recorded history', () => {
         // A manual mutation, though, must not race a live turn: it writes harness state the running
         // transcript depends on. 409 is preserved for exactly that case.
         expect(
-            await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(busyId, 'task'), {
+            await call(busy, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(busyId, 'tasks'), {
                 parameters: {}
             })
         ).toEqual({ status: 409, body: { error: { message: 'A task is running in this session; try again when it finishes.' } } });
@@ -2541,23 +2543,23 @@ describe('manual tool execution', () => {
 
         try {
             await mkdir(join(fixture, 'src', 'nested'), { recursive: true });
-            await mkdir(join(fixture, 'task'), { recursive: true });
+            await mkdir(join(fixture, 'tasks'), { recursive: true });
             await writeTextFile(join(fixture, 'src', 'a.ts'), 'a\n', 'utf8');
-            await writeTextFile(join(fixture, 'task', 'b.ts'), 'b\n', 'utf8');
+            await writeTextFile(join(fixture, 'tasks', 'b.ts'), 'b\n', 'utf8');
 
             // The direct runner applies the same single-property rule as the harness: `parameters`
             // IS the value of "ops", not a wrapper object (./api.ts resolveToolParameters).
             const listed = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('files'), {
-                parameters: [{ op: 'list', path: [join(fixture, 'src'), join(fixture, 'task')] }]
+                parameters: [{ op: 'list', path: [join(fixture, 'src'), join(fixture, 'tasks')] }]
             });
 
             // Absolute inputs keep their absolute prefix, posix-normalized, and the directory order
-            // is the caller's: src (with its child) then task. The answer is one bounded PAGE, and
+            // is the caller's: src (with its child) then tasks. The answer is one bounded PAGE, and
             // its cursor lives inside the `list` entry's own receipt.
             const expectedEntries = [
                 `${posix(fixture)}/src/a.ts`,
                 `${posix(fixture)}/src/nested/`,
-                `${posix(fixture)}/task/b.ts`
+                `${posix(fixture)}/tasks/b.ts`
             ];
             const expectedBytes = expectedEntries.reduce((total, entry) => total + Buffer.byteLength(entry, 'utf8'), 0);
 
@@ -2585,16 +2587,16 @@ describe('manual tool execution', () => {
             // The schema-wrapper spelling means the same request (both documented shapes resolve
             // through the shared validator in 'direct' mode).
             const wrapped = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('files'), {
-                parameters: { ops: [{ op: 'list', path: join(fixture, 'task') }] }
+                parameters: { ops: [{ op: 'list', path: join(fixture, 'tasks') }] }
             });
-            const wrappedEntry = `${posix(fixture)}/task/b.ts`;
+            const wrappedEntry = `${posix(fixture)}/tasks/b.ts`;
             expect(wrapped.body).toEqual({
                 ok: true,
                 result: {
                     results: [
                         {
                             op: 'list',
-                            path: `${posix(fixture)}/task`,
+                            path: `${posix(fixture)}/tasks`,
                             entries: [wrappedEntry],
                             truncated: false,
                             nextOffset: null,
@@ -2696,20 +2698,35 @@ describe('manual tool execution', () => {
         expect(executed.body.ok).toBe(true);
 
         // `boundToolValue` (./api.ts) cuts the serialized value with `boundToolResult`
-        // and re-parses the envelope, so the HTTP body stays valid JSON while a prefix
-        // of the tool's own text survives inside it.
+        // and re-parses the envelope, so the HTTP body stays valid JSON while the
+        // beginning AND the end of the tool's own text survive inside it (T5.1). The
+        // manual route has no transcript call to name, so the note says only
+        // "the tool call" — and it still tells the client what was cut.
         const bounded = executed.body.result as {
             truncated: boolean;
             originalBytes: number;
             budgetBytes: number;
+            note: string;
             content: string;
+            tail: string;
         };
 
-        expect(Object.keys(bounded).sort()).toEqual(['budgetBytes', 'content', 'originalBytes', 'truncated']);
+        expect(Object.keys(bounded).sort()).toEqual([
+            'budgetBytes',
+            'content',
+            'note',
+            'originalBytes',
+            'tail',
+            'truncated'
+        ]);
         expect(bounded.truncated).toBe(true);
         expect(bounded.budgetBytes).toBe(HARNESS_SERVICE_LIMITS.tool_result_bytes);
         expect(bounded.originalBytes).toBe(300_000);
         expect(bounded.content.startsWith('zzz')).toBe(true);
+        expect(bounded.tail.endsWith('zzz')).toBe(true);
+        expect(bounded.note).toBe(
+            "Cut 64071 of 300000 bytes from the middle by a 262144-byte cap; kept a 176946-byte head and a 58983-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it."
+        );
 
         // The envelope itself fits the published cap, which is the guarantee a client
         // relies on when it reads `tool_result_bytes` from the boot document.
@@ -2779,18 +2796,18 @@ describe('manual tool execution', () => {
                 }
             }
         });
-        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('task'), { parameters: {} })).toEqual({
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('tasks'), { parameters: {} })).toEqual({
             status: 403,
             body: {
                 error: {
-                    message: 'Tool "task" runs inside a session; call it through /v1/harness/sessions/{session_id}/tools/task/executions.'
+                    message: 'Tool "tasks" runs inside a session; call it through /v1/harness/sessions/{session_id}/tools/tasks/executions.'
                 }
             }
         });
 
         // The global body has ONE field: the old `sessionId` channel is gone, and a stale spelling
         // is refused rather than ignored (the session belongs in the PATH).
-        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('task'), { parameters: {}, session_id: 'x' })).toEqual({
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('tasks'), { parameters: {}, session_id: 'x' })).toEqual({
             status: 400,
             body: { error: { message: 'Unknown field "session_id". Allowed fields: parameters.' } }
         });
@@ -2826,7 +2843,7 @@ describe('manual tool execution', () => {
             body: { error: { message: `Unknown tool "delegate" in session "${session.id}".` } }
         });
         expect(
-            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions('missing', 'task'), {
+            await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions('missing', 'tasks'), {
                 parameters: {}
             })
         ).toEqual({ status: 404, body: { error: { message: 'Unknown session "missing".' } } });
@@ -2864,7 +2881,7 @@ describe('manual tool execution', () => {
         // read (./canonical-reads.test-support.ts header: the store stays reachable in a test).
         expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
 
-        const added = await call(runtime, 'POST', executions('task'), {
+        const added = await call(runtime, 'POST', executions('tasks'), {
             parameters: { tasks: [{ text: '  check bounds ' }] }
         });
         // T1 shape of the SAME result (src/core/task.ts project + copyItem): every
@@ -2907,7 +2924,7 @@ describe('manual tool execution', () => {
 
         // A second call sees the SAME list: the tool lives in the session harness. The
         // read is not a write, so rev, attribution and storeRev are all unchanged.
-        const listed = await call(runtime, 'POST', executions('task'), { parameters: {} });
+        const listed = await call(runtime, 'POST', executions('tasks'), { parameters: {} });
         expect(listed.body).toEqual({
             ok: true,
             result: {
@@ -3081,13 +3098,13 @@ describe('manual tool execution', () => {
         // `existed` test the kernel applies, ../harness.ts:1292-1293). It is not a statement about
         // the static catalogue, which this route never mutates.
         const reserved = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTools(owner.id), {
-            name: 'task',
+            name: 'tasks',
             description: 'Mine.',
             tags: ['text'],
             source: 'return 1;'
         });
         expect(reserved.status).toBe(201);
-        expect(reserved.body.registration.name).toBe('task');
+        expect(reserved.body.registration.name).toBe('tasks');
         expect(reserved.body.registration.created).toBe(false);
         expect(reserved.body.registration.replaced).toBe(true);
     });
@@ -3839,7 +3856,7 @@ describe('harness registry writes over HTTP', () => {
         expect(live.body.harness.tools).toEqual([...TOOLBOX, 'fetch']);
         // No subagents, so no `delegate` in the declared core - the same rule a card and a frozen
         // session both follow, so they cannot disagree.
-        expect(live.body.harness.core_tools).toEqual(['toolRequest', 'task', 'read', 'write', 'edit', 'glob', 'grep', 'fetch']);
+        expect(live.body.harness.core_tools).toEqual(['toolRequest', 'tasks', 'read', 'write', 'edit', 'glob', 'grep', 'fetch']);
 
         // A NEW session runs the live configuration; the scripted session keeps what it was built
         // with, and is still runnable offline.

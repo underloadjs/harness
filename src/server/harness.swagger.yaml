@@ -4925,6 +4925,47 @@ components:
         Recorded task state. `queued` means the turn exists with a stable id and index but has no
         `started_at` yet; the server stamps it when execution begins.
       enum: [queued, running, done, error, cancelled]
+    SessionPluginDiagnostic:
+      type: object
+      description: >-
+        One plugin diagnostic the server received for a session: a hook that THREW, TIMED OUT, or returned an
+        unparseable decision (the framework's fail-open rule drops the handler and the run continues), or a
+        plugin's own `policy` report of what it decided. Without this record a broken policy plugin and an inert
+        one answer identically, which is the invisibility this surface exists to close.
+      required: [at, kind, owner, message]
+      additionalProperties: false
+      properties:
+        at:
+          type: integer
+          description: When the server received the report, in epoch milliseconds.
+        kind:
+          type: string
+          enum: [handler-threw, handler-timed-out, invalid-decision, policy]
+          description: >-
+            The three framework kinds name a dropped handler; `policy` is a plugin speaking for itself (the
+            shipped compaction pass names the units it withheld), which is why it carries no `event`.
+        owner:
+          type: string
+          description: >-
+            The plugin that registered the hook, which is who to name to an operator. Empty string when the
+            subscription carried no owner (a hand-written programmatic plugin may omit its metadata).
+        event:
+          type: string
+          description: >-
+            The lifecycle event whose handler failed (`turn.before`, `tool.after`, ...). ABSENT for a `policy`
+            report, which is not tied to one hook — naming one would claim a failure that did not happen.
+        message:
+          type: string
+          description: >-
+            The complete human-readable fact, never empty (the server substitutes `no message` for a report that
+            arrived without one, so a consumer never renders a blank).
+        data:
+          type: object
+          additionalProperties: true
+          description: >-
+            The structured payload of a `policy` report (for a compaction pass: the withheld units, their
+            estimated tokens, and the id of the unit that superseded each). Absent for a framework failure,
+            whose `message` is the whole view.
     SessionSummary:
       type: object
       description: >-
@@ -5032,6 +5073,21 @@ components:
                 use it to explain a 400 instead of guessing: exhausting it is a 400 that carries the runtime's
                 advice to reuse an existing tool, NOT a 409, and the same pair appears as `budget` on a
                 registration receipt. Replacements of a name this session already holds do not consume it.
+            plugin_diagnostics:
+              type: array
+              maxItems: 24
+              description: >-
+                Plugin diagnostics this session reported, OLDEST FIRST and capped at the last 24 (the server
+                drops the oldest once full, so a plugin that fails every turn cannot grow this without bound).
+                ABSENT when the session has never reported one, which is the shape every pre-existing client
+                reads today, so a healthy session's resource is unchanged.
+                This is the observable half of the plugin framework's fail-open rule: a hook that THREW, TIMED
+                OUT, or returned an unparseable decision is dropped and the run continues, so without this
+                surface "the plugin is broken" and "the plugin decided to do nothing" are the same answer. The
+                same records ride `GET /sessions/{id}` after a restart (they are durable on the session), and
+                the failure kinds are additionally printed on the server log.
+              items:
+                $ref: '#/components/schemas/SessionPluginDiagnostic'
     SessionResponse:
       type: object
       description: Envelope of a session read, create, or patch.
@@ -7996,6 +8052,16 @@ components:
               enum: [system]
             content:
               type: string
+            messageId:
+              type: string
+              minLength: 1
+              description: >-
+                Stable transcript address the harness mints once per entry, as `msg-<n>` within one conversation
+                (context T1). A transcript read shows it and a write may carry it back: the harness COPIES an id it is
+                given and backfills one when the document predates ids, so `restore -> snapshot` is unchanged and a
+                restored conversation is addressable from its first round. The id never reaches a provider request, and
+                it is what a `turn.before` policy uses to name the same turn in a later round (`setIncluded(id, ...)).
+                Including a disabled instruction block by id is legal: the exclusion UNIT of a `system` entry is the entry itself.
             included:
               type: boolean
               description: >-
@@ -8016,6 +8082,16 @@ components:
               maxItems: 4
               items:
                 $ref: '#/components/schemas/HarnessAttachment'
+            messageId:
+              type: string
+              minLength: 1
+              description: >-
+                Stable transcript address the harness mints once per entry, as `msg-<n>` within one conversation
+                (context T1). A transcript read shows it and a write may carry it back: the harness COPIES an id it is
+                given and backfills one when the document predates ids, so `restore -> snapshot` is unchanged and a
+                restored conversation is addressable from its first round. The id never reaches a provider request, and
+                it is what a `turn.before` policy uses to name the same turn in a later round (`setIncluded(id, ...)).
+                A host may put any non-empty string in the key on a write; the harness carries it verbatim, and a transcript with no id gets one backfilled on read.
             included:
               type: boolean
               description: >-
@@ -8038,6 +8114,16 @@ components:
             reasoning:
               type: string
               description: Kept out of the provider payload and retained so a turn can be replayed or edited.
+            messageId:
+              type: string
+              minLength: 1
+              description: >-
+                Stable transcript address the harness mints once per entry, as `msg-<n>` within one conversation
+                (context T1). A transcript read shows it and a write may carry it back: the harness COPIES an id it is
+                given and backfills one when the document predates ids, so `restore -> snapshot` is unchanged and a
+                restored conversation is addressable from its first round. The id never reaches a provider request, and
+                it is what a `turn.before` policy uses to name the same turn in a later round (`setIncluded(id, ...)).
+                For a turn that requested tools the id addresses the WHOLE tool-call unit through `setIncluded`, exactly as the flag does.
             included:
               type: boolean
               description: >-
@@ -8071,6 +8157,30 @@ components:
                 block, which keeps strict tool-call pairing intact.
               items:
                 $ref: '#/components/schemas/HarnessAttachment'
+            outcome:
+              type: string
+              enum: [completed, failed, rejected, cancelled]
+              description: >-
+                WHY this call ended — the structured classification the `tool_result` event and the
+                `tool.after` hook already carry, persisted here so it survives a restart, a snapshot, a fork
+                and a `threadRead` instead of leaving only English prose to read. Only a NON-`completed`
+                outcome is ever STORED, the same minimal-delta rule `included` and `attachments` follow: an
+                absent key means `completed`, so every transcript written before this field exists keeps its
+                exact previous shape, and nothing re-derives an outcome from the result text. `completed` is
+                accepted on a restored or submitted transcript and normalized away, so a round-trip is
+                idempotent. Never model-facing: the provider payload for a tool result stays
+                `role`/`tool_call_id`/`content`, which is why the field-selecting transport is byte-identical
+                with or without this key.
+            messageId:
+              type: string
+              minLength: 1
+              description: >-
+                Stable transcript address the harness mints once per entry, as `msg-<n>` within one conversation
+                (context T1). A transcript read shows it and a write may carry it back: the harness COPIES an id it is
+                given and backfills one when the document predates ids, so `restore -> snapshot` is unchanged and a
+                restored conversation is addressable from its first round. The id never reaches a provider request, and
+                it is what a `turn.before` policy uses to name the same turn in a later round (`setIncluded(id, ...)).
+                The result of a call block carries its own id too, so a policy may disable an answered block from the result side.
             included:
               type: boolean
               description: >-

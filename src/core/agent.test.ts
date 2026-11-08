@@ -18,6 +18,32 @@ import type {
     HarnessStreamRequest
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // A transport that replays a fixed event list. `onRequest` lets a test assert
 // what the agent actually sent.
 const fakeStream = (
@@ -58,7 +84,7 @@ describe('agent', () => {
             stream: transport
         });
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'system', content: 'Answer in prose.' }
         ]);
@@ -73,7 +99,7 @@ describe('agent', () => {
             stream: transport
         });
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'Earlier question' }
         ]);
@@ -97,7 +123,7 @@ describe('agent', () => {
         expect(brain.user('u')).toBe(brain);
         expect(brain.assistant('a')).toBe(brain);
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 's' },
             { role: 'user', content: 'u' },
             { role: 'assistant', content: 'a' }
@@ -150,7 +176,7 @@ describe('agent', () => {
         ]);
         // The committed history carries the same attribution (reasoning and empty
         // tool calls are omitted, exactly as the transport produced them).
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'answer' }
         ]);
@@ -208,7 +234,7 @@ describe('agent', () => {
             }
         ]);
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'Say hello' },
             { role: 'assistant', content: 'Hello world', reasoning: 'thinking...' }
@@ -231,7 +257,7 @@ describe('agent', () => {
 
         expect(sent?.model).toBe('model-a');
         expect(sent?.tools).toEqual(tools);
-        expect(sent?.messages).toEqual([
+        expect(withoutIds(sent?.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'Write' }
         ]);
@@ -259,7 +285,7 @@ describe('agent', () => {
         }
 
         // Committed to history so a caller can answer it.
-        expect(brain.messages.at(-1)).toEqual({
+        expect(withoutIds(brain.messages.at(-1))).toEqual({
             role: 'assistant',
             content: '',
             toolCalls: [{ id: 'call_1', name: 'websearch', arguments: '{"q":"news"}' }]
@@ -275,7 +301,7 @@ describe('agent', () => {
 
         await collect(brain.turn());
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'assistant', content: 'ok' }
         ]);
@@ -310,7 +336,7 @@ describe('agent', () => {
         ]);
 
         // Nothing from the failed turn survives.
-        expect(brain.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
+        expect(withoutIds(brain.messages)).toEqual([{ role: 'system', content: 'You are a writer.' }]);
     });
 
     it('rolls back when the transport throws', async () => {
@@ -340,7 +366,7 @@ describe('agent', () => {
 
         brain.reset();
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'seed' }
         ]);
@@ -367,12 +393,12 @@ describe('agent', () => {
         ).rejects.toThrow('ownership lost');
 
         // No assistant message was appended by the refused turn.
-        expect(brain.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
+        expect(withoutIds(brain.messages)).toEqual([{ role: 'system', content: 'You are a writer.' }]);
 
         // A later owned turn commits normally.
         const events = await collect(brain.turn());
-        expect(events.at(-1)).toMatchObject({ type: 'done', message: { content: 'late' } });
-        expect(brain.messages).toEqual([
+        expect(withoutIds(events.at(-1))).toMatchObject({ type: 'done', message: { content: 'late' } });
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'assistant', content: 'late' }
         ]);
@@ -496,7 +522,7 @@ describe('agent identity color', () => {
         expect(seen).toHaveLength(1);
         // The exact request the transport receives: identity metadata is not part of it.
         expect(seen[0].model).toBe('m');
-        expect(seen[0].messages).toEqual([
+        expect(withoutIds(seen[0].messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'go' }
         ]);
@@ -523,6 +549,6 @@ describe('agent identity color', () => {
         brain.reset();
 
         expect(brain.color).toBe('#4ade80');
-        expect(brain.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
+        expect(withoutIds(brain.messages)).toEqual([{ role: 'system', content: 'You are a writer.' }]);
     });
 });

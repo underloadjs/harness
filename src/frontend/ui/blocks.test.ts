@@ -34,7 +34,7 @@ const identityOf = (block: {
 
 const mount = (id = 't1') => {
     const board = createTurnBoard();
-    const turn = board.begin('task');
+    const turn = board.begin('tasks');
     turn.bind({ id, index: 0 });
     return { board, turn, id };
 };

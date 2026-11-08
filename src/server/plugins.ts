@@ -18,7 +18,7 @@
 // DEFAULTS BELONG TO THE PLUGIN, OVERRIDES TO THE HOST
 // ---------------------------------------------------
 // `get(plugin, key)` answers `undefined` when the operator has never changed that key, which
-// is the provider's documented "nothing stored" signal (src/types/index.ts:3110). The plugin's
+// is the provider's documented "nothing stored" signal (src/types/index.ts:3489-3497). The plugin's
 // declared `default` is therefore applied by the library, not duplicated here, and
 // `state.json` stores ONLY what the operator changed - the same minimal-delta rule as
 // `globalSettings` (./persistence.ts `HarnessGlobalSettingsRecord`). `values(plugin)` is the
@@ -37,7 +37,7 @@
 //   - `min` / `max` are enforced. They are the bounds the plugin published, and a value
 //     outside them is a value the plugin never said it could handle.
 //   - `step` is NOT enforced, deliberately. The domain type states the numeric fields are UI
-//     hints (src/types/index.ts:3053-3056), and src/plugin/settings.ts documents that they
+//     hints (src/types/index.ts:3434-3438), and src/plugin/settings.ts documents that they
 //     are "deliberately NOT enforced" at read time. Refusing `contextLimit: 1500` because
 //     `step: 1000` would make the API stricter than the runtime that has to live with the
 //     value, and would strand any value a migration or a hand-edited document produced. A
@@ -66,7 +66,7 @@
 // Cross-references:
 //   - ../plugin/manifest.ts       — BUILTIN_PLUGIN_DESCRIPTORS: the seeded catalogue + defaults
 //   - ../plugin/settings.ts       — the per-plugin view this module projects `values` through
-//   - ../types/index.ts:3053-3118 — the descriptor, metadata, and provider contracts
+//   - ../types/index.ts:3434-3507 — the descriptor, metadata, and provider contracts
 //   - ./persistence.ts            — `HarnessPluginSettingsRecord`, the durable override map
 //   - ./sessions.ts               — owns one store per runtime, passes `provider` to buildHarness
 //   - ./api.ts                    — `GET /plugins`, `PATCH /plugins/{plugin_id}`

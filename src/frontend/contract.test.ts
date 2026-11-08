@@ -118,16 +118,16 @@ describe('descriptor extensions', () => {
         // toolRegistry, toolCreate, the story tools, agentManage/agentResult,
         // actionRequest, threadFork) are deliberately absent, so an old payload never
         // reports every runtime tool as core.
-        expect(coreToolsOf(descriptor(), 2)).toEqual(['toolRequest', 'task', 'delegate']);
-        expect(coreToolsOf(descriptor(), 1)).toEqual(['toolRequest', 'task']);
+        expect(coreToolsOf(descriptor(), 2)).toEqual(['toolRequest', 'tasks', 'delegate']);
+        expect(coreToolsOf(descriptor(), 1)).toEqual(['toolRequest', 'tasks']);
 
         // The exported constants are the same list the fallback renders, so a caller
         // that only needs the names cannot drift from it. R9-R11 renamed the wire tool
         // `todoManage` → `task`; the legacy name is asserted here as a string literal
         // (not a rewritten fixture) because its absence IS the contract.
-        expect([...HARNESS_CORE_TOOL_NAMES]).toEqual(['toolRequest', 'task']);
+        expect([...HARNESS_CORE_TOOL_NAMES]).toEqual(['toolRequest', 'tasks']);
         expect(Object.keys(HARNESS_CORE_TOOL_DESCRIPTIONS)).not.toContain('todoManage');
-        expect(HARNESS_CORE_TOOL_DESCRIPTIONS.task).toBe(
+        expect(HARNESS_CORE_TOOL_DESCRIPTIONS.tasks).toBe(
             'Read, add, patch, or remove the task list for this chat.'
         );
     });

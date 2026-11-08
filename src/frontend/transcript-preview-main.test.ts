@@ -24,7 +24,7 @@ const descriptor = (): HarnessDescriptor =>
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: [],
-        coreTools: ['toolRequest', 'toolCreate', 'task'],
+        coreTools: ['toolRequest', 'toolCreate', 'tasks'],
         primary: 'instruct',
         subagents: [],
         builtin: true,

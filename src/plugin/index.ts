@@ -21,6 +21,9 @@ export type {
     HarnessHookBus,
     HarnessHookBusOptions,
     HarnessHookErrorContext,
+    // The registration object `HarnessHookBus.on` takes (owner/api plus the T1.3/T1.4
+    // `priority`/`timeoutMs`), exported so a host typing its own bus call can name it.
+    HarnessHookRegistration,
     HarnessMergedHookResult
 } from './hooks';
 export { createInMemoryPluginSettingsProvider, createPluginSettingsView } from './settings';

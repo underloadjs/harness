@@ -156,6 +156,38 @@ const rosterInvocation = (store: SessionStore, sessionId: string, threadId: stri
     return authority?.harness.thread(threadId)?.invocationId;
 };
 
+// Wait for a conversation the AUTHORITY itself is running to settle.
+//
+// WHY A WORKER TEST NEEDS THIS AT ALL: `threadSend` into a dormant thread now STARTS a
+// turn there (delegate-stress 2026-11-08 T3.2) instead of parking text, and that run is
+// fire-and-forget — it has no SessionTurn of its own. While it is live, a focused submit
+// into the same conversation takes the server's steer path, and `SessionStore.enqueue`
+// refuses it with 409 "Thread is running but no recorded turn owns it"
+// (../sessions.ts `steerIntoThread`, the `owningTurnOf` miss). A delegated child escapes
+// that because its owner chain names a turn; a top-level thread has no chain. Waiting is
+// therefore what an operator would do — and it keeps the M4 claim (a lane re-syncing onto
+// canonical state) the thing under test.
+const waitAuthorityIdle = async (
+    store: SessionStore,
+    sessionId: string,
+    threadId: string,
+    limitMs = 120_000
+): Promise<void> => {
+    const started = Date.now();
+
+    for (;;) {
+        const authority = (store as unknown as { authorities?: Map<string, LaneAuthority> }).authorities?.get(sessionId);
+
+        if (authority?.harness.thread(threadId)?.status !== 'running') return;
+
+        if (Date.now() - started > limitMs) {
+            throw new Error(`Thread ${threadId} stayed running for more than ${limitMs}ms.`);
+        }
+
+        await sleep(25);
+    }
+};
+
 describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => {
     it('runs eight turns of one conversation, reclaiming its lane every time, and centralises all of them', async () => {
         const store = storeOf();
@@ -229,16 +261,29 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
             message: 'a sibling sent this'
         })) as { delivered?: string };
 
-        expect(sent?.delivered).toBe('appended');
+        // STATE-AWARE delivery (delegate-stress T3.2/T3.6): an idle target is no
+        // longer an inert append — the authority STARTS a turn with the message, and
+        // the receipt says `started`. Still non-blocking, still routed to the
+        // canonical harness (the send is answered at the coordinator, never in this
+        // replica), which is what keeps `threadSend` out of the nested-run doors.
+        expect(sent?.delivered).toBe('started');
 
         // `threadSend` records the SENDER inside the delivered text (`from agent "demo": ...`),
         // so the sibling entry is matched by its payload; the lane's own prompts are matched
         // exactly. What matters here is that canonical ran ahead of the replica by exactly one
-        // message while the lane was idle.
+        // USER message while the lane was idle — the answer of the turn that message started
+        // (T3.2) is an assistant turn and is not counted here.
         const afterForeign = userTurns(store, session.id, threadId);
 
         expect(afterForeign).toHaveLength(beforeForeign.length + 1);
         expect(afterForeign[afterForeign.length - 1]).toContain('a sibling sent this');
+
+        // The send started a turn at the authority (T3.2). Let it settle before the
+        // focused submit: the server refuses a submit into a conversation that is
+        // running with no recorded turn of its own (see `waitAuthorityIdle`), and the
+        // M4 claim below is about the LANE re-syncing onto canonical state, which is
+        // the same claim whichever order the authority finished in.
+        await waitAuthorityIdle(store, session.id, threadId as string);
 
         const second = await store.dispatch(session.id, 'second correctness turn', undefined, undefined, threadId);
 

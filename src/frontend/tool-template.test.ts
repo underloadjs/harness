@@ -151,7 +151,7 @@ const WIDGET_MANAGE = catalogueTool('widgetManage', {
 // optional, so the schema alone can only offer `{}` (the documented read), and the
 // merge shapes the presets carry — an added entry with `text`, a patched entry with
 // `id` + `completed`, a `remove` id list — are what the curated presets contribute.
-const TASK = coreTool('task', {
+const TASK = coreTool('tasks', {
     type: 'object',
     properties: {
         tasks: {
@@ -198,7 +198,7 @@ const descriptor = {
     requiresEndpoint: false,
     agents: ['instruct'],
     tools: ['glob'],
-    coreTools: ['toolRequest', 'task'],
+    coreTools: ['toolRequest', 'tasks'],
     primary: 'instruct',
     subagents: [],
     builtin: true,
@@ -325,7 +325,7 @@ it('pre-fills every tool with an argument set that satisfies its schema', async 
     // `task` (the old todoManage) has NO required property, so the schema alone can only
     // offer the documented read: the curated first preset `{}` and the schema fallback are
     // the same value, and the runner dedupes that pair into one button.
-    const task = await argsFor('task');
+    const task = await argsFor('tasks');
     expect(JSON.parse(task)).toEqual({});
     expect(document.querySelectorAll('.tool-preset')).toHaveLength(4);
     expect(

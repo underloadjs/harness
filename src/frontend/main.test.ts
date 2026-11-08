@@ -89,7 +89,7 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
             'toolList',
             'toolManage',
             'toolCreate',
-            'task'
+            'tasks'
         ],
         primary: 'instruct',
         subagents: [],
@@ -1148,7 +1148,9 @@ it('restores a remembered session with its frozen team and server timings', asyn
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
+            'records',
+
+            'tasks',
             'delegate'
         ]
     });
@@ -2114,7 +2116,9 @@ it('creates a harness from preset agents with an initial primary', async () => {
                             'toolList',
                             'toolManage',
                             'toolCreate',
-                            'task',
+                            'records',
+
+                            'tasks',
                             ...(request.subagents.length > 0 ? ['delegate'] : [])
                         ]
                     })
@@ -2205,7 +2209,9 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
                     'toolList',
                     'toolManage',
                     'toolCreate',
-                    'task',
+                    'records',
+
+                    'tasks',
                     ...(request.subagents.length > 0 ? ['delegate'] : [])
                 ]
             });
@@ -2462,7 +2468,9 @@ it('views a saved conversation’s team and saves a model draft through the sess
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
+            'records',
+
+            'tasks',
             'delegate'
         ]
     });

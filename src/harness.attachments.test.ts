@@ -17,6 +17,32 @@ import type {
     HarnessStreamRequest
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
 const PNG_DATA = base64(PNG_BYTES);
@@ -64,7 +90,7 @@ describe('harness root attachments', () => {
         expect(seen[0].messages).toStrictEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [image()] }
         ]);
-        expect(brain.messages).toStrictEqual([
+        expect(withoutIds(brain.messages)).toStrictEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [image()] },
             { role: 'assistant', content: 'ok' }
         ]);
@@ -139,7 +165,7 @@ describe('harness root attachments', () => {
         await writer('See [Image 1]', { attachments: [input] });
 
         input.name = 'renamed.png';
-        expect(brain.messages[0]).toStrictEqual({
+        expect(withoutIds(brain.messages[0])).toStrictEqual({
             role: 'user',
             content: 'See [Image 1]',
             attachments: [image()]

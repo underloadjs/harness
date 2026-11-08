@@ -86,7 +86,7 @@ describe('toolCreate', () => {
         expect(writer.tools.toolCreate.description).toContain('Create a tool for yourself from JavaScript source.');
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
         ]);
     });
 
@@ -114,16 +114,16 @@ describe('toolCreate', () => {
         // of the runtime row a toolRequest opened.
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
         ]);
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'toolCreate'
         ]);
         expect(declaredNames(seen[2])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'repeat',
             'toolCreate'
         ]);
@@ -256,10 +256,12 @@ describe('toolCreate', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -337,7 +339,9 @@ describe('toolCreate', () => {
         // toolList, toolManage, toolCreate, the four record tools,
         // agentManage/agentResult, threadFork, and the pending-only toolCancel)
         // plus the 32 creations.
-        expect(Object.keys(writer.tools)).toHaveLength(45);
+        // 46, not 45: the record engine added ONE core tool (`records`) ahead of its
+        // four wrappers, and the created-tool budget is unchanged.
+        expect(Object.keys(writer.tools)).toHaveLength(46);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

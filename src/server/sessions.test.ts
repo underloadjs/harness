@@ -18,6 +18,32 @@ import { AGENT_PROFILES, agentInstruction } from '../agents';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // A distinctive key: the copy-safety test also proves settings never leak into a
 // snapshot, because this string must not appear in the serialized record.
 const DEFAULTS: RunnerSettings = {
@@ -157,7 +183,7 @@ const toolRoundPreset = (usage: readonly [HarnessUsage, HarnessUsage]): HarnessP
                                 type: 'done',
                                 stopReason: 'tool_calls',
                                 toolCalls: [
-                                    { id: 'c1', name: 'task', arguments: '{}' }
+                                    { id: 'c1', name: 'tasks', arguments: '{}' }
                                 ],
                                 usage: usage[0]
                             }
@@ -483,13 +509,13 @@ describe('SessionStore turns', () => {
             {
                 type: 'tool_call',
                 agent: 'rounds',
-                call: { id: 'c1', name: 'task', arguments: '{}' }
+                call: { id: 'c1', name: 'tasks', arguments: '{}' }
             },
             { type: 'attempt_commit', agent: 'rounds', attempt: 1, maxAttempts: 11 },
             {
                 type: 'tool_result',
                 agent: 'rounds',
-                name: 'task',
+                name: 'tasks',
                 callId: 'c1',
                 content:
                     '{"tasks":[],"counts":{"total":0,"completed":0,"pending":0},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":0}',
@@ -616,7 +642,7 @@ describe('SessionStore turns', () => {
                         stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
                             const last = request.messages[request.messages.length - 1];
 
-                            if (last !== undefined && last.role === 'tool' && last.name === 'task') {
+                            if (last !== undefined && last.role === 'tool' && last.name === 'tasks') {
                                 // Request 1 is now in flight; the test cancels from here.
                                 secondRequest.resolve();
 
@@ -639,7 +665,7 @@ describe('SessionStore turns', () => {
                                 type: 'done',
                                 stopReason: 'tool_calls',
                                 toolCalls: [
-                                    { id: 'c1', name: 'task', arguments: '{}' }
+                                    { id: 'c1', name: 'tasks', arguments: '{}' }
                                 ],
                                 usage: first
                             };
@@ -1108,7 +1134,7 @@ describe('SessionStore turns', () => {
         expect(reset.status).toBe('idle');
         // A reset returns the seeded transcript and nothing else: ONE system message
         // for this scripted fixture (a plain string instruction seeds one turn).
-        expect(reset.messages).toEqual([{ role: 'system', content: 'You are a scripted test agent.' }]);
+        expect(withoutIds(reset.messages)).toEqual([{ role: 'system', content: 'You are a scripted test agent.' }]);
         expect(reset.lastError).toBeUndefined();
 
         // The other session is untouched by the reset.
@@ -1167,7 +1193,7 @@ describe('SessionStore turns', () => {
         external.turns.pop();
         external.messages.length = 0;
 
-        expect(store.get(created.id)).toEqual({
+        expect(withoutIds(store.get(created.id))).toEqual({
             id: created.id,
             harness: 'single',
             status: 'idle',
@@ -1230,7 +1256,7 @@ describe('SessionStore turns', () => {
                 tools: [],
                 // R9-R11: the declared core is the bootstrap pair; the demoted
                 // runtime rows are registered and searchable only.
-                coreTools: ['toolRequest', 'task'],
+                coreTools: ['toolRequest', 'tasks'],
                 builtin: true,
                 editable: true
             },
@@ -1271,7 +1297,7 @@ describe('SessionStore and the harness registry', () => {
         // sentence and the guidelines joined into one prompt by `agentInstruction()`
         // (../agents/index.ts), because two seeded `system` messages lost the
         // guidelines on gateways that accept only one system turn.
-        expect(before.messages[0]).toEqual({
+        expect(withoutIds(before.messages[0])).toEqual({
             role: 'system',
             content: agentInstruction(AGENT_PROFILES.instruct)
         });
@@ -1283,7 +1309,7 @@ describe('SessionStore and the harness registry', () => {
         registry.update('instruct', { title: 'Edited', primary: 'workspace', subagents: [] });
         expect(store.get(before.id).harnessDefinition?.title).toBe('Instruct');
         expect(store.get(before.id).harnessDefinition?.primary).toBe('instruct');
-        expect(store.get(before.id).messages[0]).toEqual({
+        expect(withoutIds(store.get(before.id).messages[0])).toEqual({
             role: 'system',
             content: agentInstruction(AGENT_PROFILES.instruct)
         });
@@ -1293,7 +1319,7 @@ describe('SessionStore and the harness registry', () => {
         expect(after.harnessDefinition?.title).toBe('Edited');
         expect(after.harnessDefinition?.primary).toBe('workspace');
         expect(after.harnessDefinition?.agents).toEqual(['workspace']);
-        expect(after.messages[0]).toEqual({
+        expect(withoutIds(after.messages[0])).toEqual({
             role: 'system',
             content: agentInstruction(AGENT_PROFILES.workspace)
         });
@@ -1527,7 +1553,7 @@ describe('SessionStore agent model retargeting', () => {
 
         const second = store.get(created.id).turns[1];
         expect(second.events[0]).toEqual({ type: 'start', agent: 'lead', model: 'next/model' });
-        expect(store.get(created.id).messages.filter((message) => message.role === 'user')).toEqual([
+        expect(withoutIds(store.get(created.id).messages.filter((message) => message.role === 'user'))).toEqual([
             { role: 'user', content: 'second' }
         ]);
     });
@@ -1647,15 +1673,15 @@ describe('SessionStore manual tool calls', () => {
             storeRev: 1
         };
 
-        expect(await store.callTool(mine.id, 'task', { tasks: [{ text: '  only mine ' }] })).toEqual(
+        expect(await store.callTool(mine.id, 'tasks', { tasks: [{ text: '  only mine ' }] })).toEqual(
             onlyMine
         );
 
         // The state lives in the session's harness: the same session sees the item —
         // an unchanged read reports the same rev, attribution and storeRev — a
         // sibling session does not (its own store, still at storeRev 0).
-        expect(await store.callTool(mine.id, 'task', {})).toEqual(onlyMine);
-        expect(await store.callTool(other.id, 'task', {})).toEqual({
+        expect(await store.callTool(mine.id, 'tasks', {})).toEqual(onlyMine);
+        expect(await store.callTool(other.id, 'tasks', {})).toEqual({
             tasks: [],
             counts: { total: 0, completed: 0, pending: 0 },
             page: { offset: 0, limit: 20, hasMore: false },
@@ -1687,7 +1713,7 @@ describe('SessionStore manual tool calls', () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const session = await store.create('single');
 
-        await expect(store.callTool('missing', 'task', {})).rejects.toMatchObject({
+        await expect(store.callTool('missing', 'tasks', {})).rejects.toMatchObject({
             status: 404,
             message: 'Unknown session "missing".'
         });
@@ -1700,8 +1726,8 @@ describe('SessionStore manual tool calls', () => {
 
         // A tool that throws keeps its own message: the API layer reports it as
         // ok:false, exactly like a throwing catalogue tool.
-        await expect(store.callTool(session.id, 'task', { tasks: [{}] })).rejects.toThrow(
-            'task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.'
+        await expect(store.callTool(session.id, 'tasks', { tasks: [{}] })).rejects.toThrow(
+            'invalid-field: tasks "tasks[0]" needs "text" to add a task, or an existing "id" to change one.'
         );
     });
 
@@ -1785,7 +1811,7 @@ describe('SessionStore manual tool calls', () => {
         // held promise is never reported as an unhandled rejection.
         const settled = pending.catch((error: unknown) => error);
 
-        await expect(store.callTool(session.id, 'task', {})).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'tasks', {})).rejects.toMatchObject({
             status: 409
         });
 
@@ -1832,7 +1858,7 @@ describe('SessionStore manual tool calls', () => {
 
         // A manual mutation cannot interleave with a live turn: the running
         // transcript depends on the state it would change.
-        await expect(store.callTool(session.id, 'task', {})).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'tasks', {})).rejects.toMatchObject({
             status: 409,
             message: 'A task is running in this session; try again when it finishes.'
         });
@@ -1841,7 +1867,7 @@ describe('SessionStore manual tool calls', () => {
         await running;
 
         // Once the turn is done, the same call works.
-        expect(await store.callTool(session.id, 'task', {})).toEqual({
+        expect(await store.callTool(session.id, 'tasks', {})).toEqual({
             tasks: [],
             counts: { total: 0, completed: 0, pending: 0 },
             page: { offset: 0, limit: 20, hasMore: false },

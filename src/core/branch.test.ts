@@ -31,7 +31,13 @@ import {
     pruneBranchRecords,
     quotedBranchSystemInstruction
 } from './branch';
-import type { Agent, HarnessAttachment, HarnessBranchRecord, HarnessMessage } from '../types';
+import type {
+    Agent,
+    HarnessAttachment,
+    HarnessBranchRecord,
+    HarnessMessage,
+    HarnessToolOutcome
+} from '../types';
 import type { ForkAgentOptions } from './branch';
 
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
@@ -405,7 +411,10 @@ describe('materializeBranchHistory', () => {
                 branchId: 'b'
             })
         ).toThrow(
-            'Branch history message [0] has unknown property "extra". Allowed properties: role, content, attachments, included.'
+            // The allowed-property list now names `messageId` as well (context T1.4): a
+            // fork of a transcript whose entries carry ids must COPY them, and an
+            // unknown key is still refused.
+            'Branch history message [0] has unknown property "extra". Allowed properties: role, content, attachments, included, messageId.'
         );
 
         // `included` is admitted, but it is still typed: a string flag is a
@@ -469,6 +478,115 @@ describe('materializeBranchHistory', () => {
 
         // The source transcript is untouched by the copy.
         expect(source).toEqual(before);
+    });
+
+    // Compaction T1.4 — a fork must not forget WHY a call ended. The outcome is the
+    // structured signal a later policy reads (core/tool-outcome.ts), so a branch of a
+    // transcript that knows a call failed has to know it too; it is copied verbatim and
+    // never re-decided from the result text (T1.5). `completed` normalizes to ABSENT, the
+    // same minimal-delta rule `included: true` follows in the test above, so the
+    // materializer never grows a key the runtime does not write.
+    it('carries the persisted tool outcome across a fork and normalizes `outcome: "completed"` away', () => {
+        const source: HarnessMessage[] = [
+            { role: 'user', content: 'hi' },
+            {
+                role: 'assistant',
+                content: 'call',
+                toolCalls: [
+                    { id: 'origin-a', name: 'read', arguments: '{}' },
+                    { id: 'origin-b', name: 'write', arguments: '{}' }
+                ]
+            },
+            { role: 'tool', content: 'boom', toolCallId: 'origin-a', name: 'read', outcome: 'failed' },
+            { role: 'tool', content: 'ok', toolCallId: 'origin-b', name: 'write', outcome: 'completed' },
+            { role: 'user', content: 'next' }
+        ];
+        const before = JSON.parse(JSON.stringify(source)) as HarnessMessage[];
+
+        const result = materializeBranchHistory({
+            messages: source,
+            branchId: 'branch-2',
+            reason: 'threadFork'
+        });
+
+        expect(result.messages).toEqual([
+            { role: 'user', content: 'hi' },
+            {
+                role: 'assistant',
+                content: 'call',
+                toolCalls: [
+                    { id: 'call_branch-2_1', name: 'read', arguments: '{}' },
+                    { id: 'call_branch-2_2', name: 'write', arguments: '{}' }
+                ]
+            },
+            {
+                role: 'tool',
+                content: 'boom',
+                toolCallId: 'call_branch-2_1',
+                name: 'read',
+                outcome: 'failed'
+            },
+            // The healthy sibling keeps NO key, so the branch is byte-identical to a fork
+            // of a pre-outcome transcript.
+            { role: 'tool', content: 'ok', toolCallId: 'call_branch-2_2', name: 'write' },
+            { role: 'user', content: 'next' }
+        ]);
+
+        expect(source).toEqual(before);
+    });
+
+    // Two halves of the same refusal rule (core/branch.ts `copyOutcome`):
+    //   * a value outside the union is REFUSED, not dropped — silently reading a mistyped
+    //     `"fail"` as `completed` would hide a failure from every later policy;
+    //   * a branch's own PENDING PLACEHOLDER carries no outcome at all. It is not a
+    //     committed result, and the prune policy must never see a classification there
+    //     (docs/tasks/2026-11-09-progressive-compaction.md T0 Q3).
+    it('refuses a branch outcome outside the union, and gives a pending placeholder none', () => {
+        expect(() =>
+            materializeBranchHistory({
+                messages: [
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
+                    },
+                    {
+                        role: 'tool',
+                        content: 'boom',
+                        toolCallId: 'x',
+                        name: 'read',
+                        // Deliberately invalid: a host that hand-wrote a transcript.
+                        outcome: 'fail' as unknown as HarnessToolOutcome
+                    }
+                ],
+                branchId: 'branch-3',
+                reason: 'threadFork'
+            })
+        ).toThrow(
+            'Branch history message [1].outcome must be one of: completed, failed, rejected, cancelled (or be omitted).'
+        );
+
+        const paired = materializeBranchHistory({
+            messages: [
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
+                }
+            ],
+            branchId: 'branch-4',
+            reason: 'threadFork'
+        });
+
+        expect(paired.messages).toHaveLength(2);
+        const placeholder = paired.messages[1] as Extract<HarnessMessage, { role: 'tool' }>;
+        expect(placeholder).toEqual({
+            role: 'tool',
+            content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+            toolCallId: 'call_branch-4_1',
+            name: 'read'
+        });
+        expect(Object.keys(placeholder)).not.toContain('outcome');
     });
 
     it('rejects history over maxHistoryBytes without truncating', () => {

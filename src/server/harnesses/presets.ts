@@ -324,7 +324,13 @@ const demo: HarnessPreset = {
             // notifications matter exactly like a live harness's.
             report: {
                 progress,
-                ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange })
+                ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange }),
+                // T1.5 last mile: the host's plugin-diagnostic sink, forwarded exactly like the
+                // observer above. The scripted transport still runs the SAME built-in plugins a
+                // live harness does (src/plugin/manifest.ts), so a hook failure here is a real
+                // failure the host has to be able to see; ignoring this member would leave the
+                // shipped fixture blind while every live preset reported.
+                ...(report?.diagnostic === undefined ? {} : { diagnostic: report.diagnostic })
             },
             // N4: the same owner-interaction hook every live factory gets. The
             // scripted transport never calls actionRequest, but forwarding it keeps

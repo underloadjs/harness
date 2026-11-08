@@ -81,7 +81,7 @@ const hasForkResult = (request: HarnessStreamRequest): boolean =>
 // is why it still reaches both agents — through toolRequest, not a declaration.
 const CORE_DECLARATIONS = [
     'toolRequest',
-    'task'
+    'tasks'
 ];
 
 describe('agentManage / agentResult registration', () => {

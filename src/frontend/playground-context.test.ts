@@ -33,7 +33,7 @@ const descriptor = (name: string, overrides: Partial<HarnessDescriptor> = {}): H
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: ['read'],
-        coreTools: ['toolRequest', 'task'],
+        coreTools: ['toolRequest', 'tasks'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -312,7 +312,7 @@ it('runs a session-bound call in its own session and never adopts it into the ch
 it('keeps the same temporary context across playground calls and stays on its own harness', async () => {
     const calls = stubServer({
         presets: [descriptor('alpha'), descriptor('beta')],
-        tools: [coreTool('toolRequest', ['tags']), coreTool('task', [])]
+        tools: [coreTool('toolRequest', ['tags']), coreTool('tasks', [])]
     });
     await boot();
 
@@ -324,7 +324,7 @@ it('keeps the same temporary context across playground calls and stays on its ow
 
     // A SECOND tool in the same playground visit reuses the same context: discover-then-
     // use is the whole point, so one session must serve both calls.
-    await openTool('task');
+    await openTool('tasks');
     // A merge call with NO arguments is a read of the current list (R9-R11).
     argsBox().value = '{}';
     call();
@@ -341,7 +341,8 @@ it('keeps the same temporary context across playground calls and stays on its ow
             ])
     ).toEqual([
         ['toolRequest', 'temp-1'],
-        ['task', 'temp-1']
+        // The tools view dials the re-keyed name (Decision J): `tasks`, not `task`.
+        ['tasks', 'temp-1']
     ]);
 
     // The reader switches to ANOTHER conversation. That closes the tools view (and with it
@@ -350,7 +351,7 @@ it('keeps the same temporary context across playground calls and stays on its ow
     document.querySelector<HTMLButtonElement>('.harness-item[data-harness="beta"]')?.click();
     await flush();
 
-    await openTool('task');
+    await openTool('tasks');
     // An entry with no `id` adds one task; the same call shape works in the
     // playground's fresh session because it observes the same temporary context.
     argsBox().value = '{"tasks":[{"text":"x"}]}';

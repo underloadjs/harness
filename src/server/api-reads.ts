@@ -226,7 +226,21 @@ export const sessionResourceOf = (record: SessionRecord, context: ReadContext): 
     runtime_execution: context.runtime.threadExecution,
     pending_action_count: record.pendingActions.size,
     created_tool_count: createdToolNames(record).length,
-    created_tool_limit: context.createdToolLimit
+    created_tool_limit: context.createdToolLimit,
+    // T1.5's last mile (ADDITIVE, and ABSENT when empty): the plugin diagnostics this session
+    // reported — a hook that threw or timed out, an unparseable decision, or a plugin's own
+    // `policy` report — each naming its OWNING plugin. This is the surface that makes "the
+    // compactor is broken" answerable from the identified session read instead of only from the
+    // server's stderr. Emitted only when there IS a journal, so every pre-T4 row keeps its exact
+    // key set (the `queue_depth` rule above, and `src/server/sessions.ts`
+    // `Session.pluginDiagnostics` for the cap and the durability rule).
+    //
+    // Verbatim camelCase inside, like every other domain payload on this contract
+    // (`HarnessMessage`, the display subtree): these are the library's diagnostic fields plus the
+    // receive timestamp, copied so a consumer cannot mutate the stored journal.
+    ...(record.pluginDiagnostics.length === 0
+        ? {}
+        : { plugin_diagnostics: record.pluginDiagnostics.map((entry) => ({ ...entry })) })
 });
 
 /** The live per-agent model map, read from the running brains (never a snapshot copy). */

@@ -80,7 +80,7 @@ const serverTurn = (
     ({
         id: options.id ?? 'turn-1',
         index: options.index ?? 0,
-        prompt: options.prompt ?? 'task',
+        prompt: options.prompt ?? 'tasks',
         status: options.status ?? 'done',
         startedAt: 5,
         updatedAt: 10,

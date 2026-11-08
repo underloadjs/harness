@@ -9,7 +9,33 @@
 //   - ../../../Temp/t3/probe-merge.ts    - the probe that proved the old merge invalid
 
 import { describe, expect, it } from 'vitest';
-import { readTaskStoreState } from '../../core/task';
+import {
+    CHAPTERS_COLLECTION,
+    LOCATIONS_COLLECTION,
+    PROFILES_COLLECTION,
+    TASKS_COLLECTION,
+    readRecordsStoreState
+} from '../../core';
+
+// The store validator the mint must satisfy (records-engine T3): ONE collection map
+// with the store-level counter, so a lane-minted id set has to leave `nextId` one past
+// the largest id — the F1 rule the core snapshot reader enforces.
+const validateTasks = (items: unknown[], nextId: number) => () => {
+    const store = readRecordsStoreState({
+        nextId,
+        collections: {
+            tasks: { definition: TASKS_COLLECTION, items, storeRev: 0, changes: [] },
+            chapters: { definition: CHAPTERS_COLLECTION, items: [], storeRev: 0, changes: [] },
+            profiles: { definition: PROFILES_COLLECTION, items: [], storeRev: 0, changes: [] },
+            locations: { definition: LOCATIONS_COLLECTION, items: [], storeRev: 0, changes: [] }
+        }
+    });
+
+    // The assertions below were written against the per-store shape; the unified store
+    // keeps the store-level counter ABOVE the collections, so the helper hands back the
+    // `tasks` collection with the counter folded in — the same facts, one level up.
+    return { ...store.collections.tasks, nextId: store.nextId };
+};
 import {
     ID_SPACES,
     ID_SPACE_CAPS,
@@ -27,19 +53,19 @@ describe('counter units', () => {
     it('knows which core field each space publishes, because the units differ by one', () => {
         // A record store counts the NEXT id; thread and invocation counters count the
         // LAST used one (the core does `++sequence` before use).
-        expect(counterSemanticsOf('record:todos')).toBe('next-id');
-        expect(counterSemanticsOf('record:profiles')).toBe('next-id');
+        expect(counterSemanticsOf('record')).toBe('next-id');
+        expect(counterSemanticsOf('record')).toBe('next-id');
         expect(counterSemanticsOf('thread')).toBe('last-used');
         expect(counterSemanticsOf('invocation')).toBe('last-used');
         expect(counterSemanticsOf('completedOrder')).toBe('last-used');
         expect(counterSemanticsOf('createdToolCount')).toBe('last-used');
 
-        expect(publishCounter('record:todos', 3)).toBe(4);
+        expect(publishCounter('record', 3)).toBe(4);
         expect(publishCounter('thread', 3)).toBe(3);
-        expect(seedFromCounter('record:todos', 4)).toBe(3);
+        expect(seedFromCounter('record', 4)).toBe(3);
         expect(seedFromCounter('thread', 3)).toBe(3);
         // A brand-new store (nextId 1) seeds the ledger at "nothing issued yet".
-        expect(seedFromCounter('record:todos', 1)).toBe(0);
+        expect(seedFromCounter('record', 1)).toBe(0);
     });
 
     it('mints only the created-tool budget, and bounds the live records elsewhere (T10 M1)', () => {
@@ -61,59 +87,59 @@ describe('counter units', () => {
             'resultSequence',
             'completedOrder',
             'createdToolCount',
-            'record:todos',
-            'record:profiles',
-            'record:chapters',
-            'record:locations'
+            'record'
         ]);
-        expect(isIdSpace('record:todos')).toBe(true);
+        expect(isIdSpace('record')).toBe(true);
         expect(isIdSpace('nonsense')).toBe(false);
     });
 });
 
 describe('createIdentityLedger', () => {
     it('mints ids one past what exists and publishes one past THOSE', () => {
-        const ledger = createIdentityLedger({ 'record:todos': 1 });
-        const allocated = ledger.allocate('record:todos', 3, 1);
+        const ledger = createIdentityLedger({ 'record': 1 });
+        const allocated = ledger.allocate('record', 3, 1);
 
         expect(allocated).toEqual({
             ok: true,
-            lease: { space: 'record:todos', start: 2, count: 3, laneEpoch: 1 },
+            lease: { space: 'record', start: 2, count: 3, laneEpoch: 1 },
             watermark: 4,
             published: 5
         });
-        expect(ledger.publishedOf('record:todos')).toBe(5);
+        expect(ledger.publishedOf('record')).toBe(5);
     });
 
     it('reproduces F1: three minted records leave a nextId the core validator accepts', () => {
         // The old fold published the BLOCK START (10001) while ids 10001-10003 existed,
         // and readTaskStoreState threw
         // "todo state.nextId must be greater than the largest id (10003); received 10001".
-        const ledger = createIdentityLedger({ 'record:todos': 10_000 });
+        const ledger = createIdentityLedger({ 'record': 10_000 });
         const items: { id: string; text: string; completed: boolean }[] = [];
 
         for (let taken = 0; taken < 3; taken += 1) {
-            const allocated = ledger.allocate('record:todos', 1, 1);
+            const allocated = ledger.allocate('record', 1, 1);
 
             if (!allocated.ok) throw new Error('unexpected exhaustion');
 
-            items.push({ id: idOf('record:todos', allocated.lease.start), text: `task ${allocated.lease.start}`, completed: false });
+            items.push({ id: idOf('record', allocated.lease.start), text: `task ${allocated.lease.start}`, completed: false });
         }
 
         expect(items.map((item) => item.id)).toEqual(['10001', '10002', '10003']);
 
-        const nextId = ledger.publishedOf('record:todos');
+        const nextId = ledger.publishedOf('record');
 
         expect(nextId).toBe(10_004);
         // The real core rule, not a restatement of it.
-        expect(() => readTaskStoreState({ items, nextId })).not.toThrow();
-        expect(readTaskStoreState({ items, nextId }).nextId).toBe(10_004);
+        expect(() => validateTasks(items, nextId)()).not.toThrow();
+        expect(validateTasks(items, nextId)().nextId).toBe(10_004);
 
         // T1: a minted block still has the pre-T1 SHAPE (`{ items, nextId }`), and the
         // core reader completes it rather than guessing - every record starts at content
         // rev 1 and the store has no history until the session writes one. That default
         // is what lets a lane-minted store and a core-written one be the same document.
-        expect(readTaskStoreState({ items, nextId })).toEqual({
+        expect(validateTasks(items, nextId)()).toEqual({
+            // A collection state is its SPEC plus its entries (Decision M), and the
+            // counter comes from the STORE (F3) — the helper folds the two together.
+            definition: TASKS_COLLECTION,
             items: [
                 { id: '10001', text: 'task 10001', completed: false, rev: 1 },
                 { id: '10002', text: 'task 10002', completed: false, rev: 1 },
@@ -140,7 +166,7 @@ describe('createIdentityLedger', () => {
         expect([resultA.lease.start, resultB.lease.start]).toEqual([2, 3]);
         expect(idOf('invocation', resultA.lease.start)).toBe('2');
         // Thread ids keep the core's prefix; every other space is a decimal string.
-        expect(idOf('record:todos', 12)).toBe('12');
+        expect(idOf('record', 12)).toBe('12');
         expect(idOf('completedOrder', 12)).toBe('12');
     });
 
@@ -165,22 +191,24 @@ describe('createIdentityLedger', () => {
     });
 
     it('refuses to move backwards, so an old snapshot cannot reintroduce a used id', () => {
-        const ledger = createIdentityLedger({ 'record:todos': 1 });
+        const ledger = createIdentityLedger({ 'record': 1 });
 
-        ledger.allocate('record:todos', 2, 1);
+        ledger.allocate('record', 2, 1);
 
-        expect(ledger.observe('record:todos', 1)).toEqual({
+        expect(ledger.observe('record', 1)).toEqual({
             code: 'stale-observe',
-            message: 'Observed record:todos watermark 1 is behind the ledger at 3; the ledger stays at 3 so no id is reused.'
+            // ONE id space for the whole store (F3), so the message names `record`, not a
+            // per-collection space like the retired `'record'`.
+            message: 'Observed record watermark 1 is behind the ledger at 3; the ledger stays at 3 so no id is reused.'
         });
 
         // Equal is not stale: it is the authority agreeing with the ledger.
-        expect(ledger.observe('record:todos', 3)).toBeUndefined();
-        expect(ledger.observe('record:todos', 50)).toBeUndefined();
-        expect(ledger.publishedOf('record:todos')).toBe(51);
-        expect(ledger.observe('record:todos', -1)).toEqual({
+        expect(ledger.observe('record', 3)).toBeUndefined();
+        expect(ledger.observe('record', 50)).toBeUndefined();
+        expect(ledger.publishedOf('record')).toBe(51);
+        expect(ledger.observe('record', -1)).toEqual({
             code: 'stale-observe',
-            message: 'Observed record:todos watermark must be a non-negative integer; received -1.'
+            message: 'Observed record watermark must be a non-negative integer; received -1.'
         });
     });
 
@@ -261,13 +289,13 @@ describe('createIdentityLedger', () => {
     });
 
     it('reports the counters an applier must publish after a lane wrote', () => {
-        const ledger = createIdentityLedger({ 'record:todos': 1, thread: 1 });
+        const ledger = createIdentityLedger({ 'record': 1, thread: 1 });
 
-        ledger.allocate('record:todos', 2, 1);
+        ledger.allocate('record', 2, 1);
         ledger.allocate('thread', 1, 1);
 
-        expect(publishedPatchOf(ledger, ['record:todos', 'thread'])).toEqual({ 'record:todos': 4, thread: 2 });
-        expect(ledger.watermarks()).toEqual({ 'record:todos': 3, thread: 2 });
+        expect(publishedPatchOf(ledger, ['record', 'thread'])).toEqual({ 'record': 4, thread: 2 });
+        expect(ledger.watermarks()).toEqual({ 'record': 3, thread: 2 });
         expect(publishedPatchOf(ledger, [])).toEqual({});
     });
 

@@ -17,20 +17,22 @@
 // fetch content-type gate) instead of duplicating them here.
 //
 // The parameter objects below are the tools' real schemas — NOT guesses:
-//   - `task`    -> { tasks?, remove?, claim? | release? | takeover?, expects?,
-//                    offset?, limit? }                    (tools/runtime/task.tool.ts,
-//                  patch/CAS/ownership semantics in core/task.ts)
+//   - `tasks`   -> { tasks?, remove?, ids?, expects?, offset?, limit? }
+//                                            (tools/runtime/tasks.tool.ts, patch/CAS
+//                  semantics in core/records.ts — Decision P deleted the ownership
+//                  verbs, so there is no claim to pass through)
 //   - `search`  -> { query, maxResults?, provider? }      (tools/websearch/index.ts)
 //   - `fetch`   -> { url, format?, provider? }            (tools/webfetch/index.ts)
 //
-// THE TASK COMMAND READS BEFORE IT WRITES (T1/Phase 2)
+// THE TASK COMMAND READS BEFORE IT WRITES (T1/Phase 2, still required by the engine)
 // ----------------------------------------------------
-// `core/task.ts` requires an `expects: [{ id, rev }]` token for every content
+// The record engine requires an `expects: [{ id, rev }]` token for every content
 // patch or removal made by a caller that HAS an agent identity, and `executeTool`
 // always gives one (`agent: primary`). So `/task complete|reopen|remove` reads the
-// store first and sends the real revisions; it never invents a rev. `/task
-// claim|release|takeover` need no token, because an ownership action never changes
-// `rev`. The cost is one extra read (and its `tool_execute` notification) per
+// store first and sends the real revisions; it never invents a rev. There are no
+// ownership verbs left to skip the token (Decision P), which is why exactly THREE
+// subcommands do the read dance and `/task add` does not (a new record has no rev to
+// guard). The cost is one extra read (and its `tool_execute` notification) per
 // guarded command — a debounced save, not a model turn.
 //
 // CONDITIONAL TOOLS, HONEST ERRORS
@@ -53,7 +55,7 @@
 //   - ./command.ts                 — COMMAND_NAME_PATTERN, formatCommandHelp
 //   - ./result-budget.ts           — MODEL_TOOL_RESULT_BUDGET_BYTES, utf8ByteLength
 //   - ../harness.ts                — registers these first, before configuration
-//   - ../tools/runtime/task.tool.ts / websearch / webfetch — the tools called here
+//   - ../tools/runtime/tasks.tool.ts / websearch / webfetch — the tools called here
 
 // `toErrorInfo` is the harness's total thrown-value formatter (a compiled or
 // host-supplied tool may throw a primitive); reusing it keeps a command's error
@@ -86,7 +88,11 @@ export const WEBFETCH_COMMAND_NAME = 'webfetch';
 // here (rather than importing their modules) keeps this file dependency-free:
 // importing `tools/websearch` for one constant would pull a provider adapter into
 // every harness build, including the browser one.
-const TASK_TOOL_NAME = 'task';
+// Decision J: the TOOL is plural (`tasks` manages a collection) while the slash
+// command stays singular `/task` (the act is one task). This constant is the ONLY
+// place the command resolves its tool, so the tool rename is one line here — and the
+// COMMAND name above it is a separate literal that must NOT become `/tasks`.
+const TASK_TOOL_NAME = 'tasks';
 const SEARCH_TOOL_NAME = 'search';
 const FETCH_TOOL_NAME = 'fetch';
 
@@ -172,29 +178,19 @@ const TASK_READ_MAX_PAGES = 16;
 // cursor. Ids are shown with "#" so an operator can copy `/task complete <id>`
 // straight out of the listing.
 //
-// A claimed record also shows WHO holds it, because without that an operator
-// looking at a rejected `/task complete` cannot tell the record is reserved — and
-// the fix (`/task takeover <id>`, or waiting for the lease) is the whole point of
-// the ownership feature. `data` still carries the exact machine-readable records.
+// Decision P (round 7) deleted the claim, so the listing no longer annotates a
+// holder: the old `(claimed by X until Y)` suffix described a lock that can no longer
+// exist. `rev` and the attribution still ride in `data` — the exact machine-readable
+// records — which is what an operator or a host uses to send the next `expects` token.
 const formatTaskPage = (result: unknown): string => {
     const page = (result ?? {}) as Partial<TaskPage>;
     const tasks = Array.isArray(page.tasks) ? page.tasks : [];
     const counts = page.counts ?? { total: 0, completed: 0, pending: 0 };
     const info = page.page ?? { offset: 0, limit: 0, hasMore: false };
 
-    const lines = tasks.map((task) => {
-        if (task.owner === undefined) return `#${task.id} [${task.completed ? 'x' : ' '}] ${task.text}`;
-
-        // An indefinite claim (no lease) says so rather than inventing an expiry,
-        // matching the tool's own blocked-write message (core/task.ts claimMessage).
-        const holder = `${task.owner}${task.ownerThreadId === undefined ? '' : `@${task.ownerThreadId}`}`;
-        const until =
-            task.leaseUntil === undefined
-                ? 'forever'
-                : `until ${new Date(task.leaseUntil).toISOString()}`;
-
-        return `#${task.id} [${task.completed ? 'x' : ' '}] ${task.text} (claimed by ${holder} ${until})`;
-    });
+    const lines = tasks.map(
+        (task) => `#${task.id} [${task.completed ? 'x' : ' '}] ${task.text}`
+    );
 
     if (lines.length === 0) lines.push('No tasks.');
 
@@ -266,7 +262,7 @@ const taskCommand: HarnessCommand = {
     name: TASK_COMMAND_NAME,
     description: 'Read and change this session\'s task list.',
     usage:
-        '/task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]',
+        '/task [list | add <text> | complete <id> | reopen <id> | remove <id>...]',
     execute: async (context) => {
         const [subcommand, ...rest] = context.args;
 
@@ -278,7 +274,7 @@ const taskCommand: HarnessCommand = {
             }
 
             if (!hasTool(context, TASK_TOOL_NAME)) {
-                return usageError(taskCommand, 'the "task" tool is not registered in this harness.');
+                return usageError(taskCommand, 'the "tasks" tool is not registered in this harness.');
             }
 
             try {
@@ -300,7 +296,7 @@ const taskCommand: HarnessCommand = {
             }
 
             if (!hasTool(context, TASK_TOOL_NAME)) {
-                return usageError(taskCommand, 'the "task" tool is not registered in this harness.');
+                return usageError(taskCommand, 'the "tasks" tool is not registered in this harness.');
             }
 
             try {
@@ -331,7 +327,7 @@ const taskCommand: HarnessCommand = {
             }
 
             if (!hasTool(context, TASK_TOOL_NAME)) {
-                return usageError(taskCommand, 'the "task" tool is not registered in this harness.');
+                return usageError(taskCommand, 'the "tasks" tool is not registered in this harness.');
             }
 
             try {
@@ -360,7 +356,7 @@ const taskCommand: HarnessCommand = {
             }
 
             if (!hasTool(context, TASK_TOOL_NAME)) {
-                return usageError(taskCommand, 'the "task" tool is not registered in this harness.');
+                return usageError(taskCommand, 'the "tasks" tool is not registered in this harness.');
             }
 
             try {
@@ -381,38 +377,13 @@ const taskCommand: HarnessCommand = {
             }
         }
 
-        // `/task claim|release|takeover <id...>` — the Phase 2 ownership verbs. The
-        // parameter key is the verb itself (tools/runtime/task.tool.ts), one list of
-        // exact ids, and NO `expects`: a claim, a release and a takeover move the
-        // holder without touching `rev`, so there is no content revision to guard.
-        // The command runs unthreaded (`executeTool` sets no `threadId`), which
-        // makes its holder pair `(<primary>, undefined)` — an operator's claim is
-        // therefore distinct from any conversation's claim, and `/task release` can
-        // only lift the operator's own or an expired one. A foreign live claim is
-        // the tool's rejection; `/task takeover` is the documented override.
-        if (
-            subcommand === 'claim' ||
-            subcommand === 'release' ||
-            subcommand === 'takeover'
-        ) {
-            if (rest.length === 0) {
-                return usageError(taskCommand, `"${subcommand}" needs at least one task id.`);
-            }
-
-            if (!hasTool(context, TASK_TOOL_NAME)) {
-                return usageError(taskCommand, 'the "task" tool is not registered in this harness.');
-            }
-
-            try {
-                const result = await context.harness.executeTool(TASK_TOOL_NAME, {
-                    [subcommand]: rest
-                });
-
-                return { content: formatTaskPage(result), data: result };
-            } catch (error) {
-                return failure(error, `/task ${subcommand}`);
-            }
-        }
+        // Decision P (round 7): `/task claim|release|takeover` are deleted with the
+        // lock they addressed — the three verbs, the tool's `leaseMs` parameter and its
+        // ownership block. An operator who types one now falls through to the
+        // `unknown action` line below, which is the honest answer: there is no ownership
+        // state to move, and every write is guarded by its `expects` token instead. The
+        // COMMAND name is unaffected (Decision J), and `/task claim 1` reporting an
+        // unknown action is this deletion's check.
 
         return usageError(taskCommand, `unknown action "${subcommand}".`);
     }

@@ -16,6 +16,32 @@ import type {
     HarnessStreamEvent
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
 const PNG_DATA = base64(PNG_BYTES);
@@ -50,7 +76,7 @@ describe('snapshot attachments', () => {
 
         const snapshot = writer.snapshot();
 
-        expect(snapshot.agents.writer.messages).toEqual([
+        expect(withoutIds(snapshot.agents.writer.messages)).toEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [image()] }
         ]);
     });
@@ -58,7 +84,7 @@ describe('snapshot attachments', () => {
     it('keeps a text-only user message free of an attachments key', () => {
         const writer = session([{ role: 'user', content: 'plain' }]);
 
-        expect(writer.snapshot().agents.writer.messages).toStrictEqual([
+        expect(withoutIds(writer.snapshot().agents.writer.messages)).toStrictEqual([
             { role: 'user', content: 'plain' }
         ]);
     });
@@ -70,7 +96,7 @@ describe('snapshot attachments', () => {
 
         target.restore(snapshot);
 
-        expect(target.agent.messages).toEqual([
+        expect(withoutIds(target.agent.messages)).toEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [image()] }
         ]);
 
@@ -83,7 +109,7 @@ describe('snapshot attachments', () => {
         expect(restored.attachments?.[0]).not.toBe(snapshotUser.attachments?.[0]);
 
         restored.attachments![0].data = 'AAAA';
-        expect(source.snapshot().agents.writer.messages).toEqual([
+        expect(withoutIds(source.snapshot().agents.writer.messages)).toEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [image()] }
         ]);
     });
@@ -105,7 +131,7 @@ describe('snapshot attachments', () => {
 
         const snapshot = writer.snapshot();
 
-        expect(snapshot.agents.writer.messages[1]).toEqual({
+        expect(withoutIds(snapshot.agents.writer.messages[1])).toEqual({
             role: 'tool',
             content: '{"media":"attached"}',
             toolCallId: 'c1',
@@ -121,7 +147,7 @@ describe('snapshot attachments', () => {
         expect(restored.attachments?.[0]).not.toBe(attachment);
 
         restored.attachments![0].data = 'AAAA';
-        expect(writer.snapshot().agents.writer.messages[1]).toEqual({
+        expect(withoutIds(writer.snapshot().agents.writer.messages[1])).toEqual({
             role: 'tool',
             content: '{"media":"attached"}',
             toolCallId: 'c1',
@@ -136,7 +162,7 @@ describe('snapshot attachments', () => {
             { role: 'tool', content: 'text', toolCallId: 'c1', name: 'read' }
         ]);
 
-        expect(writer.snapshot().agents.writer.messages[1]).toStrictEqual({
+        expect(withoutIds(writer.snapshot().agents.writer.messages[1])).toStrictEqual({
             role: 'tool',
             content: 'text',
             toolCallId: 'c1',
@@ -233,7 +259,7 @@ describe('snapshot attachments', () => {
 
         target.restore(legacy);
 
-        expect(target.agent.messages).toStrictEqual([
+        expect(withoutIds(target.agent.messages)).toStrictEqual([
             { role: 'system', content: 'sys' },
             { role: 'user', content: 'plain' }
         ]);

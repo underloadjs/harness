@@ -27,7 +27,11 @@ What a consumer still cannot do:
   re-sent through the whole backoff ladder before the caller sees anything;
 - **use the package's own estimate.** The estimator exists but is not on the published
   surface, so a host trimming its own history still invents its own heuristic and gets a
-  different number from the one the UI's context bar and the compaction plugin use;
+  different number from the one the UI's context bar and the compaction plugin use
+  (as of 2026-11-09 that divergence is wider, not smaller: the compaction trigger now
+  compares a provider-anchored hybrid — `estimateContextTokensHybrid` once a request
+  has reported `usage` — while the context bar stays pure chars/4, and neither name is
+  exported);
 - **find out what the package does about context size.** The README still says only that
   `agent()` owns no compaction; it never says where that policy lives or what the estimate
   counts.
@@ -54,11 +58,11 @@ the wire.
 | A streamed request posts the full transcript, unguarded | `src/transport/openai.ts:770-785` |
 | Every non-2xx collapses to one error frame carrying status + raw body text | `src/transport/openai.ts:792-796` |
 | No `contextWindow` / `maxPromptTokens` field on provider or agent configuration | `src/types/index.ts:334-354` (`HarnessSampling`, `HarnessProviderConfiguration`); grep `contextWindow\|maxPromptTokens` over `src/types/index.ts` → 0 matches |
-| The estimator is internal: defined in core, imported by the harness, never re-exported | `src/core/context-estimate.ts:108`; `src/harness.ts:372` (import), `:7587` (the only production call site) |
+| The estimator is internal: defined in core, imported by the harness, never re-exported — re-checked **2026-11-09** and still true: the hybrid sibling (`estimateContextTokensHybrid`) landed with compaction T5.4 and is **also** not on the published surface (neither `src/core/index.ts` nor the root export block re-exports either name) | `src/core/context-estimate.ts:167` (`estimateContextTokens`), `:250` (hybrid), `:221` (`anchorFromUsage`); `src/harness.ts:388-392` (imports the hybrid), `:8621`/`:8632` (the two `turn.before` estimates), `src/core/context-pruning.ts:90,361` (the floor) — and grep `estimateContextTokens` over `src/index.ts` / the root `export {` block / `dist/index.d.ts` → no match |
 | The root barrel's public-surface block exports no context helper; the only star-export is types | `src/harness.ts:10193` (the `export { agent, tool, … }` public-surface block), `:10328` (`export type * from './types'`) |
 | The limit is plugin settings, not provider config, and is checked at the turn boundary | `src/plugins/context-compaction.plugin.ts:103` (`contextLimit`), `:115` (default), `:223`, `:234` (the comparison) |
 | A per-request retry re-sends the same oversized request, so an overflow costs the full backoff ladder; cancellation is the one existing non-retriable precedent | `src/core/agent.ts:691-698` (`isAbortError` rethrows before the backoff), `:316-322` |
-| README documents none of this | grep `context-compaction\|turn.before\|estimatedTokens\|contextLimit` over `README.md` → 0 matches; `README.md:356` still states only "no compaction" |
+| README documents none of this — re-checked **2026-11-09**: `turn.before` now appears as the hook a context policy writes through (the transcript-routes paragraph and the `plugins` configuration row), but the README still never names the estimator, the `contextLimit` setting, or the shipped `context-compaction` plugin, and the `agent()` section still states only "no compaction" | grep `context-compaction\|contextLimit\|estimatedTokens\|estimateContextTokens` over `README.md` → 0 matches (grep `turn.before` → the flag/plugins rows); the "no compaction" line stands where it was |
 
 ## Proposal
 

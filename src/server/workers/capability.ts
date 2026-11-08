@@ -175,10 +175,15 @@ export type ToolSurface = {
 //   - `toolCancel` - cancels a background call of THIS run, which lives in the lane.
 //   - `delegate` - see DELEGATION_TOOL_NAME, and the nested-run refusal below.
 export const SHARED_STATE_TOOL_NAMES: readonly string[] = [
-    'task',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
+    // The record family (records-engine T1): the engine surface and its four wrappers.
+    // Every one of them ends its source entry with `harness.runtime.executeRecords`, so
+    // a lane write is performed on the canonical harness — and a name missing here would
+    // run its body on the lane against a private copy of the session (a lost write).
+    'records',
+    'tasks',
+    'chapters',
+    'profiles',
+    'locations',
     'toolCreate',
     'toolManage',
     'toolRegistry',
@@ -192,10 +197,12 @@ export const SHARED_STATE_TOOL_NAMES: readonly string[] = [
 
 // The `harness.runtime` methods whose work belongs to the authority, each with the
 // canonical tool name it backs (the shipped core tool sources do nothing but delegate to
-// these, e.g. src/tools/runtime/task.tool.ts:100). Interception happens on the REPLICA's
-// handle, so no tool source changes and no shared write is ever performed locally.
+// these — every record entry ends with
+// `context.harness.runtime.executeRecords(<its own name>, context)`). Interception
+// happens on the REPLICA's handle, so no tool source changes and no shared write is
+// ever performed locally.
 export const AUTHORITY_RUNTIME_METHODS = {
-    executeRecordTool: 'task | profileManage | chapterManage | locationManage',
+    executeRecords: 'records | tasks | chapters | profiles | locations',
     manageTool: 'toolManage',
     createToolForAgent: 'toolCreate',
     requestTools: 'toolRequest',
@@ -238,6 +245,9 @@ export const LANE_FORBIDDEN_HANDLE_CALLS = [
     'createThread',
     'setThreadMessages',
     'appendThreadMessages',
+    // T4.1: the in-place prefix rewrite belongs with the two above. All three move the
+    // CANONICAL transcript; a lane's tool body may only influence it by committing operations.
+    'patchThreadMessages',
     'setThreadStatus',
     'archiveInvocation',
     'deleteThread',
@@ -447,6 +457,39 @@ export const LANE_NESTED_RUN_DOORS: readonly NestedRunDoor[] = [
     }
 ];
 
+// ---------------------------------------------------------------------------
+// R7 — a CREATED tool must be purely standalone (records-engine Decision F, F8)
+// ---------------------------------------------------------------------------
+//
+// A created tool computes its result from its own arguments (`sum(A,B)` is always the
+// same; randomness is its declared outcome), which is exactly why an agent reaches for
+// `toolCreate` instead of spending a model turn on the work. A created tool that only
+// FORWARDS to another tool throws that away: it costs a registry entry, a schema and a
+// nested call, and computes nothing the shadowed tool did not already do.
+//
+// The rule is STATED where the author writes the body (`toolCreate`'s description) and
+// REPORTED here — never refused. ../core/creation.ts disclaims any sandbox ("no sandbox
+// and no isolation"), these are TEXTUAL patterns that also match a comment or a string,
+// and a hard semantic ban would be the first semantic restriction in a module that says
+// there is none. Same `blocking: false` stance as the door above.
+export const CREATED_TOOL_PROXY_CODE = 'created-tool-proxy';
+
+// The spellings of "this body calls another tool": the routed door and the direct one,
+// in both member-access spellings a body writes.
+export const CREATED_TOOL_PROXY_PATTERNS: readonly RegExp[] = [
+    /\bcallTool\s*\(/,
+    /\.harness\s*(?:\?\.|\.)\s*executeTool\s*\(/
+];
+
+// True when a created body reaches another tool. Textual, and honest about being
+// textual: a hit is a warning to read, never a proof.
+export const reachesToolProxy = (source: string | undefined): boolean =>
+    source !== undefined && CREATED_TOOL_PROXY_PATTERNS.some((pattern) => pattern.test(source));
+
+// The wording of the report.
+export const createdToolProxyWarning = (name: string): string =>
+    `${CREATED_TOOL_PROXY_CODE}: Tool "${name}" was created with a body that calls another tool (callTool / harness.executeTool). A created tool is meant to be PURELY STANDALONE — a deterministic computation over its own arguments — because the point of creating one is to replace a model turn with something repeatable, not to rename a tool that already exists. This is reported, not refused: \`toolCreate\` compiles the body and runs whatever it says, and this scan is a text pattern that also fires on a comment or a string. Keep the call when the body does real work around it; drop the created tool when the whole body is a forwarding call.`;
+
 // The destructured/aliased spellings of door (1). The bound name only counts once the body CALLS
 // it, which keeps the scan honest: an unused binding is not a reach.
 const NESTED_RUN_RUN_BINDINGS: readonly {
@@ -565,6 +608,11 @@ export const assessWorkerToolSurface = (tool: {
     // True when the tool came from the harness configuration as a constructed
     // definition (a closure) rather than a compiled source revision.
     closureOnly?: boolean;
+    // True when the tool was AUTHORED by a model through toolCreate. The R7
+    // standalone rule addresses exactly that author, so its scan runs only for
+    // these — a shipped tool legitimately calls a sibling tool, and warning on
+    // every one of them would bury the finding.
+    created?: boolean;
 }): ToolSurface => {
     const reasons: ToolSurface['reasons'] = [];
     const warnings: ToolSurface['warnings'] = [];
@@ -620,6 +668,17 @@ export const assessWorkerToolSurface = (tool: {
         //   - a door NO runtime guard can see (the live handle used as a runner, a sibling brain
         //     run directly) is a REASON: the tool is refused before it can create a child nobody
         //     publishes.
+        // R7 (records-engine Decision F / F8): a created body that FORWARDS to another
+        // tool. Reported under its own code, never a reason, because ../core/creation.ts
+        // disclaims a sandbox and a text scan also matches a comment (see the block above
+        // `CREATED_TOOL_PROXY_CODE`).
+        if (tool.created === true && reachesToolProxy(tool.source)) {
+            warnings.push({
+                code: CREATED_TOOL_PROXY_CODE,
+                message: createdToolProxyWarning(tool.name)
+            });
+        }
+
         for (const door of reachesNestedRunDoors(tool.source)) {
             if (door.blocking) {
                 reasons.push({

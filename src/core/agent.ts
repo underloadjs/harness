@@ -71,6 +71,12 @@ import {
 } from './branch';
 import type { NormalizedForkAgentOptions } from './branch';
 import { registerAgentThreader } from './thread';
+// Stable transcript addresses (context T1). A leaf module (types only), so importing it
+// here adds no cycle to the branch/thread registry chain above.
+import { assignMessageId } from './message-id';
+// The outcome storage rule (compaction T1) for the fork baseline below. Leaf module,
+// type-only imports — no cycle risk with ./branch or ./message-id.
+import { storedOutcomeEntry } from './tool-outcome';
 import type {
     Agent,
     AgentConfiguration,
@@ -152,7 +158,9 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
     return openAICompatible(configuration.provider);
 };
 
-// The ONE normalization point for the context-inclusion flag (`HarnessMessage.included`).
+// The ONE normalization point for the context-inclusion flag (`HarnessMessage.included`)
+// AND for the message id (`HarnessMessage.messageId`) — together: the copy that makes a
+// message REQUEST-SAFE.
 //
 // The invariant this enforces everywhere a message is COPIED into a transcript or
 // handed to a consumer: `included` is present ONLY when it is exactly `false`.
@@ -163,18 +171,40 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
 // caller used (the rest pattern strips `included`, and the override re-adds it in
 // place when it was already there).
 //
+// `messageId` is stripped for the same reason in the OTHER direction (context T1): the
+// id is an address in CANONICAL state, never a model-facing field, so a projection copy
+// carries neither key and a request object stays exactly what it was before either
+// feature existed. That is also why an id is NEVER minted here — this is the copy path,
+// and re-minting on a copy is what would stop the id being an identity. Every canonical
+// creation point adds an id explicitly, through core/message-id.ts `assignMessageId`,
+// either by minting (`seed()`, the appends, the assistant commit) or by carrying the
+// source's (the fork baseline below, a branch record, a restored transcript).
+//
+// `outcome` (compaction T1) is deliberately NOT stripped. It rides into the projection so
+// a `turn.before` plugin or a projected-copy reader can see WHY a call ended without
+// parsing English prose, and it costs the model nothing: every transport field-selects the
+// tool wire shape (`role`/`tool_call_id`/`content`, transport/openai.ts), so a provider
+// payload is byte-identical with or without the key.
+//
 // The input object is never mutated — a new object is always returned, so a caller
 // may keep or reuse its own array. The same rule is applied to untyped records by
 // core/snapshot.ts (`applyIncluded`) and core/branch.ts (`copyIncluded`); this is
 // its typed-message form, used by `seed()` (caller-supplied history entering
 // canonical state) and by the harness's model-facing projection.
 export const withIncluded = (message: HarnessMessage): HarnessMessage => {
+    // Both keys are read off in one pass for the unflagged case, so the surviving keys
+    // keep the order the caller used and the result can never alias the caller's object.
     if (message.included !== false) {
-        const { included: _omitted, ...rest } = message;
+        const { included: _omitted, messageId: _omittedId, ...rest } = message;
         return rest as HarnessMessage;
     }
 
-    return { ...message, included: false };
+    // The flagged case strips ONLY the id and leaves `included: false` where it already
+    // was, so the key order of a projection copy is bit-for-bit what it was before ids
+    // existed (the historical rule: `included` is the last key of a flagged message).
+    const { messageId: _omittedId, ...rest } = message;
+
+    return rest as HarnessMessage;
 };
 
 // A branch that forgot the flag would put a turn the user disabled straight back in
@@ -218,6 +248,13 @@ const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
                           // under, so a corrupted tool message cannot survive a
                           // fork/reset boundary quietly.
                           attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS),
+                          // Compaction T1 — a fork/reset baseline carries the recorded
+                          // outcome verbatim (never re-read from `content`), and carries
+                          // NO key for a completed result, so the baseline of a
+                          // pre-outcome transcript is byte-identical. core/tool-outcome.ts
+                          // `storedOutcomeEntry` owns the omit rule; key order matches the
+                          // canonical writer (src/harness.ts insertToolMessage).
+                          ...storedOutcomeEntry(message.outcome),
                           included: message.included
                       }
                     : {
@@ -225,6 +262,7 @@ const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
                           content: message.content,
                           toolCallId: message.toolCallId,
                           name: message.name,
+                          ...storedOutcomeEntry(message.outcome),
                           included: message.included
                       }
             );
@@ -415,7 +453,11 @@ const createAgent = (
         // mutable state with its source or with a previous reset.
         if (baseline !== undefined) {
             for (const message of baseline) {
-                next.push(copyBaselineMessage(message));
+                // T1.4 — a fork COPIES ids: the clone below carries the source entry's
+                // `messageId` rather than minting a new one, so `setIncluded(id)` means
+                // the same turn on the fork and on its owner. Two objects, one
+                // identity; every lookup is scoped to the transcript this agent owns.
+                next.push(assignMessageId(copyBaselineMessage(message), next, message.messageId));
             }
 
             messages.length = 0;
@@ -424,7 +466,10 @@ const createAgent = (
         }
 
         for (const instruction of instructions) {
-            next.push({ role: 'system', content: instruction });
+            // An instruction block is a canonical message like any other, so it is
+            // addressable too: `setIncluded('msg-1')` disabling a system instruction
+            // from the model is a real thing a compactor does.
+            next.push(assignMessageId({ role: 'system', content: instruction }, next));
         }
 
         for (const message of configuration.messages ?? []) {
@@ -433,16 +478,26 @@ const createAgent = (
             // a canonical key: absent is the only spelling of "included", so no
             // later copy, projection or request object has to defend against it.
             //
+            // The same call strips any id the caller put on a seed message, and the
+            // transcript mints its own (T1.2). That is deliberate: seeded history
+            // enters as a NEW conversation, and honouring a caller's ids would let two
+            // seed entries carry the same one — an ambiguity nothing downstream could
+            // report. Copy paths (the fork baseline above, a restore, a branch) are the
+            // ones that carry an existing id, and only they.
+            //
             // Seeded user messages may carry attachments too. Validate and copy
             // them now, so a bad seed fails construction instead of reaching a
             // transport (and so the configuration's array is never aliased by
             // live history). Text-only seeds keep their exact old shape.
             if (message.role === 'user' && message.attachments !== undefined) {
                 next.push(
-                    withIncluded({
-                        ...message,
-                        attachments: validateAttachments(message.attachments)
-                    })
+                    assignMessageId(
+                        withIncluded({
+                            ...message,
+                            attachments: validateAttachments(message.attachments)
+                        }),
+                        next
+                    )
                 );
                 continue;
             }
@@ -453,15 +508,18 @@ const createAgent = (
             // and history never aliases the caller's objects.
             if (message.role === 'tool' && message.attachments !== undefined) {
                 next.push(
-                    withIncluded({
-                        ...message,
-                        attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
-                    })
+                    assignMessageId(
+                        withIncluded({
+                            ...message,
+                            attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
+                        }),
+                        next
+                    )
                 );
                 continue;
             }
 
-            next.push(withIncluded(message));
+            next.push(assignMessageId(withIncluded(message), next));
         }
 
         // Commit point: everything above succeeded.
@@ -481,7 +539,10 @@ const createAgent = (
     let self: Agent;
 
     const append = (role: 'system' | 'user' | 'assistant', content: string): Agent => {
-        messages.push({ role, content });
+        // T1.2 — a canonical creation point. The id is minted against `messages` AS IT
+        // IS BEFORE THE PUSH (the call argument is evaluated first), which is what makes
+        // one id per transcript sequence impossible to repeat.
+        messages.push(assignMessageId({ role, content }, messages));
         return self;
     };
 
@@ -495,10 +556,16 @@ const createAgent = (
     const appendUser = (content: string, attachments?: HarnessAttachment[]): Agent => {
         const validated = validateAttachments(attachments);
 
+        // T1.2 — this is the append `runAgentCore` uses for a run's root user message,
+        // so the prompt a `turn.before` handler sees next round is addressable by id
+        // (core/message-id.ts; see `append` above for the minting rule).
         messages.push(
-            validated.length > 0
-                ? { role: 'user', content, attachments: validated }
-                : { role: 'user', content }
+            assignMessageId(
+                validated.length > 0
+                    ? { role: 'user', content, attachments: validated }
+                    : { role: 'user', content },
+                messages
+            )
         );
 
         return self;
@@ -747,12 +814,23 @@ const createAgent = (
 
         // Commit to history. reasoning is kept for replay/UI but never sent back
         // to the model, so it is not part of the wire payload.
-        messages.push({
-            role: 'assistant',
-            content: outcome.content,
-            ...(outcome.toolCalls.length > 0 ? { toolCalls: outcome.toolCalls } : {}),
-            ...(outcome.reasoning ? { reasoning: outcome.reasoning } : {})
-        });
+        //
+        // T1.2 — THE assistant commit, the third canonical creation point (with
+        // `seed()` and src/harness.ts `insertToolMessage`). It is minted here, once, and
+        // the id is NOT copied onto the `done` payload below: that payload is a result
+        // value, not a transcript entry, and giving it an id would invite a second id
+        // for one turn.
+        messages.push(
+            assignMessageId(
+                {
+                    role: 'assistant',
+                    content: outcome.content,
+                    ...(outcome.toolCalls.length > 0 ? { toolCalls: outcome.toolCalls } : {}),
+                    ...(outcome.reasoning ? { reasoning: outcome.reasoning } : {})
+                },
+                messages
+            )
+        );
 
         // SUCCESS BOUNDARY (R3/F1). Everything this request streamed is now
         // committed, so it can never be discarded by a retry of a LATER request.
@@ -795,10 +873,16 @@ const createAgent = (
         }
 
         const commitIndex = messages.length;
+        // T1.2 — the standalone `agent.stream(input)` append, the same creation rule as
+        // `appendUser` above (this factory is what a caller that never touches the
+        // harness uses, and its transcript is addressable the same way).
         messages.push(
-            attachments.length > 0
-                ? { role: 'user', content: input, attachments }
-                : { role: 'user', content: input }
+            assignMessageId(
+                attachments.length > 0
+                    ? { role: 'user', content: input, attachments }
+                    : { role: 'user', content: input },
+                messages
+            )
         );
 
         try {
@@ -902,11 +986,18 @@ const createAgent = (
         system: (content: string) => append('system', content),
         user: (content: string, attachments?: HarnessAttachment[]) => appendUser(content, attachments),
         assistant: (content: string, toolCalls?: HarnessToolCall[]) => {
-            messages.push({
-                role: 'assistant',
-                content,
-                ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {})
-            });
+            // T1.2 — a host-committed assistant turn is canonical state like a committed
+            // model turn, so it is minted the same way (see the commit in `request`).
+            messages.push(
+                assignMessageId(
+                    {
+                        role: 'assistant',
+                        content,
+                        ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {})
+                    },
+                    messages
+                )
+            );
             return self;
         },
 

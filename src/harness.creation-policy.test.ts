@@ -16,6 +16,32 @@ import { describe, expect, it } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type { Agent, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
     let index = 0;
     return async function* stream(request) {
@@ -68,7 +94,7 @@ describe('toolCreation policy', () => {
         // searchable now, so a subagent reaches it through toolRequest instead of
         // seeing it declared on the first request.
         expect(writer.tools.toolCreate.visibility).toBe('searchable');
-        expect(declaredNames(seenResearcher[0])).toEqual(['toolRequest', 'task']);
+        expect(declaredNames(seenResearcher[0])).toEqual(['toolRequest', 'tasks']);
     });
 
     it('primary: hides the tool from subagents and rejects a guessed call', async () => {
@@ -92,7 +118,7 @@ describe('toolCreation policy', () => {
         // refused by the policy rather than by the declaration list.
         expect(declaredNames(seenResearcher[0])).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
         ]);
 
         // ... and a guessed call is answered, not executed.
@@ -183,7 +209,7 @@ describe('run depth authority', () => {
 
         // The trusted primary ctx.run still works (depth 2).
         expect(content(entry.messages[2])).toBe('summary');
-        expect(summarizer.messages).toEqual([
+        expect(withoutIds(summarizer.messages)).toEqual([
             { role: 'user', content: 'text' },
             { role: 'assistant', content: 'summary' }
         ]);

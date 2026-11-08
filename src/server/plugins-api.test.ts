@@ -123,12 +123,34 @@ let probeReads: number[] = [];
 // The probe REPLACES the shipped `context-compaction` plugin (same name = one entry, per
 // ../plugin/host.ts precedence) while keeping its declared metadata, so `api.settings` resolves
 // the same key, the same default, and the same bounds the real plugin publishes.
+//
+// `probeThrows` is the T1.5 sink switch: a handler that THROWS is the framework's fail-open case,
+// where the run must still answer AND the host must still be told. The throw happens AFTER the
+// settings read, so every existing `probeReads` assertion below keeps its exact expected array —
+// the failure is added to the same moment, never moved out of it.
+let probeThrows = false;
+
+// The other half of the diagnostic channel: a plugin speaking for ITSELF (`api.report.diagnostic`,
+// compaction T4.5) rather than failing. It is the case the server log must NOT print — a policy
+// report is what the plugin DECIDED, and a pass per turn would drown the failures this whole
+// surface exists to make visible — while still belonging on the session.
+let probeReportsPolicy = false;
+
 const probePlugin = {
     name: 'context-compaction',
     metadata: COMPACTION,
     setup: (api: HarnessPluginApi) => {
         api.on('turn.before', () => {
             probeReads.push(api.settings.number('contextLimit'));
+
+            if (probeReportsPolicy) {
+                api.report.diagnostic({
+                    message: 'withheld 1 superseded tool failure unit',
+                    data: { units: ['msg-2'], savedTokens: 24 }
+                });
+            }
+
+            if (probeThrows) throw new Error('the probe policy could not read the transcript');
         });
     }
 };
@@ -164,7 +186,12 @@ const probePreset = (): HarnessPreset => ({
             presets: false,
             report: {
                 progress,
-                ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange })
+                ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange }),
+                // The T1.5 sink the shipped factories forward (./harnesses/toolbox.ts). This fixture
+                // exists to be shaped exactly like a production harness, and as of T4 a production
+                // harness HAS a diagnostic sink — so the assertion below about what the store
+                // receives is only meaningful if the forwarding is here too.
+                ...(report?.diagnostic === undefined ? {} : { diagnostic: report.diagnostic })
             },
             ...(report?.pluginSettings === undefined ? {} : { pluginSettings: report.pluginSettings }),
             plugins: [probePlugin]
@@ -186,6 +213,10 @@ const createRuntime = (options: Partial<HarnessRuntimeOptions> = {}): HarnessRun
     stubSearchKeys();
     builtReports = [];
     probeReads = [];
+    // The diagnostic switches are per-scenario on purpose: a test that leaves one set must not
+    // make an unrelated settings case below report a failure that never happened.
+    probeThrows = false;
+    probeReportsPolicy = false;
 
     return createHarnessRuntime({
         settings: SETTINGS,
@@ -321,9 +352,47 @@ describe('GET /v1/harness/plugins', () => {
                     min: 1000,
                     step: 1000,
                     description: COMPACTION.settings?.[0].description
-                }
+                },
+{
+                    key: "enabled",
+                    label: "Compact conversations",
+                    type: "boolean",
+                    default: true,
+                    description: COMPACTION.settings?.find((setting) => setting.key === "enabled")?.description
+                    },
+{
+                    key: "minTokens",
+                    label: "Minimum saving per pass (tokens)",
+                    type: "number",
+                    default: 200,
+                    min: 0,
+                    step: 50,
+                    description: COMPACTION.settings?.find((setting) => setting.key === "minTokens")?.description
+                    },
+{
+                    key: "safetyTurns",
+                    label: "Recent units to protect",
+                    type: "number",
+                    default: 6,
+                    min: 0,
+                    step: 1,
+                    description: COMPACTION.settings?.find((setting) => setting.key === "safetyTurns")?.description
+                    },
+{
+                    key: "mode",
+                    label: "Compaction mode",
+                    type: "string",
+                    default: "exclude",
+                    description: COMPACTION.settings?.find((setting) => setting.key === "mode")?.description
+                    }
             ],
-            values: { contextLimit: 100000 }
+            values: {
+                contextLimit: 100000,
+                enabled: true,
+                minTokens: 200,
+                safetyTurns: 6,
+                mode: 'exclude'
+            }
         });
     });
 
@@ -386,7 +455,13 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(patched.status).toBe(200);
         expect(Object.keys(patched.body)).toEqual(['plugin']);
         expect(patched.body.plugin.name).toBe('context-compaction');
-        expect(patched.body.plugin.values).toEqual({ contextLimit: 200000 });
+        expect(patched.body.plugin.values).toEqual({
+            contextLimit: 200000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
 
         // The declared descriptor is unchanged by a write: the row still carries the reset target.
         expect(patched.body.plugin.settings[0].default).toBe(100000);
@@ -401,7 +476,13 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         const reload = await call(runtime, 'GET', `${MOUNT}/plugins`);
 
         expect(reload.body.revision).toBe(1);
-        expect(reload.body.items[1].values).toEqual({ contextLimit: 200000 });
+        expect(reload.body.items[1].values).toEqual({
+            contextLimit: 200000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
 
         // The other plugin is untouched, and only the changed plugin is stored.
         expect(reload.body.items[0].values).toEqual({ intervalMs: 600000 });
@@ -426,7 +507,13 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
 
         expect(patched.status).toBe(200);
         // `values` carries a NUMBER, not the text that arrived, so a client round-trips types.
-        expect(patched.body.plugin.values).toEqual({ contextLimit: 150000 });
+        expect(patched.body.plugin.values).toEqual({
+            contextLimit: 150000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
         expect(pluginsOf(runtime).get('context-compaction', 'contextLimit')).toBe(150000);
     });
 
@@ -437,7 +524,13 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         const reset = await patchSettings(runtime, 'context-compaction', { contextLimit: null });
 
         expect(reset.status).toBe(200);
-        expect(reset.body.plugin.values).toEqual({ contextLimit: 100000 });
+        expect(reset.body.plugin.values).toEqual({
+            contextLimit: 100000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
         expect(reset.body.plugin.settings[0].default).toBe(100000);
         expect(pluginsOf(runtime).snapshot()).toEqual({});
 
@@ -463,7 +556,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit.'
+                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -526,12 +619,14 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             headers: {}
         });
 
-        expect(await patchSettings(runtime, 'context-compaction', { contextLimit: 5000, enabled: true })).toEqual({
+        // `pruneMode` is a name this build never declared — `enabled` IS one now (compaction
+        // T4.6), so the example has to be a key the catalogue genuinely lacks.
+        expect(await patchSettings(runtime, 'context-compaction', { contextLimit: 5000, pruneMode: 'soft' })).toEqual({
             status: 400,
             body: {
                 error: {
                     message:
-                        'Unknown setting "enabled" for plugin "context-compaction". Allowed settings: contextLimit.'
+                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -636,6 +731,176 @@ describe('the live settings provider reaches an existing session', () => {
     });
 });
 
+// ---------------------------------------------------------------------------
+// Pipeline T1.5's LAST mile: the server installs a `report.diagnostic` sink.
+//
+// The library has emitted plugin diagnostics since T1.5 — a hook that THREW, TIMED OUT, or
+// returned an unparseable decision is dropped and reported (fail-open, rule 2 of
+// ../plugin/hooks.ts), and a plugin can report its own DECISIONS through `api.report.diagnostic`
+// (compaction T4.5). What was missing is a host on the other end: `harness({ report.diagnostic })`
+// had no caller in the server, so through `GET /sessions` "the compaction policy is broken" and
+// "the compaction policy did nothing" were the same answer. These cases pin the difference, on the
+// same probe plugin the settings acceptance above uses — the plugin throws AFTER its settings read,
+// so every pre-existing assertion in this file keeps its exact expected values.
+// ---------------------------------------------------------------------------
+describe('the server installs a plugin-diagnostic sink (T1.5 last mile)', () => {
+    const roots: string[] = [];
+
+    const fixture = async (): Promise<string> => {
+        await mkdir(join(WORKSPACE_ROOT, 'Temp'), { recursive: true });
+        await mkdir(SCRATCH_ROOT, { recursive: true });
+
+        const root = await mkdtemp(join(SCRATCH_ROOT, 'plugins-diagnostic-'));
+
+        roots.push(root);
+
+        return root;
+    };
+
+    const documentOf = (root: string): Record<string, any> =>
+        JSON.parse(readFileSync(join(root, 'harness', 'state.json'), 'utf8')) as Record<string, any>;
+
+    afterEach(async () => {
+        probeThrows = false;
+        probeReportsPolicy = false;
+
+        for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+    });
+
+    // A throwing `turn.before` handler, captured stderr, and one run.
+    const runWithThrowingPlugin = async (runtime: HarnessRuntime, sessionId: string): Promise<string[]> => {
+        const lines: string[] = [];
+        const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+            lines.push(args.map((part) => String(part)).join(' '));
+        });
+
+        probeThrows = true;
+
+        try {
+            await runtime.store.liveSession(sessionId)?.harness('does a broken plugin still answer?');
+        } finally {
+            spy.mockRestore();
+            probeThrows = false;
+        }
+
+        return lines;
+    };
+
+    it('a hook that throws still answers, and names itself, its owner and its event on the session', async () => {
+        const runtime = createRuntime();
+        const created = await call(runtime, 'POST', `${MOUNT}/sessions`, { harness: 'probe' });
+
+        expect(created.status).toBe(201);
+
+        const sessionId = created.body.session.id as string;
+
+        // A healthy session reports NOTHING — the key is absent, so every existing client reads
+        // the resource shape it read before this surface existed.
+        expect('plugin_diagnostics' in (await call(runtime, 'GET', `${MOUNT}/sessions/${sessionId}`)).body.session).toBe(false);
+
+        const lines = await runWithThrowingPlugin(runtime, sessionId);
+
+        // FAIL-OPEN, first: the whole point of the channel is that a broken policy plugin is
+        // visible WITHOUT becoming the run's failure. The scripted answer arrived.
+        expect(String((await runtime.store.liveSession(sessionId)?.harness('and again'))?.content)).toBe('second');
+
+        const read = await call(runtime, 'GET', `${MOUNT}/sessions/${sessionId}`);
+
+        // The observable answer to "is this session's plugin broken": WHO, WHERE, WHAT.
+        expect(read.body.session.plugin_diagnostics).toEqual([
+            {
+                at: expect.any(Number),
+                kind: 'handler-threw',
+                owner: 'context-compaction',
+                event: 'turn.before',
+                message: 'the probe policy could not read the transcript'
+            }
+        ]);
+
+        // And the same fact on the server log, which is the other half of "visible" promised by
+        // the task — an operator not polling the API still hears about it.
+        expect(lines.filter((line) => line.includes('[harness] plugin diagnostic'))).toEqual([
+            expect.stringContaining(
+                'context-compaction — turn.before handler-threw: the probe policy could not read the transcript'
+            )
+        ]);
+
+        runtime.store.dispose();
+    });
+
+    it('journals the failure on the durable plane and reports it again after a restart', async () => {
+        const root = await fixture();
+        const first = createRuntime({ root });
+        const created = await call(first, 'POST', `${MOUNT}/sessions`, { harness: 'probe' });
+        const sessionId = created.body.session.id as string;
+
+        await runWithThrowingPlugin(first, sessionId);
+
+        const diagnostic = {
+            at: expect.any(Number),
+            kind: 'handler-threw',
+            owner: 'context-compaction',
+            event: 'turn.before',
+            message: 'the probe policy could not read the transcript'
+        };
+
+        // The document, not just the in-memory session. The store writes the journal with the NEXT
+        // state change rather than scheduling a save for a diagnostic, and a run always produces
+        // one — so "broken since before the restart" is a fact the next process can still read.
+        expect(documentOf(root).sessions[0].pluginDiagnostics).toEqual([diagnostic]);
+
+        const second = createRuntime({ root });
+        const rebooted = await call(second, 'GET', `${MOUNT}/sessions/${sessionId}`);
+
+        expect(rebooted.body.session.plugin_diagnostics).toEqual([diagnostic]);
+
+        second.store.dispose();
+        first.store.dispose();
+    });
+
+    it('keeps a plugin’s own policy report on the session and off the server log', async () => {
+        const runtime = createRuntime();
+        const created = await call(runtime, 'POST', `${MOUNT}/sessions`, { harness: 'probe' });
+        const sessionId = created.body.session.id as string;
+
+        const lines: string[] = [];
+        const spy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+            lines.push(args.map((part) => String(part)).join(' '));
+        });
+
+        probeReportsPolicy = true;
+
+        try {
+            await runtime.store.liveSession(sessionId)?.harness('what did the compactor withhold?');
+        } finally {
+            spy.mockRestore();
+            probeReportsPolicy = false;
+        }
+
+        const read = await call(runtime, 'GET', `${MOUNT}/sessions/${sessionId}`);
+
+        // Recorded, WITH the structured payload the plugin chose (the units, the token saving), and
+        // attributed to the plugin that authored it even though the report named no owner.
+        expect(read.body.session.plugin_diagnostics).toEqual([
+            {
+                at: expect.any(Number),
+                kind: 'policy',
+                owner: 'context-compaction',
+                message: 'withheld 1 superseded tool failure unit',
+                data: { units: ['msg-2'], savedTokens: 24 }
+            }
+        ]);
+
+        // No `event`: a policy report is not tied to one hook, and inventing one would claim a
+        // failure that did not happen.
+        expect('event' in read.body.session.plugin_diagnostics[0]).toBe(false);
+        // And nothing was logged: a decision is information, not a breakage.
+        expect(lines.filter((line) => line.includes('[harness] plugin diagnostic'))).toEqual([]);
+
+        runtime.store.dispose();
+    });
+});
+
 describe('plugin settings survive a restart', () => {
     // One fixture database per test, under the repo's scratch root (AGENTS.md: throwaway work
     // lives in `Temp/`, never in OS temp). Removal happens in the local `afterEach`.
@@ -696,13 +961,25 @@ describe('plugin settings survive a restart', () => {
 
         expect(second.store.pluginSettings.get('context-compaction', 'contextLimit')).toBe(200000);
         expect(second.store.pluginSettings.provider.get('context-compaction', 'contextLimit')).toBe(200000);
-        expect(second.store.pluginSettings.values('context-compaction')).toEqual({ contextLimit: 200000 });
+        expect(second.store.pluginSettings.values('context-compaction')).toEqual({
+            contextLimit: 200000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
 
         // The revision counter is epoch-local, so it restarts at 0 while the VALUE does not.
         const page = await call(second, 'GET', `${MOUNT}/plugins`);
 
         expect(page.body.revision).toBe(0);
-        expect(page.body.items[1].values).toEqual({ contextLimit: 200000 });
+        expect(page.body.items[1].values).toEqual({
+            contextLimit: 200000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
 
         // The restored store is still the LIVE one: an edit after the restart moves the same
         // provider object, and the document follows it.
@@ -741,7 +1018,13 @@ describe('plugin settings survive a restart', () => {
         const page = await call(second, 'GET', `${MOUNT}/plugins`);
 
         expect(page.body.items[0].values).toEqual({ intervalMs: 9000 });
-        expect(page.body.items[1].values).toEqual({ contextLimit: 4000 });
+        expect(page.body.items[1].values).toEqual({
+            contextLimit: 4000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
         expect(second.store.pluginSettings.snapshot()).toEqual({
             'async-ping': { intervalMs: 9000 },
             'context-compaction': { contextLimit: 4000 }
@@ -778,9 +1061,21 @@ describe('plugin settings survive a restart', () => {
         const fourth = createRuntime({ root });
 
         expect(fourth.store.pluginSettings.get('context-compaction', 'contextLimit')).toBeUndefined();
-        expect(fourth.store.pluginSettings.values('context-compaction')).toEqual({ contextLimit: 100000 });
+        expect(fourth.store.pluginSettings.values('context-compaction')).toEqual({
+            contextLimit: 100000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
+        });
         expect((await call(fourth, 'GET', `${MOUNT}/plugins`)).body.items[1].values).toEqual({
-            contextLimit: 100000
+            // Back on every declared default — and "declared" now means all five settings
+            // (compaction T4.6), not just the limit.
+            contextLimit: 100000,
+            enabled: true,
+            minTokens: 200,
+            safetyTurns: 6,
+            mode: 'exclude'
         });
     });
 });

@@ -40,7 +40,7 @@ const command = (name: string, description: string, usage?: string): HarnessComm
 const BUILT_INS: Record<string, HarnessCommand> = {
     help: command('help', 'List the commands in this harness.', '/help [command]'),
     task: command(
-        'task',
+        'tasks',
         "Read and change this session's task list.",
         '/task [list | add <text> | complete <id> | reopen <id> | remove <id>...]'
     ),

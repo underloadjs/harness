@@ -88,7 +88,8 @@ import type {
     HarnessMessage,
     HarnessSnapshot
 } from '../harness';
-import type { HarnessDescriptor, SessionStatus, SessionTurn } from './protocol';
+import type { HarnessDescriptor, SessionPluginDiagnostic, SessionStatus, SessionTurn } from './protocol';
+import { PLUGIN_DIAGNOSTIC_LIMIT } from './protocol';
 import { validateAttachments } from '../shared/attachments';
 import { agentLabelParts, readAgentResultReferenceList } from '../shared/agent-results';
 // The durable per-turn instruction snapshot (see
@@ -252,6 +253,15 @@ export type HarnessSessionRecord = {
     // `readHarnessMessages` refused), `error` is the refusal text, and
     // `label`/`agent` are the display hints captured when it was recorded.
     invalidThreads?: Record<string, HarnessInvalidThreadRecord>;
+    // pipeline T1.5's last mile (ADDITIVE): the plugin diagnostics this session reported, oldest
+    // first, capped by `PLUGIN_DIAGNOSTIC_LIMIT` in ./sessions.ts. Durable because "this plugin
+    // has been failing since before the restart" is a fact an operator needs AFTER a restart —
+    // the whole point of installing a server sink for `report.diagnostic`.
+    //
+    // OPTIONAL in every direction, like `invalidThreads` above: a document written before T4 has
+    // no field and loads unchanged, and an empty journal is written back as an absent key, so a
+    // healthy session's `state.json` stays byte-identical to its pre-T4 shape.
+    pluginDiagnostics?: SessionPluginDiagnostic[];
     // Last committed core snapshot. Core permits a synchronous snapshot at each
     // mutation boundary, so an active turn's completed tool/store changes are
     // included as they happen. A tool that is still executing when the process
@@ -1112,6 +1122,47 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
                   return mapped;
               })();
 
+    // pipeline T1.5's last mile: the plugin-diagnostics journal (see
+    // `HarnessSessionRecord.pluginDiagnostics`). TOLERANT by design, unlike the fields above:
+    // an entry that is not a diagnostic-shaped object is DROPPED rather than refusing the whole
+    // record. This journal is observability, and a hand-edited or partially written entry must
+    // not cost an operator the conversation next to it — the rule the strict fields can afford
+    // (they are load-bearing) and this one cannot. Newest `PLUGIN_DIAGNOSTIC_LIMIT` entries win,
+    // so a journal that grew past the cap on disk still restores the part an operator reads.
+    const pluginDiagnostics = (() => {
+        if (!Array.isArray(record.pluginDiagnostics)) return undefined;
+
+        const kinds = new Set(['handler-threw', 'handler-timed-out', 'invalid-decision', 'policy']);
+        const kept: SessionPluginDiagnostic[] = [];
+
+        for (const value of record.pluginDiagnostics) {
+            if (value === null || typeof value !== 'object') continue;
+
+            const item = value as Record<string, unknown>;
+            const kind = typeof item.kind === 'string' ? item.kind : '';
+
+            // `owner` and `message` are the two fields that make the entry worth reading: an
+            // entry naming neither who failed nor what happened is noise, so it is dropped.
+            if (!kinds.has(kind) || typeof item.owner !== 'string' || typeof item.message !== 'string') continue;
+            if (item.message.trim().length === 0) continue;
+
+            kept.push({
+                at: typeof item.at === 'number' && Number.isFinite(item.at) ? item.at : 0,
+                kind: kind as SessionPluginDiagnostic['kind'],
+                owner: item.owner,
+                message: item.message,
+                ...(typeof item.event === 'string' ? { event: item.event } : {}),
+                ...(item.data !== null && typeof item.data === 'object'
+                    ? { data: item.data as Record<string, unknown> }
+                    : {})
+            });
+        }
+
+        if (kept.length === 0) return undefined;
+
+        return kept.slice(-PLUGIN_DIAGNOSTIC_LIMIT);
+    })();
+
     // T27 (durability): the session's display title. `sessions.ts` WRITES this field
     // (sessionRecord, line 2506) and reads it back on restore (line 2973), and
     // `SessionSummary.title` / `UpdateSessionRequest.title` are contract-visible — but this
@@ -1184,6 +1235,9 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         ...(turnInstructionSources === undefined ? {} : { turnInstructionSources }),
         ...(invocationThreads === undefined ? {} : { invocationThreads }),
         ...(invalidThreads === undefined ? {} : { invalidThreads }),
+        // T1.5 last mile: restored as written (tolerant — see the reader above), and absent for
+        // every document written before the field existed.
+        ...(pluginDiagnostics === undefined ? {} : { pluginDiagnostics }),
         core: core as unknown as HarnessSnapshot,
         ...(agentModels === undefined ? {} : { agentModels })
     };

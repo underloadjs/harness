@@ -47,6 +47,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, openAICompatible, tool } from '@underload/harness';
 import type {
+    HarnessContextEditPatch,
     HarnessContextEntry,
     HarnessEvent,
     HarnessMessage,
@@ -58,6 +59,32 @@ import type {
     HarnessToolCall,
     HarnessTurnBeforeContext
 } from '@underload/harness';
+
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -318,7 +345,7 @@ describe('context inclusion — default behaviour', () => {
         // but the projection never forwards it.)
         expect(carriesFlag(seen[seen.length - 1])).toBe(false);
         expect(JSON.stringify(seen[seen.length - 1])).not.toContain('"included":false');
-        expect(writer.agent.messages[0]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[0])).toStrictEqual({
             role: 'user',
             content: 'go',
             included: true
@@ -326,7 +353,7 @@ describe('context inclusion — default behaviour', () => {
         // And it is normalized again on the way OUT: a snapshot never persists a
         // `true` either, so the value cannot survive a restart (core/snapshot.ts
         // `applyIncluded`), which is why no consumer has to reason about it.
-        expect(writer.snapshot().agents.writer.messages[0]).toStrictEqual({
+        expect(withoutIds(writer.snapshot().agents.writer.messages[0])).toStrictEqual({
             role: 'user',
             content: 'go'
         });
@@ -348,7 +375,7 @@ describe('context inclusion — `included: true` never persists or travels', () 
         // Canonical state: `true` is dropped at the seed boundary (absent is the
         // only spelling of "included"), `false` is kept verbatim, and the CALLER's
         // objects were not mutated by the copy.
-        expect(writer.agent.messages).toStrictEqual([
+        expect(withoutIds(writer.agent.messages)).toStrictEqual([
             { role: 'user', content: 'seed on' },
             { role: 'user', content: 'seed off', included: false },
             { role: 'user', content: 'go' },
@@ -394,7 +421,7 @@ describe('context inclusion — `included: true` never persists or travels', () 
             { role: 'user', content: 'go' }
         ]);
         expect(JSON.stringify(seen[0])).not.toContain('included');
-        expect(writer.agent.messages[0]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[0])).toStrictEqual({
             role: 'system',
             content: 'CTX off',
             included: false
@@ -472,7 +499,7 @@ describe('context inclusion — standalone messages', () => {
 
         // The turn is disabled, not deleted: canonical history still carries it,
         // flagged, at its original index.
-        expect(writer.agent.messages[0]).toEqual({
+        expect(withoutIds(writer.agent.messages[0])).toEqual({
             role: 'user',
             content: 'go',
             included: false
@@ -530,7 +557,7 @@ describe('context inclusion — standalone messages', () => {
         expect(carriesFlag(restored)).toBe(false);
         // The entry is back, byte-for-byte as it was before the flag existed.
         expect(restored.slice(0, baseline.length)).toEqual(baseline);
-        expect(writer.agent.messages[0]).toEqual({ role: 'user', content: 'go' });
+        expect(withoutIds(writer.agent.messages[0])).toEqual({ role: 'user', content: 'go' });
     });
 });
 
@@ -1023,7 +1050,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         expect(carriesFlag(seen[0])).toBe(false);
 
         // Disabled, not deleted: canonical history still holds the message, flagged.
-        expect(writer.agent.messages[1]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[1])).toStrictEqual({
             role: 'user',
             content: 'question',
             included: false
@@ -1063,13 +1090,13 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
 
         // Cascading is mandatory: the target was the assistant (a numeric index, the
         // other accepted form) and its result is flagged as well.
-        expect(writer.agent.messages[2]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'assistant',
             content: '',
             included: false,
             toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
         });
-        expect(writer.agent.messages[3]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[3])).toStrictEqual({
             role: 'tool',
             content: 'A',
             toolCallId: 'c1',
@@ -1103,13 +1130,13 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         // Owner resolution runs BOTH ways: the plugin targeted the answer, and the
         // assistant that requested that call is flagged with it, so no later turn can
         // emit a `tool_calls[]` entry with a missing result.
-        expect(writer.agent.messages[2]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'assistant',
             content: '',
             included: false,
             toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
         });
-        expect(writer.agent.messages[3]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[3])).toStrictEqual({
             role: 'tool',
             content: 'A',
             toolCallId: 'c1',
@@ -1184,12 +1211,12 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
 
         // Canonical state: the key is GONE from both members (never `true`), so the
         // transcript is byte-identical to one that was never disabled.
-        expect(writer.agent.messages[2]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'assistant',
             content: '',
             toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
         });
-        expect(writer.agent.messages[3]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[3])).toStrictEqual({
             role: 'tool',
             content: 'A',
             toolCallId: 'c1',
@@ -1270,13 +1297,13 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         ]);
         expect(pairIssues(seen[2])).toEqual([]);
         expect(includedAtRound3).toEqual([true, false, false, true]);
-        expect(writer.agent.messages[1]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[1])).toStrictEqual({
             role: 'assistant',
             content: '',
             included: false,
             toolCalls: [{ id: 'a1', name: 'alpha', arguments: '{}' }]
         });
-        expect(writer.agent.messages[2]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'tool',
             content: 'A-done',
             toolCallId: 'a1',
@@ -1312,7 +1339,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         expect(JSON.stringify(first.seen)).not.toContain('included');
         // The flag write is a CONVERSATION change, so it happened even though an
         // override decided this request.
-        expect(first.writer.agent.messages[1]).toStrictEqual({
+        expect(withoutIds(first.writer.agent.messages[1])).toStrictEqual({
             role: 'user',
             content: 'question',
             included: false
@@ -1422,7 +1449,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             ]
         });
 
-        expect(observations).toEqual({
+        expect(withoutIds(observations)).toEqual({
             questionBefore: true,
             unitBefore: true,
             resultBefore: true,
@@ -1453,6 +1480,9 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
                         () => context.setIncluded(6, false),
                         () => context.setIncluded(-1, false),
                         () => context.setIncluded(foreign, false),
+                        // A STRING is a transcript address now (context T1.5), so this
+                        // is no longer a shape error: it is an id that names nothing, and
+                        // the refusal says so with the same cure the stale entry names.
                         () => context.setIncluded('1' as unknown as number, false),
                         () => context.setIncluded(null as unknown as HarnessContextEntry, false)
                     ];
@@ -1474,8 +1504,8 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             'turn.before setIncluded index 6 is outside this transcript (0-5).',
             'turn.before setIncluded index -1 is outside this transcript (0-5).',
             'turn.before setIncluded received an entry that does not belong to this turn.',
-            'turn.before setIncluded needs a transcript index or an entry from this turn.',
-            'turn.before setIncluded needs a transcript index or an entry from this turn.'
+            'turn.before setIncluded received a stale messageId "1": no entry with that id is in the transcript. Read `entries` again after `replaceHistory()`.',
+            'turn.before setIncluded needs a transcript index, an entry from this turn, or a messageId.'
         ]);
 
         // Every refusal was a no-op: the transcript carries no key at all, and the
@@ -1517,7 +1547,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         // turn keeps the projection it was built from, and the refused write added
         // nothing to it.
         expect(replacedOnly.seen[0]).toStrictEqual(seededRequest('go'));
-        expect(replacedOnly.writer.agent.messages).toStrictEqual([
+        expect(withoutIds(replacedOnly.writer.agent.messages)).toStrictEqual([
             { role: 'user', content: 'kept' },
             { role: 'user', content: 'dropped' },
             { role: 'assistant', content: 'settled' }
@@ -1537,8 +1567,8 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             ]
         });
 
-        expect(rebuilt.seen[0]).toStrictEqual([{ role: 'user', content: 'kept' }]);
-        expect(rebuilt.writer.agent.messages).toStrictEqual([
+        expect(withoutIds(rebuilt.seen[0])).toStrictEqual([{ role: 'user', content: 'kept' }]);
+        expect(withoutIds(rebuilt.writer.agent.messages)).toStrictEqual([
             { role: 'user', content: 'kept' },
             { role: 'user', content: 'dropped', included: false },
             { role: 'assistant', content: 'settled' }
@@ -1572,7 +1602,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             'turn.before setIncluded index 3 is outside this transcript (0-1).'
         );
         expect(shifted.seen[0]).toStrictEqual([{ role: 'user', content: 'kept' }]);
-        expect(shifted.writer.agent.messages).toStrictEqual([
+        expect(withoutIds(shifted.writer.agent.messages)).toStrictEqual([
             { role: 'user', content: 'kept' },
             { role: 'user', content: 'dropped', included: false },
             { role: 'assistant', content: 'settled' }
@@ -1610,7 +1640,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
 
         // The flag is in the persisted document, and only on the disabled entry.
         const snapshot = JSON.parse(JSON.stringify(writer.snapshot())) as HarnessSnapshot;
-        expect(snapshot.agents.writer.messages[1]).toStrictEqual({
+        expect(withoutIds(snapshot.agents.writer.messages[1])).toStrictEqual({
             role: 'user',
             content: 'question',
             included: false
@@ -1963,7 +1993,7 @@ describe('context inclusion — turn.before refinements', () => {
         // Withholding the only seeded turn leaves JUST the run's prompt on the wire:
         // request-time filtering follows the canonical flags, entry bounds or not.
         expect(oneSeed.seen[0]).toStrictEqual([{ role: 'user', content: 'go' }]);
-        expect(oneSeed.writer.agent.messages[0]).toStrictEqual({
+        expect(withoutIds(oneSeed.writer.agent.messages[0])).toStrictEqual({
             role: 'user',
             content: 'only',
             included: false
@@ -2018,8 +2048,8 @@ describe('context inclusion — turn.before refinements', () => {
             ]
         });
 
-        expect(withheld.seen[0]).toStrictEqual([{ role: 'user', content: 'go' }]);
-        expect(withheld.writer.agent.messages[0]).toStrictEqual({
+        expect(withoutIds(withheld.seen[0])).toStrictEqual([{ role: 'user', content: 'go' }]);
+        expect(withoutIds(withheld.writer.agent.messages[0])).toStrictEqual({
             role: 'system',
             content: 'Write.',
             included: false
@@ -2070,7 +2100,7 @@ describe('context inclusion — turn.before refinements', () => {
         expect(a.afterFlag).toStrictEqual(seededRequest('go').filter((message) => message.content !== 'question'));
         // The provider received the live view, never the stale entry-time one.
         expect(first.seen[0]).toStrictEqual(a.afterFlag);
-        expect(first.writer.agent.messages[1]).toStrictEqual({
+        expect(withoutIds(first.writer.agent.messages[1])).toStrictEqual({
             role: 'user',
             content: 'question',
             included: false
@@ -2090,10 +2120,10 @@ describe('context inclusion — turn.before refinements', () => {
         });
 
         expect(a.afterOverride).toStrictEqual([{ role: 'user', content: 'explicit override' }]);
-        expect(second.seen[0]).toStrictEqual(a.afterOverride);
+        expect(withoutIds(second.seen[0])).toStrictEqual(a.afterOverride);
         // The flag write is still a CONVERSATION change even though the override decided
         // this request.
-        expect(second.writer.agent.messages[1]).toStrictEqual({
+        expect(withoutIds(second.writer.agent.messages[1])).toStrictEqual({
             role: 'user',
             content: 'question',
             included: false
@@ -2151,7 +2181,7 @@ describe('context inclusion — turn.before refinements', () => {
         expect(seen[0]).toStrictEqual(observed[0].afterFlag);
         expect(pairIssues(seen[0])).toEqual([]);
         // ... and the write persisted exactly as in the sync case.
-        expect(writer.agent.messages[1]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[1])).toStrictEqual({
             role: 'user',
             content: 'question',
             included: false
@@ -2160,7 +2190,7 @@ describe('context inclusion — turn.before refinements', () => {
         // The handler threw AFTER its write: fail-open swallowed the rejection, the run
         // still committed its answer, and the flag the handler wrote survived the throw
         // (a hook error never rolls back a canonical write it already made).
-        expect(writer.agent.messages[writer.agent.messages.length - 1]).toStrictEqual({
+        expect(withoutIds(writer.agent.messages[writer.agent.messages.length - 1])).toStrictEqual({
             role: 'assistant',
             content: 'settled'
         });
@@ -2208,5 +2238,1122 @@ describe('context inclusion — turn.before refinements', () => {
 
         // A's index-only write still reached the provider.
         expect(seen[0]).toStrictEqual(seededRequest('go').filter((message) => message.content !== 'question'));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 8 — pipeline T3: `context.edit`, the SECOND mutation primitive, and the branch
+//     discriminator (pipeline T3.4 / context T8 — one change, one landing)
+// ---------------------------------------------------------------------------
+
+// Canonical state, as BYTES, read from inside a handler through the entries the round
+// issued (an entry's `message` IS the canonical object). `edit`'s all-or-nothing rule is
+// only worth having if a refusal can be proven to have changed nothing at all, so every
+// refusal test takes this before and after the attempts and compares them — the edit
+// sibling of the `setIncluded` tests' "changing nothing" assertions, one level stricter.
+const canonicalBytes = (context: HarnessTurnBeforeContext): string =>
+    JSON.stringify(context.entries.map((entry) => entry.message));
+
+// One user turn, rewritten — the shape every edit test below asserts against. Written
+// out rather than derived from `seededRequest` so a placement bug cannot hide behind a
+// shared transformation of the expected value.
+const EDITED_SEED_REQUEST: HarnessMessage[] = [
+    { role: 'system', content: 'Write.' },
+    { role: 'user', content: 'edited question' },
+    {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
+    },
+    { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+    { role: 'assistant', content: 'answered' },
+    { role: 'user', content: 'go' }
+];
+
+describe('context control — entry editing (pipeline T3)', () => {
+    it('edits one user entry in place, and the SAME request carries the new text', async () => {
+        const changes: HarnessStateChangeEvent[] = [];
+
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('editor', (context) => {
+                    context.edit(entryWith(context, 'question'), { content: 'edited question' });
+                })
+            ],
+            stateChanges: changes
+        });
+
+        // T3.1/T3.2: an edit is a CANONICAL write, so the round that made it is
+        // re-projected and the provider receives the new text on THIS request — the same
+        // seep `setIncluded` has, with no `setTranscript` involved.
+        expect(seen[0]).toStrictEqual(EDITED_SEED_REQUEST);
+
+        // Canonical history: same entries, same positions, only that one entry's text
+        // different. No `included` key appeared, and nothing else moved.
+        expect(withoutIds(writer.agent.messages)).toStrictEqual([
+            ...EDITED_SEED_REQUEST,
+            { role: 'assistant', content: 'settled' }
+        ]);
+
+        // ONE persistence notification for ONE edit, and it is the transcript-change
+        // reason every other canonical write reports: the run's own user append, then the
+        // edit, then the committed answer.
+        expect(changesOf(changes)).toEqual([
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-'
+        ]);
+
+        // Read-your-writes through the live view: the handler's own write is already in
+        // `currentMessages()`, while `messages` stays what it was entered with.
+        const views: Array<{ atEntry: string; live: string }> = [];
+        await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('view-check', (context) => {
+                    const atEntry = JSON.stringify(context.messages);
+                    context.edit(entryWith(context, 'question'), { content: 'edited question' });
+                    views.push({ atEntry, live: JSON.stringify(context.currentMessages()) });
+                })
+            ]
+        });
+
+        expect(JSON.parse(views[0].atEntry)).toStrictEqual(seededRequest('go'));
+        expect(JSON.parse(views[0].live)).toStrictEqual(EDITED_SEED_REQUEST);
+    });
+
+    it('edits a tool result content while its pairing keys stay exactly as they were', async () => {
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('result-editor', (context) => {
+                    const result = entryWith(context, 'A');
+
+                    // T3.1: content is what a result may change. Rewriting it does NOT
+                    // cascade to the unit — a unit is a PAIRING question and an edit
+                    // cannot move a pairing key.
+                    context.edit(result, { content: 'rewritten result' });
+                })
+            ]
+        });
+
+        const request = seen[0];
+        expect(request).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
+            },
+            { role: 'tool', content: 'rewritten result', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+        // The provider pairing oracle stays empty, and the unit is still in request.
+        expect(pairIssues(request)).toEqual([]);
+        expect(request.filter((message) => message.role === 'tool')).toHaveLength(1);
+
+        // The canonical result object keeps its EXACT key set and order — an assignment
+        // to an existing field, not a rebuild. That is what lets an edit add no key to the
+        // snapshot and branch whitelists (T3.6); the one extra name below is the address
+        // the insertion minted (context T1.2), which is the only key T1 added anywhere.
+        const canonical = writer.agent.messages[3];
+        expect(Object.keys(canonical)).toEqual([
+            'role',
+            'content',
+            'toolCallId',
+            'name',
+            'messageId'
+        ]);
+        expect(canonical).toStrictEqual({
+            role: 'tool',
+            content: 'rewritten result',
+            toolCallId: 'c1',
+            name: 'alpha',
+            // The tool result is the fourth canonical entry of this transcript, so its id
+            // is the fourth minted (src/core/message-id.ts counts per transcript).
+            messageId: 'msg-4'
+        });
+    });
+
+    it('edits an assistant turn\'s text and reasoning, and refuses reasoning on every other role', async () => {
+        const failures: string[] = [];
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('answer-editor', (context) => {
+                    context.edit(entryWith(context, 'answered'), {
+                        content: 're-worded answer',
+                        reasoning: 'thoughts, edited'
+                    });
+
+                    // `reasoning` is an assistant field and the snapshot/branch
+                    // whitelists list it for that role ONLY, so writing it anywhere else
+                    // would produce a transcript that no longer restores.
+                    for (const content of ['question', 'Write.', 'A']) {
+                        try {
+                            context.edit(entryWith(context, content), { reasoning: 'nope' });
+                        } catch (error) {
+                            failures.push((error as Error).message);
+                        }
+                    }
+                })
+            ]
+        });
+
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 're-worded answer', reasoning: 'thoughts, edited' },
+            { role: 'user', content: 'go' }
+        ]);
+
+        // The assistant-with-toolCalls entry is untouched (no reasoning was named on it),
+        // and the plain assistant gained the key the assistant whitelist already carries.
+        expect(withoutIds(writer.agent.messages[4])).toStrictEqual({
+            role: 'assistant',
+            content: 're-worded answer',
+            reasoning: 'thoughts, edited'
+        });
+        expect(Object.keys(writer.agent.messages[4])).toEqual([
+            'role',
+            'content',
+            'messageId',
+            'reasoning'
+        ]);
+
+        expect(failures).toEqual([
+            'turn.before edit cannot change `reasoning` on a user message: only an assistant message carries reasoning, and no other role whitelists it.',
+            'turn.before edit cannot change `reasoning` on a system message: only an assistant message carries reasoning, and no other role whitelists it.',
+            'turn.before edit cannot change `reasoning` on a tool message: only an assistant message carries reasoning, and no other role whitelists it.'
+        ]);
+    });
+
+    it('refuses every patch that is not text, before writing a single byte', async () => {
+        const failures: string[] = [];
+        let bytesBefore = '';
+        let bytesAfter = '';
+
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('refusals', (context) => {
+                    const assistant = entryWith(context, 'answered');
+                    const result = entryWith(context, 'A');
+                    const question = entryWith(context, 'question');
+
+                    // Shaped like a real entry, but never handed out by this round.
+                    const foreign = {
+                        index: 0,
+                        message: { role: 'user', content: 'elsewhere' },
+                        included: true
+                    } as HarnessContextEntry;
+
+                    bytesBefore = canonicalBytes(context);
+
+                    const attempts: Array<() => void> = [
+                        // Pairing keys on a tool result (T3.1).
+                        () => context.edit(result, { toolCallId: 'c2' } as unknown as HarnessContextEditPatch),
+                        () => context.edit(result, { name: 'beta' } as unknown as HarnessContextEditPatch),
+                        // Structure: tool-call membership is what the unit resolver keys on.
+                        () => context.edit(assistant, { toolCalls: [] } as unknown as HarnessContextEditPatch),
+                        () => context.edit(question, { role: 'system' } as unknown as HarnessContextEditPatch),
+                        () => context.edit(question, { attachments: [] } as unknown as HarnessContextEditPatch),
+                        // The other axis of context control, with its own control.
+                        () => context.edit(question, { included: false } as unknown as HarnessContextEditPatch),
+                        // Not text.
+                        () => context.edit(question, { content: 12 as unknown as string }),
+                        () => context.edit(question, { content: null as unknown as string }),
+                        () => context.edit(question, { content: undefined }),
+                        // An empty patch names nothing to change.
+                        () => context.edit(question, {}),
+                        // Not a patch.
+                        () => context.edit(question, 're-worded' as unknown as { content: string }),
+                        () => context.edit(question, null as unknown as { content: string }),
+                        () => context.edit(question, [{ content: 'x' }] as unknown as { content: string }),
+                        // A fabricated entry, and one this round never issued.
+                        () => context.edit(foreign, { content: 'x' }),
+                        () => context.edit(42 as unknown as HarnessContextEntry, { content: 'x' })
+                    ];
+
+                    for (const attempt of attempts) {
+                        try {
+                            attempt();
+                        } catch (error) {
+                            failures.push((error as Error).message);
+                        }
+                    }
+
+                    bytesAfter = canonicalBytes(context);
+                })
+            ]
+        });
+
+        expect(failures).toEqual([
+            'turn.before edit cannot change `toolCallId` on a tool message: the call id pairs this result with its assistant block; changing it re-pairs the transcript by hand.',
+            'turn.before edit cannot change `name` on a tool message: the tool name is part of the call identity the transport re-emits.',
+            'turn.before edit cannot change `toolCalls` on an assistant message: a patch may not change tool-call membership — unit resolution and provider pairing both key on call ids.',
+            'turn.before edit cannot change `role` on a user message: a role is not text; a patch cannot turn one entry into another.',
+            'turn.before edit cannot change `attachments` on a user message: attachments are validated bytes, not text.',
+            'turn.before edit cannot change `included` on a user message: inclusion is a different axis and switches the WHOLE unit; use setIncluded.',
+            'turn.before edit needs a string for `content` on a user message; received 12.',
+            'turn.before edit needs a string for `content` on a user message; received null.',
+            'turn.before edit needs a string for `content` on a user message; received undefined.',
+            'turn.before edit received an empty patch; name at least one editable field (content).',
+            'turn.before edit needs a patch object for entry 1; received "re-worded".',
+            'turn.before edit needs a patch object for entry 1; received null.',
+            'turn.before edit needs a patch object for entry 1; received [{"content":"x"}].',
+            'turn.before edit received an entry that does not belong to this turn.',
+            'turn.before edit needs an entry from this turn.'
+        ]);
+
+        // THE POINT OF THE ORDERING: fifteen refusals, zero bytes of change. The
+        // comparison is on the RAW document (addresses included), which is the strictest
+        // form of "nothing moved".
+        expect(bytesAfter).toBe(bytesBefore);
+        expect(withoutIds(JSON.parse(bytesAfter))).toEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+
+        // And the request the round went out with is the untouched projection.
+        expect(seen[0]).toStrictEqual(seededRequest('go'));
+        expect(writer.agent.messages.filter((message) => 'included' in message)).toHaveLength(0);
+    });
+
+    it('refuses an entry made stale by replaceHistory, exactly like setIncluded does', async () => {
+        const failures: string[] = [];
+
+        await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('stale-editor', (context) => {
+                    const stale = entryWith(context, 'question');
+                    context.replaceHistory([
+                        { role: 'user', content: 'kept' },
+                        { role: 'user', content: 'dropped' }
+                    ]);
+
+                    try {
+                        context.edit(stale, { content: 'written where?' });
+                    } catch (error) {
+                        failures.push((error as Error).message);
+                    }
+
+                    // The rewritten transcript is addressable, because a LATER read of
+                    // `entries` sees the replacement — the documented cure.
+                    context.edit(entryWith(context, 'dropped'), { content: 'dropped, edited' });
+                })
+            ]
+        });
+
+        expect(failures).toEqual([
+            'turn.before edit received a stale entry (index 1): its message is no longer in the transcript. Read `entries` again after `replaceHistory()`.'
+        ]);
+    });
+});
+
+describe('context control — the branch discriminator (pipeline T3.4 / context T8)', () => {
+    it('names a fork round differently from a root round while threadId stays equal, and a branch edit reports no notification', async () => {
+        vi.useFakeTimers();
+
+        // Same routing convention as the branch test above (a branch shares its source's
+        // transport, so requests are routed by content) and the same drain budget.
+        const lastUser = (messages: readonly HarnessMessage[]): string => {
+            for (let index = messages.length - 1; index >= 0; index -= 1) {
+                if (messages[index].role === 'user') return String(messages[index].content);
+            }
+            return '';
+        };
+        const toolContents = (messages: readonly HarnessMessage[]): string[] =>
+            messages
+                .filter((message) => message.role === 'tool')
+                .map((message) => String(message.content));
+        const settle = async (): Promise<void> => {
+            for (let pass = 0; pass < 32; pass += 1) {
+                await vi.advanceTimersByTimeAsync(0);
+                await Promise.resolve();
+            }
+        };
+
+        // A round is the branch's own when its transcript holds the `created-branch`
+        // placeholder for the still-pending fork call — content the root never carries.
+        // The discriminator under test is then checked AGAINST that ground truth, which is
+        // why this test does not need branch ids to be predictable.
+        const isBranchRound = (context: HarnessTurnBeforeContext): boolean =>
+            context.entries.some((entry) => entry.message.content.includes('created-branch'));
+
+        const runFork = async (withPlugin: boolean) => {
+            const seen: HarnessMessage[][] = [];
+            const changes: HarnessStateChangeEvent[] = [];
+            const contexts: HarnessTurnBeforeContext[] = [];
+
+            const writer = harness({
+                agents: {
+                    writer: agent({
+                        model: 'test/model',
+                        stream: async function* (request) {
+                            const messages = request.messages;
+                            seen.push(copyMessages(messages));
+
+                            if (lastUser(messages) === 'inspect') {
+                                for (const frame of answer('branch summary')) yield frame;
+                                return;
+                            }
+                            if (toolContents(messages).some((content) => content.includes('branch summary'))) {
+                                for (const frame of answer('root final')) yield frame;
+                                return;
+                            }
+                            if (!messages.some((message) => message.role === 'assistant')) {
+                                for (const frame of calls(call('f1', 'threadFork', '{"input":"inspect"}'))) {
+                                    yield frame;
+                                }
+                                return;
+                            }
+
+                            for (const frame of answer('waiting')) yield frame;
+                        }
+                    })
+                },
+                presets: false,
+                ...(withPlugin
+                    ? {
+                          plugins: [
+                              turnBeforePlugin('branch-editor', (context) => {
+                                  contexts.push(context);
+
+                                  if (!isBranchRound(context)) return;
+
+                                  // A branch owns an ephemeral copy, so the same control
+                                  // surface applies there — and it is the copy the branch
+                                  // request is projected from.
+                                  context.edit(entryWith(context, 'root input'), {
+                                      content: 'branch-edited root input'
+                                  });
+                              })
+                          ]
+                      }
+                    : {}),
+                report: { stateChange: (event: HarnessStateChangeEvent) => void changes.push(event) }
+            });
+
+            await writer('root input');
+            await settle();
+
+            return { seen, changes, contexts, writer };
+        };
+
+        const plain = await runFork(false);
+        const edited = await runFork(true);
+
+        const branchContexts = edited.contexts.filter(isBranchRound);
+        const rootContexts = edited.contexts.filter((context) => !isBranchRound(context));
+
+        // One fork round, two root rounds (the fork request and the final one).
+        expect(branchContexts).toHaveLength(1);
+        expect(rootContexts).toHaveLength(2);
+
+        const [rootContext] = rootContexts;
+        const [branchContext] = branchContexts;
+
+        // (1) `threadId` STILL means the spawning conversation: identical on both rounds,
+        //     which is exactly the trap F11/T3.4 named. Its meaning did not change.
+        expect(branchContext.threadId).toBe(rootContext.threadId);
+
+        // (2) A root round is the registered agent's own scheduling key, and carries NO
+        //     branch id at all — the key is absent, not `branchId: undefined`.
+        expect(rootContext.actorKey).toBe('writer');
+        expect('branchId' in rootContext).toBe(false);
+        expect(rootContext.branchId).toBeUndefined();
+
+        // (3) The fork round reports `branch:<id>` and the branch's own id, and that id is
+        //     the same one the harness's branch record names — exposure, not invention.
+        expect(branchContext.branchId).toBeDefined();
+        expect(branchContext.actorKey).toBe(`branch:${branchContext.branchId}`);
+        expect(edited.writer.branches()[0].branchId).toBe(branchContext.branchId);
+
+        // (4) The two rounds are distinguishable by the discriminator alone: a policy that
+        //     must not touch a transcript that is about to be incorporated can now say so.
+        expect(branchContext.actorKey).not.toBe(rootContext.actorKey);
+
+        // (5) The branch edit landed on the branch's OWN request.
+        const branchRequest = edited.seen.find((messages) => lastUser(messages) === 'inspect');
+        const plainRequest = plain.seen.find((messages) => lastUser(messages) === 'inspect');
+        expect(branchRequest).toBeDefined();
+        expect(plainRequest).toBeDefined();
+        expect(branchRequest!.map((message) => message.role)).toEqual(['user', 'assistant', 'tool', 'user']);
+        expect(branchRequest![0]).toStrictEqual({
+            role: 'user',
+            content: 'branch-edited root input'
+        });
+        expect(branchRequest!.some((message) => message.content === 'root input')).toBe(false);
+        expect(pairIssues(branchRequest!)).toEqual([]);
+
+        // (6) T3.6: a branch write is EPHEMERAL and SILENT. The source conversation and
+        //     its snapshot never saw the edit, and the state-change stream is what the
+        //     plugin-less run reported — one notification fewer than the root round's own
+        //     writes would have added.
+        expect(
+            edited.writer.agent.messages.filter((message) => message.content === 'branch-edited root input')
+        ).toHaveLength(0);
+        expect(edited.writer.agent.messages.some((message) => message.content === 'root input')).toBe(true);
+        expect(JSON.stringify(edited.writer.snapshot())).not.toContain('branch-edited root input');
+        expect(withoutBranchIds(changesOf(edited.changes))).toBe(withoutBranchIds(changesOf(plain.changes)));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 8 — stable transcript addresses (context T1)
+// ---------------------------------------------------------------------------
+//
+// The flag write needs an address that OUTLIVES the round that wrote it. Stage 1
+// shipped two, and both are round-scoped: a numeric index is re-read against the
+// CURRENT transcript, and `replaceHistory()` replaces the message identities a held
+// entry depends on. `messageId` is the third (F1/T1), and it is an ADDITIONAL target:
+// index and entry resolution stay exactly as they were, because they are shipped,
+// tested behaviour.
+//
+// Contract pinned below:
+//   - ONE id per canonical entry, minted where the message is created
+//     (`msg-<n>` per transcript, in creation order — src/core/message-id.ts);
+//   - never re-minted on a copy: a projection, a fork and a snapshot carry or drop the
+//     id, they do not invent one;
+//   - NEVER in a provider request: `withIncluded` strips it with the flag, so the wire
+//     and the `turn.before` `messages` view are exactly what they were before ids;
+//   - `entries` expose it, `setIncluded` accepts it, and a stale/blank id is refused in
+//     the same loud style as a stale entry, naming the cure.
+
+describe('context inclusion — stable transcript addresses (context T1)', () => {
+    it('mints one address per canonical entry in creation order, and keeps it out of every request', async () => {
+        const { writer, seen } = await settledRun();
+
+        // The whole transcript of `settledRun`: the prompt, the answered tool unit,
+        // and the final answer — four canonical creations, four minted addresses, in
+        // creation order. Exact, because the runtime counts per transcript and nothing
+        // else: no process-global counter is involved (src/core/message-id.ts header).
+        expect(writer.agent.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4'
+        ]);
+
+        // THE PROVIDER NEVER SEES AN ADDRESS. Every projected copy goes through
+        // `withIncluded` (src/core/agent.ts), which strips `messageId` exactly as it
+        // strips the flag, so a custom transport gets the same flag-free, id-free data
+        // it got before either feature existed — and R3's byte-identical default path
+        // survives the new field.
+        expect(JSON.stringify(seen)).not.toContain('messageId');
+        expect(JSON.stringify(seen)).not.toContain('included');
+        expect(seen.map(shape)).toEqual([
+            ['user:go'],
+            ['user:go', 'assistant::a1', 'tool:a1:A']
+        ]);
+        expect(seen.map(pairIssues)).toEqual([[], []]);
+
+        // Every canonical entry carries one, and no entry carries a second spelling.
+        expect(writer.agent.messages.filter((message) => message.messageId !== undefined)).toHaveLength(4);
+        expect(JSON.stringify(writer.agent.messages)).not.toContain('messageId":undefined');
+    });
+
+    it('addresses the same turn by id in a LATER round of one conversation', async () => {
+        let questionId = '';
+        const rounds: string[][] = [];
+
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('address-by-id', (context) => {
+                    rounds.push(context.entries.map((entry) => entry.messageId ?? '-'));
+
+                    if (questionId === '') {
+                        // Round one only LEARNS the address of the seeded user turn.
+                        questionId = entryWith(context, 'question').messageId ?? '';
+
+                        return;
+                    }
+
+                    // Round two acts on it: not the index (the transcript grew), and not
+                    // the message object (this handler never held one).
+                    context.setIncluded(questionId, false);
+                })
+            ]
+        });
+
+        await writer('again');
+
+        // The address is the second canonical entry — the seeded instruction is first.
+        expect(questionId).toBe('msg-2');
+
+        // Round 1 saw the seeded five plus the run's own prompt (minted by
+        // `agent.user`, src/core/agent.ts `appendUser`); round 2 additionally sees round
+        // 1's committed answer and its own prompt. Both lists are exact.
+        expect(rounds).toEqual([
+            ['msg-1', 'msg-2', 'msg-3', 'msg-4', 'msg-5', 'msg-6'],
+            ['msg-1', 'msg-2', 'msg-3', 'msg-4', 'msg-5', 'msg-6', 'msg-7', 'msg-8']
+        ]);
+
+        // The first request carried the turn; the second one does not, and nothing else
+        // moved — the id named the SAME unit in a round that had never seen the entry.
+        expect(seen[0]).toStrictEqual(seededRequest('go'));
+        expect(seen[1]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }] },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'settled' },
+            { role: 'user', content: 'again' }
+        ]);
+        expect(pairIssues(seen[1])).toEqual([]);
+        expect(carriesFlag(seen[1])).toBe(false);
+
+        // Canonical history still holds the turn, flagged, with its address unchanged.
+        expect(writer.agent.messages[1]).toStrictEqual({
+            role: 'user',
+            content: 'question',
+            included: false,
+            messageId: 'msg-2'
+        });
+        expect(writer.agent.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4',
+            'msg-5',
+            'msg-6',
+            'msg-7',
+            'msg-8',
+            'msg-9'
+        ]);
+    });
+
+    it('keeps an id addressable across replaceHistory, while the entry object it replaced is refused', async () => {
+        const outcomes: string[] = [];
+
+        const { writer } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('replace-then-address', (context) => {
+                    const question = entryWith(context, 'question');
+                    const questionId = question.messageId ?? '';
+
+                    // A compactor's usual move: rewrite the list from the entries it is
+                    // holding. The replacement is validated through the snapshot reader,
+                    // which COPIES the entries and carries their addresses (T1.3) — so
+                    // the ids survive and the object identities do not.
+                    context.replaceHistory(context.entries.map((entry) => entry.message));
+
+                    try {
+                        context.setIncluded(question, false);
+                        outcomes.push('entry: accepted');
+                    } catch (error) {
+                        outcomes.push(`entry: ${(error as Error).message}`);
+                    }
+
+                    try {
+                        context.setIncluded(questionId, false);
+                        outcomes.push('id: accepted');
+                    } catch (error) {
+                        outcomes.push(`id: ${(error as Error).message}`);
+                    }
+
+                    for (const [label, target] of [
+                        ['missing', 'msg-99'],
+                        ['blank', '   ']
+                    ] as const) {
+                        try {
+                            context.setIncluded(target, false);
+                            outcomes.push(`${label}: accepted`);
+                        } catch (error) {
+                            outcomes.push(`${label}: ${(error as Error).message}`);
+                        }
+                    }
+                })
+            ]
+        });
+
+        expect(outcomes).toEqual([
+            'entry: turn.before setIncluded received a stale entry (index 1): its message is no longer in the transcript. Read `entries` again after `replaceHistory()`.',
+            'id: accepted',
+            'missing: turn.before setIncluded received a stale messageId "msg-99": no entry with that id is in the transcript. Read `entries` again after `replaceHistory()`.',
+            'blank: turn.before setIncluded needs a non-empty messageId; received an empty string.'
+        ]);
+
+        // The accepted id write landed on the REPLACED transcript, on that entry alone,
+        // and the addresses themselves are unchanged — the whole point of the field.
+        expect(withoutIds(writer.agent.messages)).toEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question', included: false },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }] },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'settled' }
+        ]);
+        expect(writer.agent.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4',
+            'msg-5',
+            'msg-6',
+            'msg-7'
+        ]);
+    });
+
+    it('keeps `edit` entry-addressed, refuses a patch that rewrites an address, and writes nothing', async () => {
+        const outcomes: string[] = [];
+
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('id-shape', (context) => {
+                    const question = entryWith(context, 'question');
+
+                    // (1) `edit` stays ENTRY-addressed (pipeline T3): an edit rewrites the
+                    // text of ONE specific entry, and the stage's own finding is that a
+                    // bare number is unreliable against a moving transcript. A bare id is
+                    // therefore a shape error here, not a second spelling of the control —
+                    // only `setIncluded` grew the id target (T1.5).
+                    try {
+                        context.edit(question.messageId as unknown as HarnessContextEntry, {
+                            content: 'edited'
+                        });
+                        outcomes.push('id as entry: accepted');
+                    } catch (error) {
+                        outcomes.push(`id as entry: ${(error as Error).message}`);
+                    }
+
+                    // (2) An address is not text. A plugin that re-worded one would
+                    // silently re-point every later `setIncluded(id, …)`.
+                    try {
+                        context.edit(question, { messageId: 'msg-9' } as unknown as HarnessContextEditPatch);
+                        outcomes.push('messageId patch: accepted');
+                    } catch (error) {
+                        outcomes.push(`messageId patch: ${(error as Error).message}`);
+                    }
+                })
+            ]
+        });
+
+        expect(outcomes).toEqual([
+            'id as entry: turn.before edit needs an entry from this turn.',
+            "messageId patch: turn.before edit cannot change `messageId` on a user message: the messageId is this entry's address, not its text; the runtime mints and copies it."
+        ]);
+
+        // Both refusals wrote nothing: the request went out as the plain projection, and
+        // no entry was switched off.
+        expect(seen[0]).toStrictEqual(seededRequest('go'));
+        expect(writer.agent.messages.some((message) => message.included === false)).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 9 — the live size of the request (context T5)
+// ---------------------------------------------------------------------------
+
+describe('context inclusion — the entry-time and live context estimates (context T5)', () => {
+    it('keeps `estimatedTokens` entry-time and reports the savings through currentEstimatedTokens()', async () => {
+        const record: Record<string, unknown> = {};
+        let late: HarnessTurnBeforeContext | undefined;
+
+        const { writer, seen } = await controlRun({
+            seed: [
+                { role: 'system', content: 'Write.' },
+                { role: 'user', content: 'question' },
+                { role: 'assistant', content: 'answered' }
+            ],
+            plugins: [
+                turnBeforePlugin('estimate-views', (context) => {
+                    if (Object.keys(record).length > 0) return;
+
+                    // Kept so the round can be re-read AFTER it closed: the live accessor
+                    // must answer about the request the round SENT, not about whatever the
+                    // transcript looks like now.
+                    late = context;
+
+                    // The projection at entry is 24 characters of counted text — 6 + 8 +
+                    // 8 + the run's own 2-character prompt — and src/core/context-estimate
+                    // .ts is `ceil(chars / 4)`, so 6. Nothing has been written yet, so the
+                    // live accessor answers the same number.
+                    record.entryBefore = context.estimatedTokens;
+                    record.liveBefore = context.currentEstimatedTokens();
+                    record.listBefore = context.currentMessages().length;
+                    record.staticListBefore = context.messages.length;
+
+                    const question = entryWith(context, 'question');
+                    context.setIncluded(question.messageId ?? '', false);
+
+                    // ENTRY-TIME, DELIBERATELY (F7/T5 option b): the number the shipped
+                    // compactor compares against its limit and its cooldown map does NOT
+                    // move underneath it, so a pass can never trigger on a transcript it
+                    // never measured.
+                    record.entryAfter = context.estimatedTokens;
+                    record.staticListAfter = context.messages.length;
+
+                    // ...and the live accessor is the same estimator over the same list
+                    // `currentMessages()` returns: 16 characters now, so 4. The write saved
+                    // exactly 2 tokens by this measure, which is what a minimum-savings
+                    // floor needs to see in the handler that made the write.
+                    record.liveAfter = context.currentEstimatedTokens();
+                    record.listAfter = context.currentMessages().length;
+                })
+            ]
+        });
+
+        expect(record).toEqual({
+            entryBefore: 6,
+            liveBefore: 6,
+            listBefore: 4,
+            staticListBefore: 4,
+            entryAfter: 6,
+            staticListAfter: 4,
+            liveAfter: 4,
+            listAfter: 3
+        });
+
+        // AFTER THE ROUND, both live accessors are frozen to what the round DECIDED — the
+        // same rule `currentMessages()` already follows, and the reason the live number is
+        // still useful to a late reader (a parked context, a test inspecting one after the
+        // run). The run has since committed its answer, so the canonical transcript is FIVE
+        // entries and a naive re-projection now would measure four; this answers three
+        // entries and 4 tokens, exactly the request that went out.
+        expect(late?.currentMessages()).toHaveLength(3);
+        expect(late?.currentEstimatedTokens()).toBe(4);
+        expect(late?.estimatedTokens).toBe(6);
+        expect(writer.agent.messages).toHaveLength(5);
+
+        // The provider received the live view, not the entry-time one: the disabled turn
+        // is absent, and neither the flag nor an address rides along.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(JSON.stringify(seen[0])).not.toContain('included');
+        expect(JSON.stringify(seen[0])).not.toContain('messageId');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 10 — host hygiene for a submitted `included: true` (context T6)
+// ---------------------------------------------------------------------------
+//
+// T6.1 keeps the shipped behaviour: an entry point that accepts WHOLE messages
+// normalizes a submitted `included: true` to the absent form instead of rejecting it,
+// because rejecting would break a host that round-trips its own JSON (a transcript
+// document read back and written again). T6.2 records that read-side normalization is
+// NOT added to `threadMessages()`: the read surface shows canonical state, and
+// `entries` must keep showing the canonical object. One test per accepted entry point,
+// each asserting the same two things: canonical state carries no `true`, and the host
+// read surface never shows one either.
+
+describe('context inclusion — a submitted `included: true` never reaches state or the read surface (context T6)', () => {
+    it('normalizes a seeded `true` in canonical state and in threadMessages()', async () => {
+        const { writer } = await controlRun({
+            seed: [
+                { role: 'user', content: 'seed on', included: true },
+                { role: 'user', content: 'seed off', included: false }
+            ]
+        });
+
+        const expected = [
+            { role: 'user', content: 'seed on', messageId: 'msg-1' },
+            { role: 'user', content: 'seed off', included: false, messageId: 'msg-2' },
+            { role: 'user', content: 'go', messageId: 'msg-3' },
+            { role: 'assistant', content: 'settled', messageId: 'msg-4' }
+        ];
+
+        // `true` is dropped, `false` is kept verbatim, and the caller's own objects were
+        // not touched (core/agent.ts `withIncluded`, pinned at the seed boundary).
+        expect(writer.agent.messages).toStrictEqual(expected);
+        expect(writer.threadMessages('agent:writer')).toStrictEqual(expected);
+        expect(JSON.stringify(writer.threadMessages('agent:writer'))).not.toContain('"included":true');
+    });
+
+    it('normalizes a `true` submitted through setThreadMessages, in state and in the read', () => {
+        const writer = harness({
+            agents: { writer: agent({ model: 'test/model', stream: scripted([answer('unused')], []) }) },
+            presets: false
+        });
+
+        writer.setThreadMessages('agent:writer', [
+            { role: 'user', content: 'replaced on', included: true },
+            { role: 'user', content: 'replaced off', included: false }
+        ]);
+
+        const stored = writer.threadMessages('agent:writer');
+
+        expect(stored).toStrictEqual([
+            { role: 'user', content: 'replaced on', messageId: 'msg-1' },
+            { role: 'user', content: 'replaced off', included: false, messageId: 'msg-2' }
+        ]);
+
+        // A replaced transcript is a NEW conversation state, so the reader mints its
+        // addresses from the top of the new list (context T1.3).
+        expect(JSON.stringify(stored)).not.toContain('"included":true');
+        expect(writer.agent.messages[0]).not.toHaveProperty('included');
+    });
+
+    it('normalizes a `true` submitted through the lane append seam, and gives the appended entry an unused address', async () => {
+        const writer = harness({
+            agents: { writer: agent({ model: 'test/model', stream: scripted([answer('unused')], []) }) },
+            presets: false
+        });
+
+        writer.setThreadMessages('agent:writer', [{ role: 'user', content: 'base', messageId: 'msg-7' }]);
+
+        // The append is the one host write that delivers a SLICE, so the reader mints
+        // against the WHOLE transcript: the appended entry cannot be given an address the
+        // conversation already owns (core/snapshot.ts `readHarnessMessages`).
+        const appended = writer.appendThreadMessages(
+            'agent:writer',
+            [{ role: 'user', content: 'appended on', included: true }],
+            1
+        );
+
+        expect(appended).toStrictEqual([
+            { role: 'user', content: 'base', messageId: 'msg-7' },
+            { role: 'user', content: 'appended on', messageId: 'msg-8' }
+        ]);
+        expect(writer.threadMessages('agent:writer')).toStrictEqual(appended);
+        expect(JSON.stringify(writer.snapshot().agents.writer.messages)).not.toContain('"included":true');
+
+        // The submitted id is honoured, not renumbered — a copy keeps its identity.
+        await Promise.resolve();
+    });
+
+    it('leaves a hand-written `true` on a direct canonical edit visible to the read surface — the recorded T6.2 decision', async () => {
+        const { writer, seen } = await settledRun();
+
+        // The path the contract already disclaims: `agent.messages` is public and
+        // mutable, and the state-change observer cannot see a direct edit
+        // (`HarnessStateChangeEvent`). T6.2 DECIDES not to normalize on READ: nothing
+        // rewrites this key on the way out, so `entries` and `threadMessages()` keep
+        // showing exactly what canonical state holds.
+        writer.agent.messages[0].included = true;
+
+        expect(writer.threadMessages('agent:writer')[0]).toStrictEqual({
+            role: 'user',
+            content: 'go',
+            included: true,
+            messageId: 'msg-1'
+        });
+
+        // ...while the model-facing surfaces stay clean: the projection strips the key
+        // (core/agent.ts `withIncluded`), and the snapshot reader normalizes it
+        // (core/snapshot.ts `applyIncluded`), so the value cannot survive a restart.
+        await writer('again');
+        const last = seen[seen.length - 1];
+        expect(carriesFlag(last)).toBe(false);
+        expect(JSON.stringify(writer.snapshot().agents.writer.messages)).not.toContain('"included":true');
+
+        // The rule a host has to keep (T6.3), stated in the type comment and README: the
+        // storage form is "only `false`", so a persisted copy OMITS the key.
+        expect(writer.snapshot().agents.writer.messages[0]).toStrictEqual({
+            role: 'user',
+            content: 'go',
+            messageId: 'msg-1'
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Context T4 / compaction T4.4 — notification coalescing at the round boundary.
+//
+// `agent_message` is the ONLY durability mechanism a plugin's flag write has, and the
+// server turns each one into a whole-document atomic rewrite (src/server/persistence.ts).
+// So N writes from ONE `turn.before` round must become ONE report, or a 40-unit compaction
+// costs 40 saves for one logical change.
+//
+// Three properties are pinned together, and each one is a hazard on its own:
+//   * BATCHING — three flag writes in one round report once (and all three flags are still
+//     in canonical state; coalescing the report must never coalesce the WRITE);
+//   * COMPLETENESS — the batch also covers a flag write plus an entry edit, because both
+//     move the same transcript and the same document save covers both;
+//   * THE HOST PLANE IS UNTOUCHED — a host transcript write (`setThreadMessages`) is still
+//     one write, one report: the batching window is a plugin round, not a time window, and
+//     no debounce may ever delay a durability report across a run boundary (context T4.3).
+// ---------------------------------------------------------------------------
+
+describe('context inclusion — one persistence report per plugin round (context T4 / compaction T4.4)', () => {
+    // Three standalone turns, so a plugin can disable exactly three units and nothing else
+    // moves. The run's own writes are the baseline every count below subtracts.
+    const threeTurnSeed = (): HarnessMessage[] => [
+        { role: 'system', content: 'Write.' },
+        { role: 'user', content: 'first' },
+        { role: 'user', content: 'second' },
+        { role: 'user', content: 'third' },
+        { role: 'assistant', content: 'answered' }
+    ];
+
+    it('reports a three-unit flag write ONCE, with all three flags persisted', async () => {
+        const changes: HarnessStateChangeEvent[] = [];
+
+        const { writer, seen } = await controlRun({
+            seed: threeTurnSeed(),
+            plugins: [
+                turnBeforePlugin('batcher', (context) => {
+                    // Three writes in the order a real policy performs them: an index, a
+                    // messageId, and a live entry — the batching point must not care how the
+                    // unit was addressed.
+                    context.setIncluded(1, false);
+                    context.setIncluded('msg-3', false);
+                    context.setIncluded(context.entries[3], false);
+                })
+            ],
+            stateChanges: changes
+        });
+
+        // THREE writes, ONE report. The three events below are the run's own user append,
+        // the round's single coalesced transcript change, and the committed answer. A
+        // per-write notifier would have produced five.
+        expect(changesOf(changes)).toEqual([
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-'
+        ]);
+
+        // Coalescing the REPORT never coalesces the WRITE: every named unit is disabled in
+        // canonical state, which is what a snapshot and the next round read.
+        expect(withoutIds(writer.agent.messages)).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'first', included: false },
+            { role: 'user', content: 'second', included: false },
+            { role: 'user', content: 'third', included: false },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'settled' }
+        ]);
+
+        // The provider request for the run carries only what stayed enabled: the batch landed
+        // on THIS round's request, not on the next one.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+    });
+
+    it('batches a flag write together with an entry edit', async () => {
+        const changes: HarnessStateChangeEvent[] = [];
+
+        const { writer, seen } = await controlRun({
+            seed: threeTurnSeed(),
+            plugins: [
+                turnBeforePlugin('editor-and-disabler', (context) => {
+                    context.setIncluded(1, false);
+                    context.edit(context.entries[2], { content: 'second, re-worded' });
+                })
+            ],
+            stateChanges: changes
+        });
+
+        // Two canonical writes of two different kinds, ONE report: the document save that
+        // follows sees both, because both were in the transcript before the flush.
+        expect(changesOf(changes)).toEqual([
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-'
+        ]);
+
+        expect(
+            (writer.agent.messages[2] as Extract<HarnessMessage, { role: 'user' }>).content
+        ).toBe('second, re-worded');
+        expect((writer.agent.messages[1] as { included?: boolean }).included).toBe(false);
+
+        // Both changes are on the request that went out in the same round.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'second, re-worded' },
+            { role: 'user', content: 'third' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+    });
+
+    it('leaves host transcript writes notifying per write', async () => {
+        const changes: HarnessStateChangeEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    instruction: 'Write.',
+                    stream: scripted([], [])
+                })
+            },
+            presets: false,
+            report: {
+                stateChange: (event: HarnessStateChangeEvent) => void changes.push(event)
+            }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Host writes' });
+
+        // A host write is ONE write, so it is ONE report — the batching window is a plugin
+        // round, and there is no round here. Three successive host writes therefore notify
+        // three times: coalescing them across calls would be a time-based debounce, which is
+        // exactly what durability forbids (context T4.3).
+        for (const content of ['one', 'two', 'three']) {
+            writer.setThreadMessages(thread.id, [{ role: 'user', content }]);
+        }
+
+        expect(
+            changesOf(changes).filter((change) => change.startsWith('agent_message'))
+        ).toEqual(['agent_message:writer:-', 'agent_message:writer:-', 'agent_message:writer:-']);
+
+        // One report per write, and the LAST document is what a store would persist.
+        expect(withoutIds(writer.threadMessages(thread.id))).toStrictEqual([
+            { role: 'user', content: 'three' }
+        ]);
+    });
+
+    it('still reports a flag write that lands after the round closed', async () => {
+        const changes: HarnessStateChangeEvent[] = [];
+        let late: HarnessTurnBeforeContext | undefined;
+
+        const { writer } = await controlRun({
+            seed: threeTurnSeed(),
+            plugins: [
+                turnBeforePlugin('hoarder', (context) => {
+                    // Park the context; write nothing in this round.
+                    late = context;
+                })
+            ],
+            stateChanges: changes
+        });
+
+        if (late === undefined) throw new Error('the hoarder handler never ran.');
+        const lateContext = late;
+
+        const baseline = changesOf(changes);
+
+        expect(baseline).toEqual(['agent_message:writer:-', 'agent_message:writer:-']);
+
+        // A plugin that acts after its round: the batch window is gone, so the write reports
+        // on the spot. Dropping this report is how a coalescer would lose a durable write —
+        // the hazard the context entry names as the reason no debounce is allowed.
+        lateContext.setIncluded(1, false);
+
+        expect(changesOf(changes)).toEqual([...baseline, 'agent_message:writer:-']);
+        expect((writer.agent.messages[1] as { included?: boolean }).included).toBe(false);
     });
 });

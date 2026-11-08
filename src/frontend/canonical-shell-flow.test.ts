@@ -64,7 +64,7 @@ const HARNESS_CARD = {
     subagents: [],
     agents: ['instruct'],
     tools: ['read'],
-    core_tools: ['task'],
+    core_tools: ['tasks'],
     definition_revision: 1,
     builtin: true,
     editable: true
@@ -73,7 +73,7 @@ const HARNESS_CARD = {
 // `ToolSummary` (../shared/harness-api.ts:640): the catalogue ROW. It carries NO `parameters`
 // — that is the point of the identified read this test exists to pin.
 const TASK_ROW = {
-    name: 'task',
+    name: 'tasks',
     group: 'Core tools',
     description: 'Read or update the session task list.',
     tags: ['core', 'harness'],
@@ -190,14 +190,14 @@ const stub = (sessions: Record<string, unknown>[]): void => {
             if (path === `${ROOT}/models` && method === 'POST') return json({ models: ['m1'] });
 
             // --- the identified tool read: the ONLY place `parameters` exists -------------
-            if (path === `${ROOT}/tools/task` && method === 'GET') return json({ tool: TASK_DETAIL });
+            if (path === `${ROOT}/tools/tasks` && method === 'GET') return json({ tool: TASK_DETAIL });
 
             // --- the playground's temporary session --------------------------------------
             if (path === `${ROOT}/sessions` && method === 'POST') return json({ session: sessionResource() }, 201);
             // Leaving the tools view deletes the context this browser created (R7) — a real
             // delete on a real route, not a local forget.
             if (path === `${ROOT}/sessions/pl-1` && method === 'DELETE') return json({ deleted: true });
-            if (path === `${ROOT}/sessions/pl-1/tools/task/executions` && method === 'POST') {
+            if (path === `${ROOT}/sessions/pl-1/tools/tasks/executions` && method === 'POST') {
                 return json({ ok: true, result: 'queued', duration_ms: 4 });
             }
 
@@ -354,14 +354,14 @@ it('boots, runs a core tool through its identified read, then submits and settle
     byClass('.tools-toggle', 'button').click();
     await flush();
 
-    byClass('.tool-tab-button[data-tool="task"]', 'button').click();
+    byClass('.tool-tab-button[data-tool="tasks"]', 'button').click();
     await flush(2);
 
     // One identified read for the opened tool, and its schema is on screen: the catalogue row
     // carries NO `parameters` (../shared/harness-api.ts:636-648), so the schema pane can only show
     // this text if the runner merged `GET /v1/harness/tools/{id}`. The box itself starts from the
-    // tool's first NAMED preset (the curated `task` read), which is the correct fill.
-    expect(dialed('GET', `${ROOT}/tools/task`)).toBe(1);
+    // tool's first NAMED preset (the curated `tasks` read), which is the correct fill.
+    expect(dialed('GET', `${ROOT}/tools/tasks`)).toBe(1);
     const panes = [...document.querySelectorAll<HTMLElement>('.tool-card pre')].map((node) => node.textContent ?? '');
     expect(panes.some((text) => text.includes('"properties"') && text.includes('"input"'))).toBe(true);
     expect(JSON.parse(byClass('.tool-args', 'textarea').value)).toEqual({});
@@ -373,9 +373,9 @@ it('boots, runs a core tool through its identified read, then submits and settle
 
     expect(dialed('POST', `${ROOT}/sessions`)).toBe(1);
     expect(
-        calls.find((call) => call.method === 'POST' && call.url === `${ROOT}/sessions/pl-1/tools/task/executions`)
+        calls.find((call) => call.method === 'POST' && call.url === `${ROOT}/sessions/pl-1/tools/tasks/executions`)
     )?.toEqual({
-        url: `${ROOT}/sessions/pl-1/tools/task/executions`,
+        url: `${ROOT}/sessions/pl-1/tools/tasks/executions`,
         method: 'POST',
         body: { parameters: { input: 'smoke' } }
     });
@@ -389,9 +389,9 @@ it('boots, runs a core tool through its identified read, then submits and settle
     // page is replaced).
     byClass('.dialog-close', 'button').click();
     await flush();
-    byClass('.tool-tab-button[data-tool="task"]', 'button').click();
+    byClass('.tool-tab-button[data-tool="tasks"]', 'button').click();
     await flush(2);
-    expect(dialed('GET', `${ROOT}/tools/task`)).toBe(1);
+    expect(dialed('GET', `${ROOT}/tools/tasks`)).toBe(1);
 
     // --- 4. back to the chat: the submit answers a receipt, the socket finishes the job ---
     byClass('.tools-toggle', 'button').click();

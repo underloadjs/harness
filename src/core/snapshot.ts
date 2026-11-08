@@ -29,6 +29,13 @@
 
 import { HarnessError } from '../util';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
+// Stable transcript addresses (context T1.3): the reader-side id rule — carry an id that
+// is already there, backfill one that is not. A leaf (types-only) import, like the
+// `./agent-limits` leaf below.
+import { createMessageIdAllocator } from './message-id';
+// The outcome vocabulary + validation used by `applyOutcome` below. Direct module import
+// (no barrel), the same convention as ./message-id above.
+import { TOOL_OUTCOMES, isToolOutcome } from './tool-outcome';
 import type {
     HarnessAgentResultSnapshot,
     HarnessAgentSnapshot,
@@ -44,9 +51,6 @@ import type {
 // leaf keeps a snapshot read free of any catalogue projection.
 import { AGENT_RESULT_RETENTION } from './agent-limits';
 import { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, THREAD_HOST_PREFIX } from './thread';
-import { readChapterStoreState } from './chapter';
-import { readLocationStoreState } from './location';
-import { readProfileStoreState } from './profile';
 import {
     isSnapshotRecord,
     readSnapshotArray,
@@ -57,11 +61,19 @@ import {
     readSnapshotRecord,
     readSnapshotString
 } from './snapshot-validation';
-import { readTaskStoreState } from './task';
+import { readRecordsStoreState } from './records';
 
 // The only schema this build reads. A snapshot from a future build is rejected by
 // version rather than guessed at: migration belongs to whoever changes the shape.
-export const HARNESS_SNAPSHOT_VERSION = 1 as const;
+//
+// v2 is the records-engine shape change (T3): `records` was FOUR sibling stores
+// (`todos`, `profiles`, `chapters`, `locations`), each with its own id counter, and
+// it is now ONE collection map with one global counter (F3) plus a persisted
+// definition per collection (Decision M). The version moved rather than the reader
+// accepting both shapes because R5 says nothing is in production: a v1 file is
+// refused with the version message below, and nobody has to lose data to a
+// half-migrated read.
+export const HARNESS_SNAPSHOT_VERSION = 2 as const;
 
 // The model-facing message union is small and closed. Validate every branch and
 // copy it, so a live array can never be shared with a saved object.
@@ -227,21 +239,112 @@ const applyIncluded = (
     }
 };
 
-export const readHarnessMessages = (value: unknown, label: string): HarnessMessage[] =>
-    readSnapshotArray(value, label).map((entry, index) => {
+// The persisted tool outcome (compaction T1.4 — the reader side of core/tool-outcome.ts).
+//
+// Same minimal-delta contract as `included` directly above: ABSENT means `completed`, so
+// every snapshot written before this field existed restores byte-for-byte and no fixture
+// needs a migration. A snapshot that does carry `outcome: "completed"` (hand-edited, or
+// written by a host that ignored the omit rule) is accepted and NORMALIZED to the absent
+// form, exactly like `included: true`, so `restore -> snapshot` stays idempotent instead
+// of re-adding a key the runtime never writes.
+//
+// A value OUTSIDE the union is REFUSED rather than dropped: silently reading a mistyped
+// `"fail"` as `completed` would hide a real failure from every later policy, and this
+// reader's whole rule is that a corrupt document fails loudly (file header). There is no
+// fallback that re-derives an outcome from the result TEXT — the omit rule is a deliberate
+// migration decision, not a bridge (T1.5).
+const applyOutcome = (
+    message: Extract<HarnessMessage, { role: 'tool' }>,
+    record: Record<string, unknown>,
+    label: string
+): void => {
+    if (record.outcome === undefined) return;
+
+    if (!isToolOutcome(record.outcome)) {
+        throw new HarnessError(
+            `${label}.outcome must be one of: ${TOOL_OUTCOMES.join(', ')} (or be omitted).`
+        );
+    }
+
+    // `completed` is stored as nothing at all; only the three non-healthy values are kept.
+    if (record.outcome !== 'completed') {
+        message.outcome = record.outcome;
+    }
+};
+
+// The stable transcript address (context T1.3): `messageId` is OPTIONAL on read, so a
+// `state.json` written before ids existed keeps restoring byte-for-bit.
+//
+// BACKFILL-ON-READ, the option this file picks (the task left both open): every path
+// INTO canonical state goes through this reader — `snapshot()` uses it to project live
+// messages, and `restore()`/`setThreadMessages`/`appendThreadMessages` use it to build
+// them — so minting here is the one place that guarantees canonical state always has
+// ids WITHOUT touching any of those call sites. The alternative (minting on write into
+// canonical state) would leave a pre-id transcript id-less until the next snapshot, and
+// `entries` would report `messageId` absent for a turn that is perfectly addressable.
+//
+// Idempotence is the property this choice has to keep, and it does: an id that is
+// ALREADY there is carried verbatim (never re-minted, the rule in core/message-id.ts),
+// and only an entry with no id consumes the next free number. So restoring a document
+// and snapshotting it again returns THE SAME document, which is what `applyIncluded`
+// already guarantees for the flag (see the comment above).
+//
+// A present-but-unsuitable id is refused like any other mistyped field — a non-string,
+// or an empty string — rather than silently re-minted, because the caller (a server
+// transcript PUT, a hand-edited file) needs to know its address was dropped. The
+// runtime's own spelling is `msg-<n>`; a host may carry any other non-empty string, and
+// it survives as an opaque address (core/message-id.ts header).
+const readMessageId = (record: Record<string, unknown>, label: string): string | undefined =>
+    record.messageId === undefined
+        ? undefined
+        : readSnapshotString(record.messageId, `${label}.messageId`, { min: 1 });
+
+const applyMessageId = (message: HarnessMessage, allocated: string): void => {
+    // Written LAST, so the key order of a read message matches the order a runtime
+    // creation point produces (`assignMessageId`) and a flagged entry keeps `included`
+    // before `messageId` in both directions.
+    message.messageId = allocated;
+};
+
+export const readHarnessMessages = (
+    value: unknown,
+    label: string,
+    // THE TRANSCRIPT THESE ENTRIES ARE JOINING — only for an APPEND (src/harness.ts
+    // `appendThreadMessages`, the lane-worker seam), where the array being read is a
+    // slice rather than a whole conversation. Backfilling an absent address must count
+    // against everything the conversation already owns, or the appended entry would be
+    // minted an id the transcript holds (and `setIncluded(id)` would name two turns).
+    // `snapshot()`, `restore()` and `setThreadMessages` pass nothing: the array each of
+    // them reads IS the whole transcript, so its own ids are the ceiling.
+    surrounding?: readonly HarnessMessage[]
+): HarnessMessage[] => {
+    const entries = readSnapshotArray(value, label);
+
+    // One allocator per read: it scans the list ONCE for the highest id it already
+    // carries, then hands out increasing ids for the entries that have none, so ids
+    // cannot collide with a host-authored one and a mixed document (some entries ided,
+    // some not) reads sanely.
+    const allocate = createMessageIdAllocator(
+        surrounding === undefined ? entries : [...surrounding, ...entries]
+    );
+
+    return entries.map((entry, index) => {
         const entryLabel = `${label}[${index}]`;
         const record = readSnapshotRecord(entry, entryLabel);
         const role = readSnapshotString(record.role, `${entryLabel}.role`, { min: 1 });
 
         switch (role) {
             case 'system': {
-                // `included` is the only optional system key, and it is listed as
-                // OPTIONAL so a pre-flag snapshot (role+content only) still passes.
+                // `included` and `messageId` are the optional system keys, both listed as
+                // OPTIONAL so a pre-flag / pre-id snapshot (role+content only) still
+                // passes — and `messageId` is then BACKFILLED on the way in (see
+                // `applyMessageId` above), which is what makes a transcript restored from
+                // such a file addressable by id from its very next round.
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'included'],
+                    ['role', 'content', 'included', 'messageId'],
                     entryLabel,
-                    ['included']
+                    ['included', 'messageId']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'system' }> = {
@@ -250,6 +353,7 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 };
 
                 applyIncluded(message, record, entryLabel);
+                applyMessageId(message, allocate(readMessageId(record, entryLabel)));
                 return message;
             }
 
@@ -262,9 +366,9 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 // object.
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'attachments', 'included'],
+                    ['role', 'content', 'attachments', 'included', 'messageId'],
                     entryLabel,
-                    ['attachments', 'included']
+                    ['attachments', 'included', 'messageId']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'user' }> = {
@@ -284,15 +388,16 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 }
 
                 applyIncluded(message, record, entryLabel);
+                applyMessageId(message, allocate(readMessageId(record, entryLabel)));
                 return message;
             }
 
             case 'assistant': {
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'toolCalls', 'reasoning', 'included'],
+                    ['role', 'content', 'toolCalls', 'reasoning', 'included', 'messageId'],
                     entryLabel,
-                    ['toolCalls', 'reasoning', 'included']
+                    ['toolCalls', 'reasoning', 'included', 'messageId']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'assistant' }> = {
@@ -312,6 +417,7 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 }
 
                 applyIncluded(message, record, entryLabel);
+                applyMessageId(message, allocate(readMessageId(record, entryLabel)));
                 return message;
             }
 
@@ -325,9 +431,9 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 // rather than replay garbage to the provider.
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'toolCallId', 'name', 'attachments', 'included'],
+                    ['role', 'content', 'toolCallId', 'name', 'attachments', 'outcome', 'included', 'messageId'],
                     entryLabel,
-                    ['attachments', 'included']
+                    ['attachments', 'outcome', 'included', 'messageId']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'tool' }> = {
@@ -351,7 +457,9 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                     }
                 }
 
+                applyOutcome(message, record, entryLabel);
                 applyIncluded(message, record, entryLabel);
+                applyMessageId(message, allocate(readMessageId(record, entryLabel)));
                 return message;
             }
 
@@ -361,6 +469,7 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
                 );
         }
     });
+};
 
 // Copy a creation record without validating it. Used at the moment of creation
 // (the source has already been through createDynamicTool) and when emitting a
@@ -808,9 +917,11 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
         }
     }
 
-    // Record stores: each reader validates its own bounds and returns copies.
+    // The ONE record store. The key list is NOT checked here: the engine owns the
+    // shape (a collection map whose membership is data, because an agent can `define`
+    // a collection), so validation is DELEGATED to its reader, which validates every
+    // collection against the definition stored beside it (T3).
     const records = readSnapshotRecord(root.records, 'snapshot.records');
-    readSnapshotKeys(records, ['todos', 'profiles', 'chapters', 'locations'], 'snapshot.records');
 
     return {
         version: HARNESS_SNAPSHOT_VERSION,
@@ -822,11 +933,6 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
         ...(threads === undefined || threadSequence === undefined
             ? {}
             : { threads, threadSequence }),
-        records: {
-            todos: readTaskStoreState(records.todos),
-            profiles: readProfileStoreState(records.profiles),
-            chapters: readChapterStoreState(records.chapters),
-            locations: readLocationStoreState(records.locations)
-        }
+        records: readRecordsStoreState(records)
     };
 };

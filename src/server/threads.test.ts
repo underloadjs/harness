@@ -46,6 +46,32 @@ import type {
 import type { SessionSnapshot, SessionThread, SessionView } from './protocol';
 import { listAgentResultBlocks, REFERENCED_RESULTS_FOOTER, REFERENCED_RESULTS_HEADER } from '../shared/agent-results';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const SETTINGS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',
     apiKey: 'super-secret-key',
@@ -293,7 +319,7 @@ describe('SessionStore persistent threads', () => {
 
         // The roster is the join between the runtime record and this turn, and it
         // carries the conversation itself for a focused UI.
-        expect(snapshot.threads).toEqual([
+        expect(withoutIds(snapshot.threads)).toEqual([
             {
                 id: 'thread-1',
                 agent: 'probe',
@@ -1096,7 +1122,7 @@ describe('SessionStore thread persistence', () => {
         expect(restored.queueDepth).toBe(1);
 
         // The thread and its transcript survive, with the invocation join.
-        expect(restored.threads).toEqual([
+        expect(withoutIds(restored.threads)).toEqual([
             {
                 id: 'thread-1',
                 agent: 'probe',

@@ -21,8 +21,13 @@
 //     replaced; the authority compares it against the CANONICAL value and refuses a
 //     stale one. Concurrent edits therefore serialise by receipt - no lost update,
 //     and no weak "these two values are just different" conflict flag (F5/F12);
-//   - a transcript is APPENDED at a known prefix length, so a lane cannot overwrite
-//     text a sibling appended into the same conversation;
+//   - a transcript is APPENDED at a known prefix length, so a lane cannot overwrite text a
+//     sibling appended into the same conversation;
+//   - and the ALREADY-COMMITTED prefix may be rewritten IN PLACE only by the lane holding the
+//     digest of that prefix (`transcript:patch`, pipeline T4.1). That is what makes a plugin's
+//     `setIncluded`/`edit` durable under `threadExecution: 'worker'`: the write is canonical and
+//     notified on the authority, so `state.json` captures it, while a concurrent rewrite of the
+//     same prefix is a refusal with the canonical facts in the receipt — never a silent overwrite.
 //   - one WRITER LEASE per shared conversation: a second lane delegating to the same
 //     agent's default conversation is refused and takes its own child conversation
 //     instead of writing behind the first lane's back (F5);
@@ -58,7 +63,11 @@ import type { IdentityLedger } from './lane-identity';
 import { idOf } from './lane-identity';
 import { ABSENT_DIGEST, applyMemoryWrite, digestMemoryValue } from './lane-memory';
 
-export const RECORD_STORES = ['todos', 'profiles', 'chapters', 'locations'] as const;
+// The collection keys of the ONE session store (records-engine T3): the snapshot no
+// longer holds four sibling stores, so a fold names a COLLECTION, and the id counter
+// every collection draws from is the store-level `view.records.nextId`, not a per-store
+// number.
+export const RECORD_STORES = ['tasks', 'chapters', 'profiles', 'locations'] as const;
 export type RecordStoreName = (typeof RECORD_STORES)[number];
 
 export const MAX_RECORDS_PER_STORE = 512;
@@ -86,6 +95,10 @@ export type CanonicalThread = {
 
 export type CanonicalRecord = { id: string } & Record<string, unknown>;
 
+// One collection's records. `nextId` is kept as a MIRROR of the store-level counter
+// (`CanonicalView.records.nextId`, the one that is authoritative since F3 collapsed the
+// four id spaces into one); a fold that mints an id updates both, so a caller reading
+// either number sees the same fact.
 export type CanonicalStore = { items: CanonicalRecord[]; nextId: number };
 
 export type CanonicalTool = { name: string; source: string; revision: string; replaced: boolean };
@@ -120,6 +133,10 @@ export const archiveDigestOf = (record: {
 export type CanonicalView = {
     threads: Record<string, CanonicalThread>;
     stores: Record<RecordStoreName, CanonicalStore>;
+    // The store-level half of the unified record engine: the ONE id counter every
+    // collection draws from (F3). The per-collection `stores` entries hold the records;
+    // this holds the numbering.
+    records: { nextId: number };
     results: Record<string, HarnessAgentResultSnapshot>;
     // T10 finding M3: which lane epoch wrote each archived invocation. The core's own
     // identity rule makes a HOST thread's invocation id its THREAD id (harness.ts
@@ -161,11 +178,14 @@ export const DEFAULT_BOUNDS: CanonicalBounds = {
 export const emptyCanonicalView = (): CanonicalView => ({
     threads: {},
     stores: {
-        todos: { items: [], nextId: 1 },
-        profiles: { items: [], nextId: 1 },
+        // The four built-in collections (records-engine T3). `nextId` is the mirrored
+        // store-level counter; `records.nextId` below is the authoritative one.
+        tasks: { items: [], nextId: 1 },
         chapters: { items: [], nextId: 1 },
+        profiles: { items: [], nextId: 1 },
         locations: { items: [], nextId: 1 }
     },
+    records: { nextId: 1 },
     results: {},
     resultOwners: {},
     tools: {},
@@ -187,6 +207,48 @@ export type SharedMutation =
     | { kind: 'thread:create'; agent: string; ownerThreadId?: string; label?: string }
     | { kind: 'thread:status'; threadId: string; status: 'idle' | 'stopped'; expects: string }
     | { kind: 'transcript:append'; threadId: string; fromLength: number; messages: HarnessMessage[] }
+    // pipeline T4.1: an IN-PLACE rewrite of the part of the transcript this lane has already
+    // committed — `expectedLength` whole entries, in canonical order — compare-and-set against
+    // the digest of that prefix as this lane last ADOPTED it. It is the op an append cannot be:
+    // a plugin's `setIncluded`/`edit` writes an already-committed entry without changing the
+    // length, so the append condition (`transcript.length > committedLength`) never fires for
+    // it (finding F6) and the change died with the worker process.
+    //
+    // WHY A WHOLE-PREFIX PATCH AND NOT A SPARSE ONE:
+    //   1. the CAS is whole-prefix, so it cannot be trusted per entry anyway — one changed byte
+    //      anywhere in the committed prefix fails the digest and the lane re-reads canonical;
+    //   2. a whole-prefix replace makes the fold's apply trivially ATOMIC (`splice` one range)
+    //      against a view the fold already proved, and atomic-per-op is rule F10 here;
+    //   3. the cost is already inside the envelope this lane pays: `deriveOperations` takes a
+    //      whole `snapshot()` of the replica every boundary, and the authority folds against a
+    //      whole `snapshot()` every group, so a prefix copy on the rare round that edited a
+    //      committed entry is not the thing that needs optimising;
+    //   4. it converges: the lane adopts the authority's digest from the receipt, so one
+    //      refusal plus one re-read ends the argument instead of re-litigating an entry index.
+    //
+    // WHY A NEW KIND AND NOT A WIDER `transcript:append`: the fold applies ops IN ORDER, so the
+    // in-place patch is emitted BEFORE the append in the same group. Making the append carry both
+    // would overload `fromLength` with "the prefix you may rewrite AND the point you may extend",
+    // and a pure in-place change (length identical) would still be unrepresentable. It is also
+    // additive both directions: a worker that predates T4 never sends it, and a worker newer than
+    // its coordinator gets a named `invalid-mutation` refusal instead of a silently ignored op.
+    //
+    // The name says PATCH, not SYNC: `transcript:sync` is already the REQUEST a lane raises to
+    // PULL canonical state (./lane-authority.ts). One name per direction, or a reader cannot tell
+    // who is overwriting whom.
+    | {
+          kind: 'transcript:patch';
+          threadId: string;
+          // The committed prefix this lane replaces, and the length its `expects` digest was
+          // taken over. `messages.length` MUST equal it — a mismatch is `invalid-mutation`.
+          expectedLength: number;
+          // `digestMemoryValue` of the canonical prefix as this lane last adopted it (the
+          // receipt, the turn-start sync, or the hello snapshot). Key-order independent, like
+          // every other digest on this protocol (./lane-memory.ts).
+          expects: string;
+          // The whole committed prefix, as it now is on this replica, in canonical order.
+          messages: HarnessMessage[];
+      }
     | { kind: 'memory:set'; key: string; value: unknown; expects: string }
     | { kind: 'memory:delete'; key: string; expects: string }
     | {
@@ -340,7 +402,11 @@ export const createWriterLeaseLedger = (): WriterLeaseLedger => {
 // because two lanes may legitimately add different records to the same store.
 export const leaseScopeOf = (mutation: SharedMutation, view: CanonicalView): LeaseScope | undefined => {
     switch (mutation.kind) {
-        case 'transcript:append': {
+        case 'transcript:append':
+        // T4.1: the in-place patch writes the SAME conversation the append would, so it needs
+        // the SAME single-writer lease. A plugin's flag write is not a weaker claim on a shared
+        // conversation than a message is.
+        case 'transcript:patch': {
             const thread = view.threads[mutation.threadId];
 
             // A host thread belongs to the lane that runs it; an agent's DEFAULT
@@ -476,7 +542,9 @@ export const applySharedMutation = (
     // ownership of something that is not there.
     const scope = leaseScopeOf(mutation, view);
     const targetThreadId =
-        mutation.kind === 'transcript:append' || mutation.kind === 'thread:status' ? mutation.threadId : undefined;
+        mutation.kind === 'transcript:append' || mutation.kind === 'transcript:patch' || mutation.kind === 'thread:status'
+            ? mutation.threadId
+            : undefined;
     const targetKnown = targetThreadId === undefined || view.threads[targetThreadId] !== undefined;
 
     if (scope !== undefined && targetKnown) {
@@ -503,19 +571,23 @@ export const applySharedMutation = (
                 return reject(base, 'capacity-records', `The ${mutation.store} store holds at most ${bounds.maxRecordsPerStore} records.`);
             }
 
-            const allocation = context.identity.allocate(`record:${mutation.store}`, 1, context.laneEpoch);
+            // ONE space for every collection (F3): a task id and a chapter id are
+            // drawn from the same lease, so two collections can never mint the same id.
+            const allocation = context.identity.allocate('record', 1, context.laneEpoch);
 
             if (!allocation.ok) {
                 return reject(base, 'capacity-records', allocation.fault.message);
             }
 
-            const mintedId = idOf(`record:${mutation.store}` as import('./lane-identity').IdSpace, allocation.lease.start);
+            const mintedId = idOf('record', allocation.lease.start);
             const record: CanonicalRecord = { ...mutation.record, id: mintedId } as CanonicalRecord;
             store.items.push(record);
 
             // The published counter is the LEDGER's value for this space's units -
             // one past the largest minted id - which is exactly what the core's
-            // snapshot validator requires (the F1 rule).
+            // snapshot validator requires (the F1 rule). It is the STORE-level number:
+            // the per-store mirror is written alongside it so both read the same fact.
+            view.records.nextId = allocation.published;
             store.nextId = allocation.published;
 
             return {
@@ -657,6 +729,86 @@ export const applySharedMutation = (
             thread.messages.push(...mutation.messages);
 
             return { ...base, status: 'applied', effect: { length: thread.messages.length, digest: digestMemoryValue(thread.messages) } };
+        }
+
+        case 'transcript:patch': {
+            const thread = view.threads[mutation.threadId];
+
+            if (thread === undefined) return reject(base, 'unknown-thread', `Thread "${mutation.threadId}" is not in the canonical state.`);
+
+            // The op states the prefix it replaces, so a length that disagrees with its own
+            // payload is a malformed send, not a conflict: naming it `invalid-mutation` keeps
+            // `prefix-moved` meaning exactly one thing for a lane (canonical moved, re-read).
+            if (!Number.isInteger(mutation.expectedLength) || mutation.expectedLength < 0) {
+                return reject(
+                    base,
+                    'invalid-mutation',
+                    `Thread "${mutation.threadId}" patch needs a non-negative committed-prefix length; received ${JSON.stringify(mutation.expectedLength)}.`
+                );
+            }
+
+            if (mutation.messages.length !== mutation.expectedLength) {
+                return reject(
+                    base,
+                    'invalid-mutation',
+                    `Thread "${mutation.threadId}" patch names ${mutation.expectedLength} committed entries but carries ${mutation.messages.length}.`
+                );
+            }
+
+            // Both refusals below answer with the SAME facts an append refusal carries — the
+            // canonical length and the canonical digest — because both send the lane to the same
+            // place: the `transcript:sync` pull and a re-derivation (T4.1 reuses the existing
+            // `prefix-moved` → rebase path rather than inventing a second conflict story).
+            if (thread.messages.length < mutation.expectedLength) {
+                // Canonical got SHORTER than this lane's base (a reset or a host repair landed
+                // while the lane was alive), so the prefix it wants to rewrite no longer exists.
+                return {
+                    ...base,
+                    status: 'rejected',
+                    rejection: {
+                        code: 'prefix-moved',
+                        message: `Thread "${mutation.threadId}" holds ${thread.messages.length} messages, not ${mutation.expectedLength}; re-read before patching.`
+                    },
+                    effect: { length: thread.messages.length, digest: digestMemoryValue(thread.messages) }
+                };
+            }
+
+            const canonicalPrefix = digestMemoryValue(thread.messages.slice(0, mutation.expectedLength));
+
+            if (canonicalPrefix !== mutation.expects) {
+                // Somebody else rewrote the committed prefix: this lane's in-place change is
+                // refused WHOLE, never merged in entry by entry, because the digest cannot say
+                // which entries it covers. Nothing moves; the lane re-reads and its policy
+                // re-derives its decision on the next round.
+                return {
+                    ...base,
+                    status: 'rejected',
+                    rejection: {
+                        code: 'prefix-moved',
+                        message: `The first ${mutation.expectedLength} messages of thread "${mutation.threadId}" changed since this lane read them; re-read before patching.`
+                    },
+                    effect: { length: thread.messages.length, digest: digestMemoryValue(thread.messages) }
+                };
+            }
+
+            // Replace the prefix IN PLACE (splice, not reassign): the thread object the next op
+            // in this group reads is this one, and an append that follows a patch in the same
+            // group must land on the rewritten prefix, not on a detached array.
+            thread.messages.splice(0, mutation.expectedLength, ...mutation.messages);
+
+            const patchedPrefix = thread.messages.slice(0, mutation.expectedLength);
+
+            return {
+                ...base,
+                status: 'applied',
+                // `length` here is the COMMITTED PREFIX the lane holds, not the whole transcript
+                // (which a patch never changes, and which may legitimately be longer than the
+                // prefix — a coordinator append between the lane's read and its commit). The
+                // append receipt's `length` is the whole transcript; the two scopes are named
+                // apart because a lane that adopted the wrong one would either strand its own
+                // tail or re-send the same prefix forever.
+                effect: { length: mutation.expectedLength, digest: digestMemoryValue(patchedPrefix) }
+            };
         }
 
         case 'memory:set': {

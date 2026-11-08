@@ -61,7 +61,7 @@ describe('browser catalogue fallback (T24)', () => {
         // 30 rows: the browser bundle carries the same generated inventory as the
         // Node build, including the new `download` preset and the `threadRead`
         // runtime entry.
-        expect(TOOL_DESCRIPTORS).toHaveLength(30);
+        expect(TOOL_DESCRIPTORS).toHaveLength(31);
     });
 
     it('derives the preset and runtime groups from the generated data', () => {
@@ -90,10 +90,12 @@ describe('browser catalogue fallback (T24)', () => {
         'toolList',
         'toolManage',
         'toolCreate',
-        'task',
-        'profileManage',
-        'chapterManage',
-        'locationManage',
+        'records',
+
+        'tasks',
+        'profiles',
+        'chapters',
+        'locations',
         'agentManage',
         'agentResult',
         'delegate',

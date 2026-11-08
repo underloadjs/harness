@@ -46,7 +46,7 @@ const record = (
     ({
         id: options.id,
         index: options.index,
-        prompt: 'task',
+        prompt: 'tasks',
         status: options.status ?? 'done',
         startedAt: 1,
         updatedAt: 2,
@@ -89,7 +89,7 @@ describe('explicit conversation label reservation (T14 parity)', () => {
             threadId: 'thread-root',
             threadLabel: 'RR1',
             events: [
-                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'task' }),
+                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'tasks' }),
                 delegateCall('Researcher', 'call-1'),
                 withThread(
                     { type: 'start', agent: 'Researcher', model: 'r1' },
@@ -124,7 +124,7 @@ describe('explicit conversation label reservation (T14 parity)', () => {
             threadId: 'thread-root',
             threadLabel: 'RR4',
             events: [
-                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'task' }),
+                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'tasks' }),
                 delegateCall('Researcher', 'call-1'),
                 withThread(
                     { type: 'start', agent: 'Researcher', model: 'r1' },
@@ -157,7 +157,7 @@ describe('explicit conversation label reservation (T14 parity)', () => {
             threadId: 'thread-root',
             threadLabel: 'RR1',
             events: [
-                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'task' }),
+                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'tasks' }),
                 delegateCall('Researcher', 'call-1'),
                 withThread(
                     { type: 'start', agent: 'Researcher', model: 'r1' },
@@ -189,7 +189,7 @@ describe('explicit conversation label reservation (T14 parity)', () => {
             threadId: 'thread-root',
             threadLabel: 'RR1',
             events: [
-                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'task' }),
+                withThread({ type: 'start', agent: 'Researcher', model: 'r1' }, { id: 'inv-root', input: 'tasks' }),
                 delegateCall('Researcher', 'call-1'),
                 withThread(
                     { type: 'start', agent: 'Researcher', model: 'r1' },

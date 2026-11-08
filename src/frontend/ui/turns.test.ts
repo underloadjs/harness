@@ -514,7 +514,7 @@ describe('server queue', () => {
         ({
             id: 't1',
             index: 0,
-            prompt: 'task',
+            prompt: 'tasks',
             status: 'done',
             startedAt: T,
             updatedAt: T + 1000,

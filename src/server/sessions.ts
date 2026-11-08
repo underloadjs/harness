@@ -155,6 +155,7 @@ import type {
     HarnessActionRequestContext,
     HarnessAttachment,
     HarnessCommandResult,
+    HarnessDiagnosticEvent,
     HarnessEvent,
     HarnessInteractionConfiguration,
     HarnessMessage,
@@ -265,6 +266,7 @@ import type {
     HarnessDescriptor,
     HarnessUsage,
     SessionInvalidThread,
+    SessionPluginDiagnostic,
     SessionSnapshot,
     SessionStatus,
     SessionStreamItem,
@@ -279,6 +281,10 @@ import type {
     TurnStepDetail,
     UpdateThreadTranscriptResult
 } from './protocol';
+// T1.5's last mile: the shared cap on one session's plugin-diagnostic journal. Imported as a
+// VALUE because `notePluginDiagnostic` trims the journal with it, and ./persistence.ts honours
+// the same bound when it restores one (the constant lives in ./protocol.ts for that reason).
+import { PLUGIN_DIAGNOSTIC_LIMIT } from './protocol';
 // R1/R3/R4: the compiled display surface. The fold is SERVER-only (the browser
 // imports the types from ../shared/turn-display.ts and never this runtime), and the
 // journal is the per-step durable log the compiled memory is rebuilt from.
@@ -609,6 +615,23 @@ export type Session = {
     // it and the operator can fix it. An entry is dropped as soon as a readable
     // transcript replaces it.
     invalidThreads: Map<string, HarnessInvalidThreadRecord>;
+    // pipeline T1.5's last mile: the plugin diagnostics this session produced, OLDEST FIRST,
+    // capped at `PLUGIN_DIAGNOSTIC_LIMIT` (the oldest entries are dropped once it is full — a
+    // plugin that throws on every turn must not grow the durable document without bound).
+    //
+    // WHY IT LIVES HERE AND NOT ON A TURN: the diagnostic names a PLUGIN and a lifecycle hook,
+    // not a conversation turn — a manual tool call, a slash command, an async wake and a lane
+    // commit can all produce one, and the framework failure kinds (`handler-threw`,
+    // `handler-timed-out`, `invalid-decision`) describe the host's plugin surface rather than
+    // any one run. A host that wants to blame a turn still can: the framework kinds carry the
+    // failing `event`, and a `policy` report carries its own structured payload.
+    //
+    // Durable (`HarnessSessionRecord.pluginDiagnostics`) because "the compactor has been failing
+    // since before the restart" is exactly the fact an operator needs after a restart. It is
+    // written with the NEXT save rather than scheduling one: a diagnostic is an observation, and
+    // scheduling a whole-document rewrite for it would let a chatty plugin drive the save rate
+    // (the standing coalescing rule, docs/tasks/2026-11-09-context-inclusion-followups.md F6).
+    pluginDiagnostics: SessionPluginDiagnostic[];
     // True while a LEGACY /messages run owns this harness. Manual calls set `busy`
     // without changing `status`, so the aggregate status needs its own flag to know
     // when a real run is active.
@@ -702,6 +725,14 @@ export type SessionStoreOptions = {
     database?: HarnessDatabase;
     onPersistenceError?: (error: Error) => void;
     onRestoreError?: (error: Error) => void;
+    // T1.5's last mile (ADDITIVE): the reporter for a plugin diagnostic this store received on
+    // behalf of a session — a hook that threw, timed out, or returned an unparseable decision, or
+    // a plugin's own `policy` report (the shipped compaction pass names what it withheld). The
+    // journal itself always lands on the session (durable, and projected onto the snapshot and
+    // `GET /sessions/{id}`); this hook only replaces the STDERR line the failure kinds print, and
+    // only for those kinds, so a host with its own log pipeline can stay quiet without losing the
+    // record. The default is stderr, matching `onPersistenceError`/`onRestoreError`.
+    onPluginDiagnostic?: (diagnostic: SessionPluginDiagnostic) => void;
     // T5 (R1/R3): the RESOLVED server runtime. `threadExecution: 'worker'` makes every turn,
     // manual tool call and slash command run on a lane worker; the default is today's inline
     // behaviour. Deliberately an OPTION on the store rather than a per-session field: the
@@ -1410,6 +1441,10 @@ export class SessionStore {
     private readonly onPersistenceError: ((error: Error) => void) | undefined;
     // Per-session restore reporter (see SessionStoreOptions.onRestoreError).
     private readonly onRestoreError: ((error: Error) => void) | undefined;
+    // T1.5 last mile: the plugin-diagnostic reporter (see SessionStoreOptions.onPluginDiagnostic).
+    // `undefined` means "print the failure kinds on stderr", the same default shape the two
+    // reporters above use; the JOURNAL is written either way.
+    private readonly onPluginDiagnostic: ((diagnostic: SessionPluginDiagnostic) => void) | undefined;
     // Every saved session this load dropped, in document order, as the full
     // diagnostic message (file path + session id + the underlying reason). Kept
     // because a dropped session must stay explainable after it stops being
@@ -1501,6 +1536,8 @@ export class SessionStore {
         this.persistence = options.persistence;
         this.onPersistenceError = options.onPersistenceError;
         this.onRestoreError = options.onRestoreError;
+        // T1.5 last mile: the sink `buildHarness` installs on every harness this store creates.
+        this.onPluginDiagnostic = options.onPluginDiagnostic;
 
         // T16: the operator's saved GLOBAL provider defaults (base URL + model). Read straight
         // from the document the host already loaded, so a `PATCH /config` survives a restart
@@ -1974,6 +2011,8 @@ export class SessionStore {
             invocationThreads: new Map(),
             // C4: a fresh session has no unreadable transcript by construction.
             invalidThreads: new Map(),
+            // T1.5 last mile: no plugin has failed on it yet.
+            pluginDiagnostics: [],
             // T27: a fresh session has exactly the members its definition shipped with.
             sessionAgents: [],
             legacyRunning: false,
@@ -2071,6 +2110,17 @@ export class SessionStore {
         return preset.create(settings, progress, {
             stateChange,
             interaction,
+            // T1.5's last mile: THE SERVER'S DIAGNOSTIC SINK. The library has emitted
+            // `report.diagnostic` events since T1.5 (a hook that threw or timed out, an
+            // unparseable decision — `src/harness.ts` `notifyPluginDiagnostic` — plus a plugin's
+            // own `api.report.diagnostic` policy report), and `HarnessConfiguration.report.diagnostic`
+            // is the channel, but until this line no server host PASSED one, so a broken plugin on
+            // a durable session was still invisible. Presence here is what makes "the compactor is
+            // broken" a fact `GET /sessions` can answer, and it is deliberately NOT routed through
+            // `stateChange`: a plugin failure is not a persistence transition, so it must not
+            // schedule a whole-document save on its own (src/types/index.ts
+            // `HarnessDiagnosticEvent`, and `notePluginDiagnostic` below for the journal rule).
+            diagnostic: (event: HarnessDiagnosticEvent): void => this.notePluginDiagnostic(current(), event),
             // T5 (R2/R3): the runtime's LIVE plugin settings provider. Every build path lands
             // here — `create` (a fresh session, line ~1875 above) and the restore path (line
             // ~3044 below) — so both a new conversation and one rebuilt from `state.json` read
@@ -2723,6 +2773,13 @@ export class SessionStore {
                           )
                       )
                   }),
+            // T1.5 last mile: the plugin-diagnostic journal, written only when it is non-empty,
+            // so a healthy session's `state.json` keeps its pre-T4 shape exactly like the
+            // `invalidThreads` block above. Durable because a restart does not change the fact
+            // that a plugin HAS been failing — that is the sentence an operator needs after one.
+            ...(session.pluginDiagnostics.length === 0
+                ? {}
+                : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             // The last committed snapshot. During an active run this is the latest
             // mutation boundary the observer captured (a completed tool's store
             // writes and tool-result message together), plus the event log above.
@@ -2880,6 +2937,104 @@ export class SessionStore {
         // so stderr is the only always-on channel. Callers/tests can inject
         // `onPersistenceError` instead and stay quiet.
         console.error(`[harness] failed to persist the harness database: ${error.message}`);
+    }
+
+    // The journal as a REPORTABLE list: copied, oldest first, `data` detached so a snapshot or
+    // resource consumer cannot mutate what the session stores (the compaction pass hands over an
+    // array of withheld units, and `store.get()` hands that to a caller). `structuredClone` is
+    // the same transfer rule the lane protocol uses; a value that cannot be cloned is kept by
+    // reference rather than dropping the entry — an un-clonable payload is a reason to keep the
+    // text, not to lose the fact that the plugin reported something.
+    private pluginDiagnosticsOf(session: Session): SessionPluginDiagnostic[] {
+        return session.pluginDiagnostics.map((entry) => ({
+            ...entry,
+            ...(entry.data === undefined
+                ? {}
+                : {
+                      data: (() => {
+                          try {
+                              return structuredClone(entry.data) as Record<string, unknown>;
+                          } catch {
+                              return entry.data;
+                          }
+                      })()
+                  })
+        }));
+    }
+
+    // -----------------------------------------------------------------------
+    // T1.5 (last mile): the plugin-diagnostic sink
+    // -----------------------------------------------------------------------
+
+    // The kinds that ALSO go to the server log. A `policy` report is deliberately NOT one of
+    // them: that is a plugin saying what it DECIDED (the shipped compactor names the units it
+    // withheld), which is information an operator reads on the session when they want it, not a
+    // problem to print on every turn. The three framework kinds are the "a plugin is broken"
+    // signal this whole channel exists for, so they are the ones worth stderr.
+    private static readonly LOGGED_DIAGNOSTIC_KINDS: ReadonlySet<HarnessDiagnosticEvent['kind']> = new Set([
+        'handler-threw',
+        'handler-timed-out',
+        'invalid-decision'
+    ]);
+
+    // The sink handed to every harness this store builds (`buildHarness`). Two jobs, in this
+    // order:
+    //
+    //   1. JOURNAL it on the session — bounded, durable, and projected onto the snapshot and the
+    //      `GET /sessions/{id}` resource, which is the observable surface a broken plugin was
+    //      missing. Copied, never aliased: the event object belongs to the framework, and a
+    //      consumer of the journal must not be able to write through it into the next report.
+    //   2. LOG the failure kinds (see `LOGGED_DIAGNOSTIC_KINDS`) so an operator tailing stderr
+    //      sees the same thing, with the plugin NAMED.
+    //
+    // What it does NOT do: schedule a save. The journal rides the NEXT state-change save, exactly
+    // like `session.invalidThreads` does, because a diagnostic is an observation rather than a
+    // transition — and letting a chatty or failing plugin drive the whole-document save rate would
+    // undo the coalescing rule the persistence layer was built around
+    // (docs/tasks/2026-11-09-context-inclusion-followups.md F6/T4).
+    //
+    // It can never fail a run in either direction (the framework's own fail-open rule,
+    // src/plugin/hooks.ts rule 2): the harness already swallows a throw from this callback, and
+    // everything below is total — a missing field becomes `''`, an empty message is replaced with
+    // a stated placeholder rather than dropped.
+    private notePluginDiagnostic(session: Session | undefined, event: HarnessDiagnosticEvent): void {
+        const owner = typeof event.owner === 'string' ? event.owner : '';
+        const message = typeof event.message === 'string' && event.message.trim().length > 0 ? event.message : 'no message';
+        const diagnostic: SessionPluginDiagnostic = {
+            at: Date.now(),
+            kind: event.kind,
+            owner,
+            // Absent stays absent: a `policy` report is not tied to one hook, and inventing an
+            // `event` for it would claim a failure that did not happen.
+            ...(typeof event.event === 'string' ? { event: event.event } : {}),
+            message,
+            ...(event.data === undefined ? {} : { data: event.data })
+        };
+
+        if (session !== undefined) {
+            session.pluginDiagnostics.push(diagnostic);
+
+            // Bounded, oldest first: the newest entries are the ones that explain a live problem,
+            // and a plugin that fails every turn must not grow `state.json` without limit.
+            if (session.pluginDiagnostics.length > PLUGIN_DIAGNOSTIC_LIMIT) {
+                session.pluginDiagnostics.splice(0, session.pluginDiagnostics.length - PLUGIN_DIAGNOSTIC_LIMIT);
+            }
+        }
+
+        if (!SessionStore.LOGGED_DIAGNOSTIC_KINDS.has(diagnostic.kind)) return;
+
+        const line = `[harness] plugin diagnostic${session === undefined ? '' : ` on session ${session.id}`}: ${owner || '(no owner)'} — ${diagnostic.event ?? 'no event'} ${diagnostic.kind}: ${message}`;
+
+        if (this.onPluginDiagnostic === undefined) {
+            console.error(line);
+            return;
+        }
+
+        try {
+            this.onPluginDiagnostic(diagnostic);
+        } catch {
+            // An injected reporter that throws must not become the failure it was reporting.
+        }
     }
 
     // Core state-change observer (attached at construction). Core fires it AFTER a
@@ -3195,6 +3350,10 @@ export class SessionStore {
                 // C4: replaced by tolerant restore below (persisted entries are
                 // re-validated there, so a stale one cannot survive a restart).
                 invalidThreads: new Map(),
+                // T1.5 last mile: the durable journal this document carried (the loader already
+                // dropped malformed entries and re-applied the cap). Absent means "nothing was
+                // ever reported", which is every document written before this field existed.
+                pluginDiagnostics: [...(record.pluginDiagnostics ?? [])],
                 legacyRunning: false,
                 watchers: new Set(),
                 pumping: false,
@@ -3624,6 +3783,13 @@ export class SessionStore {
                               messages: copyInvalidMessages(entry.messages)
                           }))
                   }),
+            // T1.5 last mile: the plugin-diagnostic journal (oldest first, capped), omitted when
+            // the session has never reported one — the same additive rule as `invalidThreads`
+            // immediately above, so a healthy session's snapshot stays byte-identical to the
+            // shape every existing client reads.
+            ...(session.pluginDiagnostics.length === 0
+                ? {}
+                : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             ...(session.labelSeeds.size === 0
                 ? {}
                 : {
@@ -3891,6 +4057,11 @@ export class SessionStore {
             // (GET /views/:id/threads/:threadId/transcript), which is exactly when the
             // UI has shown a transcript dialog.
             ...(threads.length === 0 ? {} : { threadViews: threadViewsOf(threads) }),
+            // T1.5 last mile: the plugin-diagnostic journal, on the COMPILED view too (see
+            // `SessionView.pluginDiagnostics` for why both headers carry it).
+            ...(session.pluginDiagnostics.length === 0
+                ? {}
+                : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             ...(session.invalidThreads.size === 0
                 ? {}
                 : {
@@ -8719,6 +8890,11 @@ export class SessionStore {
         // conversation has nothing left to describe. A reset starts the raw-JSON
         // editing over too.
         session.invalidThreads.clear();
+        // T1.5 last mile: the plugin-diagnostic journal deliberately SURVIVES a reset. It
+        // describes this session's plugin HEALTH, not the conversation that was just cleared —
+        // an operator who resets a broken compactor's session and then reads `GET /sessions`
+        // must still be able to see that it was failing, or the reset would look like a fix.
+        // (Its cap is what bounds the growth, not the conversation's lifetime.)
         // N4: a reset forgets the conversation, so a question from it is no longer
         // answerable. No pending entry exists here (reset refuses a busy session,
         // and a run expires its own questions), but the bounded history is cleared
@@ -8945,5 +9121,25 @@ export class SessionStore {
         this.releaseBusy(session);
         this.releaseDrain(session);
         this.releaseTurnWaiters(session);
+
+        // T1.6 — a session going away is the harness's teardown point. `dispose()` is
+        // idempotent and never aborts, so the runs the aborts above just cancelled still
+        // get their terminal hooks: `harness.dispose` is emitted by the LAST run to
+        // settle (the harness owns that ordering), which is exactly the guarantee the
+        // handle documents rather than something the server may guess at.
+        //
+        // Read as `Partial<Harness>` and called optionally because `session.harness` is
+        // the harness a session OWNS, and some fixtures hand the store a partial one
+        // (the same defensive read `threadsSupported`/`agentModels` already use elsewhere
+        // in this file, e.g. `session.harness as Partial<Harness>`). A real session always
+        // carries the full handle, so `dispose` is present; the `?.` is what keeps a
+        // reduced fixture from turning a teardown into a TypeError.
+        try {
+            (session.harness as Partial<Harness>).dispose?.();
+        } catch {
+            // Nothing to do: the session is gone, and every later frame is suppressed.
+            // The bus already swallows a throwing dispose handler (plugin/hooks.ts
+            // rule 2), so nothing a plugin does can land here.
+        }
     }
 }

@@ -667,4 +667,47 @@ describe('selectTools with declared core tools', () => {
             { name: 'filesCore', description: 'filesCore capability.', tags: ['files'] }
         ]);
     });
+
+    it('reports a conditionally-declared control in both directions (delegate-stress T1.2)', () => {
+        // `toolCancel` is `visibility: 'core'` AND declared only while the calling
+        // agent has background calls in flight — `registration.pendingOnly: true` in
+        // src/tools/runtime/toolCancel.tool.ts, appended by `offerDeclarations` and
+        // mirrored into discovery by `declaredForDiscovery` in src/harness.ts. The
+        // stress run (docs/tasks/2026-11-08-delegate-stress-test.md, finding 1) found
+        // the model told to "use toolCancel with that callId" while discovery answered
+        // `matched: 0`. The engine half of that contract is what is pinned here, in
+        // BOTH directions: whatever the caller declares is what the report says, and a
+        // pending-only control that is NOT declared stays a genuine miss — which is
+        // exactly why it must never become a catalogue candidate.
+        const cancel = make('toolCancel', ['tool', 'cancel', 'background', 'abort'], {
+            visibility: 'core',
+            description: 'Cancel one background tool call you started.'
+        });
+
+        // Declared (work in flight): reported as callable right now, never selected.
+        expect(selectTools([], { regex: '/cancel/i' }, { declared: [cancel] })).toEqual({
+            names: [],
+            tools: [],
+            alreadyAvailable: [
+                {
+                    name: 'toolCancel',
+                    description: 'Cancel one background tool call you started.',
+                    tags: ['tool', 'cancel', 'background', 'abort']
+                }
+            ]
+        });
+
+        // Not declared (nothing to cancel): the same query matches nothing at all.
+        expect(selectTools([], { regex: '/cancel/i' }, { declared: [] })).toEqual({
+            names: [],
+            tools: []
+        });
+
+        // And the tool is still never selectable when it is merely in the catalogue:
+        // core visibility, conditional or not, is not a discovery grant.
+        expect(selectTools([cancel], { names: ['toolCancel'] }, { declared: [] })).toEqual({
+            names: [],
+            tools: []
+        });
+    });
 });

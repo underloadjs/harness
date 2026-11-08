@@ -33,12 +33,26 @@ import {
     harness,
     tool
 } from '@underload/harness';
-import { TASK_DEFAULT_LEASE_MS } from './core/task';
+// The built-in collection SPECS (records-engine T3): a v2 snapshot stores each
+// collection's definition beside its entries (Decision M), so every fixture and every
+// expectation below names the spec it restores against. The lease constant this line
+// used to import died with Decision P.
+import {
+    CHAPTERS_COLLECTION,
+    LOCATIONS_COLLECTION,
+    PROFILES_COLLECTION,
+    TASKS_COLLECTION
+} from './core';
+// The read rule for the persisted tool outcome (compaction T1). Imported from the module,
+// like ./core/task above, so the round-trip assertions below pin the SAME helper a policy
+// uses rather than re-spelling `?? 'completed'` in a test.
+import { toolOutcomeOf, toolResultIsError } from './core/tool-outcome';
 import type {
     Agent,
     Harness,
     HarnessAttachment,
     HarnessMessage,
+    HarnessPluginApi,
     HarnessSnapshot,
     HarnessStateChangeEvent,
     HarnessStream,
@@ -51,6 +65,32 @@ import type {
     ToolCreation
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // ---------------------------------------------------------------------------
 // Clock policy
 // ---------------------------------------------------------------------------
@@ -62,7 +102,6 @@ import type {
 // same policy src/harness.thread-runtime.test.ts uses).
 const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
 const EPOCH_MS = Date.parse(EPOCH_ISO);
-const LEASE_UNTIL = EPOCH_MS + TASK_DEFAULT_LEASE_MS;
 
 beforeEach(() => {
     vi.useFakeTimers({ toFake: ['Date'] });
@@ -202,7 +241,6 @@ const taskItem = (
         at?: string;
         owner?: string;
         ownerThreadId?: string;
-        leaseUntil?: number;
     } = {}
 ): TaskItem => ({
     id,
@@ -214,7 +252,8 @@ const taskItem = (
     ...(shape.at === undefined ? {} : { updatedAt: shape.at }),
     ...(shape.owner === undefined ? {} : { owner: shape.owner }),
     ...(shape.ownerThreadId === undefined ? {} : { ownerThreadId: shape.ownerThreadId }),
-    ...(shape.leaseUntil === undefined ? {} : { leaseUntil: shape.leaseUntil })
+    // No owner / ownerThreadId / leaseUntil: Decision P deleted the lock, so a
+    // persisted claim field is reported as an unknown field, never restored.
 });
 
 // One change-log entry in the canonical key order core/task.ts appends them in.
@@ -270,64 +309,91 @@ const buildExpectedSnapshot = (): HarnessSnapshot => ({
     createdTools: [repeatCreation],
     createdToolCount: 1,
     records: {
-        // T1 persistence: every record carries its content revision and the writer,
-        // and the store keeps `storeRev` plus the bounded change feed so a resumed
-        // session can answer `since` without replaying anything.
-        todos: {
-            items: [
-                taskItem('1', 'Plan', { by: 'writer', at: EPOCH_ISO }),
-                taskItem('2', 'Draft', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
-            ],
-            nextId: 3,
-            storeRev: 3,
-            changes: [
-                taskEvent(1, '1', 'add', { by: 'writer', itemRev: 1 }),
-                taskEvent(2, '2', 'add', { by: 'writer', itemRev: 1 }),
-                taskEvent(3, '2', 'update', { by: 'writer', fields: ['completed'], itemRev: 2 })
-            ]
-        },
-        profiles: {
-            items: [
-                {
-                    id: '1',
-                    name: 'Elena',
-                    description: 'A cartographer.',
-                    traits: ['cartographer', 'pilot'],
-                    notes: 'Travels.'
-                }
-            ],
-            nextId: 2
-        },
-        chapters: {
-            items: [
-                {
-                    id: '1',
-                    title: 'Arrival',
-                    summary: 'They arrive.',
-                    content: 'Body.',
-                    status: 'draft',
-                    order: 2
-                },
-                {
-                    id: '2',
-                    title: 'Return',
-                    summary: 'They return.',
-                    content: '',
-                    status: 'planned'
-                }
-            ],
-            nextId: 3
-        },
-        locations: {
-            items: [
-                {
-                    id: '1',
-                    name: 'Harbor',
-                    description: 'A port.',
-                    notes: 'Fog.'
-                }
-            ],
-            nextId: 2
+        // ONE store, ONE counter (records-engine F3/T3): the ids below are the seed
+        // order across ALL collections — tasks 1,2 then profile 3 then chapters 4,5
+        // then location 6 — and the store-level nextId is one past the largest.
+        nextId: 7,
+        collections: {
+            // Every record carries its content revision and its writer, and the
+            // collection keeps `storeRev` plus its own bounded change feed (Decision B)
+            // so a resumed session can answer `since` without replaying anything.
+            tasks: {
+                definition: TASKS_COLLECTION,
+                items: [
+                    taskItem('1', 'Plan', { by: 'writer', at: EPOCH_ISO }),
+                    taskItem('2', 'Draft', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
+                ],
+                storeRev: 3,
+                changes: [
+                    taskEvent(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+                    taskEvent(2, '2', 'add', { by: 'writer', itemRev: 1 }),
+                    taskEvent(3, '2', 'update', { by: 'writer', fields: ['completed'], itemRev: 2 })
+                ]
+            },
+            chapters: {
+                definition: CHAPTERS_COLLECTION,
+                items: [
+                    {
+                        id: '4',
+                        title: 'Arrival',
+                        summary: 'They arrive.',
+                        content: 'Body.',
+                        status: 'draft',
+                        order: 2,
+                        rev: 1,
+                        updatedBy: 'writer',
+                        updatedAt: EPOCH_ISO
+                    },
+                    {
+                        id: '5',
+                        title: 'Return',
+                        summary: 'They return.',
+                        content: '',
+                        status: 'planned',
+                        rev: 1,
+                        updatedBy: 'writer',
+                        updatedAt: EPOCH_ISO
+                    }
+                ],
+                storeRev: 2,
+                changes: [
+                    taskEvent(1, '4', 'add', { by: 'writer', itemRev: 1 }),
+                    taskEvent(2, '5', 'add', { by: 'writer', itemRev: 1 })
+                ]
+            },
+            profiles: {
+                definition: PROFILES_COLLECTION,
+                items: [
+                    {
+                        id: '3',
+                        name: 'Elena',
+                        description: 'A cartographer.',
+                        traits: ['cartographer', 'pilot'],
+                        notes: 'Travels.',
+                        rev: 1,
+                        updatedBy: 'writer',
+                        updatedAt: EPOCH_ISO
+                    }
+                ],
+                storeRev: 1,
+                changes: [taskEvent(1, '3', 'add', { by: 'writer', itemRev: 1 })]
+            },
+            locations: {
+                definition: LOCATIONS_COLLECTION,
+                items: [
+                    {
+                        id: '6',
+                        name: 'Harbor',
+                        description: 'A port.',
+                        notes: 'Fog.',
+                        rev: 1,
+                        updatedBy: 'writer',
+                        updatedAt: EPOCH_ISO
+                    }
+                ],
+                storeRev: 1,
+                changes: [taskEvent(1, '6', 'add', { by: 'writer', itemRev: 1 })]
+            }
         }
     }
 });
@@ -340,16 +406,16 @@ const seedSource = async (): Promise<Harness> => {
     await writer.executeTool('toolRequest', { tags: ['bulk'] });
     await writer.executeTool('toolCreate', repeatCreation);
 
-    await writer.executeTool('task', { tasks: [{ text: 'Plan' }] });
-    await writer.executeTool('task', { tasks: [{ text: 'Draft' }] });
+    await writer.executeTool('tasks', { tasks: [{ text: 'Plan' }] });
+    await writer.executeTool('tasks', { tasks: [{ text: 'Draft' }] });
     // A guarded write (executeTool runs as the primary agent) needs the token the
     // caller read: id "2" was added at content rev 1 (src/core/task.ts).
-    await writer.executeTool('task', {
+    await writer.executeTool('tasks', {
         tasks: [{ id: '2', completed: true }],
         expects: [{ id: '2', rev: 1 }]
     });
 
-    await writer.executeTool('profileManage', {
+    await writer.executeTool('profiles', {
         action: 'add',
         name: 'Elena',
         description: 'A cartographer.',
@@ -357,7 +423,7 @@ const seedSource = async (): Promise<Harness> => {
         notes: 'Travels.'
     });
 
-    await writer.executeTool('chapterManage', {
+    await writer.executeTool('chapters', {
         action: 'add',
         title: 'Arrival',
         summary: 'They arrive.',
@@ -365,13 +431,13 @@ const seedSource = async (): Promise<Harness> => {
         status: 'draft',
         order: 2
     });
-    await writer.executeTool('chapterManage', {
+    await writer.executeTool('chapters', {
         action: 'add',
         title: 'Return',
         summary: 'They return.'
     });
 
-    await writer.executeTool('locationManage', {
+    await writer.executeTool('locations', {
         action: 'add',
         name: 'Harbor',
         description: 'A port.',
@@ -385,7 +451,7 @@ const seedSource = async (): Promise<Harness> => {
 // matrix. Kept small so each mutation is obvious.
 const seedSmall = async (): Promise<HarnessSnapshot> => {
     const writer = buildSession();
-    await writer.executeTool('task', { tasks: [{ text: 'One' }] });
+    await writer.executeTool('tasks', { tasks: [{ text: 'One' }] });
     await writer.executeTool('toolCreate', repeatCreation);
     return writer.snapshot();
 };
@@ -424,7 +490,7 @@ describe('harness snapshot/restore', () => {
         const snapshot = source.snapshot();
 
         // The whole value, not a sample: every persisted category is pinned.
-        expect(snapshot).toEqual(buildExpectedSnapshot());
+        expect(withoutIds(snapshot)).toEqual(buildExpectedSnapshot());
 
         // It must survive the disk shape a server writes.
         expectJsonShaped(snapshot);
@@ -451,17 +517,17 @@ describe('harness snapshot/restore', () => {
         ]);
         expect(target.agents.writer.model()).toBe('merge/ds4-flash');
         expect(target.agents.researcher.model()).toBe('research/model');
-        expect(target.agents.writer.messages).toEqual(seededWriterMessages);
-        expect(target.agents.researcher.messages).toEqual(seededResearcherMessages);
+        expect(withoutIds(target.agents.writer.messages)).toEqual(seededWriterMessages);
+        expect(withoutIds(target.agents.researcher.messages)).toEqual(seededResearcherMessages);
 
         // Ids continue from the restored counters, and so does the store revision:
         // three events were restored, this add is the fourth. The new record is
         // attributed to the restored harness's primary.
-        expect(await target.executeTool('task', { tasks: [{ text: 'Next' }] })).toEqual({
+        expect(await target.executeTool('tasks', { tasks: [{ text: 'Next' }] })).toEqual({
             tasks: [
                 taskItem('1', 'Plan', { by: 'writer', at: EPOCH_ISO }),
                 taskItem('2', 'Draft', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO }),
-                taskItem('3', 'Next', { by: 'writer', at: EPOCH_ISO })
+                taskItem('7', 'Next', { by: 'writer', at: EPOCH_ISO })
             ],
             counts: { total: 3, completed: 1, pending: 2 },
             page: { offset: 0, limit: 20, hasMore: false },
@@ -469,30 +535,46 @@ describe('harness snapshot/restore', () => {
         });
 
         // Record bodies and trait arrays survived the copy.
-        expect(await target.executeTool('profileManage', { action: 'get', id: '1' })).toEqual({
+        expect(await target.executeTool('profiles', { action: 'get', id: '3' })).toEqual({
             profile: {
-                id: '1',
+                id: '3',
                 name: 'Elena',
                 description: 'A cartographer.',
                 traits: ['cartographer', 'pilot'],
-                notes: 'Travels.'
+                notes: 'Travels.',
+                rev: 1,
+                updatedBy: 'writer',
+                updatedAt: EPOCH_ISO
             },
             counts: { total: 1 }
         });
-        expect(await target.executeTool('chapterManage', { action: 'get', id: '1' })).toEqual({
+        expect(await target.executeTool('chapters', { action: 'get', id: '4' })).toEqual({
             chapter: {
-                id: '1',
+                id: '4',
                 title: 'Arrival',
                 summary: 'They arrive.',
                 status: 'draft',
-                order: 2
+                order: 2,
+                rev: 1,
+                updatedBy: 'writer',
+                updatedAt: EPOCH_ISO
             },
+            // The body rides beside the summary — the wrapper contract the tool's own
+            // description states ('"get" returns { chapter, content, counts }').
             content: 'Body.',
             counts: { total: 2, planned: 1, draft: 1, complete: 0 }
         });
-        expect(await target.executeTool('locationManage', { action: 'list' })).toEqual({
+        expect(await target.executeTool('locations', { action: 'list' })).toEqual({
             locations: [
-                { id: '1', name: 'Harbor', description: 'A port.', notes: 'Fog.' }
+                {
+                    id: '6',
+                    name: 'Harbor',
+                    description: 'A port.',
+                    notes: 'Fog.',
+                    rev: 1,
+                    updatedBy: 'writer',
+                    updatedAt: EPOCH_ISO
+                }
             ],
             counts: { total: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
@@ -563,7 +645,7 @@ describe('harness snapshot/restore', () => {
         // registered but not declared.
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'delegate',
             'repeat',
             'bulk01',
@@ -666,7 +748,7 @@ describe('harness snapshot/restore', () => {
 
         // The user message is committed; the assistant reply is still streaming.
         // Snapshot reads the committed state and never mutates anything.
-        expect(session.snapshot()).toEqual({
+        expect(withoutIds(session.snapshot())).toEqual({
             version: HARNESS_SNAPSHOT_VERSION,
             agents: {
                 writer: {
@@ -678,12 +760,16 @@ describe('harness snapshot/restore', () => {
             createdTools: [],
             createdToolCount: 0,
             records: {
-                // An untouched T1 store still serializes `storeRev: 0` and the empty
-                // feed, because `snapshot()` always emits both.
-                todos: { items: [], nextId: 1, storeRev: 0, changes: [] },
-                profiles: { items: [], nextId: 1 },
-                chapters: { items: [], nextId: 1 },
-                locations: { items: [], nextId: 1 }
+                // An untouched store still serializes `storeRev: 0` and the empty feed
+                // for every collection, because `snapshot()` always emits both — and it
+                // carries ONE counter at the store level (F3).
+                nextId: 1,
+                collections: {
+                    tasks: { definition: TASKS_COLLECTION, items: [], storeRev: 0, changes: [] },
+                    chapters: { definition: CHAPTERS_COLLECTION, items: [], storeRev: 0, changes: [] },
+                    profiles: { definition: PROFILES_COLLECTION, items: [], storeRev: 0, changes: [] },
+                    locations: { definition: LOCATIONS_COLLECTION, items: [], storeRev: 0, changes: [] }
+                }
             }
         });
 
@@ -717,7 +803,7 @@ describe('harness snapshot/restore', () => {
                 yield {
                     type: 'done',
                     stopReason: 'tool_calls',
-                    toolCalls: [{ id: 'c1', name: 'task', arguments: toolArguments }]
+                    toolCalls: [{ id: 'c1', name: 'tasks', arguments: toolArguments }]
                 };
                 return;
             }
@@ -752,25 +838,25 @@ describe('harness snapshot/restore', () => {
         expect(captures).toHaveLength(1);
         const checkpoint = captures[0];
 
-        expect(checkpoint.records.todos).toEqual({
+        expect(checkpoint.records.collections.tasks).toEqual({
+            definition: TASKS_COLLECTION,
             items: [taskItem('1', 'Durable', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })],
-            nextId: 2,
             storeRev: 1,
             changes: [taskEvent(1, '1', 'add', { by: 'writer', threadId: 'agent:writer', itemRev: 1 })]
         });
-        expect(checkpoint.agents.writer.messages).toEqual([
+        expect(withoutIds(checkpoint.agents.writer.messages)).toEqual([
             { role: 'user', content: 'go' },
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'c1', name: 'task', arguments: toolArguments }]
+                toolCalls: [{ id: 'c1', name: 'tasks', arguments: toolArguments }]
             },
             {
                 role: 'tool',
                 content:
                     '{"tasks":[{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1}',
                 toolCallId: 'c1',
-                name: 'task'
+                name: 'tasks'
             }
         ]);
 
@@ -789,7 +875,7 @@ describe('harness snapshot/restore', () => {
         target.restore(checkpoint);
 
         expect(target.snapshot()).toEqual(checkpoint);
-        expect(await target.executeTool('task', {})).toEqual({
+        expect(await target.executeTool('tasks', {})).toEqual({
             tasks: [taskItem('1', 'Durable', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false },
@@ -837,13 +923,13 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         // `snapshot()` runs the SAME reader `restore()` enforces, so the flagged
         // entry is exactly what a host will find on disk, and its unflagged
         // neighbours carry no `included` key at all.
-        expect(snapshot.agents.writer.messages).toEqual(flaggedWriterMessages());
+        expect(withoutIds(snapshot.agents.writer.messages)).toEqual(flaggedWriterMessages());
 
         const seen: HarnessStreamRequest[] = [];
         const target = buildSession({ turns: [answer('after restore')], seen });
         target.restore(snapshot);
 
-        expect(target.agents.writer.messages).toEqual(flaggedWriterMessages());
+        expect(withoutIds(target.agents.writer.messages)).toEqual(flaggedWriterMessages());
         // Re-saving is lossless and stable: the flag survives, nothing is added.
         expect(target.snapshot()).toEqual(snapshot);
 
@@ -863,7 +949,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
             { role: 'user', content: 'continue' }
         ]);
         expect(JSON.stringify(seen[seen.length - 1].messages)).not.toContain('included');
-        expect(target.agents.writer.messages).toEqual([
+        expect(withoutIds(target.agents.writer.messages)).toEqual([
             ...flaggedWriterMessages(),
             { role: 'user', content: 'continue' },
             { role: 'assistant', content: 'after restore' }
@@ -875,7 +961,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         const target = buildSession();
 
         expect(() => target.restore(clone(snapshot))).not.toThrow();
-        expect(target.agents.writer.messages).toEqual(seededWriterMessages);
+        expect(withoutIds(target.agents.writer.messages)).toEqual(seededWriterMessages);
         expect(JSON.stringify(target.snapshot())).not.toContain('included');
     });
 
@@ -888,8 +974,110 @@ describe('snapshot persistence of the context-inclusion flag', () => {
 
         // Absent means included, and the runtime never writes `true`, so a re-save
         // drops the key instead of perpetuating a value the schema does not use.
-        expect(target.agents.writer.messages[1]).toEqual({ role: 'user', content: 'seed question' });
+        expect(withoutIds(target.agents.writer.messages[1])).toEqual({ role: 'user', content: 'seed question' });
         expect(JSON.stringify(target.snapshot())).not.toContain('included');
+    });
+
+    // -----------------------------------------------------------------------
+    // Context T1 — the persisted transcript address.
+    //
+    // `messageId` is OPTIONAL on read (a `state.json` written before ids existed must
+    // keep restoring), and the reader BACKFILLS it: every path into canonical state goes
+    // through `readHarnessMessages`, so minting here is the one place that can promise
+    // a restored conversation is addressable from its very next round. The three tests
+    // below pin the two halves of that decision plus its idempotence requirement.
+    // -----------------------------------------------------------------------
+
+    it('restores a transcript written before addresses existed, and mints them in transcript order', async () => {
+        const preId = clone(await seedSmall());
+
+        // A document from before T1: no entry carries the key at all.
+        for (const name of Object.keys(preId.agents)) {
+            preId.agents[name].messages = preId.agents[name].messages.map((message) => {
+                const copy = { ...message } as Record<string, unknown>;
+                delete copy.messageId;
+
+                return copy as HarnessMessage;
+            });
+        }
+
+        expect(JSON.stringify(preId.agents)).not.toContain('messageId');
+
+        const target = buildSession();
+        expect(() => target.restore(preId)).not.toThrow();
+
+        // BACKFILL-ON-READ, numbered from the top of the transcript, because nothing in
+        // the document claimed a number (src/core/message-id.ts counts per transcript).
+        expect(target.agents.writer.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3'
+        ]);
+
+        // IDEMPOTENCE, the property `applyIncluded` already protects: an address that is
+        // already there is carried verbatim, so `restore -> snapshot` hands the same
+        // document back and a host that re-saves it does not renumber its conversation.
+        const first = target.snapshot();
+        target.restore(clone(first));
+        expect(target.snapshot()).toEqual(first);
+        expect(target.agents.writer.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3'
+        ]);
+    });
+
+    it('honours the addresses a document carries and numbers the next entry above them', async () => {
+        const source = clone(await seedSmall());
+        source.agents.writer.messages = source.agents.writer.messages.map(
+            (message, index) =>
+                ({ ...message, messageId: `msg-${String(index + 9)}` }) as HarnessMessage
+        );
+
+        const target = buildSession();
+        target.restore(source);
+
+        // A copy never re-mints: the restored entries keep the ids the document named.
+        expect(target.agents.writer.messages.map((message) => message.messageId)).toEqual([
+            'msg-9',
+            'msg-10',
+            'msg-11'
+        ]);
+
+        // And the transcript's counter starts ABOVE what it restored, so the next
+        // creation cannot collide with an id the file already owns — the same
+        // reserve-from-max rule src/harness.ts applies to restored branch ids.
+        await target('continue');
+        expect(target.agents.writer.messages.map((message) => message.messageId)).toEqual([
+            'msg-9',
+            'msg-10',
+            'msg-11',
+            'msg-12',
+            'msg-13'
+        ]);
+    });
+
+    it('refuses a messageId that is not a usable address, and leaves the target untouched', async () => {
+        const valid = await seedSmall();
+
+        const notAString = clone(valid);
+        (notAString.agents.writer.messages[1] as Record<string, unknown>).messageId = 7;
+
+        const blank = clone(valid);
+        (blank.agents.writer.messages[0] as Record<string, unknown>).messageId = '';
+
+        const target = buildSession();
+        const before = target.snapshot();
+
+        // Refused rather than silently re-minted: the caller (a server transcript PUT, a
+        // hand-edited file) has to learn its address was not taken seriously.
+        expect(() => target.restore(notAString)).toThrow(
+            'snapshot.agents["writer"].messages[1].messageId must be a string.'
+        );
+        expect(() => target.restore(blank)).toThrow(
+            'snapshot.agents["writer"].messages[0].messageId must be at least 1 characters.'
+        );
+        expect(target.snapshot()).toEqual(before);
     });
 
     it('refuses an `included` value that is not a boolean and leaves the target untouched', async () => {
@@ -966,7 +1154,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
 
         // Exclusion must not be an excuse to drop bytes: the persisted entry keeps
         // BOTH the attachment list and the flag, in the reader's key order.
-        expect(snapshot.agents.writer.messages).toStrictEqual([
+        expect(withoutIds(snapshot.agents.writer.messages)).toStrictEqual([
             { role: 'user', content: 'see [Image 1]', attachments: [PNG()], included: false },
             { role: 'user', content: 'plain' }
         ]);
@@ -975,7 +1163,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         const target = agentSession(seeded, seen);
         target.restore(snapshot);
 
-        expect(target.agent.messages).toStrictEqual([
+        expect(withoutIds(target.agent.messages)).toStrictEqual([
             { role: 'user', content: 'see [Image 1]', attachments: [PNG()], included: false },
             { role: 'user', content: 'plain' }
         ]);
@@ -1011,7 +1199,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         // disabled entry keeps its flag there too, and a hand-written `true` is
         // already normalized away before the file is ever written.
         expect(snapshot.threads).toHaveLength(1);
-        expect(snapshot.threads![0].messages).toStrictEqual([
+        expect(withoutIds(snapshot.threads![0].messages)).toStrictEqual([
             { role: 'system', content: 'thread sys' },
             { role: 'user', content: 'thread off', included: false },
             { role: 'user', content: 'thread on' }
@@ -1020,8 +1208,11 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         const target = agentSession([{ role: 'user', content: 'main' }]);
         target.restore(snapshot);
 
+        // No normalizer on either side: this is the `restore -> snapshot` round trip,
+        // and what it proves now includes the transcript addresses coming back
+        // byte-for-byte (context T1.3).
         expect(target.snapshot()).toEqual(snapshot);
-        expect(target.threadMessages(thread.id)).toStrictEqual([
+        expect(withoutIds(target.threadMessages(thread.id))).toStrictEqual([
             { role: 'system', content: 'thread sys' },
             { role: 'user', content: 'thread off', included: false },
             { role: 'user', content: 'thread on' }
@@ -1030,8 +1221,325 @@ describe('snapshot persistence of the context-inclusion flag', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Compaction T1 — the persisted tool outcome (F2 of that entry)
+// ---------------------------------------------------------------------------
+
+// The classification a delivery computes is otherwise LOST the moment the run ends: the
+// event stream is gone, and the committed entry carried only result prose. These tests pin
+// the four properties the substrate depends on:
+//   * a NON-`completed` outcome is persisted, verbatim, on the canonical message;
+//   * a `completed` one is NOT (no key, no `"completed"` string), so a pre-outcome
+//     snapshot and a post-T1 snapshot of the same healthy conversation are the same bytes;
+//   * a snapshot round-trips (and re-saves identically) through the same strict reader a
+//     `threadRead` and a branch record go through;
+//   * a value outside the union is REFUSED, and an explicitly-written `completed` is
+//     normalized back to the omitted form, exactly like `included: true` above.
+describe('snapshot persistence of the tool outcome', () => {
+    // One failed unit and one healthy unit, both INCLUDED, so the fixture isolates the new
+    // key from the flag semantics pinned above.
+    const outcomeWriterMessages = (): HarnessMessage[] => [
+        { role: 'system', content: 'Write.' },
+        { role: 'user', content: 'seed question' },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c1', name: 'bulk01', arguments: '{}' }]
+        },
+        {
+            role: 'tool',
+            content: 'Tool "bulk01" failed: kaput',
+            toolCallId: 'c1',
+            name: 'bulk01',
+            outcome: 'failed'
+        },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c2', name: 'bulk02', arguments: '{}' }]
+        },
+        { role: 'tool', content: 'found', toolCallId: 'c2', name: 'bulk02' },
+        { role: 'assistant', content: 'seed answer' }
+    ];
+
+    // The same session built by splicing the two units into the seeded transcript, so the
+    // agent set stays identical to what `buildSession()` restores into.
+    const outcomeSession = (): Harness => {
+        const session = buildSession();
+        session.agents.writer.messages.splice(2, 0, ...outcomeWriterMessages().slice(2, 6));
+        return session;
+    };
+
+    it('writes no outcome key while every result completed, and reads a pre-outcome document as completed', async () => {
+        // The omit rule in one assertion: a healthy transcript — every fixture in this file,
+        // and every one an older build wrote — carries no `outcome` key at all.
+        expect(JSON.stringify(await seedSmall())).not.toContain('"outcome"');
+        expect(JSON.stringify(buildSession().snapshot())).not.toContain('"outcome"');
+
+        // A PRE-OUTCOME document: this session with the classification taken back out, i.e.
+        // exactly what is on disk for a conversation saved before T1.
+        const snapshot = clone(outcomeSession().snapshot());
+        delete (snapshot.agents.writer.messages[3] as Record<string, unknown>).outcome;
+
+        const target = buildSession();
+        target.restore(snapshot);
+
+        const restored = target.agents.writer.messages[3] as Extract<
+            HarnessMessage,
+            { role: 'tool' }
+        >;
+
+        // ABSENT reads as `completed` (core/tool-outcome.ts `toolOutcomeOf`) — the only
+        // reading that keeps every existing document valid with no migration. And NOTHING
+        // reconstructs a failure from the prose: the text still says "failed" while the
+        // stored fact stays absent, because there is deliberately no string-matching bridge
+        // (T1.5). A policy therefore never prunes on such an entry alone (T0 Q3).
+        expect(restored.content).toBe('Tool "bulk01" failed: kaput');
+        expect('outcome' in restored).toBe(false);
+        expect(toolOutcomeOf(restored)).toBe('completed');
+        expect(toolResultIsError(restored)).toBe(false);
+    });
+
+    it('persists a failed outcome, restores it byte-for-byte, and re-saves identically', async () => {
+        const snapshot = clone(outcomeSession().snapshot());
+
+        // `snapshot()` runs the same reader `restore()` enforces, so what a host sees on disk
+        // is exactly the stored form: the failure carries its value, the healthy sibling
+        // carries nothing.
+        expect(withoutIds(snapshot.agents.writer.messages)).toEqual(outcomeWriterMessages());
+
+        const seen: HarnessStreamRequest[] = [];
+        const target = buildSession({ turns: [answer('after restore')], seen });
+        target.restore(snapshot);
+
+        expect(withoutIds(target.agents.writer.messages)).toEqual(outcomeWriterMessages());
+        expect(target.snapshot()).toEqual(snapshot);
+
+        // Restore is idempotent for a classified transcript too, and `completed` never
+        // creeps back in on a re-save.
+        target.restore(snapshot);
+        expect(target.snapshot()).toEqual(snapshot);
+        expect(JSON.stringify(target.snapshot())).toContain('"outcome":"failed"');
+        expect(JSON.stringify(target.snapshot())).not.toContain('"outcome":"completed"');
+
+        await target('continue');
+
+        // The model-facing PROJECTION keeps the outcome (`withIncluded` strips only
+        // `included`/`messageId`), so a `turn.before` policy can read WHY a call ended from
+        // the very transcript it is being asked about. The provider payload itself is
+        // field-selected by the transport and stays unchanged — pinned in
+        // src/transport/openai.test.ts.
+        const projected = seen[seen.length - 1].messages.filter(
+            (message) => message.role === 'tool'
+        );
+        expect(projected).toEqual([
+            {
+                role: 'tool',
+                content: 'Tool "bulk01" failed: kaput',
+                toolCallId: 'c1',
+                name: 'bulk01',
+                outcome: 'failed'
+            },
+            { role: 'tool', content: 'found', toolCallId: 'c2', name: 'bulk02' }
+        ]);
+    });
+
+    it('normalizes a hand-written `outcome: "completed"` back to the omitted form', () => {
+        const snapshot = clone(outcomeSession().snapshot());
+        // A host that spelled the healthy value out instead of omitting it.
+        (snapshot.agents.writer.messages[5] as Record<string, unknown>).outcome = 'completed';
+
+        const target = buildSession();
+        target.restore(snapshot);
+
+        // The runtime never writes `completed`, so a re-save drops it rather than
+        // perpetuating a second spelling of the same fact (the `included: true` rule).
+        expect(withoutIds(target.agents.writer.messages[5])).toEqual({
+            role: 'tool',
+            content: 'found',
+            toolCallId: 'c2',
+            name: 'bulk02'
+        });
+        // The real failure is untouched by that normalization.
+        expect((target.agents.writer.messages[3] as { outcome?: string }).outcome).toBe('failed');
+        expect(JSON.stringify(target.snapshot())).not.toContain('"outcome":"completed"');
+    });
+
+    it('refuses an outcome outside the union and leaves the target untouched', () => {
+        const invalid = clone(outcomeSession().snapshot());
+        (invalid.agents.writer.messages[3] as Record<string, unknown>).outcome = 'fail';
+
+        const target = buildSession();
+        const before = target.snapshot();
+
+        // Refused, not read as healthy: a mistyped classification that silently became
+        // `completed` would hide a failure from every policy that prunes on one.
+        expect(() => target.restore(invalid)).toThrow(
+            'snapshot.agents["writer"].messages[3].outcome must be one of: completed, failed, rejected, cancelled (or be omitted).'
+        );
+        expect(target.snapshot()).toEqual(before);
+    });
+
+    it('persists the outcome of a thread transcript and restores it with the thread', () => {
+        const source = buildSession();
+        const thread = source.createThread('writer', { label: 'Outcome' });
+        source.setThreadMessages(thread.id, [
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'bulk01', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'Tool "bulk01" was cancelled before it produced a value.',
+                toolCallId: 'c1',
+                name: 'bulk01',
+                outcome: 'cancelled'
+            }
+        ]);
+
+        const snapshot = clone(source.snapshot());
+
+        // The thread reader IS the shared `readHarnessMessages`, so the tool allowlist and
+        // this key apply to a host thread exactly as they do to an agent transcript.
+        expect(withoutIds(snapshot.threads![0].messages)).toEqual([
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'bulk01', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'Tool "bulk01" was cancelled before it produced a value.',
+                toolCallId: 'c1',
+                name: 'bulk01',
+                outcome: 'cancelled'
+            }
+        ]);
+
+        const target = buildSession();
+        target.restore(snapshot);
+
+        // Restored with the thread: `toStrictEqual` so the key set itself is pinned — the
+        // classification is there, and the healthy entries around it gained nothing.
+        expect(
+            target.threadMessages(thread.id)[1]
+        ).toStrictEqual({
+            role: 'tool',
+            content: 'Tool "bulk01" was cancelled before it produced a value.',
+            toolCallId: 'c1',
+            name: 'bulk01',
+            outcome: 'cancelled',
+            messageId: expect.any(String)
+        });
+        expect(target.snapshot()).toEqual(snapshot);
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Validation / no partial application
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Pipeline T3 — an entry EDIT is persisted state, not a request-only rewrite
+// ---------------------------------------------------------------------------
+
+describe('snapshot persistence of an entry edit', () => {
+    // One host plugin re-wording one entry through the real `turn.before` control
+    // surface. The `find` guard makes the write one-shot: after the first round no entry
+    // still carries the old text, so a later round of the same run changes nothing.
+    const editPlugin = (from: string, to: string) => ({
+        name: `edit-${to}`,
+        setup: (api: HarnessPluginApi) => {
+            api.on('turn.before', (context) => {
+                const target = context.entries.find(
+                    (candidate) => candidate.message.content === from
+                );
+
+                if (target === undefined) return;
+
+                context.edit(target, { content: to });
+            });
+        }
+    });
+
+    const editSession = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): Harness =>
+        harness({
+            agents: {
+                writer: agent({
+                    model: 'merge/ds4-flash',
+                    instruction: 'Write.',
+                    messages: [{ role: 'user', content: 'seed question' }],
+                    stream: scripted(turns, seen)
+                })
+            },
+            presets: false,
+            plugins: [editPlugin('seed question', 'edited seed')]
+        });
+
+    it('persists the edited text through JSON and serves it after a restart', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const source = editSession([answer('settled')], seen);
+
+        await source('go');
+
+        // (1) The request the edit was made for already carried the new text (T3.2), so
+        //     the run that made it is the run that used it.
+        expect(seen[0].messages.map((message) => message.content)).toEqual([
+            'Write.',
+            'edited seed',
+            'go'
+        ]);
+
+        const snapshot = clone(source.snapshot());
+
+        // (2) The persisted document carries the new text and NOTHING ELSE moved. Every
+        //     message keeps its exact key set: an edit writes fields the per-role
+        //     whitelists already list, which is why no whitelist had to change (T3.6),
+        //     and no `included` key appeared on the way.
+        expect(withoutIds(snapshot.agents.writer.messages)).toEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'edited seed' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'settled' }
+        ]);
+        expect(
+            snapshot.agents.writer.messages.map((message) => Object.keys(message))
+        ).toEqual([
+            // `messageId` is the one key the snapshot whitelist gained (context T1.3);
+            // an EDIT still added nothing, which is what T3.6 pinned.
+            ['role', 'content', 'messageId'],
+            ['role', 'content', 'messageId'],
+            ['role', 'content', 'messageId'],
+            ['role', 'content', 'messageId']
+        ]);
+        expect(JSON.stringify(snapshot.agents.writer.messages)).not.toContain('included');
+
+        // (3) A restart from that document serves the EDITED text with no plugin involved
+        //     at all: an edit is canonical, not request-scoped. Re-saving is stable.
+        const restoredSeen: HarnessStreamRequest[] = [];
+        const target = harness({
+            agents: {
+                writer: agent({
+                    model: 'merge/ds4-flash',
+                    stream: scripted([answer('after restore')], restoredSeen)
+                })
+            },
+            presets: false
+        });
+        target.restore(snapshot);
+        expect(target.snapshot()).toEqual(snapshot);
+
+        await target('again');
+
+        expect(restoredSeen[restoredSeen.length - 1].messages).toEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'edited seed' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'settled' },
+            { role: 'user', content: 'again' }
+        ]);
+    });
+});
 
 describe('harness restore validation', () => {
     // Every invalid case starts from a fresh target and asserts both the exact
@@ -1053,8 +1561,12 @@ describe('harness restore validation', () => {
 
     it('pins the schema version', async () => {
         await restoreRejects((snapshot) => {
-            snapshot.version = 2 as unknown as HarnessSnapshot['version'];
-        }, /Snapshot version 2 is not supported; this harness reads version 1\./);
+            // v2 is the records-engine shape (one collection map, one id counter),
+            // so the unsupported-version probe now names v1 as the file from before the
+            // collapse: R5 says nothing is in production, so a v1 snapshot is REFUSED by
+            // the version gate rather than half-migrated into the new reader.
+            snapshot.version = 1 as unknown as HarnessSnapshot['version'];
+        }, /Snapshot version 1 is not supported; this harness reads version 2\./);
     });
 
     it('rejects a non-object snapshot and unknown top-level fields', async () => {
@@ -1137,19 +1649,20 @@ describe('harness restore validation', () => {
 
     it('rejects duplicate record ids and a colliding nextId', async () => {
         await restoreRejects((snapshot) => {
-            snapshot.records.todos.items.push(clone(snapshot.records.todos.items[0]));
-            snapshot.records.todos.nextId = 3;
-        }, /todo state contains the duplicate id "1"\./);
+            snapshot.records.collections.tasks.items.push(clone(snapshot.records.collections.tasks.items[0]));
+        }, /lists the same id twice; ids are unique\./);
 
         await restoreRejects((snapshot) => {
-            snapshot.records.todos.nextId = 1;
-        }, /todo state\.nextId must be greater than the largest id \(1\); received 1\./);
+            // ONE counter for the whole store (F3): the largest id across every
+            // collection here is 6 (location), so anything at or below it collides.
+            snapshot.records.nextId = 1;
+        }, /records state\.nextId must be greater than the largest id \(1\); received 1\./);
     });
 
     it('rejects unknown record fields', async () => {
         await restoreRejects((snapshot) => {
-            (snapshot.records.locations as unknown as Record<string, unknown>).extra = true;
-        }, /location state has an unknown field "extra"\./);
+            (snapshot.records.collections.locations as unknown as Record<string, unknown>).extra = true;
+        }, /records state\.collections\.locations has an unknown field "extra"\./);
     });
 
     // -----------------------------------------------------------------------
@@ -1161,12 +1674,18 @@ describe('harness restore validation', () => {
     // A pre-T1 `records.todos` block: no `rev` on any record, and no `storeRev` or
     // `changes` on the store. Snapshot version 1 did not change, so this is a real
     // file a live server has on disk.
+    // A pre-T1 RECORD shape (no `rev`, no attribution) inside the v2 collection
+    // block: the counter moved to the store, and the definition is the spec the entries
+    // are validated against. Nothing is invented on the way in — `rev: 1`, `storeRev: 0`,
+    // empty feed.
     const legacyTodos = {
+        definition: TASKS_COLLECTION,
         items: [
             { id: '1', text: 'Legacy open', completed: false },
             { id: '2', text: 'Legacy done', completed: true }
         ],
-        nextId: 3
+        storeRev: 0,
+        changes: []
     };
 
     it('restores a pre-T1 task store with the documented defaults', async () => {
@@ -1174,17 +1693,20 @@ describe('harness restore validation', () => {
         const target = buildSession();
         const restored = clone(valid) as unknown as HarnessSnapshot;
 
-        (restored.records as unknown as { todos: unknown }).todos = clone(legacyTodos);
+        (restored.records as unknown as { collections: Record<string, unknown> }).collections.tasks = clone(legacyTodos);
+        // ONE store-level counter (F3): the legacy block tops out at id 2, so the
+        // counter has to be past it or the restore reports a collision.
+        restored.records.nextId = 3 as (typeof restored.records)['nextId'];
         target.restore(restored);
 
         // `rev` is the revision a record was CREATED with, and an old file has no
         // history at all: storeRev 0, empty feed. Nothing is invented.
-        expect(target.snapshot().records.todos).toEqual({
+        expect(target.snapshot().records.collections.tasks).toEqual({
+            definition: TASKS_COLLECTION,
             items: [
                 taskItem('1', 'Legacy open'),
                 taskItem('2', 'Legacy done', { completed: true })
             ],
-            nextId: 3,
             storeRev: 0,
             changes: []
         });
@@ -1192,7 +1714,7 @@ describe('harness restore validation', () => {
         // The next write is a normal guarded write from rev 1, so a resumed session
         // can use every T1 verb immediately — and the feed starts from zero.
         expect(
-            await target.executeTool('task', {
+            await target.executeTool('tasks', {
                 tasks: [{ id: '1', completed: true }],
                 expects: [{ id: '1', rev: 1 }]
             })
@@ -1212,7 +1734,10 @@ describe('harness restore validation', () => {
         const target = buildSession();
         const restored = clone(valid) as unknown as HarnessSnapshot;
 
-        (restored.records as unknown as { todos: unknown }).todos = clone(legacyTodos);
+        (restored.records as unknown as { collections: Record<string, unknown> }).collections.tasks = clone(legacyTodos);
+        // ONE store-level counter (F3): the legacy block tops out at id 2, so the
+        // counter has to be past it or the restore reports a collision.
+        restored.records.nextId = 3 as (typeof restored.records)['nextId'];
         target.restore(restored);
 
         const normalized = target.snapshot();
@@ -1220,9 +1745,9 @@ describe('harness restore validation', () => {
         // A restore that changes nothing observable must not invent events either:
         // snapshotting straight back is the same defaulted block, so a host that
         // saves on every notification cannot grow a feed out of a legacy file.
-        expect(normalized.records.todos).toEqual({
+        expect(normalized.records.collections.tasks).toEqual({
+            definition: TASKS_COLLECTION,
             items: [taskItem('1', 'Legacy open'), taskItem('2', 'Legacy done', { completed: true })],
-            nextId: 3,
             storeRev: 0,
             changes: []
         });
@@ -1236,37 +1761,40 @@ describe('harness restore validation', () => {
     it('rejects a task record or change field the persisted schema does not describe', async () => {
         // A typo in a persisted T1 field is data loss, so it fails loudly.
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos.items[0] as unknown as Record<string, unknown>).reve = 2;
-        }, /todo state\.items\[0\] has an unknown field "reve"\./);
+            (snapshot.records.collections.tasks.items[0] as unknown as Record<string, unknown>).reve = 2;
+        }, /records state\.collections\.tasks\.items\[0\] has an unknown field "reve"\./);
 
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos.items[0] as unknown as Record<string, unknown>).rev = 0;
-        }, /todo state\.items\[0\]\.rev must be between 1 and Infinity\./);
+            (snapshot.records.collections.tasks.items[0] as unknown as Record<string, unknown>).rev = 0;
+        }, /records state.collections.tasks\.items\[0\]\.rev must be between 1 and Infinity\./);
 
-        // `leaseUntil` protects a HOLDER; an expiry with no owner protects nothing.
+        // Decision P deleted the lock, so a persisted claim field is not restored and
+        // not cross-checked — it is refused as a key the shape does not describe. That is
+        // the honest replacement for the old "leaseUntil needs owner" rule: an old file
+        // cannot silently re-introduce a lock the engine no longer models.
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos.items[0] as unknown as Record<string, unknown>).leaseUntil =
-                LEASE_UNTIL;
-        }, /todo state\.items\[0\]\.leaseUntil needs "owner"\./);
+            (snapshot.records.collections.tasks.items[0] as unknown as Record<string, unknown>).leaseUntil =
+                EPOCH_MS + 900_000;
+        }, /items\[0\] has an unknown field "leaseUntil"\./);
 
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos.items[0] as unknown as Record<string, unknown>).leaseUntil = 'soon';
-        }, /todo state\.items\[0\]\.leaseUntil must be a finite positive number\./);
+            (snapshot.records.collections.tasks.items[0] as unknown as Record<string, unknown>).leaseUntil = 'soon';
+        }, /items\[0\] has an unknown field "leaseUntil"\./);
 
         // The feed itself: an unknown store key, an op the tool never logs, and a
         // log that does not rise.
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos as unknown as Record<string, unknown>).revision = 1;
-        }, /todo state has an unknown field "revision"\./);
+            (snapshot.records.collections.tasks as unknown as Record<string, unknown>).revision = 1;
+        }, /records state.collections.tasks has an unknown field "revision"\./);
 
         await restoreRejects((snapshot) => {
-            const todos = snapshot.records.todos as unknown as { changes: Record<string, unknown>[] };
+            const todos = snapshot.records.collections.tasks as unknown as { changes: Record<string, unknown>[] };
 
             todos.changes[0].op = 'explode';
-        }, /todo state\.changes\[0\]\.op must be one of: add, update, remove, claim, release\./);
+        }, /changes\[0\]\.op must be one of: add, update, remove\./);
 
         await restoreRejects((snapshot) => {
-            const todos = snapshot.records.todos as unknown as {
+            const todos = snapshot.records.collections.tasks as unknown as {
                 changes: unknown[];
                 storeRev: number;
             };
@@ -1278,31 +1806,31 @@ describe('harness restore validation', () => {
                 taskEvent(1, '1', 'add', { by: 'writer', itemRev: 1 })
             ];
             todos.storeRev = 2;
-        }, /todo state\.changes must be ordered by a rising rev; 1 follows 2\./);
+        }, /records state\.collections\.tasks\.changes must be strictly ascending in "rev"; 1 follows 2\./);
 
         // A feed that runs ahead of the revision it was written under is the same
         // corruption in the other direction: every event is bounded by `storeRev`.
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos as unknown as Record<string, unknown>).storeRev = 0;
-        }, /todo state\.changes\[0\]\.rev must be between 1 and 0\./);
+            (snapshot.records.collections.tasks as unknown as Record<string, unknown>).storeRev = 0;
+        }, /storeRev is 0, behind the last retained change \(1\)\./);
 
         // `fields` names content fields only, and never a field twice.
         await restoreRejects((snapshot) => {
-            const todos = snapshot.records.todos as unknown as { changes: Record<string, unknown>[] };
+            const todos = snapshot.records.collections.tasks as unknown as { changes: Record<string, unknown>[] };
 
             todos.changes[0].fields = ['owner'];
-        }, /todo state\.changes\[0\]\.fields entries must be one of: text, completed\./);
+        }, /records state.collections.tasks\.changes\[0\]\.fields entries must be one of: text, completed\./);
 
         await restoreRejects((snapshot) => {
-            const todos = snapshot.records.todos as unknown as { changes: Record<string, unknown>[] };
+            const todos = snapshot.records.collections.tasks as unknown as { changes: Record<string, unknown>[] };
 
             todos.changes[0].fields = ['text', 'text'];
-        }, /todo state\.changes\[0\]\.fields lists "text" more than once\./);
+        }, /records state.collections.tasks\.changes\[0\]\.fields lists "text" more than once\./);
 
         await restoreRejects((snapshot) => {
-            (snapshot.records.todos.items[0] as unknown as Record<string, unknown>).completed =
+            (snapshot.records.collections.tasks.items[0] as unknown as Record<string, unknown>).completed =
                 'true';
-        }, /todo state\.items\[0\]\.completed must be a boolean\./);
+        }, /records state\.collections\.tasks\.items\[0\] "completed" must be a boolean when provided\./);
     });
 });
 
@@ -1318,7 +1846,7 @@ describe('state-change observer', () => {
         writer = buildSession({
             stateChange: (event) => events.push(event),
             turns: [
-                callTool('c1', 'task', '{"tasks":[{"text":"Persist me"}]}'),
+                callTool('c1', 'tasks', '{"tasks":[{"text":"Persist me"}]}'),
                 answer('done')
             ]
         });
@@ -1331,7 +1859,7 @@ describe('state-change observer', () => {
             { type: 'state_change', reason: 'agent_message', agent: 'writer' },
             { type: 'state_change', reason: 'agent_message', agent: 'writer' },
             { type: 'state_change', reason: 'agent_message', agent: 'writer' },
-            { type: 'state_change', reason: 'tool_execute', agent: 'writer', tool: 'task' },
+            { type: 'state_change', reason: 'tool_execute', agent: 'writer', tool: 'tasks' },
             { type: 'state_change', reason: 'agent_message', agent: 'writer' }
         ]);
 
@@ -1339,13 +1867,13 @@ describe('state-change observer', () => {
 
         // Manual Tools-tab mutations emit no progress events, so this is the only
         // observation point.
-        await writer.executeTool('profileManage', {
+        await writer.executeTool('profiles', {
             action: 'add',
             name: 'Elena',
             description: 'A cartographer.'
         });
         expect(events).toEqual([
-            { type: 'state_change', reason: 'tool_execute', tool: 'profileManage' }
+            { type: 'state_change', reason: 'tool_execute', tool: 'profiles' }
         ]);
 
         events.length = 0;
@@ -1372,9 +1900,9 @@ describe('state-change observer', () => {
             }
         });
 
-        await writer.executeTool('task', { tasks: [{ text: 'Still here' }] });
+        await writer.executeTool('tasks', { tasks: [{ text: 'Still here' }] });
 
-        expect(await writer.executeTool('task', {})).toEqual({
+        expect(await writer.executeTool('tasks', {})).toEqual({
             tasks: [taskItem('1', 'Still here', { by: 'writer', at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false },
@@ -1416,171 +1944,6 @@ describe('task store snapshot/restore (T1)', () => {
 
     // One harness with a patched AND claimed record, so a snapshot has content
     // revisions, attribution, ownership keys and several feed entries at once. The
-    // Agent object comes back too: `harness.callTool` is the door that carries an
-    // explicit (agent, thread) identity, which is how a test expresses "a different
-    // holder is trying to write".
-    const seedClaimed = async (): Promise<{ session: Harness; writer: Agent }> => {
-        const pair = writerOnlySession();
 
-        await pair.session.executeTool('task', { tasks: [{ text: 'Write chapter one' }] });
-        await pair.session.executeTool('task', {
-            tasks: [{ id: '1', text: 'Write chapter one, then two' }],
-            expects: [{ id: '1', rev: 1 }]
-        });
-        await pair.session.executeTool('task', {
-            claim: ['1'],
-            leaseMs: TASK_DEFAULT_LEASE_MS
-        });
 
-        return pair;
-    };
-
-    it('round-trips rev, attribution, the claim and the feed through JSON', async () => {
-        const { session: source, writer } = await seedClaimed();
-        const snapshot = source.snapshot();
-
-        // The exact persisted block: an unthreaded `executeTool` claim keeps only
-        // the (owner, no-thread) half of the holder pair (src/core/task.ts
-        // setClaim), and every feed entry is stamped at the frozen instant.
-        expect(snapshot.records.todos).toEqual({
-            items: [
-                taskItem('1', 'Write chapter one, then two', {
-                    rev: 2,
-                    by: 'writer',
-                    at: EPOCH_ISO,
-                    owner: 'writer',
-                    leaseUntil: LEASE_UNTIL
-                })
-            ],
-            nextId: 2,
-            storeRev: 3,
-            changes: [
-                taskEvent(1, '1', 'add', { by: 'writer', itemRev: 1 }),
-                taskEvent(2, '1', 'update', { by: 'writer', fields: ['text'], itemRev: 2 }),
-                taskEvent(3, '1', 'claim', { by: 'writer' })
-            ]
-        });
-
-        expectJsonShaped(snapshot);
-        const json = JSON.parse(JSON.stringify(snapshot));
-
-        expect(json).toEqual(snapshot);
-
-        // The target has the SAME agent roster as the source: restore refuses an
-        // agent the file does not carry, so this is a like-for-like session.
-        const targetPair = writerOnlySession();
-        const target = targetPair.session;
-        target.restore(json);
-
-        // Byte-identical store after a real restore, and the lease survived as the
-        // exact epoch-ms instant rather than "some number".
-        expect(target.snapshot().records.todos).toEqual(snapshot.records.todos);
-
-        // The reader-facing contract survived too: `since` replays the same three
-        // events, and the record is still rev 2 with the same holder.
-        const page = (await target.executeTool('task', { since: 0 })) as TaskResult & {
-            changes: TaskChange[];
-        };
-
-        expect(page.tasks).toEqual([
-            taskItem('1', 'Write chapter one, then two', {
-                rev: 2,
-                by: 'writer',
-                at: EPOCH_ISO,
-                owner: 'writer',
-                leaseUntil: LEASE_UNTIL
-            })
-        ]);
-        expect(page.storeRev).toBe(3);
-        expect(page.changes).toEqual(snapshot.records.todos.changes);
-
-        // A claim that crossed the restart still BLOCKS. The restored holder pair is
-        // (writer, no thread); a caller ON a conversation is a DIFFERENT pair, so the
-        // resumed session refuses that foreign content write with the same message
-        // the source session would have used.
-        const foreignPair = writerOnlySession();
-        const foreign = foreignPair.session;
-        foreign.restore(json);
-        const thread = foreign.createThread('writer');
-
-        await expect(
-            foreign.callTool(
-                'task',
-                { tasks: [{ id: '1', completed: true }], expects: [{ id: '1', rev: 2 }] },
-                { agent: foreignPair.writer, threadId: thread.id }
-            )
-        ).rejects.toThrow(
-            `task "1" is claimed by "writer" until ${new Date(LEASE_UNTIL).toISOString()}; release it or take it over first.`
-        );
-
-        // ...and the takeover the resumed session CAN make continues the restored
-        // feed rather than restarting it: event 4 is the new claim, and `rev` is
-        // still 2 — an ownership action never moves a content revision.
-        const taken = (await foreign.callTool(
-            'task',
-            { takeover: ['1'] },
-            { agent: foreignPair.writer, threadId: thread.id }
-        )) as TaskResult;
-
-        expect(taken.tasks).toEqual([
-            taskItem('1', 'Write chapter one, then two', {
-                rev: 2,
-                by: 'writer',
-                threadId: thread.id,
-                at: EPOCH_ISO,
-                owner: 'writer',
-                ownerThreadId: thread.id,
-                leaseUntil: LEASE_UNTIL
-            })
-        ]);
-        expect(taken.storeRev).toBe(4);
-    });
-
-    it('drops a restored claim whose conversation the snapshot does not carry', async () => {
-        const { session: source } = await seedClaimed();
-        const snapshot = source.snapshot();
-
-        // A claim taken on a thread that is gone (deleted after the snapshot, or a
-        // hand-edited file). The thread id is unaddressable in the resumed session,
-        // so nothing could ever lift the lock again — src/harness.ts releases it.
-        (snapshot.records.todos.items[0] as TaskItem).ownerThreadId = 'thread-gone';
-
-        // The target has the SAME agent roster as the source (restore refuses an
-        // agent the file does not carry).
-        const target = writerOnlySession().session;
-        target.restore(snapshot);
-        expect(target.snapshot().records.todos.items).toEqual([
-            taskItem('1', 'Write chapter one, then two', { rev: 2, by: 'writer', at: EPOCH_ISO })
-        ]);
-
-        // `releaseThread` is itself a recorded event, so the drop is visible to a
-        // reader polling the feed — and it names the thread, with no `by`, unlike a
-        // voluntary release.
-        expect(target.snapshot().records.todos.storeRev).toBe(4);
-        expect(target.snapshot().records.todos.changes?.[3]).toEqual(
-            taskEvent(4, '1', 'release', { threadId: 'thread-gone' })
-        );
-
-        // Free to write now: the guarded patch lands, and the store keeps the
-        // restored history instead of restarting it (event 5 is the update on top of
-        // the four events the file carried).
-        expect(
-            await target.executeTool('task', {
-                tasks: [{ id: '1', completed: true }],
-                expects: [{ id: '1', rev: 2 }]
-            })
-        ).toEqual({
-            tasks: [
-                taskItem('1', 'Write chapter one, then two', {
-                    completed: true,
-                    rev: 3,
-                    by: 'writer',
-                    at: EPOCH_ISO
-                })
-            ],
-            counts: { total: 1, completed: 1, pending: 0 },
-            page: { offset: 0, limit: 20, hasMore: false },
-            storeRev: 5
-        });
-    });
 });

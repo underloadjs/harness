@@ -61,7 +61,7 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: ['read'],
-        coreTools: ['read', 'write', 'edit', 'glob', 'toolRequest', 'toolCreate', 'task'],
+        coreTools: ['read', 'write', 'edit', 'glob', 'toolRequest', 'toolCreate', 'tasks'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -96,7 +96,7 @@ const turn = (overrides: Partial<SessionTurn>): SessionTurn =>
     ({
         id: 't1',
         index: 0,
-        prompt: 'task',
+        prompt: 'tasks',
         status: 'done',
         startedAt: T,
         updatedAt: T + 100,

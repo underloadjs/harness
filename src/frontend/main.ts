@@ -1380,7 +1380,8 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
             }
         }
     ],
-    // `task` (R9-R11: the old `todoManage`) is a merge/patch command, not an action
+    // `tasks` (renamed from `task` by the records-engine redesign, Decision J; the slash
+    // command is still `/task`) is a merge/patch call, not an action
     // enum, so each button below is one complete merge the tool accepts as-is:
     //   - no properties at all reads the current list;
     //   - a `tasks` entry WITHOUT `id` adds one, and `text` is what makes it valid;
@@ -1390,7 +1391,7 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
     // are edited from the result of the read/add call that precedes them. The read
     // payload is identical to the schema-derived fallback (`{}`), so the runner shows one
     // button for it, never two.
-    task: [
+    tasks: [
         { label: 'Current tasks', value: {} },
         { label: 'Add a task', value: { tasks: [{ text: 'Review the change' }] } },
         {
@@ -1417,7 +1418,7 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
     // exact key is never part of this value.
     search: [{ label: 'Tool discovery', value: { query: 'harness tool discovery', maxResults: 5 } }],
     // ---------------------------------------------------------------------------
-    // Runtime registry + story tools. Every value below is schema-checked against the
+    // Runtime registry + record-store wrappers. Every value below is schema-checked against the
     // tool's own metadata (src/tools/runtime/*.tool.ts), including the enum spellings
     // and the `additionalProperties: false` rule, because a preset the server rejects is
     // worse than no preset. Anything that names a RUNTIME id (a call, a thread, an id
@@ -1485,7 +1486,7 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
     // The story tables: `action` is required and each write action needs its own pair of
     // fields, so the add presets carry complete records and the id-based one stays a
     // clearly-marked placeholder.
-    profileManage: [
+    profiles: [
         { label: 'List profiles', value: { action: 'list' } },
         {
             label: 'Add a profile',
@@ -1498,7 +1499,7 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
         },
         { label: 'Get by id (edit id)', value: { action: 'get', id: '<id from add>' } }
     ],
-    chapterManage: [
+    chapters: [
         { label: 'List chapters', value: { action: 'list' } },
         {
             label: 'Add a draft chapter',
@@ -1512,7 +1513,7 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
         },
         { label: 'Get by id (edit id)', value: { action: 'get', id: '<id from add>' } }
     ],
-    locationManage: [
+    locations: [
         { label: 'List locations', value: { action: 'list' } },
         {
             label: 'Add a location',

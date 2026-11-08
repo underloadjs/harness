@@ -27,6 +27,32 @@ import type {
     HarnessStreamRequest
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // One frame list per model request. The final list repeats, mirroring the
 // scripted provider used by the other harness tests.
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
@@ -171,11 +197,17 @@ describe('compiled tool failure containment', () => {
             isError: false,
             outcome: 'completed'
         });
-        expect(entry.messages[2]).toEqual({
+        expect(withoutIds(entry.messages[2])).toEqual({
             role: 'tool',
             content: 'Tool "syncBoom" failed: sync-boom',
             toolCallId: 'c1',
-            name: 'syncBoom'
+            name: 'syncBoom',
+            // Compaction T1: the classification the event reports is now COMMITTED on the
+            // entry, so it survives a restart/snapshot/fork instead of living only in prose.
+            // A completed result carries no such key at all — that omit rule is what keeps
+            // every pre-existing fixture byte-identical (see the new pins in
+            // src/harness.background.test.ts and src/core/tool-outcome.test.ts).
+            outcome: 'failed'
         });
 
         // The same harness stays usable manually and the failing name still
@@ -548,7 +580,7 @@ describe('compiled tool failure containment', () => {
         // No stuck task/gate: a normal model run still completes afterwards and
         // sees no leaked failure.
         await expect(writer('go')).resolves.toMatchObject({ content: 'after-failure' });
-        expect(entry.messages).toEqual([
+        expect(withoutIds(entry.messages)).toEqual([
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'after-failure' }
         ]);

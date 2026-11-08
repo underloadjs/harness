@@ -464,7 +464,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
 
         // And the command really mutated THIS session's harness (the live tool sees
         // it; sessions.ts `callTool` refuses a busy session, and this one is idle).
-        expect(await runtime.store.callTool(id, 'task', {})).toEqual(
+        expect(await runtime.store.callTool(id, 'tasks', {})).toEqual(
             taskPage([taskRecord('1', 'testing')], 1, 0, 1, 1)
         );
 
@@ -535,7 +535,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
                 '/help  List the commands in this harness, or show one command.',
                 '  usage: /help [command]',
                 "/task  Read and change this session's task list.",
-                '  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>... | claim <id>... | release <id>... | takeover <id>...]',
+                '  usage: /task [list | add <text> | complete <id> | reopen <id> | remove <id>...]',
                 '/tools  List the tools registered in this harness.',
                 '  usage: /tools [filter]',
                 "/webfetch  Fetch one http(s) page through this session's fetch tool.",
@@ -586,11 +586,12 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         expect(lines.map((line) => line.split(' — ')[0] as string)).toEqual([
             'agentManage',
             'agentResult',
-            'chapterManage',
+            'chapters',
             'digest',
-            'locationManage',
-            'profileManage',
-            'task',
+            'locations',
+            'profiles',
+            'records',
+            'tasks',
             'threadFork',
             'toolCancel',
             'toolCreate',
@@ -774,7 +775,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         expect(restored.queueDepth).toBeUndefined();
 
         // The restarted harness also still has the task the command added.
-        expect(await second.store.callTool(id, 'task', {})).toEqual(
+        expect(await second.store.callTool(id, 'tasks', {})).toEqual(
             taskPage([taskRecord('1', 'testing')], 1, 0, 1, 1)
         );
 
@@ -1067,7 +1068,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         // The command DID execute in the live session (its harness side effect is in
         // memory, and the answer is recorded in the turn's events). This later save
         // succeeds — the failure was one write, not a dead database.
-        expect(await runtime.store.callTool(id, 'task', {})).toEqual(
+        expect(await runtime.store.callTool(id, 'tasks', {})).toEqual(
             taskPage([taskRecord('1', 'testing')], 1, 0, 1, 1)
         );
 

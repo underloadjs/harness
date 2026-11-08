@@ -210,7 +210,12 @@ describe('harness server', () => {
         const response = await fetch(`${base}${HARNESS_ROUTES.tools()}`, { headers: CLIENT });
         expect(response.status).toBe(200);
 
-        const page = await json<ToolSummaryPage>(response);
+        // `limit=100`: the page is capped, and the record engine added rows to the
+        // catalogue (T3), so a default page no longer provably contains every tool. The
+        // pagination probe below still asks for exactly one row.
+        const page = await json<ToolSummaryPage>(
+            await fetch(`${base}${HARNESS_ROUTES.tools()}?limit=100`, { headers: CLIENT })
+        );
         const names = page.items.map((tool) => tool.name);
 
         expect(names).toContain('timeNow');

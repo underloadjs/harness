@@ -212,6 +212,18 @@ export type LaneCommand =
           // sides may disagree (a sibling `threadSend` landed between hello and here), which
           // is exactly why length alone was never a sync primitive (T10 finding M4).
           fromLength: number;
+          // pipeline T4.1: the digest of that same canonical transcript, so the lane can tell
+          // "canonical moved IN PLACE" from "canonical did not move" at the same length — a host
+          // transcript edit, or another lane's committed `transcript:patch`, changes the bytes at
+          // positions this lane already holds and changes no length, so the check above would
+          // call it "nothing moved" and the model would run on a stale context.
+          //
+          // OPTIONAL in both directions: a worker that predates T4 ignores it, and a worker newer
+          // than its coordinator falls back to the length rule (an absent digest is never
+          // compared, never guessed). It is the digest of the WHOLE canonical transcript, which is
+          // the only scope that is meaningful: the lane compares it exactly when
+          // `committedLength === fromLength`, and then the whole transcript IS its prefix.
+          fromDigest?: string;
       }
     // One operator action, executed on this lane's CPU (decision D1): a session-bound
     // direct tool call or a slash command. Answered by `invoke.done`. Its shared-state

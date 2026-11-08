@@ -150,7 +150,7 @@ const compactionRow = (): Row => ({
             min: 1000,
             step: 1000,
             description:
-                'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the same ~4 characters/token estimate the UI context bar uses.'
+                'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost.'
         }
     ],
     values: { contextLimit: 100000 }

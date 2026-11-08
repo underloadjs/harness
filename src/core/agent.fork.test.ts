@@ -31,6 +31,32 @@ import {
 // pinned for BOTH in this file.
 import { createThreadAgent } from './thread';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
 
@@ -104,7 +130,7 @@ describe('Agent.fork', () => {
         expect(meta!.toolCallIds).toEqual([
             { origin: 'origin-a', branch: `call_${branchId}_1` }
         ]);
-        expect(branch.messages).toEqual([
+        expect(withoutIds(branch.messages)).toEqual([
             { role: 'system', content: 'You are A.' },
             { role: 'user', content: 'hello' },
             {
@@ -144,7 +170,7 @@ describe('Agent.fork', () => {
         const branch = source.fork();
         const branchId = agentBranchOf(branch)!.branchId;
 
-        expect(branch.messages).toEqual([
+        expect(withoutIds(branch.messages)).toEqual([
             {
                 role: 'assistant',
                 content: '',
@@ -176,7 +202,7 @@ describe('Agent.fork', () => {
         const stored = branch.messages[1] as Extract<HarnessMessage, { role: 'user' }>;
         stored.content = 'branch changed';
 
-        expect(source.messages[1]).toEqual({ role: 'user', content: 'hello' });
+        expect(withoutIds(source.messages[1])).toEqual({ role: 'user', content: 'hello' });
 
         branch.model('model-b');
         expect(branch.model()).toBe('model-b');
@@ -186,11 +212,11 @@ describe('Agent.fork', () => {
         branch.user('branch-only');
 
         branch.reset();
-        expect(branch.messages).toEqual([
+        expect(withoutIds(branch.messages)).toEqual([
             { role: 'system', content: 'sys' },
             { role: 'user', content: 'hello' }
         ]);
-        expect(source.messages).toEqual([
+        expect(withoutIds(source.messages)).toEqual([
             { role: 'system', content: 'sys' },
             { role: 'user', content: 'hello' },
             { role: 'user', content: 'source-only' }
@@ -250,21 +276,105 @@ describe('Agent.fork', () => {
             { role: 'assistant', content: 'done' }
         ];
 
-        expect(branch.messages).toEqual(forked);
+        expect(withoutIds(branch.messages)).toEqual(forked);
         expect(JSON.stringify(branch.messages)).not.toContain('"included":true');
         // The source transcript is never mutated by a fork.
+        // Exact, ids included: forking never rewrites the source transcript, so every
+        // entry keeps the address it had (context T1.4 — a fork COPIES ids, it does not
+        // re-mint them, and it certainly does not drop them from its owner).
         expect(source.messages).toEqual(before);
 
         // A branch re-seeds from a CLONED baseline on every reset, so the flags must
         // be in the baseline itself, not only in the first materialized copy.
         branch.user('appended after the fork');
-        expect(branch.messages[branch.messages.length - 1]).toEqual({
+        expect(withoutIds(branch.messages[branch.messages.length - 1])).toEqual({
             role: 'user',
             content: 'appended after the fork'
         });
 
         branch.reset();
-        expect(branch.messages).toEqual(forked);
+        // A reset re-clones the baseline, so the flags are back exactly as they were
+        // (the id column is not what this test is about — src/harness.fork.test.ts
+        // pins what a fork does to ids).
+        expect(withoutIds(branch.messages)).toEqual(forked);
+    });
+
+    // Compaction T1 — the same two-hop ride as the flag above. The outcome travels on the
+    // MATERIALIZED transcript (core/branch.ts `copyOutcome`) AND on the detached reset
+    // baseline (core/agent.ts `copyBaselineMessage`), and an explicit `completed` never
+    // comes back as a string. A branch that forgot WHY a call ended could not answer "was
+    // this work already superseded?" without re-reading prose — the exact thing the
+    // classification exists to prevent.
+    it('carries the persisted tool outcome through the fork clone and its reset baseline', () => {
+        const source = agent({
+            name: 'writer',
+            model: 'model-a',
+            instruction: ['You are A.'],
+            stream: fakeStream(),
+            messages: [
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [
+                        { id: 'origin-a', name: 'read', arguments: '{}' },
+                        { id: 'origin-b', name: 'write', arguments: '{}' }
+                    ]
+                },
+                {
+                    role: 'tool',
+                    content: 'boom',
+                    toolCallId: 'origin-a',
+                    name: 'read',
+                    outcome: 'failed'
+                },
+                {
+                    role: 'tool',
+                    content: 'ok',
+                    toolCallId: 'origin-b',
+                    name: 'write',
+                    outcome: 'completed'
+                }
+            ]
+        });
+
+        const branch = source.fork();
+        const branchId = agentBranchOf(branch)!.branchId;
+
+        const forked: HarnessMessage[] = [
+            { role: 'system', content: 'You are A.' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: `call_${branchId}_1`, name: 'read', arguments: '{}' },
+                    { id: `call_${branchId}_2`, name: 'write', arguments: '{}' }
+                ]
+            },
+            {
+                role: 'tool',
+                content: 'boom',
+                toolCallId: `call_${branchId}_1`,
+                name: 'read',
+                outcome: 'failed'
+            },
+            // The healthy sibling carries NO key, so a fork of a pre-outcome transcript is
+            // byte-identical to a fork of this one.
+            { role: 'tool', content: 'ok', toolCallId: `call_${branchId}_2`, name: 'write' }
+        ];
+
+        expect(withoutIds(branch.messages)).toEqual(forked);
+        expect(JSON.stringify(branch.messages)).not.toContain('"outcome":"completed"');
+        expect(JSON.stringify(branch.messages)).toContain('"outcome":"failed"');
+
+        branch.user('appended after the fork');
+        branch.reset();
+
+        // A reset re-clones the BASELINE, which is the copy path T1 updated: a baseline that
+        // dropped the key would un-know the failure one turn later.
+        expect(withoutIds(branch.messages)).toEqual(forked);
+        expect((branch.messages[2] as Extract<HarnessMessage, { role: 'tool' }>).outcome).toBe(
+            'failed'
+        );
     });
 
     it('pairs a pending call of a disabled block with a disabled placeholder', () => {
@@ -284,7 +394,7 @@ describe('Agent.fork', () => {
         const branch = agent({ model: 'm', stream: fakeStream(), messages: source }).fork();
         const branchId = agentBranchOf(branch)!.branchId;
 
-        expect(branch.messages).toEqual([
+        expect(withoutIds(branch.messages)).toEqual([
             { role: 'user', content: 'prompt' },
             {
                 role: 'assistant',
@@ -310,7 +420,7 @@ describe('Agent.fork', () => {
         const branch = source.fork();
         const stored = branch.messages[0] as Extract<HarnessMessage, { role: 'user' }>;
 
-        expect(stored).toEqual({
+        expect(withoutIds(stored)).toEqual({
             role: 'user',
             content: 'see [Image 1]',
             attachments: [image()]
@@ -348,11 +458,11 @@ describe('Agent.fork', () => {
                 }
             }
         ]);
-        expect(seen[0].messages).toEqual([
+        expect(withoutIds(seen[0].messages)).toEqual([
             { role: 'system', content: 'sys' },
             { role: 'user', content: 'hi' }
         ]);
-        expect(source.messages).toEqual([{ role: 'system', content: 'sys' }]);
+        expect(withoutIds(source.messages)).toEqual([{ role: 'system', content: 'sys' }]);
     });
 
     it('nests ordinary forks to depth 2 and rejects depth 3', () => {

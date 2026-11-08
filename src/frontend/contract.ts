@@ -68,9 +68,13 @@ import type {
 // every runtime tool as core for an old payload. The server's own `coreTools` stays
 // authoritative whenever it is present (see `coreToolsOf`); this list only fills the
 // gap for a payload that predates the field.
+// Decision I: the record wrappers that stay in the bootstrap are 'toolRequest' and
+// 'tasks' (plural since the records-engine rename, Decision J). The engine surface
+// 'records' and the three story collections are searchable, so they do NOT belong in
+// this fallback core set.
 export const HARNESS_CORE_TOOL_NAMES = [
     'toolRequest',
-    'task'
+    'tasks'
 ] as const;
 
 // One-line explanations, keyed by WIRE NAME, for the tools a caller can look up here.
@@ -83,7 +87,8 @@ export const HARNESS_CORE_TOOL_NAMES = [
 //
 // RENAME (wire names): `fileWrite` is `write`, and the two-mode `fileGlob` is now
 // `glob` (file NAMES only) plus `grep` (file CONTENTS); `syntaxCheck` is `syntax`
-// with a free-text `language`; `todoManage` is `task` and its `action` enum is gone —
+// with a free-text `language`; `todoManage` became `task` and then `tasks` and its
+// `action` enum is gone —
 // the same call merges `tasks` (add without `id`, patch with `id`), `remove`, and the
 // paging fields, then answers with the current list.
 // Keys follow the wire names, because that is what a caller can look a tool up by.
@@ -92,7 +97,11 @@ export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = 
     toolList: 'List every registered tool by name and description.',
     toolManage: 'Inspect and edit registered tools: details, source, path, create, update, reload.',
     toolCreate: 'Add a small session-local tool when the catalogue cannot help.',
-    task: 'Read, add, patch, or remove the task list for this chat.',
+    tasks: 'Read, add, patch, or remove the task list for this chat.',
+    records: 'The one session store: any collection, batch writes, revisions, and define.',
+    profiles: 'Read and change the session character profiles.',
+    chapters: 'Read and change the session chapter tracker.',
+    locations: 'Read and change the session location notes.',
     delegate: 'Hand a self-contained task to one of this harness’s agents.',
     read: 'Read one or more text files on the server host.',
     write: 'Write one or more text files on the server host.',

@@ -97,13 +97,14 @@ const RUNTIME_SOURCE_ENTRIES = [
     'delegate.tool.ts',
     'agentManage.tool.ts',
     'agentResult.tool.ts',
-    'chapterManage.tool.ts',
-    'locationManage.tool.ts',
-    'profileManage.tool.ts',
+    'chapters.tool.ts',
+    'locations.tool.ts',
+    'profiles.tool.ts',
+    'records.tool.ts',
     'threadFork.tool.ts',
     'threadList.tool.ts',
     'threadSend.tool.ts',
-    'task.tool.ts',
+    'tasks.tool.ts',
     'toolCancel.tool.ts',
     'toolCreate.tool.ts',
     'toolList.tool.ts',
@@ -149,10 +150,14 @@ const STARTUP_SOURCE_ENTRIES = {
     toolList: 'tools/runtime/toolList.tool.ts',
     toolManage: 'tools/runtime/toolManage.tool.ts',
     toolCreate: 'tools/runtime/toolCreate.tool.ts',
-    task: 'tools/runtime/task.tool.ts',
-    profileManage: 'tools/runtime/profileManage.tool.ts',
-    chapterManage: 'tools/runtime/chapterManage.tool.ts',
-    locationManage: 'tools/runtime/locationManage.tool.ts',
+    // The record family (records-engine T3): the engine surface and its four
+    // wrappers. Every one registers from source at startup, so the gate needs the
+    // name → path row for each; a missing row is a silent coverage loss.
+    records: 'tools/runtime/records.tool.ts',
+    tasks: 'tools/runtime/tasks.tool.ts',
+    profiles: 'tools/runtime/profiles.tool.ts',
+    chapters: 'tools/runtime/chapters.tool.ts',
+    locations: 'tools/runtime/locations.tool.ts',
     agentManage: 'tools/runtime/agentManage.tool.ts',
     agentResult: 'tools/runtime/agentResult.tool.ts'
 };

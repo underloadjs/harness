@@ -568,7 +568,14 @@ export const createToolboxHarness = (
         // be absent (CLI, direct preset creation).
         report: {
             progress,
-            ...(observer?.stateChange === undefined ? {} : { stateChange: observer.stateChange })
+            ...(observer?.stateChange === undefined ? {} : { stateChange: observer.stateChange }),
+            // T1.5 last mile: the host's plugin-diagnostic sink. Forwarded exactly like
+            // `stateChange` — presence means the operator can see a broken plugin, absence
+            // means the library's silent no-op. It is NOT a persistence observer: a plugin
+            // that throws must not schedule a save by itself (src/types/index.ts
+            // `HarnessDiagnosticEvent`), which is why it rides `report` beside `stateChange`
+            // rather than replacing it.
+            ...(observer?.diagnostic === undefined ? {} : { diagnostic: observer.diagnostic })
         },
         // N4: the host owner answerer. It belongs on the TOP-LEVEL harness
         // configuration (not inside `report`), because presence is what makes the

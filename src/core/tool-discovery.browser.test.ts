@@ -45,7 +45,7 @@ describe('browser discovery fallback', () => {
         );
         // 30 package rows: the 20 harness-owned runtime entries plus the 10 presets
         // (the 9 historical ones plus the R3/R4 `download` entry, order 235).
-        expect(descriptors).toHaveLength(30);
+        expect(descriptors).toHaveLength(31);
     });
 
     it('returns detached copies, not the manifest rows themselves', () => {
@@ -57,7 +57,7 @@ describe('browser discovery fallback', () => {
     });
 
     it('honours includePresets without touching the filesystem', () => {
-        expect(discoverToolMetadata({ includePresets: false })).toHaveLength(20);
+        expect(discoverToolMetadata({ includePresets: false })).toHaveLength(21);
     });
 
     it('rejects a folder request with a clear unsupported error', () => {

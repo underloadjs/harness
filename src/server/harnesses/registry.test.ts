@@ -241,10 +241,12 @@ describe('creating a harness', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'delegate',
@@ -521,10 +523,12 @@ describe('updating a harness', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'task',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
+            'records',
+
+            'tasks',
+            'profiles',
+            'chapters',
+            'locations',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -561,7 +565,7 @@ describe('updating a harness', () => {
         const live = after.create(SETTINGS, progress);
         expect(Object.keys(live.agents)).toEqual(['workspace']);
         expect(Object.keys(live.tools)).toEqual(
-            expect.arrayContaining([...SHARED_TOOL_NAMES, 'toolRequest', 'toolCreate', 'task'])
+            expect.arrayContaining([...SHARED_TOOL_NAMES, 'toolRequest', 'toolCreate', 'tasks'])
         );
     });
 

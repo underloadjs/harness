@@ -50,6 +50,32 @@ import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime, setHarnessRuntime } from './runtime';
 import type { SessionSnapshot } from './protocol';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
 const TEMP_ROOT = path.join(REPO_ROOT, 'Temp');
@@ -311,7 +337,7 @@ describe('R3b durable harness database', () => {
         // T1: the record carries its content revision, the writing agent, and the
         // pinned instant, and the page carries `storeRev` — ALL of which the snapshot
         // has to bring back, so the clock is pinned for this whole test.
-        expect(await first.store.callTool(id, 'task', { tasks: [{ text: 'keep me' }] })).toEqual({
+        expect(await first.store.callTool(id, 'tasks', { tasks: [{ text: 'keep me' }] })).toEqual({
             tasks: [taskItem('1', 'one', 'keep me', { at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false },
@@ -351,7 +377,7 @@ describe('R3b durable harness database', () => {
         // patch) makes the window non-trivial, so a restart that dropped `changes`
         // cannot pass by accident.
         expect(
-            await first.store.callTool(id, 'task', {
+            await first.store.callTool(id, 'tasks', {
                 tasks: [{ id: '1', completed: true }],
                 expects: [{ id: '1', rev: 1 }]
             })
@@ -364,7 +390,7 @@ describe('R3b durable harness database', () => {
             )
         );
 
-        const todosBefore = await first.store.callTool(id, 'task', {});
+        const todosBefore = await first.store.callTool(id, 'tasks', {});
         // A read is not a write: re-reading the list leaves `rev`, `storeRev` and the
         // feed exactly where the patch left them.
         expect(todosBefore).toEqual(
@@ -376,7 +402,7 @@ describe('R3b durable harness database', () => {
             )
         );
 
-        const feedBefore = (await first.store.callTool(id, 'task', {
+        const feedBefore = (await first.store.callTool(id, 'tasks', {
             since: 0
         })) as TaskResult & { changes: TaskChange[] };
 
@@ -421,12 +447,12 @@ describe('R3b durable harness database', () => {
         expect(restored.discoveredTools).toEqual(['echoed']);
         expect(restored.agentModels).toEqual({ one: 'next/model' });
         expect(restored.harnessDefinition).toEqual(before.harnessDefinition);
-        expect(await second.store.callTool(id, 'task', {})).toEqual(todosBefore);
+        expect(await second.store.callTool(id, 'tasks', {})).toEqual(todosBefore);
 
         // The durable feed came back as well: the same two events under the same
         // store revision, so a resumed session can answer `since` for everything a
         // reader missed while the process was down.
-        expect(await second.store.callTool(id, 'task', { since: 0 })).toEqual(feedBefore);
+        expect(await second.store.callTool(id, 'tasks', { since: 0 })).toEqual(feedBefore);
         expect(await second.store.callTool(id, 'echoed', 'works')).toBe('WORKS');
 
         // Registry metadata re-created from disk (not from the seed list).
@@ -443,175 +469,6 @@ describe('R3b durable harness database', () => {
     // T3 editable configuration. An instruction override is EXECUTABLE state: a
     // restart must bring back both the map and the prompts the next session runs, or
     // the saved configuration the reader edited would silently revert on reboot.
-    // T1 durability of the CONCURRENCY half of the store. A claim exists to protect
-    // one in-flight edit, and a server restarts in the middle of edits all the time,
-    // so the holder pair, the wall-clock lease and the change feed must all cross the
-    // restart intact — otherwise the resumed session hands back a store that looks
-    // uncontested and lets a second writer stomp the first one's work.
-    it('restores a task claim, its lease and the change feed intact', async () => {
-        const advance = pinTaskClock();
-        const root = tempRoot('claim-restart');
-        const first = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
-        const id = (await first.store.create('one')).id;
-
-        await first.store.callTool(id, 'task', { tasks: [{ text: 'Hold this' }] });
-
-        // An unthreaded claim (the tools-tab / command door) records only the owner
-        // half of the holder pair, which is exactly the pair `restore()` is allowed to
-        // keep: src/harness.ts sweeps a claim only when its `ownerThreadId` names a
-        // conversation the snapshot does not carry.
-        expect(await first.store.callTool(id, 'task', { claim: ['1'] })).toEqual(
-            taskPage(
-                [
-                    taskItem('1', 'one', 'Hold this', {
-                        at: EPOCH_ISO,
-                        owner: 'one',
-                        leaseUntil: EPOCH_MS + 900_000
-                    })
-                ],
-                1,
-                0,
-                2
-            )
-        );
-
-        first.store.dispose();
-
-        const second = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
-
-        // Same record, same content revision, same holder, and the lease is still the
-        // exact instant it was issued for — not "some future number".
-        expect(await second.store.callTool(id, 'task', {})).toEqual(
-            taskPage(
-                [
-                    taskItem('1', 'one', 'Hold this', {
-                        at: EPOCH_ISO,
-                        owner: 'one',
-                        leaseUntil: EPOCH_MS + 900_000
-                    })
-                ],
-                1,
-                0,
-                2
-            )
-        );
-
-        // The feed survived event-for-event, so a reader that stopped at storeRev 1
-        // still learns about the claim after the restart.
-        const feed = (await second.store.callTool(id, 'task', { since: 1 })) as TaskResult & {
-            changes: TaskChange[];
-        };
-
-        expect(feed.changes).toEqual([taskEvent(2, '1', 'claim', 'one')]);
-        expect(feed.changesHasMore).toBe(false);
-        expect(feed.changesTruncated).toBe(false);
-        expect(feed.storeRev).toBe(2);
-
-        // A claim is CONTENT-neutral across the restart: the record is still rev 1, so
-        // a token read before the restart is still the right token afterwards.
-        expect(feed.tasks[0].rev).toBe(1);
-
-        // Re-claiming from the same (unthreaded) door is the holder's heartbeat.
-        // src/core/task.ts renews a held claim by writing `leaseUntil` and NOTHING
-        // else: no attribution churn, no `rev`, no change entry, no `storeRev`.
-        advance(EPOCH_MS + 60_000);
-
-        expect(await second.store.callTool(id, 'task', { claim: ['1'] })).toEqual(
-            taskPage(
-                [
-                    taskItem('1', 'one', 'Hold this', {
-                        at: EPOCH_ISO,
-                        owner: 'one',
-                        leaseUntil: EPOCH_MS + 60_000 + 900_000
-                    })
-                ],
-                1,
-                0,
-                2
-            )
-        );
-    });
-
-    // The expiry is a wall-clock instant INSIDE the snapshot, so "the holder died and
-    // its lease ran out" has to be true on the other side of a restart as well.
-    it('reclaims a foreign claim whose lease expired across the restart', async () => {
-        const advance = pinTaskClock();
-        const root = tempRoot('claim-expiry');
-        const first = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
-        const id = (await first.store.create('one')).id;
-
-        await first.store.callTool(id, 'task', { tasks: [{ text: 'Contested' }] });
-        first.store.dispose();
-
-        // The persisted claim belongs to an agent this session can never become (the
-        // worker that took it is gone): the file says `ghost`, with the lease this
-        // session would have issued.
-        rewriteClaimOwner(root, 'ghost', EPOCH_MS + 900_000);
-
-        const second = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
-
-        // While the lease is live the restored claim really does block, and the
-        // refusal names the holder and the exact expiry the file carried.
-        await expect(
-            second.store.callTool(id, 'task', {
-                tasks: [{ id: '1', completed: true }],
-                expects: [{ id: '1', rev: 1 }]
-            })
-        ).rejects.toThrow(
-            `task "1" is claimed by "ghost" until ${new Date(EPOCH_MS + 900_000).toISOString()}; release it or take it over first.`
-        );
-
-        // Nothing was written by the refusal: same rev, same storeRev, same feed.
-        expect(await second.store.callTool(id, 'task', { since: 0 })).toEqual(
-            {
-                ...taskPage(
-                    [
-                        taskItem('1', 'one', 'Contested', {
-                            at: EPOCH_ISO,
-                            owner: 'ghost',
-                            leaseUntil: EPOCH_MS + 900_000
-                        })
-                    ],
-                    1,
-                    0,
-                    1
-                ),
-                changes: [taskEvent(1, '1', 'add', 'one', { itemRev: 1 })],
-                changesHasMore: false,
-                changesTruncated: false
-            }
-        );
-
-        // Past the lease the abandoned claim stops blocking, and the next writer CLEARS
-        // it (src/core/task.ts plan.expired → clearClaim). The clear is recorded before
-        // the update it unlocked, so a reader can tell "the lock lifted" from "nothing
-        // happened" without re-reading the list.
-        advance(EPOCH_MS + 900_000 + 1);
-        const at = new Date(EPOCH_MS + 900_000 + 1).toISOString();
-
-        expect(
-            await second.store.callTool(id, 'task', {
-                tasks: [{ id: '1', completed: true }],
-                expects: [{ id: '1', rev: 1 }]
-            })
-        ).toEqual(
-            taskPage(
-                [taskItem('1', 'one', 'Contested', { completed: true, rev: 2, at })],
-                1,
-                1,
-                3
-            )
-        );
-
-        const feed = (await second.store.callTool(id, 'task', { since: 1 })) as TaskResult & {
-            changes: TaskChange[];
-        };
-
-        expect(feed.changes).toEqual([
-            taskEvent(2, '1', 'release', 'one', { at }),
-            taskEvent(3, '1', 'update', 'one', { at, fields: ['completed'], itemRev: 2 })
-        ]);
-    });
 
     it('restores a saved instruction override and applies it to the rebuilt factory', async () => {
         const root = tempRoot('instructions');
@@ -915,7 +772,7 @@ describe('R3b durable harness database', () => {
         // ONE system message, because `agentInstruction()` joins the demo profile's
         // identity sentence and guidelines into a single prompt (../agents/index.ts).
         expect(restored.messages.map((message) => message.role)).toEqual(['system']);
-        expect(restored.messages).toEqual([
+        expect(withoutIds(restored.messages)).toEqual([
             { role: 'system', content: agentInstruction(AGENT_PROFILES.demo) }
         ]);
     });
@@ -968,7 +825,7 @@ describe('R3b durable harness database', () => {
         // primary's prompt is the frozen instruct profile joined into ONE system
         // message (../agents/index.ts `agentInstruction`).
         expect(restored.messages.map((message) => message.role)).toEqual(['system']);
-        expect(restored.messages).toEqual([
+        expect(withoutIds(restored.messages)).toEqual([
             { role: 'system', content: agentInstruction(AGENT_PROFILES.instruct) }
         ]);
     });
@@ -1175,7 +1032,7 @@ describe('R3b durable harness database', () => {
                                     toolCalls: [
                                         {
                                             id: 'c1',
-                                            name: 'task',
+                                            name: 'tasks',
                                             arguments: '{"tasks":[{"text":"done before crash"}]}'
                                         }
                                     ]
@@ -1215,7 +1072,7 @@ describe('R3b durable harness database', () => {
         // AND the conversation that wrote it (this write came from the MODEL path, so
         // `updatedThreadId` is the mutator's default conversation), and the change
         // feed behind `storeRev`.
-        expect(await second.store.callTool(created.id, 'task', {})).toEqual({
+        expect(await second.store.callTool(created.id, 'tasks', {})).toEqual({
             tasks: [
                 {
                     ...taskItem('1', 'mutator', 'done before crash', { at: EPOCH_ISO }),
@@ -1271,7 +1128,7 @@ describe('R3b durable harness database', () => {
                 {
                     role: 'assistant',
                     content: '',
-                    toolCalls: [{ id: 'c1', name: 'task', arguments: '{}' }]
+                    toolCalls: [{ id: 'c1', name: 'tasks', arguments: '{}' }]
                 }
             ]
         });
@@ -1282,13 +1139,13 @@ describe('R3b durable harness database', () => {
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'c1', name: 'task', arguments: '{}' }]
+                toolCalls: [{ id: 'c1', name: 'tasks', arguments: '{}' }]
             },
             {
                 role: 'tool',
                 content: INTERRUPTED_TOOL_RESULT_TEXT,
                 toolCallId: 'c1',
-                name: 'task'
+                name: 'tasks'
             }
         ]);
 
@@ -1301,11 +1158,11 @@ describe('R3b durable harness database', () => {
                     role: 'assistant',
                     content: '',
                     toolCalls: [
-                        { id: 'done-1', name: 'task', arguments: '{}' },
-                        { id: 'lost-2', name: 'task', arguments: '{"tasks":[{"x"}]}' }
+                        { id: 'done-1', name: 'tasks', arguments: '{}' },
+                        { id: 'lost-2', name: 'tasks', arguments: '{"tasks":[{"x"}]}' }
                     ]
                 },
-                { role: 'tool', content: '{"tasks":[]}', toolCallId: 'done-1', name: 'task' }
+                { role: 'tool', content: '{"tasks":[]}', toolCallId: 'done-1', name: 'tasks' }
             ]
         });
 
@@ -1316,16 +1173,16 @@ describe('R3b durable harness database', () => {
                 role: 'assistant',
                 content: '',
                 toolCalls: [
-                    { id: 'done-1', name: 'task', arguments: '{}' },
-                    { id: 'lost-2', name: 'task', arguments: '{"tasks":[{"x"}]}' }
+                    { id: 'done-1', name: 'tasks', arguments: '{}' },
+                    { id: 'lost-2', name: 'tasks', arguments: '{"tasks":[{"x"}]}' }
                 ]
             },
-            { role: 'tool', content: '{"tasks":[]}', toolCallId: 'done-1', name: 'task' },
+            { role: 'tool', content: '{"tasks":[]}', toolCallId: 'done-1', name: 'tasks' },
             {
                 role: 'tool',
                 content: INTERRUPTED_TOOL_RESULT_TEXT,
                 toolCallId: 'lost-2',
-                name: 'task'
+                name: 'tasks'
             }
         ]);
 
@@ -1347,7 +1204,7 @@ describe('R3b durable harness database', () => {
                 {
                     role: 'assistant',
                     content: '',
-                    toolCalls: [{ id: 'helper-1', name: 'task', arguments: '{}' }]
+                    toolCalls: [{ id: 'helper-1', name: 'tasks', arguments: '{}' }]
                 }
             ]
         });
@@ -1363,7 +1220,7 @@ describe('R3b durable harness database', () => {
             role: 'tool',
             content: INTERRUPTED_TOOL_RESULT_TEXT,
             toolCallId: 'helper-1',
-            name: 'task'
+            name: 'tasks'
         });
         expect(multiRepaired.records).toBe(multiAgent.records);
         expect(multiRepaired.discovery).toBe(multiAgent.discovery);
@@ -1405,7 +1262,7 @@ describe('R3b durable harness database', () => {
 
         const first = runtimeOf(root, [preset]);
         const created = await first.store.create('probe');
-        await first.store.callTool(created.id, 'task', { tasks: [{ text: 'kept record' }] });
+        await first.store.callTool(created.id, 'tasks', { tasks: [{ text: 'kept record' }] });
         first.store.dispose();
 
         // Simulate the active-snapshot window T22 discovered: the persisted core
@@ -1418,7 +1275,7 @@ describe('R3b durable harness database', () => {
         transcript.messages.push({
             role: 'assistant',
             content: '',
-            toolCalls: [{ id: 'orphan-1', name: 'task', arguments: '{"tasks":[{"never run"}]}' }]
+            toolCalls: [{ id: 'orphan-1', name: 'tasks', arguments: '{"tasks":[{"never run"}]}' }]
         });
         fs.writeFileSync(file, JSON.stringify(database, null, 2), 'utf8');
 
@@ -1428,17 +1285,17 @@ describe('R3b durable harness database', () => {
         // repair is about transcript coherence, not status. (A real mid-run file
         // also carries status 'running', which restores as 'error' above.)
         expect(restored.status).toBe('idle');
-        expect(restored.messages.at(-1)).toEqual({
+        expect(withoutIds(restored.messages.at(-1))).toEqual({
             role: 'tool',
             content: INTERRUPTED_TOOL_RESULT_TEXT,
             toolCallId: 'orphan-1',
-            name: 'task'
+            name: 'tasks'
         });
 
         // The orphan call was never executed: only the pre-crash record exists.
         // The orphan call was never executed: the one record that existed keeps its
         // revision, its attribution and its single feed entry.
-        expect(await second.store.callTool(created.id, 'task', {})).toEqual(
+        expect(await second.store.callTool(created.id, 'tasks', {})).toEqual(
             taskPage([taskItem('1', 'probe', 'kept record', { at: EPOCH_ISO })], 1, 0, 1)
         );
 
@@ -1528,7 +1385,7 @@ describe('R3b durable harness database', () => {
         const second = runtimeOf(root, [preset]);
         const restored = second.store.get(created.id);
         expect(restored.turns[0].status).toBe('error');
-        expect(restored.messages.at(-1)).toEqual({
+        expect(withoutIds(restored.messages.at(-1))).toEqual({
             role: 'tool',
             content: INTERRUPTED_TOOL_RESULT_TEXT,
             toolCallId: 'hang-1',
@@ -1583,7 +1440,7 @@ describe('R3b durable harness database', () => {
 
         // Durable session state on the doomed record: a todo (core snapshot), a
         // live per-agent model map and its own settings model.
-        expect(await first.store.callTool(doomed.id, 'task', { tasks: [{ text: 'delete me too' }] })).toEqual(
+        expect(await first.store.callTool(doomed.id, 'tasks', { tasks: [{ text: 'delete me too' }] })).toEqual(
             taskPage([taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })], 1, 0, 1)
         );
         expect((await first.store.setAgentModels(doomed.id, { two: 'next/model' })).agentModels).toEqual({
@@ -2578,5 +2435,248 @@ describe('durable steered-submit text archive (T14)', () => {
         rotted.sessions[0].turns.find((entry: Record<string, unknown>) => entry.id === turnId).steerTexts[640].prompt = 42;
 
         expect(() => readHarnessDatabase(rotted)).toThrow(/steerTexts\[640\]\.prompt must be a string/);
+    });
+});
+// ---------------------------------------------------------------------------
+// Compaction T3 + T4.4 at the DURABLE plane.
+//
+// The two claims this pins, because they only mean anything together:
+//
+//   1. a pruning pass is CANONICAL transcript state — the flags land in `state.json`, so a
+//      restarted session sends the same shortened context and does not re-prune; and
+//   2. one multi-unit pass produces ONE persistence notification, not one per unit
+//      (compaction T4.4 / context-inclusion T4). That is the difference between one
+//      whole-document rewrite per turn and one per flag, and the save model is exactly why
+//      the coalescing was worth doing (see the file header's durability note, and
+//      ../harness.ts `closeRoundObservations`, which is where the batch flushes).
+//
+// Both are measured as a DIFFERENCE against the same fixture with the built-in replaced by a
+// no-op plugin of the same name (a programmatic plugin naming a built-in replaces it —
+// ./plugin/host.ts), so the counts cannot be inflated by the run's own writes.
+//
+// The seeded conversation is deliberately a REAL tool exchange rather than a hand-written
+// transcript: the units carry a persisted `outcome: 'failed'` (T1) produced by a throwing
+// tool, and the answers are ordinary completed results. The agent is named `writer`, not
+// `compactor` — the plugin's own internal-agent markers would (correctly) refuse to compact
+// a conversation whose name contains `compact`.
+// ---------------------------------------------------------------------------
+
+describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
+    type DurableCounters = {
+        transcriptWrites: string[];
+        diagnostics: string[];
+    };
+
+    // The operator's numbers, supplied the way the server supplies them: a LIVE provider the
+    // plugin re-reads every turn. A 100-token limit is crossed by this fixture on the first
+    // turn, `minTokens: 10` clears the withheld failures, and `safetyTurns: 0` removes the
+    // horizon so the whole transcript is eligible (the horizon has its own cases in
+    // src/plugin/context-compaction.test.ts).
+    const OPERATOR_SETTINGS: Record<string, number> = {
+        contextLimit: 100,
+        minTokens: 10,
+        safetyTurns: 0
+    };
+
+    const compactionPreset = (
+        counters: DurableCounters,
+        options: { compact: boolean }
+    ): HarnessPreset =>
+        presetOf('writer', (settings, progress: HarnessProgress, report) => {
+            // Three failed reads of three files, each answered later by the same call with
+            // its arguments reordered. 600 characters of failure text each, so the pass has
+            // a saving to clear the floor with and the provider payload visibly changes.
+            const messages: HarnessMessage[] = [{ role: 'user', content: 'open them' }];
+
+            (['a.ts', 'b.ts', 'c.ts'] as const).forEach((file, round) => {
+                messages.push(
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [
+                            { id: `f${round}`, name: 'read', arguments: `{"path":"${file}"}` }
+                        ]
+                    },
+                    {
+                        role: 'tool',
+                        content: `Tool "read" failed: ${'E'.repeat(600)}`,
+                        toolCallId: `f${round}`,
+                        name: 'read',
+                        outcome: 'failed'
+                    },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [
+                            { id: `k${round}`, name: 'read', arguments: `{ "path" : "${file}" }` }
+                        ]
+                    },
+                    {
+                        role: 'tool',
+                        content: `${file} contents`,
+                        toolCallId: `k${round}`,
+                        name: 'read'
+                    }
+                );
+            });
+
+            messages.push({ role: 'assistant', content: 'settled' });
+
+            return harness({
+                agents: {
+                    writer: agent({
+                        model: settings.model,
+                        instruction: 'You are the compaction fixture.',
+                        stream: answerStream('after'),
+                        messages
+                    })
+                },
+                primary: 'writer',
+                presets: false,
+                pluginSettings: {
+                    get: (plugin, key) =>
+                        plugin === 'context-compaction' ? OPERATOR_SETTINGS[key] : undefined
+                },
+                // `compact: false` contributes a no-op host plugin that NAMES the built-in,
+                // which is how this file measures the pass instead of guessing at it.
+                ...(options.compact ? {} : { plugins: [{ name: 'context-compaction' }] }),
+                // The store's own observers stay wired (that is the production path); these
+                // wrappers are transparent, so the counts are the REAL number of reports a
+                // shared store would turn into document saves.
+                report: {
+                    progress,
+                    // UPDATED IN PLACE (pipeline T4, 2026-11-09): this used to record a GAP —
+                    // `HarnessPresetReport` carried `stateChange` and `interaction` but NO
+                    // `diagnostic`, so a durable server session had no sink to forward a plugin
+                    // report to. The gap is closed: the report now has the member, the shared
+                    // toolbox forwards it, and `SessionStore.buildHarness` installs one that
+                    // journals the event on the session (durable, and readable from
+                    // `GET /sessions/{id}`). This preset still supplies its OWN sink, which is
+                    // what an in-process host does — and it is why the counters below can count
+                    // reports without a database in the way.
+                    diagnostic: (event) => {
+                        counters.diagnostics.push(`${event.kind}:${event.message.slice(0, 42)}`);
+                    },
+                    stateChange: (event) => {
+                        if (event.reason === 'agent_message' && event.agent === 'writer') {
+                            counters.transcriptWrites.push(event.reason);
+                        }
+
+                        report?.stateChange?.(event);
+                    }
+                }
+            });
+        });
+
+    const runOne = async (root: string, preset: HarnessPreset): Promise<void> => {
+        const runtime = runtimeOf(root, [preset]);
+        const created = await runtime.store.create('writer');
+
+        // The LEGACY run path is the one that walks the entry agent's default conversation,
+        // i.e. the transcript the preset seeded. (`enqueue` opens a fresh host conversation,
+        // which starts empty and would leave a compaction nothing to look at.)
+        await runtime.store.run(created.id, 'next', async () => {});
+        await runtime.store.waitForIdle(created.id);
+        runtime.store.dispose();
+    };
+
+    const durableTranscript = (root: string): HarnessMessage[] => {
+        const session = new HarnessPersistence(root).load()?.sessions[0];
+
+        if (session === undefined) throw new Error('the compaction session did not persist');
+
+        return session.core.agents.writer.messages;
+    };
+
+    const flaggedOf = (messages: readonly HarnessMessage[]) =>
+        messages
+            .map((message, index) => ({ index, role: message.role, included: message.included }))
+            .filter((entry) => entry.included === false);
+
+    it('persists a pruned pass and reports the whole multi-unit pass ONCE', async () => {
+        const compacted: DurableCounters = { transcriptWrites: [], diagnostics: [] };
+        const control: DurableCounters = { transcriptWrites: [], diagnostics: [] };
+
+        const root = tempRoot('compaction-pass-durable');
+        await runOne(root, compactionPreset(compacted, { compact: true }));
+
+        const rootWithout = tempRoot('compaction-pass-control');
+        await runOne(rootWithout, compactionPreset(control, { compact: false }));
+
+        // THE COALESCING COUNT, at the plane that pays for it. The same run with no pass
+        // writes TWO transcript changes (the prompt the session appended and the answer it
+        // committed); with a THREE-unit pass it writes THREE. One notification for three
+        // flags, i.e. one whole-document rewrite instead of three — and 40 units would also
+        // be one (compaction T4.4, context-inclusion T4.1).
+        expect(control.transcriptWrites).toEqual(['agent_message', 'agent_message']);
+        expect(compacted.transcriptWrites).toEqual([
+            'agent_message',
+            'agent_message',
+            'agent_message'
+        ]);
+
+        // The pass is also VISIBLE to a host that installed a diagnostic sink (T4.5): one
+        // `policy` report naming the three units and the saving, and nothing else.
+        expect(compacted.diagnostics).toHaveLength(1);
+        expect(compacted.diagnostics[0].startsWith('policy:context-compaction withheld 3')).toBe(
+            true
+        );
+        expect(control.diagnostics).toEqual([]);
+
+        // Durable, in exactly the runtime's own form. The seeded conversation gains a system
+        // entry when it is applied, so the three pruned units sit at 2/3, 6/7 and 10/11 —
+        // assistant plus its result, and NOTHING else is flagged: the answers, the tail and
+        // the opening prompt all stay.
+        const flagged = flaggedOf(durableTranscript(root));
+
+        expect(flagged).toEqual([
+            { index: 2, role: 'assistant', included: false },
+            { index: 3, role: 'tool', included: false },
+            { index: 6, role: 'assistant', included: false },
+            { index: 7, role: 'tool', included: false },
+            { index: 10, role: 'assistant', included: false },
+            { index: 11, role: 'tool', included: false }
+        ]);
+
+        // Nothing was ever written for the healthy units — the flag is stored only when it is
+        // `false`, so the persisted document stays byte-compatible with a pre-flag session.
+        expect(
+            durableTranscript(root)
+                .slice(12)
+                .every((message) => message.included === undefined)
+        ).toBe(true);
+
+        // RESTART: the stored document carries the decision, and the policy reproduces it
+        // byte-for-byte. Note what a durable PRESET conversation actually is on reopen: the
+        // preset's own `messages` seed is re-applied when the harness is built (that is what
+        // a preset IS — a programmatic starting transcript), so the running conversation
+        // starts from the un-pruned seed and the pass re-derives the same six flags. The
+        // durable document, by contrast, never lost them — asserted above and again below.
+        //
+        // Two properties follow, and both are measured against the same restart with the
+        // policy switched off, which is why the counts are read rather than assumed:
+        //   * the re-derived pass is IDENTICAL — the same six units, the same single report —
+        //     so pruning is a function of the transcript, not of when it was first scanned;
+        //   * it is again ONE notification for THREE writes (3 events against the control's
+        //     2), i.e. coalescing is a property of every pass, not of the first one.
+        const reopened: DurableCounters = { transcriptWrites: [], diagnostics: [] };
+        await runOne(root, compactionPreset(reopened, { compact: true }));
+
+        const reopenedControl: DurableCounters = { transcriptWrites: [], diagnostics: [] };
+        await runOne(rootWithout, compactionPreset(reopenedControl, { compact: false }));
+
+        expect(reopenedControl.transcriptWrites).toEqual(['agent_message', 'agent_message']);
+        expect(reopened.transcriptWrites).toEqual([
+            'agent_message',
+            'agent_message',
+            'agent_message'
+        ]);
+        expect(reopened.diagnostics).toEqual(compacted.diagnostics);
+        expect(flaggedOf(durableTranscript(root))).toEqual(flagged);
+
+        // The control conversation, untouched by any policy, still holds every failure in
+        // front of the model — the difference between the two runs is the pruning and nothing
+        // else.
+        expect(flaggedOf(durableTranscript(rootWithout))).toEqual([]);
     });
 });

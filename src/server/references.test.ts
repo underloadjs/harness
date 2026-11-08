@@ -36,6 +36,32 @@ import {
 import type { TaskReceipt, TurnResponse } from '../shared/harness-api';
 import type { SessionSnapshot, SessionTurn } from './protocol';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
 const TEMP_ROOT = path.join(REPO_ROOT, 'Temp');
@@ -324,7 +350,7 @@ describe('fresh server blocks', () => {
         const latestThread = snapshot.threads!.find(
             (thread) => thread.id === snapshot.turns[1]!.threadId
         )!;
-        expect(latestThread.messages.filter((message) => message.role === 'user')).toEqual([
+        expect(withoutIds(latestThread.messages.filter((message) => message.role === 'user'))).toEqual([
             { role: 'user', content: 'second block' }
         ]);
     });

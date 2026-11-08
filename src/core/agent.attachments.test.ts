@@ -20,6 +20,32 @@ import type {
     HarnessStreamRequest
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 const base64 = (bytes: readonly number[]): string => Buffer.from(bytes).toString('base64');
 const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
 const PNG_DATA = base64(PNG_BYTES);
@@ -66,7 +92,7 @@ describe('agent user attachments', () => {
             messages: [{ role: 'user', content: 'seed [Image 1]', attachments: [image()] }]
         });
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'seed [Image 1]', attachments: [expectedAttachment] }
         ]);
 
@@ -113,7 +139,7 @@ describe('agent user attachments', () => {
 
         // `toStrictEqual` is the strict form: a leftover `included: undefined` key
         // fails it, exactly as a written `included: true` does.
-        expect(brain.messages).toStrictEqual([
+        expect(withoutIds(brain.messages)).toStrictEqual([
             { role: 'user', content: 'upload on [Image 1]', attachments: [expectedAttachment] },
             {
                 role: 'user',
@@ -171,7 +197,7 @@ describe('agent user attachments', () => {
 
         brain.user('hello');
 
-        expect(brain.messages).toStrictEqual([{ role: 'user', content: 'hello' }]);
+        expect(withoutIds(brain.messages)).toStrictEqual([{ role: 'user', content: 'hello' }]);
     });
 
     it('appends validated attachments as a detached copy', () => {
@@ -180,7 +206,7 @@ describe('agent user attachments', () => {
 
         brain.user('See [Image 1]', [input]);
 
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [expectedAttachment] }
         ]);
 
@@ -224,10 +250,10 @@ describe('agent user attachments', () => {
                 }
             }
         ]);
-        expect(seen[0].messages).toEqual([
+        expect(withoutIds(seen[0].messages)).toEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [expectedAttachment] }
         ]);
-        expect(brain.messages).toEqual([
+        expect(withoutIds(brain.messages)).toEqual([
             { role: 'user', content: 'See [Image 1]', attachments: [expectedAttachment] },
             { role: 'assistant', content: 'ok' }
         ]);
@@ -239,8 +265,8 @@ describe('agent user attachments', () => {
 
         await collect(brain.stream('plain'));
 
-        expect(seen[0].messages).toStrictEqual([{ role: 'user', content: 'plain' }]);
-        expect(brain.messages).toStrictEqual([
+        expect(withoutIds(seen[0].messages)).toStrictEqual([{ role: 'user', content: 'plain' }]);
+        expect(withoutIds(brain.messages)).toStrictEqual([
             { role: 'user', content: 'plain' },
             { role: 'assistant', content: 'ok' }
         ]);
@@ -276,12 +302,12 @@ describe('agent user attachments', () => {
 
         await collect(brain.stream('See [Image 1]', { attachments: [image()] }));
 
-        expect(seen[0].messages[0]).toEqual({
+        expect(withoutIds(seen[0].messages[0])).toEqual({
             role: 'user',
             content: 'See [Image 1]',
             attachments: [{ ...expectedAttachment, data: 'AAAA' }]
         });
-        expect(brain.messages[0]).toEqual({
+        expect(withoutIds(brain.messages[0])).toEqual({
             role: 'user',
             content: 'See [Image 1]',
             attachments: [expectedAttachment]

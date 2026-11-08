@@ -460,8 +460,8 @@ describe('compactness bounds (R1)', () => {
         const body = `${'body-'.repeat(120)}${marker}${'-end'.repeat(120)}`;
         const result = fold([
             starts(),
-            toolCall('call-1', 'task', args),
-            toolResult('task', body, 'call-1', { outcome: 'completed' }),
+            toolCall('call-1', 'tasks', args),
+            toolResult('tasks', body, 'call-1', { outcome: 'completed' }),
             { type: 'text', agent: 'one', delta: 'the answer' }
         ]);
 

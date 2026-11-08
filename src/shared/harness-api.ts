@@ -899,6 +899,24 @@ export type SessionTurnStatus =
     | "cancelled";
 
 /**
+ * One plugin diagnostic the server received for a session: a hook that THREW, TIMED OUT, or returned an
+ * unparseable decision (the framework's fail-open rule drops the handler and the run continues), or a plugin's
+ * own `policy` report of what it decided. Without this record a broken policy plugin and an inert one answer
+ * identically, which is the invisibility this surface exists to close.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface SessionPluginDiagnostic {
+    at: number;
+    kind: "handler-threw" | "handler-timed-out" | "invalid-decision" | "policy";
+    owner: string;
+    event?: string;
+    message: string;
+    data?: {
+      [key: string]: unknown;
+      };
+}
+
+/**
  * One session as a list row: metadata and counters, nothing else. Deliberately absent: turns, events, the
  * thread roster, transcripts, display trees, the frozen definition, and the live `agent_models` map. A rail of
  * a hundred long conversations is therefore a constant-size response.
@@ -937,6 +955,7 @@ export type SessionResource =
     pending_action_count: number;
     created_tool_count: number;
     created_tool_limit: number;
+    plugin_diagnostics?: SessionPluginDiagnostic[];
 };
 
 /**

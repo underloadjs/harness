@@ -157,7 +157,7 @@ describe('threadRead registration (R1)', () => {
 
         expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'threadList',
             'threadRead',
             'threadSend'

@@ -123,10 +123,12 @@ export type {
 } from './tool-source';
 export {
     MODEL_TOOL_RESULT_BUDGET_BYTES,
+    MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES,
     boundToolResult,
+    createToolResultTurnBudget,
     utf8ByteLength
 } from './result-budget';
-export type { BoundedToolResult } from './result-budget';
+export type { BoundedToolResult, ToolResultBoundOptions, ToolResultSource, ToolResultTurnBudget } from './result-budget';
 export {
     MAX_CREATED_SCHEMA_BYTES,
     MAX_CREATED_SCHEMA_DEPTH,
@@ -136,10 +138,56 @@ export {
     validateSchemaValue
 } from './schema-validation';
 export type { SchemaCheck, ToolArgumentMode } from './schema-validation';
-export { createTaskTool } from './task';
-export { createProfileTool } from './profile';
-export { createChapterTool } from './chapter';
-export { createLocationTool } from './location';
+// The unified session store (records-engine T2/T3): ONE engine owns every record,
+// so the four per-store factories are gone. The built-in collection SPECS stay next
+// to the collection they describe.
+export {
+    createRecordEngine,
+    readRecordsStoreState,
+    RECORD_ERROR_CODES,
+    RECORD_ENGINE_TOOL_NAMES,
+    BUILTIN_RECORD_COLLECTIONS,
+    isRecordRejection,
+    translateRecordRejection
+} from './records';
+export type { RecordEngine, RecordErrorCode } from './records';
+export { TASKS_COLLECTION, TASK_MAX_RECORDS, TASK_MAX_TEXT } from './task';
+export {
+    PROFILES_COLLECTION,
+    PROFILE_MAX_RECORDS,
+    PROFILE_MAX_NAME,
+    PROFILE_MAX_TEXT,
+    PROFILE_MAX_TRAITS,
+    PROFILE_MAX_TRAIT
+} from './profile';
+export {
+    CHAPTERS_COLLECTION,
+    CHAPTER_MAX_RECORDS,
+    CHAPTER_MAX_NAME,
+    CHAPTER_MAX_TEXT,
+    CHAPTER_STATUSES,
+    CHAPTER_MAX_ORDER
+} from './chapter';
+export {
+    LOCATIONS_COLLECTION,
+    LOCATION_MAX_RECORDS,
+    LOCATION_MAX_NAME,
+    LOCATION_MAX_TEXT
+} from './location';
+// The engine's own bounds (store size, page budget, change window, define limits),
+// exported so a test asserts the number instead of restating it.
+export {
+    RECORD_MAX_RECORDS,
+    RECORD_MAX_TEXT,
+    RECORD_LIST_DEFAULT_LIMIT,
+    RECORD_LIST_MAX_LIMIT,
+    RECORD_RESPONSE_BUDGET_BYTES,
+    RECORD_MAX_CHANGES,
+    RECORD_MAX_CHANGES_IN_RESULT,
+    RECORD_MAX_FIELDS,
+    RECORD_MAX_COLLECTION_NAME,
+    RECORD_STALE_PAYLOAD_BUDGET_BYTES
+} from './records';
 // Slash commands. The parser is PURE (no harness, no transport, no Node built-in)
 // so every host resolves one line the same way: `/task add "testing"` becomes
 // `{ name: 'task', args: ['add', 'testing'], rest, input }`. `harness()` owns the
@@ -186,6 +234,47 @@ export type { ToolUiExtraction } from './tool-ui';
 // harness and the manual API path share. Profiles live in ../shared/attachments.
 export { toolMedia, toolMediaDescriptors, toolMediaOf, unwrapToolResult } from './tool-media';
 export type { ToolMediaExtraction, ToolResultExtraction } from './tool-media';
+// The persisted tool outcome (progressive-compaction T1). The three rules — store only a
+// NON-`completed` outcome, read absent as `completed`, derive `isError` instead of keeping
+// a second field — live in ./tool-outcome.ts so the writers (../harness.ts, ./agent.ts) and
+// the readers (./snapshot.ts, ./branch.ts) cannot drift apart. Internal to the package
+// surface like the scheduler below; a host reads the field off `HarnessMessage` directly.
+export {
+    TOOL_OUTCOMES,
+    isErrorOutcome,
+    isToolOutcome,
+    storedOutcomeEntry,
+    toolOutcomeOf,
+    toolResultIsError
+} from './tool-outcome';
+// The canonical argument fingerprint (progressive-compaction T2). One canonical string per
+// argument object, and a (name, fingerprint) CALL key: the structural identity a retry or a
+// prune rule needs, because ids are always fresh and `arguments` is verbatim JSON text.
+// Exported here, in `src/core` beside the context estimator (./context-estimate.ts, which
+// ../harness.ts imports directly rather than through this barrel), per T2.2. No consumer
+// yet — T3's resolver is the next task; the behaviour is pinned in ./argument-fingerprint.test.ts.
+export { argumentFingerprint, toolCallFingerprint } from './argument-fingerprint';
+// The compaction policy (progressive-compaction T3): which committed tool units stop being
+// sent, given the transcript. Pure — the shipped plugin owns the trigger, the settings and
+// the flag WRITES (../plugins/context-compaction.plugin.ts), and this is the part that can be
+// pinned without a harness. Exported here beside the two helpers it consumes so a host that
+// wants to preview a pass (or replace the built-in with its own writer) reads the same rule.
+export {
+    PRUNE_CANDIDATE_OUTCOMES,
+    RESOLVING_OUTCOME,
+    groupUnits,
+    isCandidateFacts,
+    planContextPruning,
+    resolvesPrunedFailure
+} from './context-pruning';
+export type {
+    ContextUnit,
+    PruneCandidate,
+    PruneOptions,
+    PrunePlan,
+    UnitClass,
+    UnitFacts
+} from './context-pruning';
 // Background tool scheduling (T3): one board per harness. Internal to the
 // package surface (the harness is the only owner), exported here so the harness
 // module and focused tests share one implementation.
@@ -233,14 +322,16 @@ export {
     THREAD_SEND_NAME,
     TOOL_REQUEST_METADATA,
     TOOL_REQUEST_NAME,
-    TASK_METADATA,
-    TASK_NAME,
-    PROFILE_MANAGE_METADATA,
-    PROFILE_MANAGE_NAME,
-    CHAPTER_MANAGE_METADATA,
-    CHAPTER_MANAGE_NAME,
-    LOCATION_MANAGE_METADATA,
-    LOCATION_MANAGE_NAME,
+    RECORDS_METADATA,
+    RECORDS_NAME,
+    TASKS_METADATA,
+    TASKS_NAME,
+    PROFILES_METADATA,
+    PROFILES_NAME,
+    CHAPTERS_METADATA,
+    CHAPTERS_NAME,
+    LOCATIONS_METADATA,
+    LOCATIONS_NAME,
     agentDelegateMetadata,
     coreToolMetadata
 } from './metadata';

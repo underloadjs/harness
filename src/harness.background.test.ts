@@ -68,6 +68,32 @@ import type {
     HarnessToolCall
 } from '@underload/harness';
 
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
 // ---------------------------------------------------------------------------
 // Local types
 // ---------------------------------------------------------------------------
@@ -489,7 +515,7 @@ describe('background tool calls', () => {
         ]);
         expect(seen[0].toolNames).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'alpha',
             'beta'
         ]);
@@ -1573,7 +1599,7 @@ describe('delegated answer extraction', () => {
 
         // The child is paused on a REAL answer while its own call is pending:
         // this is the visible answer the reported session stopped on.
-        expect(researcher.messages).toEqual([
+        expect(withoutIds(researcher.messages)).toEqual([
             { role: 'user', content: 'find facts' },
             {
                 role: 'assistant',
@@ -1592,13 +1618,13 @@ describe('delegated answer extraction', () => {
 
         // Only the answer crosses back — the substantive one, not the blank
         // terminal turn.
-        expect(toolMessages(writer.agent.messages).map((message) => delegationAnswer(message.content))).toEqual([
+        expect(withoutIds(toolMessages(writer.agent.messages).map((message) => delegationAnswer(message.content)))).toEqual([
             { agent: 'researcher', content: 'the researched facts' }
         ]);
 
         // The child's own transcript keeps the literal final turn: extraction
         // changes the DELEGATE RESULT, never history.
-        expect(researcher.messages.at(-1)).toEqual({ role: 'assistant', content: '\n' });
+        expect(withoutIds(researcher.messages.at(-1))).toEqual({ role: 'assistant', content: '\n' });
 
         // Streaming is untouched: the substantive text was emitted as a delta,
         // and the blank terminal turn still streamed its own text.
@@ -1922,6 +1948,29 @@ describe('toolCancel', () => {
             }
         ]);
 
+        // Compaction T1.2 — the control outcome is PERSISTED, and it is persisted as the
+        // value the delivery classified, not as a failure and not as nothing: a restart or a
+        // snapshot of this conversation still knows `k1` was cancelled by the caller. The
+        // two completed results (the real sibling, and the `toolCancel` control itself)
+        // carry no key, and no entry carries a stored `isError`.
+        const committed = writer.agent.messages.filter(
+            (message): message is Extract<HarnessMessage, { role: 'tool' }> => message.role === 'tool'
+        );
+
+        expect(committed.map((message) => message.toolCallId)).toEqual(['k1', 'k2', 'k3']);
+        expect(committed.map((message) => message.outcome)).toEqual(['cancelled', undefined, undefined]);
+        expect(
+            committed.map((message) =>
+                Object.keys(message)
+                    .filter((key) => key !== 'messageId')
+                    .join('+')
+            )
+        ).toEqual([
+            'role+content+toolCallId+name+outcome',
+            'role+content+toolCallId+name',
+            'role+content+toolCallId+name'
+        ]);
+
         // A late settlement of the uncooperative tool is data on a dead call: no
         // transcript mutation and no second result event.
         const settledTranscript = copyMessages(writer.agent.messages);
@@ -2243,6 +2292,122 @@ describe('toolCancel', () => {
         expect(failed.map((event) => event.outcome)).toEqual(['failed']);
         expect(failed.map((event) => event.isError)).toEqual([true]);
         expect(failed.map((event) => event.content)).toEqual(['Tool "broken" failed: kaput']);
+
+        expect(wireIssues(seen)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // Compaction T1.2/T1.3 — the classification is COMMITTED, not only reported. The
+    // `tool_result` event is gone the moment the run ends, so anything that has to know WHY
+    // a call ended after a restart, a snapshot, a fork or a `threadRead` (the whole point of
+    // the prune policy) needs the value on the canonical transcript entry:
+    //   * `rejected` and `failed` ride along verbatim, never re-derived from the result text;
+    //   * a COMPLETED result gets NO key at all — the minimal-delta storage rule `included`
+    //     and `attachments` follow, which is what keeps every pre-existing transcript,
+    //     snapshot fixture and branch record byte-identical (T1.1);
+    //   * `isError` is not stored beside it (T1.3): it stays the derived projection of the
+    //     one value, asserted here only on the event that reports it.
+    it('persists the outcome on the committed tool message and omits the key for a completed result', async () => {
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const broken = tool<string, string>({
+            description: 'Fails at once.',
+            tags: ['test'],
+            visibility: 'core',
+            parameters: {
+                type: 'object',
+                properties: { value: { type: 'string' } },
+                required: ['value'],
+                additionalProperties: false
+            },
+            execute: () => {
+                throw new Error('kaput');
+            }
+        });
+
+        const works = tool<string, string>({
+            description: 'Succeeds at once.',
+            tags: ['test'],
+            visibility: 'core',
+            parameters: {
+                type: 'object',
+                properties: { value: { type: 'string' } },
+                required: ['value'],
+                additionalProperties: false
+            },
+            execute: () => 'saved'
+        });
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    stream: streamFrom(
+                        (turn) =>
+                            turn === 0
+                                ? calls(
+                                      call('n1', 'missing', '{"value":"M"}'),
+                                      call('f1', 'broken', '{"value":"F"}'),
+                                      call('w1', 'works', '{"value":"W"}')
+                                  )
+                                : answer('done'),
+                        seen
+                    )
+                })
+            },
+            tools: { broken, works },
+            presets: false,
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        expect(state.status).toBe('resolved');
+
+        const committed = writer.agent.messages.filter(
+            (message): message is Extract<HarnessMessage, { role: 'tool' }> => message.role === 'tool'
+        );
+
+        // Call order, at the original positions (R3), and one entry per call.
+        expect(committed.map((message) => message.toolCallId)).toEqual(['n1', 'f1', 'w1']);
+
+        // The KEY SET AND ORDER is the storage contract: a snapshot is JSON, so the outcome
+        // sits exactly where the type declares it (after `name`, before the control keys),
+        // and a completed entry gains nothing.
+        expect(
+            committed.map((message) =>
+                Object.keys(message)
+                    .filter((key) => key !== 'messageId')
+                    .join('+')
+            )
+        ).toEqual([
+            'role+content+toolCallId+name+outcome',
+            'role+content+toolCallId+name+outcome',
+            'role+content+toolCallId+name'
+        ]);
+
+        // Exact values, verbatim from the delivery: the unregistered name is an invocation
+        // refusal, the throwing tool an operational failure, the successful one UNSTORED.
+        expect(committed.map((message) => message.outcome)).toEqual(['rejected', 'failed', undefined]);
+
+        // Byte-exact proof of the omit rule: a completed result serializes to the same bytes
+        // the runtime wrote before this field existed (ids are the one separately-pinned,
+        // volatile key, so they are projected out by the file's existing normalizer).
+        expect(JSON.stringify(withoutIds(committed[2]))).toBe(
+            '{"role":"tool","content":"saved","toolCallId":"w1","name":"works"}'
+        );
+
+        // Nothing second was stored to drift: no `isError` key on the entry, while the event
+        // still reports the derived boolean alongside the outcome.
+        expect(Object.keys(committed[0])).not.toContain('isError');
+        expect(resultsOf(events, 'broken').map((event) => [event.outcome, event.isError])).toEqual([
+            ['failed', true]
+        ]);
+        expect(resultsOf(events, 'works').map((event) => [event.outcome, event.isError])).toEqual([
+            ['completed', false]
+        ]);
 
         expect(wireIssues(seen)).toEqual([]);
         expect(vi.getTimerCount()).toBe(0);

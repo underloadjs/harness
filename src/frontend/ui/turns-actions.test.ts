@@ -62,7 +62,7 @@ const serverTurn = (
 ): SessionTurn => ({
     id: 'turn-1',
     index: 0,
-    prompt: 'task',
+    prompt: 'tasks',
     status: options.status ?? 'running',
     startedAt: 5,
     updatedAt: 10,
@@ -86,7 +86,7 @@ describe('action cards in the turn board', () => {
     it('mounts an interactive root question and resolves it from action_answer', () => {
         const board = mount();
         board.bindSession('s1');
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply(requestEvent());
 
@@ -118,7 +118,7 @@ describe('action cards in the turn board', () => {
         document.body.replaceChildren(board.element);
         board.bindSession('session-1');
 
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply(requestEvent());
 
@@ -139,7 +139,7 @@ describe('action cards in the turn board', () => {
 
     it('makes a non-root request read-only regardless of thread kind', () => {
         const board = mount();
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply(
             requestEvent({
@@ -177,7 +177,7 @@ describe('action cards in the turn board', () => {
 
     it('keeps a done-with-pending pause answerable but expires a settled turn', () => {
         const live = mount();
-        const turn = live.begin('task');
+        const turn = live.begin('tasks');
         startRoot(turn);
         turn.apply(requestEvent());
         turn.apply({
@@ -218,7 +218,7 @@ describe('action cards in the turn board', () => {
     it('expires an unresolved question when the session changes', () => {
         const board = mount();
         board.bindSession('s1');
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply(requestEvent());
 
@@ -234,7 +234,7 @@ describe('action cards in the turn board', () => {
 
     it('does not downgrade an answered card on a later terminal transition', () => {
         const board = mount();
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply(requestEvent());
         turn.apply(
@@ -255,7 +255,7 @@ describe('action cards in the turn board', () => {
 
     it('applies an answer that precedes its request and adopts the first session bind', () => {
         const board = mount();
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
 
         // Legacy/reordered replay: the answer record may be encountered first. The
@@ -277,7 +277,7 @@ describe('action cards in the turn board', () => {
         // A card rendered before the first bind is adopted by that conversation,
         // not expired as if it belonged somewhere else.
         const early = mount();
-        const earlyTurn = early.begin('task');
+        const earlyTurn = early.begin('tasks');
         startRoot(earlyTurn);
         earlyTurn.apply(requestEvent());
         early.bindSession('s-late');
@@ -288,7 +288,7 @@ describe('action cards in the turn board', () => {
 describe('fork / autoanswer branch rows', () => {
     it('renders a fork as a nested block with a short kind tag and settles on branch_end', () => {
         const board = mount();
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply({
             type: 'branch_start',
@@ -341,7 +341,7 @@ describe('fork / autoanswer branch rows', () => {
 
     it('labels an autoanswer branch and reports a failed branch without raw ids', () => {
         const board = mount();
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply({
             type: 'branch_start',
@@ -383,7 +383,7 @@ describe('fork / autoanswer branch rows', () => {
 
     it('nests a branch under its source thread without a second block shape', () => {
         const board = mount();
-        const turn = board.begin('task');
+        const turn = board.begin('tasks');
         startRoot(turn);
         turn.apply({
             type: 'start',

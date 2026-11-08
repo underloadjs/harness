@@ -7,6 +7,7 @@
 
 import type {
     Harness,
+    HarnessDiagnosticEvent,
     HarnessInteractionConfiguration,
     HarnessPluginSettingsProvider,
     HarnessProgress,
@@ -48,9 +49,28 @@ export type HarnessPresetReport = {
     // reference and each plugin's `api.settings` re-reads it on every call
     // (src/plugin/settings.ts, src/plugin/host.ts:151), so a `PATCH /v1/harness/plugins/
     // {plugin_id}` changes what an ALREADY RUNNING session reads on its next turn with no
-    // rebuild. SessionStore passes one provider for the whole process (./sessions.ts
-    // `buildHarness`); the worker lane cannot (see ./plugins.ts, "WORKER MODE").
+    // rebuild. SessionStore passes one provider for the whole process (../sessions.ts
+    // `buildHarness`); the worker lane cannot (see ../plugins.ts, "WORKER MODE").
     pluginSettings?: HarnessPluginSettingsProvider;
+    // Plugin diagnostics (pipeline T1.5's last mile). Same optional-third-argument discipline
+    // as `stateChange`, `interaction` and `pluginSettings` above, so every existing factory
+    // signature and caller keeps compiling and a factory that ignores it simply produces a
+    // harness with no diagnostic sink.
+    //
+    // WHY THIS IS HERE AT ALL: the library channel exists and IS wired —
+    // `createHookBus({ onHandlerError: notifyPluginDiagnostic })` and a plugin's own
+    // `api.report.diagnostic` both land on `harness({ report.diagnostic })`
+    // (src/types/index.ts `HarnessDiagnosticEvent`) — but until now no server host PASSED one,
+    // so a broken plugin on a durable session was still invisible: "the compactor is throwing"
+    // and "the compactor decided to do nothing" read identically through `GET /sessions`. This
+    // member is the one line the server needed to install a sink; the store's implementation
+    // (src/server/sessions.ts `buildHarness`) journals the event on the session and logs the
+    // failure kinds.
+    //
+    // Synchronous, advisory, and never a run failure: the harness swallows a throw from this
+    // callback (the same rule as `stateChange`), so a sink that cannot allocate a string cannot
+    // take a conversation down with it.
+    diagnostic?: (event: HarnessDiagnosticEvent) => void;
 };
 
 // One named harness in the catalogue.

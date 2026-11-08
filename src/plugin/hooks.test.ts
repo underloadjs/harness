@@ -584,3 +584,328 @@ describe('emitMaybeSync', () => {
         expect(order).toEqual(['sync', 'async']);
     });
 });
+
+// ---------------------------------------------------------------------------
+// Event bus v2 (T1) + the turn-decision reducer (T2.2)
+// ---------------------------------------------------------------------------
+//
+// What each of these pins, and why it exists:
+//   - WILDCARD: an audit plugin must subscribe ONCE and see every event exactly once
+//     with a payload that NARROWS with the event name (open decision 6 — the mapped
+//     union is the whole point; `payload: unknown` would put the `any` back);
+//   - `host.state_change` is NOT part of the fan-out (T1.7), and `live()` expands a
+//     wildcard into exactly the events it will be delivered, or the Plugins pane starts
+//     lying (T1.2);
+//   - PRIORITY: "whoever registered last wins" must stop being an accident of the
+//     plugin array (R2), while staying STABLE inside one priority;
+//   - BUDGET: one handler that never resolves used to park the turn forever, and losing
+//     it must be visible (fail-open + reported, never fail-closed);
+//   - the DECISION REDUCER is the single place (T2.2) where a round's transcript and
+//     its run-level decision merge, so the harness's consumer cannot disagree with it.
+describe('createHookBus — event bus v2', () => {
+    // Every event a `'*'` subscription is delivered. Written out in full so adding an
+    // event to the catalogue FAILS these assertions until its author decides whether an
+    // audit plugin should receive it (plugin/hooks.ts `WILDCARD_DELIVERABLE`).
+    const DELIVERED = [
+        'thread.created',
+        'thread.started',
+        'thread.paused',
+        'thread.resumed',
+        'thread.stopped',
+        'thread.idle',
+        'thread.deleted',
+        'run.started',
+        'run.finished',
+        'run.failed',
+        'turn.before',
+        'turn.after',
+        'tool.before',
+        'tool.after',
+        'async.pending',
+        'async.drained',
+        'harness.dispose'
+    ];
+
+    it('delivers every emitted event to a wildcard exactly once, with the right payload', async () => {
+        const bus = createHookBus();
+        const seen: string[] = [];
+        const deleted: unknown[] = [];
+        const tokens: number[] = [];
+
+        bus.on('*', (context) => {
+            seen.push(context.event);
+
+            // COMPILE-TIME evidence for open decision 6: `payload` narrows with `event`.
+            // Without the mapped union these two property reads would not typecheck.
+            if (context.event === 'thread.deleted') deleted.push(context.payload.threadId);
+            if (context.event === 'turn.before') tokens.push(context.payload.estimatedTokens);
+        });
+
+        // A named subscriber alongside the wildcard, so "exactly once" is proven to mean
+        // once per EMIT, not once per registration of any kind.
+        bus.on('run.started', () => undefined, { owner: 'named' });
+
+        bus.fire('thread.deleted', { threadId: 'thread-1', agent: 'writer' });
+        await bus.emit('run.started', {
+            threadId: 'thread-1',
+            agent: 'writer',
+            depth: 1,
+            input: 'go'
+        });
+        bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+        await bus.emit('harness.dispose', {});
+
+        // `host.state_change` fires on every mutation and is opt-in by name, so a
+        // wildcard that saw nothing else must still have seen exactly these four.
+        expect(seen).toEqual(['thread.deleted', 'run.started', 'turn.before', 'harness.dispose']);
+        expect(deleted).toEqual(['thread-1']);
+        expect(tokens).toEqual([1]);
+    });
+
+    it('counts a wildcard as a listener for has()/count(), and expands it honestly in live()', async () => {
+        const bus = createHookBus();
+
+        const off = bus.on('*', () => undefined, { owner: 'auditor' });
+
+        // Rule 5's guard must not skip an event just because nobody subscribed to THAT
+        // event: an audit plugin is exactly the reason `has()` has to be true here.
+        expect(bus.has('turn.before')).toBe(true);
+        expect(bus.has('thread.deleted')).toBe(true);
+        expect(bus.count('turn.before')).toBe(1);
+
+        const live = bus.live();
+
+        // T1.2 — one row per delivered event, the owner repeated, and NO invented `'*'`
+        // key (the return type is keyed by HarnessLifecycleEvent).
+        expect(Object.keys(live).sort()).toEqual([...DELIVERED].sort());
+        expect(live['turn.before']).toEqual(['auditor']);
+        expect(live['harness.dispose']).toEqual(['auditor']);
+
+        // T1.7 — the host plane is excluded from the fan-out, so `live()` must not
+        // claim a wildcard listener for it.
+        expect(live['host.state_change']).toBeUndefined();
+        expect(bus.has('host.state_change')).toBe(false);
+
+        off();
+
+        expect(bus.has('turn.before')).toBe(false);
+        expect(bus.live()).toEqual({});
+    });
+
+    it('does not deliver host.state_change to a wildcard, and does to an explicit subscriber', async () => {
+        const bus = createHookBus();
+        const seen: string[] = [];
+
+        bus.on('*', (context) => {
+            seen.push(`wild:${context.event}`);
+        });
+        bus.on('host.state_change', (payload) => {
+            seen.push(`named:${payload.reason}`);
+        }, { owner: 'persistence-reader' });
+
+        await bus.emit('host.state_change', { type: 'state_change', reason: 'agent_message' });
+        await bus.emit('turn.before', turnPayload([user('go')]));
+
+        expect(seen).toEqual(['named:agent_message', 'wild:turn.before']);
+    });
+
+    it('runs a priority-1 handler before a priority-0 handler registered earlier, stably within a priority', async () => {
+        const bus = createHookBus();
+        const order: string[] = [];
+
+        bus.on('turn.before', () => void order.push('a:p0'), { owner: 'a' });
+        bus.on('turn.before', () => void order.push('b:p0'), { owner: 'b' });
+        bus.on('turn.before', () => void order.push('c:p1'), { owner: 'c', priority: 1 });
+        // A priority below zero sorts AFTER the defaults, and ties keep registration
+        // order — the same rule the named handlers follow, applied to a wildcard too.
+        bus.on('*', () => void order.push('d:p-1'), { owner: 'd', priority: -1 });
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round).toEqual({ sync: true, value: {} });
+        expect(order).toEqual(['c:p1', 'a:p0', 'b:p0', 'd:p-1']);
+    });
+
+    it('drops a handler that never resolves at its budget, reports it, and keeps the round', async () => {
+        const failures: Array<{ owner: string; kind?: string; message: string }> = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push({
+                owner: context.owner,
+                kind: context.kind,
+                message: (context.error as Error).message
+            })
+        });
+
+        // A summarizer call that never comes back: before T1.4 this parked the turn
+        // forever, and the run had no way to notice.
+        bus.on('turn.before', () => new Promise<never>(() => undefined), {
+            owner: 'slow-policy',
+            timeoutMs: 5
+        });
+        bus.on('turn.before', () => ({ transcript: [user('kept')] }), { owner: 'fast-policy' });
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round.sync).toBe(false);
+        // Fail-OPEN: the healthy handler's override survives, the round resolves, and
+        // the stuck handler contributes nothing whenever it finally would have.
+        await expect((round as { promise: Promise<unknown> }).promise).resolves.toEqual({
+            transcript: [user('kept')]
+        });
+        expect(failures).toEqual([
+            {
+                owner: 'slow-policy',
+                kind: 'timed-out',
+                message:
+                    'A "slow-policy" handler for "turn.before" timed out after 5ms and was dropped (fail-open).'
+            }
+        ]);
+    });
+
+    it('arms no timer for a synchronous handler that carries a budget', async () => {
+        const failures: string[] = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push(`${String(context.kind)}:${(context.error as Error).message}`)
+        });
+
+        bus.on('turn.before', () => ({ transcript: [user('sync')] }), {
+            owner: 'sync-policy',
+            timeoutMs: 1
+        });
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        // Rule 6: the timer may only be armed at the moment a handler returns a thenable,
+        // so a budget on a synchronous handler changes nothing on the hot path.
+        expect(round).toEqual({ sync: true, value: { transcript: [user('sync')] } });
+
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        expect(failures).toEqual([]);
+    });
+
+    it('ignores AND reports an unparseable decision, keeping the transcript override (T2.2 rule 5)', async () => {
+        const failures: Array<{ owner: string; kind?: string; message: string }> = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push({
+                owner: context.owner,
+                kind: context.kind,
+                message: (context.error as Error).message
+            })
+        });
+
+        // The typo is in the DECISION only, so the handler's real work still counts.
+        bus.on('turn.before', () => ({
+            transcript: [user('kept')],
+            decision: { action: 'halt' }
+        }), { owner: 'typo-policy' });
+
+        const merged = await bus.emit('turn.before', turnPayload([user('go')]));
+
+        expect(merged).toEqual({ transcript: [user('kept')] });
+        expect(failures).toEqual([
+            {
+                owner: 'typo-policy',
+                kind: 'invalid-decision',
+                message:
+                    'A "typo-policy" handler for "turn.before" returned a decision this contract cannot parse and it was ignored: {"action":"halt"}.'
+            }
+        ]);
+    });
+
+    it('reports an unparseable decision on the async tail too, without failing the round', async () => {
+        const failures: string[] = [];
+        const bus = createHookBus({
+            onHandlerError: (context) => failures.push(`${String(context.kind)}:${(context.error as Error).message}`)
+        });
+
+        bus.on('turn.before', async () => ({ decision: 'stop' }), { owner: 'string-decision' });
+        bus.on('turn.before', () => ({ decision: { action: 'stop', reason: 'budget' } }), {
+            owner: 'valid-policy'
+        });
+
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round.sync).toBe(false);
+        await expect((round as { promise: Promise<unknown> }).promise).resolves.toEqual({
+            decision: { action: 'stop', reason: 'budget' }
+        });
+        expect(failures).toEqual([
+            'invalid-decision:A "string-decision" handler for "turn.before" returned a decision this contract cannot parse and it was ignored: "stop".'
+        ]);
+    });
+
+    it('merges one round into { transcript, decision }: last wins per channel, replace normalizes into the transcript', async () => {
+        const bus = createHookBus();
+
+        // Rule 3 of the precedence list: a decision COMPOSES with an earlier rewrite —
+        // the transcript is still decided, the run is additionally ended.
+        bus.on('turn.before', () => ({ transcript: [user('first')] }), { owner: 'rewriter' });
+        bus.on('turn.before', () => ({ decision: { action: 'stop', reason: 'out of budget' } }), {
+            owner: 'budget'
+        });
+
+        expect(await bus.emit('turn.before', turnPayload([user('go')]))).toEqual({
+            transcript: [user('first')],
+            decision: { action: 'stop', reason: 'out of budget' }
+        });
+
+        // Rule 4: a later plugin can CLEAR that decision, and a `replace` decision lands
+        // on the transcript channel so the consumer has one thing to read.
+        const cleared = createHookBus();
+
+        cleared.on('turn.before', () => ({ decision: { action: 'stop' } }), { owner: 'budget' });
+        cleared.on('turn.before', () => ({ decision: { action: 'continue' } }), { owner: 'override' });
+        cleared.on('turn.before', () => ({
+            decision: { action: 'replace', transcript: [user('replaced')] }
+        }), { owner: 'replacer' });
+
+        expect(await cleared.emit('turn.before', turnPayload([user('go')]))).toEqual({
+            transcript: [user('replaced')],
+            decision: { action: 'replace', transcript: [user('replaced')] }
+        });
+
+        // Rule 4 again, by PRIORITY: the higher-priority policy speaks last for the
+        // round, no matter where it sits in the plugin array.
+        const ranked = createHookBus();
+
+        ranked.on('turn.before', () => ({ decision: { action: 'pause', reason: 'cheap' } }), {
+            owner: 'cheap-policy'
+        });
+        ranked.on('turn.before', () => ({ decision: { action: 'stop', reason: 'authority' } }), {
+            owner: 'authoritative-policy',
+            priority: 10
+        });
+
+        expect(await ranked.emit('turn.before', turnPayload([user('go')]))).toEqual({
+            decision: { action: 'pause', reason: 'cheap' }
+        });
+    });
+
+    it('refuses a non-finite priority or timeout at registration', () => {
+        const bus = createHookBus();
+
+        expect(() =>
+            bus.on('turn.before', () => undefined, { owner: 'x', priority: Number.NaN })
+        ).toThrow('A "turn.before" priority must be a finite number.');
+        expect(() =>
+            bus.on('turn.before', () => undefined, { owner: 'x', timeoutMs: -1 })
+        ).toThrow('A "turn.before" timeoutMs must be a finite number >= 0.');
+
+        // Nothing was registered on the way to the refusal.
+        expect(bus.count('turn.before')).toBe(0);
+    });
+
+    it('accepts the "*" event name only as a subscription form, never as an event', () => {
+        const bus = createHookBus();
+
+        // `'*'` is not an event name, so an emit site that invented it finds no
+        // listeners of its own — the wildcard fan-out is a dispatch rule, not an event.
+        expect(bus.has('*' as HarnessLifecycleEvent)).toBe(false);
+
+        bus.on('turn.before', () => undefined, { owner: 'named' });
+
+        expect(bus.live()['*']).toBeUndefined();
+        expect(bus.live()).toEqual({ 'turn.before': ['named'] });
+    });
+});

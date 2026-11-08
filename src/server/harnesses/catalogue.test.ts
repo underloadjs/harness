@@ -191,7 +191,7 @@ describe('tool catalogue', () => {
         // Keyless search never registers, so the only advertised web row is fetch.
         expect(enabled.coreTools).toEqual([
             'toolRequest',
-            'task',
+            'tasks',
             'delegate',
             'read',
             'write',

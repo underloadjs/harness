@@ -28,10 +28,15 @@
 //   - ../../../Temp/t5/probe-lane.ts- the standalone version of this probe
 
 import { afterAll, describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { agent, harness } from '../../harness';
-import type { Harness, HarnessStreamEvent } from '../../harness';
+import type { Harness, HarnessMessage, HarnessStreamEvent } from '../../harness';
 import { createHarnessRegistry } from '../harnesses';
+// The built-in task collection SPEC, which a persisted collection block carries beside its
+// entries (Decision M) — so the expectation below names it instead of spelling it out.
+import { TASKS_COLLECTION } from '../../core';
 import { ALL_PRESET_TEMPLATES } from '../harnesses/presets.ts';
 import { SHARED_APP_TOOL_SOURCES } from '../harnesses/toolbox';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
@@ -40,8 +45,26 @@ import type { SessionSnapshot, SessionTurn } from '../protocol';
 import { SessionStore } from '../sessions';
 import type { LaneHost } from './lane-host';
 // T12 (S7) + T14: the replica-shaping steps, exported for exactly this kind of test.
-import { nestedRunHandshakeLimitations, refuseNestedRuns } from './lane-worker-loop';
-import { NESTED_RUN_ARMED_DOORS, NESTED_RUN_LIMITATION_CODE, nestedRunLimitationMessage, nestedRunRefusalMessage } from './capability';
+// `installAuthorityRuntime` is the classification gate itself: the loop that refuses a
+// runtime member nobody routed or declared local (records-engine T1).
+import { installAuthorityRuntime, nestedRunHandshakeLimitations, refuseNestedRuns } from './lane-worker-loop';
+// T4.1: the worker's OWN op derivation, exported for the same reason — it is the one piece of the
+// lane that can be pinned without spawning a thread, and it reads the replica through a structural
+// view (`ReplicaReadView`) precisely so a test can hand it one.
+import { committedDigestOf, deriveOperations } from './lane-worker-loop';
+import type { LaneWorkerState, ReplicaReadView } from './lane-worker-loop';
+import { digestMemoryValue } from './lane-memory';
+import type { LaneAuthority } from './lane-authority';
+import { HarnessPersistence } from '../persistence';
+import {
+    AUTHORITY_RUNTIME_METHODS,
+    LOCAL_RUNTIME_METHODS,
+    NESTED_RUN_ARMED_DOORS,
+    NESTED_RUN_LIMITATION_CODE,
+    ROUTED_RUNTIME_METHODS,
+    nestedRunLimitationMessage,
+    nestedRunRefusalMessage
+} from './capability';
 import { buildTestWorkerEntry } from './worker-test-build.test-support';
 
 // A cold lane builds the harness, recompiles the created-tool sources and restores the
@@ -79,6 +102,23 @@ const SETTINGS = { baseURL: 'http://localhost:9/v1', apiKey: '', model: 'demo' }
 
 const stores: SessionStore[] = [];
 
+// A durable root for the T4.1 restart case, under the repo's `Temp/` — the same convention
+// ../persistence.test.ts uses (`tempRoot`), so a crashed run leaves an inspectable document rather
+// than a directory in the OS temp that nobody can find afterwards.
+const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+const TEMP_ROOT = path.join(path.resolve(PACKAGE_ROOT, '../../..'), 'Temp');
+const roots: string[] = [];
+
+const tempRoot = (label: string): string => {
+    fs.mkdirSync(TEMP_ROOT, { recursive: true });
+
+    const root = fs.mkdtempSync(path.join(TEMP_ROOT, `harness-lane-${label}-`));
+
+    roots.push(root);
+
+    return root;
+};
+
 const storeOf = (): SessionStore => {
     // `demo` is the shipped SCRIPTED preset: it needs no provider, and its durable template
     // record is what a worker rebuilds (`presetFromRecord`), which is the whole point of the
@@ -103,6 +143,9 @@ afterAll(async () => {
     await new Promise((resolve) => setTimeout(resolve, 250));
 
     BUILT_TEST_WORKER?.dispose();
+
+    // The T4.1 durable roots are disposable once the stores that wrote them are closed.
+    for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
 });
 
 // The host is created lazily by the store on the first worker-mode dispatch, and even then
@@ -370,7 +413,7 @@ describe('worker mode: shared state is central, not local', () => {
     // One page of the canonical task store, as a routed call answers it. T1 put a
     // content revision, an attribution and a store revision into every answer, and the
     // worker boundary must not lose any of them: the WRITE happens at the authority
-    // (../../lane-authority.ts `executeRecordTool`), so the record a lane receives IS
+    // (../../lane-authority.ts `executeRecords`), so the record a lane receives IS
     // the canonical one.
     type TaskPageShape = {
         tasks?: Array<Record<string, unknown>>;
@@ -397,7 +440,7 @@ describe('worker mode: shared state is central, not local', () => {
         const store = storeOf();
         const session = await store.create('demo');
 
-        const added = (await store.callTool(session.id, 'task', {
+        const added = (await store.callTool(session.id, 'tasks', {
             tasks: [{ text: 'written from a lane' }]
         })) as TaskPageShape;
 
@@ -429,7 +472,7 @@ describe('worker mode: shared state is central, not local', () => {
         // failure mode.
         hostOf(store).closeSession(session.id, 'test reclaim');
 
-        const reread = (await store.callTool(session.id, 'task', {})) as TaskPageShape;
+        const reread = (await store.callTool(session.id, 'tasks', {})) as TaskPageShape;
 
         // Byte-identical to the first answer, stamp included: the rebuilt replica re-read
         // the canonical store rather than restamping or re-adding anything.
@@ -446,11 +489,12 @@ describe('worker mode: shared state is central, not local', () => {
         // restored only `{ items, nextId }` would silently drop the concurrency contract.
         const core = (
             store as unknown as {
-                sessions: Map<string, { core?: { records?: { todos?: unknown } } }>;
+                sessions: Map<string, { core?: { records?: { collections?: Record<string, unknown>; nextId?: number } } }>;
             }
         ).sessions.get(session.id);
 
-        expect(core?.core?.records?.todos).toEqual({
+        expect(core?.core?.records?.collections?.tasks).toEqual({
+            definition: TASKS_COLLECTION,
             items: [
                 {
                     id: '1',
@@ -461,10 +505,12 @@ describe('worker mode: shared state is central, not local', () => {
                     updatedAt: stamp
                 }
             ],
-            nextId: 2,
             storeRev: 1,
             changes: [{ rev: 1, id: '1', op: 'add', by: 'demo', at: stamp, itemRev: 1 }]
         });
+        // The id counter is the STORE's, not the collection's (F3): one range mints ids
+        // for every collection, so it lives beside the map rather than inside it.
+        expect(core?.core?.records?.nextId).toBe(2);
     }, 180_000);
 
     it('sends across threads from a lane and reads the roster from the authority', async () => {
@@ -486,7 +532,12 @@ describe('worker mode: shared state is central, not local', () => {
             message: 'hello from the operator lane'
         })) as { delivered?: string; threadId?: string; sender?: string };
 
-        expect(sent).toMatchObject({ threadId: target, delivered: 'appended', sender: 'demo' });
+        // STATE-AWARE delivery (delegate-stress T3.2/T3.6): the target had settled,
+        // so the send STARTS a turn in it at the authority and reports `started`
+        // rather than the old inert `appended`. Routing and non-blocking behaviour are
+        // unchanged, which is what keeps `threadSend` an authority-routed operation
+        // instead of a nested-run door (./capability.ts).
+        expect(sent).toEqual({ threadId: target, delivered: 'started', sender: 'demo' });
 
         const roster = (await store.callTool(session.id, 'threadList', {})) as {
             threads: { id: string; origin?: string; status: string }[];
@@ -496,8 +547,19 @@ describe('worker mode: shared state is central, not local', () => {
         expect(roster.threads.some((thread) => thread.origin === 'agent')).toBe(true);
 
         // The message is in the TARGET conversation, read from the canonical harness - the
-        // append happened at the authority, not inside the calling replica.
-        const transcript = store.threadTranscript(session.id, target);
+        // append happened at the authority, not inside the calling replica. Because the send
+        // started a turn there (T3.2) without waiting for it, the prompt is committed by that
+        // run, so this is one bounded wait for settled canonical state - not a race.
+        let transcript = store.threadTranscript(session.id, target);
+
+        for (
+            let attempt = 0;
+            attempt < 50 && !JSON.stringify(transcript).includes('hello from the operator lane');
+            attempt += 1
+        ) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+            transcript = store.threadTranscript(session.id, target);
+        }
 
         expect(JSON.stringify(transcript)).toContain('hello from the operator lane');
     }, 180_000);
@@ -987,4 +1049,365 @@ describe('worker mode: a steer is reported from the lane receipt, not the post (
             expect(JSON.stringify(thread?.messages ?? [])).toContain('the-recorded-guidance-text');
         }
     }, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// T4.1 — the derivation the WORKER owns, pinned where the rule is decided.
+//
+// `deriveOperations` is exported with a STRUCTURAL read view (`ReplicaReadView`) precisely so this
+// rule can be asserted without a provider, a thread, or a mock of either (see the type's own
+// comment: "a test or probe can hand over the same three members without a harness"). The real
+// threads above prove the frames and the receipts move; this block pins the ONE condition finding
+// F6 named — an in-place write to an already-committed entry changes no length, so the append test
+// (`transcript.length > committedLength`) was blind to it and the change died with the process.
+// ---------------------------------------------------------------------------
+describe('worker mode: an IN-PLACE change to the committed prefix is an operation the lane owes (T4.1 / F6)', () => {
+    // The smallest conversation that can carry both kinds of in-place write: a question and its
+    // answer, already committed, with the addresses the core minted for them.
+    const conversation = (): HarnessMessage[] => [
+        { role: 'user', content: 'question', messageId: 'msg-1' },
+        { role: 'assistant', content: 'answer', messageId: 'msg-2' }
+    ];
+
+    const replicaView = (messages: HarnessMessage[]): ReplicaReadView => ({
+        threadMessages: () => messages,
+        memory: { has: () => false, get: () => undefined },
+        snapshot: () => ({})
+    });
+
+    // The lane's base at a commit boundary: what its last receipt / last sync ADOPTED, which is
+    // exactly the pair the derivation diffs against — the length (T10 M4) and, since T4.1, the
+    // content of that same prefix.
+    const laneOf = (committedLength: number, committedDigest: string): LaneWorkerState =>
+        ({
+            epoch: 7,
+            targetId: 'thread-1',
+            committedLength,
+            committedDigest,
+            readDigests: {},
+            declaredKeys: [],
+            archived: new Map(),
+            identities: {}
+        }) as unknown as LaneWorkerState;
+
+    it('owes NOTHING while the replica matches its base, and a patch the moment a committed flag moves', () => {
+        const base = conversation();
+        const digest = digestMemoryValue(base);
+
+        // The hot path: nothing changed, so a boundary owes no transcript operation at all. This
+        // is the case every tool result crosses, which is why the digest comparison is the only
+        // work it may cost (pipeline F8).
+        expect(deriveOperations(laneOf(base.length, digest), replicaView(base))).toEqual([]);
+
+        // `setIncluded(entry, false)`: the `included` key appears and the LENGTH does not move —
+        // the exact write the retired condition could not see.
+        const flagged = [{ ...base[0], included: false }, base[1]];
+
+        expect(deriveOperations(laneOf(base.length, digest), replicaView(flagged))).toEqual([
+            {
+                kind: 'transcript:patch',
+                threadId: 'thread-1',
+                expectedLength: 2,
+                expects: digest,
+                messages: flagged
+            }
+        ]);
+
+        // And adoption terminates the argument: once the lane has re-based on the content it
+        // published, the same replica derives NOTHING again. Without that, a plugin's single
+        // decision would be re-pushed at every boundary for the life of the process.
+        expect(deriveOperations(laneOf(base.length, digestMemoryValue(flagged)), replicaView(flagged))).toEqual([]);
+    });
+
+    it('owes a patch for a TEXT edit as well, and the patch BEFORE the append when the turn also grew', () => {
+        const base = conversation();
+        const digest = digestMemoryValue(base);
+
+        // `edit(entry, { content })` — the other in-place mutation T3 shipped, same class, same op.
+        const edited = [base[0], { ...base[1], content: 'answer, rewritten by the plugin' }];
+
+        expect(deriveOperations(laneOf(base.length, digest), replicaView(edited))).toEqual([
+            {
+                kind: 'transcript:patch',
+                threadId: 'thread-1',
+                expectedLength: 2,
+                expects: digest,
+                messages: edited
+            }
+        ]);
+
+        // A compactor's real turn: it disabled an older unit AND answered the prompt. Both facts
+        // belong to one boundary, and the ORDER matters — the fold applies a group in sequence, so
+        // the prefix is rewritten before the new tail is appended at it.
+        const grown = [...edited.map((message, index) => (index === 0 ? { ...message, included: false } : message)), {
+            role: 'user',
+            content: 'the next prompt',
+            messageId: 'msg-3'
+        }];
+
+        expect(deriveOperations(laneOf(base.length, digest), replicaView(grown)).map((op) => op.kind)).toEqual([
+            'transcript:patch',
+            'transcript:append'
+        ]);
+
+        // An UNPUBLISHED tail edit is not an in-place change at all: the entry still lives below
+        // the base, so the append already carries it. Deriving a patch there would double-write.
+        const tailEdited = [...base, { role: 'user', content: 'mine, edited before it shipped', messageId: 'msg-3' }];
+
+        expect(deriveOperations(laneOf(base.length, digest), replicaView(tailEdited))).toEqual([
+            {
+                kind: 'transcript:append',
+                threadId: 'thread-1',
+                fromLength: 2,
+                messages: [tailEdited[2]]
+            }
+        ]);
+    });
+
+    it("adopts the content base as the digest of the prefix it holds, and only that prefix's", () => {
+        const base = conversation();
+
+        // The rule `adoptCommittedBase` follows, pinned: the digest of `threadMessages[0..length]`,
+        // which is what `transcript:sync` answers at the same length and what the patch CASes with.
+        expect(committedDigestOf(replicaView(base), { targetId: 'thread-1', committedLength: 2 })).toBe(digestMemoryValue(base));
+        expect(committedDigestOf(replicaView(base), { targetId: 'thread-1', committedLength: 1 })).toBe(digestMemoryValue([base[0]]));
+
+        // A base of ZERO is the digest of an EMPTY transcript, not `ABSENT_DIGEST`: "this
+        // conversation has nothing yet" is a state both sides can compare, while "this key never
+        // existed" is a memory-axis fact with a different meaning (./lane-memory.ts).
+        expect(committedDigestOf(replicaView([]), { targetId: 'thread-1', committedLength: 0 })).toBe(digestMemoryValue([]));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T4.1 / context-inclusion T3 — the durability claim itself, end to end on a REAL session.
+//
+// What is real here: a real lane worker runs the turn (the block above this one), the commit is
+// made by the SESSION's own authority on the lane's OWN epoch under the writer lease that lane
+// holds, the canonical transcript is the coordinator's harness, `state.json` is the store's
+// document, and the restart is a second store over the same root.
+//
+// What is simulated, stated plainly: the `transcript:patch` OPERATION is submitted by the test
+// rather than by the worker's own commit loop, because a HOST plugin cannot be installed inside a
+// replica — a preset factory closure cannot cross `worker_threads`, so a `turn.before` handler
+// that calls `setIncluded`/`edit` has no way to run on a lane today (finding F5, and T4.4 owns
+// loading plugins there). The derivation that produces this exact op is pinned above, and the
+// receipt path that adopts its effect is the same one every append already exercises here.
+// ---------------------------------------------------------------------------
+describe('worker mode: an in-place lane commit becomes canonical state, is saved, and survives a restart (T4.1)', () => {
+    it('lands a flag and a text edit on the authority, writes them to the durable document, and reads them back after a restart', async () => {
+        const root = tempRoot('inplace-sync');
+        // NOTE the argument order: the THIRD positional is the harness describer (an injected
+        // `describeHarness`), and persistence is an OPTION (../sessions.ts
+        // `SessionStoreOptions.persistence`) — ../persistence.test.ts uses the same shape.
+        const store = new SessionStore(SETTINGS, createHarnessRegistry(ALL_PRESET_TEMPLATES as never), undefined, {
+            persistence: new HarnessPersistence(root),
+            runtime: WORKER_RUNTIME
+        });
+
+        stores.push(store);
+
+        const session = await store.create('demo');
+        const run = await store.dispatch(session.id, 'the turn that will be edited later');
+        const turn = await settle(store, session.id, run.turn.id);
+
+        expect(turn.status).toBe('done');
+
+        const threadId = turn.threadId as string;
+        // The conversation as the COORDINATOR now holds it — the prefix a lane would have adopted.
+        const canonical = store.threadTranscript(session.id, threadId).messages;
+
+        expect(canonical.length).toBeGreaterThan(1);
+
+        const lanes = await hostReady(store);
+        const authority = (store as unknown as { authorities?: Map<string, LaneAuthority> }).authorities?.get(session.id);
+        const live = lanes.lanes().find((lane) => lane.sessionKey === session.id);
+
+        if (authority === undefined || live === undefined) {
+            throw new Error(`No live lane authority for session ${session.id}.`);
+        }
+
+        // The write one plugin round produces: the first committed entry disabled (history kept,
+        // only hidden — the standing product rule), and the last entry's text rewritten.
+        const patched = canonical.map((message, index) => {
+            if (index === 0) return { ...message, included: false };
+            if (index === canonical.length - 1) return { ...message, content: `${String(message.content)} — edited on the lane` } as HarnessMessage;
+
+            return message;
+        });
+
+        const outcome = authority.commit(live.epoch, {
+            laneEpoch: live.epoch,
+            // One past what this lane's own commits settled: the journal is what orders a lane's
+            // groups, and a test that invented a seq would not be exercising the real base.
+            seq: authority.journal.appliedThrough(live.epoch) + 1,
+            ops: [
+                {
+                    kind: 'transcript:patch',
+                    threadId,
+                    expectedLength: canonical.length,
+                    expects: digestMemoryValue(canonical),
+                    messages: patched
+                }
+            ]
+        });
+
+        // The lane's OWN epoch, the writer lease it holds for this conversation, and the CAS all
+        // accepted it. A `not-writer` here would mean the test invented an identity, not that the
+        // protocol is broken, so the receipt is named rather than asserted away.
+        expect(outcome.receipts[0].rejection).toBeUndefined();
+        expect(outcome.complete).toBe(true);
+
+        // 1. THE AUTHORITY's transcript — not the replica's. `included: false` on entry 0, the new
+        //    text on the last, and every address preserved exactly where it was.
+        expect(store.threadTranscript(session.id, threadId).messages).toEqual(patched);
+        expect(store.threadTranscript(session.id, threadId).messages[0].included).toBe(false);
+
+        // 2. The DURABLE plane: the store writes on the `agent_message` notification the same seam
+        //    an inline transcript write reports, so the document on disk carries both changes.
+        const persisted = new HarnessPersistence(root).load();
+        const record = persisted?.sessions.find((entry) => entry.id === session.id);
+
+        expect(record).toBeDefined();
+        expect(JSON.stringify((record as { core: unknown }).core)).toContain('"included":false');
+        expect(JSON.stringify(record)).toContain('edited on the lane');
+
+        // 3. THE RESTART: a second store over the same root — no plugin, no lane, no memory of the
+        //    process that wrote it. This is the sentence src/types/index.ts used to disclaim.
+        // 3. THE RESTART: a second store over the same root — no plugin, no lane, no memory of the
+        //    process that wrote it. A store does not read its own document by itself (the host
+        //    loads and validates it, then hands it in as `options.database`, which is what
+        //    ./runtime.ts does on boot), so the restart is spelled the same way here.
+        const restarted = new SessionStore(SETTINGS, createHarnessRegistry(ALL_PRESET_TEMPLATES as never), undefined, {
+            persistence: new HarnessPersistence(root),
+            database: new HarnessPersistence(root).load() ?? undefined,
+            runtime: WORKER_RUNTIME
+        });
+
+        stores.push(restarted);
+
+        const restored = restarted.get(session.id);
+
+        expect(restored).toBeDefined();
+        expect(
+            restarted
+                .threadTranscript(session.id, threadId)
+                .messages.map((message) => ({ role: message.role, content: message.content, included: message.included }))
+        ).toEqual(
+            patched.map((message) => ({ role: message.role, content: message.content, included: message.included }))
+        );
+
+        restarted.dispose();
+        store.dispose();
+    }, 180_000);
+
+
+});
+
+// ---------------------------------------------------------------------------
+// records-engine T1/T7 — the worker-mode half of "shared state has one writer".
+//
+// The record store IS session state, so in worker mode a wrapper write must be ANSWERED
+// BY THE AUTHORITY. Two halves, both cheap to pin and both load-bearing:
+//   1. every record surface — the four wrappers plus `records` itself — goes out through
+//      `runtime.executeRecords`, and what comes back is the canonical record: the lane
+//      replica keeps nothing, which is exactly the failure the retired merge had;
+//   2. the classification loop in ./lane-worker-loop.ts is still exhaustive. An
+//      unregistered runtime member is a hello-time throw, because a member nobody
+//      classified is precisely how a private write would sneak back in.
+// ---------------------------------------------------------------------------
+describe('worker mode: the record route is the only door (T1/T7)', () => {
+    // One persisted collection block, as the coordinator's own document holds it.
+    type CanonicalBlock = { items: Array<Record<string, unknown>>; storeRev: number; changes: unknown[] };
+    const canonicalStore = (store: SessionStore, sessionId: string) =>
+        (
+            store as unknown as {
+                sessions: Map<
+                    string,
+                    { core?: { records?: { nextId?: number; collections?: Record<string, CanonicalBlock> } } }
+                >;
+            }
+        ).sessions.get(sessionId)?.core?.records;
+
+    it('writes through every record surface and reads the canonical store back', async () => {
+        const store = storeOf();
+        const session = await store.create('demo');
+
+        const CASES: Array<{ tool: string; parameters: Record<string, unknown>; key: string }> = [
+            { tool: 'tasks', parameters: { tasks: [{ text: 'from the plan' }] }, key: 'tasks' },
+            {
+                tool: 'profiles',
+                parameters: { action: 'add', name: 'Elena', description: 'A cartographer.' },
+                key: 'profile'
+            },
+            { tool: 'chapters', parameters: { action: 'add', title: 'Arrival', summary: 'They land.' }, key: 'chapter' },
+            { tool: 'locations', parameters: { action: 'add', name: 'Harbour', description: 'A port.' }, key: 'location' },
+            // The low-level surface names its own collection: same route, same authority.
+            {
+                tool: 'records',
+                parameters: { collection: 'tasks', entries: [{ text: 'through the engine' }] },
+                key: 'entry'
+            }
+        ];
+
+        for (const { tool: toolName, parameters, key } of CASES) {
+            const answer = (await store.callTool(session.id, toolName, parameters)) as Record<string, unknown>;
+
+            // The wrapper's OWN envelope comes back — the authority's answer, with the id
+            // the core minted. A receipt for a replica-local write has no such page.
+            expect(Object.keys(answer)).toContain(key);
+        }
+
+        const canonical = canonicalStore(store, session.id);
+
+        // ONE store with ONE counter (F3): five writes across four collections, numbered
+        // 1..5 in call order. A replica-local write would have left this map empty.
+        expect(canonical?.nextId).toBe(6);
+        expect(Object.keys(canonical?.collections ?? {}).sort()).toEqual(['chapters', 'locations', 'profiles', 'tasks']);
+        expect((canonical?.collections.tasks.items ?? []).map((item) => item.id)).toEqual(['1', '5']);
+        expect((canonical?.collections.profiles.items ?? []).map((item) => item.id)).toEqual(['2']);
+        expect((canonical?.collections.chapters.items ?? []).map((item) => item.id)).toEqual(['3']);
+        expect((canonical?.collections.locations.items ?? []).map((item) => item.id)).toEqual(['4']);
+
+        // Attribution is the coordinator's answer too: a manual call carries the session's
+        // primary and no conversation, so the record names `demo` and carries no thread.
+        expect(canonical?.collections.tasks.items[0]).toMatchObject({ updatedBy: 'demo' });
+        expect('updatedThreadId' in (canonical?.collections.tasks.items[0] ?? {})).toBe(false);
+    }, 180_000);
+
+    it('classifies every runtime member a live harness exposes', () => {
+        const replica = harness({
+            agents: { writer: agent({ model: 'test/model', provider: { baseURL: 'http://provider.test/v1' } }) },
+            presets: false
+        });
+        const unclassified = Object.keys(replica.runtime).filter(
+            (key) =>
+                !(ROUTED_RUNTIME_METHODS as readonly string[]).includes(key) &&
+                !(LOCAL_RUNTIME_METHODS as readonly string[]).includes(key)
+        );
+
+        expect(unclassified).toEqual([]);
+        // The record door is routed, and it serves all five tools by name (Decision A).
+        expect(ROUTED_RUNTIME_METHODS).toContain('executeRecords');
+        expect(AUTHORITY_RUNTIME_METHODS.executeRecords).toBe('records | tasks | chapters | profiles | locations');
+    });
+
+    it('refuses to install an authority runtime for an unregistered member', () => {
+        const replica = harness({
+            agents: { writer: agent({ model: 'test/model', provider: { baseURL: 'http://provider.test/v1' } }) },
+            presets: false
+        });
+
+        // Every live member is classified, so the install itself is the clean case.
+        expect(() => installAuthorityRuntime(replica)).not.toThrow();
+
+        // One unclassified member is enough to lose the guarantee: a lane could write to it
+        // locally and the coordinator would never see the change, so the build says so at
+        // install time instead of running with a private writer.
+        (replica.runtime as unknown as Record<string, unknown>).mintRecordLocally = () => undefined;
+
+        expect(() => installAuthorityRuntime(replica)).toThrow(
+            'harness.runtime.mintRecordLocally is neither routed to the authority nor declared local, so this build cannot guarantee that shared state has one writer.'
+        );
+    });
 });
