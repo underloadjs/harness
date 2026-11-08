@@ -550,12 +550,23 @@ describe('one toolbox, different agents', () => {
             expect(block).toContain('cannot delegate further');
         }
 
-        // The Planner additionally names the specialist ids it routes to, so the
-        // researcher/coder/reviewer targets are discoverable in words.
+        // The Planner names the specialist ids it routes to, so the
+        // researcher/coder/reviewer targets are discoverable in words — and it defers
+        // to the delegate `agent` enum for the authoritative list. That indirection is
+        // the fix for a real contradiction: the SAME profile is the primary of the
+        // `instruct` team, where `instruct` is excluded from the allowlist (a team's
+        // allowlist is every member except its primary), so a prompt that promised
+        // "instruct for general work" instructed the planner to route to an id it
+        // structurally could not reach.
         const plannerPlan = AGENT_PROFILES.planner.guidelines.join('\n');
-        for (const target of ['research', 'workspace', 'reviewer', 'instruct']) {
+        for (const target of ['research', 'workspace', 'reviewer']) {
             expect(plannerPlan).toContain(target);
         }
+        expect(plannerPlan).toContain('delegate `agent` enum');
+        expect(plannerPlan).toContain('do the step yourself');
+        // The unreachable-id promise is gone: no guideline may name `instruct` as a
+        // routing target.
+        expect(plannerPlan).not.toContain('instruct for general work');
     });
 
     it('exposes each real preset team as the valid delegation ids', () => {

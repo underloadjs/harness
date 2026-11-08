@@ -308,6 +308,7 @@ import {
     AGENT_RESULT_PAGE_CHARS,
     AGENT_RESULT_PAGE_MAX_CHARS,
     AGENT_RESULT_RETENTION,
+    DELEGATE_TIMEOUT_MS,
     agentDelegateMetadata,
     createTaskScheduler,
     // R4 cross-thread chat + R2 thread agents. A host thread is backed by a fresh
@@ -420,6 +421,7 @@ import type {
     HarnessThreadRoster,
     HarnessThreadStatus,
     HarnessThreadSteerReceipt,
+    HarnessInvocationStatus,
     HarnessToolCall,
     HarnessToolCallOptions,
     HarnessToolOutcome,
@@ -1382,6 +1384,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         return core;
+    };
+
+    // T28: the set toolRequest reports as `alreadyAvailable`. It is the standing core
+    // view PLUS a pending-only control while that control is genuinely actionable for
+    // this actor — the exact condition `offerDeclarations` uses to declare it. Without
+    // this, a model searching for "cancel"/"abort"/"kill" got `matched: 0` while
+    // `toolCancel` was declared on the same request, which is the worst kind of
+    // discovery answer: a confident "no" about a capability the caller already has.
+    const declaredForDiscovery = (brain: Agent, selfCallId?: string): Tool[] => {
+        const declared = visibleCoreTools(brain);
+        const pendingCancel = tools[TOOL_CANCEL];
+
+        if (
+            pendingCancel !== undefined &&
+            pendingOnlyDefinitions.has(pendingCancel) &&
+            // Exclude the CALLING tool call: `toolRequest` itself is pending while it
+            // runs, so counting it would make `toolCancel` look actionable on every
+            // discovery query and turn a real "nothing to cancel" into a false yes.
+            scheduler
+                .pending(actorKeyOf(brain))
+                .some((task) => task.callId !== selfCallId)
+        ) {
+            declared.push(pendingCancel);
+        }
+
+        return declared;
     };
 
     // -----------------------------------------------------------------------
@@ -2609,7 +2637,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Core tools are reported through `alreadyAvailable` and never enabled.
     const requestToolsFor = (
         caller: Agent | undefined,
-        parameters: { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown } | unknown
+        parameters: { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown } | unknown,
+        // T28: the calling tool call's id, so the pending-only `toolCancel` report is
+        // not triggered by the `toolRequest` call that is asking.
+        selfCallId?: string
     ): unknown => {
         // Tolerate a bare array (a legacy/model call that sends only tags) and
         // non-string members; selectTools performs its own query validation
@@ -2643,7 +2674,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const catalogue = Object.values(tools).filter(
             (definition) => !pendingOnlyDefinitions.has(definition)
         );
-        const declared = visibleCoreTools(caller ?? primary);
+        // T28: the ALREADY-DECLARED set includes a pending-only control while it is
+        // actually actionable. `toolCancel` is appended to the declaration list only
+        // while this actor has work in flight (offerDeclarations), and it used to be
+        // invisible to discovery in exactly that window: a model that searched for
+        // "cancel"/"abort"/"kill" got `matched: 0` and concluded the capability did
+        // not exist, even though the tool was declared on that very request. Reporting
+        // it through `alreadyAvailable` is the honest channel: it is a report, not a
+        // grant, so nothing is enabled and no cap slot is spent.
+        const declared = declaredForDiscovery(caller ?? primary, selfCallId);
         const selection = selectTools(catalogue, query, { declared });
         const narrowed =
             limit === undefined ? selection.tools : selection.tools.slice(0, limit);
@@ -2820,8 +2859,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         createToolForAgent,
         agentManage: () => agentManageView(),
         agentResult: (parameters: Record<string, any>) => agentResultFor(parameters),
-        delegate: (caller, parameters, run, runDepth) =>
-            delegateFor(caller, parameters, run, runDepth),
+        delegate: (caller, parameters, run, runDepth, callerSignal, selfCallId, selfScope) =>
+            delegateFor(caller, parameters, run, runDepth, callerSignal, selfCallId, selfScope),
         threadSend: (caller, threadId, parameters) => threadSendFor(caller, threadId, parameters),
         threadList: (threadId) => threadRoster(threadId),
         search: (context) => {
@@ -2886,7 +2925,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // omitted because they have no answer yet. reset() clears the registry with
     // the conversation, because invocation ids are session-scoped.
     type AgentInvocationKind = 'root' | 'delegation' | 'fork' | 'autoanswer';
-    type AgentInvocationStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+    type AgentInvocationStatus = HarnessInvocationStatus;
 
     type AgentInvocationRecord = {
         invocationId: string;
@@ -2906,6 +2945,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         content: string;
         // Failure/cancellation message (never a transcript or tool body).
         error?: string;
+        // T28 FORENSICS. What the run had already produced when it was cancelled or
+        // failed, plus how far it got. The transcript rollback (runAgentCore's catch)
+        // removes the run's own messages, so without these two fields a cancelled run
+        // is forensically empty: you cannot see what a frozen agent was doing, what it
+        // had written, or how far it got. They are recorded on the TERMINAL transition
+        // from the run's own state, never from a transcript read, so they cannot leak
+        // system instructions or tool bodies.
+        partialContent?: string;
+        cancelledAtMessage?: number;
+        // Measured span of the run, in milliseconds. Set on the terminal transition.
+        durationMs?: number;
+        // T28: the PARENT tool call that spawned this run (delegate/ctx.run pass their
+        // own `call.id`). It is what lets a delegation identify ITS child precisely:
+        // "the newest record for that agent" is ambiguous when two delegations to the
+        // same agent are in flight, and a caller would then be handed a sibling's
+        // identity and status. Absent for a root run and for a manual executeTool call.
+        parentCallId?: string;
+        // T28: the spawning run's scheduler scope. A tool-call id is unique only WITHIN
+        // one run, so `parentScope` + `parentCallId` is what identifies a child exactly
+        // (two host parents that both call `delegate` with id `c1` are otherwise
+        // indistinguishable).
+        parentScope?: string;
         // R2: the persistent thread that owns this invocation. Internal only; it
         // exists so `deleteThread` can purge every lookup scoped to the removed
         // conversation (the persisted agent-result schema is unchanged).
@@ -2949,7 +3010,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             status: 'running',
             content: '',
             completedOrder: 0,
-            ...(run.threadId === undefined ? {} : { threadId: run.threadId })
+            ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
+            // T28: the spawning tool call, so a delegation can find ITS child even
+            // while a sibling delegation to the same agent is in flight.
+            ...(run.parentCallId === undefined ? {} : { parentCallId: run.parentCallId }),
+            ...(run.parentScope === undefined ? {} : { parentScope: run.parentScope })
         });
 
         pruneInvocationRecords();
@@ -2958,6 +3023,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Terminal transition. A success records the resolved answer (which may be
     // empty); a failure keeps only the error message. Deliberately pure from the
     // run's perspective: it must never affect history, events, or the outcome.
+    //
+    // T28: a NON-success also records the run's own forensic state (how many messages
+    // it produced and the last substantive text it committed) BEFORE the transcript
+    // rollback erases it. That is the whole point: a cancelled run is exactly the one
+    // you need to post-mortem, so the record must outlive the rollback.
     const finishInvocation = (
         run: RunState,
         outcome: { message?: HarnessAssistantMessage; error?: unknown }
@@ -2966,6 +3036,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (record === undefined) return;
 
         record.completedOrder = ++invocationCompletionSequence;
+        record.durationMs = Math.max(0, Date.now() - run.startedAt);
 
         if (outcome.message !== undefined) {
             record.status = 'completed';
@@ -2976,6 +3047,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             record.error = toErrorInfo(
                 outcome.error ?? new HarnessError(`Agent "${run.agent.name}" ended without a result.`)
             ).message;
+
+            // Forensics: the run's own counters, captured before the rollback. A
+            // cancelled run keeps what it had said and how far it got, so
+            // agentResult/delegate can answer "what was it doing?" instead of
+            // returning an empty record.
+            if (run.messagesProduced !== undefined) {
+                record.cancelledAtMessage = run.messagesProduced;
+            }
+
+            const partial = run.partialContent ?? run.answer?.content;
+            if (typeof partial === 'string' && partial.trim().length > 0) {
+                record.partialContent = partial;
+            }
         }
 
         pruneInvocationRecords();
@@ -3013,6 +3097,40 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         [...invocationRecords.values()]
             .filter((record) => record.agent === name)
             .sort((left, right) => right.sequence - left.sequence);
+
+    // T28: the record a delegation reports. The newest STARTED invocation of that
+    // agent is the one the delegation just ran (the actor queue serializes runs of one
+    // agent, so there is no ambiguity about which one it was).
+    const latestInvocationOf = (name: string): AgentInvocationRecord | undefined =>
+        recordsForAgent(name)[0];
+
+    // T28: which parts of a brief are missing, for the opt-in dispatch gate. A brief
+    // is "specified enough" when it names a concrete TARGET (a path, a symbol, a URL,
+    // or an id) AND an acceptance signal (what "done" means). Deliberately coarse: the
+    // gate exists to stop `"Fix the bug."` from reaching a write-capable agent, not to
+    // grade prose. An empty list means the brief passed.
+    const missingBriefParts = (brief: string): string[] => {
+        const missing: string[] = [];
+
+        // A target: a path-like token, a dotted/underscored identifier, a URL, or a
+        // quoted name. `Fix the bug.` matches none of these.
+        const hasTarget =
+            /(?:[\w.-]+\/[\w./-]+)|(?:\b[\w-]+\.[A-Za-z]{1,5}\b)|(?:https?:\/\/)|(?:`[^`]+`)|(?:"[^"]+")|(?:\b[a-z]+[A-Z]\w*\b)|(?:\b\w+_\w+\b)/.test(
+                brief
+            );
+
+        if (!hasTarget) missing.push('concrete target (file, symbol, URL, or id)');
+
+        // An acceptance signal: the brief says how the result will be judged.
+        const hasAcceptance =
+            /\b(acceptance|criteria|expect|expected|should|must|verify|verified|pass|passes|test|tests|repro|reproduce|done when|so that|because|instead of|without)\b/i.test(
+                brief
+            );
+
+        if (!hasAcceptance) missing.push('acceptance criterion (what "done" means)');
+
+        return missing;
+    };
 
     // Pagination must not cut a UTF-16 surrogate pair in half. `offset` is a
     // character (code-unit) index, which can land inside a non-BMP glyph; move the
@@ -3178,14 +3296,39 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
 
             if (record.status === 'failed' || record.status === 'cancelled') {
+                // T28: a cancelled/failed run is NOT an empty record. The transcript
+                // rollback removed the run's messages, so these two fields are the only
+                // surviving account of what it was doing and how far it got. They are
+                // paged exactly like a completed answer, so a long partial answer costs
+                // one page rather than the whole payload.
+                const partial = record.partialContent ?? '';
+                const partialTotal = partial.length;
+                const partialOffset =
+                    typeof parameters?.offset === 'number'
+                        ? Math.min(parameters.offset, partialTotal)
+                        : 0;
+                const partialPage = resultPageOf(partial, partialOffset, limit);
+
                 return {
                     ...base,
-                    content: '',
-                    contentLength: 0,
-                    offset: 0,
+                    content: partialPage.content,
+                    contentLength: partialTotal,
+                    offset: partialPage.offset,
                     limit,
-                    hasMore: false,
-                    error: record.error ?? 'The invocation did not complete.'
+                    hasMore: partialPage.hasMore,
+                    ...(partialPage.nextOffset === undefined
+                        ? {}
+                        : { nextOffset: partialPage.nextOffset }),
+                    error: record.error ?? 'The invocation did not complete.',
+                    // How far the run got before it was stopped. Present only when the
+                    // run actually appended something, so a run cancelled before its
+                    // first turn keeps a minimal shape.
+                    ...(record.cancelledAtMessage === undefined
+                        ? {}
+                        : { cancelledAtMessage: record.cancelledAtMessage }),
+                    ...(record.durationMs === undefined
+                        ? {}
+                        : { durationMs: record.durationMs })
                 };
             }
 
@@ -3208,17 +3351,77 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // agentResult is registered by the descriptor loop above; its body is this
     // function, reached through `context.harness.runtime.agentResult(...)`.
 
+    // T28: link two abort signals into one. The result aborts when EITHER input does,
+    // carrying the reason of whichever fired first. Used by `delegate` to combine the
+    // calling run's signal with its own `timeoutMs` bound, so a caller-imposed limit
+    // and a cancellation of the parent both reach the child.
+    //
+    // The listeners are `once` and are removed by the returned `detach`, which the
+    // caller invokes when the child settles: a long session that delegates many times
+    // must not accumulate one forwarding listener per finished child.
+    const linkSignals = (
+        first: AbortSignal | undefined,
+        second: AbortSignal | undefined
+    ): AbortSignal => {
+        if (first === undefined) return second as AbortSignal;
+        if (second === undefined) return first;
+
+        const controller = new AbortController();
+        const forward = (source: AbortSignal): void => {
+            if (controller.signal.aborted) return;
+            controller.abort(source.reason);
+        };
+
+        if (first.aborted) forward(first);
+        else first.addEventListener('abort', () => forward(first), { once: true });
+
+        if (second.aborted) forward(second);
+        else second.addEventListener('abort', () => forward(second), { once: true });
+
+        return controller.signal;
+    };
+
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
     // Subagents never receive it (see declared()), and launchToolCall rejects a
     // guessed call, so delegation is exactly one level deep. runAgent rejects
     // re-entering an agent that is already running, which closes the ctx.run
     // cycle as well.
+    //
+    // T28 RESULT CONTRACT. The result is no longer `{ agent, content }`:
+    //   - it carries the SAME identity agentManage/agentResult report
+    //     (`invocationId`, `threadId`, `status`, `durationMs`), so a caller never has
+    //     to correlate by agent name plus sequence order (ambiguous with two
+    //     concurrent runs of one agent);
+    //   - `content` is PAGED through the same `resultPageOf` the agentResult tool
+    //     uses, so a 58 KB answer costs one page plus an explicit continuation
+    //     instead of the whole payload inline;
+    //   - a child that was cancelled or failed returns a STRUCTURED result carrying
+    //     what it had already produced (`partialContent`, `cancelledAtMessage`)
+    //     instead of throwing away the only account of the run. A cancellation of the
+    //     CALLING run still propagates, because that is a rollback, not a result.
     const delegateFor = async (
         caller: Agent | undefined,
-        parameters: { agent?: string; input?: string },
+        parameters: {
+            agent?: string;
+            input?: string;
+            maxChars?: number;
+            requireClarification?: boolean;
+            timeoutMs?: number;
+            scope?: { tools?: readonly string[] };
+        },
         run: ToolContext['run'],
-        runDepth: number | undefined
+        runDepth: number | undefined,
+        // The CALLING run's signal. Used only to tell "the child was cancelled"
+        // (a result) from "the caller was aborted" (a rollback that must propagate).
+        callerSignal?: AbortSignal,
+        // The CALLING tool call's id. The child run records it as `parentCallId`, which
+        // is what lets this delegation find ITS OWN invocation while a sibling
+        // delegation to the same agent is in flight.
+        selfCallId?: string,
+        // The CALLING run's scheduler scope. A call id is unique only within one run, so
+        // the pair is what identifies the child exactly.
+        selfScope?: string
     ): Promise<HarnessDelegationResult> => {
         // Defence in depth: the tool is not DECLARED to subagents, but a model can
         // guess a name, so the caller is checked here too.
@@ -3251,15 +3454,167 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw new HarnessError('Delegation requires a non-empty input.');
         }
 
+        // T28 UNDER-SPECIFIED BRIEFS ARE GATED AT DISPATCH. A brief that names no
+        // target, no file, and no acceptance criterion is the shape that sent a
+        // workspace agent straight into `pwd`/`ls`/`git status` on a real checkout.
+        // The gate is opt-in (`requireClarification: true`) because a caller that
+        // knows its brief is terse should not be blocked; when it is on, the refusal
+        // happens BEFORE the child runs, so nothing is mutated and no recon is spent.
+        if (parameters?.requireClarification === true) {
+            const brief = parameters.input.trim();
+            const missing = missingBriefParts(brief);
+
+            if (missing.length > 0) {
+                throw new HarnessError(
+                    `The brief for "${target}" is under-specified: it names no ${missing.join(', no ')}. ` +
+                        'Restate it with the concrete target (file, symbol, or URL), what "done" means, and any constraint, then delegate again.'
+                );
+            }
+        }
+
         if (!run) {
             throw new HarnessError('Delegation requires a harness run context.');
         }
 
-        const message = await run(target, parameters.input);
+        const limit =
+            typeof parameters?.maxChars === 'number'
+                ? Math.min(Math.max(1, Math.floor(parameters.maxChars)), AGENT_RESULT_PAGE_MAX_CHARS)
+                : AGENT_RESULT_PAGE_MAX_CHARS;
+
+        const startedAt = Date.now();
+        let message: HarnessAssistantMessage;
+
+        // T28: the invocation ids that already exist for this agent. A delegation's own
+        // record is the one that is NOT in this set afterwards. Matching by "newest
+        // record" instead would report a STALE run whenever the child was refused before
+        // it registered one (a stopped thread, a cycle, a depth refusal) — the caller
+        // would then be handed another run's identity and status.
+        const knownInvocations = new Set(
+            recordsForAgent(target).map((record) => record.invocationId)
+        );
+
+        // The child this delegation started: matched by the spawning call id when the
+        // runtime recorded one (the model path always does), otherwise by "new since
+        // dispatch" (the manual executeTool path has no call id).
+        const newInvocationOf = (): AgentInvocationRecord | undefined => {
+            const records = recordsForAgent(target);
+
+            if (selfCallId !== undefined) {
+                const owned = records.find(
+                    (record) =>
+                        record.parentCallId === selfCallId &&
+                        (selfScope === undefined || record.parentScope === selfScope)
+                );
+                if (owned !== undefined) return owned;
+            }
+
+            return records.find((record) => !knownInvocations.has(record.invocationId));
+        };
+
+        // T28 TIMEOUT. A delegation used to have no wall-clock bound at all: a child
+        // that ran `sleep 600` sat `running` indefinitely, and the only recovery was
+        // `toolCancel` (which then destroyed the transcript). `timeoutMs` bounds the
+        // CHILD only — the calling run keeps its own signal, so the structured result
+        // below still reaches the parent instead of the whole parent turn rolling back.
+        const timeoutMs =
+            typeof parameters?.timeoutMs === 'number' && Number.isFinite(parameters.timeoutMs)
+                ? Math.max(1, Math.floor(parameters.timeoutMs))
+                : DELEGATE_TIMEOUT_MS;
+
+        const timeoutController = new AbortController();
+        const timer = setTimeout(() => {
+            timeoutController.abort(
+                new HarnessError(
+                    `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
+                )
+            );
+        }, timeoutMs);
+
+        // Node keeps the process alive for a pending timer; a delegation must not.
+        (timer as { unref?: () => void }).unref?.();
+
+        const childSignal = linkSignals(callerSignal, timeoutController.signal);
+
+        try {
+            message = await run(target, parameters.input, {
+                signal: childSignal,
+                // T28: an explicit tool allowlist for the child. A planning or review
+                // delegation can therefore be read-only by construction instead of by
+                // instruction, so it cannot leave artifacts in the user's checkout.
+                ...(parameters.scope?.tools === undefined
+                    ? {}
+                    : { tools: parameters.scope.tools })
+            });
+        } catch (error) {
+            // A cancellation of the CALLING run is a rollback: the parent transcript
+            // is about to be truncated, so a structured result would be inserted into
+            // a dead transcript. Propagate it unchanged.
+            if (callerSignal?.aborted === true) throw error;
+
+            // Otherwise the CHILD ended without an answer (cancelled by toolCancel, a
+            // timeout, or a failure). Report it as a result carrying the child's own
+            // forensic record, so the caller can see what it had produced and how far
+            // it got instead of receiving a bare error.
+            //
+            // A child that never STARTED (a stopped thread, a cycle, a depth refusal)
+            // registered no invocation at all. That is a dispatch failure, not a run
+            // outcome, so it keeps the historical error result: reporting a fabricated
+            // envelope would invent an identity and a status for work that never ran.
+            const record = newInvocationOf();
+
+            if (record === undefined) throw error;
+
+            const partial = record.partialContent ?? '';
+            const page = resultPageOf(partial, 0, limit);
+            const timedOut = timeoutController.signal.aborted;
+
+            return {
+                agent: target,
+                content: page.content,
+                contentLength: partial.length,
+                offset: page.offset,
+                limit,
+                truncated: page.hasMore,
+                ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+                invocationId: record.invocationId,
+                ...(record.threadId === undefined ? {} : { threadId: record.threadId }),
+                status: record.status,
+                durationMs: record.durationMs ?? Math.max(0, Date.now() - startedAt),
+                error: timedOut
+                    ? `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
+                    : (record.error ?? toErrorInfo(error).message),
+                ...(record.partialContent === undefined
+                    ? {}
+                    : { partialContent: record.partialContent }),
+                ...(record.cancelledAtMessage === undefined
+                    ? {}
+                    : { cancelledAtMessage: record.cancelledAtMessage })
+            };
+        } finally {
+            clearTimeout(timer);
+        }
 
         // Only the answer crosses back: the subagent keeps its own transcript and
-        // instructions.
-        return { agent: target, content: message.content };
+        // instructions. The identity comes from the run that produced it, so the
+        // caller can page the rest with agentResult or address the conversation with
+        // threadSend/threadRead.
+        const record = newInvocationOf();
+        const total = message.content.length;
+        const page = resultPageOf(message.content, 0, limit);
+
+        return {
+            agent: target,
+            content: page.content,
+            contentLength: total,
+            offset: page.offset,
+            limit,
+            truncated: page.hasMore,
+            ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+            invocationId: record?.invocationId ?? '',
+            ...(record?.threadId === undefined ? {} : { threadId: record.threadId }),
+            status: record?.status ?? 'completed',
+            durationMs: record?.durationMs ?? Math.max(0, Date.now() - startedAt)
+        };
     };
 
     // Delegation's per-harness allowlist schema was applied to the registered
@@ -3400,7 +3755,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // agent, so a subagent cannot even see the delegation control. toolCreate is
     // the same under the 'primary' creation policy (R12). That rule lives in
     // visibleCoreTools, which toolRequest also reads — one source for both.
-    const declared = (brain: Agent): Tool[] => {
+    const declared = (brain: Agent, scope?: readonly string[]): Tool[] => {
         // "At the model-turn boundary" is exactly here: every request rebuilds this
         // list from the SAME capped enabled set authorization reads. Core tools are
         // never counted or truncated; the set is already newest-selection-first.
@@ -3408,7 +3763,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             .map((name) => tools[name])
             .filter((definition): definition is Tool => definition !== undefined);
 
-        return [...visibleCoreTools(brain), ...discovered];
+        const all = [...visibleCoreTools(brain), ...discovered];
+
+        // T28 SCOPE: a delegation may restrict the child to an explicit allowlist, so a
+        // pure-reasoning child cannot reach a file or shell tool. The filter is applied
+        // to the DECLARATION here and to the LAUNCH gate below, so a scoped child can
+        // neither see nor call a tool outside its scope.
+        if (scope === undefined) return all;
+
+        const allowed = new Set(scope);
+        return all.filter((definition) => allowed.has(definition.name));
     };
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
@@ -3436,7 +3800,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         if (run.autoAnswer) return { offered, declarations: [] };
 
-        const definitions = declared(run.agent);
+        const definitions = declared(run.agent, run.toolScope);
         const list: HarnessStreamTool[] = [];
 
         for (const definition of definitions) {
@@ -3601,6 +3965,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the same transcript by the time a caller looks. Undefined until such a
         // response occurs; reset naturally with each new RunState.
         answer?: HarnessAssistantMessage;
+        // T28 FORENSICS. Captured by runAgentCore's catch IMMEDIATELY BEFORE the
+        // transcript rollback, because that rollback is what used to erase every trace
+        // of a cancelled run. `messagesProduced` is how many messages this run had
+        // appended; `partialContent` is the last non-blank assistant text it had
+        // committed. Both are reported by agentResult/delegate for a cancelled run, so
+        // a frozen agent can be post-mortemed instead of vanishing.
+        messagesProduced?: number;
+        partialContent?: string;
+        // Epoch milliseconds at run start, for the reported duration.
+        startedAt: number;
+        // T28: the parent tool call that spawned this run (delegate/ctx.run pass their
+        // own `call.id`). Used to identify a delegation's OWN child invocation when two
+        // delegations to the same agent are in flight.
+        parentCallId?: string;
+        // T28: the spawning run's scheduler scope (see AgentInvocationRecord.parentScope).
+        parentScope?: string;
+        // T28: the tool allowlist this run is scoped to (a delegation's `scope.tools`).
+        // Absent means unrestricted. Enforced in `declared()` and in the launch gate, so
+        // a scoped child can neither SEE nor CALL a tool outside it.
+        toolScope?: readonly string[];
     };
 
     // Internal run knobs. Deliberately NOT part of the public HarnessRunOptions:
@@ -5621,9 +6005,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (!definition) {
             // Unknown tool: answer the call so the transcript stays valid for strict
             // providers, and point the model at discovery.
-            const available = declared(brain).map((tool) => tool.name).join(', ') || 'none';
+            const available = declared(brain, run.toolScope).map((tool) => tool.name).join(', ') || 'none';
             await fail(
                 `Tool "${call.name}" is not registered. Available tools: ${available}. Call ${TOOL_REQUEST} with capability tags to search the catalogue.`
+            );
+            return;
+        }
+
+        // T28 SCOPE GATE. A scoped run (a delegation with `scope.tools`) may only call
+        // what its allowlist names. The declaration filter already hides the rest, so
+        // this is the defence-in-depth half for a model that GUESSES a name — the same
+        // shape as the primary-only gate below, and it answers with a readable result
+        // instead of failing the run.
+        if (run.toolScope !== undefined && !run.toolScope.includes(call.name)) {
+            await fail(
+                `Tool "${call.name}" is outside this run's scope. Allowed: ${run.toolScope.join(', ') || 'none'}.`
             );
             return;
         }
@@ -5833,6 +6229,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         }),
                     // Always present now: a background call is always cancelable.
                     signal,
+                    // T28: the model's own call id, so a tool that reads the pending
+                    // board can exclude the call that is asking (toolRequest).
+                    callId: call.id,
+                    // T28: the calling run's scope, so a child run can be identified
+                    // unambiguously (a call id is unique only within one run).
+                    runScope: run.scope,
                     runDepth: run.depth,
                     // T14: the live nested-run policy, so a tool with a real local path takes it
                     // on a lane instead of failing on the refusal (src/harness.ts `refuseNestedRun`
@@ -5842,7 +6244,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // runtime supplies it (never a tool argument), so threadSend can
                     // attribute the sender honestly.
                     ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
-                    run: (agentName: string, input: string) => {
+                    run: (agentName: string, input: string, options?: { signal?: AbortSignal; tools?: readonly string[] }) => {
                         // T14: refuse BEFORE anything is resolved, so no child thread state, no
                         // transcript append and no provider request can exist behind the refusal.
                         // The throw is inside THIS function, which is also why a body that
@@ -5862,6 +6264,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         // labels the child's events with the tool call that spawned
                         // it (T3 UI threads); the runtime guards above are unchanged.
                         //
+                        // T28: an explicit `options.signal` is LINKED to this call's
+                        // signal rather than replacing it, so a caller-imposed bound
+                        // (delegate's `timeoutMs`) and a cancellation of the calling
+                        // run both reach the child.
+                        const childSignal =
+                            options?.signal === undefined
+                                ? signal
+                                : linkSignals(signal, options.signal);
+                        //
                         // T2/R1: only the built-in delegate opts into answer
                         // extraction (a whitespace-only final turn resolves to the
                         // run's last substantive tool-free response). Any other tool
@@ -5874,12 +6285,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             runAgent(
                                 target,
                                 input,
-                                signal,
+                                childSignal,
                                 run,
                                 call.id,
                                 delegateAnswerDefinitions.has(definition)
                                     ? DELEGATE_ANSWER
-                                    : undefined
+                                    : undefined,
+                                undefined,
+                                undefined,
+                                undefined,
+                                // T28: the caller's tool allowlist, enforced on the child.
+                                options?.tools
                             )
                         );
                     }
@@ -7102,6 +7518,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // T28: the last non-blank assistant text this run committed, read from the
+    // transcript slice the run owns (`commitIndex`..end) BEFORE the rollback removes
+    // it. Only assistant TEXT is considered: a tool call's arguments and a tool
+    // result's body are not "what the agent said", and copying them into a
+    // cancellation record would leak tool payloads into an inspection surface that is
+    // documented as answer text only.
+    const lastSubstantiveText = (
+        messages: readonly HarnessMessage[],
+        from: number
+    ): string | undefined => {
+        for (let index = messages.length - 1; index >= from; index--) {
+            const message = messages[index];
+            if (message.role !== 'assistant') continue;
+            if (typeof message.content !== 'string') continue;
+            if (message.content.trim().length === 0) continue;
+            return message.content;
+        }
+
+        return undefined;
+    };
+
     // Resolve the message a DELEGATED run hands back (T2/R1). Only the exact
     // reported failure case is rescued: a normal `stop` whose content is
     // whitespace only, after the same run already produced a substantive
@@ -7406,6 +7843,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             run.aborted = run.signal?.aborted === true;
             scheduler.abandonScope(run.scope);
 
+            // T28 FORENSICS, captured BEFORE the rollback below. The splice is what
+            // used to erase every trace of a cancelled run: `thread-9` went from 3
+            // messages to 1, so the one run you most need to inspect was the one with
+            // nothing left to inspect. These two values are the run's own counters, so
+            // they survive the rollback and reach agentResult/delegate.
+            run.messagesProduced = Math.max(0, brain.messages.length - commitIndex);
+            run.partialContent = lastSubstantiveText(brain.messages, commitIndex);
+
             // R5 preservation: steering this run drained is rolled back with the
             // transcript, so hand it to the NEXT host turn in its original order.
             // A stop is different by contract: the host stopped the conversation,
@@ -7543,7 +7988,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // created thread; everything else is resolved below (root -> the
         // primary's default conversation, delegation -> the child agent's default
         // conversation). A fork/autoanswer branch never binds to a thread.
-        threadState?: ThreadState
+        threadState?: ThreadState,
+        // T28: the tool allowlist this run is scoped to (a delegation's `scope.tools`).
+        // Omitted means unrestricted. A scoped run neither sees nor can call a tool
+        // outside the list (see `declared` and the launch gate).
+        toolScope?: readonly string[]
     ): Promise<HarnessAssistantMessage> => {
         // Validation is the first side-effect-free step: a malformed attachment
         // rejects the run with nothing appended, nothing emitted, and no queued
@@ -7777,6 +8226,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 syncWakers: [],
                 steering: [],
                 attachments: validatedAttachments,
+                startedAt: Date.now(),
+                ...(callId === undefined ? {} : { parentCallId: callId }),
+                ...(parent === undefined ? {} : { parentScope: parent.scope }),
+                ...(toolScope === undefined ? {} : { toolScope }),
                 // Delegate-only answer extraction (T2/R1). A host run and an
                 // arbitrary ctx.run leave this false, so their returned message is
                 // exactly the model's final turn, as before.
@@ -8791,7 +9244,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             runDepth: 1,
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
-            run: (agentName: string, input: string) => {
+            run: (agentName: string, input: string, options?: { signal?: AbortSignal; tools?: readonly string[] }) => {
                 // T14: refuse this door before anything resolves (no parent run reaches
                 // `runAgent`'s lineage guard from here).
                 if (nestedRunsRefused()) {
@@ -8811,12 +9264,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     runAgent(
                         target,
                         input,
-                        undefined,
+                        options?.signal,
                         undefined,
                         undefined,
                         delegateAnswerDefinitions.has(definition)
                             ? DELEGATE_ANSWER
-                            : undefined
+                            : undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        // T28: the caller's tool allowlist, enforced on the child.
+                        options?.tools
                     )
                 );
             }

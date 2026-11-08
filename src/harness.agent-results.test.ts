@@ -508,6 +508,10 @@ describe('agentResult', () => {
 
         await expect(writer('go')).rejects.toThrow('transport exploded');
 
+        // T28: a failed run reports its forensic state too. `cancelledAtMessage` is how
+        // many messages the run had appended before the rollback removed them, and
+        // `durationMs` is the measured span. Both are present only when the run actually
+        // got that far, so this pins the shape of a run that failed on its first request.
         expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({
             agent: 'writer',
             invocationId: '1',
@@ -518,7 +522,9 @@ describe('agentResult', () => {
             offset: 0,
             limit: 4000,
             hasMore: false,
-            error: 'transport exploded'
+            error: 'transport exploded',
+            cancelledAtMessage: 1,
+            durationMs: expect.any(Number)
         });
     });
 

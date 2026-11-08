@@ -346,29 +346,39 @@ describe('runtime entry metadata ownership', () => {
         expect(coreMetadata.agentDelegateMetadata(['alpha', 'beta'])).toEqual(
             agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])
         );
+        // T28: the allowlist form is DERIVED from the entry's own literal, so this
+        // pins the derivation rather than restating the schema by hand. Restating it
+        // is what let the catalogue advertise a smaller surface than the runtime every
+        // time an argument was added.
         expect(agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])).toEqual({
             name: 'delegate',
-            description:
-                'Delegate a self-contained task to a configured subagent and return its answer. Subagents: alpha, beta. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.',
+            description: expect.stringContaining('Subagents: alpha, beta.'),
             tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
             visibility: 'core',
             parameters: {
                 type: 'object',
                 properties: {
+                    ...(agentDelegateEntry.metadata.parameters.properties as Record<string, unknown>),
                     agent: {
                         type: 'string',
                         enum: ['alpha', 'beta'],
                         description: 'Subagent name, one of the configured allowlist.'
-                    },
-                    input: {
-                        type: 'string',
-                        description: 'The full brief the subagent should act on.'
                     }
                 },
                 required: ['agent', 'input'],
                 additionalProperties: false
             }
         });
+        // The full argument surface is declared ONCE, in the literal, and both forms
+        // carry it.
+        expect(Object.keys(agentDelegateEntry.metadata.parameters.properties)).toEqual([
+            'agent',
+            'input',
+            'maxChars',
+            'requireClarification',
+            'timeoutMs',
+            'scope'
+        ]);
         // The entry annotates the factory with the leaf type through a TYPE-ONLY
         // import of '../core' (erased at transpile, resolves to the LIVE core
         // module), so the captured revision keeps `dependencies: []`.

@@ -76,5 +76,5 @@ export const execute = (context: ToolContext) => {
         throw new Error('toolRequest requires the live harness reference.');
     }
 
-    return harness.runtime.requestTools(context.agent, context.parameters);
+    return harness.runtime.requestTools(context.agent, context.parameters, context.callId);
 };

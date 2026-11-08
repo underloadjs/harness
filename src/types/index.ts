@@ -780,7 +780,8 @@ export type HarnessToolRuntime = {
         caller: Agent | undefined,
         parameters:
             | { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown }
-            | unknown
+            | unknown,
+        selfCallId?: string
     ) => unknown;
     // toolList: every live registry entry, in insertion order, name+description only.
     listTools: () => HarnessToolListEntry[];
@@ -800,11 +801,23 @@ export type HarnessToolRuntime = {
     agentResult: (parameters: Record<string, any>) => unknown;
     // delegate: one-level bounded delegation. `run` is the invocation-bound
     // harness runner from ToolContext (never a captured implementation).
+    // `callerSignal` is the CALLING run's signal, so a child cancellation can be told
+    // apart from a caller rollback (see harness.ts `delegateFor`).
     delegate: (
         caller: Agent | undefined,
-        parameters: { agent?: string; input?: string },
+        parameters: {
+            agent?: string;
+            input?: string;
+            maxChars?: number;
+            requireClarification?: boolean;
+            timeoutMs?: number;
+            scope?: { tools?: readonly string[] };
+        },
         run: ToolContext['run'],
-        runDepth: number | undefined
+        runDepth: number | undefined,
+        callerSignal?: AbortSignal,
+        selfCallId?: string,
+        selfScope?: string
     ) => Promise<HarnessDelegationResult>;
     // Conditional cross-thread chat / roster. Sender identity comes from the
     // runtime context, never from model arguments.
@@ -846,10 +859,58 @@ export type ToolCreationPolicy = 'all' | 'primary' | false;
 
 // What a delegation hands back to the primary agent: the subagent's answer, not
 // its transcript (history stays with the subagent).
+//
+// IDENTITY (T28). The result used to be `{ agent, content }`, which carried no way to
+// correlate it with a thread or an invocation: a caller had to call `threadList` and
+// match by agent name plus sequence order, which is ambiguous with two concurrent runs
+// of the same agent. Every field below is the SAME identity `agentManage`/`agentResult`
+// report, so one id works everywhere:
+//   - `invocationId` — the `agentResult`/`agentManage` id for this run;
+//   - `threadId`     — the persistent conversation it ran in (the address `threadSend`
+//                      and `threadRead` take), absent only for an ephemeral branch;
+//   - `status`       — the terminal state, so a caller never has to infer it;
+//   - `durationMs`   — the measured span of the child run.
+//
+// BOUNDED CONTENT (T28). `content` is paged exactly like `agentResult`: `maxChars`
+// (default 8000) caps one page, `contentLength` is the full length, and
+// `truncated`/`nextOffset` say how to read the rest. A 58 KB answer therefore costs one
+// page plus an explicit continuation instead of the whole payload in one tool result.
 export type HarnessDelegationResult = {
     agent: string;
+    // The answer page. Empty for a cancelled/failed child (see `error`).
     content: string;
+    // Full answer length in characters, independent of the page returned.
+    contentLength: number;
+    // 0-based character offset this page starts at.
+    offset: number;
+    // The page bound that was applied.
+    limit: number;
+    // True when more of the answer remains after this page.
+    truncated: boolean;
+    // Where to continue; present exactly when `truncated` is true.
+    nextOffset?: number;
+    // The invocation identity, shared with agentManage/agentResult.
+    invocationId: string;
+    // The persistent conversation the child ran in. Absent for an ephemeral branch.
+    threadId?: string;
+    // Terminal state of the child run.
+    status: HarnessInvocationStatus;
+    // Measured span of the child run, in milliseconds.
+    durationMs: number;
+    // Failure/cancellation message. Present only when `status` is not 'completed'.
+    error?: string;
+    // What the child had already produced when it was cancelled or failed, so a
+    // post-mortem does not require the (rolled-back) transcript. Present only for a
+    // non-completed run that had said something substantive.
+    partialContent?: string;
+    // How many messages the child had appended when it was cancelled/failed. This is
+    // the "how far did it get" number the transcript rollback used to erase.
+    cancelledAtMessage?: number;
 };
+
+// Terminal (or in-flight) state of one agent invocation. The same vocabulary
+// agentManage/agentResult report, exported so a host can switch on it.
+export type HarnessInvocationStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
 // ---------------------------------------------------------------------------
 // actionRequest / threadFork / branches (N3)
@@ -1391,7 +1452,33 @@ export type ToolContext<TParameters = any> = {
     agents?: Readonly<Record<string, Agent>>;
     // Run a full turn (including tool execution) on a named agent. Present only
     // inside a harness.
-    run?: (agentName: string, input: string) => Promise<HarnessAssistantMessage>;
+    //
+    // `options.signal` (T28) lets the CALLER bound the child independently of the
+    // calling run: `delegate` uses it to enforce `timeoutMs` without aborting its own
+    // tool call (which would discard the structured result it wants to return).
+    // Omitted, the child inherits the calling run's signal exactly as before.
+    //
+    // `options.tools` (T28) is an ALLOWLIST of wire names the child may see and call.
+    // It is the scope a delegation needs: a pure-reasoning child gets no file or shell
+    // tools, so a "planning" run cannot leave artifacts in the user's checkout. Omitted
+    // means "no restriction" (the historical behaviour).
+    run?: (
+        agentName: string,
+        input: string,
+        options?: { signal?: AbortSignal; tools?: readonly string[] }
+    ) => Promise<HarnessAssistantMessage>;
+    // The id of the tool call being executed (T28). Present for a model tool call
+    // (the id the model wrote) and absent for a manual `executeTool` call, which has
+    // no call id. A tool that inspects the pending board needs it to tell "work I
+    // started" from "the call that is asking" — `toolRequest` uses it so its own
+    // in-flight call does not make `toolCancel` look actionable.
+    callId?: string;
+    // The CALLING run's scheduler scope (T28). A tool-call id is unique only WITHIN
+    // one run, so a child run records `parentScope` + `parentCallId` to be identified
+    // unambiguously: two host parents that both call `delegate` with call id `c1` are
+    // otherwise indistinguishable, and a delegation would report its sibling's
+    // identity. Absent for a manual `executeTool` call, which has no run.
+    runScope?: string;
     // Cancellation for the run that invoked this tool (R10), forwarded from
     // `HarnessRunOptions.signal`. Present for every HARNESS invocation (a direct
     // standalone call has none).

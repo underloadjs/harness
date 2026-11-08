@@ -76,7 +76,8 @@ export {
     AGENT_MANAGE_PREVIEW_CHARS,
     AGENT_RESULT_PAGE_CHARS,
     AGENT_RESULT_PAGE_MAX_CHARS,
-    AGENT_RESULT_RETENTION
+    AGENT_RESULT_RETENTION,
+    DELEGATE_TIMEOUT_MS
 } from './agent-limits';
 
 // Look one generated row up by wire name. Throws for an unknown name so a typo
@@ -192,6 +193,13 @@ export const THREAD_LIST_METADATA = coreMetadataOf(THREAD_LIST_NAME);
 // The BASELINE IS THE ENTRY'S LITERAL (read from the generated manifest), and this
 // function only applies the allowlist transformation to it. Keeping the baseline
 // as data is what stops the two copies of the wording from drifting.
+//
+// T28: the allowlist form is derived from the BASELINE SCHEMA, not re-typed. The
+// previous version restated `properties` by hand, so every new delegate argument
+// (`maxChars`, `requireClarification`, `timeoutMs`) had to be added twice and the
+// projection silently advertised a smaller surface than the entry it claimed to
+// mirror. Only `agent` is replaced (its enum IS the allowlist); every other property
+// is copied from the entry's own literal.
 export const agentDelegateMetadata = (
     subagents: readonly string[] = []
 ): CoreToolMetadata => {
@@ -200,26 +208,29 @@ export const agentDelegateMetadata = (
 
     if (listed.length === 0) return baseline;
 
+    const baselineParameters = baseline.parameters as {
+        properties?: Record<string, unknown>;
+        required?: readonly string[];
+        additionalProperties?: boolean;
+    };
+
     return {
         name: baseline.name,
-        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.`,
+        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
         tags: [...baseline.tags],
         visibility: 'core',
         parameters: {
             type: 'object',
             properties: {
+                ...(baselineParameters.properties ?? {}),
                 agent: {
                     type: 'string',
                     enum: listed,
                     description: 'Subagent name, one of the configured allowlist.'
-                },
-                input: {
-                    type: 'string',
-                    description: 'The full brief the subagent should act on.'
                 }
             },
-            required: ['agent', 'input'],
-            additionalProperties: false
+            required: [...(baselineParameters.required ?? ['agent', 'input'])],
+            additionalProperties: baselineParameters.additionalProperties ?? false
         }
     };
 };

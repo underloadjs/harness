@@ -1641,9 +1641,21 @@ describe('executeTool', () => {
         // A manual delegate call runs a REAL turn on the subagent, so its answer is
         // the same one the model would receive. No user message is appended to the
         // primary's conversation: this was not a turn.
-        expect(await writer.executeTool('delegate', { agent: 'helper', input: 'find it' })).toEqual({
+        //
+        // T28: the result is an envelope carrying the child's identity and a paged
+        // answer, not the old `{ agent, content }` pair. A manual call has no tool-call
+        // id, so the identity is resolved from the invocation the call created.
+        expect(await writer.executeTool('delegate', { agent: 'helper', input: 'find it' })).toMatchObject({
             agent: 'helper',
-            content: 'helper answer'
+            content: 'helper answer',
+            contentLength: 13,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            status: 'completed',
+            threadId: 'agent:helper',
+            invocationId: expect.any(String),
+            durationMs: expect.any(Number)
         });
         expect(writer.agent.messages).toEqual([]);
         expect(writer.agents.helper.messages.map((message) => message.role)).toEqual(['user', 'assistant']);

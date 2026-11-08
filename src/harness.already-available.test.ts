@@ -23,7 +23,8 @@ import {
     AGENT_MANAGE_METADATA,
     AGENT_RESULT_METADATA,
     TOOL_CREATE_METADATA,
-    TOOL_REQUEST_METADATA
+    TOOL_REQUEST_METADATA,
+    agentDelegateMetadata
 } from './core/metadata';
 
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
@@ -55,13 +56,13 @@ const declaredNames = (request: HarnessStreamRequest | undefined): string[] =>
     (request?.tools ?? []).map((declaration) => declaration.name);
 
 // The exact runtime metadata delegate carries in a harness whose only
-// subagent is "researcher" (core/metadata.ts agentDelegateMetadata).
-const DELEGATE_MATCH = {
-    name: 'delegate',
-    description:
-        'Delegate a self-contained task to a configured subagent and return its answer. Subagents: researcher. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.',
-    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
-};
+// subagent is "researcher" (core/metadata.ts agentDelegateMetadata). Derived from
+// the projection itself so a wording change is a one-place edit, not a second copy
+// that silently drifts (T28).
+const DELEGATE_MATCH = (() => {
+    const projected = agentDelegateMetadata(['researcher']);
+    return { name: projected.name, description: projected.description, tags: [...projected.tags] };
+})();
 
 // Discovery cards are metadata only: name, description, tags. The literals come
 // from the one declarative source the runtime registers, so an expectation here
@@ -289,5 +290,155 @@ describe('toolRequest already-available core tools', () => {
         // configured fixtures, then the enabled rows in discovery order.
         expect(writer.discoveredTools).toEqual(enabledNames);
         expect(declaredNames(seen[1])).toEqual(['toolRequest', 'task', ...enabledNames]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T28 — a pending-only control is discoverable exactly while it is actionable
+// ---------------------------------------------------------------------------
+//
+// `toolCancel` is declared only while the calling agent has work in flight, and it
+// used to be invisible to discovery in exactly that window: a model that searched for
+// "cancel"/"abort"/"kill" got `matched: 0` and concluded the capability did not exist,
+// even though the tool was declared on that very request. The fix reports it through
+// `alreadyAvailable` — a report, not a grant, so nothing is enabled and no cap slot is
+// spent — and excludes the `toolRequest` call that is asking, so an idle agent still
+// gets an honest "nothing to cancel".
+describe('toolCancel discovery (T28)', () => {
+    it('reports toolCancel while a call is pending, and not while the query itself is the only work', async () => {
+        let release!: () => void;
+        const hang = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+
+        const seen: HarnessStreamRequest[] = [];
+        const entry = brain(
+            scripted(
+                [
+                    // Turn 0: start a long call.
+                    callTool('h1', 'hang', '{}'),
+                    // Turn 1: search for the cancellation capability WHILE it is pending.
+                    callTool('q1', 'toolRequest', '{"tags":["cancel"]}'),
+                    // Turn 2+: state-based. Only once the hang's REAL result is visible
+                    // is the board empty, so the second query is the idle case.
+                    answer('done')
+                ],
+                seen
+            )
+        );
+
+        // The stream is state-based rather than turn-indexed: the run takes a turn per
+        // completion, so a fixed index would race the async call it is waiting on.
+        let turn = 0;
+        const stateful: HarnessStream = async function* stream(request) {
+            seen.push(request);
+            turn++;
+
+            if (turn === 1) {
+                yield* [
+                    {
+                        type: 'done',
+                        stopReason: 'tool_calls',
+                        toolCalls: [{ id: 'h1', name: 'hang', arguments: '{}' }]
+                    } as HarnessStreamEvent
+                ];
+                return;
+            }
+
+            const hangSettled = request.messages.some(
+                (message) =>
+                    message.role === 'tool' &&
+                    message.toolCallId === 'h1' &&
+                    // The projection inserts a PLACEHOLDER for a still-pending call, so
+                    // "a tool message exists" is not "the call settled". The real result
+                    // is the one that is not the pending envelope.
+                    !message.content.startsWith('{"status":"pending"')
+            );
+            const queried = request.messages.some(
+                (message) => message.role === 'tool' && message.toolCallId === 'q1'
+            );
+
+            if (!queried) {
+                yield* [
+                    {
+                        type: 'done',
+                        stopReason: 'tool_calls',
+                        toolCalls: [{ id: 'q1', name: 'toolRequest', arguments: '{"tags":["cancel"]}' }]
+                    } as HarnessStreamEvent
+                ];
+                return;
+            }
+
+            if (!hangSettled) {
+                // Pause: the pending call is still running, so wait for it.
+                yield* [{ type: 'text', delta: 'waiting' } as HarnessStreamEvent];
+                yield* [{ type: 'done', stopReason: 'stop', toolCalls: [] } as HarnessStreamEvent];
+                return;
+            }
+
+            if (!request.messages.some((message) => message.role === 'tool' && message.toolCallId === 'q2')) {
+                yield* [
+                    {
+                        type: 'done',
+                        stopReason: 'tool_calls',
+                        toolCalls: [{ id: 'q2', name: 'toolRequest', arguments: '{"tags":["cancel"]}' }]
+                    } as HarnessStreamEvent
+                ];
+                return;
+            }
+
+            yield* [{ type: 'text', delta: 'done' } as HarnessStreamEvent];
+            yield* [{ type: 'done', stopReason: 'stop', toolCalls: [] } as HarnessStreamEvent];
+        };
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream: stateful }) },
+            tools: {
+                hang: tool({
+                    description: 'Hang until released.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    // ASYNC: a sync call would hold the batch gate, so the run could not
+                    // take the discovery turn while the call is still pending — which is
+                    // the exact window this test is about.
+                    mode: 'async',
+                    execute: () => hang.then(() => 'released')
+                })
+            },
+            presets: false
+        });
+
+        const running = writer('go');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        const toolResultOf = (callId: string): string => {
+            const message = writer.agent.messages.find(
+                (candidate) => candidate.role === 'tool' && candidate.toolCallId === callId
+            );
+            if (message === undefined) throw new Error(`no tool result for ${callId}`);
+            return content(message);
+        };
+
+        // The query ran while `hang` was pending, so the answer must name toolCancel.
+        const pendingAnswer = JSON.parse(toolResultOf('q1'));
+        expect(pendingAnswer.alreadyAvailable.map((match: { name: string }) => match.name)).toEqual([
+            'toolCancel'
+        ]);
+        // A report only: toolCancel was never ENABLED and no cap slot was spent on it.
+        expect(pendingAnswer.enabled).not.toContain('toolCancel');
+        expect(writer.discoveredTools).not.toContain('toolCancel');
+
+        release();
+        await running;
+
+        // With nothing pending, the same query is an honest miss for the CONTROL: the
+        // toolRequest call that is asking must not count as work to cancel. (Other
+        // searchable rows may still match the tag; only toolCancel is the subject here.)
+        const idleAnswer = JSON.parse(toolResultOf('q2'));
+        const idleNames = (idleAnswer.alreadyAvailable ?? []).map(
+            (match: { name: string }) => match.name
+        );
+        expect(idleNames).not.toContain('toolCancel');
+        expect(idleAnswer.enabled).not.toContain('toolCancel');
     });
 });

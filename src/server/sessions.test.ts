@@ -757,7 +757,11 @@ describe('SessionStore turns', () => {
                 agent: 'lead',
                 name: 'delegate',
                 callId: 'call_1',
-                content: '{"agent":"helper","content":"helper answer"}',
+                // T28: the delegate result is an envelope (identity + paged answer),
+                // not the old `{ agent, content }` pair. The identity fields are what
+                // let a caller page the rest with agentResult or address the child's
+                // conversation with threadSend/threadRead.
+                content: expect.stringContaining('"agent":"helper","content":"helper answer"'),
                 // Additive execution span (harness.ts deliverTask). The clock is
                 // pinned at 2_000, so the delegated inline call is exactly 0 ms.
                 durationMs: 0,

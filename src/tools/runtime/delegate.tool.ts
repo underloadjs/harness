@@ -21,6 +21,17 @@
 // `tools/catalogue` specifiers resolve LIVE — a leaf type import would be captured
 // as a local dependency. The shape is enforced at read time by
 // core/tool-scan.ts.
+//
+// T28 RESULT CONTRACT (why the description is long)
+// -------------------------------------------------
+// The result is no longer `{ agent, content }`. It carries the SAME identity
+// agentManage/agentResult report (`invocationId`, `threadId`, `status`,
+// `durationMs`), pages `content` with `maxChars`/`truncated`/`nextOffset`, and
+// returns a cancelled/failed child as a STRUCTURED result with `partialContent`
+// and `cancelledAtMessage` instead of an empty record. The model reads the
+// description, not this file, so the description states all three facts: a caller
+// that assumes the old two-field shape would silently drop the identity and the
+// continuation offset.
 import type { CoreToolMetadata } from '../../core';
 import type { ToolContext } from '../../types';
 
@@ -29,6 +40,13 @@ export const AGENT_DELEGATE_NAME = 'delegate';
 // The canonical, AST-extractable declaration. Deliberately literal (see header).
 // This is the ZERO-SUBAGENT catalogue form: a host that lists the capability
 // before any session exists sees this description and a free-form agent name.
+//
+// T28: the literal carries the FULL argument surface (every property except the
+// allowlist enum). The allowlist form below is derived from it, so a new delegate
+// argument is declared ONCE and both forms — the catalogue row and the live
+// declaration — advertise it. The previous split (a two-property literal plus a
+// hand-retyped allowlist schema) meant every added argument had to be written twice
+// and the catalogue silently advertised a smaller surface than the runtime.
 export const metadata = {
     name: AGENT_DELEGATE_NAME,
     description:
@@ -42,7 +60,40 @@ export const metadata = {
                 type: 'string',
                 description: 'Subagent name, one of the session harness allowlist.'
             },
-            input: { type: 'string', description: 'The full brief the subagent should act on.' }
+            input: { type: 'string', description: 'The full brief the subagent should act on.' },
+            maxChars: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 8000,
+                description:
+                    'Page size in characters for the returned answer, 1-8000. Defaults to 8000; a longer answer reports truncated and nextOffset.'
+            },
+            requireClarification: {
+                type: 'boolean',
+                description:
+                    'When true, refuse the delegation BEFORE the child runs if the brief names no concrete target (file, symbol, URL, or id) or no acceptance criterion. Use it for a write-capable subagent so an under-specified brief cannot spend a run mutating the workspace.'
+            },
+            timeoutMs: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 3600000,
+                description:
+                    'Wall-clock bound for the child run, in milliseconds. Defaults to 300000 (5 minutes). On expiry the child is stopped and the result reports status "cancelled" with its partialContent and cancelledAtMessage, so a frozen child cannot hold the session open.'
+            },
+            scope: {
+                type: 'object',
+                description:
+                    'Restrict what the child may do. `tools` is an allowlist of wire names: the child neither sees nor can call anything outside it, so a planning or review delegation can be read-only by construction instead of by instruction. Omit for the historical unrestricted child.',
+                properties: {
+                    tools: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description:
+                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all.'
+                    }
+                },
+                additionalProperties: false
+            }
         },
         required: ['agent', 'input'],
         additionalProperties: false
@@ -93,20 +144,22 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
 
     return {
         name: AGENT_DELEGATE_NAME,
-        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.`,
+        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
         tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
         visibility: 'core',
         parameters: {
             type: 'object',
+            // T28: derived from the literal above, so the allowlist form advertises
+            // exactly the same argument surface — only `agent` is replaced.
             properties: {
+                ...(metadata.parameters.properties as Record<string, unknown>),
                 agent: {
                     type: 'string',
                     enum: listed,
                     description: 'Subagent name, one of the configured allowlist.'
-                },
-                input: { type: 'string', description: 'The full brief the subagent should act on.' }
+                }
             },
-            required: ['agent', 'input'],
+            required: [...metadata.parameters.required],
             additionalProperties: false
         }
     };
@@ -119,8 +172,23 @@ export const execute = (context: ToolContext) => {
 
     return context.harness.runtime.delegate(
         context.agent,
-        (context.parameters ?? {}) as { agent?: string; input?: string },
+        (context.parameters ?? {}) as {
+            agent?: string;
+            input?: string;
+            maxChars?: number;
+            requireClarification?: boolean;
+            timeoutMs?: number;
+            scope?: { tools?: readonly string[] };
+        },
         context.run,
-        context.runDepth
+        context.runDepth,
+        // The CALLING run's signal, so the runtime can tell a child cancellation
+        // (a structured result) from a caller rollback (which must propagate).
+        context.signal,
+        // The CALLING tool call's id, so the runtime reports THIS child's identity
+        // even while a sibling delegation to the same agent is in flight.
+        context.callId,
+        // The CALLING run's scope: a call id is unique only within one run.
+        context.runScope
     );
 };

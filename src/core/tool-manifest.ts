@@ -806,6 +806,36 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                 input: {
                     type: "string",
                     description: "The full brief the subagent should act on."
+                },
+                maxChars: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 8000,
+                    description: "Page size in characters for the returned answer, 1-8000. Defaults to 8000; a longer answer reports truncated and nextOffset."
+                },
+                requireClarification: {
+                    type: "boolean",
+                    description: "When true, refuse the delegation BEFORE the child runs if the brief names no concrete target (file, symbol, URL, or id) or no acceptance criterion. Use it for a write-capable subagent so an under-specified brief cannot spend a run mutating the workspace."
+                },
+                timeoutMs: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 3600000,
+                    description: "Wall-clock bound for the child run, in milliseconds. Defaults to 300000 (5 minutes). On expiry the child is stopped and the result reports status \"cancelled\" with its partialContent and cancelledAtMessage, so a frozen child cannot hold the session open."
+                },
+                scope: {
+                    type: "object",
+                    description: "Restrict what the child may do. `tools` is an allowlist of wire names: the child neither sees nor can call anything outside it, so a planning or review delegation can be read-only by construction instead of by instruction. Omit for the historical unrestricted child.",
+                    properties: {
+                        tools: {
+                            type: "array",
+                            items: {
+                                type: "string"
+                            },
+                            description: "Wire names the child may use (e.g. [\"read\", \"glob\", \"grep\"] for a read-only review). An empty array declares no tools at all."
+                        }
+                    },
+                    additionalProperties: false
                 }
             },
             required: [

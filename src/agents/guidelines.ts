@@ -61,7 +61,7 @@ export const WEB_SEARCH_GUIDELINE =
 
 // One wording for all five real roles: correct for a primary, a subagent, and a lone agent.
 export const DELEGATION_GUIDELINE =
-    'If you are the primary agent and this harness configures subagents, delegate is declared to you: give ONE target a self-contained brief (a subagent never sees this conversation) and verify its answer. A subagent never receives delegate and cannot delegate further; otherwise do the work yourself.';
+    'If you are the primary agent and this harness configures subagents, delegate is declared to you: give ONE target a self-contained brief (a subagent never sees this conversation) and verify its answer. A subagent never receives delegate and cannot delegate further; otherwise do the work yourself. Talk to a subagent instead of guessing: a follow-up delegation continues its conversation.';
 
 // No sandbox: side effects land on the machine running the harness.
 export const PERMISSIONS_GUIDELINE =

@@ -70,11 +70,11 @@ const IDENTITY = {
 // shared guideline line is a visible diff here. 1500 characters is room for a policy
 // bullet, not for a tool manual — the ceiling below is the budget that keeps it true.
 const PROMPT_LENGTHS = [
-    { name: 'instruct', length: 1367 },
-    { name: 'research', length: 1391 },
-    { name: 'workspace', length: 1348 },
-    { name: 'reviewer', length: 1372 },
-    { name: 'planner', length: 1434 },
+    { name: 'instruct', length: 1458 },
+    { name: 'research', length: 1482 },
+    { name: 'workspace', length: 1439 },
+    { name: 'reviewer', length: 1463 },
+    { name: 'planner', length: 1464 },
     { name: 'summarizer', length: 141 },
     { name: 'demo', length: 294 },
     { name: 'flaky', length: 344 }

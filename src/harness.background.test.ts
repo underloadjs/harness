@@ -342,6 +342,21 @@ const toolMessages = (messages: HarnessMessage[]): { toolCallId: string; name: s
             content: message.content
         }));
 
+// T28: a delegate result is an ENVELOPE (identity + paged content), not the old
+// `{ agent, content }` pair. These tests are about WHICH answer crossed back, so they
+// project the two fields they mean and leave the identity to the envelope test in
+// harness.delegation.test.ts.
+//
+// The MODEL path serializes the envelope into a tool message (a JSON string); the
+// MANUAL `executeTool` path returns the live object. Both are accepted here so a test
+// can assert the same two fields on either path.
+const delegationAnswer = (value: unknown): { agent: string; content: string } => {
+    const parsed = (
+        typeof value === 'string' ? JSON.parse(value) : value
+    ) as Record<string, any>;
+    return { agent: parsed.agent, content: parsed.content };
+};
+
 // Strict wire pairing (R3): after every assistant message that requests tools,
 // the next messages must be exactly one tool message per call, in call order and
 // with no other role in between. Every tool message must belong to such a run —
@@ -1469,19 +1484,21 @@ describe('delegation under background tools', () => {
 
         // Only answers cross back, at the original call positions.
         expect(
-            toolMessages(writer.agent.messages).filter(
-                (message) => message.toolCallId === 'd1' || message.toolCallId === 'd2'
-            )
+            toolMessages(writer.agent.messages)
+                .filter((message) => message.toolCallId === 'd1' || message.toolCallId === 'd2')
+                .map((message) => ({ toolCallId: message.toolCallId, name: message.name, ...delegationAnswer(message.content) }))
         ).toEqual([
             {
                 toolCallId: 'd1',
                 name: 'delegate',
-                content: '{"agent":"researcher","content":"child-one"}'
+                agent: 'researcher',
+                content: 'child-one'
             },
             {
                 toolCallId: 'd2',
                 name: 'delegate',
-                content: '{"agent":"researcher","content":"child-two"}'
+                agent: 'researcher',
+                content: 'child-two'
             }
         ]);
         expect(wireIssues(parentSeen)).toEqual([]);
@@ -1575,12 +1592,8 @@ describe('delegated answer extraction', () => {
 
         // Only the answer crosses back — the substantive one, not the blank
         // terminal turn.
-        expect(toolMessages(writer.agent.messages)).toEqual([
-            {
-                toolCallId: 'd1',
-                name: 'delegate',
-                content: '{"agent":"researcher","content":"the researched facts"}'
-            }
+        expect(toolMessages(writer.agent.messages).map((message) => delegationAnswer(message.content))).toEqual([
+            { agent: 'researcher', content: 'the researched facts' }
         ]);
 
         // The child's own transcript keeps the literal final turn: extraction
@@ -1619,12 +1632,8 @@ describe('delegated answer extraction', () => {
         await flush();
 
         expect(state.value?.content).toBe('parent-done');
-        expect(toolMessages(writer.agent.messages)).toEqual([
-            {
-                toolCallId: 'd1',
-                name: 'delegate',
-                content: '{"agent":"researcher","content":"final facts"}'
-            }
+        expect(toolMessages(writer.agent.messages).map((message) => delegationAnswer(message.content))).toEqual([
+            { agent: 'researcher', content: 'final facts' }
         ]);
         expect(vi.getTimerCount()).toBe(0);
     });
@@ -1654,7 +1663,10 @@ describe('delegated answer extraction', () => {
         await flush();
 
         expect(state.status).toBe('resolved');
-        expect(state.value).toEqual({ agent: 'researcher', content: 'manual facts' });
+        expect(delegationAnswer(state.value)).toEqual({
+            agent: 'researcher',
+            content: 'manual facts'
+        });
 
         // A manual delegation is still not a conversation turn on the caller.
         expect(writer.agent.messages).toEqual([]);
@@ -1689,7 +1701,10 @@ describe('delegated answer extraction', () => {
 
         // A truncation is a fact about the final turn, not a blank answer to
         // repair: the earlier text is NOT substituted.
-        expect(state.value).toEqual({ agent: 'researcher', content: '\n' });
+        expect(delegationAnswer(state.value)).toEqual({
+            agent: 'researcher',
+            content: '\n'
+        });
         expect(vi.getTimerCount()).toBe(0);
     });
 
@@ -1769,7 +1784,10 @@ describe('delegated answer extraction', () => {
         slowGate.resolve('slow-done');
         await flush();
 
-        expect(first.value).toEqual({ agent: 'researcher', content: 'first facts' });
+        expect(delegationAnswer(first.value)).toEqual({
+            agent: 'researcher',
+            content: 'first facts'
+        });
 
         const second = probe(
             writer.executeTool('delegate', { agent: 'researcher', input: 'find more' })
@@ -1777,7 +1795,10 @@ describe('delegated answer extraction', () => {
         await flush();
 
         expect(second.status).toBe('resolved');
-        expect(second.value).toEqual({ agent: 'researcher', content: '\n' });
+        expect(delegationAnswer(second.value)).toEqual({
+            agent: 'researcher',
+            content: '\n'
+        });
         expect(seen).toHaveLength(4);
         expect(vi.getTimerCount()).toBe(0);
     });

@@ -25,3 +25,13 @@ export const AGENT_RESULT_RETENTION = 64;
 export const AGENT_RESULT_PAGE_CHARS = 4000;
 
 export const AGENT_RESULT_PAGE_MAX_CHARS = 8000;
+
+// T28: the wall-clock bound a delegation applies to its CHILD when the caller does
+// not pass `timeoutMs`. Before this, a child that ran `sleep 600` sat `running`
+// indefinitely and the only recovery was `toolCancel` — which then destroyed the
+// transcript. Five minutes is long enough for a real research or edit run and short
+// enough that a frozen child cannot hold a session open forever.
+//
+// The delegate entry inlines this number as a literal (a runtime entry must keep zero
+// captured local dependencies), so core/metadata.ownership.test.ts pins the equality.
+export const DELEGATE_TIMEOUT_MS = 300_000;

@@ -1637,7 +1637,8 @@ describe('delegated child threads', () => {
             { role: 'system', content: 'lead' },
             { role: 'user', content: 'delegate please' },
             { role: 'assistant', content: '' },
-            { role: 'tool', content: '{"agent":"helper","content":"helper answer"}' },
+            // T28: the delegate result is an envelope (identity + paged answer).
+            { role: 'tool', content: expect.stringContaining('"agent":"helper","content":"helper answer"') },
             { role: 'assistant', content: 'lead answer' }
         ]);
 

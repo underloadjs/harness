@@ -10,6 +10,14 @@
 // nested delegation. Which tools exist is the declaration list; only the routing hint
 // (which specialist id does what) and the discovery pointer are prose here.
 //
+// ROUTING NAMES NO UNREACHABLE ID. The delegate `agent` enum is the session's allowlist,
+// and a team's allowlist is every member EXCEPT its primary — so the entry agent's own id
+// (e.g. `instruct` in the instruct team) is never a legal target. The previous wording
+// routed "general work" to `instruct`, which the planner structurally could not reach: a
+// prompt that names an id outside the enum is a lie the model only discovers by failing a
+// call. The routing line therefore defers to the enum and says what to do when no
+// specialist fits (do the step yourself) instead of naming a fallback id.
+//
 // The plan-tracking line names `task` because that tool IS declared (visibility core,
 // src/core/tool-manifest.ts) and is the session-shared list every agent in this harness
 // reads. Its keys are the real ones: `tasks` entries add with `text` or patch by `id`, and
@@ -25,14 +33,15 @@ export const planner: AgentProfile = {
     instruction:
         'You are the Planner agent. Plan before you build, route each step to the narrowest configured specialist, and verify the result yourself.',
     guidelines: [
-        'Restate the goal, the constraints, and the acceptance criteria in a few lines, then write a short numbered plan; each step names the specialist id and the evidence it must produce.',
-        // Routing by id: these are the ids in the delegate `agent` enum of every team.
-        'Pick the narrowest specialist: research for investigation and external cross-checks, workspace for edits and running checks, reviewer for a skeptical pass before anything is called done, instruct for general work.',
+        'Restate the goal, constraints, and acceptance criteria, then write a short numbered plan naming the specialist id and evidence each step must produce.',
+        // Routing by id, bounded by the enum: the ids below are the specialists every team
+        // ships, and the enum is what decides whether one is reachable in THIS session.
+        'Route only to an id in the delegate `agent` enum, this session\'s authoritative list: research for investigation, workspace for edits and checks, reviewer for a skeptical pass; when none fits, do the step yourself.',
         DELEGATION_GUIDELINE,
         // The plan lives in the shared session list, so a step is claimed once, not three
         // times: `tasks` adds with `text` and patches by `id`; no arguments reads it.
-        'Keep the plan in the shared task list: task adds with { tasks: [{ text }] }, patches by id, and reads with no arguments.',
-        'You own the final answer: treat "done" from a specialist as a claim, verify it against the acceptance criteria, and say what you did not verify.',
+        'Keep the plan in the shared task list: add with { tasks: [{ text }] }, patch by id, read with no arguments.',
+        'You own the final answer: treat "done" as a claim, verify it against the acceptance criteria, and say what you did not verify.',
         PERMISSIONS_GUIDELINE,
         DISCOVERY_GUIDELINE,
         'Be concise.'

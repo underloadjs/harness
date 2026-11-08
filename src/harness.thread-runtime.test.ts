@@ -127,6 +127,12 @@ const roles = (messages: { role: string }[]): string[] => messages.map((message)
 const textOf = (messages: { content?: string }[]): string[] =>
     messages.map((message) => message.content ?? '');
 
+// T28: a delegate result is an ENVELOPE (identity + paged content), not the old
+// `{ agent, content }` pair. These tests are about which answer crossed back and which
+// conversation it belongs to, so they project the fields they mean.
+const delegationOf = (message: { content: string }): Record<string, any> =>
+    JSON.parse(message.content) as Record<string, any>;
+
 describe('persistent agent threads (R2)', () => {
     it('exposes one default conversation per agent and independent host threads', () => {
         const writer = quiet(brain(scripted([answer('unused')])));
@@ -693,8 +699,16 @@ describe('host-parent delegation (R4)', () => {
         const betaTool = writer
             .threadMessages(beta.id)
             .find((message) => message.role === 'tool') as { content: string };
-        expect(alphaTool.content).toBe('{"agent":"helper","content":"alpha facts"}');
-        expect(betaTool.content).toBe('{"agent":"helper","content":"beta facts"}');
+        expect(delegationOf(alphaTool)).toMatchObject({
+            agent: 'helper',
+            content: 'alpha facts',
+            status: 'completed'
+        });
+        expect(delegationOf(betaTool)).toMatchObject({
+            agent: 'helper',
+            content: 'beta facts',
+            status: 'completed'
+        });
 
         // Ownership and status are persisted, so a restore keeps the same tree.
         const snapshot = writer.snapshot();
@@ -996,8 +1010,22 @@ describe('host-parent delegation (R4)', () => {
             .threadMessages(beta.id)
             .find((message) => message.role === 'tool') as { content: string };
 
-        expect(alphaTool.content).toBe('Tool "delegate" failed: child stopped');
-        expect(betaTool.content).toBe('{"agent":"helper","content":"beta facts"}');
+        // T28: a stopped child is a CANCELLED run, not a bare tool failure. The parent
+        // still observes a normal tool result it can read and recover from, and that
+        // result now carries the child's identity plus how far it got — the forensic
+        // record the transcript rollback used to erase.
+        expect(delegationOf(alphaTool)).toMatchObject({
+            agent: 'helper',
+            content: '',
+            status: 'cancelled',
+            error: 'child stopped',
+            cancelledAtMessage: 1
+        });
+        expect(delegationOf(betaTool)).toMatchObject({
+            agent: 'helper',
+            content: 'beta facts',
+            status: 'completed'
+        });
 
         // The unrelated child completed, and both parents are idle and resumable.
         expect(textOf(writer.threadMessages(betaChildRecord.id))).toEqual([

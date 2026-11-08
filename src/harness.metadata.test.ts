@@ -434,23 +434,43 @@ describe('core tool metadata', () => {
         });
 
         // The runtime declaration names the exact allowlist in its enum, and the
-        // description states the one-level rule.
-        expect(team.tools.delegate.parameters).toEqual({
-            type: 'object',
-            properties: {
-                agent: {
-                    type: 'string',
-                    enum: ['helper'],
-                    description: 'Subagent name, one of the configured allowlist.'
-                },
-                input: { type: 'string', description: 'The full brief the subagent should act on.' }
-            },
-            required: ['agent', 'input'],
-            additionalProperties: false
+        // description states the one-level rule. T28: the argument surface is derived
+        // from the entry's own literal, so this pins the DERIVATION (only `agent` is
+        // replaced) rather than restating a schema that would drift.
+        const parameters = team.tools.delegate.parameters as {
+            properties: Record<string, any>;
+            required: string[];
+            additionalProperties: boolean;
+        };
+
+        expect(parameters.properties.agent).toEqual({
+            type: 'string',
+            enum: ['helper'],
+            description: 'Subagent name, one of the configured allowlist.'
         });
-        expect(team.tools.delegate.description).toBe(
-            'Delegate a self-contained task to a configured subagent and return its answer. Subagents: helper. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.'
+        expect(parameters.properties.input).toEqual({
+            type: 'string',
+            description: 'The full brief the subagent should act on.'
+        });
+        // The T28 arguments are declared on the live tool, not only in the
+        // catalogue row.
+        expect(Object.keys(parameters.properties)).toEqual([
+            'agent',
+            'input',
+            'maxChars',
+            'requireClarification',
+            'timeoutMs',
+            'scope'
+        ]);
+        expect(parameters.required).toEqual(['agent', 'input']);
+        expect(parameters.additionalProperties).toBe(false);
+        expect(team.tools.delegate.description).toContain(
+            'Delegate a self-contained task to a configured subagent and return its answer. Subagents: helper.'
         );
+        expect(team.tools.delegate.description).toContain('cannot delegate further');
+        // The result contract is stated where the model reads it.
+        expect(team.tools.delegate.description).toContain('invocationId');
+        expect(team.tools.delegate.description).toContain('partialContent');
         expect(team.tools.delegate.visibility).toBe('core');
         expect(team.tools.delegate.tags).toEqual(['agents', 'delegate', 'delegation', 'subagent', 'team']);
     });
