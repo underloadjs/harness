@@ -48,6 +48,13 @@ it('indents one step per nesting level so any depth works', () => {
     expect(children).toContain('padding-left: var(--thread-indent)');
     expect(children).toContain('flex-direction: column');
 
+    // T7: the SAME step on the right and a foot, so a delegated card is inset from the
+    // conversation card's right and bottom edges instead of running flush into them.
+    // Both are the host's own padding, so an empty host (`display: none`) pays nothing.
+    expect(children).toContain('padding-right: var(--thread-indent)');
+    expect(children).toContain('padding-bottom: 4px');
+    expect(blockOf('.thread-children:empty {')).toContain('display: none');
+
     // R3: hierarchy is indentation ONLY. The row must have no stripe of its own and
     // no extra left padding duplicating the host indent.
     const row = blockOf('.thread-row {');

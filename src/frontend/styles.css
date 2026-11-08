@@ -3222,6 +3222,18 @@ body.is-resizing-rail {
     flex-direction: column;
     gap: 4px;
     padding-left: var(--thread-indent);
+    /* T7: the SAME step on the right, so a delegated card is inset from the conversation
+       card's right edge instead of running flush into it. The left indent says "this card
+       belongs to the block above"; the matching right inset is what makes the pair read as
+       a column of cards rather than a stack bleeding off the edge. `box-sizing: border-box`
+       (the global reset) takes it out of the width, so the indent still shrinks the content
+       instead of pushing it sideways. */
+    padding-right: var(--thread-indent);
+    /* T7: and a foot, so the LAST delegated card never sits on the conversation card's
+       bottom border. The same 4px as the gap between rows, so the bottom reads as one more
+       gap rather than a different measurement. An empty host is `display: none` below, so a
+       leaf entry pays nothing for either inset. */
+    padding-bottom: 4px;
     margin-top: 4px;
     /* R6: the host is a flex item of `.thread-row`. `min-width: 0` keeps the
        intrinsic width of a deep/long child from widening the host past the row

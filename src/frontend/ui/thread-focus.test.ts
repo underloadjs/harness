@@ -535,6 +535,78 @@ describe('persistent child conversations (S2)', () => {
         expect(board.focusedThread()).toBeUndefined();
         expect(nestedRow(board.turns()[0])?.classList.contains('is-expanded')).toBe(false);
     });
+
+    // T7: the header row IS the toggle, for a persistent child too. `focusThread` only
+    // ever OPENS, so routing every press through it made the card a one-way control:
+    // the second click re-focused the same conversation and left the footer chevron as
+    // the only way back. A press on an OPEN card that IS the focused conversation now
+    // closes it through the board's own `collapse()` (the same deliberate unfocus the
+    // root tile performs), so the composer never keeps targeting a closed card.
+    it('toggles a persistent child card from its header, and unfocuses on close', () => {
+        const { board, focus } = mount();
+        board.setThreads(roster());
+        board.hydrate([
+            turnRecord({
+                id: 'turn-1',
+                index: 0,
+                threadId: 'thread-root',
+                status: 'running',
+                events: delegationEvents()
+            })
+        ]);
+
+        const row = nestedRow(board.turns()[0]);
+        const select = row?.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select');
+        expect(row?.dataset.persistentThread).toBe('thread-child');
+
+        // First press: focus + open, exactly as before.
+        select?.click();
+        expect(row?.classList.contains('is-expanded')).toBe(true);
+        expect(row?.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('true');
+        expect(board.focusedThread()).toBe('thread-child');
+
+        // Second press on the SAME header: the card closes and the focus goes with it.
+        select?.click();
+        expect(row?.classList.contains('is-expanded')).toBe(false);
+        expect(row?.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('false');
+        expect(board.focusedThread()).toBeUndefined();
+        expect(focus[focus.length - 1]).toBeUndefined();
+
+        // Third press re-opens it: the toggle is symmetric, not a one-shot.
+        select?.click();
+        expect(row?.classList.contains('is-expanded')).toBe(true);
+        expect(board.focusedThread()).toBe('thread-child');
+    });
+
+    // The footer chevron closes the card WITHOUT moving focus (T7). A header press on
+    // that closed-but-still-focused card must therefore RE-OPEN it, not collapse the
+    // focus a second time — otherwise the chevron would leave the row unopenable.
+    it('re-opens a card the footer chevron closed while its thread stayed focused', () => {
+        const { board } = mount();
+        board.setThreads(roster());
+        board.hydrate([
+            turnRecord({
+                id: 'turn-1',
+                index: 0,
+                threadId: 'thread-root',
+                status: 'running',
+                events: delegationEvents()
+            })
+        ]);
+
+        const row = nestedRow(board.turns()[0]);
+        const select = row?.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select');
+        select?.click();
+        expect(board.focusedThread()).toBe('thread-child');
+
+        row?.querySelector<HTMLButtonElement>('.answer-collapse')?.click();
+        expect(row?.classList.contains('is-expanded')).toBe(false);
+        expect(board.focusedThread()).toBe('thread-child');
+
+        select?.click();
+        expect(row?.classList.contains('is-expanded')).toBe(true);
+        expect(board.focusedThread()).toBe('thread-child');
+    });
 });
 
 describe('label seeds (deletion must not renumber blocks)', () => {

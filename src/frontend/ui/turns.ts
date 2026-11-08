@@ -4495,9 +4495,29 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // that conversation (the composer then targets the child's true id), not
             // merely an ephemeral detail expansion. An unmapped entry keeps the old
             // independent expand/collapse behaviour.
+            //
+            // T7: the row IS the toggle, for BOTH kinds of entry. `focusThread` only
+            // ever OPENS, so routing every press through it made a persistent child a
+            // one-way control: the card opened on the first click and the second click
+            // re-focused the same conversation, leaving the footer chevron (at the end
+            // of a long transcript) as the only way back. A card that is already OPEN
+            // and is the conversation the board has focused therefore closes on the
+            // same press that opened it, through the board's own `collapse()` — the
+            // same deliberate unfocus the root tile performs — so the composer never
+            // keeps targeting a conversation the reader just closed.
+            //
+            // The `entry.expanded` half of the test is what keeps the chevron's
+            // contract intact: that button closes the card WITHOUT moving focus (T7),
+            // so a closed card whose thread is still focused must re-open on a header
+            // press, not collapse the focus a second time.
             select.addEventListener('click', () => {
                 const persistent = persistentIdOf(entry);
                 if (persistent !== undefined) {
+                    if (entry.expanded && focusedThreadId === persistent) {
+                        collapse();
+                        return;
+                    }
+
                     focusThread(persistent);
                     return;
                 }
