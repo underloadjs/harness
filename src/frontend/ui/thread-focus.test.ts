@@ -565,12 +565,39 @@ describe('persistent child conversations (S2)', () => {
         expect(row?.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('true');
         expect(board.focusedThread()).toBe('thread-child');
 
+        // T6 guard: the close routes through the BOARD-level `collapse()`, whose
+        // `dropFocusState()` (turns.ts:2958-2968) strips `is-expanded` from EVERY
+        // `.conversation` host and every turn tile — it is board-global, not card
+        // scoped. So "close this card" has to be verified against the ENCLOSING
+        // parent conversation, otherwise a more aggressive unfocus (collapsing the
+        // whole group) would still pass the row-local assertions below.
+        //
+        // The reachable pre-press state already has the parent collapsed: focusing a
+        // child detaches tile expansion (turns.ts:3053, pinned at :331 and :358-362),
+        // hence the contract is "unchanged + still connected", NOT "expanded".
+        const parentTile = board.turns()[0].element;
+        const parentHost = parentTile.closest<HTMLElement>('.conversation');
+        const parentHostExpandedBefore = parentHost?.classList.contains('is-expanded') ?? false;
+        const parentTileExpandedBefore = parentTile.classList.contains('is-expanded');
+
         // Second press on the SAME header: the card closes and the focus goes with it.
         select?.click();
         expect(row?.classList.contains('is-expanded')).toBe(false);
         expect(row?.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('false');
         expect(board.focusedThread()).toBeUndefined();
         expect(focus[focus.length - 1]).toBeUndefined();
+
+        // The parent conversation surfaces survive the board-global collapse untouched:
+        // `dataset.threadId` doubles as the existence pin (an undefined host would make
+        // it `undefined`, never `'thread-root'`), and the expanded flags are byte-for-byte
+        // what they were before the press — both `false` under the current design, so no
+        // new collapse happened.
+        expect(parentHost?.dataset.threadId).toBe('thread-root');
+        expect(parentHost?.isConnected).toBe(true);
+        expect(parentHost?.classList.contains('is-expanded')).toBe(parentHostExpandedBefore);
+        expect(parentHostExpandedBefore).toBe(false);
+        expect(parentTile.classList.contains('is-expanded')).toBe(parentTileExpandedBefore);
+        expect(parentTileExpandedBefore).toBe(false);
 
         // Third press re-opens it: the toggle is symmetric, not a one-shot.
         select?.click();

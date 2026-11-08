@@ -544,6 +544,24 @@ describe('grep', () => {
         expect((nested as Error).message).toMatch(/is not a directory|does not exist/);
     });
 
+    it('searches an ordinary subdirectory root and says nothing about the missing rule file', async () => {
+        // F2 regression, the shape the removed clause hit most often: `paths: ['src']` in
+        // a tree whose only `.gitignore` sits ABOVE the root. Nothing is withheld by this
+        // call, so its note is absent — `excluded.ignoreFilesParsed: 0` is the fact, and a
+        // paragraph telling the caller to re-root at the directory that owns the
+        // `.gitignore` was advice about build output (`dist/`) that is not under `src` at
+        // all. The scope rule the clause tried to explain is unchanged and stays pinned by
+        // the "grep - .gitignore scoping" describe below; the tool description states it.
+        const result = await grep({ pattern: 'TODO: one', paths: ['src'] });
+
+        expect(result.matches).toEqual([
+            { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 }
+        ]);
+        expect(result.searched).toEqual({ inScope: 4, scanned: 4, roots: 1 });
+        expect(result.excluded.ignoreFilesParsed).toBe(0);
+        expect(result.note).toBeUndefined();
+    });
+
     it('still applies the pattern filter to a file root, and says so', async () => {
         // `paths: ['src/a.ts'], patterns: ['*.md']` is a contradiction, not a match. The
         // answer is empty, but `inScope` proves the file WAS in scope while `scanned`
@@ -1116,9 +1134,21 @@ describe('grep - .gitignore scoping', () => {
             { path: 'Temp/scratch.ts', line: 1, text: 'MARK scratch', textTruncated: false, bytes: 12 }
         ]);
 
-        await expect(grep({ pattern: 'MARK', paths: ['dist'] }).then((r) => r.matches)).resolves.toEqual([
+        const dist = await grep({ pattern: 'MARK', paths: ['dist'] });
+
+        expect(dist.matches).toEqual([
             { path: 'dist/hidden.ts', line: 1, text: 'MARK dist', textTruncated: false, bytes: 9 }
         ]);
+
+        // F2 regression. This root parses no rule file (`dist/` owns none), and an earlier
+        // revision therefore appended a "no .gitignore was read at or below the root"
+        // paragraph to its note. The traversal above is the documented scope rule and the
+        // answer needs no advice attached, so the note is asserted VERBATIM: it carries
+        // only what `skipped` says was not searched, and any re-added clause fails here.
+        expect(dist.excluded.ignoreFilesParsed).toBe(0);
+        expect(dist.note).toBe(
+            '1 file(s) larger than 1048576 bytes were not searched; 1 binary file(s) were not searched'
+        );
 
         // node_modules is BOTH on the fixed name-skip list and ignored here, so a result
         // proves the relaxation (./glob.ts rootTargetsSkippedDirectory) as well: the

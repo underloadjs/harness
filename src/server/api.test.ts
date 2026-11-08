@@ -2739,15 +2739,22 @@ describe('manual tool execution', () => {
             expect(read.body.ok).toBe(true);
 
             // The tool's own object, not the envelope: no budgetBytes/content keys.
+            // `note` is the large-file advisory (R4, ./tools/files/read.tool.ts): a
+            // 300 000-byte file cut by the envelope is exactly the case it exists for,
+            // and its bytes are reserved before the split, so it joins the key set here
+            // without moving the response over the cap (the assertion below).
             const result = read.body.result as Record<string, unknown>;
             expect(Object.keys(result).sort()).toEqual([
                 'bytes',
                 'contentBudget',
                 'files',
+                'note',
                 'skipped',
                 'truncated',
                 'wireBytes'
             ]);
+
+            expect(result.note).toContain('is 300000 bytes');
 
             // And the continuation fields survived, which is the whole point.
             const entry = (result.files as Record<string, unknown>[])[0];

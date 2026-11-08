@@ -448,7 +448,7 @@ const read = tool<FileReadParameters, FileReadResult>({
 
 // { files: [{ path, content, startLine, endLine, truncated,
 //             nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }],
-//   truncated, bytes, wireBytes, contentBudget, skipped }
+//   truncated, bytes, wireBytes, contentBudget, skipped, note? }
 await read(['package.json']);                // no harness, no agent
 harness({ tools: { read } });                // the model calls read
 ```
@@ -855,7 +855,7 @@ import {
 
 await syntax({ code: 'def f():\n    pass', language: 'python' });  // true
 await syntax({ code: 'const a: number = 1;', language: 'ts' });     // true (typescript, tsx, jsx and json too)
-await read(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, wireBytes, contentBudget, skipped }
+await read(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, wireBytes, contentBudget, skipped, note? } — `note` only when a file of 65536 bytes or more came back cut
 await write([{ path: 'notes.md', content: '# Notes' }]);            // [{ path, bytes }]
 await files([{ op: 'list', path: ['src', 'task'] }]);                // { results: [{ op: 'list', path: 'src', entries: ['src/a.ts', 'src/nested/', 'task/b.ts', …], truncated, nextOffset, offset, limit, bytes }], bytes, contentBudget }
 await files([{ op: 'list', path: 'src', offset: 200 }]);           // page 2 of the same list
@@ -973,7 +973,7 @@ process; it makes no claim about another process or worker thread.
 | Tool | Signatures | Result |
 |---|---|---|
 | `syntax` | `({ code, language: string })` — any name, validated at run time | `true` when the snippet parses and `false` when it does not. Parsers: `javascript` (a classic script, so no `import`/`export` or top-level await) and its `js` alias, `typescript`/`ts`, `tsx`, `jsx` (syntax diagnostics only — a type error still parses), `json` (strict; one leading BOM is ignored), and `python`/`py`/`python3`. Any other language is an ERROR that lists the supported set, never a verdict |
-| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files, truncated, bytes, wireBytes, contentBudget, skipped }`; one window per path, ordered, default 5000 lines; an unreadable path keeps its slot with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call |
+| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files, truncated, bytes, wireBytes, contentBudget, skipped, note? }`; one window per path, ordered, **no default line cap** (the byte budget is the limit; an explicit `maxLines` is 1..20000); `note` is present only when a file of `65536` bytes or more came back cut — it names up to 2 such paths with their size, what was returned, and the exact continuation, and counts the rest; an unreadable path keeps its slot with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call |
 | `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected; serialized per file against a concurrent `edit` |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted; read-match-write is one per-file critical section |
 | `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` — non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` gives `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (200 entries by default, 1000 maximum, one shared 64 KiB entry-text budget across the call), `move`/`copy` give `{ path, to, kind, bytes }` and gate an existing destination on `overwrite`, `delete` gives `{ path, removed, recursive }` and refuses a non-empty directory without `recursive` (`force` reports a missing path as a no-op), `mkdir` gives `{ path, created }`; a failed list entry carries its own `error: { code, message }`, a failed mutation rejects the call naming the operations already applied (no rollback) |

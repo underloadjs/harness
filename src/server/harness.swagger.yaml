@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
-# Underload Harness - target REST + WebSocket contract
+# Underload Harness - REST + WebSocket contract
 #
-# Codegrounded sources (read-only, no implementation claims below):
+# Codegrounded sources this document is read off (it describes the build, not a wish):
 #   src/server/api.ts        - route dispatcher, envelopes, field allowlists, status codes, body caps
 #   src/server/protocol.ts   - wire types (session, turn, thread, tool, model, transcript, action)
 #   src/server/sessions.ts   - store semantics, queue, threads, transcripts, pending actions, limits
@@ -15,11 +15,12 @@
 openapi: 3.0.3
 info:
   title: Underload Harness API
-  version: 1.0.0-target
+  version: 1.0.0
   description: >-
-    TARGET CONTRACT for the harness server, mounted at `/v1/harness`. This is a design document: the
-    server work needed to satisfy it is expected, and nothing here should be read as a claim that a
-    running build already answers every route exactly as written. It is one complete contract with no
+    THE CONTRACT THE HARNESS SERVER IMPLEMENTS, mounted at `/v1/harness`. This document describes what
+    the running build actually does: every status code, bound, and message shape here was read off the
+    server that answers it, so a claim in this file IS a claim about the build. Where the build and an
+    older draft disagreed, the build won and this text follows it. It is one complete contract with no
     second vocabulary, no optional second spelling of any field, and no surface kept alongside the
     canonical one.
 
@@ -42,15 +43,25 @@ info:
     either.
 
 
-    PAGES AND REVISIONS. Paginated reads accept `limit` (default 25, maximum 100) and an opaque
-    `cursor`, and answer `{ items, limit, next_cursor, observed_at, revision }`. A cursor encodes the
-    ordering key and the revision it was taken at, so a page never skips or repeats an entry across a
-    concurrent mutation; an unrecognised cursor is a 400 naming the parameter. Every addressable
-    resource instance carries an integer `revision` that increases by one on every accepted mutation of
-    that instance, and every collection page carries the collection `revision`. A revision is a
-    staleness test, not a cursor: it orders "did my read race my subscription" and it never enumerates
-    history. Revisions restart at 1 for a freshly created resource, and a server restart starts a new
-    stream epoch (see the stream extension), so a client never compares revisions across epochs.
+    PAGES AND REVISIONS. Paginated reads accept `limit` (default 25, 1-100, and a value outside that
+    range is a 400 naming the parameter) and an opaque `cursor`, and answer `{ items, limit,
+    next_cursor, observed_at, revision }`. A cursor is `base64url(epoch + '.' + served-ordinal)`: the
+    process epoch plus how many entries have already been served, so a cursor carried across a restart
+    is refused rather than silently re-reading page one. `next_cursor` is null at the end of a
+    collection, and also null when a page that filled `limit` reached the collection's known total; the
+    response's `limit` is the number of rows THIS page carries, not the size that was requested (a page
+    read past the end therefore carries `limit: 0` and no cursor). Every addressable resource instance
+    carries an integer `revision` from one per-process counter hub keyed by `(StreamResourceKind, id)`.
+    That key is what a client must read carefully: `harnesses`, `agents`, `tools`, and `config` are
+    HOST-WIDE kinds whose id is discarded when the key is built, so every agent profile shares one
+    counter, every card shares the `harnesses` counter, and an accepted agent write moves that shared
+    counter TWICE (once as the host-wide collection, once as the per-id key that collapses onto it).
+    Only per-instance kinds - `definition` keyed by harness name, `session`, `threads`, `turns`,
+    `transcript` - count one resource. A revision is a staleness test, not a cursor: it orders "did my
+    read race my subscription" and it never enumerates history. Counters live in memory, so a resource
+    nothing has mutated IN THIS PROCESS reads 0 - a shipped built-in harness or profile, and a session
+    restored after a restart, all start at 0, not at 1 - and a restart starts a new stream epoch (see
+    the stream extension), so a client never compares revisions across epochs.
 
 
     CONCURRENCY. General REST mutations are LAST-WRITE-WINS: a write is accepted against whatever state the
@@ -88,33 +99,51 @@ info:
     id or instruction text. Tools are the one place executable code legitimately exists. Global tools
     are composed by the deployment, so the global tool surface is read plus execute, never upload. A
     session tool registration is declarative `ToolCreation` (name, description, tags, JSON Schema,
-    optional function body or module text) compiled by the host realm with NO sandbox and NO isolation:
-    submitting code is therefore a capability grant, and a deployment that does not grant it answers
-    403 on that route. `protected: true` marks the harness-owned control plane (the tools a session runs
-    on: `toolRegistry`, `toolRequest`, `toolCreate`, `toolManage`, `task`, `delegate`); a protected
-    entry cannot be replaced, edited, disabled, or deleted by any route - 403, not 409 - because
-    removing it would break that session's own control surface. Every write rejects unknown properties
-    outright instead of ignoring them, so a client is never left believing it changed something.
+    optional function body or module text) compiled by the host realm with NO sandbox and NO isolation,
+    and this build ALWAYS accepts that source: there is no code-submission capability gate and no
+    deployment that answers 403 for sending it. What is refused is narrower and specific: `replace:
+    true` on the session-tool POST is refused with 403 (the route is create-or-409, not an atomic
+    replace), and a metadata-only PATCH over a tool with no captured source revision - a built-in
+    registered from an already-constructed definition - is refused with 403 because there is no
+    revision to re-publish. `protected: true` marks an entry the session's own control surface runs on:
+    the name is either one of the harness core names (the server derives that set from the runtime tool
+    manifest, so it is data rather than a hard-coded list) or one the session's frozen harness
+    definition declares. A protected entry refuses the enable/disable PATCH and refuses DELETE with
+    403, not 409, because removing it would break that session's own control surface; a registration
+    that merely takes the same NAME is not refused, and replaces the live entry like any other
+    same-name write. Every write rejects unknown properties outright instead of ignoring them, so a
+    client is never left believing it changed something.
 
 
     LIMITS (the same numbers travel to a client in `GET /v1/harness`, so they are contract, not
     folklore). Request body 1,000,000 bytes; a task submit may reach 16,777,216 bytes because base64
     media rides inside the JSON. Task input 200,000 characters. At most 100 pending (queued) tasks per
-    session, 429 beyond that. At most 256 persistent thread records per session. At most 4 attachments
-    per turn, 4,194,304 bytes each, 8,388,608 bytes per turn. At most 16 result references per submit.
-    At most 4 live pending action requests per session, and at most 64 steered-submit audit records on
-    one turn. At most 32 tools created per harness lifetime. A model-facing tool result is bounded to
-    65,536 bytes of text; the detail routes answer recorded bytes verbatim and state the cap they were
-    measured against. Stream limits are stated on the stream operation itself.
+    session, 429 beyond that. At most 256 persistent thread records per session - the cap answers 429
+    when a task submit has to open a conversation for it, and 500 on `POST .../threads`, where the
+    runtime's refusal is not classified into a status. At most 4 attachments per turn, 4,194,304 bytes
+    each, 8,388,608 bytes per turn. At most 16 result references per submit. At most 4 live pending
+    action requests per session, and at most 64 steered-submit audit records on one turn. At most 32
+    tools created per harness lifetime, and going past that answers 400 naming the budget - a
+    registration is refused, not conflicted, because the caller's fix is to reuse a name rather than to
+    wait for state to change. A model-facing tool result is bounded to 262,144 bytes of text (256 KiB,
+    sized to match the `read` tool's own output budget so a full-budget result survives the wire
+    intact); the detail routes answer recorded bytes verbatim and state the cap they were measured
+    against. Stream limits are stated on the stream operation itself.
 
 
     ERRORS. Every failure answers `{ "error": { "message": string } }` with one of 400, 403, 404, 405,
     409, 413, 415, 429, 500, 502, 503. A 405 names the methods that path accepts, and any method a path
     item does not declare is a 405 even where the response is not repeated inline. 403 is always a
-    scope or operator-policy refusal. 409 always means "the resource state refuses this operation and
-    it is safe to retry once that state changes". Note that an EXECUTION failure of a manually called
-    tool is not an HTTP error at all: the call itself succeeded and the tool reported the failure, so
-    the answer is 200 with `ok: false` (see `ToolCallResult`).
+    policy refusal stated by the route, and NO capability flag produces one: of the nine advertised
+    capabilities only `websocket_stream` is ever consulted (the stream route refuses when it is false),
+    while the other eight are advertisement for a client's affordances and change no status code. 409
+    always means "the resource state refuses this operation and it is safe to retry once that state
+    changes". A refusal the server could not CLASSIFY is a 500, not a 409 or a 400: the runtime refuses
+    some thread writes - the 256-thread cap and a non-host `owner_thread_id` on
+    `POST .../threads` - and that refusal reaches the client as 500 carrying the runtime's message.
+    Note that an EXECUTION failure of a manually called tool is not an HTTP error at all: the call
+    itself succeeded and the tool reported the failure, so the answer is 200 with `ok: false` (see
+    `ToolCallResult`).
 
 
     AUTHENTICATION. None, and none is invented here. The service applies an Origin check for its own
@@ -212,9 +241,8 @@ paths:
                 $ref: '#/components/schemas/ServiceInfo'
               example:
                 api_root: /v1/harness
-                service: underload-harness
-                api_version: '1.0'
-                build_version: 0.3.0
+                service: noobscript-harness
+                api_version: v1
                 server_time: 1762250000000
                 epoch: 9f2c17a4
                 capabilities:
@@ -244,12 +272,14 @@ paths:
                   page_limit_default: 25
                   page_limit_max: 100
                 links:
+                  self: /v1/harness
                   health: /v1/harness/health
                   config: /v1/harness/config
                   harnesses: /v1/harness/harnesses
                   agents: /v1/harness/agents
                   tools: /v1/harness/tools
                   plugins: /v1/harness/plugins
+                  models: /v1/harness/models
                   sessions: /v1/harness/sessions
                   stream: /v1/harness/stream
         '405':
@@ -297,12 +327,19 @@ paths:
       summary: Change global provider defaults
       description: >-
         Whole-field patch of the host defaults; only `settings` is writable. A `null` value for
-        `base_url` or `model` restores the built-in default. `api_key` is write-only, and an explicit
-        empty string or `null` REMOVES the configured server key (the response then reports
-        `has_api_key: false`); omitting the property leaves the key untouched, so a client can never
-        clobber it by echoing a read. Every change affects FUTURE sessions only - an existing session
-        already captured the settings it runs with. Bounds come from `src/server/config.ts`
-        (`base_url` 2048 characters, `model` 256). A runtime knob in this body is a 400 naming it.
+        `base_url` or `model` restores the built-in default. `api_key` is write-only and has three
+        distinct outcomes: a non-empty string issues a NEW process-only credential scoped to the base
+        URL the same final patch settles on, an explicit empty string REMOVES the key (the response
+        then reports `has_api_key: false`), and `null` does NOT mean "no key" - it restores the SHIPPED
+        credential together with the shipped provider it belongs to, so the response reports the
+        shipped `has_api_key`. Omitting the property leaves the key untouched, so a client can never
+        clobber it by echoing a read. The patch is decided on a candidate copy and committed once, so a
+        refusal writes nothing: `base_url: ''` is a 400 ('A provider base URL cannot be empty.') and a
+        body that also moved `model` leaves `model` where it was. The length caps measure the TRIMMED
+        value, because the trimmed string is what a later session validates and sends. Every change
+        affects FUTURE sessions only - an existing session already captured the settings it runs with.
+        Bounds come from `src/server/config.ts` (`base_url` 2048 characters, `model` 256). A runtime
+        knob in this body is a 400 naming it.
       requestBody:
         required: true
         content:
@@ -321,6 +358,11 @@ paths:
                 value:
                   settings:
                     api_key: ''
+              restore-shipped-key:
+                summary: Put the shipped credential and its provider back
+                value:
+                  settings:
+                    api_key: null
       responses:
         '200':
           description: Updated global configuration document.
@@ -374,10 +416,16 @@ paths:
       description: >-
         Selection-only body: a client picks trusted agent names and may record per-agent model ids,
         instruction overrides, and display colors. It cannot supply a provider, a credential, a transport, or a
-        tool list - those are deployment-owned. The registry validates every member name against the trusted agent
-        catalogue and every override key against the resulting member set, so 400 (unknown member) and
-        404 (unknown profile) are both possible before anything is written. A new definition is the
-        inheritance source for sessions created AFTER it; no existing session changes.
+        tool list - those are deployment-owned. The registry validates the name and every member before
+        anything is written, and each refusal is the one the server actually answers: a `name` that is not a
+        letter followed by letters, digits, `_` or `-` within 64 characters is 400, a `name` that is one of
+        the built-in ALIASES (`writer`, `assistant`, `researcher`) is 400 because an alias is a redirect, not
+        an identity, a `name` already held by an entry (compared case-insensitively, so `Writer` and `writer`
+        are one name) is 409, a `primary` or `subagents` entry that is not a known profile is 400 naming the
+        known set, and a member whose profile the operator has RETIRED is 409 - a retired profile is out of
+        the selectable catalogue, which is a state the caller can change, not a typo. There is no 403 on this
+        route: every entry is an editable application copy and no definition is read-only. A new definition
+        is the inheritance source for sessions created AFTER it; no existing session changes.
       requestBody:
         required: true
         content:
@@ -407,8 +455,6 @@ paths:
                 $ref: '#/components/schemas/HarnessDefinitionResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
   /v1/harness/harnesses/{harness_name}:
@@ -443,8 +489,12 @@ paths:
         `agent_instructions` and `agent_colors` REPLACE the map they name: `{}` clears it, every key must name a
         member of the resulting definition (400 otherwise), and an override for a member the same patch removes is
         dropped rather than rejected. Changing `primary` without `subagents` removes the new primary from
-        the old allowlist. A PATCH produces a new immutable registry entry under the same name and
-        raises its `revision`; the definition an existing session captured does not move.
+        the old allowlist. Selecting a RETIRED agent is 409 only when this patch INTRODUCES it; re-selecting a
+        retired profile the entry already named is allowed, because a saved row and its existing sessions must
+        stay replayable. A built-in is patched exactly like a created entry - there is no read-only gate, so this
+        route answers no 403. A PATCH produces a new immutable registry entry under the same name and raises its
+        `definition_revision` by exactly one (the collection counter `harnesses` moves with it); the definition an
+        existing session captured does not move.
       requestBody:
         required: true
         content:
@@ -460,10 +510,10 @@ paths:
                 $ref: '#/components/schemas/HarnessDefinitionResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
     delete:
       tags: [Harnesses]
       operationId: deleteHarness
@@ -473,8 +523,9 @@ paths:
         exactly like a created one, and its name is tombstoned so a restart does not re-ship it. This
         never cascades: every existing session runs, and a saved session restores from, the definition
         it captured, so deleting a definition with live or saved conversations is not an error. A repeat
-        delete is 404 because the second call removed nothing. `restored_by_restart: true` states the
-        restore rule honestly: only a host restart re-ships a built-in, and there is no HTTP undo.
+        delete is 404 because the second call removed nothing, and nothing here answers 403 - no
+        definition is read-only. `restored_by_restart` is always false: the tombstone is part of the
+        durable document, so no host restart brings the removed entry back, and there is no HTTP undo.
       responses:
         '200':
           description: Removal receipt.
@@ -482,8 +533,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeleteHarnessResult'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
   /v1/harness/harnesses/{harness_name}/instructions:
@@ -517,13 +566,20 @@ paths:
       operationId: getHarnessInstruction
       summary: Read one member's effective instruction text
       description: >-
-        The recorded or inherited instruction for exactly one member of this definition. Resolution
-        order is the harness override, then the global profile override, then the trusted catalogue, and
-        `source` states which one supplied the text. A harness override IS the member's complete prompt,
-        so `guidelines` are reported as the profile's rules for clients that compose the default text of
-        an un-overridden member; they are never appended underneath a stored override. A member
-        outside the definition's member set is 404, which is how a client learns membership rather than
-        reading an empty string.
+        The recorded or inherited instruction for exactly one member of this definition. On THIS route
+        `source` says one of two things: `harness` when this definition carries an override for the
+        member, `catalogue` when the trusted profile supplies the text. The deployment-wide agent layer
+        is NOT consulted here, so a global `PATCH /agents/{id}` override reports `catalogue` on this
+        route even though a new session would run the overridden text; the layer a member's text
+        actually came from, including `global`, is what the INDEX route states. Resolution order is
+        therefore the harness override, then the trusted profile, and nothing between them. A harness
+        override IS the member's complete prompt, so `guidelines` are reported as the profile's rules
+        for clients that compose the default text of an un-overridden member; they are never appended
+        underneath a stored override. A member outside the definition's member set is 404, which is how
+        a client learns membership rather than reading an empty string. One edge case is real and is
+        part of the contract: a member whose profile the operator has RETIRED has no selectable profile
+        entry and no shipped fallback on this route, and when the definition carries no override for it
+        the read answers 200 with an EMPTY body rather than a document or a 404.
       responses:
         '200':
           description: Instruction text for one member.
@@ -566,9 +622,11 @@ paths:
       description: >-
         The identified read, carrying the full trusted text (`instruction`, `guidelines`) plus
         `instruction_source` (whether the text is the shipped catalogue value or a global override) and
-        `referenced_by` (the harness definitions currently naming this member, so a client can explain
-        why a DELETE would be refused). One profile costs one request; a client never has to download
-        the catalogue to resolve one binding.
+        `referenced_by` (the harness definitions currently naming this member). `referenced_by` is
+        INFORMATIONAL - it tells an operator who would be left pointing at a retired profile - and it is
+        never a delete precondition: `DELETE /agents/{agent_id}` answers 200 whatever this list holds,
+        because a harness definition is not rewritten by retiring a profile. One profile costs one
+        request; a client never has to download the catalogue to resolve one binding.
       responses:
         '200':
           description: Agent profile.
@@ -619,9 +677,14 @@ paths:
         harness definition. It removes availability for NEW sessions and for member selection only. It
         never cascades: existing sessions keep running the definition they captured, their transcripts
         stay renderable, and their session-local bindings that referenced this profile keep working.
-        A profile still named by a live harness definition is refused with 409 naming the referencing
-        definitions, because a harness has no frozen-copy mechanism for its member list. A repeat delete
-        is 404. There is no HTTP undo: `restored_by_restart` states the only restore path.
+        There is NO reference check: a profile still named by live harness definitions retires with
+        200, because `referenced_by` is information and not a precondition, and a definition that keeps
+        naming the retired profile stays runnable (its own sessions keep working) while NEW selections
+        of that profile are refused with 409. The refusal this route does give is 404, and it covers an
+        unknown id, a name this build never shipped, and a repeat delete alike - an already-retired
+        profile is "nothing to remove", so a second DELETE does not answer a second success. There is no
+        403 (no profile is read-only) and no 409 (no resource state refuses the retirement, and the
+        route declares neither response). `restored_by_restart` states the only restore path.
       responses:
         '200':
           description: Retirement receipt.
@@ -629,12 +692,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeleteAgentResult'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
   /v1/harness/tools:
     get:
       tags: [Tools]
@@ -708,12 +767,15 @@ paths:
         Direct execution against the deployment catalogue. The body carries `parameters` only: this
         route has no session field at all, because a call made here resolves through the static global
         registry, not a conversation's registry. A `session_bound` entry (the harness-owned control
-        plane) has no standalone implementation and is refused with 400 naming the session-scoped
-        route that does have one. A tool that fails at execution is a 200 with `ok: false` plus the
-        serialised failure - the call succeeded and the tool reported the failure - so a client must
-        read `ok`, not only the status. A credential-dependent entry that is unconfigured is 409.
-        Results are the tool's own value with panels and media DESCRIPTORS only: no base64 travels on
-        this route, because a catalogue call has no transcript to attach bytes to.
+        plane) has no standalone implementation and is refused with 403 naming the session-scoped route
+        that does have one - a policy refusal about WHERE the call can run, not a malformed body, so it
+        is not a 400. A credential-dependent entry that is unconfigured is NOT a conflict either: it is
+        a 200 with `ok: false` whose message is the catalogue hint (environment variable NAMES, never
+        values), because the call itself was accepted and the tool reported that it cannot run. A tool
+        that fails at execution is likewise a 200 with `ok: false` plus the serialised failure - the
+        call succeeded and the tool reported the failure - so a client must read `ok`, not only the
+        status. Results are the tool's own value with panels and media DESCRIPTORS only: no base64
+        travels on this route, because a catalogue call has no transcript to attach bytes to.
       requestBody:
         required: false
         content:
@@ -739,8 +801,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '500':
@@ -888,7 +948,11 @@ paths:
       operationId: listSessions
       summary: List sessions as bounded summaries
       description: >-
-        A page of `SessionSummary` rows - one per live or restored session, newest activity first. A row
+        A page of `SessionSummary` rows - one per live or restored session, in STORE ORDER: the order the
+        store's session map holds them, which is creation order for this process with sessions restored from
+        the durable document taking their slots first, in document order. It is NOT newest-activity-first and
+        it is NOT sorted by `updated_at`, so a `PATCH` that renames a session or a task that finishes one
+        never moves its row, and a client that wants a recent-first rail sorts the rows itself. A row
         is metadata and counters only: id, optional display title, harness name, status, queue depth, resolved
         model, timestamps,
         turn and thread counts, and the last error string. It carries NO turns, NO recorded events, NO
@@ -908,10 +972,14 @@ paths:
         - name: harness
           in: query
           required: false
-          description: Exact harness definition name to filter by.
+          description: >-
+            Exact harness definition name to filter by, matched against the name each row reports. That is
+            the CANONICAL name a session was created from, so filtering by a legacy alias such as `writer`
+            answers an empty page even though creating on `writer` works: the alias resolved at creation and
+            the row keeps the resolved name. A name no session uses is an empty page, never a 404.
           schema:
             type: string
-            pattern: '^[a-z][a-z0-9_-]*$'
+            pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
       responses:
         '200':
           description: Page of session summaries.
@@ -927,10 +995,21 @@ paths:
       summary: Create a session from a harness definition
       description: >-
         Freezes the named harness definition into the new session and merges the supplied endpoint
-        settings with the host defaults. Unknown harness name is 404; a definition that needs a provider
-        endpoint and receives neither an explicit nor a configured one is 400. `title` is optional display
-        data for a session rail and carries no authority, so two sessions may share one title.
-        `settings.api_key` is
+        settings with the host defaults. Unknown harness name is 404 - the lookup is direct and ALIAS-AWARE,
+        so a legacy name such as `writer` creates the session while the row reports the canonical definition
+        it resolved to. A definition that needs a provider endpoint and receives neither an explicit nor a
+        configured one is 400. A member of the chosen definition that has been RETIRED on this deployment is
+        409, not 400: the harness is built before the session exists, and that refusal is a deployment
+        decision the body cannot fix, so the session is simply never created and the client picks another
+        definition. In worker execution a harness a lane worker could not rebuild is refused the same way
+        with the reason and the fix, rather than being silently run inline, and a preset factory that throws
+        anything without a status of its own - a real configuration bug - answers 400 naming the definition.
+        The last step is the durable write: a server that has closed its database root answers 503 and the
+        in-memory entry is rolled back, so a 503 here means no session was created. Nothing on this route is
+        permission-gated, so there is no 403. `title` is optional display
+        data for a session rail and carries no authority, so two sessions may share one title; it is trimmed
+        and then TRUNCATED to 200 characters server-side rather than refused, and a value that is not a
+        string is ignored instead of rejected. `settings.api_key` is
         accepted here, used for this session only, and never echoed back. The answer is the created
         session resource (metadata plus counters), not a conversation tree.
       requestBody:
@@ -956,12 +1035,14 @@ paths:
                 $ref: '#/components/schemas/SessionResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '503':
+          $ref: '#/components/responses/Unavailable'
   /v1/harness/sessions/{session_id}:
     parameters:
       - $ref: '#/components/parameters/SessionId'
@@ -994,10 +1075,15 @@ paths:
       description: >-
         The session-level writes. A session's harness, settings, recorded history, and frozen definition are
         immutable over HTTP. `agent_models` maps agent id to model id and MERGES: an agent absent from the body
-        keeps the model it currently runs, so changing one dropdown does not reset its siblings, while `{}` is a
-        400 no-op. Every key must name a member of this session's frozen definition and every value a non-empty
-        model id, or the whole patch is refused with 400 and nothing is applied. `title` replaces the display
-        name and an explicit `null` clears it; it is presentation data, never an identifier, so renaming a
+        keeps the model it currently runs, so changing one dropdown does not reset its siblings, while a body
+        that names neither writable field (`{}`) is a 400 - the route never reports a success that changed
+        nothing. Every key must name a live member of this session (the frozen definition's members plus
+        anything this conversation has bound since) and every value a non-empty model id of at most 200
+        characters with no control characters, or the whole patch is refused with 400 and nothing is applied.
+        `title` replaces the display
+        name and an explicit `null` clears it; the value is trimmed and then TRUNCATED to 200 characters
+        server-side, never refused for length, and a trimmed-empty title clears it rather than answering 400.
+        It is presentation data, never an identifier, so renaming a
         session never changes how it is addressed. The patch is accepted while the session is running; an
         in-flight request keeps the model it started with and only later requests observe the change. The answer
         is the mutated session resource, whose `model` and `agent_models` reflect the change and whose `revision`
@@ -1050,12 +1136,22 @@ paths:
       description: >-
         The definition captured at creation - the authority for this session's member set, delegation
         allowlist, declared and core tools, and per-agent overrides (`agent_models`, `agent_colors`,
-        `agent_instructions`) - plus `source_revision`: the `definition_revision` of the registry entry at
-        capture time, which lets a client state "this session runs an older copy" without fetching that copy.
+        `agent_instructions`) - plus the currency pair a client asks it for. Read it live rather than as a
+        timestamp: `source_revision` and `current_revision` are BOTH the live `definition` counter of the
+        registry entry this session was built from, sampled at request time, so they are always the same
+        number. The revision the copy was captured at is not stored anywhere, which is why neither field can
+        be a capture-time value, and why equal revisions do NOT imply currency. `current` is the honest
+        comparison: a deep structural check of the live entry's projection against this session's frozen copy,
+        therefore false the moment the entry is edited, and false when the entry has been DELETED (a removed
+        harness is never current, which is exactly what a saved session restoring from its own record means).
+        `revision` and `definition_revision` here are the SESSION-keyed `definition` counter - 1 for a session
+        this process created, 0 for one restored from disk after a restart - and are not comparable with
+        `GET /harnesses/{harness_name}`.
         Instruction TEXT is omitted, exactly as on a global definition read; `instruction_summary` gives
-        per-member provenance and length, and the effective text for a member of THIS session is the session
-        agent instruction route, which also accounts for session-level overrides. A later global edit cannot
-        move this resource.
+        per-member provenance and length (a member this conversation invented reports `source: session`), and
+        the effective text for a member of THIS session is the session agent instruction route, which also
+        accounts for session-level overrides. The definition body itself never moves: a later global edit
+        changes only the currency fields and `discovered_tools`, never what this session froze.
       responses:
         '200':
           description: Frozen definition.
@@ -1075,9 +1171,13 @@ paths:
       description: >-
         A server-computed fold of every recorded turn. Honest about unknowns: a provider that never
         reports usage contributes nothing, so `usage` is absent when no turn reported any rather than
-        printed as zero, and `reported_turns` names how many turns carried a tally. `by_thread` totals
-        cost per conversation and is bounded by the session's thread budget; `truncated` states when a
-        deployment with the full thread budget returns the aggregate instead of every row.
+        printed as zero, and `reported_turns` names how many turns carried a tally. A turn with no
+        conversation of its own (a slash command, a legacy run) counts in the totals and in no per-thread row.
+        `by_thread` is UNCAPPED and unpaginated: one row per conversation that reported anything, in
+        first-reported order - the order the fold met each conversation while walking the turns oldest first,
+        so a client cannot assume cost order and must sort itself. `truncated` is therefore a signal, not a
+        cut: it is true only once 256 distinct reporting threads exist (the session's conversation budget) and
+        it never means a row was left out, because none ever is.
       responses:
         '200':
           description: Session usage aggregate.
@@ -1172,12 +1272,18 @@ paths:
         or deleted `thread_id` is 404 before anything mutates.
 
 
-        `references` names prior blocks whose completed content this task wants as context; malformed
-        entries, unknown turn or label ids, and already-failed or cancelled blocks are all 400 before a
-        turn exists. Typed `#LABEL` tokens inside `input` are also resolved server-side, so a client
-        without metadata still works. Validation is complete up front: an oversized body is 413, an
-        unusable media type or a kind that disagrees with its MIME is 415, a full queue is 429, and
-        nothing is mutated by a refusal. Every new thread gets its own execution lane, so two unfocused
+        `references` names prior blocks whose completed content this task wants as context; more than 16 of
+        them is 400, and malformed entries, unknown turn or label ids, and already-failed or cancelled blocks
+        are all 400 before a turn exists. Typed `#LABEL` tokens inside `input` are also resolved server-side, so a client
+        without metadata still works. Validation is complete up front: an oversized body is 413 - this route
+        alone gets the 16 MiB media cap, every other route 1 MB, and a task over 200,000 characters is 413
+        whatever the JSON weighs - an unusable media type or a kind that disagrees with its MIME is 415, and
+        nothing is mutated by a refusal. Two refusals are BACKPRESSURE rather than bad input, so both answer
+        429: the pending-task cap of 100 is counted across EVERY conversation lane at once (a running turn is
+        not in a queue, so one task per lane may execute while 100 wait, and spreading work over more threads
+        cannot bypass the bound), and an unfocused submit that would have to open a new conversation on a
+        session already at its 256-thread budget says so and names the remedy - delete a terminal
+        conversation. Every new thread gets its own execution lane, so two unfocused
         submits run concurrently.
       requestBody:
         required: true
@@ -1372,19 +1478,35 @@ paths:
       summary: Bind a trusted profile into this session
       description: >-
         Creates a SESSION-LOCAL agent. When `name` spells a trusted profile the call binds that profile, so
-        `profile` must name a live global agent and a retired one is 409; when `name` is NOT a catalogue
+        `profile` may be omitted entirely (it defaults to `name`) and must EQUAL `name` when supplied - the
+        roster key is the identity a restart rebuilds the team from, and there is no alias map; a retired
+        profile is 409. When `name` is NOT a catalogue
         profile the call defines a NEW agent for this conversation alone, whose instruction is the `instruction`
-        supplied here (a default identity sentence when it is omitted) and whose model is `model` (the session
-        model when absent). Either way a client cannot supply an implementation, a transport, a tool list, or a
-        provider, which is why no route in this contract can inject agent code. `model` must be a non-empty model
-        id and `instruction` bounded non-empty text; both are recorded on the session and never on the profile,
-        and a session-defined agent is durable in the session record so a restart rebuilds it unchanged. The
-        agent exists in this session only - the global catalogue and every other session are untouched - and it
-        must not collide with an existing roster key (409, including a case-only difference), because a session's
-        agent keys are its delegation and identity namespace. A 65th member is 409 against the 64-binding roster
+        supplied here (a default identity sentence when it is omitted or blank) and whose model is `model` (the session
+        model when it is absent or blank). Either way a client cannot supply an implementation, a transport, a tool list, or a
+        provider, which is why no route in this contract can inject agent code. `model` is recorded on the
+        session and never on the profile - this route states no length bound of its own, while a later
+        session-level `agent_models` patch re-validates the same id at 200 characters - and `instruction` is
+        capped at 8000 characters (a longer string is 400, not 413). A session-defined name must match
+        `^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$` - letters, digits, spaces, `.`, `_` and `-`, starting with a letter or
+        digit, at most 64 characters - because the same string becomes a delegation id, a runtime registry
+        key, an `agent:<name>` conversation id and a durable preset key in one step; a name that fails it is
+        400, and so is `unknown` in any case, which is the placeholder id every surface paints for "no agent
+        at all". A blank name is 400, a non-string `name`, `profile`, `model` or `instruction` is 400, and so
+        is a `role` outside `primary`/`subagent`.
+        The roster is case-INSENSITIVE: a key that only differs in case from an existing member is 409, not a
+        second agent, and an exact collision is 409 as well, because a session's agent keys are its delegation
+        and identity namespace. A 65th member is 409 against the 64-binding roster
         budget. `role: subagent` adds the binding to the primary's delegation allowlist for this session only;
-        `role: primary` re-targets the entry agent of subsequent unfocused submits and is refused with 409 while
-        the session is running. The new agent is immediately addressable by a task that names its thread. The
+        `role: primary` is ALWAYS 409 - the entry agent is structural, decided by the harness definition, so no
+        session write can re-target it while the session is running or while it is idle. The session must be
+        IDLE: any live run or queued work answers 409, because a turn is accepted against the roster it can
+        already see. The harness template also decides: a session built from a SCRIPTED definition or from a
+        preset injected in memory answers 409 here, because that factory replays the shipped team (or cannot
+        rebuild a differing one) and the 201 would be taken back by the next restart - create a live harness to
+        bind agents durably. An override of an existing member is not affected by that rule; only membership
+        is. The new agent is immediately addressable by a task that names its thread, is durable in the session
+        record so a restart rebuilds it unchanged, and touches nothing global. The
         frozen definition is not rewritten: `origin: session` is what distinguishes a local agent from an
         inherited member.
       requestBody:
@@ -1418,8 +1540,6 @@ paths:
                 $ref: '#/components/schemas/SessionAgentResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -1452,14 +1572,29 @@ paths:
       summary: Override one session agent's model or instruction
       description: >-
         Stated per field: an omitted property is no change, a string REPLACES that field, and an explicit
-        `null` clears the session override and RESTORES the inherited binding - for `model` the model it
-        would otherwise run, for `instruction` the harness, global, or catalogue text. That is what makes
+        `null` clears the session override and RESTORES the inherited binding - for `model` the model this
+        session's settings carry, for `instruction` the harness, global, or catalogue text. That is what makes
         an override reversible without rebuilding the session, and the response states the resulting
-        provenance. `{}` and an all-`null` body are both valid, the second clearing every override.
+        provenance. `{}` is a 400 - the route refuses a success that changed nothing - while an all-`null`
+        body is valid and clears every override it names.
+        The two fields have different concurrency rules, because they are different operations: a MODEL change
+        runs through the live brains and is accepted while the session is running (an in-flight request keeps
+        the model it started with and only later requests observe it), while an INSTRUCTION change rewrites a
+        prompt a turn has already been accepted against, so it requires an idle session and answers 409 while
+        any live run OR queued work exists. A retired profile member's instruction is 409 as well - the
+        deployment text it would restore no longer exists - and so is the runtime's own refusal to re-seed the
+        member. Blank or non-string instruction text is 400 (send `null` to restore instead), as is more than
+        8000 characters; a model id is trimmed and must be non-empty and at most 200 characters with no
+        control characters. Neither field is gated by the roster-durability rule that answers 409 on
+        `POST …/agents` and `DELETE …/agents/{id}` for a scripted or in-memory-injected harness template: an
+        override retunes a seed inside the team the record already carries, so the write is accepted on every
+        template - though the template still decides what a restart keeps, and only the instruction route states
+        that per template.
         Writes are session-local and never reach the global catalogue, the harness definition, or another
-        session. Concurrency matches the session patch: accepted while running, an in-flight request keeps
-        the model it started with. Identity, profile, tools, and the delegation graph are immutable here,
-        so only selection-shaped data is writable.
+        session. Identity, profile, tools, and the delegation graph are immutable here,
+        so only selection-shaped data is writable. Each accepted patch bumps this roster's `session_agents`
+        counter, which is the revision the row and the response header carry. Nothing here is capability-gated,
+        so there is no 403.
       requestBody:
         required: true
         content:
@@ -1480,8 +1615,6 @@ paths:
                 $ref: '#/components/schemas/SessionAgentResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -1491,19 +1624,24 @@ paths:
       operationId: deleteSessionAgent
       summary: Remove one session agent binding
       description: >-
-        Precisely what it removes. For a session-created agent (`origin: session`) it removes the agent
-        from THIS session's roster: its default conversation goes with it, it can no longer be targeted or
-        delegated to, and for a session-defined agent its stored instruction goes with it, so a restart does
-        not resurrect it. Already-recorded turns keep the agent name they ran
-        with, because turn records are verbatim history and a delete must not rewrite them. For an
-        inherited member (`origin: definition`) DELETE is 400 stating the alternative: clearing every
-        session override with a `null` patch restores the inherited binding exactly, and an inherited
-        member cannot be removed because its member set is frozen with the session and its delegation
-        allowlist would become unresolvable. Nothing global changes in either case. A conversation still
-        running or queued answers 409, matching thread deletion, so an agent cannot be pulled out from
-        under its own run. And an agent that OWNS a conversation answers 409 naming those conversation ids:
-        a removal never deletes a thread the caller did not name, so delete the conversations first (the
-        roster row's `deletable` flag states the same condition).
+        Precisely what it removes, and it removes BOTH kinds of member. For a session-created agent
+        (`origin: session`) it takes the agent out of THIS session's roster: its default conversation goes with
+        it, it can no longer be targeted or delegated to, and for a session-defined agent its stored base
+        instruction goes with it too, so a restart does not resurrect it. For an INHERITED member
+        (`origin: definition`) the answer is the same 200 - being declared by the frozen definition is not a
+        reason a session cannot drop it: the removal edits this session's own copy of the member set, its
+        delegation allowlist, and its durable preset, so the member is gone from the roster, can no longer be
+        delegated to, and stays gone after a restart, and any session-level model or instruction override for
+        it is discarded with it. There is no 400 for `origin: definition`; clearing overrides with a `null`
+        patch is a different, smaller operation, not a precondition. Already-recorded turns keep the agent name
+        they ran with, because turn records are verbatim history and a delete must not rewrite them. Nothing
+        global changes in either case. Three conditions answer 409 and nothing is removed by any of them: this
+        agent is the session's entry agent (every session needs one - change the harness definition instead),
+        it OWNS a conversation (409 naming those conversation ids, so a removal never deletes a thread the
+        caller did not name - delete the conversations first, and the roster row's `deletable` flag states the
+        same condition), or the session has a live run or queued work. A scripted or in-memory-injected harness
+        template answers 409 here as well, because its factory would put the member back on the next restore
+        and the 200 would not survive a restart.
       responses:
         '200':
           description: Removal receipt.
@@ -1511,8 +1649,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeleteSessionAgentResult'
-        '400':
-          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -1527,13 +1663,21 @@ paths:
       summary: Read one session agent's effective instruction
       description: >-
         The instruction text this agent actually runs with, plus its guidelines and the `source` that
-        supplied the text: `session`, `harness`, `global`, or `catalogue`, resolved in that order. This
-        is the session-scoped answer, so it already accounts for a session override - unlike the global
-        definition's instruction route. A session-defined agent (a name this conversation created that no
-        catalogue profile describes) answers `source: session` with an EMPTY `guidelines` list, because it
-        has no trusted profile to supply any; clearing its override with `PATCH …/agents/{id}` restores the
-        instruction this session created it with. It is the lazy surface behind a "show prompt" affordance: the
-        roster and the session read never carry this text. A recorded conversation's actual system messages
+        supplied the text. The text is read from the LIVE brain - the system messages this member was seeded
+        with - and only falls back to the stored override or the profile when the roster exposes no brain, so
+        the answer is what the next turn sends rather than what some layer once proposed. The provenance is
+        decided in this order: a member this conversation INVENTED (a name no catalogue profile describes)
+        answers `source: session` with an EMPTY `guidelines` list, because it has no trusted profile to supply
+        any; otherwise a session-level instruction override on this conversation is reported as
+        `source: harness` - that is the value the field carries for a session override, and it does not mean
+        the harness DEFINITION wrote the text; then `global`, and only when the live text actually contains the
+        deployment-wide override, because a session created before an operator edit runs the text it was seeded
+        with and calling that "global" would credit a layer this conversation never ran on; everything else is
+        `catalogue`. So `source: session` never labels a profile member's session override - it labels only an
+        agent this conversation invented, whose prompt has no catalogue layer at all. Clearing an override with
+        `PATCH …/agents/{id}` (or the `PATCH` verb on this route) restores whatever this session created the
+        agent with, or the profile text for a profile member. It is the lazy surface behind a "show prompt"
+        affordance: the roster and the session read never carry this text. A recorded conversation's actual system messages
         are a different thing and are served by the turn block detail route of kind `system`.
       responses:
         '200':
@@ -1544,6 +1688,66 @@ paths:
                 $ref: '#/components/schemas/SessionInstructionTextResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Session Agents]
+      operationId: updateSessionAgentInstruction
+      summary: Replace or clear one session agent's instruction
+      description: >-
+        The write verb of the document a client is looking at: the same store operation the binding `PATCH`
+        performs when its body names `instruction`, reached without addressing the binding row, and answered
+        with the SAME document `GET` on this route returns - `source` now naming the layer the session
+        actually runs. A string REPLACES the member's whole system prompt; an explicit `null` clears the
+        session override, which re-seeds a profile member from the deployment's CURRENT effective profile text
+        (global layer first, shipped catalogue second) and restores the base instruction for an agent this
+        conversation invented. The value is trimmed, and blank or non-string text is a 400 that states the
+        `null` remedy rather than quietly clearing; more than 8000 characters is a 400 too, so the only undo
+        of an oversized prompt is `null`, not a longer string. Only `instruction` is writable here: role,
+        model, profile, and tools stay on the binding row. This route bumps the `session_agents` counter, and
+        the roster row's `instruction_chars` and `has_instruction_override` move with it.
+        It is deliberately NOT gated by the roster-durability rule that answers 409 on `POST …/agents` and
+        `DELETE …/agents/{id}` for a scripted or in-memory-injected harness template: an override retunes a seed
+        inside the team the record already carries, so the write is accepted on every template. Whether it then
+        survives a restart is the template's answer, not this route's promise: a `live` or `flaky` session
+        rebuilds from its own saved team, so the text comes back exactly as written; a `scripted` session replays
+        the shipped factory, which ignores the saved team, so the override is live immediately and reverts to the
+        shipped prompt at the next restart; and a template-less (injected) preset restores only while its registry
+        entry still matches the saved record, which a fresh override by definition changes - such a session is
+        dropped at restore with a named error rather than quietly repainted. What DOES answer 409 here is the idle
+        gate - a live run or any queued work in this session,
+        because a turn has already been accepted against the current prompts - and a retired profile member,
+        whose deployment text no longer exists to restore. One override moves only this member's leading system
+        block: the member's committed turns and every other member's transcript are untouched, and nothing here
+        reaches the global catalogue or the harness definition.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSessionAgentInstructionRequest'
+            examples:
+              replace:
+                summary: Make this member's whole prompt
+                value:
+                  instruction: You audit diffs. Report only what changed and what it breaks.
+              restore:
+                summary: Clear the session override
+                value:
+                  instruction: null
+      responses:
+        '200':
+          description: The instruction document, as `GET` on this route answers it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionInstructionTextResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
   /v1/harness/sessions/{session_id}/tools:
     parameters:
       - $ref: '#/components/parameters/SessionId'
@@ -1552,12 +1756,16 @@ paths:
       operationId: listSessionTools
       summary: List this session's toolbox
       description: >-
-        The union the model actually sees: declared catalogue entries, the tools `toolRequest` enabled
-        (in discovery order), and tools created at runtime. Each row is the catalogue projection plus the
-        live session facts the catalogue cannot state: `declared` (this turn's run declares it), `enabled`
+        Every entry this session's live registry holds: what the frozen definition declares, what
+        `toolRequest` has enabled (in registry order), and what this session created at runtime - which is a
+        wider set than what the model can call right now, and the row says which is which. Each row is the
+        catalogue projection plus the
+        live session facts the catalogue cannot state: `declared` (the frozen definition declares it), `enabled`
         (callable here), `origin` (`catalogue`, `discovered`, or `created`), `protected`, whether an
         editable source revision exists, and the created-tool budget. Rows omit the argument JSON Schema
-        and the source text; the identified read adds the schema, the source route adds the code.
+        and the source text; the identified read adds the schema, the source route adds the code. The `enabled`
+        and `origin` filters narrow the page, never the row shape, and the page carries the collection's
+        `session_tools` revision beside the budget so a client can order a read against a stream frame.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -1591,20 +1799,28 @@ paths:
       summary: Register a session-local tool
       description: >-
         Declarative tool creation, the same capability the model already uses through `toolCreate`.
-        `name` must match the registry-safe name pattern, `description` is bounded text, `tags` are
-        REQUIRED because an untagged tool could never be discovered, and `parameters` is a JSON Schema
-        bounded in depth (12), node count (256), and serialised size (16,384 bytes). Registration
+        `name` must match the registry-safe name pattern `^[A-Za-z][A-Za-z0-9_-]{0,63}$` - one letter, then
+        letters, digits, `_` or `-`, at most 64 characters, upper case allowed anywhere a letter may
+        stand - `description` is bounded text (at most 2000 characters), `tags` are
+        REQUIRED because an untagged tool could never be discovered (1 to 16 entries, each a non-empty string
+        of at most 64 characters), and `parameters` is a JSON Schema
+        bounded in depth (12), node count (256), and serialised size (16,384 bytes). A field that breaks one of
+        these rules is a 400 that names it, before anything is registered. Registration
         compiles a candidate and NEVER runs it, so creating a tool has no side effect until a call.
-        TRUST: an optional function body or module text is compiled with the host realm's `Function`
-        constructor and runs with the process's own permissions - there is no sandbox and no isolation,
-        the same model as the `shell` tool - so submitting code is a capability grant and a deployment
-        that does not grant it answers 403 here. A name this session already resolves is 409 unless the
-        body sets `replace: true`, and a `protected` harness-owned name is 403 even with `replace`,
-        because replacing the tools a session runs on would break that session's own control plane. A
-        replacement does not consume the created-tool budget; a creation stops at it (409, with
-        `budget` in the receipt stating used and limit). A created tool is registered searchable and
-        enabled at once, so the next turn can call it without a discovery round. The whole effect is
-        confined to this session.
+        TRUST: an optional function body (at most 20,000 characters) or module text is compiled with the host
+        realm's `Function` constructor and runs with the process's own permissions - there is no sandbox and no
+        isolation, the same model as the `shell` tool - so submitting code is a capability grant this deployment
+        simply accepts: no 403 gates source submission here, and the only 403 this route can answer is a body
+        that sets `replace`. A name this session already resolves is NOT a 409: the POST answers 201 anyway,
+        with the receipt saying `created: false, replaced: true` because the previous registration was
+        atomically replaced, and a `protected` name is not refused either - a create may shadow the control
+        plane, it is the PATCH and DELETE routes that will not touch it. Creation stops at the created-tool
+        budget (32 by default, shown as `budget` in the receipt) and that refusal is a 400 carrying the
+        runtime's own advice to reuse an existing tool, not a 409; a replacement of a name this session already
+        holds does not consume the budget. A created tool is registered searchable and
+        enabled at once, so the next turn can call it without a discovery round, and it needs no idle session:
+        unlike an enable/disable or an unregister, a registration is accepted while the session is running. The
+        whole effect is confined to this session - the shared catalogue is never mutated.
       requestBody:
         required: true
         content:
@@ -1627,7 +1843,9 @@ paths:
                   source: 'return { words: String(args.path).split(/\s+/).length };'
       responses:
         '201':
-          description: Registered session tool.
+          description: >-
+            Registered session tool - the same answer whether the name was new (`created: true`) or this
+            session already resolved it (`created: false, replaced: true`).
           content:
             application/json:
               schema:
@@ -1638,8 +1856,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
   /v1/harness/sessions/{session_id}/tools/{tool_id}:
@@ -1669,13 +1885,28 @@ paths:
       summary: Edit or re-enable one session tool
       description: >-
         An omitted property is no change and a supplied value REPLACES the whole field (arrays and schemas
-        are replaced, never merged); at least one property is required, so `{}` is a 400 no-op. Metadata
-        and gate changes do not mint a source revision. Supplying `source` or `module_text` goes through
+        are replaced, never merged); at least one property is required, so `{}` is a 400. `replace` is
+        accepted and IGNORED on this route: a source write here always replaces, so the field changes nothing
+        and its POST-only meaning (403 for an atomic replace-on-create) does not apply.
+        Metadata and gate changes do not mint a source revision. Supplying `source` or `module_text` goes through
         the registration kernel and publishes a NEW revision atomically, and a compile failure is 400 with
-        the previous revision still callable - a broken edit can never take a live tool down. `enabled`
-        is the reversible gate: `false` withdraws the tool from this session's callable set without losing
-        anything, `true` restores the inherited binding exactly. A `protected` entry refuses every PATCH
-        with 403, because disabling the tools a session runs on is not a user-level edit. Writes are
+        the previous revision still callable - a broken edit can never take a live tool down. A patch that
+        names only metadata (description, tags, visibility, parameters) is not a no-op either: it re-publishes
+        the INSTALLED source revision with the new declaration, so the edit lands as one more revision of the
+        same code; a name with NO captured source revision at all - a tool registered from an already-built
+        definition, which is every built-in - has nothing to re-publish and is refused with 403 instead of
+        silently doing nothing. `enabled`
+        is the discovery gate: `false` withdraws the tool from this session's callable set without losing
+        anything, and `true` switches that same live slot back on - it does not restore an inherited binding,
+        because a removal in this API never hands back a superseded revision. Concurrency is per verb, not per
+        route: the `enabled` gate and an unregister mutate the LIVE harness and so require an IDLE session
+        (409 naming the lanes that are running, since in worker mode a replica would disagree with what a run
+        in flight executes), while a source or metadata registration is accepted while the session runs. A patch
+        that names BOTH is checked in that order, after the source has already been published, so such a 409
+        can arrive with the new revision installed and the gate unchanged. A `protected` entry splits the same
+        way: an `enabled`-only patch is 403 - disabling the tools a session runs on is not a user-level edit -
+        while a source patch is accepted, because replacing an implementation is a different privilege from
+        switching the control plane off. Writes are
         session-local and never change the global catalogue.
       requestBody:
         required: true
@@ -1710,12 +1941,22 @@ paths:
       operationId: deleteSessionTool
       summary: Remove one session tool registration
       description: >-
-        What it actually does, stated in the receipt, because removal has two different outcomes:
-        deleting a name that this session OVERRODE restores the inherited catalogue binding
-        (`restored_inherited: true`), while deleting a name created in this session removes it until it is
-        created again (`removed_created: true`). An inherited entry with no session-local registration has
-        nothing to remove and answers 400, and a `protected` harness-owned entry answers 403 - the control
-        plane is not deletable. Nothing global is touched either way.
+        What it actually does, stated in the receipt, because removal has two different meanings here and only
+        one of them is a restore. Deleting a name this session CREATED removes it until it is created again
+        (`removed_created: true`): the runtime drops the implementation, the captured source revision, the
+        owning-path association, the created-tool record, and the enabled slot in one step, and the session
+        document is committed at once, so a restart does not resurrect it. Deleting a name the session merely
+        DISCOVERED (enabled through `toolRequest`, never registered locally) takes away the grant and leaves
+        the catalogue entry itself alone. `restored_inherited` is ALWAYS false, and not because the route forgot
+        to set it: the kernel retains only the INSTALLED revision of a name - it reports a replaced revision's
+        identity but never keeps its bytes - so after an override there is no second copy to hand back, and a
+        deletion states that instead of letting a client infer a restore that did not happen. Two refusals stay
+        distinct because they mean different things: a `protected` entry (a harness-owned control tool, or a name
+        this session's frozen definition declares) is 403 - the control plane is not deletable - while an
+        inherited name with NO session-local registration and an origin that is not `discovered` is 400,
+        because there is nothing here to remove. Like the gate, an unregister mutates the live harness and so
+        requires an IDLE session: 409 while a run or a conversation lane is active, checked after the 403 and
+        400 guards. Nothing global is touched either way.
       responses:
         '200':
           description: Removal receipt.
@@ -1814,11 +2055,15 @@ paths:
       operationId: listSessionThreads
       summary: List this session's conversations
       description: >-
-        A page of conversation rows in creation order: identity, owning agent, origin (`agent` for an
-        agent's default conversation, `host` for an additional one), status, label, the parent thread for
-        a delegated child, reference edges, and transcript SIGNALS only (`message_count`, `chars`,
-        `has_transcript`, a preview of at most 280 characters). Rows carry NO messages, NO tool results, and
-        NO invocation roster - a long transcript costs nothing in this list. A conversation whose stored
+        A page of conversation rows in creation order (the record's monotonic per-session sequence, which a
+        later write never renumbers): identity, owning agent, origin, status, label, the parent thread for a
+        delegated child, reference edges, and transcript SIGNALS only (`message_count`, `chars`,
+        `has_transcript`). Only INDEPENDENT conversations are rows: an agent's default `agent:<name>`
+        conversation is implicit and is never listed, even though the row schema carries that origin for the
+        stream projections that do use it. Rows carry NO messages, NO tool results, NO invocation roster, and
+        NO `preview` - a long transcript costs nothing in this list, and the last-entry preview the
+        `ThreadSummary` schema declares is projected ONLY into a stream `thread.upsert` row, bounded at 160
+        characters there. A conversation whose stored
         transcript this build could not read is a row with `transcript_state: unreadable` plus the refusal
         reason, so one hand-broken transcript never costs the user the rest of the session.
       parameters:
@@ -1827,17 +2072,23 @@ paths:
         - name: agent
           in: query
           required: false
-          description: Exact agent name to filter by.
+          description: >-
+            Exact agent name to filter by, compared against the row's `agent` with no folding and no
+            existence check, so a name this session does not have is simply an empty page. The value is not
+            validated and no pattern gates it: the comparison is a literal string match, so a value outside
+            the alphabet a roster key may hold simply matches nothing instead of answering 400.
           schema:
             type: string
-            pattern: '^[a-z][a-z0-9_-]*$'
         - name: status
           in: query
           required: false
-          description: Filter conversations by lifecycle state.
+          description: >-
+            Filter conversations by lifecycle state. Only three values are filterable: `paused` is a state a
+            record can hold (and a row can report) but the filter refuses it with 400, so a paused
+            conversation is reachable only through the unfiltered list or `status=idle`-style polling.
           schema:
             type: string
-            enum: [idle, running, paused, stopped]
+            enum: [idle, running, stopped]
       responses:
         '200':
           description: Page of conversation rows.
@@ -1856,10 +2107,19 @@ paths:
       description: >-
         Opens a persistent host conversation for one member agent of this session's frozen definition.
         Nothing runs until a task names the returned thread, so creating a thread is free and lets a client
-        set up parallel work lanes. `agent` must be a member (400 otherwise); `owner_thread_id` must name an
-        existing HOST thread, because an agent's default conversation is implicit and is never persisted as
-        a record that could be restored as an owner. A session at its 256-thread budget answers 409 naming
-        the budget. The label is display-only: it grants no authority and is not an identifier.
+        set up parallel work lanes. `agent` must be a member (400 otherwise, naming the id);
+        `owner_thread_id` must name an EXISTING thread or the call is 404 before anything is attempted, and it
+        must be an independent HOST thread, because an agent's default conversation is implicit and is never
+        persisted as a record that could be restored as an owner.
+        What happens after the route's own checks is decided by the runtime, and this route hands the runtime's
+        refusal straight to the caller: an owner that exists but is not a host thread, a session at its
+        256-conversation budget, and a label that is blank, not a string, or longer than 120 characters are all
+        UNCLASSIFIED runtime failures and therefore answer 500 with the runtime's message. That is a real
+        asymmetry worth planning around, not a transient fault: the same capacity limit is a retryable 429 when
+        an unfocused SUBMIT opens the thread (the store maps it), and the same label rules are a 400 wherever
+        the store validates the body, so a 500 on this route generally means fix the request, not retry it. A
+        body over 1 MB is 413, and a session at the budget keeps answering 500 until a terminal conversation is
+        deleted. The label is display-only: it grants no authority and is not an identifier.
       requestBody:
         required: true
         content:
@@ -1877,8 +2137,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
   /v1/harness/sessions/{session_id}/threads/{thread_id}:
     parameters:
       - $ref: '#/components/parameters/SessionId'
@@ -1888,12 +2150,16 @@ paths:
       operationId: getSessionThread
       summary: Read one conversation's metadata
       description: >-
-        The full row for one conversation: everything the list projects plus the invocation roster
+        The full row for one conversation: everything the list projects - still without `preview`, which only a
+        stream `thread.upsert` row carries - plus the invocation roster
         (`invocation_ids`, oldest first - the join key to invocation cards inside turn events), the result
         blocks this conversation consumes, its connected conversations, and transcript metadata with its
-        `revision`. Still no messages: those are the transcript routes. `invocation_ids` is bounded by the
-        session's recorded-work budget and is truncated with an explicit `invocation_ids_truncated` flag
-        rather than silently.
+        `revision` and measured `transcript_bytes`. Still no messages: those are the transcript routes.
+        `invocation_ids` holds at most 64 entries and keeps the OLDEST 64 - it stops after 64 rather than
+        trimming from the front - so on a conversation with more recorded work than that the NEWEST ids are the
+        ones missing, which is why `invocation_id` and `origin_invocation_id` are published separately: they
+        stay accurate whatever the roster dropped. `invocation_ids_truncated` is true whenever 64 ids were
+        recorded, so a client never reads a cut list as the whole history.
       responses:
         '200':
           description: Conversation metadata.
@@ -1938,9 +2204,19 @@ paths:
         Aborts this conversation's live run and drops its queued continuations without touching any other
         conversation, so a focused Stop button stops exactly what the user is looking at. A delegated child
         is not cascaded: stopping a parent neither aborts nor purges a child that merely REFERENCES it,
-        because a reference is an edge and not ownership - only `owner_thread_id` lineage is honoured. The
+        because a reference is an edge and not ownership - only `owner_thread_id` lineage is honoured, and a
+        conversation this one owns IS stopped and its backlog discarded. The
         thread is left `stopped`, which an explicit later submit to this thread revives.
-        `cancelled: false` is a success: the conversation was idle with no work, so it was marked stopped.
+        Read the receipt as a report about the CALL, not about what was running: `cancelled` is always true,
+        because this route discards the store's computed "did a live run actually abort" and answers with the
+        fact that the stop was performed - an idle conversation with no work at all still gets `cancelled: true`
+        alongside `status: stopped`, so `false` is a value that never appears here. `dropped_queued_tasks`
+        counts only the named conversation's own lane backlog, measured before the stop began: a descendant's
+        backlog and any session-level (legacy) queue this stop also drains are real drops that the number
+        leaves out, so treat it as a floor rather than a total. The refusal surface is 400 and 404 only: an
+        unknown session or an unknown conversation is 404, and a stop the runtime itself rejects is a 400 that
+        quotes the runtime's message. Nothing raises 409 here - stopping a RUNNING conversation is exactly what
+        this route is for, and an idle one is a 200 rather than a conflict.
       responses:
         '200':
           description: Stop outcome.
@@ -1952,8 +2228,6 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
   /v1/harness/sessions/{session_id}/threads/{thread_id}/transcript:
     parameters:
       - $ref: '#/components/parameters/SessionId'
@@ -1990,7 +2264,11 @@ paths:
         the server persists what it was given, keeps the conversation's LIVE transcript a valid placeholder,
         and answers `accepted_as: raw` with the structured `invalid` explanation - so an invalid draft is
         always stored and always explained, and an invalid transcript is never installed into the model's
-        context. A running or queued conversation answers 409, so an edit cannot land mid-run. `if_revision` is the
+        context. A RUNNING conversation answers 409 - its record says `running`, or its lane still holds an
+        active run - so an edit cannot land mid-run, and a harness whose session cannot carry transcripts at
+        all is refused the same way. A conversation with work merely QUEUED is NOT refused: the write lands
+        while the backlog waits, and those queued turns then read the transcript this call installed, which is
+        the honest ordering rather than a lock on an accepted-but-unstarted task. `if_revision` is the
         ONE optimistic lock in this API: supply the revision the document was edited from, and a mismatch is 409
         naming the current revision with nothing written - the general rule elsewhere is last-write-wins with no
         precondition, because no other resource is edited as a whole human-authored document. The receipt
@@ -2037,7 +2315,8 @@ paths:
         the first entry to return, so a client can jump to an end (`cursor` past the last entry answers an
         empty page plus `total`) or stream forward from a known point without re-reading. Every entry is a
         verbatim `HarnessMessage` in the shape the harness manipulates, and a tool entry may carry tool
-        result text up to the model-facing 65,536-byte bound - which is exactly why this is a paged route.
+        result text up to the model-facing 262,144-byte bound (256 KiB per result) - which is exactly why this
+        is a paged route.
         An unreadable transcript answers a valid placeholder list plus `transcript_state: unreadable`; the
         broken stored value is on the document route, never here.
       parameters:
@@ -2203,7 +2482,8 @@ paths:
         at, matching the `(turnId, index)` locator of `src/server/journal.ts`, so an index seen in a step
         detail or a context block resolves here and to nothing else. Each item pairs the event with its
         `index` and its `at` from `eventTimes`, keeping the two parallel arrays addressable without a
-        client re-pairing them. A running turn answers the events recorded SO FAR plus `partial: true`, and
+        client re-pairing them. A turn that is still `queued` or `running` answers the events recorded SO FAR
+        plus `partial: true`, and
         a later page continues from `next_cursor`.
       parameters:
         - $ref: '#/components/parameters/Limit'
@@ -2213,9 +2493,13 @@ paths:
           required: false
           description: >-
             Filter to one event type (`tool_result` alone, for example). The filter applies to the page and
-            `next_cursor` still addresses the unfiltered ordinal space.
+            `next_cursor` still addresses the unfiltered ordinal space. The value is NOT validated against the
+            event-type vocabulary: it is trimmed and compared literally, so a misspelled or unknown type is an
+            empty page with `total_events: 0` rather than a 400, and an over-long value simply matches nothing
+            (64 characters covers every type this build records). An empty or whitespace-only value counts as
+            no filter at all.
           schema:
-            $ref: '#/components/schemas/HarnessEventType'
+            type: string
       responses:
         '200':
           description: Page of recorded events.
@@ -2400,7 +2684,7 @@ paths:
         build-specific scope outside the fixed `WsSubscriptionScope` enum.
 
 
-        HEARTBEAT, BACKPRESSURE, AND LIMITS. All numbers are the target contract's, stated in `x-websocket` and
+        HEARTBEAT, BACKPRESSURE, AND LIMITS. All numbers are this build's, stated in `x-websocket` and
         handed to the client in `welcome.limits` (`WsStreamLimits`), so a client reads them from the connection it
         is on instead of assuming them, and no prose number differs from a schema number. `x-websocket` classifies
         which of them a deployment may retune and which are fixed by the contract.
@@ -2596,7 +2880,7 @@ paths:
             When a connection's send queue is full the server drops the OLDEST droppable `update` frames per
             subscription, oldest first, never a `welcome`, `subscription_state`, `resync_required`, `error`,
             `heartbeat`, or `pong`, and never a frame that would leave a display op stream half-applied inside
-            one frame. It then emits `resync_required{ reason: backpressure }` for each affected subscription,
+            one frame. It then emits `resync_required{ reason: frames_dropped }` for each affected subscription,
             so loss is always explicit and always recoverable by a bounded read.
           sustained_stall_ms: 10000
           sustained_stall_close_code: 1013
@@ -2976,32 +3260,41 @@ components:
       in: path
       required: true
       description: >-
-        Harness definition name. Identity only, so it is immutable on PATCH. A deleted name is absent and
-        stays absent, so it resolves 404 rather than to a tombstone.
+        Harness definition name: one letter, then letters, digits, `_` or `-`, at most 64 characters in
+        total - the registry's own rule, so an uppercase first letter is legal and a leading digit is not.
+        Identity only, so it is immutable on PATCH, and a lookup is DIRECT: a legacy alias such as `writer`
+        resolves on session creation but is 404 on PATCH and DELETE. A deleted name is absent and stays
+        absent, so it resolves 404 rather than to a tombstone.
       schema:
         type: string
-        pattern: '^[a-z][a-z0-9_-]*$'
+        pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
     AgentId:
       name: agent_id
       in: path
       required: true
       description: >-
         Agent name in the relevant scope: a trusted catalogue profile at the global level, a session roster
-        key at the session level. Names are unique within their scope and there is no cross-scope fallback
-        in either direction.
+        key at the session level. A session roster key may be one THIS conversation invented, so the pattern
+        admits upper-case letters, digits, a leading digit, spaces, `.` and `-` (the same rule
+        `POST /sessions/{session_id}/agents` applies to a session-defined name); catalogue profile ids are
+        the lower-case subset of it, and `GET /agents` lists exactly those. Names are unique within their
+        scope and there is no cross-scope fallback in either direction.
       schema:
         type: string
-        pattern: '^[a-z][a-z0-9_-]*$'
+        pattern: '^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$'
     ToolId:
       name: tool_id
       in: path
       required: true
       description: >-
         Tool wire name: the name the model calls and the registry key, matched case-sensitively and unique
-        within its registry.
+        within its registry. One letter, then letters, digits, `_` or `-`, at most 64 characters - the
+        registry's own rule (`^[A-Za-z][A-Za-z0-9_-]{0,63}$`), so a name this session CREATED may start with
+        an upper-case letter or contain one. Catalogue tool names are the all-lower-case subset of that
+        alphabet.
       schema:
         type: string
-        pattern: '^[a-z][a-z0-9_-]*$'
+        pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
     PluginId:
       name: plugin_id
       in: path
@@ -3018,9 +3311,14 @@ components:
       in: query
       required: false
       description: >-
-        Entries per page. The same default and maximum apply to every paginated route in this contract, so
-        a client writes one paging helper. A page that returns exactly `limit` items always carries
-        `next_cursor` (possibly to an empty page), which is how the end is detected without a total.
+        Entries per page, 1 to 100, default 25. The same bounds apply to every paginated route in this
+        contract, so a client writes one paging helper, and a value outside the range (including 0) is a
+        400 naming the parameter. The end of a collection is `next_cursor: null`. A page that returned
+        exactly `limit` rows does NOT always carry a cursor: these collections know their own total, so a
+        full page that also reached that total ends the walk with `next_cursor: null`. The `limit` a
+        response reports is the number of rows that page actually carries, not the size that was asked
+        for, which is how a client sees a short final page and a page read past the end (0 rows, null
+        cursor) without comparing against its own request.
       schema:
         type: integer
         minimum: 1
@@ -3031,9 +3329,12 @@ components:
       in: query
       required: false
       description: >-
-        Opaque position token issued by the route that accepts it (a collection revision plus an ordering
-        key, or an event or message ordinal). A client never decodes one; an unrecognised or stale cursor
-        answers 400 naming the parameter, and the client restarts from the first page.
+        Opaque position token issued by the route that accepts it. Its shape is
+        `base64url(epoch + '.' + served ordinal)` - this process's epoch plus the number of entries
+        already served - and it is server-private: a client never decodes one and never builds one. The
+        epoch half is what makes staleness decidable, so a token carried across a restart, a foreign
+        token, or a malformed one is a 400 naming the parameter, after which the client restarts from
+        the first page rather than silently looping.
       schema:
         type: string
         maxLength: 256
@@ -3055,13 +3356,22 @@ components:
             stale-cursor:
               value:
                 error:
-                  message: 'cursor is not a valid position token for this collection; start from the first page.'
+                  message: 'Query parameter "cursor" is stale or foreign; restart from the first page.'
     Forbidden:
       description: >-
-        The request is well formed but the operation is not permitted in this deployment or scope: a
-        protected harness-owned tool was replaced, edited, disabled, or removed; executable tool source was
-        submitted to a deployment that did not grant that operator capability; or a global write was refused
-        because the host runs its catalogue and configuration read-only. This status is always a POLICY
+        The request is well formed and this server refuses it as a matter of policy. The complete set of
+        403s this build answers is short and enumerable: `replace: true` on a session-tool POST; a
+        metadata-only PATCH over a tool with no captured source revision; the enable/disable PATCH or a
+        DELETE over a PROTECTED session tool (one of the harness core names, or any name the session's
+        frozen harness definition declares - a PATCH that installs NEW source over such a name is
+        accepted, because replacing an implementation is not the same act as detaching it); a global
+        execution of a `session_bound` catalogue entry, which has no standalone implementation;
+        `GET /stream` on a deployment that advertises `capabilities.websocket_stream: false`; and the
+        host's browser-Origin gate, which refuses a cross-origin request or a cross-origin stream
+        upgrade before any route runs. No other capability flag produces this status - the other eight
+        advertised capabilities change no answer at all - and no global resource is read-only, so no
+        harness, agent, config, plugin, or model ROUTE refuses on its own; the only 403 those paths can
+        carry is the host's Origin gate answering before the route runs. This status is always a POLICY
         outcome, never an authentication outcome: there is no credential to send, no `WWW-Authenticate`
         header, and no security scheme in this contract. The host's Origin check and its client-hint header
         are neither an identity nor a secret.
@@ -3073,11 +3383,21 @@ components:
             protected-tool:
               value:
                 error:
-                  message: 'toolCreate is a protected harness tool and cannot be replaced or removed.'
-            code-grant:
+                  message: 'Tool "task" is harness-owned in session "01JD4K3R8M"; a protected entry cannot be unregistered.'
+            replace-on-create:
               value:
                 error:
-                  message: 'This deployment does not allow submitting tool source over HTTP.'
+                  message: 'POST /v1/harness/sessions/01JD4K3R8M/tools with "replace" is not available: this deployment does not support an atomic replace-on-create registration.'
+            session-bound:
+              value:
+                error:
+                  message: >-
+                    Tool "toolRequest" runs inside a session; call it through
+                    /v1/harness/sessions/{session_id}/tools/toolRequest/executions.
+            cross-origin:
+              value:
+                error:
+                  message: Cross-origin requests are not allowed.
     NotFound:
       description: >-
         No resource with that identity exists in the addressed scope. A nested route answers 404 when either
@@ -3103,12 +3423,21 @@ components:
                   message: Use GET, PATCH or DELETE for /v1/harness/sessions/:session_id.
     Conflict:
       description: >-
-        The resource state refuses the operation, and the operation is safe to retry once that state changes.
-        Every conflict here is a concurrency or lifecycle guard rather than a validation error: a session is
-        busy or has queued work (reset, transcript write, manual tool call), a conversation is running or
-        queued (delete, agent removal), a name collides with an existing registry entry, a tool is
-        unconfigured, the created-tool or thread-record budget is reached, a definition still references an
-        agent, or an action was already answered or has expired.
+        The resource state refuses the operation, and the operation is safe to retry once that state
+        changes. Every conflict here is a concurrency or lifecycle guard rather than a validation error,
+        and the set this build actually answers includes: a session roster collision (the name is already
+        a member), a case-clash with an existing member, or the 64-binding roster budget; selecting a
+        RETIRED agent profile - as a harness member, as a session binding, or as a session instruction
+        edit; a session-agent write on a harness whose entry is scripted or was injected in memory, where
+        the change could not survive a restart; removing the entry agent, or an agent that still owns
+        conversations; deleting or steering a conversation that still has live work; a tool or agent write
+        that needs the session idle while a run or queued work holds it; a busy session being reset; a
+        transcript write whose `if_revision` is stale or whose session has no replaceable transcript; and
+        an action request that was already answered or has expired. Two things are NOT conflicts in this
+        build, whatever an older draft promised: an unconfigured tool is a 200 carrying `ok: false`, and
+        retiring an agent that definitions still reference succeeds with 200. A tool registration past
+        the created-tool budget is a 400, and a thread write past the thread budget is a 429 or a 500
+        depending on the route.
       content:
         application/json:
           schema:
@@ -3117,7 +3446,17 @@ components:
             reset-busy:
               value:
                 error:
-                  message: A running or queued session cannot be reset; cancel it first.
+                  message: Cancel the running task before resetting the session.
+            roster-member:
+              value:
+                error:
+                  message: 'Agent "researcher" is already a member of session "01JD4K3R8M".'
+            retired-agent:
+              value:
+                error:
+                  message: >-
+                    Agent "summarizer" is retired and can no longer be selected. Existing harnesses and
+                    sessions that already select it are unaffected.
     PayloadTooLarge:
       description: >-
         The body exceeds the route's declared byte budget: 1,000,000 bytes for an ordinary request, or
@@ -3140,17 +3479,41 @@ components:
             $ref: '#/components/schemas/ErrorBody'
     TooManyRequests:
       description: >-
-        A bounded budget is full. On a task submit it means the session already holds 100 pending tasks - the
-        active turn is not counted - so the caller must wait for a slot rather than assume its work was
-        accepted. The same status covers a client that submits faster than the stream's advertised rate.
+        A bounded budget is full. On a task submit it means the session already holds 100 pending tasks -
+        the active turn is not counted - so the caller must wait for a slot rather than assume its work
+        was accepted. A submit that has to OPEN a conversation for an unfocused task also answers 429 when
+        the session already holds the 256 thread records, because that route classifies the runtime's
+        capacity refusal as retryable; the same condition on `POST /sessions/{session_id}/threads` is not
+        classified and answers 500 instead, which is the one place the two routes disagree about the same
+        full budget. Both caps are HTTP-side only. Stream rate pressure never answers this status: the
+        connection is already open, so an over-fast client gets a `WsProtocolError{ code: rate_limited }`
+        frame and close 4429 instead.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorBody'
+          examples:
+            pending-full:
+              value:
+                error:
+                  message: A session cannot queue more than 100 pending tasks.
+            threads-full:
+              value:
+                error:
+                  message: >-
+                    Could not open a new thread: This session already has 256 independent threads; delete a
+                    terminal one before creating another (maximum 256).
     InternalError:
       description: >-
-        The server failed to complete an operation it accepted. The message is the serialised failure, never
-        a stack trace, and an accepted submit that fails this way keeps its turn record with status `error`.
+        The server failed to complete an operation it accepted. The message is the serialised failure,
+        never a stack trace, and an accepted submit that fails this way keeps its turn record with status
+        `error`. This status is ALSO what an unclassified runtime refusal becomes: `POST
+        /sessions/{session_id}/threads` calls the runtime directly, so a capacity refusal (the session
+        already holds 256 independent threads) or an `owner_thread_id` the runtime will not accept (an
+        agent's own default thread cannot own another conversation) reaches the client as 500 carrying the
+        runtime's sentence, where the equivalent task submit answers 429. A client that must handle both
+        routes therefore treats 500 on that thread create as a possible budget or lineage refusal rather
+        than as a server fault to retry blindly.
       content:
         application/json:
           schema:
@@ -3187,14 +3550,22 @@ components:
       properties:
         limit:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 100
-          description: The page size actually applied (the request's `limit`, or 25 when omitted).
+          description: >-
+            The number of rows THIS page carries, which is the effective page size: a short final page
+            reports its own length, and a page read past the end carries zero rows. It is never the
+            requested size echoed back, so a client detects the end from this field and from
+            `next_cursor` without comparing against what it asked for.
         next_cursor:
           type: string
           nullable: true
           maxLength: 256
-          description: Opaque position for the following page, or null when this page is the last one.
+          description: >-
+            Opaque position for the following page (this page's served ordinal), or null when there is no
+            following page - which includes the case where this page filled `limit` AND completed the
+            collection, because the server knows these collections' totals and does not advertise an empty
+            page after the last real one.
         observed_at:
           type: integer
           description: Epoch milliseconds at which the page was assembled.
@@ -3245,9 +3616,16 @@ components:
     ServiceCapabilities:
       type: object
       description: >-
-        What THIS deployment offers, stated as booleans so a client hides an affordance instead of discovering
-        a 403 or a 404 by clicking it. Every capability here maps onto real routes; a false value means the
-        routes exist and answer 403 (policy) or 404 (not applicable), not that a different path exists.
+        What THIS deployment offers, stated as booleans so a client hides an affordance instead of
+        discovering it by clicking. This is an ADVERTISEMENT, not a switch: with one exception no route
+        consults one of these flags, so no value here changes a status code. The exception is
+        `websocket_stream`, which the stream route does read and refuses with 403 when it is false. The
+        other eight describe work this build has already decided it performs: the shipped advertisement is
+        all-true, a deployment may withhold a flag through its start options, and in either case no route
+        consults the flag - so a client uses them to choose which affordances to show and never to
+        explain a refusal. A false value would mean
+        the routes still exist and behave as this document describes them, not that a different path
+        exists.
       required:
         - websocket_stream
         - tool_execution
@@ -3262,41 +3640,61 @@ components:
       properties:
         websocket_stream:
           type: boolean
-          description: Whether `GET /v1/harness/stream` completes an upgrade.
+          description: >-
+            Whether `GET /v1/harness/stream` completes an upgrade. THE ONE ENFORCED FLAG: the stream route
+            reads this value and answers 403 when it is false, which is the only capability in this
+            object that can change an answer.
         tool_execution:
           type: boolean
-          description: Whether manual tool execution routes are enabled at all.
+          description: >-
+            Whether manual tool execution routes are enabled at all. NOT ENFORCED by any route in this
+            build: the execution routes answer as documented whatever this says, and an entry that
+            cannot run says so in its own `execution` block.
         tool_registration:
           type: boolean
           description: >-
-            Whether a session tool may be created or edited over HTTP. False means executable source is not
-            accepted anywhere: those writes answer 403 and the toolbox stays read-only.
+            Whether a session tool may be created or edited over HTTP. NOT ENFORCED by any route in this
+            build: source submission is always accepted, and the only refusals on those routes are the
+            policy refusals the `Forbidden` response enumerates.
         transcript_editing:
           type: boolean
-          description: Whether the whole-document transcript PUT is enabled.
+          description: >-
+            Whether the whole-document transcript PUT is enabled. NOT ENFORCED by any route in this
+            build; the route answers as documented and refuses on session state, not on this flag.
         command_dispatch:
           type: boolean
           description: >-
-            Whether a `/`-prefixed submit is executed by the in-process command registry rather than sent to a
-            model.
+            Whether a `/`-prefixed submit is executed by the in-process command registry rather than sent
+            to a model. NOT ENFORCED by any route in this build; the submit path consults the session's
+            own command registry.
         model_discovery:
           type: boolean
-          description: Whether the server will perform a provider model list on a client's behalf.
+          description: >-
+            Whether the server will perform a provider model list on a client's behalf. NOT ENFORCED by
+            any route in this build: `POST /models` always attempts the provider call.
         harness_definition_writes:
           type: boolean
-          description: Whether harness definitions may be created, edited, and removed over HTTP.
+          description: >-
+            Whether harness definitions may be created, edited, and removed over HTTP. NOT ENFORCED by
+            any route in this build, and no definition is read-only.
         agent_writes:
           type: boolean
-          description: Whether global agent profile text may be overridden over HTTP.
+          description: >-
+            Whether global agent profile text may be overridden over HTTP. NOT ENFORCED by any route in
+            this build: the override layer is implemented and durable.
         persistent_threads:
           type: boolean
-          description: Whether this session family supports persistent conversations.
+          description: >-
+            Whether this session family supports persistent conversations. NOT ENFORCED by any route in
+            this build; whether a session actually has threads is state the session resource reports.
     ServiceLimits:
       type: object
       description: >-
         The numeric envelope every route is bounded by, published once so a client validates before sending
         and explains a refusal without guessing. These are contract numbers, not aspirations: a route refuses
-        a value above them with 400, 413, 415, or 429 as stated on the operation.
+        a value above them with 400, 413, 415, 429, or 500 as stated on the operation - 500 in the one case
+        where a runtime refusal is not classified into a status of its own, `thread_records` on
+        `POST /sessions/{session_id}/threads`.
       required:
         - body_bytes
         - submit_body_bytes
@@ -3334,7 +3732,11 @@ components:
         thread_records:
           type: integer
           minimum: 1
-          description: Persistent thread records per session.
+          description: >-
+            Persistent thread records per session. The status this bound produces depends on the route: a
+            task submit that has to open a conversation answers 429, while `POST
+            /sessions/{session_id}/threads` passes the runtime's refusal through unclassified and answers
+            500.
         attachments_per_turn:
           type: integer
           minimum: 0
@@ -3364,11 +3766,20 @@ components:
         created_tools:
           type: integer
           minimum: 1
-          description: Tools one session's harness may create in its lifetime, across resets.
+          description: >-
+            Tools one session's harness may create in its lifetime, across resets. Going beyond it answers
+            400, not 409: the registration is refused with the budget named ("This harness already created
+            32 tools; reuse an existing tool instead of creating more."), because the caller's fix is to
+            reuse a name rather than to wait for server state to change. Only a NEW name spends the budget,
+            so a replacement under an existing name never does.
         tool_result_bytes:
           type: integer
           minimum: 1
-          description: Model-facing text bound for one tool result; detail routes answer verbatim recorded bytes.
+          description: >-
+            Model-facing text bound for one tool result: 262,144 bytes (256 KiB). It is set to match the
+            `read` tool's own output budget, so a full-budget read survives the wire instead of being cut
+            into the truncation envelope; it is PER RESULT with no aggregate guard, so parallel calls can
+            each commit up to this many bytes in one turn. Detail routes answer verbatim recorded bytes.
         page_limit_default:
           type: integer
           minimum: 1
@@ -3393,10 +3804,16 @@ components:
           type: string
         api_version:
           type: string
-          description: The contract line this server implements, e.g. `1.0`.
+          description: >-
+            The API version this server answers as. The build states it as `v1` (the mount's version
+            segment), not as a dotted contract number, and it is the only version field the boot
+            document sends.
         build_version:
           type: string
-          description: The host's package version, informational.
+          description: >-
+            Optional informational field the shape allows. This build does NOT send it: the boot
+            document carries no package version, so a client must not read a missing value as `0.0.0`
+            and must use `epoch` to detect a restart.
         server_time:
           type: integer
           description: Epoch milliseconds, so a client can render relative times against the server clock.
@@ -3538,20 +3955,30 @@ components:
               type: string
               nullable: true
               maxLength: 2048
-              description: A `null` value restores the built-in default base URL.
+              description: >-
+                A `null` value restores the built-in default base URL. An empty string is NOT a
+                default: it is a 400 ('A provider base URL cannot be empty.'). The cap measures the
+                TRIMMED value, which is the string a later session actually validates and sends.
             model:
               type: string
               nullable: true
               maxLength: 256
-              description: A `null` value restores the built-in default model.
+              description: >-
+                A `null` value restores the built-in default model. The cap measures the TRIMMED
+                value, and the patch commits only if every stated field passes, so a refusal here
+                leaves an earlier `base_url` in the same body unchanged as well.
             api_key:
               type: string
               nullable: true
               writeOnly: true
               description: >-
-                Write-only. A non-empty string replaces the server key, an explicit empty string or `null`
-                REMOVES it (the response then reports `has_api_key: false`), and an omitted property leaves it
-                untouched. The stored value is never echoed back.
+                Write-only, and three distinct outcomes: a non-empty string issues a NEW process-only
+                credential whose provider scope is the base URL the FINAL settings settle on (so a body
+                that moves `base_url` and writes a key together issues the key for THAT provider); an
+                explicit empty string REMOVES the key and the response reports `has_api_key: false`;
+                and `null` RESTORES the shipped credential together with the shipped provider it
+                belongs to, reporting the shipped `has_api_key` - it never means "no key". An omitted
+                property leaves the key untouched. The stored value is never echoed back.
     # ---------------------------------------------------------------------
     # Harness definitions
     # ---------------------------------------------------------------------
@@ -3567,7 +3994,7 @@ components:
       properties:
         name:
           type: string
-          pattern: '^[a-z][a-z0-9_-]*$'
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
         title:
           type: string
         description:
@@ -3599,10 +4026,15 @@ components:
             edited and deleted exactly like a created entry.
         definition_revision:
           type: integer
-          minimum: 1
+          minimum: 0
           description: >-
-            Monotonic revision of this registry entry. A PATCH produces a new immutable entry under the same
-            name and raises it, which is how a session can state which copy it froze.
+            The `definition`-family counter keyed by this harness NAME, so cards do count separately (this
+            is not the host-wide `harnesses` counter the collection page reports). A shipped entry nothing
+            has mutated in this process reads 0; a created entry reads 1, because its POST counts as its
+            first mutation; and every accepted PATCH or DELETE of this name adds exactly one. Counters
+            live in memory, so a restart renumbers everything and a revision is only comparable inside one
+            epoch. A PATCH produces a new immutable registry entry under the same name, which is how a
+            session can state which copy it froze.
     HarnessInstructionSummaryEntry:
       type: object
       description: >-
@@ -3675,16 +4107,18 @@ components:
       description: >-
         Selection-only body. A client picks trusted agent names and may record per-agent model ids,
         instruction overrides, and display colors; it cannot supply a provider, a credential, a transport, or
-        a tool list. Every override key must name a member of the resulting definition.
+        a tool list. Every override key must name a member of the resulting definition. The roster itself is
+        validated as a SET: an agent listed in `subagents` more than once is a 400, and listing `primary` in
+        `subagents` is a 400, because a harness has exactly one primary.
       required: [name, primary]
       additionalProperties: false
       properties:
         name:
           type: string
-          pattern: '^[a-z][a-z0-9_-]*$'
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
         title:
           type: string
-          maxLength: 200
+          maxLength: 120
         description:
           type: string
           maxLength: 2000
@@ -3692,15 +4126,17 @@ components:
           type: string
         subagents:
           type: array
-          maxItems: 32
+          maxItems: 16
           items:
             type: string
         agent_models:
           type: object
-          description: Agent name to model id. An id only - never a provider or a credential.
+          description: >-
+            Agent name to model id. An id only - never a provider or a credential - trimmed, non-empty,
+            and free of control characters.
           additionalProperties:
             type: string
-            maxLength: 256
+            maxLength: 200
         agent_instructions:
           type: object
           description: >-
@@ -3709,7 +4145,7 @@ components:
             appended underneath an override; the trusted profile itself is never rewritten.
           additionalProperties:
             type: string
-            maxLength: 200000
+            maxLength: 8000
         agent_colors:
           type: object
           description: >-
@@ -3732,7 +4168,7 @@ components:
       properties:
         title:
           type: string
-          maxLength: 200
+          maxLength: 120
         description:
           type: string
           maxLength: 2000
@@ -3740,19 +4176,19 @@ components:
           type: string
         subagents:
           type: array
-          maxItems: 32
+          maxItems: 16
           items:
             type: string
         agent_models:
           type: object
           additionalProperties:
             type: string
-            maxLength: 256
+            maxLength: 200
         agent_instructions:
           type: object
           additionalProperties:
             type: string
-            maxLength: 200000
+            maxLength: 8000
         agent_colors:
           type: object
           description: >-
@@ -3798,12 +4234,15 @@ components:
           description: Number of members, which is `items.length`.
         items:
           type: array
-          maxItems: 33
+          maxItems: 17
           items:
             $ref: '#/components/schemas/HarnessInstructionSummaryEntry'
     HarnessInstructionTextResponse:
       type: object
-      description: One member's effective instruction text, with its provenance.
+      description: >-
+        One member's effective instruction text, with its provenance. A retired member with no harness
+        override has nothing to project on this route, and the read then answers 200 with an EMPTY body
+        rather than this document.
       required: [harness_name, agent, source, instruction, guidelines, chars]
       additionalProperties: false
       properties:
@@ -3814,14 +4253,24 @@ components:
         source:
           type: string
           enum: [catalogue, global, harness]
+          description: >-
+            Which layer supplied the text: `harness` when this definition carries an override for the member,
+            `global` when the deployment-wide agent layer does, `catalogue` when the trusted profile does. The
+            value set is the shared projection's - `instructionTextOf` (api-reads.ts:1143) reports `global`
+            whenever its optional global-overlay argument is supplied - while THIS route calls it without that
+            argument (api.ts:1688), so in practice the answer here is only ever `harness` or `catalogue`: a
+            global `PATCH /agents/{id}` override still reports `catalogue`, and the INDEX route is the surface
+            that names `global`.
         instruction:
           type: string
-          maxLength: 200000
+          maxLength: 8000
         guidelines:
           type: array
+          maxItems: 64
           description: The rules appended to the instruction at runtime; an instruction override never changes them.
           items:
             type: string
+            maxLength: 1000
         chars:
           type: integer
           minimum: 0
@@ -3846,8 +4295,11 @@ components:
         restored_by_restart:
           type: boolean
           description: >-
-            True states the restore rule: only a host restart re-ships a built-in. There is no HTTP undo, and a
-            created entry is simply gone.
+            Always false, and it is a statement about durability rather than a flag that can flip: the
+            tombstone is written into the harness document, so no restart re-ships a removed entry - not
+            a built-in and not a created one. A built-in comes back only when a NEW release ships it
+            again or an operator recreates it through `POST /harnesses`, which is a new entry that clears
+            the tombstone, not a restore.
     # ---------------------------------------------------------------------
     # Global agents
     # ---------------------------------------------------------------------
@@ -3896,11 +4348,13 @@ components:
           type: string
         instruction:
           type: string
-          maxLength: 200000
+          maxLength: 8000
         guidelines:
           type: array
+          maxItems: 64
           items:
             type: string
+            maxLength: 1000
         instruction_source:
           type: string
           enum: [catalogue, global]
@@ -3914,13 +4368,24 @@ components:
         referenced_by:
           type: array
           description: >-
-            Harness definitions that currently name this profile as a member. A non-empty list is why a DELETE
-            answers 409 rather than orphaning a definition.
+            INFORMATIONAL ONLY: the harness definitions that currently name this profile as a member, so an
+            operator can see what a retirement leaves behind. It is never a delete precondition -
+            `DELETE /agents/{agent_id}` succeeds whatever this list holds - and it is a live registry scan,
+            not a stored back-reference, so a definition that keeps naming a retired profile still appears
+            here until it is edited.
           items:
             type: string
         revision:
           type: integer
           minimum: 0
+          description: >-
+            The host-wide `agents` counter, NOT a per-profile counter: `agents` is a host-wide resource
+            kind whose id is discarded when the revision key is built, so every profile in the catalogue
+            reports the SAME number and any profile's write moves it. An accepted agent write bumps that
+            shared counter TWICE (once as the collection, once as the per-id key that collapses onto it),
+            so consecutive accepted writes advance it by 2. It is a staleness signal for the whole agent
+            catalogue, never an identity or a per-resource version, and a process that has mutated nothing
+            reports 0.
     AgentSummaryPage:
       description: Page of agent summaries.
       allOf:
@@ -3955,7 +4420,7 @@ components:
         title:
           type: string
           nullable: true
-          maxLength: 200
+          maxLength: 120
         description:
           type: string
           nullable: true
@@ -3963,14 +4428,14 @@ components:
         instruction:
           type: string
           nullable: true
-          maxLength: 200000
+          maxLength: 8000
         guidelines:
           type: array
           nullable: true
           maxItems: 64
           items:
             type: string
-            maxLength: 4000
+            maxLength: 1000
     DeleteAgentResult:
       type: object
       description: >-
@@ -3990,8 +4455,12 @@ components:
         restored_by_restart:
           type: boolean
           description: >-
-            True states the only restore path. A re-created profile with the same name is a code change, so this
-            contract does not imply an HTTP undo.
+            The only restore path, stated honestly for the deployment rather than as a constant. It is TRUE
+            only when the host has no database root: the retirement is then process state, so the next start
+            re-ships the profile from the catalogue and the operator's decision is gone. It is FALSE when a
+            root exists, because the tombstone is written into `<root>/harness/agents.json` and no restart
+            re-adds the profile. Either way there is no HTTP undo: re-creating a profile with the same name
+            is a code change.
     # ---------------------------------------------------------------------
     # Built-in plugins (R2/R3): the loaded catalogue, its declared settings,
     # and the effective values an operator has set.
@@ -4234,8 +4703,13 @@ components:
                 manual:
                   type: boolean
                   description: >-
-                    False when an operator call is refused even in a valid scope, for example a control tool
-                    whose effect requires an active run. The reason is in the 409 message.
+                    False when this entry has no standalone implementation on this deployment, so an operator
+                    call cannot run it as submitted. Where the reason is stated depends on WHY: a session-bound
+                    control tool is refused with 403 whose message names the session route to call instead, and
+                    an entry that is merely unconfigured answers 200 with `ok: false` and the availability hint,
+                    because "not configured" is tool data rather than a request failure. Neither case is a 409 -
+                    this route is not reporting a concurrency conflict - and a session row's own `execution`
+                    projection always reports `manual: true`.
     ToolSummaryPage:
       description: Page of catalogue rows.
       allOf:
@@ -4516,11 +4990,14 @@ components:
           properties:
             definition_revision:
               type: integer
-              minimum: 1
+              minimum: 0
               description: >-
-                The `definition_revision` of the registry entry this session froze. Compare it with
-                `GET /harnesses/{harness_name}` to state "this session runs an older copy" without fetching the
-                copy.
+                This session's OWN `definition` counter - the session-keyed counter of `StreamResourceKind`, the
+                same figure the frozen-definition read publishes as `revision`. It is 1 for a session this
+                process created and 0 for one restored from disk after a restart, because these counters are
+                per-process and a restore does not re-advance them. It is NOT the registry entry's
+                `definition_revision` and is not comparable with `GET /harnesses/{harness_name}`; the currency
+                of the captured copy is what that definition read's `current` field answers.
             agent_models:
               type: object
               description: >-
@@ -4549,8 +5026,12 @@ components:
               type: integer
               minimum: 1
               description: >-
-                This session's lifetime created-tool budget, so a client can explain a 409 instead of guessing.
-                Replacements do not consume it.
+                This session's lifetime created-tool budget. The figure the API reports is the advertised
+                constant (32), while enforcement is the harness's own `maxCreatedTools`, whose default is the
+                same number, so read this as the budget and `created_tool_count` as the live side. A client can
+                use it to explain a 400 instead of guessing: exhausting it is a 400 that carries the runtime's
+                advice to reuse an existing tool, NOT a 409, and the same pair appears as `budget` on a
+                registration receipt. Replacements of a name this session already holds do not consume it.
     SessionResponse:
       type: object
       description: Envelope of a session read, create, or patch.
@@ -4613,29 +5094,39 @@ components:
               type: integer
               minimum: 0
               description: >-
-                The `definition` counter of `StreamResourceKind`, defined to equal `current_revision`: the frozen
-                copy itself never moves, so the only honest change signal is the live registry entry this session is
-                behind. A `session` subscription reports THIS figure, so a client compares one number in both
-                places.
+                The SESSION-keyed `definition` counter of `StreamResourceKind` - the same number this resource
+                prints as `definition_revision`, and the figure a `session` subscription reports for this
+                conversation, so a client compares one number in both places. It is 1 for a session this process
+                created and 0 for one restored from disk. It is NOT the registry entry's counter and therefore
+                NOT equal to `current_revision`: those two live in different key spaces and move independently.
             frozen_at:
               type: integer
               description: Epoch milliseconds at which the session captured this definition.
             source_revision:
               type: integer
-              minimum: 1
-              description: The `definition_revision` this copy came from.
+              minimum: 0
+              description: >-
+                Misleading by name, and the build is authoritative here: this is the live `definition` counter of
+                the registry entry this session was built from, sampled at REQUEST time, not the revision the
+                copy was captured at (the capture-time figure is never stored). It is computed from the same
+                read as `current_revision`, so the two are always identical, and 0 means this process has never
+                written that entry - a built-in or a session restored after a restart.
             current_revision:
               type: integer
-              minimum: 1
+              minimum: 0
               description: >-
-                The live registry entry's revision right now. Equal to `source_revision` means this session is
-                running the current copy.
+                The live registry entry's counter right now, and by construction always equal to
+                `source_revision`. Because both halves of the pair are live reads of one counter, "the two
+                numbers match" carries no information about this session; `current` does.
             current:
               type: boolean
               description: >-
-                `current_revision === source_revision`, published as a boolean so a client states currency
-                without arithmetic. False is not an error: running a captured copy is the whole point of
-                snapshot isolation.
+                A deep structural comparison of the live entry's projection against this session's frozen copy,
+                performed on every read. It is NOT `current_revision === source_revision`, and equal revisions
+                do not imply it: the numbers always match while the copy may not. False when the entry has been
+                edited, and false when it has been DELETED, because a removed harness has nothing to compare
+                against - which is exactly what a saved session restoring from its own record means. False is
+                not an error: running a captured copy is the whole point of snapshot isolation.
             discovered_tools:
               type: array
               description: >-
@@ -4662,38 +5153,61 @@ components:
       properties:
         harness:
           type: string
-          pattern: '^[a-z][a-z0-9_-]*$'
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
+          description: >-
+            The definition to freeze, matched with the registry's own name rule: one letter, then letters,
+            digits, `_` or `-`, at most 64 characters, so an upper-case first letter is legal. A legacy alias
+            resolves here (`writer` builds the definition it names) while the created session reports the
+            canonical name, and a name this build does not hold is 404 - a lookup is direct and never falls
+            back to a tombstone.
         title:
           type: string
-          maxLength: 200
           description: >-
-            Optional display name for a rail or a picker. Trimmed server-side; it carries no authority, so a
-            duplicate title is not a conflict.
+            Optional display name for a rail or a picker. Trimmed server-side and then TRUNCATED to 200
+            characters, so a longer title is accepted rather than refused and the read returns what was stored;
+            a blank title stores nothing. It carries no authority, so a duplicate title is not a conflict, and
+            a value that is not a string is ignored on create (a patch is stricter and refuses it with 400).
         settings:
           $ref: '#/components/schemas/RunnerSettingsInput'
     UpdateSessionRequest:
       type: object
       description: >-
-        The session-level writes, both declarative. An omitted property is no change. `agent_models` MERGES: an
-        agent absent from the body keeps the model it currently runs, so changing one selection does not reset
-        its siblings; every key must name a member of this session's frozen definition and every value a
-        non-empty model id, or the whole patch is refused with 400 and nothing is applied. `title` REPLACES the
-        display name, and an explicit `null` clears it. `{}` is a 400 no-op. Recorded history, the harness
+        The session-level writes, both declarative. An omitted property is no change, and a body that names
+        neither field (`{}`) is refused with 400 rather than answering a success that changed nothing.
+        `agent_models` MERGES: an agent absent from the body keeps the model it currently runs, so changing one
+        selection does not reset its siblings; every key must name a live member of this session (the frozen
+        definition plus anything bound since) and every value a trimmed, non-empty model id of at most 200
+        characters with no control characters, or the whole patch is refused with 400 and nothing is applied.
+        A present-but-empty map is NOT that refusal: the patch merges over the live map, so
+        `{ "agent_models": {} }` changes nothing and answers 200 with an unchanged map and a bumped `revision`.
+        The store's stricter "at least one agent model" 400 is enforced on the MERGED map, and a live session
+        always has at least one agent brain because the entry agent cannot be detached.
+        `title` REPLACES the display name, and an explicit `null` clears it; the string is trimmed and then
+        TRUNCATED to 200 characters server-side, never refused for length, and a trimmed-empty title clears the
+        field like `null` does. Recorded history, the harness
         definition, and the endpoint settings are immutable over HTTP.
       minProperties: 1
       additionalProperties: false
       properties:
         agent_models:
           type: object
-          minProperties: 1
-          description: Agent id to model id.
+          description: >-
+            Agent id to model id, merged over the live map. An empty map is a VALID patch, not a no-op
+            refusal: it replaces nothing, so the response is 200 with the live map unchanged and the
+            `revision` bumped. The `{}`-is-400 rule is about a body that names no field at all, never about
+            this field being empty.
           additionalProperties:
             type: string
-            maxLength: 256
+            maxLength: 200
+            description: >-
+              A model id, trimmed and required non-empty; 200 characters is the registry's bound and a control
+              character in the id is a 400.
         title:
           type: string
           nullable: true
-          maxLength: 200
+          description: >-
+            Longer input is accepted and truncated to 200 characters, so the stored value is what a later read
+            reports; a value that is neither a string nor `null` is 400.
     # ---------------------------------------------------------------------
     # Session agents
     # ---------------------------------------------------------------------
@@ -4734,8 +5248,13 @@ components:
           type: string
           enum: [definition, session]
           description: >-
-            `definition` means inherited from the frozen definition (not removable, overrides restorable);
-            `session` means created through this API (removable while no conversation uses it).
+            How this member entered the conversation, NOT whether it can leave: `definition` means it came with
+            the frozen harness definition and `session` means `POST …/agents` bound it here, and BOTH are
+            removable with a 200 while the member is neither the entry agent nor the owner of a conversation.
+            The distinction matters elsewhere only: `origin: session` is what tells a client this row is a
+            binding this conversation made (and, for a session-defined agent, that no catalogue profile stands
+            behind it), and a membership change on a scripted or injected harness template is the one case that
+            answers 409 instead.
         model:
           type: string
           description: The model this agent runs NOW, after any session override.
@@ -4746,41 +5265,68 @@ components:
           type: string
           enum: [catalogue, global, harness, session]
           description: >-
-            Provenance of the effective text, so a client states where it came from instead of guessing.
-            `session` names the one case with no profile at all: a session-defined agent, whose text this
-            conversation wrote (`harness`/`global`/`catalogue` are the layers a profile member can inherit).
+            Provenance of the effective text, so a client states where it came from instead of guessing. Read
+            the values carefully, because the ladder is not the layer names a client would expect: `session`
+            labels exactly one case - an agent THIS conversation invented, whose prompt no profile supplies -
+            and never a profile member's session override. A session-level instruction override written onto a
+            profile member is reported as `harness`, which is why the value does not mean "the harness
+            definition's `agent_instructions` wrote this". `global` is reported only when the live text actually
+            contains the deployment-wide override, so a session created before an operator edit keeps the layer
+            it really runs; anything else is `catalogue`.
         instruction_chars:
           type: integer
           minimum: 0
           description: EXACT character count of the effective instruction text, without carrying the text.
         has_instruction_override:
           type: boolean
-          description: True when this session carries its own instruction override for this binding.
+          description: >-
+            ABSENT, not false, when there is no override to report. For a profile member it is true exactly when
+            `instruction_source` is `harness` - this session carries its own instruction text for that member.
+            For a session-defined agent it states the narrower truth: the session has RE-WRITTEN the base
+            instruction it created that agent with (`PATCH …/instruction`), so `null` here returns the
+            conversation's own base rather than a profile's text.
         guidelines_count:
           type: integer
           minimum: 0
-          description: How many rule lines are appended to the instruction; the lines are on the instruction route.
+          description: >-
+            How many system-message blocks this member's live brain carries - its instruction plus any guideline
+            blocks - and absent when the roster exposes no brain for it. The lines themselves are on the
+            instruction route.
         editable:
           type: boolean
-          description: False only when the deployment froze session writes.
+          description: >-
+            Always true on this build: every session-scoped agent write is available on every session, so a
+            client can treat the flag as informational rather than gating a button on it.
         deletable:
           type: boolean
           description: >-
-            False for the entry agent (every session needs one) and for a member that still owns a conversation,
-            because removing it would take that history with it; `DELETE …/agents/{id}` answers 409 on exactly
-            this condition. True for every other binding this conversation may detach.
+            False for the entry agent (every session needs one) and for a member that still owns an independent
+            conversation, because removing it would take that history with it; `DELETE …/agents/{id}` answers
+            409 on exactly those two conditions. True for every other member of either origin - a member the
+            frozen definition declared is detachable from this conversation just like one this conversation
+            bound. One case the flag cannot see: a scripted or in-memory-injected harness template refuses a
+            membership change with 409 for durability reasons, whatever this row says.
         restorable:
           type: boolean
           description: >-
-            True for an inherited member: clearing every override with a `null` patch returns it to its default,
-            so an override always has a stated undo.
+            True when a `null` patch has something to undo. For an agent this conversation invented it is always
+            true, because `null` returns the base instruction this session created the agent with; for a profile
+            member it is true as soon as the text it runs is not the plain shipped profile - a session override
+            or a deployment-layer text - and false for a member that has never been retuned.
         busy:
           type: boolean
-          description: True while this agent has a run or queued work, which is what a DELETE answers 409 on.
+          description: >-
+            ABSENT unless true, and true only while this member owns a turn that is RUNNING right now (an active
+            conversation lane, or the legacy session run). Queued work is deliberately not included here, even
+            though it blocks the same writes: a binding change and an instruction change answer 409 while a live
+            run OR any queued work exists, so `busy` is a hint about the moment, not the gate.
         revision:
           type: integer
           minimum: 0
-          description: Increases on every accepted write to this binding.
+          description: >-
+            The roster-wide `session_agents` counter this row carries - the same number every other row of this
+            session and the roster envelope report, bumped by any accepted agent write, so a client detects
+            "the team moved" rather than diffing one binding's private counter.
     SessionAgentListResponse:
       type: object
       description: >-
@@ -4826,61 +5372,109 @@ components:
         and no guideline layer. Both kinds are durable in the session record and are rebuilt with the same model
         and instruction when the server restarts, and both are removable again with `DELETE` while no conversation
         uses them.
-      required: [name, profile]
+      required: [name]
       additionalProperties: false
       properties:
         name:
           type: string
-          pattern: '^[a-z][a-z0-9_-]*$'
+          pattern: '^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$'
           maxLength: 64
           description: >-
-            The session roster key. Must not collide with an existing member (409), including case-insensitively
-            (409) and including the `unknown` placeholder (400). A key that is not a catalogue profile name
-            declares a session-defined agent.
+            The session roster key. A name that spells a trusted catalogue profile (the all-lower-case subset
+            the global catalogue lists) BINDS that profile; any other name in this alphabet DECLARES a
+            session-defined agent, and a name outside it - starting with a space or `_`, containing `:` or `/`,
+            longer than 64 characters - is 400, because the same string becomes a delegation id, a runtime
+            registry key, an `agent:<name>` conversation id and a durable preset key in one step. A key that
+            collides exactly with an existing member is 409, a key that differs from one only in CASE is 409 too
+            (the roster is case-insensitive by rule), and `unknown` in any case is 400 because it is the
+            placeholder id every surface paints for "no agent at all". A blank or whitespace-only name is 400.
         profile:
           type: string
           description: >-
-            Must equal `name` (400 otherwise): the roster key is the identity a restart rebuilds. A name that
-            spells a catalogue profile binds that profile, and a retired profile is refused with 409; any other
-            name is a session-defined agent.
+            Optional, and redundant by rule: omitted it takes the value of `name`, and a supplied value that is
+            not `name` after trimming is refused with 400, because the roster key is the identity a restart
+            rebuilds the team from and no alias map is stored. A name that spells a catalogue profile binds that
+            profile, and a retired profile is refused with 409; any other name is a session-defined agent.
         model:
           type: string
-          maxLength: 256
-          description: Optional model id. Omitted inherits the session model.
+          description: >-
+            Optional model id for this member. Trimmed, and blank or omitted runs the session model. This route
+            states no length bound of its own - an over-long id is accepted and recorded here - while the
+            session-level `agent_models` patch and a binding PATCH re-validate the same id at 200 characters,
+            so keep it inside 200 if a dropdown may edit it later.
         instruction:
           type: string
-          maxLength: 200000
+          maxLength: 8000
           description: >-
-            Optional non-empty text that IS the agent's complete prompt: for a catalogue profile it replaces
-            the whole composed instruction, so the profile's guidelines are NOT appended underneath it, and
-            `null`/omitted runs the trusted text (identity sentence plus its guidelines); for a session-defined
-            agent it IS the agent's whole instruction either way (the session stores a default identity sentence
-            when it is omitted). Never mutates the profile it overrides.
+            Optional text that IS the agent's complete prompt: for a catalogue profile it replaces the whole
+            composed instruction, so the profile's guidelines are NOT appended underneath it, and omitted or
+            blank runs the trusted text (identity sentence plus its guidelines); for a session-defined agent it
+            IS the agent's whole instruction, and a blank or omitted value stores the default identity sentence
+            this conversation builds for the name. A blank value is therefore "none", not an error, on this
+            route - the PATCH is stricter and refuses blank instead of clearing. More than 8000 characters is
+            400. Never mutates the profile it overrides.
         role:
           type: string
           enum: [primary, subagent]
           default: subagent
           description: >-
-            `subagent` adds this binding to the primary's delegation allowlist for THIS session only.
-            `primary` re-targets the entry agent of subsequent submits and is refused with 409 while the
-            session is running, because the entry agent decides what an unfocused submit opens.
+            `subagent` adds this binding to the primary's delegation allowlist for THIS session only, and is
+            what an omitted value means. `primary` is ALWAYS 409, running or idle: the entry agent is structural
+            metadata of the harness definition, so no session write can re-target what an unfocused submit
+            opens; the refusal says so rather than binding a subagent and ignoring the request. A value outside
+            these two is 400.
     UpdateSessionAgentRequest:
       type: object
       description: >-
         An omitted property is no change; a string REPLACES the whole field; an explicit `null` clears the
         session override and RESTORES the inherited binding. Identity, profile, tools, and the delegation graph
-        are immutable here.
+        are immutable here. A model patch is accepted while the session runs; an instruction patch needs an
+        idle session and answers 409 while a live run or queued work exists.
       minProperties: 1
       additionalProperties: false
       properties:
         model:
           type: string
           nullable: true
-          maxLength: 256
+          maxLength: 200
+          description: >-
+            The model this member runs. Trimmed, non-empty, at most 200 characters, no control characters; a
+            `null` clears the session override and runs the model this session's settings carry. The value is
+            applied to the live brain, so an in-flight request keeps the model it started with.
         instruction:
           type: string
           nullable: true
-          maxLength: 200000
+          maxLength: 8000
+          description: >-
+            The member's COMPLETE system prompt, at most 8000 characters (longer is 400). A blank or
+            whitespace-only string is 400 rather than a silent clear: send `null` to clear the override, which
+            re-seeds a profile member from the deployment's CURRENT effective profile text and restores an agent
+            this conversation invented to the base it was created with. Changing it at all requires an idle
+            session, because a queued turn has already been accepted against the prompt it will run.
+    # The write verb of the session agent instruction subresource: the same store operation this binding
+    # PATCH performs when it names `instruction`, reached from the document instead of the roster row, and
+    # answered with that document. `instruction` is required here (absent is a 400, not a no-op), the store
+    # trims it and refuses blank text, and 8000 characters is the store's own ceiling
+    # (sessions.ts `maxAgentInstructionChars`), enforced as a 400.
+    UpdateSessionAgentInstructionRequest:
+      type: object
+      description: >-
+        One field, required: a string REPLACES this member's whole system prompt for this session, and `null`
+        clears the session override so the member runs the deployment's current effective profile text (for a
+        profile member) or the base instruction this conversation created it with (for a session-defined
+        agent). Nothing else on the binding is writable from here, and no other field is accepted.
+      required: [instruction]
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        instruction:
+          type: string
+          nullable: true
+          maxLength: 8000
+          description: >-
+            Trimmed and required non-blank: a whitespace-only string is a 400 that names the `null` remedy, and
+            more than 8000 characters is a 400 from the same store rule that bounds a harness definition's
+            per-agent instruction. Any non-string type is a 400.
     DeleteSessionAgentResult:
       type: object
       description: >-
@@ -4922,14 +5516,31 @@ components:
         source:
           type: string
           enum: [catalogue, global, harness, session]
-          description: Resolved in that order; the value names the layer that supplied the text.
+          description: >-
+            Which layer supplied the text, decided in this order: `session` for an agent THIS conversation
+            invented (a name no catalogue profile describes) - that value never labels a profile member's
+            session override; otherwise `harness` when this session carries its own instruction text for the
+            member, which is what a session-level override is reported as; then `global`, and only when the live
+            text actually contains the deployment-wide override; everything else is `catalogue`. The names are
+            the layers the server keeps, not a client's mental model of who wrote the prompt.
         instruction:
           type: string
           maxLength: 200000
+          description: >-
+            The whole text this member runs - the identity sentence with its composed guideline block beneath
+            it, or exactly the override this session stored. The bound here is the response's own generous
+            ceiling; the bound a client WRITES against is 8000 characters, so a composed profile prompt that no
+            session override stands behind can legitimately be longer than anything this API accepts.
         guidelines:
           type: array
+          maxItems: 64
+          description: >-
+            The trusted profile's rule lines, each one a bounded bullet. EMPTY for an agent this conversation
+            invented, because nothing trusted supplies its guidelines - which is why an override of a profile
+            member replaces the whole prompt: these lines are not re-appended underneath it.
           items:
             type: string
+            maxLength: 1000
         chars:
           type: integer
           minimum: 0
@@ -4952,29 +5563,45 @@ components:
               type: string
             declared:
               type: boolean
-              description: True when the current run declares the tool, so the model may call it right now.
+              description: >-
+                True when this session's FROZEN definition declares the name, which is the set that is in
+                context on every request. It is a property of what the session was built with, not of what the
+                current turn happens to be running, so the value does not flicker between turns.
             enabled:
               type: boolean
               description: >-
-                True when the tool is callable in this session, whether declared, discovered through
-                `toolRequest`, or created at runtime. `PATCH` toggles this, and re-enabling restores the
-                inherited binding exactly.
+                True when the tool is callable in this session right now - the live enabled set, whether the
+                name is declared, was discovered through `toolRequest`, or was created at runtime. `PATCH`
+                toggles it. `false` withdraws the name without losing its registration or its captured source
+                revision, and `true` switches that same live slot back on: it does NOT restore an inherited
+                binding, because a removal or an override here never keeps a superseded copy to hand back.
+                Toggling requires an idle session (409) and is refused with 403 on a protected entry.
             origin:
               type: string
               enum: [catalogue, discovered, created]
-              description: How it got into this session's toolbox.
+              description: >-
+                How it got into this session's toolbox: `created` is a name this session registered (it owns the
+                source revision and a created-tool slot), `discovered` is a catalogue tool this conversation
+                enabled through `toolRequest`, `catalogue` is everything else - declared by the frozen definition
+                or inherited from the shared registry with no local registration.
             protected:
               type: boolean
               description: >-
-                True for the harness-owned control plane (`toolRegistry`, `toolRequest`, `toolCreate`,
-                `toolManage`, `task`, `delegate`). A protected entry refuses create-collision, PATCH, and
-                DELETE with 403, not 409, because replacing or removing the tools a session runs on breaks its
-                own control surface.
+                True for the control plane this session runs on: the harness-owned core set the runtime manifest
+                ships (`toolRegistry`, `toolRequest`, `toolCreate`, `toolManage`, `task`, `delegate`, ...) OR any
+                name this session's FROZEN definition declares. The declared half is why an ordinary preset tool
+                is protected too - the definition, not the operator, chose it. Consequences, stated exactly: a
+                protected entry refuses an `enabled`-only PATCH and refuses DELETE with 403, and it accepts a
+                source PATCH (replacing an implementation is a different privilege from switching the control
+                plane off). A CREATE that collides with a protected name is NOT refused: the POST answers 201
+                with `replaced: true` even here, so a client must not expect 403 from a collision.
             source_available:
               type: boolean
               description: >-
                 False states "this registration has no editable source" rather than returning an empty string,
-                so an editor can tell an inherited entry from an empty created one.
+                so an editor can tell an inherited entry from an empty created one. It is the gate on the source
+                route (404 without it) and on a metadata-only PATCH, which re-publishes the installed revision
+                and has nothing to re-publish when this is false.
             source_revision:
               type: string
               description: >-
@@ -4999,8 +5626,9 @@ components:
     ToolExecutionScope:
       type: object
       description: >-
-        How this entry may be called from HTTP, stated rather than inferred. `session_required` is the normal
-        answer for a protected control tool, whose effect depends on a live conversation.
+        How this entry may be called from HTTP, stated rather than inferred. This is the SESSION-route
+        projection, and it has two values here, never three: the session route classifies a name by what this
+        conversation holds, not by what the catalogue says.
       required: [scope, manual]
       additionalProperties: false
       properties:
@@ -5008,11 +5636,24 @@ components:
           type: string
           enum: [global, session_required, session_only]
           description: >-
-            `global` may also be called without a session; `session_required` is the same entry seen from the
-            session route; `session_only` means the entry exists only in this session (created or replaced).
+            On a session row: `session_required` for a harness-owned core name (the control plane, whose effect
+            depends on a live conversation) and `session_only` for EVERY other live entry this session holds -
+            created, discovered, replaced, or inherited with no local registration. It is a statement about the
+            name, not about where the entry came from, so a replaced catalogue tool still reads `session_only`.
+            `global` is not answered by this route at all: it appears only on the catalogue detail read
+            (`GET /tools/{tool_id}`), where an entry with a standalone implementation is callable without a
+            session. Treat the three values as two different projections of one gate rather than a ladder.
         manual:
           type: boolean
-          description: False when an operator call is refused even in a valid scope, with the reason in the 409 message.
+          description: >-
+            Always true on a session row: the session-scoped execution route is the documented surface for every
+            live entry, so no name is listed there and then refused. The field exists for the catalogue
+            projection, where it only states whether the entry has an implementation that can run standalone.
+            The 403 belongs to `scope: session_required` and comes from the entry being session-bound, never
+            from this flag: that global execution is refused with the session route to use named in the message -
+            never a 409, because it is a routing policy, not a concurrency conflict. A `global` entry with
+            `manual: false` is not refused: it answers 200 `ok: false` carrying the catalogue's availability
+            hint, so an unconfigured tool is a failure reported as data rather than a policy outcome.
     SessionToolPage:
       description: >-
         Page of session toolbox rows. Deliberately absent from every row: the argument JSON Schema, the source
@@ -5030,7 +5671,10 @@ components:
                 $ref: '#/components/schemas/SessionToolSummary'
             budget:
               type: object
-              description: The created-tool budget, reported on the collection so a client can explain a 409 before trying.
+              description: >-
+                The created-tool budget for this session, reported on the collection so a client can explain a
+                400 before trying to register: spending the last slot is what makes the next create fail, and the
+                refusal is a 400 carrying the runtime's advice to reuse an existing tool.
               required: [used, limit]
               additionalProperties: false
               properties:
@@ -5058,8 +5702,13 @@ components:
       properties:
         name:
           type: string
-          pattern: '^[a-z][a-z0-9_-]*$'
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,63}$'
           maxLength: 64
+          description: >-
+            The registry key this session publishes, matched against the kernel's own rule: one letter, then
+            letters, digits, `_` or `-`, at most 64 characters, with upper case legal anywhere a letter may
+            stand. A name that breaks it is a 400 quoting the rule, and a name this session already resolves is
+            not a conflict - the registration replaces it and the receipt says `replaced: true`.
         description:
           type: string
           maxLength: 2000
@@ -5077,17 +5726,18 @@ components:
           additionalProperties: true
         source:
           type: string
-          maxLength: 65536
+          maxLength: 20000
           description: >-
-            Optional async function BODY, e.g. `return args.toUpperCase();`. Compiled with the host realm's
+            Optional async function BODY, e.g. `return args.toUpperCase();`, at most 20,000 characters - the
+            kernel's own ceiling, refused with a 400 that says to split the work. Compiled with the host realm's
             `Function` constructor and run with the process's own permissions: no sandbox, no isolation, the
             same trust model as the `shell` tool. Mutually exclusive with `module_text`.
         module_text:
           type: string
-          maxLength: 262144
           description: >-
-            Full editable module source for a module revision. Mutually exclusive with `source`, and both are
-            refused with 403 on a deployment that does not grant source submission.
+            Full editable module source for a module revision. Mutually exclusive with `source`; the only
+            request-level bound is this route's 1 MB body cap, and a module that fails to compile or load is a
+            400 whose diagnostics leave the previous registration callable.
         source_path:
           type: string
           maxLength: 512
@@ -5108,7 +5758,6 @@ components:
                 maxLength: 512
               text:
                 type: string
-                maxLength: 262144
         visibility:
           type: string
           enum: [core, searchable]
@@ -5116,8 +5765,10 @@ components:
         replace:
           type: boolean
           description: >-
-            Must be true to publish over a name this session already resolves; without it a collision is 409. A
-            `protected` name is refused with 403 even with this set.
+            Refusal, not a modifier: this route has no atomic replace-on-create, so `true` is answered 403
+            naming the operation and the missing capability, and `false` is accepted and ignored. A collision
+            without the field is not a conflict either - the registration publishes over the name this session
+            already resolves and answers 201 with `created: false, replaced: true`, protected names included.
     UpdateSessionToolRequest:
       type: object
       description: >-
@@ -5146,14 +5797,22 @@ components:
         enabled:
           type: boolean
           description: >-
-            The reversible gate. `false` withdraws the tool from this session's callable set without losing
-            anything; `true` restores the inherited binding exactly.
+            The discovery gate, and it is a real runtime write. `false` withdraws the tool from this session's
+            callable set without losing its registration or its captured revision; `true` switches that same
+            live slot back on - it does NOT restore an inherited binding, and no superseded revision comes back.
+            A patch naming ONLY this field is refused 403 on a protected entry and 409 unless the session is
+            idle, and its receipt reports `created: false, replaced: false` because the code did not change.
         source:
           type: string
-          maxLength: 65536
+          maxLength: 20000
+          description: >-
+            Function body for a new revision, at most 20,000 characters (the kernel's ceiling; 400 beyond it).
+            Publishing one requires no `replace` flag and no idle session.
         module_text:
           type: string
-          maxLength: 262144
+          description: >-
+            Module text for a new revision. Supplying either text replaces the installed revision atomically; a
+            compile failure is a 400 that leaves the previous revision callable.
         dependencies:
           type: array
           maxItems: 32
@@ -5167,10 +5826,13 @@ components:
                 maxLength: 512
               text:
                 type: string
-                maxLength: 262144
         replace:
           type: boolean
-          description: Required to publish a new source revision over a name another registration already owns.
+          description: >-
+            Accepted and IGNORED on this route: a source write here always replaces, so nothing is gated on the
+            flag and a body naming only `replace` is treated as a metadata-only patch (which re-publishes the
+            installed revision, or 403s when there is none). The 403 this field earns exists on the POST route,
+            where an atomic replace-on-create is the capability that is missing.
     SessionToolRegistrationResult:
       type: object
       description: >-
@@ -5183,17 +5845,35 @@ components:
           type: string
         source_revision:
           type: string
-          description: The installed revision. A replacement changes this value.
+          description: >-
+            The revision this call installed. Three honest shapes: a content-addressed id for a registration that
+            captured source text, the literal `definition` for a registration built from an already-constructed
+            definition (nothing was captured, so nothing is editable), and an empty string when the receipt is
+            not about source at all - a gate-only `enabled` patch of a name with no captured revision reports `""`
+            rather than pretending a revision moved. A replacement always changes this value.
         created:
           type: boolean
-          description: True when the name was not registered in this session before this call.
+          description: >-
+            True only when this session's live registry had NO entry under this name before this call. A POST
+            that collides with a name the session already resolves reports `false` - it registered a replacement,
+            not a creation - and still answers 201, and a PATCH never reports `true`.
         replaced:
           type: boolean
-          description: True when an existing registration was atomically replaced.
+          description: >-
+            True when an existing registration was atomically replaced: on a colliding POST (which is why that
+            201 carries `created: false, replaced: true` rather than a 409) and on a source PATCH. A gate-only
+            `enabled` patch reports `false`, because no code changed.
         previous_revision:
           type: string
+          description: >-
+            The revision this write replaced, when there was one. Identity only: the kernel keeps just the
+            installed revision, so naming a previous one does not mean the server could roll back to it - which
+            is exactly why a deletion reports `restored_inherited: false`.
         source_path:
           type: string
+          description: >-
+            The owning entry path a restore re-reads, present only when this revision actually originates from a
+            file; a runtime-only registration detaches the association.
         checks:
           type: array
           description: The validation checks the registration kernel performed for this revision.
@@ -5201,7 +5881,10 @@ components:
             type: string
         budget:
           type: object
-          description: The created-tool budget after this call, so a client learns the limit was consumed without a second read.
+          description: >-
+            The created-tool budget as of this write, so a client learns the limit was consumed without a second
+            read. Only a genuinely NEW name spends a slot - a replacement of a name this session already held,
+            and a gate-only patch, leave `used` where it was.
           required: [used, limit]
           additionalProperties: false
           properties:
@@ -5222,8 +5905,10 @@ components:
     DeleteSessionToolResult:
       type: object
       description: >-
-        The receipt states what the removal actually did, because removing a name this session OVERRODE restores
-        the inherited catalogue binding, while removing a name created in this session simply ends it.
+        The receipt states what the removal actually did, and the two flags are not opposites: one reports what
+        this session lost, the other reports an undo this build cannot perform. Removing a name created in this
+        session ends it until it is created again; removing a name this session merely enabled through
+        `toolRequest` takes the grant away and leaves the shared catalogue entry exactly as it was.
       required: [deleted, tool_id, session_id, removed_created, restored_inherited]
       additionalProperties: false
       properties:
@@ -5236,12 +5921,20 @@ components:
           type: string
         removed_created:
           type: boolean
-          description: True when the removed registration was a tool created in this session.
+          description: >-
+            True when the name this session removed was one THIS session created - decided from the live
+            created-tool records measured before the removal, so the figure describes this write and not the last
+            committed snapshot. A name that was only discovered, replaced, or inherited reports `false` even
+            though the call succeeded and the model can no longer call it.
         restored_inherited:
           type: boolean
+          enum: [false]
           description: >-
-            True when a catalogue or harness-level binding became visible again because the session-local
-            registration is gone - the undo a deletion performs rather than a destruction.
+            ALWAYS false, and set that way on purpose rather than left to a client's inference: restoring an
+            inherited baseline would need a second copy of the definition this session overrode, and the
+            registration kernel keeps only the INSTALLED revision - a replaced revision's identity is reported,
+            its bytes are not retained. So a deletion here is a destruction, never an undo, and the receipt says
+            so instead of promising a baseline the server cannot produce.
     SessionToolSourceResponse:
       type: object
       description: The installed source revision of one session tool.
@@ -5259,11 +5952,20 @@ components:
           type: string
         module_text:
           type: string
-          maxLength: 262144
+          description: >-
+            The captured entry module, and this read carries NO character cap of its own: a path-shaped revision
+            reports the whole entry file as the kernel read it from disk, so the text can be longer than anything
+            an HTTP body could have uploaded. The write side is bounded differently: `module_text` on the create
+            and update bodies has no length bound either, so only this route's 1,000,000-byte body cap applies to
+            it. The 262,144-byte figure elsewhere in this contract is the model-facing tool RESULT bound and has
+            nothing to do with source text in either direction.
         source:
           type: string
-          maxLength: 65536
-          description: The function body of a body-shaped registration, absent for a module-shaped one.
+          maxLength: 20000
+          description: >-
+            The function body of a body-shaped registration, absent for a module-shaped one. 20,000 is the
+            registration kernel's OWN ceiling (`createDynamicTool`), and it is re-checked when a persisted
+            revision is restored, so no historical value can arrive here above it.
         dependencies:
           type: array
           maxItems: 32
@@ -5455,14 +6157,21 @@ components:
           $ref: '#/components/schemas/SessionTurnStatus'
         prompt_preview:
           type: string
-          maxLength: 280
+          maxLength: 160
+          description: >-
+            At most 160 characters of the task text: whitespace is flattened onto one line, the head is kept, and
+            a cut is marked with a trailing ellipsis INSIDE the 160. Read `prompt_chars` for the real length.
         prompt_chars:
           type: integer
           minimum: 0
           description: EXACT recorded prompt length, which the preview stands in for.
         thread_id:
           type: string
-          description: The conversation this task will continue; absent means a new host thread at execution.
+          description: >-
+            The conversation this task will continue. An unfocused submit already owns one by the time it is
+            queued - the route opens the host thread when the turn is created, not at execution - so the field is
+            present on a queued row the moment the 202 is issued. Absent means the turn has no conversation of
+            its own: a slash-command turn, or a session whose harness cannot carry threads.
         thread_label:
           type: string
         reference_labels:
@@ -5475,6 +6184,11 @@ components:
           minimum: 0
         accepted_at:
           type: integer
+          description: >-
+            When the server took this task. It is the turn's `startedAt` when one exists and otherwise its
+            `updatedAt`, which for a queued record is exactly the instant the submit was accepted - the same
+            figure the turn row and the stream carry, so a queue panel and a turn list cannot show two different
+            times for one task.
     QueuedTaskPage:
       description: Page of queued tasks, in pump order.
       allOf:
@@ -5628,7 +6342,10 @@ components:
                 $ref: '#/components/schemas/CommandDescriptor'
     UsageByThread:
       type: object
-      description: One conversation's share of the session's reported usage, so cost follows what the user is looking at.
+      description: >-
+        One conversation's share of the session's reported usage, so cost follows what the user is looking at.
+        Present only for a conversation whose turns reported something: a thread that ran only a slash command,
+        or only a provider that reports no usage, gets no row rather than a row of zeroes.
       required: [thread_id, usage]
       additionalProperties: false
       properties:
@@ -5661,16 +6378,19 @@ components:
             - $ref: '#/components/schemas/HarnessUsage'
         by_thread:
           type: array
-          maxItems: 100
           description: >-
-            Per-conversation totals, page-sized at most 100 rows and ordered by total descending. When
-            `truncated` is true the omitted rows are derivable from the turn pages, which each carry their own
-            usage.
+            Per-conversation totals, UNCAPPED and unpaginated: one row for every conversation whose turns
+            reported anything, in first-reported order - the order the fold met each conversation while walking
+            the turns oldest first. It is deliberately not sorted by cost, so a client that wants the expensive
+            conversations first sorts the rows itself. Nothing is ever omitted from this list.
           items:
             $ref: '#/components/schemas/UsageByThread'
         truncated:
           type: boolean
-          description: True when `by_thread` was cut at 100 rows, so the reader never mistakes the list for a complete partition.
+          description: >-
+            True once 256 distinct conversations reported usage - the session's conversation budget - and NOT
+            because a row was dropped: no row is ever dropped here. Read it as "this session is at the thread cap
+            and this list is as large as a session can get", which is the only signal the fold can honestly give.
         revision:
           type: integer
           minimum: 0
@@ -5681,9 +6401,11 @@ components:
       type: object
       description: >-
         One conversation as a roster row: identity, ownership, lifecycle, and transcript SIGNALS. The committed
-        transcript - every tool result verbatim, each bounded at 65,536 bytes of text - is deliberately absent,
-        which is what makes a 256-conversation roster a bounded read. `message_count` and `has_transcript` say
-        whether a transcript read is worth asking for, and `preview` is a bounded tail of the last entry.
+        transcript - every tool result verbatim, each bounded at 262,144 bytes (256 KiB) of model-facing text -
+        is deliberately absent, which is what makes a 256-conversation roster a bounded read. `message_count` and
+        `has_transcript` say whether a transcript read is worth asking for. This is also the shape a stream
+        `thread.upsert` row carries, and it is the ONLY place `preview` appears: a REST roster row and a REST
+        create/identified read never send it.
       required: [id, agent, origin, status, sequence, transcript_state, message_count, has_transcript]
       additionalProperties: false
       properties:
@@ -5696,10 +6418,16 @@ components:
           enum: [agent, host]
           description: >-
             `agent` is that agent's DEFAULT conversation, implicit and never deletable; `host` is an ADDITIONAL
-            independent conversation, opened by an unfocused submit, by a client, or by a delegated child.
+            independent conversation, opened by an unfocused submit, by a client, or by a delegated child. Only
+            `host` conversations are listed by `GET /sessions/{id}/threads`, so a row read over REST is `host` by
+            construction and `agent` shows up only in projections that include the implicit conversation.
         status:
           type: string
           enum: [idle, running, paused, stopped]
+          description: >-
+            The record's lifecycle state. All four values can be REPORTED; the roster's `status` filter accepts
+            only `idle`, `running` and `stopped`, so `paused` is a state you can read but cannot filter on (the
+            filter answers 400 for it).
         sequence:
           type: integer
           minimum: 0
@@ -5724,17 +6452,28 @@ components:
         message_count:
           type: integer
           minimum: 0
-          description: How many transcript entries the conversation holds, never their content.
+          description: >-
+            How many transcript entries the conversation holds, never their content - and 0 for an `unreadable`
+            conversation, because what the model is sent there is the placeholder, not the stored value.
         chars:
           type: integer
           minimum: 0
-          description: Exact character total of the stored transcript, so a client can size a paged read.
+          description: >-
+            Exact character total of the live entries' text content, so a client can size a paged read. ABSENT
+            when the conversation holds no entry, rather than answering 0 twice over.
         has_transcript:
           type: boolean
+          description: >-
+            True when there is a transcript worth reading. False for an empty conversation and for an `unreadable`
+            one, whose stored value lives only on the document route.
         preview:
           type: string
-          maxLength: 280
-          description: Bounded tail of the last committed entry, so a roster row still shows something.
+          maxLength: 160
+          description: >-
+            The OPENING of the last committed entry (not its tail): flattened onto one line, cut at 160
+            characters with a trailing ellipsis inside the bound, and absent entirely when the last entry has no
+            text content. NEVER present on a REST thread row - the roster list, the create receipt and the
+            identified read all omit it - and only a stream `thread.upsert` row projects it.
     ThreadResource:
       type: object
       description: >-
@@ -5759,29 +6498,43 @@ components:
               description: The invocation identity of this conversation's LATEST run.
             invocation_ids:
               type: array
-              maxItems: 512
+              maxItems: 64
               description: >-
-                EVERY invocation id observed running here, oldest first - the complete join to invocation cards
-                inside turn events, which the single latest and origin slots cannot provide once a conversation
-                has been resumed. Values are unique and belong to this thread only.
+                The invocation ids recorded as running here, oldest first, at most 64 of them. The cap keeps the
+                FIRST 64 and stops, so on a conversation with more recorded work than that it is the NEWEST ids
+                that are missing - the opposite of what "recent work first" would suggest - which is why
+                `invocation_id` (latest) and `origin_invocation_id` (first) are carried separately and stay
+                correct whatever this list dropped. Values are unique and belong to this thread only.
               items:
                 type: string
             invocation_ids_truncated:
               type: boolean
               description: >-
-                True when the roster exceeded 512 entries and the oldest were dropped, so a client never mistakes
-                a cut list for the whole history.
+                True as soon as 64 ids were recorded for this conversation, because that is the point where the
+                projection stopped adding - so it reports "the list hit its bound", including in the exact case
+                where there were precisely 64 and nothing was actually lost. Treat it as "ask for the newer ids
+                from the turn routes", never as a count of what was dropped.
             references:
               type: array
               maxItems: 16
-              description: The result blocks this conversation consumes (the `#` links), deduplicated.
+              description: >-
+                The result blocks this conversation consumes (the `#` links), copied VERBATIM from the recorded
+                turn this row names in `origin_turn_id` and in the order that submit bound them - explicit
+                entries first, then any typed `#LABEL` token - with NO deduplication and no sorting, so the same
+                block can appear more than once (one submit merges its explicit list with its prompt tokens).
+                Because only that one turn is read, this is the conversation's ENTRY reference list rather than
+                its whole reference history: links added by a later turn of the same conversation appear on the
+                turn routes instead. The 16-entry bound is the kernel's cap on ONE submit, not on a
+                conversation.
               items:
                 $ref: '#/components/schemas/AgentResultReference'
             connected_thread_ids:
               type: array
               description: >-
-                The conversations those blocks belong to. A REFERENCE EDGE, never ownership: stopping or deleting
-                a connected source neither aborts nor removes this conversation.
+                The conversations those blocks belong to, as a sorted, deduplicated union across EVERY recorded
+                turn of this conversation - a wider view than `references`, which states only the entry turn's
+                list. A connection is a reference EDGE, never ownership: stopping or deleting a connected source
+                neither aborts nor removes this conversation.
               items:
                 type: string
             transcript_revision:
@@ -5833,12 +6586,17 @@ components:
         label:
           type: string
           maxLength: 120
-          description: Trimmed display label. Grants no authority and is not an identifier.
+          description: >-
+            Trimmed display label, at most 120 characters. Grants no authority and is not an identifier. The
+            bound is enforced by the runtime rather than by request parsing, so a blank or over-long value is an
+            unclassified failure and answers 500 with the runtime's message - keep it inside 120 on the client.
         owner_thread_id:
           type: string
           description: >-
             Must already exist and must be a HOST thread, because an agent's default conversation is implicit and
-            is never persisted as a thread record that could be restored as an owner.
+            is never persisted as a thread record that could be restored as an owner. An id this session does not
+            have is 404, checked before anything mutates; an id that exists but names an agent's default
+            conversation is refused by the runtime and therefore answers 500.
     DeleteThreadResult:
       type: object
       description: >-
@@ -5873,9 +6631,13 @@ components:
       properties:
         cancelled:
           type: boolean
+          enum: [true]
           description: >-
-            True when a live run was aborted or at least one queued turn of that conversation was dropped; false
-            when the conversation was merely marked stopped because it had no work.
+            ALWAYS true, and it reports the call, not the work: this route performs the stop and answers true
+            whether or not anything was running, discarding the store's own "did a live run actually abort"
+            result. An idle conversation with no queued turn gets the same `true` alongside `status: stopped`, so
+            a client must not read `false` as "nothing to stop" - that value is never sent - and must use the
+            thread row's own status for that.
         thread_id:
           type: string
         session_id:
@@ -5887,6 +6649,11 @@ components:
         dropped_queued_tasks:
           type: integer
           minimum: 0
+          description: >-
+            Tasks removed from the queue by this stop, counted as the NAMED conversation's own lane backlog
+            measured before the stop began. A conversation this one owns is also stopped and its backlog drained,
+            and a session-level (legacy) backlog may go too, but neither is counted here - so the figure is a
+            floor, not the total this call discarded.
         revision:
           type: integer
           minimum: 0
@@ -5975,8 +6742,9 @@ components:
         `role` filter, so a client can page a filtered view and still know the conversation's size. `revision` is
         the transcript's own counter (`TranscriptMetadata.revision`), the same figure the `transcript` and
         `transcript_messages` kinds of `StreamResourceKind` report, so paging and replacing never present two
-        numbers to compare. A tool entry's `content` is recorded text bounded at the model-facing 65,536 bytes,
-        which is precisely why this route is paged rather than embedded in a session read.
+        numbers to compare. A tool entry's `content` is recorded text bounded at the model-facing 262,144 bytes
+        (256 KiB per result, with no aggregate cap across a turn's parallel calls), which is precisely why this
+        route is paged rather than embedded in a session read.
       allOf:
         - $ref: '#/components/schemas/PageMeta'
         - type: object
@@ -6309,10 +7077,13 @@ components:
     TurnEventPage:
       description: >-
         Page of one turn's verbatim recorded events. `revision` is the owning turn's `TurnResource.revision` (the
-        `turn_events` counter of `StreamResourceKind` is DEFINED to be that figure), and `total_events` is the
-        position within it, so a client holding the turn revision already knows whether this page is current - one
-        counter per comparison, never two. `partial` is true while the turn is still running, so a client keeps
-        polling from `next_cursor` instead of assuming the record is complete.
+        `turn_events` counter of `StreamResourceKind` is DEFINED to be that figure), so a client holding the turn
+        revision already knows whether this page is current - one counter per comparison, never two. `total_events`
+        is NOT that counter and is not filter-independent: it is how many recorded events match the `type` filter
+        in force (all of them when no filter was sent), so the same turn answers two different totals depending on
+        the query and a client must not compare the figure against `items.length` of an unfiltered walk.
+        `partial` is true while the turn is `queued` OR `running`, so a client keeps polling from `next_cursor`
+        instead of assuming the record is complete.
       allOf:
         - $ref: '#/components/schemas/PageMeta'
         - type: object
@@ -6324,10 +7095,15 @@ components:
             total_events:
               type: integer
               minimum: 0
-              description: Events recorded so far, independent of the `type` filter.
+              description: >-
+                Events recorded so far that match the current `type` filter - every recorded event when the
+                filter is absent, and 0 for a filter naming a type this turn never recorded. It is recomputed on
+                every page and never refers to the unfiltered stream when a filter was sent.
             partial:
               type: boolean
-              description: True when the turn is still executing and more events will follow.
+              description: >-
+                True while the turn is `queued` or `running` - accepted work that has not started yet reports it
+                too, because its event list is genuinely incomplete rather than merely short.
             items:
               type: array
               maxItems: 100
@@ -7261,8 +8037,8 @@ components:
             content:
               type: string
               description: >-
-                The model-facing result text, bounded at 65,536 bytes by the record itself; the step detail route
-                answers the recorded bytes from the durable event rather than this projection.
+                The model-facing result text, bounded at 262,144 bytes (256 KiB) by the record itself; the step
+                detail route answers the recorded bytes from the durable event rather than this projection.
             toolCallId:
               type: string
             name:

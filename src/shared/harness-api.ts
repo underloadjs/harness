@@ -296,9 +296,14 @@ export interface HealthResponse {
 }
 
 /**
- * What THIS deployment offers, stated as booleans so a client hides an affordance instead of discovering a 403
- * or a 404 by clicking it. Every capability here maps onto real routes; a false value means the routes exist
- * and answer 403 (policy) or 404 (not applicable), not that a different path exists.
+ * What THIS deployment offers, stated as booleans so a client hides an affordance instead of discovering it by
+ * clicking. This is an ADVERTISEMENT, not a switch: with one exception no route consults one of these flags, so
+ * no value here changes a status code. The exception is `websocket_stream`, which the stream route does read
+ * and refuses with 403 when it is false. The other eight describe work this build has already decided it
+ * performs: the shipped advertisement is all-true, a deployment may withhold a flag through its start options,
+ * and in either case no route consults the flag - so a client uses them to choose which affordances to show and
+ * never to explain a refusal. A false value would mean the routes still exist and behave as this document
+ * describes them, not that a different path exists.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ServiceCapabilities {
@@ -316,7 +321,9 @@ export interface ServiceCapabilities {
 /**
  * The numeric envelope every route is bounded by, published once so a client validates before sending and
  * explains a refusal without guessing. These are contract numbers, not aspirations: a route refuses a value
- * above them with 400, 413, 415, or 429 as stated on the operation.
+ * above them with 400, 413, 415, 429, or 500 as stated on the operation - 500 in the one case where a runtime
+ * refusal is not classified into a status of its own, `thread_records` on `POST
+ * /sessions/{session_id}/threads`.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ServiceLimits {
@@ -472,7 +479,9 @@ export type HarnessDefinition = HarnessCard
 /**
  * Selection-only body. A client picks trusted agent names and may record per-agent model ids, instruction
  * overrides, and display colors; it cannot supply a provider, a credential, a transport, or a tool list. Every
- * override key must name a member of the resulting definition.
+ * override key must name a member of the resulting definition. The roster itself is validated as a SET: an
+ * agent listed in `subagents` more than once is a 400, and listing `primary` in `subagents` is a 400, because a
+ * harness has exactly one primary.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateHarnessRequest {
@@ -541,7 +550,8 @@ export interface HarnessInstructionIndexResponse {
 }
 
 /**
- * One member's effective instruction text, with its provenance.
+ * One member's effective instruction text, with its provenance. A retired member with no harness override has
+ * nothing to project on this route, and the read then answers 200 with an EMPTY body rather than this document.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface HarnessInstructionTextResponse {
@@ -994,12 +1004,18 @@ export interface CreateSessionRequest {
 }
 
 /**
- * The session-level writes, both declarative. An omitted property is no change. `agent_models` MERGES: an agent
- * absent from the body keeps the model it currently runs, so changing one selection does not reset its
- * siblings; every key must name a member of this session's frozen definition and every value a non-empty model
- * id, or the whole patch is refused with 400 and nothing is applied. `title` REPLACES the display name, and an
- * explicit `null` clears it. `{}` is a 400 no-op. Recorded history, the harness definition, and the endpoint
- * settings are immutable over HTTP.
+ * The session-level writes, both declarative. An omitted property is no change, and a body that names neither
+ * field (`{}`) is refused with 400 rather than answering a success that changed nothing. `agent_models` MERGES:
+ * an agent absent from the body keeps the model it currently runs, so changing one selection does not reset its
+ * siblings; every key must name a live member of this session (the frozen definition plus anything bound since)
+ * and every value a trimmed, non-empty model id of at most 200 characters with no control characters, or the
+ * whole patch is refused with 400 and nothing is applied. A present-but-empty map is NOT that refusal: the
+ * patch merges over the live map, so `{ "agent_models": {} }` changes nothing and answers 200 with an unchanged
+ * map and a bumped `revision`. The store's stricter "at least one agent model" 400 is enforced on the MERGED
+ * map, and a live session always has at least one agent brain because the entry agent cannot be detached.
+ * `title` REPLACES the display name, and an explicit `null` clears it; the string is trimmed and then TRUNCATED
+ * to 200 characters server-side, never refused for length, and a trimmed-empty title clears the field like
+ * `null` does. Recorded history, the harness definition, and the endpoint settings are immutable over HTTP.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateSessionRequest {
@@ -1067,7 +1083,7 @@ export interface SessionAgentResponse {
  */
 export interface CreateSessionAgentRequest {
     name: string;
-    profile: string;
+    profile?: string;
     model?: string;
     instruction?: string;
     role?: "primary" | "subagent";
@@ -1076,12 +1092,24 @@ export interface CreateSessionAgentRequest {
 /**
  * An omitted property is no change; a string REPLACES the whole field; an explicit `null` clears the session
  * override and RESTORES the inherited binding. Identity, profile, tools, and the delegation graph are immutable
- * here.
+ * here. A model patch is accepted while the session runs; an instruction patch needs an idle session and
+ * answers 409 while a live run or queued work exists.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateSessionAgentRequest {
     model?: string | null;
     instruction?: string | null;
+}
+
+/**
+ * One field, required: a string REPLACES this member's whole system prompt for this session, and `null` clears
+ * the session override so the member runs the deployment's current effective profile text (for a profile
+ * member) or the base instruction this conversation created it with (for a session-defined agent). Nothing else
+ * on the binding is writable from here, and no other field is accepted.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface UpdateSessionAgentInstructionRequest {
+    instruction: string | null;
 }
 
 /**
@@ -1140,8 +1168,9 @@ export type SessionToolDetail = SessionToolSummary
 };
 
 /**
- * How this entry may be called from HTTP, stated rather than inferred. `session_required` is the normal answer
- * for a protected control tool, whose effect depends on a live conversation.
+ * How this entry may be called from HTTP, stated rather than inferred. This is the SESSION-route projection,
+ * and it has two values here, never three: the session route classifies a name by what this conversation holds,
+ * not by what the catalogue says.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ToolExecutionScope {
@@ -1244,8 +1273,10 @@ export interface SessionToolRegistrationResponse {
 }
 
 /**
- * The receipt states what the removal actually did, because removing a name this session OVERRODE restores the
- * inherited catalogue binding, while removing a name created in this session simply ends it.
+ * The receipt states what the removal actually did, and the two flags are not opposites: one reports what this
+ * session lost, the other reports an undo this build cannot perform. Removing a name created in this session
+ * ends it until it is created again; removing a name this session merely enabled through `toolRequest` takes
+ * the grant away and leaves the shared catalogue entry exactly as it was.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface DeleteSessionToolResult {
@@ -1253,7 +1284,7 @@ export interface DeleteSessionToolResult {
     tool_id: string;
     session_id: string;
     removed_created: boolean;
-    restored_inherited: boolean;
+    restored_inherited: false;
 }
 
 /**
@@ -1444,6 +1475,8 @@ export type CommandPage = PageMeta
 
 /**
  * One conversation's share of the session's reported usage, so cost follows what the user is looking at.
+ * Present only for a conversation whose turns reported something: a thread that ran only a slash command, or
+ * only a provider that reports no usage, gets no row rather than a row of zeroes.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UsageByThread {
@@ -1469,9 +1502,11 @@ export interface SessionUsageResponse {
 
 /**
  * One conversation as a roster row: identity, ownership, lifecycle, and transcript SIGNALS. The committed
- * transcript - every tool result verbatim, each bounded at 65,536 bytes of text - is deliberately absent, which
- * is what makes a 256-conversation roster a bounded read. `message_count` and `has_transcript` say whether a
- * transcript read is worth asking for, and `preview` is a bounded tail of the last entry.
+ * transcript - every tool result verbatim, each bounded at 262,144 bytes (256 KiB) of model-facing text - is
+ * deliberately absent, which is what makes a 256-conversation roster a bounded read. `message_count` and
+ * `has_transcript` say whether a transcript read is worth asking for. This is also the shape a stream
+ * `thread.upsert` row carries, and it is the ONLY place `preview` appears: a REST roster row and a REST
+ * create/identified read never send it.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ThreadSummary {
@@ -1554,7 +1589,7 @@ export interface DeleteThreadResult {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CancelThreadResult {
-    cancelled: boolean;
+    cancelled: true;
     thread_id: string;
     session_id: string;
     status: "stopped";
@@ -1599,8 +1634,9 @@ export interface TranscriptMetadataResponse {
  * filter, so a client can page a filtered view and still know the conversation's size. `revision` is the
  * transcript's own counter (`TranscriptMetadata.revision`), the same figure the `transcript` and
  * `transcript_messages` kinds of `StreamResourceKind` report, so paging and replacing never present two numbers
- * to compare. A tool entry's `content` is recorded text bounded at the model-facing 65,536 bytes, which is
- * precisely why this route is paged rather than embedded in a session read.
+ * to compare. A tool entry's `content` is recorded text bounded at the model-facing 262,144 bytes (256 KiB per
+ * result, with no aggregate cap across a turn's parallel calls), which is precisely why this route is paged
+ * rather than embedded in a session read.
  */
 export type TranscriptMessagePage = 
     | PageMeta
@@ -1747,10 +1783,13 @@ export interface TurnEventRow {
 
 /**
  * Page of one turn's verbatim recorded events. `revision` is the owning turn's `TurnResource.revision` (the
- * `turn_events` counter of `StreamResourceKind` is DEFINED to be that figure), and `total_events` is the
- * position within it, so a client holding the turn revision already knows whether this page is current - one
- * counter per comparison, never two. `partial` is true while the turn is still running, so a client keeps
- * polling from `next_cursor` instead of assuming the record is complete.
+ * `turn_events` counter of `StreamResourceKind` is DEFINED to be that figure), so a client holding the turn
+ * revision already knows whether this page is current - one counter per comparison, never two. `total_events`
+ * is NOT that counter and is not filter-independent: it is how many recorded events match the `type` filter in
+ * force (all of them when no filter was sent), so the same turn answers two different totals depending on the
+ * query and a client must not compare the figure against `items.length` of an unfiltered walk. `partial` is
+ * true while the turn is `queued` OR `running`, so a client keeps polling from `next_cursor` instead of
+ * assuming the record is complete.
  */
 export type TurnEventPage = PageMeta
     & {

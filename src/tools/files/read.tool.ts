@@ -89,8 +89,42 @@
 //       bytes: number,               // total RAW content bytes returned
 //       wireBytes: number,           // serialized bytes the budget is charged on
 //       contentBudget: number,       // the wire budget this call was subject to
-//       skipped: number              // entries that reported an error, not content
+//       skipped: number,             // entries that reported an error, not content
+//       note?: string                // advisory for a truncated LARGE file
 //     }
+//
+// WHY A TOP-LEVEL `note` EXISTS (R4)
+// ----------------------------------
+// Every continuation field this tool publishes is per ENTRY, and a caller that reads a
+// 261 KB file gets back 256 KB of text plus four numbers it has to notice and
+// interpret. In a reviewed agent run that is exactly what did not happen: the model
+// read a truncated window of a large file, saw no prose telling it the file continued,
+// and answered as if it had the whole file. Small reads do not need the sentence (the
+// entry fields are the contract, and a note on every entry would cost budget).
+//
+// So `note` is a ONE-LINE-PER-FILE advisory, emitted only when BOTH hold:
+//   - the entry is `truncated` and therefore has a continuation (`nextByte` or
+//     `nextLine`), and
+//   - the file is at least FILE_READ_NOTE_MIN_BYTES (64 KiB).
+//
+// The size gate is what keeps the note an advisory rather than boilerplate, and it is
+// also why a 261 KB SINGLE-LINE file gets no note: such a file needs no escaping, so
+// it comes back whole (`truncated: false`, nothing withheld), and `sizeBytes` already
+// reports its size. A 261 KB multi-line file crosses the wire budget because every
+// `\n` costs two serialized bytes, and that is the case the note is for.
+//
+// At most FILE_READ_NOTE_MAX_PATHS paths are spelled out and the rest are counted, so
+// a 100-file batch cannot spend the budget it just freed on the advisory. The note's
+// worst-case serialized cost is reserved BEFORE the content budget is split
+// (`noteReserve`), which is what keeps `wireBytes <= contentBudget` true with the note
+// present — the guarantee the wire-cap test exists to prove. That reserve is priced in
+// UTF-8 BYTES like the measurement it protects, never in UTF-16 code units: a path of
+// CJK characters costs three bytes per character, and a code-unit reserve under-shoots
+// the cap by exactly the difference (F1).
+//
+// A clause never advises "raise maxLines" to a caller already at FILE_READ_MAX_LINES,
+// because following that advice with 20000+1 is rejected as an invalid request; at the
+// ceiling the note names the ceiling and gives the continuation instead (F3).
 //
 // WHY `limit` EXISTS (D5)
 // -----------------------
@@ -298,6 +332,21 @@ const READ_CHUNK_BYTES = 64 * 1024;
 // adversarial, and two passes already handle every realistic case.
 const ALLOCATION_PASSES = 4;
 
+// THE LARGE-FILE ADVISORY (`note`) — see "WHY A TOP-LEVEL `note` EXISTS" above.
+//
+// A file at or above this size is the case where a truncated window is genuinely
+// surprising: 64 KiB is the size every OTHER file tool in this package caps a whole
+// response at (`FILE_GLOB_CONTENT_BUDGET`, `FILE_GREP_CONTENT_BUDGET`), so a file this
+// large cannot be taken in by any of them in one call, while a smaller one usually
+// can. Below the gate the per-entry continuation fields are the whole contract and a
+// note would be noise charged against the caller's context.
+export const FILE_READ_NOTE_MIN_BYTES = 64 * 1024;
+
+// How many paths the note spells out. Beyond that the affected files are COUNTED,
+// because a 100-file batch of large reads must not spend the wire budget the allocator
+// just freed on the advisory itself.
+export const FILE_READ_NOTE_MAX_PATHS = 2;
+
 // Per-path request: a bare path keeps the old call shape, an object selects a
 // window. All range fields are optional so `{ path }` is valid too.
 export type FileReadTarget =
@@ -396,6 +445,14 @@ export type FileReadResult = {
     contentBudget: number;
     // How many entries reported an `error` instead of content.
     skipped: number;
+    // The prose advisory for a LARGE file whose window was cut — one short sentence per
+    // affected file (path, `sizeBytes`, bytes returned, and the continuation to use),
+    // first FILE_READ_NOTE_MAX_PATHS paths named and the remainder counted. Present ONLY
+    // when at least one entry is large enough and truncated enough to need it (see the
+    // "WHY A TOP-LEVEL `note` EXISTS" section), and the bytes it can cost are reserved
+    // before the content budget is split, so it never pushes the response over
+    // `contentBudget`. The key is absent, not `undefined`, for a small or complete read.
+    note?: string;
 };
 
 // The value `execute` receives: the `paths` array itself (single-property rule).
@@ -528,11 +585,27 @@ const ENTRY_VALUE_RESERVE = 200;
 
 // The JSON cost of one entry's `error` object, measured on the real message. A
 // failed entry is known before scanning starts, so there is no need to guess.
+//
+// `Buffer.byteLength`, NOT `String.length` (F1): the budget is charged on the UTF-8
+// bytes the harness actually serializes (see the `shape()` measurement below), while
+// `.length` counts UTF-16 code units. An error message embeds the requested path, so
+// `.length` UNDER-states the cost by 2 bytes per CJK character (3 UTF-8 bytes against 1
+// code unit) and by 2 more per astral character (4 UTF-8 bytes against the 2 code units a
+// surrogate pair occupies) — the reserve then buys content that does not fit, and
+// `wireBytes` crosses the 256 KiB envelope, which is the failure `boundToolResult`
+// turns into a truncated JSON envelope that destroys `nextByte`/`nextLine`.
+// `ENTRY_SHELL`/`RESULT_SHELL` below need no such conversion: their every character
+// is ASCII, where the two measures agree by construction.
 const entryErrorWire = (code: string, message: string): number =>
-    JSON.stringify({ error: { code, message } }).length - 1; // -1: the leading comma
+    Buffer.byteLength(JSON.stringify({ error: { code, message } })) - 1; // -1: the leading comma
 
+// One entry's fixed scaffolding, in UTF-8 BYTES (see `entryErrorWire` for why the
+// measurement is not `.length`): the shell, the escaped path, the value allowance,
+// and the error object when this path is unreadable. The `- 2` removes the two quote
+// characters `JSON.stringify` adds, because `ENTRY_SHELL` already contains them for
+// the empty path; quotes are ASCII, so removing them from a byte count is exact.
 const entryOverhead = (path: string, error?: { code: string; message: string }): number =>
-    ENTRY_SHELL.length + (JSON.stringify(path).length - 2) + ENTRY_VALUE_RESERVE +
+    ENTRY_SHELL.length + (Buffer.byteLength(JSON.stringify(path)) - 2) + ENTRY_VALUE_RESERVE +
     (error === undefined ? 0 : entryErrorWire(error.code, error.message));
 
 // The fixed cost of the result object around the array: `files`, the four summary
@@ -545,6 +618,172 @@ const RESULT_SHELL = JSON.stringify({
     contentBudget: 0,
     skipped: 0
 });
+
+// ---------------------------------------------------------------------------
+// THE LARGE-FILE ADVISORY (`note`) — rationale in the header section of the same
+// name. Two functions share one set of clause builders: `buildReadNote` produces the
+// text after the scan, `noteReserve` prices its WORST CASE before the scan, so the
+// response cannot grow past the budget it measured itself against.
+// ---------------------------------------------------------------------------
+
+// Fixed text of one clause, plus the widest number every field it quotes can carry:
+//   `" is ` + ` bytes; returned ` + `(limit: maxLines at the 20000 ceiling)` +
+//   ` - continue at startByte N, or { startLine: N, startColumn: N }`
+// The quoted path is added on top by the caller, in UTF-8 BYTES and DOUBLE-ESCAPED
+// (it is text inside the note string, which is itself serialized) — see `noteReserve`.
+// 208 dominates the widest clause the builders above can emit: ~115 bytes of fixed
+// text (the ceiling wording is the longest variant, longer than "raise maxLines") plus
+// up to 15 digits on each of the five numbers it quotes.
+const NOTE_CLAUSE_OVERHEAD = 208;
+
+// Everything around the clauses: the `read: ` prefix, the `; ` separators, the
+// "and N more large file(s)" tail, and the serialized `"note":"..."` key itself.
+const NOTE_SHELL_OVERHEAD = 128;
+
+// The prefix that makes the advisory self-describing once it is separated from the
+// entries it refers to (a model reads the note in the result envelope, out of order).
+const NOTE_PREFIX = 'read: ';
+
+// One entry plus the line cap its request applied. `FileReadEntry.limit` says WHY the
+// window stopped but not at what number, and `noteClause` needs the number to avoid
+// advising "raise maxLines" at the ceiling (F3). Slots are paired with entries by
+// index at the call site — `files` is `slots.map(...)`, so the order is the contract.
+type NoteCandidate = {
+    entry: FileReadEntry;
+    maxLines: number;
+};
+
+// Does this entry deserve a sentence? BOTH must hold (see the header section):
+// content was withheld, and the file is large. `truncated` alone is true for a
+// 10-line file read with `maxLines: 3`, where the flags already say everything.
+const noteWorthy = (entry: FileReadEntry): boolean =>
+    entry.error === undefined &&
+    entry.truncated &&
+    entry.sizeBytes !== null &&
+    entry.sizeBytes >= FILE_READ_NOTE_MIN_BYTES &&
+    // A continuation the caller can actually act on. `truncated` normally implies one,
+    // and the guard keeps a malformed entry from producing "continue at nothing".
+    (entry.nextByte !== null || entry.nextLine !== null);
+
+// The resume advice for one entry. `startByte` leads because it is the only form that
+// resumes by SEEKING (no rescanned prefix), and it is exact even mid-line; the
+// `{ startLine, startColumn }` spelling is offered because a caller that pages by line
+// has those fields at hand. `startColumn` is named only when the cut landed INSIDE a
+// line, where omitting it would resume at the wrong offset.
+const noteContinuation = (entry: FileReadEntry): string => {
+    const primary =
+        entry.nextByte !== null ? `startByte ${entry.nextByte}` : `startLine ${entry.nextLine}`;
+
+    // Nothing to offer as an alternative when the primary IS the line form.
+    if (entry.nextByte === null || entry.nextLine === null) return primary;
+
+    const column = entry.nextColumn === null || entry.nextColumn === 0 ? '' : `, startColumn: ${entry.nextColumn}`;
+
+    return `${primary}, or { startLine: ${entry.nextLine}${column} }`;
+};
+
+// One file's sentence: size, what came back, why it stopped, and how to continue.
+//
+// `maxLines` is the cap THIS request applied, which the entry cannot report (its
+// `limit` field is only the reason, not the number). The distinction matters because
+// the two `maxLines` cases have OPPOSITE remedies:
+//   - below the ceiling: raising `maxLines` is free progress, so the clause says so;
+//   - AT the ceiling (FILE_READ_MAX_LINES): "raise maxLines" is a trap — following it
+//     with 20001 is rejected by `readMaxLines` as an invalid request, so the clause
+//     names the ceiling it hit and leaves the continuation as the only remedy (F3).
+const noteClause = (entry: FileReadEntry, maxLines: number): string => {
+    const limit =
+        entry.limit !== 'maxLines'
+            ? `limit: ${entry.limit ?? 'budget'}`
+            : maxLines >= FILE_READ_MAX_LINES
+              ? `limit: maxLines at the ${FILE_READ_MAX_LINES} ceiling`
+              : 'limit: maxLines - raise maxLines';
+
+    return `${JSON.stringify(entry.path)} is ${entry.sizeBytes} bytes; returned ${entry.bytes} (${limit}) - continue at ${noteContinuation(entry)}`;
+};
+
+// The note itself, built from the FINAL entries (paired with the cap each request
+// applied — see `noteClause`). Absent (not empty) when no entry qualifies, so
+// `note === undefined` keeps meaning "nothing needed explaining" — the same convention
+// glob and grep publish, and the reason a JSON round trip cannot invent a key.
+const buildReadNote = (candidates: readonly NoteCandidate[]): string | undefined => {
+    const large = candidates.filter((candidate) => noteWorthy(candidate.entry));
+
+    if (large.length === 0) return undefined;
+
+    const clauses = large
+        .slice(0, FILE_READ_NOTE_MAX_PATHS)
+        .map((candidate) => noteClause(candidate.entry, candidate.maxLines));
+    const rest = large.length - clauses.length;
+
+    if (rest > 0) clauses.push(`and ${rest} more large file(s) report truncated/nextByte`);
+
+    return `${NOTE_PREFIX}${clauses.join('; ')}.`;
+};
+
+// The serialized cost to reserve for the note BEFORE the content budget is split.
+//
+// The note itself needs the scan outcome, which does not exist yet, so the reserve is
+// priced from the set the note can only ever be drawn from: a file the note may name is
+// a READABLE slot (`entry === null` after the open phase) at or above
+// FILE_READ_NOTE_MIN_BYTES, and that is exactly the predicate `noteWorthy` tests against
+// the same `sizeBytes` (`scanSafely` copies the stat size onto the entry).
+//
+// The two LONGEST such paths are reserved, which dominates whatever pair the note
+// actually names (it names the first two in request order), and the fixed clause and
+// shell overheads are constants above sized for the widest numbers. A reserve larger
+// than the final note only costs a few hundred content bytes out of 256 KiB; a reserve
+// SMALLER than it would let `wireBytes` overshoot the budget, which is the one property
+// the wire-cap test exists to protect.
+//
+// The path is priced in UTF-8 BYTES, not `String.length` (F1). The note quotes the path
+// exactly as `JSON.stringify` renders it, and the harness measures the response in
+// bytes, so a code-unit count under-states every non-ASCII path by 2 bytes per CJK
+// character — which is how a 261 KiB read under a CJK path ended 52 bytes over the cap
+// and lost its continuation fields to the envelope.
+//
+// The path term is priced DOUBLE-serialized (F1-residual), because the note is the one
+// place in the response where a path is escaped TWICE: `noteClause` embeds
+// `${JSON.stringify(entry.path)}` as TEXT inside the note string, and that string is
+// then serialized as a JSON value. JSON string escaping is per code unit and
+// context-free, so the wire cost of that embedded term is exactly
+// `byteLength(JSON.stringify(quoted)) - 2` — hence the whole double-serialized length
+// below, which dominates it by those 2 quote bytes. A single serialization prices each
+// escaped path character at 2 bytes (`\"`) where the wire carries 4 (`\\\"`, because BOTH
+// characters of the inner escape are escaped again) — 2 unpriced bytes per escaped
+// character, plus 4 more for the two inner quote delimiters the outer pass also has to
+// escape. Measured:
+// 180 quotes under-reserved 364 bytes and a 261,000-byte multi-line read measured
+// 262,146 against the 262,144-byte budget; 200 quotes + 40 backslashes under-reserve 484,
+// which is 122 bytes past the cap on top of the ~362 bytes of slack `ENTRY_VALUE_RESERVE`
+// and the shell constants leave — the envelope cut that destroys `files`/`nextByte`. The
+// `read > holds the wire cap for a cut large file under an escape-heavy path` test pins
+// exactly that shape. `entryOverhead` keeps the SINGLE measure: an entry's `path` is a
+// JSON string value, escaped only once.
+const noteReserve = (slots: readonly ScanSlot[]): number => {
+    const candidates = slots
+        .filter((slot) => slot.entry === null && slot.sizeBytes >= FILE_READ_NOTE_MIN_BYTES)
+        // `resolve(...)` is the exact value `noteClause` embeds: a note-worthy entry is
+        // a scanned one, and `scanSafely` sets `path: resolve(request.path)` (see the
+        // entry construction above), so the reserve cannot price a different string than
+        // the note quotes.
+        .map((slot) => {
+            const quoted = JSON.stringify(resolve(slot.request.path));
+            return Buffer.byteLength(JSON.stringify(quoted), 'utf8');
+        })
+        .sort((left, right) => right - left)
+        .slice(0, FILE_READ_NOTE_MAX_PATHS);
+
+    if (candidates.length === 0) return 0;
+
+    return (
+        NOTE_SHELL_OVERHEAD +
+        candidates.reduce((total, pathBytes) => total + pathBytes + NOTE_CLAUSE_OVERHEAD, 0) +
+        // `; ` between clauses and the closing `.` of the sentence.
+        (candidates.length - 1) * 2 +
+        1
+    );
+};
 
 // The ordered entry a failed path produces. It is shaped exactly like an empty
 // window (empty content, endLine = startLine - 1, no continuation, zero bytes), so
@@ -1397,7 +1636,7 @@ const isDirectory = async (path: string): Promise<boolean> => {
 export const FILE_READ_METADATA: PresetToolMetadata = {
     name: 'read',
     description:
-        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped }. Defaults: startLine 1, startColumn 0, startByte null, and NO line cap — the byte budget is the limit, so a default read returns as much as the envelope holds; an EXPLICIT maxLines is an integer in [1, 20000]. `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. `limit` says WHY a truncated window stopped: "maxLines" (raise maxLines to get more) or "budget" (more lines would not help; the 256 KiB envelope is full) — or null when the window reached EOF, in which case truncated is false. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. A startByte that lands inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; a startByte at or past the end of the file is an ERANGE entry, not an empty window, so "offset out of range" and "file is empty" are different answers. With no startLine, the true line at a seek offset is counted and reported rather than defaulting to 1. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use files or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), ERANGE (startByte at or past EOF), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte counts newlines from the start to find it, on raw bytes and at seek speed. Binary detection is WINDOW-SCOPED, not whole-file: bytes outside the requested window are never decoded, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.',
+        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped, note? }. Defaults: startLine 1, startColumn 0, startByte null, and NO line cap — the byte budget is the limit, so a default read returns as much as the envelope holds; an EXPLICIT maxLines is an integer in [1, 20000]. `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. `limit` says WHY a truncated window stopped: "maxLines" (raise maxLines to get more) or "budget" (more lines would not help; the 256 KiB envelope is full) — or null when the window reached EOF, in which case truncated is false. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. LARGE FILE: check `sizeBytes` against `bytes` and read `truncated` before assuming you have the whole file, and for a file you already know is large ask for a window ({ startLine } or { startByte }) instead of reading blindly from the top — when a file of 65536 bytes or more comes back cut, the top-level `note` names up to 2 of them — their size, what was returned, and the exact continuation — and counts the remainder as \"and N more large file(s) report truncated/nextByte\", so a big batch never spends the budget the note freed. A startByte that lands inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; a startByte at or past the end of the file is an ERANGE entry, not an empty window, so "offset out of range" and "file is empty" are different answers. With no startLine, the true line at a seek offset is counted and reported rather than defaulting to 1. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use files or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), ERANGE (startByte at or past EOF), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte counts newlines from the start to find it, on raw bytes and at seek speed. Binary detection is WINDOW-SCOPED, not whole-file: bytes outside the requested window are never decoded, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.',
     tags: ['files', 'read', 'filesystem'],
     // R18: everyday file access is core — always declared, never discovered.
     visibility: 'core',
@@ -1579,7 +1818,12 @@ export const read = tool<FileReadParameters, FileReadResult>({
         // Reserve the scaffolding of EVERY entry first, including the failed ones: an
         // error message is part of the response and costs wire bytes too. What is
         // left is content.
-        let reserved = RESULT_SHELL.length;
+        //
+        // `noteReserve(slots)` is added to the same reserve (R4): the advisory is only
+        // writable after the scan, but it is part of the response too, so a budget
+        // spent without pricing it is a budget that overshoots `contentBudget` exactly
+        // when the note fires — the one case the wire-cap test covers.
+        let reserved = RESULT_SHELL.length + noteReserve(slots);
         for (const slot of slots) reserved += slot.overhead;
 
         const contentBudget = Math.max(0, FILE_READ_WIRE_BUDGET - reserved);
@@ -1643,6 +1887,16 @@ export const read = tool<FileReadParameters, FileReadResult>({
         const truncated = files.some((entry) => entry.truncated);
         const skipped = files.filter((entry) => entry.error !== undefined).length;
 
+        // The advisory, decided from the FINAL entries (see `buildReadNote`). Each entry
+        // is paired with the line cap its OWN request applied, because the note must not
+        // advise "raise maxLines" to a caller already at FILE_READ_MAX_LINES (F3); the
+        // pairing is by index and `files` is built from `slots` in the same order. Its
+        // worst-case cost was already taken out of the content budget by `noteReserve`,
+        // so adding it here cannot push `wireBytes` past `contentBudget`.
+        const note = buildReadNote(
+            slots.map((slot, index) => ({ entry: files[index], maxLines: slot.request.maxLines }))
+        );
+
         // Measure the real serialized length rather than trusting the reserve: this
         // is the exact number the harness compares against its own cap, so a caller
         // can rely on `wireBytes <= contentBudget`.
@@ -1653,9 +1907,15 @@ export const read = tool<FileReadParameters, FileReadResult>({
         // measurement is monotone in the inserted value and the value's digit count
         // stabilises after one refinement, so the loop settles immediately; the cap
         // just guarantees termination for any input.
+        //
+        // `note` leads the object — the same reasoning grep gives for putting `note`
+        // before `matches`: if the harness ever does cut a serialized result, it keeps
+        // the BEGINNING, and the advisory is the part a caller needs in order to read
+        // the rest of the response correctly.
         const shape = (wire: number) =>
             Buffer.byteLength(
                 JSON.stringify({
+                    ...(note === undefined ? {} : { note }),
                     files,
                     truncated,
                     bytes,
@@ -1678,6 +1938,14 @@ export const read = tool<FileReadParameters, FileReadResult>({
             wireBytes = next;
         }
 
-        return { files, truncated, bytes, wireBytes, contentBudget: FILE_READ_WIRE_BUDGET, skipped };
+        return {
+            ...(note === undefined ? {} : { note }),
+            files,
+            truncated,
+            bytes,
+            wireBytes,
+            contentBudget: FILE_READ_WIRE_BUDGET,
+            skipped
+        };
     }
 });

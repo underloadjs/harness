@@ -27,10 +27,10 @@
 // server/environment.test.ts.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile as writeTextFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { toolParameterKey } from '../../core';
+import { boundToolResult, toolParameterKey } from '../../core';
 import { MODEL_TOOL_RESULT_BUDGET_BYTES } from '../../core/result-budget';
 import {
     read,
@@ -38,6 +38,8 @@ import {
     FILE_READ_DEFAULT_MAX_LINES,
     FILE_READ_MAX_LINES,
     FILE_READ_MAX_TARGETS,
+    FILE_READ_NOTE_MAX_PATHS,
+    FILE_READ_NOTE_MIN_BYTES,
     FILE_READ_WIRE_BUDGET
 } from './read.tool';
 import type { FileReadResult } from './read.tool';
@@ -80,6 +82,13 @@ const linesUpTo = (count: number): string =>
 const LINES_1300 = linesUpTo(1300);
 const LINES_5100 = linesUpTo(5100);
 
+// The `maxLines` CEILING fixture: 20 001 lines of 7-11 bytes, so a request for exactly
+// FILE_READ_MAX_LINES (20 000) is cut by the LINE cap rather than by the byte budget
+// (20 000 lines serialize to 228 894 bytes, inside the 262 144-byte envelope) while the
+// file stays at 208 905 bytes, over the 65 536-byte note gate. Every number the note
+// quotes is derivable from this shape.
+const LINES_20001 = linesUpTo(20_001);
+
 beforeAll(async () => {
     await mkdir(TEMP_ROOT, { recursive: true });
     workdir = await mkdtemp(join(TEMP_ROOT, 'harness-file-read-'));
@@ -114,6 +123,14 @@ beforeAll(async () => {
     // Four equal large files, to show an even split is still even when every file
     // wants more than its share.
     for (const index of [0, 1, 2, 3]) await seed(`many/${index}.txt`, 'a'.repeat(200_000));
+
+    // The R4 fixtures, in the shape the reviewed run actually hit: 261 KB of ordinary
+    // 58-byte lines needs 265,500 SERIALIZED bytes (every `\n` escapes to two), so the
+    // 256 KiB envelope CUTS it and the caller needs the advisory; the same 261 000
+    // bytes on ONE line needs no escaping and comes back WHOLE, where it does not.
+    const fixedLine = `${'x'.repeat(57)}\n`; // exactly 58 bytes
+    await seed('big-multiline.txt', fixedLine.repeat(4_500)); // exactly 261_000 bytes
+    await seed('big-singleline.txt', 'x'.repeat(261_000)); // exactly 261_000 bytes
 
     // Binary fixtures: NUL bytes and bytes that are not valid UTF-8 (no NUL).
     await seedBytes('binary-nul.bin', Buffer.from([0x61, 0x00, 0x62]));
@@ -571,6 +588,12 @@ describe('read', () => {
         expect(reparsed.files[0].nextLine).not.toBeNull();
         expect(reparsed.files[0].nextByte).not.toBeNull();
         expect(reparsed.files[0].truncated).toBe(true);
+
+        // R4: and the advisory survives with them. `huge-line.txt` is 300 006 bytes and
+        // its window is cut by the envelope, so this is a large-file truncation - the
+        // note was reserved before the split precisely so that this call could carry it
+        // without crossing the cap the test exists to protect.
+        expect(reparsed.note).toContain('is 300005 bytes');
     });
 
     it('charges the budget on escaped bytes, not raw ones', async () => {
@@ -856,6 +879,371 @@ describe('read', () => {
         const whole = await read([join(workdir, 'a.txt')]);
         expect(whole.files[0].truncated).toBe(false);
         expect(whole.files[0].limit).toBeNull();
+    });
+
+    // -----------------------------------------------------------------------
+    // THE LARGE-FILE ADVISORY (`note`, R4). Every entry already carries
+    // `truncated`/`limit`/`nextByte`, and in the reviewed run those fields were present
+    // and still missed: a 261 KB file came back at 256 KiB with no prose saying the
+    // file continued. These tests pin the sentence, the exact conditions it appears
+    // under, and the budget accounting that keeps it inside the wire cap.
+    // -----------------------------------------------------------------------
+
+    it('publishes the note thresholds it documents', () => {
+        // The gate a caller can reason about: 64 KiB, the size every other file tool in
+        // this package caps a response at, and two named paths.
+        expect(FILE_READ_NOTE_MIN_BYTES).toBe(65_536);
+        expect(FILE_READ_NOTE_MAX_PATHS).toBe(2);
+    });
+
+    it('names the size, the bytes returned, and the exact continuation for a cut large file', async () => {
+        const path = join(workdir, 'big-multiline.txt');
+        const full = await readFile(path, 'utf8');
+        const result = await read([path]);
+        const entry = result.files[0];
+
+        // The premise, in exact bytes: 4500 lines of 58 is 261 000 raw, and 265 500
+        // SERIALIZED (a `\n` costs two), so the 262 144-byte envelope must cut it.
+        expect(Buffer.byteLength(full, 'utf8')).toBe(261_000);
+        expect(entry.sizeBytes).toBe(261_000);
+        expect(entry.truncated).toBe(true);
+        expect(entry.limit).toBe('budget');
+        // The window starts at byte 0, so the first unread byte IS the number of bytes
+        // returned - the value the note quotes as the resume offset.
+        expect(entry.nextByte).toBe(entry.bytes);
+        expect(entry.bytes).toBeLessThan(261_000);
+        // The note costs a few hundred bytes of a 262 144-byte budget, never a sizeable
+        // share of it (the bound a caller needs to trust the reserve).
+        expect(entry.bytes).toBeGreaterThan(253_000);
+
+        // The sentence itself, asserted whole. The `{ startLine, startColumn }` half is
+        // spelled out only when the cut actually landed inside a line (which it does
+        // here, because the allowance is not a whole number of lines); quoting a column
+        // of 0 would be the tool claiming a mid-line resume it did not perform.
+        const column = entry.nextColumn === 0 ? '' : `, startColumn: ${entry.nextColumn}`;
+
+        expect(result.note).toBe(
+            `read: ${JSON.stringify(entry.path)} is 261000 bytes; returned ${entry.bytes} (limit: budget) - ` +
+                `continue at startByte ${entry.nextByte}, or { startLine: ${entry.nextLine}${column} }.`
+        );
+
+        // And the advice is correct rather than decorative: what the note names as the
+        // continuation rebuilds the file exactly, with nothing duplicated or dropped.
+        const rest = await read([{ path, startByte: entry.nextByte as number }]);
+        expect(rest.files[0].truncated).toBe(false);
+        expect(entry.content + rest.files[0].content).toBe(full);
+    });
+
+    it('keeps a large-file read with its note inside the wire budget', async () => {
+        // R4's other half: the note's worst case is reserved BEFORE the content budget
+        // is split (`noteReserve` in ./read.tool.ts), so quoting a path, two numbers and
+        // a continuation cannot push the response past the cap the harness would cut it
+        // at - which is the case the review hit, because the advisory is exactly what an
+        // envelope truncation would have destroyed.
+        const result = await read([join(workdir, 'big-multiline.txt')]);
+        const serialized = JSON.stringify(result);
+
+        expect(result.note).toBeTypeOf('string');
+        expect(Buffer.byteLength(serialized, 'utf8')).toBe(result.wireBytes);
+        expect(result.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
+        expect(result.wireBytes).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        // The advisory leads the serialized object, so even a hypothetical envelope cut
+        // (which the assertion above is what prevents) keeps it.
+        expect(serialized.startsWith('{"note":"read: ')).toBe(true);
+    });
+
+    it('holds the wire cap for a cut large file under a long non-ASCII path', async () => {
+        // F1 regression. `wireBytes` is a UTF-8 measurement (see `shape()` in
+        // ./read.tool.ts), so every reserve charged against the same budget has to be
+        // UTF-8 too. `entryOverhead` and `noteReserve` priced the path with
+        // `JSON.stringify(path).length`, which counts UTF-16 CODE UNITS: a CJK character
+        // costs 3 bytes on the wire and 1 unit in that count. Six nested CJK directories
+        // plus a CJK file name put 103 multi-byte characters in the path the ENTRY quotes
+        // and the NOTE quotes again - 412 bytes of response nobody priced - and a
+        // full-budget read measured 262,196 bytes against the 262,144-byte harness cap,
+        // so `boundToolResult` threw the whole object away and the continuation fields
+        // the note advertises were destroyed with it.
+        const cjkSegment = '读取大文件窗口预算契约测试目录'; // 15 chars, 45 UTF-8 bytes
+        const cjkName = '大文件截断续读回归测试文件.txt'; // 13 CJK + ".txt" = 17 chars, 43 bytes
+        const relative = `${Array.from({ length: 6 }, () => cjkSegment).join('/')}/${cjkName}`;
+        // The same 261 000 bytes / 4 500 lines as `big-multiline.txt`, so the ONLY
+        // variable this test moves is how the path is spelled.
+        const path = await seed(relative, `${'x'.repeat(57)}\n`.repeat(4_500));
+        const full = await readFile(path, 'utf8');
+        const result = await read([path]);
+        const entry = result.files[0];
+
+        // The premise, in exact numbers: 103 multi-byte characters, so the resolved path
+        // is 206 bytes longer than its code-unit length, and the file is the same cut.
+        expect(entry.path.length + 206).toBe(Buffer.byteLength(entry.path, 'utf8'));
+        expect(Buffer.byteLength(full, 'utf8')).toBe(261_000);
+        expect(entry.sizeBytes).toBe(261_000);
+        expect(entry.truncated).toBe(true);
+        expect(entry.limit).toBe('budget');
+        expect(entry.nextByte).toBe(entry.bytes);
+
+        // The note is present and EXACT - not merely "survived" - including the path as
+        // `JSON.stringify` renders it. CJK characters are not escaped, so the characters
+        // the note quotes are the bytes that broke the code-unit accounting.
+        const column = entry.nextColumn === 0 ? '' : `, startColumn: ${entry.nextColumn}`;
+
+        expect(result.note).toBe(
+            `read: ${JSON.stringify(entry.path)} is 261000 bytes; returned ${entry.bytes} (limit: budget) - ` +
+                `continue at startByte ${entry.nextByte}, or { startLine: ${entry.nextLine}${column} }.`
+        );
+
+        // The cap itself, held: `wireBytes` is the real serialized length of THIS
+        // response, and it fits both the tool's own budget and the harness's.
+        const serialized = JSON.stringify(result);
+
+        expect(Buffer.byteLength(serialized, 'utf8')).toBe(result.wireBytes);
+        expect(result.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
+        expect(result.wireBytes).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        // End to end, with the module that actually does the cutting: an under-reserved
+        // response comes back `truncated: true` with an envelope instead of `files`,
+        // which is the failure this test exists for.
+        const bounded = boundToolResult(serialized);
+
+        expect(bounded.truncated).toBe(false);
+        expect(bounded.content).toBe(serialized);
+        expect(bounded.originalBytes).toBe(result.wireBytes);
+        expect((JSON.parse(bounded.content).files[0] as { nextByte: number }).nextByte).toBe(entry.nextByte);
+
+        // And the continuation the note names is correct under the non-ASCII path too,
+        // so the advice is not just affordable - it resumes the file exactly.
+        const rest = await read([{ path, startByte: entry.nextByte as number }]);
+
+        expect(rest.files[0].truncated).toBe(false);
+        expect(entry.content + rest.files[0].content).toBe(full);
+    });
+
+    // `"` and `\` are illegal in a Windows file name (and `\` is its separator), so the
+    // fixture this test needs can only exist on a POSIX filesystem; CI is ubuntu-latest.
+    it.runIf(process.platform !== 'win32')('holds the wire cap for a cut large file under an escape-heavy path', async () => {
+        // F1-residual regression. F1 moved the reserves from code units to UTF-8 BYTES,
+        // but the NOTE quotes the path one level deeper than an entry does: `noteClause`
+        // embeds `${JSON.stringify(entry.path)}` as TEXT inside the note string, and that
+        // string is serialized AGAIN. Every `"` and every `\` in the name is therefore
+        // escaped TWICE on the wire (`"` -> `\"` -> `\\\"`), while `noteReserve` priced it
+        // with a SINGLE `JSON.stringify`. 200 quotes + 40 backslashes buy 484 bytes of
+        // unpriced wire, the estimator only leaves ~362 bytes of slack, and a 261 000-byte
+        // multi-line read measured 262,266 against the 262,144-byte budget — so
+        // `boundToolResult` replaced the whole object with its envelope and `files`,
+        // `nextByte`, `nextLine` and the note itself were gone.
+        //
+        // Both characters are legal in a POSIX file name (and illegal on Windows, which
+        // is why the case is `runIf`-guarded above), so the fixture is a real file on a
+        // real path rather than a mock; the ONLY thing this read differs in from
+        // `big-multiline.txt` is how the name is spelled.
+        const QUOTES = 200;
+        const BACKSLASHES = 40;
+        const name = `${'"'.repeat(QUOTES)}${'\\'.repeat(BACKSLASHES)}.txt`; // 244 bytes, inside NAME_MAX
+        const path = await seed(name, `${'x'.repeat(57)}\n`.repeat(4_500));
+        const full = await readFile(path, 'utf8');
+        const result = await read([path]);
+        const entry = result.files[0];
+
+        // The premise, in exact numbers: the same 261 000 bytes / 4 500 lines as the
+        // ASCII fixture, cut by the budget rather than by a line cap.
+        expect(Buffer.byteLength(name, 'utf8')).toBe(244);
+        expect(Buffer.byteLength(full, 'utf8')).toBe(261_000);
+        expect(entry.sizeBytes).toBe(261_000);
+        expect(entry.truncated).toBe(true);
+        expect(entry.limit).toBe('budget');
+        expect(entry.nextByte).toBe(entry.bytes);
+        // The 484-byte penalty is paid out of CONTENT, not out of the cap: the reserve is
+        // a few hundred bytes of a 262 144-byte budget, which is the bound a caller needs
+        // in order to keep trusting it (the same shape the ASCII large-file case pins).
+        expect(entry.bytes).toBeGreaterThan(253_000);
+
+        // The amplification itself, asserted as arithmetic rather than assumed: the single
+        // pass prices one escaped character as 2 bytes (`\"`), and the outer pass escapes
+        // BOTH of those bytes again, so the wire carries 4 — 2 more per escaped character
+        // than the old reserve knew about, plus 4 more for the pair of inner quotes the
+        // outer pass has to escape as well.
+        const singleEscaped = Buffer.byteLength(JSON.stringify(entry.path), 'utf8');
+        const doubleEscaped = Buffer.byteLength(JSON.stringify(JSON.stringify(entry.path)), 'utf8');
+
+        expect(doubleEscaped - singleEscaped).toBe(2 * (QUOTES + BACKSLASHES) + 4);
+        expect(doubleEscaped - singleEscaped).toBe(484);
+
+        // The note is present and EXACT, including the path as `JSON.stringify` renders
+        // it — the string whose double escaping the reserve now prices.
+        const column = entry.nextColumn === 0 ? '' : `, startColumn: ${entry.nextColumn}`;
+
+        expect(result.note).toBe(
+            `read: ${JSON.stringify(entry.path)} is 261000 bytes; returned ${entry.bytes} (limit: budget) - ` +
+                `continue at startByte ${entry.nextByte}, or { startLine: ${entry.nextLine}${column} }.`
+        );
+
+        // The cap, held: `wireBytes` is the real serialized length of THIS response, and
+        // it fits both the tool's own budget and the harness's.
+        const serialized = JSON.stringify(result);
+
+        expect(Buffer.byteLength(serialized, 'utf8')).toBe(result.wireBytes);
+        expect(result.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
+        expect(result.wireBytes).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        // Non-vacuous by construction: the unpriced delta is LARGER than the slack this
+        // response leaves under the cap, so with the old single-`JSON.stringify` pricing
+        // the same read would have landed over 262 144 bytes and been envelope-cut.
+        const unpriced = doubleEscaped - singleEscaped;
+
+        expect(FILE_READ_WIRE_BUDGET - result.wireBytes).toBeLessThan(unpriced);
+        expect(result.wireBytes + unpriced).toBeGreaterThan(FILE_READ_WIRE_BUDGET);
+
+        // End to end, through the module that actually does the cutting: an escape-heavy
+        // path survives intact, with every continuation field still parseable.
+        const bounded = boundToolResult(serialized);
+
+        expect(bounded.truncated).toBe(false);
+        expect(bounded.content).toBe(serialized);
+        expect(bounded.originalBytes).toBe(result.wireBytes);
+
+        const parsed = JSON.parse(bounded.content) as { files: { nextByte: number; nextLine: number }[] };
+
+        expect(parsed.files[0].nextByte).toBe(entry.nextByte);
+        expect(parsed.files[0].nextLine).toBe(entry.nextLine);
+
+        // And the continuation the note names rebuilds the file exactly under that path,
+        // so the reserve did not just buy room — it bought room for advice that works.
+        const rest = await read([{ path, startByte: entry.nextByte as number }]);
+
+        expect(rest.files[0].truncated).toBe(false);
+        expect(entry.content + rest.files[0].content).toBe(full);
+        // The tail is a complete read, so it needs no advisory of its own.
+        expect(rest.note).toBeUndefined();
+    });
+
+    it('advises raise-maxLines when a large file stops at the caller line cap', async () => {
+        // `limit` already names the reason per entry; the note repeats it as an action,
+        // because the remedy for a `maxLines` cut is the OPPOSITE of the remedy for a
+        // budget cut (see the D5 section of ./read.tool.ts).
+        const result = await read([{ path: join(workdir, 'big-multiline.txt'), maxLines: 3 }]);
+        const entry = result.files[0];
+
+        // Three 58-byte lines: every number in the sentence is derivable from the file.
+        expect(entry.bytes).toBe(174);
+        expect(entry.truncated).toBe(true);
+        expect(entry.limit).toBe('maxLines');
+        expect(entry.nextByte).toBe(174);
+        expect(entry.nextLine).toBe(4);
+        expect(entry.nextColumn).toBe(0);
+
+        expect(result.note).toBe(
+            `read: ${JSON.stringify(entry.path)} is 261000 bytes; returned 174 ` +
+                '(limit: maxLines - raise maxLines) - continue at startByte 174, or { startLine: 4 }.'
+        );
+    });
+
+    it('stops advising raise-maxLines once the caller is at the maxLines ceiling', async () => {
+        // F3 regression. The clause used to append "- raise maxLines" to EVERY
+        // `limit: "maxLines"` note, including the one a caller already at
+        // FILE_READ_MAX_LINES received - and that advice throws, because `readMaxLines`
+        // rejects 20001 with "read maxLines must be an integer between 1 and 20000". At
+        // the ceiling the continuation is the only usable remedy, so the clause names the
+        // ceiling it hit instead of a raise that cannot happen.
+        const path = await seed('ceiling.txt', LINES_20001);
+        const result = await read([{ path, maxLines: FILE_READ_MAX_LINES }]);
+        const entry = result.files[0];
+
+        // The window is exactly the cap, and every number is derivable from the fixture:
+        // 20 001 lines are 208 905 bytes, the first 20 000 are 208 894 of them, and the
+        // next unread byte is the start of line 20 001. The file is over the 65 536-byte
+        // gate, so the note IS published - it just cannot promise an impossible raise.
+        expect(entry.truncated).toBe(true);
+        expect(entry.limit).toBe('maxLines');
+        expect(entry.sizeBytes).toBe(208_905);
+        expect(entry.bytes).toBe(208_894);
+        expect(entry.nextByte).toBe(208_894);
+        expect(entry.nextLine).toBe(20_001);
+        expect(entry.nextColumn).toBe(0);
+
+        expect(result.note).toBe(
+            `read: ${JSON.stringify(entry.path)} is 208905 bytes; returned 208894 ` +
+                '(limit: maxLines at the 20000 ceiling) - continue at startByte 208894, or { startLine: 20001 }.'
+        );
+
+        // One line below the ceiling the free remedy really is available, and the note
+        // says so - which is what keeps the ceiling wording an exception rather than a
+        // blanket rewrite of the clause.
+        const below = await read([{ path, maxLines: FILE_READ_MAX_LINES - 1 }]);
+
+        expect(below.files[0].limit).toBe('maxLines');
+        expect(below.files[0].bytes).toBe(208_883);
+        expect(below.note).toBe(
+            `read: ${JSON.stringify(below.files[0].path)} is 208905 bytes; returned 208883 ` +
+                '(limit: maxLines - raise maxLines) - continue at startByte 208883, or { startLine: 20000 }.'
+        );
+
+        // The advice the ceiling case removed was not just unhelpful, it was rejected -
+        // pinned here so the note can never send a caller into that error again.
+        await expect(read([{ path, maxLines: FILE_READ_MAX_LINES + 1 }])).rejects.toThrow(
+            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}, or omitted for no line cap; received ${FILE_READ_MAX_LINES + 1}.`
+        );
+    });
+
+    it('names at most two large files and counts the rest', async () => {
+        // A 100-path batch cannot spend the budget the allocator just freed on the
+        // advisory, so the tail is a count (FILE_READ_NOTE_MAX_PATHS).
+        const paths = [0, 1, 2].map((index) => join(workdir, 'many', `${index}.txt`));
+        const result = await read(paths);
+
+        expect(result.files.every((entry) => entry.truncated)).toBe(true);
+
+        const [first, second, third] = result.files;
+        const column = (entry: typeof first): string =>
+            entry.nextColumn === 0 ? '' : `, startColumn: ${entry.nextColumn}`;
+        const clause = (entry: typeof first): string =>
+            `${JSON.stringify(entry.path)} is 200000 bytes; returned ${entry.bytes} (limit: budget) - ` +
+                `continue at startByte ${entry.nextByte}, or { startLine: ${entry.nextLine}${column(entry)} }`;
+
+        expect(result.note).toBe(
+            `read: ${clause(first)}; ${clause(second)}; and 1 more large file(s) report truncated/nextByte.`
+        );
+
+        // The third file is counted, not spelled out - and it is still fully described
+        // by its own entry fields, which is what makes counting it honest.
+        expect(result.note).not.toContain(JSON.stringify(third.path));
+        expect(third.nextByte).not.toBeNull();
+    });
+
+    it('says nothing for a small read, a complete read, or a truncated small one', async () => {
+        // Three negatives, because "when is there no note" is the half a caller has to
+        // be able to rely on:
+        //   1. a small file returned whole;
+        const small = await read([join(workdir, 'a.txt')]);
+
+        expect(small.truncated).toBe(false);
+        expect(small.note).toBeUndefined();
+        // Absent, not `undefined`, so a JSON round trip cannot invent the key and
+        // `'note' in result` stays meaningful.
+        expect('note' in small).toBe(false);
+
+        //   2. a 261 KB file on ONE line - bigger than the gate, but nothing was
+        //      withheld (no newline to escape, so it fits the envelope whole), which is
+        //      why this case deliberately gets no sentence: an advisory that says
+        //      "continue" where there is nothing to continue teaches a model to doubt a
+        //      complete answer. `sizeBytes` already reports the size;
+        const singleLine = await read([join(workdir, 'big-singleline.txt')]);
+
+        expect(singleLine.files[0].sizeBytes).toBe(261_000);
+        expect(singleLine.files[0].bytes).toBe(261_000);
+        expect(singleLine.files[0].truncated).toBe(false);
+        expect(singleLine.note).toBeUndefined();
+        expect('note' in singleLine).toBe(false);
+
+        //   3. a file BELOW the size gate that really is cut (line cap) - the per-entry
+        //      fields carry it, and a note here would be boilerplate on the common read.
+        const smallCut = await read([{ path: join(workdir, 'lines.txt'), maxLines: 3 }]);
+
+        expect(smallCut.files[0].truncated).toBe(true);
+        expect(smallCut.files[0].limit).toBe('maxLines');
+        expect(smallCut.files[0].sizeBytes).toBe(Buffer.byteLength(LINES_1300, 'utf8'));
+        expect(smallCut.note).toBeUndefined();
+        expect('note' in smallCut).toBe(false);
     });
 
     it('counts a deep startLine on raw bytes and agrees with the seek', async () => {

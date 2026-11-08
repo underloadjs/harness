@@ -771,7 +771,20 @@ describe('glob — .gitignore rules at the search root', () => {
         // the request, so both roots answer.
         await expect(glob({ paths: ['Temp'] }).then((r) => r.files)).resolves.toEqual(['Temp/points.mts']);
 
-        await expect(glob({ paths: ['dist'] }).then((r) => r.files)).resolves.toEqual(['dist/app.js']);
+        const dist = await glob({ paths: ['dist'] });
+
+        expect(dist.files).toEqual(['dist/app.js']);
+
+        // F2 regression. An earlier revision attached a "no .gitignore was read at or
+        // below the root" paragraph to EVERY directory root that parsed no rule file, so
+        // this call - and plain ones like `paths: ['src']` - came with advice about build
+        // output that is not under the root at all. `buildNote` documents the opposite
+        // contract ("an all-clean listing gets no note at all"), and nothing is withheld
+        // here: the scope rule that paragraph explained is the documented behaviour
+        // (./gitignore.ts "SCOPE: THE SEARCH ROOT"), pinned by the two assertions above
+        // and the one below.
+        expect(dist.excluded.ignoreFilesParsed).toBe(0);
+        expect(dist.note).toBeUndefined();
 
         // Same rule the other way, one level deeper: `src/skip/` prunes the directory
         // from a root of '.', and is fully walked as a root of its own.
@@ -970,11 +983,44 @@ describe('glob — a tree with nothing to ignore', () => {
         // failed read is swallowed),
         // so an absent .gitignore changes nothing about the listing — and the two
         // name-skipped seeds stay skipped on the name rule alone.
-        await expect(glob({ paths: ['.'], maxResults: 100 }).then((r) => r.files)).resolves.toEqual([
-            'a.ts',
-            'docs/note.md',
-            'nested/b.ts'
-        ]);
+        const result = await glob({ paths: ['.'], maxResults: 100 });
+
+        expect(result.files).toEqual(['a.ts', 'docs/note.md', 'nested/b.ts']);
+        expect(result.excluded).toEqual({
+            ignoredFiles: 0,
+            prunedDirectories: 0,
+            skippedDirectories: 2,
+            unreadableDirectories: 0,
+            symlinks: 0,
+            ignoreFilesParsed: 0,
+            ignoreRulesTruncated: false
+        });
+
+        // F2 regression: the only clause this note carries is the one that names
+        // something the caller can act on (the two name-skipped directories). An earlier
+        // revision ALSO appended a "no .gitignore was read at or below the root"
+        // paragraph here, purely because the walk parsed no rule file - which contradicted
+        // `buildNote`'s documented contract ("an all-clean listing gets no note at all and
+        // its absence is information too") and told the caller to go root somewhere else
+        // when the listing was already complete. The whole note is therefore asserted
+        // verbatim: a re-added clause makes this fail.
+        expect(result.note).toBe(
+            '2 directories were skipped by name (.git, node_modules) - root the search inside one to walk it'
+        );
+    });
+
+    it('says nothing for an ordinary subdirectory root that owns no .gitignore', async () => {
+        // F2 regression, the shape the noisy clause hit most often: a plain subdirectory
+        // with no rule file at or below it. The answer needs no explanation - the walk is
+        // complete, `excluded` counts everything it did not yield, and
+        // `excluded.ignoreFilesParsed: 0` is a fact rather than an action. The scope rule
+        // itself (rules ABOVE a root never apply) stays documented in the tool
+        // description and is pinned by the ".gitignore rules at the search root" describe.
+        const result = await glob({ paths: ['nested'] });
+
+        expect(result.files).toEqual(['nested/b.ts']);
+        expect(result.excluded.ignoreFilesParsed).toBe(0);
+        expect(result.note).toBeUndefined();
     });
 });
 
