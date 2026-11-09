@@ -2495,10 +2495,11 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
     // horizon so the whole transcript is eligible (the horizon has its own cases in
     // src/plugin/context-compaction.test.ts).
     //
-    // R4's two new knobs are deliberately NOT listed, i.e. they take their declared defaults:
-    // `modelLimits` stays `{}` (no per-model ceiling) and `gapTokens` stays 65536, which
-    // clamps the trigger to `max(1, 100 - 65536) = 1` token — so this fixture still crosses it
-    // on the very first turn, exactly as it did before the headroom existed.
+    // R4's per-model map is deliberately NOT listed, i.e. it takes its declared default:
+    // `modelLimits` stays `{}` (no per-model ceiling). There is no headroom knob any more —
+    // the operator's 2026-11-10 one-number ruling removed it — so the 100-token limit IS the
+    // firing point, and this fixture still crosses it on the very first turn, exactly as it
+    // did before the headroom existed.
     const OPERATOR_SETTINGS: Record<string, number> = {
         contextLimit: 100,
         minTokens: 10,

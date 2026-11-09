@@ -114,10 +114,10 @@ const flush = async (): Promise<void> => {
 // The rows `GET /plugins` serves, in the contract's wire spelling. `async-ping` is the
 // real shipped row (src/plugins/async-ping.plugin.ts) so every figure asserted for it is
 // the real one. `context-compaction` is the shipped plugin TRIMMED to the one setting the
-// R3 request is about: the real descriptor declares seven
-// (contextLimit/gapTokens/modelLimits/enabled/minTokens/safetyTurns/mode — pinned against
+// R3 request is about: the real descriptor declares six
+// (contextLimit/modelLimits/enabled/minTokens/safetyTurns/mode — pinned against
 // the generated catalogue in src/plugin/manifest.test.ts and src/server/plugins.test.ts),
-// and a seven-control form is not what this pane's contract is about. The third declares
+// and a six-control form is not what this pane's contract is about. The third declares
 // nothing, which is the read-only case, and the fourth carries a boolean + a string so
 // both remaining control types are pinned.
 //

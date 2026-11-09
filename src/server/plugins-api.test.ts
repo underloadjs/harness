@@ -401,23 +401,15 @@ describe('GET /v1/harness/plugins', () => {
                     key: 'contextLimit',
                     label: 'Context limit (tokens)',
                     type: 'number',
-                    default: 100000,
+                    default: 200000,
                     min: 1000,
                     step: 1000,
                     description: COMPACTION.settings?.[0].description
                 },
-                // R4 added these two BEFORE `enabled` (declared order is the row order the pane
-                // renders, so both position and value are pinned): the headroom that moves the
-                // firing point off the ceiling, and the per-model JSON override map.
-                {
-                    key: 'gapTokens',
-                    label: 'Headroom before the limit (tokens)',
-                    type: 'number',
-                    default: 65536,
-                    min: 0,
-                    step: 1024,
-                    description: COMPACTION.settings?.find((setting) => setting.key === 'gapTokens')?.description
-                },
+                // R4 added this BEFORE `enabled` (declared order is the row order the pane
+                // renders, so both position and value are pinned): the per-model JSON
+                // override map. There is no headroom setting any more — the limit IS the
+                // firing point (the operator's 2026-11-10 one-number ruling).
                 {
                     key: 'modelLimits',
                     label: 'Per-model limits (JSON)',
@@ -459,8 +451,7 @@ describe('GET /v1/harness/plugins', () => {
                 }
             ],
             values: {
-                contextLimit: 100000,
-                gapTokens: 65536,
+                contextLimit: 200000,
                 modelLimits: '{}',
                 enabled: true,
                 minTokens: 200,
@@ -562,14 +553,14 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(patched.status).toBe(200);
         expect(Object.keys(patched.body)).toEqual(['plugin']);
         expect(patched.body.plugin.name).toBe('context-compaction');
-        // `values` is the projection of EVERY declared key (seven as of R4: the limit, the two
-        // new trigger knobs, and the four policy knobs), not just the one that was written. The
-        // same seven-key map is what every later read below re-asserts, because the store answers
-        // stored value -> declared default per key and a partial projection would let a new
-        // setting ship without ever being exposed on the contract.
+        // `values` is the projection of EVERY declared key (six as of the 2026-11-10
+        // one-number ruling: the limit, the per-model map, and the four policy knobs), not
+        // just the one that was written. The same six-key map is what every later read below
+        // re-asserts, because the store answers stored value -> declared default per key and
+        // a partial projection would let a new setting ship without ever being exposed on the
+        // contract.
         expect(patched.body.plugin.values).toEqual({
             contextLimit: 200000,
-            gapTokens: 65536,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -578,7 +569,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         });
 
         // The declared descriptor is unchanged by a write: the row still carries the reset target.
-        expect(patched.body.plugin.settings[0].default).toBe(100000);
+        expect(patched.body.plugin.settings[0].default).toBe(200000);
 
         // One accepted write, one revision, on the body AND the contract header.
         expect(patched.body.plugin.name).toBe('context-compaction');
@@ -592,7 +583,6 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(reload.body.revision).toBe(1);
         expect(reload.body.items[1].values).toEqual({
             contextLimit: 200000,
-            gapTokens: 65536,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -625,7 +615,6 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         // `values` carries a NUMBER, not the text that arrived, so a client round-trips types.
         expect(patched.body.plugin.values).toEqual({
             contextLimit: 150000,
-            gapTokens: 65536,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -643,15 +632,14 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
 
         expect(reset.status).toBe(200);
         expect(reset.body.plugin.values).toEqual({
-            contextLimit: 100000,
-            gapTokens: 65536,
+            contextLimit: 200000,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
             mode: 'exclude'
         });
-        expect(reset.body.plugin.settings[0].default).toBe(100000);
+        expect(reset.body.plugin.settings[0].default).toBe(200000);
         expect(pluginsOf(runtime).snapshot()).toEqual({});
 
         // A reset is a mutation, so the counter moved again (1 -> 2).
@@ -681,7 +669,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, gapTokens, modelLimits, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -751,7 +739,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, gapTokens, modelLimits, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -788,7 +776,7 @@ describe('the live settings provider reaches an existing session', () => {
         // Turn 1: nothing is stored, so the plugin reads its declared default.
         await record.harness('one');
 
-        expect(probeReads).toEqual([100000]);
+        expect(probeReads).toEqual([200000]);
 
         const patched = await patchSettings(runtime, 'context-compaction', { contextLimit: 24000 });
 
@@ -802,13 +790,13 @@ describe('the live settings provider reaches an existing session', () => {
 
         await record.harness('two');
 
-        expect(probeReads).toEqual([100000, 24000]);
+        expect(probeReads).toEqual([200000, 24000]);
 
         // A reset is equally immediate: the plugin falls back to the declared default.
         await patchSettings(runtime, 'context-compaction', { contextLimit: null });
         await record.harness('three');
 
-        expect(probeReads).toEqual([100000, 24000, 100000]);
+        expect(probeReads).toEqual([200000, 24000, 200000]);
     });
 
     it('resolves the effective value through the same view a plugin uses', () => {
@@ -816,7 +804,7 @@ describe('the live settings provider reaches an existing session', () => {
         const provider = pluginsOf(runtime).provider;
         const view = createPluginSettingsView('context-compaction', provider, COMPACTION.settings);
 
-        expect(view.number('contextLimit')).toBe(100000);
+        expect(view.number('contextLimit')).toBe(200000);
         expect(provider.get('context-compaction', 'contextLimit')).toBeUndefined();
 
         pluginsOf(runtime).update('context-compaction', { contextLimit: 32000 });
@@ -1051,7 +1039,7 @@ describe('plugin settings survive a restart', () => {
 
         const saved = documentOf(root);
 
-        // Overrides only: the declared default (100000) is NOT written, and no other plugin
+        // Overrides only: the declared default (200000) is NOT written, and no other plugin
         // appears. The credential rule of this file holds for the whole document.
         expect(saved.pluginSettings).toEqual({ 'context-compaction': { contextLimit: 200000 } });
         expect(JSON.stringify(saved)).not.toContain('server-secret');
@@ -1065,7 +1053,6 @@ describe('plugin settings survive a restart', () => {
         expect(second.store.pluginSettings.provider.get('context-compaction', 'contextLimit')).toBe(200000);
         expect(second.store.pluginSettings.values('context-compaction')).toEqual({
             contextLimit: 200000,
-            gapTokens: 65536,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -1079,7 +1066,6 @@ describe('plugin settings survive a restart', () => {
         expect(page.body.revision).toBe(0);
         expect(page.body.items[1].values).toEqual({
             contextLimit: 200000,
-            gapTokens: 65536,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -1126,7 +1112,6 @@ describe('plugin settings survive a restart', () => {
         expect(page.body.items[0].values).toEqual({ intervalMs: 9000 });
         expect(page.body.items[1].values).toEqual({
             contextLimit: 4000,
-            gapTokens: 65536,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -1170,8 +1155,7 @@ describe('plugin settings survive a restart', () => {
 
         expect(fourth.store.pluginSettings.get('context-compaction', 'contextLimit')).toBeUndefined();
         expect(fourth.store.pluginSettings.values('context-compaction')).toEqual({
-            contextLimit: 100000,
-            gapTokens: 65536,
+            contextLimit: 200000,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -1179,11 +1163,10 @@ describe('plugin settings survive a restart', () => {
             mode: 'exclude'
         });
         expect((await call(fourth, 'GET', `${MOUNT}/plugins`)).body.items[1].values).toEqual({
-            // Back on every declared default — and "declared" now means all seven settings
-            // (five as of compaction T4.6, plus R4's `gapTokens` and `modelLimits`), not just
-            // the limit.
-            contextLimit: 100000,
-            gapTokens: 65536,
+            // Back on every declared default — and "declared" now means all six settings
+            // (five as of compaction T4.6, plus R4's `modelLimits`; the R4 headroom knob was
+            // removed by the 2026-11-10 one-number ruling), not just the limit.
+            contextLimit: 200000,
             modelLimits: '{}',
             enabled: true,
             minTokens: 200,
@@ -1327,7 +1310,7 @@ describe('R2 — the global plugin switch', () => {
         // Turn 1: the probe plugin's `turn.before` handler runs and records the read.
         await record.harness('one');
 
-        expect(probeReads).toEqual([100000]);
+        expect(probeReads).toEqual([200000]);
 
         // The write lands with a session ALIVE and needs no idle window (R1: the page is
         // reachable while a thread is running, and this route has no 409 path at all).
@@ -1340,7 +1323,7 @@ describe('R2 — the global plugin switch', () => {
         // plugin's handler is NOT delivered — and the run still answers normally.
         const second = await record.harness('two');
 
-        expect(probeReads).toEqual([100000]);
+        expect(probeReads).toEqual([200000]);
         expect(second.content).toBe('second');
 
         // Turn 3 after the click back on: the same registration is live again, with no
@@ -1348,7 +1331,7 @@ describe('R2 — the global plugin switch', () => {
         await patchSettings(runtime, 'context-compaction', { enabled: true });
         await record.harness('three');
 
-        expect(probeReads).toEqual([100000, 100000]);
+        expect(probeReads).toEqual([200000, 200000]);
 
         // `has()` follows the gate too, so an emit site guarded by it skips the payload
         // construction: a disabled permanent subscriber costs what no subscriber costs.

@@ -245,19 +245,19 @@ describe('R3 lane propagation: the blueprint carries the plugin overrides at lan
 
         // A non-boolean knob crosses too - the plugin gate is not the only value a replica
         // used to answer with its shipped default - and the map keeps catalogue order.
-        await store.updatePluginSettings('context-compaction', { contextLimit: 4096, gapTokens: 0 });
+        await store.updatePluginSettings('context-compaction', { contextLimit: 4096, minTokens: 0 });
 
         const blueprint = blueprintOf(store, session.id);
 
         expect(blueprint.pluginSettings).toEqual({
-            'context-compaction': { contextLimit: 4096, gapTokens: 0 },
+            'context-compaction': { contextLimit: 4096, minTokens: 0 },
             'context-trimmer': { enabled: false }
         });
         // One source of truth: the SAME map `state.json` carries (../plugins.ts `snapshot`),
         // and every value is a JSON scalar, so the frame is structured-cloneable data.
         expect(blueprint.pluginSettings).toEqual(store.pluginSettings.snapshot());
         expect(structuredClone(blueprint.pluginSettings)).toEqual({
-            'context-compaction': { contextLimit: 4096, gapTokens: 0 },
+            'context-compaction': { contextLimit: 4096, minTokens: 0 },
             'context-trimmer': { enabled: false }
         });
 
@@ -265,7 +265,7 @@ describe('R3 lane propagation: the blueprint carries the plugin overrides at lan
         await store.updatePluginSettings('context-trimmer', { enabled: null });
 
         expect(blueprintOf(store, session.id).pluginSettings).toEqual({
-            'context-compaction': { contextLimit: 4096, gapTokens: 0 }
+            'context-compaction': { contextLimit: 4096, minTokens: 0 }
         });
     });
 
@@ -497,12 +497,12 @@ describe('R3 parity: the scripted demo factory forwards both deployment-wide swi
         // Off: the framework's gate reads `enabled` and the pass stops at its Rule 0, so no
         // policy knob is consulted at all - the hooks are not delivered.
         expect(await keysReadFor('context-compaction', { enabled: false })).toEqual(['enabled']);
-        // On: the same run consults the whole policy (the limit, the headroom and the
-        // per-model map), which is what "the operator enabled it" has to mean on a replica.
+        // On: the same run consults the whole policy (the limit and the per-model map, which
+        // together ARE the firing point now that the headroom knob is gone), which is what
+        // "the operator enabled it" has to mean on a replica.
         expect(await keysReadFor('context-compaction', { enabled: true })).toEqual([
             'contextLimit',
             'enabled',
-            'gapTokens',
             'modelLimits'
         ]);
     });

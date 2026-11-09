@@ -38,37 +38,36 @@
 // F11/T8 of ../docs/tasks/2026-11-09-context-inclusion-followups.md, which is where the
 // discriminator (`branchId`) was specified.
 //
-// THE TRIGGER POINT — LIMIT vs WINDOW vs GAP (R4)
-// -----------------------------------------------
-// `contextLimit` is an OPERATOR CEILING, never the number the plugin compares against. The
-// number that actually fires is the TRIGGER, computed per turn from three inputs:
+// THE TRIGGER POINT — ONE NUMBER (the operator's 2026-11-10 ruling)
+// -----------------------------------------------------------------
+// `contextLimit` IS the firing point. There is no second number beside it: when a turn's
+// `estimatedTokens` is at or above the effective limit, the pass fires on THAT turn. The
+// effective limit is resolved per turn from the same inputs as before, minus the headroom:
 //
 //     resolved  = modelLimits[<current model>].limit ?? contextLimit
 //     effective = model window is declared ? min(resolved, window) : resolved
-//     trigger   = max(1, effective − max(0, gapTokens))
+//     trigger   = max(1, floor(effective))
 //
-// Each input answers a different question, and conflating them is the bug this fixes:
-//   - `contextLimit` is what the operator is WILLING to pay for, globally.
+// Each surviving input answers a different question:
+//   - `contextLimit` is what the operator is WILLING to pay for, globally — and the exact
+//     size compaction starts at, with no leeway subtracted. A former `gapTokens` headroom
+//     (fire N tokens early because the answer grows the context) was removed at the
+//     operator's request: one number, reached exactly, is the whole rule. What keeps a
+//     blank pass from parking the same conversation every turn is the Rule-3 cooldown, not
+//     a headroom.
 //   - `modelLimits[...].limit` is what the operator is willing to pay for ONE model, so a
 //     1M-token model and an 8k one stop sharing one ceiling.
 //   - `modelLimits[...].window` is a FACT ABOUT THE MODEL — the hard context window the
 //     provider rejects requests past. A ceiling above the window is a ceiling that can never
 //     be reached, so the window caps it: limit 512k on a 256k model compacts at the 256k
 //     behaviour, not at 512k.
-//   - `gapTokens` is HEADROOM for everything the estimate does not carry: the tool schemas,
-//     the message framing and the answer the model writes DURING the turn that trips the
-//     check. `estimatedTokens` measures the request that is about to go out; the request
-//     that comes back from it is bigger. Firing exactly AT the limit is therefore firing
-//     too late, so the real firing point sits `gapTokens` early. With the shipped defaults
-//     the trigger moves 100000 → 34464, which is the intentional behaviour change (an
-//     operator who wants the old point sets `gapTokens: 0`).
 //
 // The model id comes from the live agent registry (`api.agents[context.agent].model()`), so
 // an operator switching models changes the ceiling on the NEXT turn with no restart. When
 // the lookup yields nothing (no registered brain, a host stub, a throwing accessor) the
 // plugin does not guess: it degrades to "model unknown" — global limit, no window — and
-// compacts at limit − gap. Malformed `modelLimits` JSON and unusable entries are ignored the
-// same way, so a typo in a settings field can never stop compaction altogether.
+// compacts at the limit itself. Malformed `modelLimits` JSON and unusable entries are
+// ignored the same way, so a typo in a settings field can never stop compaction altogether.
 //
 // THE TRIGGER RULES (each one exists for a concrete failure mode)
 // ---------------------------------------------------------------
@@ -186,7 +185,7 @@ export const metadata = {
     name: 'context-compaction',
     title: 'Context Compaction',
     description:
-        'Watches each agent conversation against a context limit and, when the limit is reached, prunes the tool units a later success already answered at the turn boundary before the next model request is sent. Nothing is deleted: a pruned unit keeps its place in history and can be switched back on. The limit is a ceiling, not the firing point: compaction starts gapTokens before the effective limit, where the effective limit is the per-model override for the model the conversation is running, capped by that model\'s declared context window when one is declared.',
+        'Watches each agent conversation against a context limit and, when the limit is reached, prunes the tool units a later success already answered at the turn boundary before the next model request is sent. Nothing is deleted: a pruned unit keeps its place in history and can be switched back on. The limit is the firing point: compaction starts as soon as the estimate reaches the effective limit, which is the per-model override for the model the conversation is running, capped by that model\'s declared context window when one is declared.',
     version: '1.0.0',
     tags: ['context', 'compaction', 'lifecycle'],
     builtin: true,
@@ -196,21 +195,11 @@ export const metadata = {
             key: 'contextLimit',
             label: 'Context limit (tokens)',
             type: 'number',
-            default: 100000,
+            default: 200000,
             min: 1000,
             step: 1000,
             description:
-                'The global ceiling: estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. It is NOT the firing point. The firing point is the effective limit MINUS gapTokens, and the effective limit is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
-        },
-        {
-            key: 'gapTokens',
-            label: 'Headroom before the limit (tokens)',
-            type: 'number',
-            default: 65536,
-            min: 0,
-            step: 1024,
-            description:
-                'How far BEFORE the effective limit compaction fires. The estimate measures the request that is about to go out; the request that comes back from it is bigger, because the answer plus the next tool block are appended to the same context — so firing exactly AT the limit is firing too late, and on a model with a hard window it is firing past the point the provider rejects. 0 restores the historical behaviour of acting exactly at the limit. It cannot take the firing point below 1 token: a limit smaller than the gap compacts as early as it possibly can.'
+                'The firing point: estimated tokens a conversation may reach before this plugin compacts it, measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. There is no separate headroom: the estimate at or above this number fires the pass on that turn. It is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
         },
         {
             key: 'modelLimits',
@@ -260,12 +249,12 @@ export const metadata = {
 } satisfies HarnessPluginMetadata;
 
 // Fallback when the host stores nothing for `contextLimit`. It has to equal
-// `metadata.settings[0].default` (100000): the metadata must stay a plain object literal
+// `metadata.settings[0].default` (200000): the metadata must stay a plain object literal
 // for the manifest scanner, so the number is written twice and BOTH places move together.
 // The fallback only matters for a host plugin that reuses the guard without declaring the
 // setting, because a declared default always outranks this argument (plugin/settings.ts
 // `resolve`: stored value -> declared default -> argument fallback).
-const CONTEXT_LIMIT_DEFAULT = 100000;
+const CONTEXT_LIMIT_DEFAULT = 200000;
 
 // The same duplication rule for the policy settings the descriptors above declare: each
 // constant here is the `default:` of the descriptor above it, written out because the
@@ -280,13 +269,7 @@ const MIN_TOKENS_DEFAULT = 200;
 const SAFETY_TURNS_DEFAULT = 6;
 const MODE_DEFAULT = 'exclude';
 
-// R4's two trigger settings, duplicated from their descriptors by the same rule.
-// `GAP_TOKENS_DEFAULT` is 65536 (64k) because that is the order of magnitude a real
-// tool-heavy turn adds on top of the request being measured: the answer, the tool block it
-// asks for, and the schemas the estimate does not carry. It is deliberately generous — the
-// cost of firing early is one extra pruning pass on a conversation that had not quite
-// reached the ceiling; the cost of firing late is a provider rejection mid-run.
-const GAP_TOKENS_DEFAULT = 65536;
+// R4's remaining trigger setting, duplicated from its descriptor by the same rule.
 // An empty map: no per-model knowledge, so every model uses the global ceiling. A JSON
 // string rather than one setting per model, because the model ids are the operator's, not
 // this build's, and a declared setting list cannot enumerate them.
@@ -359,17 +342,17 @@ export type HarnessContextModelLimits = {
 };
 
 // The full answer for one turn, kept together so a caller (or a diagnostic, later) can see
-// WHY it fired: the resolved ceiling, the window that capped it when one was declared, the
-// effective limit, and the trigger the comparison uses.
+// WHY it fired: the resolved ceiling, the window that capped it when one was declared, and
+// the effective limit — the one number `estimatedTokens` is compared against.
 export type HarnessContextTrigger = {
     // `modelLimits[model].limit ?? contextLimit`.
     limit: number;
     // Present only when a usable window was declared for this model.
     window?: number;
-    // min(limit, window) when windowed, the resolved limit otherwise.
+    // max(1, floor(min(limit, window) when windowed, limit otherwise)) — the number
+    // `estimatedTokens` is compared to. With no window it is the ceiling itself: the limit
+    // IS the firing point, with no headroom subtracted.
     effective: number;
-    // max(1, effective − max(0, gapTokens)) — the number `estimatedTokens` is compared to.
-    trigger: number;
 };
 
 // A positive, finite, whole token count — the only shape worth keeping from a hand-typed
@@ -429,15 +412,12 @@ export const parseModelLimits = (raw: unknown): Record<string, HarnessContextMod
 };
 
 // Resolves the number this turn's estimate is compared against. See the header section
-// "THE TRIGGER POINT — LIMIT vs WINDOW vs GAP" for what each input means and for why an
-// unknown model degrades to the global limit instead of guessing.
+// "THE TRIGGER POINT — ONE NUMBER" for what each input means and for why an unknown model
+// degrades to the global limit instead of guessing.
 export const resolveContextTrigger = (input: {
     // The global `contextLimit` setting. The caller has already refused a non-finite or
     // non-positive value (Rule 1: the plugin is off), so this is a real ceiling.
     contextLimit: number;
-    // The `gapTokens` setting. A negative value is treated as 0 rather than as "fire later
-    // than the limit", so an operator who types `-1000` gets the limit, not a surprise.
-    gapTokens: number;
     // The validated per-model map (see `parseModelLimits`).
     modelLimits: Record<string, HarnessContextModelLimits>;
     // The model this conversation is running, when it is known (see `currentModelId`).
@@ -459,20 +439,19 @@ export const resolveContextTrigger = (input: {
     // The window CAPS the ceiling; it never raises it. A model that declares a 512k ceiling
     // and a 256k window compacts at the window, which is the whole point of the example in
     // the operator's request.
-    const effective = window === undefined ? limit : Math.min(limit, window);
+    const resolved = window === undefined ? limit : Math.min(limit, window);
 
-    const gap = Number.isFinite(input.gapTokens) ? Math.max(0, input.gapTokens) : 0;
-
-    // `max(1, ...)` is the only clamp: a ceiling smaller than the gap (the test-suite's
-    // limit of 100, or an 8k model on a 64k gap) fires at 1 token rather than never. Flooring
-    // keeps the trigger an integer token count, matching the estimate.
-    const trigger = Math.max(1, Math.floor(effective - gap));
+    // The firing point is the ceiling itself — no headroom subtracted. `max(1, ...)` is the
+    // only clamp: a ceiling so small it floors below one token (the test-suite's limit of
+    // 100 is fine, but a host that stores 0.5 is not refused by Rule 1) fires at 1 token
+    // rather than never. Flooring keeps the trigger an integer token count, matching the
+    // estimate.
+    const effective = Math.max(1, Math.floor(resolved));
 
     return {
         limit,
         ...(window === undefined ? {} : { window }),
-        effective,
-        trigger
+        effective
     };
 };
 
@@ -654,8 +633,8 @@ export async function executeCompaction(
 //
 // The limit is read INSIDE the handler, not once at setup, because `api.settings` is
 // re-read on every access by contract (plugin/settings.ts): an operator changing the
-// value from the UI takes effect on the next turn, with no restart. That applies to the
-// two trigger settings exactly as much as to `contextLimit`.
+// value from the UI takes effect on the next turn, with no restart. That applies to
+// `modelLimits` exactly as much as to `contextLimit`.
 export const createContextCompactionHandler = (
     api: HarnessPluginApi,
     action: HarnessCompactionAction = executeCompaction
@@ -716,13 +695,12 @@ export const createContextCompactionHandler = (
         // matching correctness check in `executeCompaction`.
         if (context.branchId !== undefined) return undefined;
 
-        // Rules 2 and 3 compare against the TRIGGER, never against the raw ceiling: the
-        // per-model facts are read here, per turn, so switching models or editing the map
-        // takes effect on the next turn like everything else. Reading them AFTER the
-        // internal-agent and branch skips keeps a skipped round at two settings reads — the
-        // disabled/enabled tests below pin the exact read sequence, because a silent extra
-        // read on the hot path is a silent per-turn cost.
-        const gapTokens = api.settings.number('gapTokens', GAP_TOKENS_DEFAULT);
+        // Rules 2 and 3 compare against the EFFECTIVE limit, never against some derived
+        // firing point: the per-model facts are read here, per turn, so switching models or
+        // editing the map takes effect on the next turn like everything else. Reading them
+        // AFTER the internal-agent and branch skips keeps a skipped round at two settings
+        // reads — the disabled/enabled tests below pin the exact read sequence, because a
+        // silent extra read on the hot path is a silent per-turn cost.
         const rawLimits = api.settings.string('modelLimits', MODEL_LIMITS_DEFAULT);
 
         if (rawLimits !== limitsRaw) {
@@ -730,21 +708,20 @@ export const createContextCompactionHandler = (
             limitsMap = parseModelLimits(rawLimits);
         }
 
-        const { effective, trigger } = resolveContextTrigger({
+        const { effective } = resolveContextTrigger({
             contextLimit: limit,
-            gapTokens,
             modelLimits: limitsMap,
             modelId: currentModelId(api, context.agent)
         });
 
-        // Rule 2: under the trigger — clear the cooldown so the next crossing is fresh, and
+        // Rule 2: under the limit — clear the cooldown so the next crossing is fresh, and
         // return without touching the thread.
-        if (context.estimatedTokens < trigger) {
+        if (context.estimatedTokens < effective) {
             triggered.delete(context.threadId);
             return undefined;
         }
 
-        // Rule 3: at or above the trigger. Fire on a fresh crossing, or once the conversation
+        // Rule 3: at or above the limit. Fire on a fresh crossing, or once the conversation
         // has grown by at least REGROWTH_RATIO of the effective limit since the last fire.
         // `max(1, ...)` keeps a margin for a limit so small that 5% rounds to 0 — otherwise an
         // unchanged estimate would fire on every turn again.

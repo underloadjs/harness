@@ -417,15 +417,9 @@ which is why the compaction fixtures disable it
 (`src/plugin/context-compaction.test.ts`, `src/server/persistence.test.ts`)
 instead of reasoning about the overlap.
 
-The trigger reads two settings beyond `contextLimit`
+The trigger reads one setting beyond `contextLimit`
 (`src/plugins/context-compaction.plugin.ts`):
 
-- `gapTokens` (default 65536) — how far BEFORE the effective limit a pass
-  fires: the trigger is `max(1, effective limit − gapTokens)`. The estimate
-  measures the request that is about to go out, and the answer plus the next
-  tool block land in that same context, so firing exactly at the limit fires
-  too late; `0` is the historical act-exactly-at-the-limit behaviour. A gap
-  larger than the limit just compacts as early as it possibly can.
 - `modelLimits` (a JSON string map, model id → `{ limit?, window? }`) —
   `limit` replaces `contextLimit` for that one model; `window` states the
   model's HARD context window and CAPS whichever limit is in force. The model
@@ -433,6 +427,11 @@ The trigger reads two settings beyond `contextLimit`
   the next turn. Anything malformed — broken JSON, a value that is not an
   object, a non-positive limit — is ignored rather than an error, and a model
   that is not in the map takes the global settings.
+
+There is no headroom beside the limit: the limit IS the firing point. A turn
+whose estimate is at or above the effective limit fires the pass on that turn
+— a former `gapTokens` knob that fired N tokens early was removed in favour
+of the single number.
 
 ---
 

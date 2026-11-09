@@ -117,19 +117,10 @@ describe('plugin auto-discovery', () => {
                 key: 'contextLimit',
                 label: 'Context limit (tokens)',
                 type: 'number',
-                default: 100000,
+                default: 200000,
                 min: 1000,
                 step: 1000,
-                description: 'The global ceiling: estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. It is NOT the firing point. The firing point is the effective limit MINUS gapTokens, and the effective limit is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
-            },
-            {
-                key: 'gapTokens',
-                label: 'Headroom before the limit (tokens)',
-                type: 'number',
-                default: 65536,
-                min: 0,
-                step: 1024,
-                description: 'How far BEFORE the effective limit compaction fires. The estimate measures the request that is about to go out; the request that comes back from it is bigger, because the answer plus the next tool block are appended to the same context — so firing exactly AT the limit is firing too late, and on a model with a hard window it is firing past the point the provider rejects. 0 restores the historical behaviour of acting exactly at the limit. It cannot take the firing point below 1 token: a limit smaller than the gap compacts as early as it possibly can.'
+                description: 'The firing point: estimated tokens a conversation may reach before this plugin compacts it, measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. There is no separate headroom: the estimate at or above this number fires the pass on that turn. It is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
             },
             {
                 key: 'modelLimits',
