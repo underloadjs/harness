@@ -26,12 +26,15 @@
 //   - ./api.ts       — API root resolution, fetch client, SSE parser
 //   - ./deployment.ts — the local/LAN server chain a GitHub Pages host probes
 //   - ./contract.ts  — wire validation/presentation helpers
+//   - ./extensions/  — the plug-and-play panel seam: panel KINDS and shell panels a
+//                      host registers, plus the runtime the app shell paints through
 //   - ./ui/*.ts      — turn board, agent row, create form, markdown, panels, tools,
 //                      dialog shell, attachment/file/image previews
 //   - ./main.ts      — the app shell (NOT exported: it boots on import)
 //   - ../../package.json — "exports[./frontend]"
 export * from './api';
 export * from './contract';
+export * from './extensions';
 export * from './ui/activity';
 export * from './ui/agents';
 export * from './ui/create-harness';

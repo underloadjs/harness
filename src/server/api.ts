@@ -256,6 +256,8 @@ import {
     instructionTextOf,
     promptPreview,
     queueRowsOf,
+    recordsDeltaOf,
+    recordsSnapshotOf,
     runtimeSettingsOf,
     sessionAgentRowsOf,
     sessionDefinitionOf,
@@ -1222,6 +1224,31 @@ export const createHarnessApi = ({
                     resources: [transcriptKey, messagesKey],
                     target: transcriptKey,
                     payload: { transcript: signalBody }
+                });
+
+                return;
+            }
+            case 'records.updated': {
+                // The record store is ONE session-level counter domain (`records`), whatever the
+                // mutation touched: the panel's question is "is my projection current", not "which
+                // collection moved", and the affected names are on the REST delta anyway.
+                const recordsKey = resourceKeyOf('records', record.id);
+
+                events.bumpRevision('records', record.id);
+
+                events.publish({
+                    kind: 'records.updated',
+                    resources: [recordsKey],
+                    target: recordsKey,
+                    // Revisions only, never a record: `store_rev` is where the replay feed
+                    // continues (the `?since=` cursor of the REST delta) and `collections_rev`
+                    // moving is the client's cue to take a fresh snapshot instead of a delta.
+                    payload: {
+                        records: {
+                            store_rev: signal.storeRev,
+                            collections_rev: signal.collectionsRev
+                        }
+                    }
                 });
 
                 return;
@@ -2398,6 +2425,45 @@ export const createHarnessApi = ({
         // without a revision simply carries none), so a client can order a read against a stream
         // frame from the response headers alone.
         return json(200, result, (result as { revision?: number }).revision);
+    };
+
+    // T4 (data plane): the record store read behind the live records/tasks panels.
+    //
+    // ONE path, two shapes, exactly as the contract states them: no `since` answers the
+    // whole store (every collection's field spec and entries, plus the retained feed), and
+    // `?since=N` answers only the feed after store position `N`. The rule is "bootstrap
+    // once, then page" — a panel that is already showing the store pays for what moved.
+    //
+    // READ-ONLY by construction: it projects the harness handle's `records()` /
+    // `recordsChanges()` and calls no tool, so a browser polling this route moves no
+    // revision, writes no journal event, and cannot disturb the model's context. The
+    // revision stamped here is the hub's `records` counter — the same figure a
+    // `records.updated` frame quotes — which is what makes "read at or above the frame's
+    // revision wins" the one ordering rule a client needs.
+    const getSessionRecords: Handler = (ctx) => {
+        const record = requireSession(ctx.params.session_id);
+        const revision = events.getRevision('records', record.id);
+        const raw = paramOf(ctx.query, 'since');
+
+        if (raw === undefined) return json(200, recordsSnapshotOf(record, revision), revision);
+
+        // A malformed cursor is a CALLER error and stays a 400. Only a cursor that parses
+        // and is no longer answerable is a `reset`, and the two must stay distinguishable:
+        // a client has to know whether the server trimmed the window or it sent junk.
+        if (!/^\d+$/.test(raw)) {
+            throw new HttpError(400, 'Query parameter "since" must be a non-negative integer.');
+        }
+
+        const since = Number(raw);
+
+        // A digit string longer than the safe-integer range parses fine but cannot be a
+        // real store position (the feed is bounded at 200), so it is refused rather than
+        // silently clamped into a `reset` the client did not ask for.
+        if (!Number.isSafeInteger(since)) {
+            throw new HttpError(400, 'Query parameter "since" must be a non-negative integer within the safe integer range.');
+        }
+
+        return json(200, recordsDeltaOf(record, since, revision), revision);
     };
 
     // The 202/200 acceptance receipt of ONE durable submit, extracted so `POST /tasks` and
@@ -4246,6 +4312,10 @@ export const createHarnessApi = ({
         sessionsBySessionIdUsage: { GET: getSessionUsage },
         sessionsBySessionIdCommands: { GET: getSessionCommands },
         sessionsBySessionIdQueue: { GET: getSessionQueue },
+        // The record store read (snapshot / `?since=` delta). Named `records`, never
+        // `tasks`, because `sessionsBySessionIdTasks` below is the RUN QUEUE submit and a
+        // record collection called `tasks` is a different thing entirely.
+        sessionsBySessionIdRecords: { GET: getSessionRecords },
         sessionsBySessionIdTasks: { POST: postSessionTask },
         sessionsBySessionIdReset: { POST: postSessionReset },
         sessionsBySessionIdCancel: { POST: postSessionCancel },

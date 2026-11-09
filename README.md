@@ -248,6 +248,9 @@ src/frontend/
   contract.ts           wire validation/presentation helpers
   ui/                   turns, agents, create form, markdown, panels, tools, tokens,
                         action-request (owner question card)
+  extensions/           the shell's panel registry: context + runtime, the records
+                        client/wake/dom helpers, and the two live panels
+                        (harness.tasks, harness.records — see the scratch-board section)
   styles.css            the app stylesheet
   index.html            the app entry document
 
@@ -3419,6 +3422,47 @@ allow the port through the firewall only there.
 Vite only and proxies `/api` to the service gateway; `yarn dev:server` is the
 separate standalone API launcher (explicit, no Vite). Production hosting is the
 service gateway below.
+
+### The scratch board's live panels (Tasks and Records)
+
+The scratch board mounts two first-party panels over the session's record store:
+`harness.tasks` (title **Tasks**) above `harness.records` (title **Records**). Both
+are `scratch`-slot, `requiresSession: true`, and **display-only** — their controls are
+view-side only: a task row's "Show N changes" disclosure, the records panel's collection
+filter chips, the "N new" follow pill, and a Retry where a read failed. Nothing writes:
+the agent owns the store, so a checkbox that looks clickable but is not would be a lie.
+
+- **Data, once, then deltas.** Each panel reads the two bounded REST reads
+  (`GET …/records` for the snapshot, `GET …/records?since=` for the delta). The
+  `records.updated` wake carries the store's watermarks and no records at all, so it
+  is a nudge, never a payload; the two panels share ONE registration on that topic
+  (`extensions/records-wake.ts`), and a burst costs one delta read, not one per
+  frame. There is no polling anywhere.
+- **Five states, and the panel says which one it is in.** `loading` (a skeleton, but
+  only after the read has been slow for 250 ms), `empty`, `error` with a Retry,
+  `stale` (rows on screen that may be behind), and `ready`. The state is published as
+  `data-phase` on the panel root, so the stylesheet and assistive tech read the same
+  fact the reader sees.
+- **A change speaks about itself.** A live row lands with its identity and order at
+  once and its values one debounced re-read later, because a change row names the
+  fields it touched and carries no values. A value that is not knowable renders `—`
+  with a tooltip rather than being invented. Rows key by record id, so a task that
+  completes is the same element travelling from Pending to Completed, and rows that
+  just landed carry a short highlight plus a word — never a strike or a colour alone.
+- **A reader who scrolled away keeps their place.** New rows above the reading
+  position raise a "N new" pill instead of shoving the list; the panel follows the
+  bottom edge only while the reader is already at it.
+- **A screen reader hears the same story** through a pre-mounted `role=status`
+  region: sentences about what landed ("agent added a task: …"), coalesced into one
+  write per burst, and never the rows a first read brought in (arriving is not an
+  event). `prefers-reduced-motion` drops every animation.
+- **Failures stay local.** A panel whose read fails, whose plane died, or whose
+  registration was refused explains itself in its own rail; its neighbour and the
+  shell are untouched. A conversation switch drops the rows, the filter and the
+  registration it belonged to.
+
+Their CSS is one clearly-marked section at the end of `src/frontend/styles.css`,
+namespaced `.panel-tasks-*` / `.panel-records-*`, with nothing overridden above it.
 
 ### Service host (`/v1/harness`)
 

@@ -8037,3 +8037,730 @@ body.is-resizing-rail {
 .block-detail-retry {
     flex: 0 0 auto;
 }
+
+/* ==========================================================================
+   T6 — the live shell panels (`harness.tasks`, `harness.records`)
+   ==========================================================================
+   Everything below is NEW surface: the two panels built by
+   ./extensions/records-panels.ts and the shared helpers in
+   ./extensions/records-dom.ts that stamp these class names. Nothing here
+   restates a rule above; the card frame, the title and the tool-panel blocks
+   stay exactly as `.panel` / `.panel-title` / `.panel-blocks` already draw
+   them (styles.css:6518 onward), and a live panel is one of those cards with a
+   body of its own inside.
+
+   WHY SO MANY RULES FOR TWO PANELS: a panel that stays mounted while a server
+   pushes into it needs things a tool card never needed — a live region that is
+   invisible, a skeleton that must not shift the rows, a highlight that says
+   "this one just landed", a pill that says "you are not at the end", and five
+   named states that must each look like themselves. Each of those is a handful
+   of lines here and an attribute in the TS, never a style object.
+
+   NAMESPACING: `.panel-tasks-*` and `.panel-records-*` only, plus seven shared
+   `.panel-*` roots (`panel-live`, `panel-new-pill`, `panel-actor`, `panel-stamp`,
+   `panel-expand`, `panel-skeleton`, `panel-state`) that both panels use, and the
+   `panel-*` sub-element variants those rules address (`panel-live-line`,
+   `panel-skeleton-row`/`-cell`, `panel-history-*`). The per-panel prefixes keep a
+   rule for one feed from ever reaching the other.
+
+   STATE vs DECORATION: `data-phase` on the panel body is the ONE fact every
+   visual derives from (loading / empty / error / stale / ready); `data-fresh`,
+   `data-flip`, `data-completed` and `data-actor` are the row-level facts. The
+   colour of a highlight is CSS; the fact that a row IS new is an attribute, so
+   `prefers-reduced-motion` can remove the animation and lose nothing.          */
+
+/* The live region: visually-hidden but NOT display:none, which would take it out
+   of the accessibility tree and stop it being announced. Same clip recipe as the
+   turn tile's state word (styles.css:3164). */
+.panel-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+/* One line per announced event; `aria-atomic=false` on the region means only the
+   line that was added is read, so a burst does not re-read the whole history. */
+.panel-live-line {
+    display: block;
+}
+
+/* The body is the positioning context for the "N new" pill, and the scroller is
+   the only thing that scrolls: a panel that grew the rail to 4000px would push
+   the rest of the board away, which is the opposite of a live view. */
+.panel-tasks-body,
+.panel-records-body {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.panel-tasks-scroller,
+.panel-records-scroller {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+    /* Two rails are ~320px wide; a feed that never scrolls is a feed nobody
+       reads. The cap leaves the rest of the right rail for the sessions list. */
+    max-height: min(46vh, 460px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+}
+
+/* --------------------------------------------------------------------------
+   The five states
+   -------------------------------------------------------------------------- */
+
+/* LOADING mirrors the final row layout so the surface does not jump when the
+   data lands. The skeleton is `aria-hidden` (the region already says "loading"
+   through `aria-busy` on the root) and the delay before one is worth drawing at
+   all lives in TS (`RECORDS_SKELETON_DELAY_MS`), so a warm re-read never
+   shimmers. */
+.panel-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* Rows and cells carry the OWNING panel's prefix (`panel-tasks-skeleton-row`,
+   ./records-dom.ts `recordsSkeletonOf`), so all three names are listed: the generic
+   one for a host that passes no prefix, the two namespaced ones for the live panels. */
+.panel-skeleton-row,
+.panel-tasks-skeleton-row,
+.panel-records-skeleton-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    min-height: 18px;
+}
+
+.panel-skeleton-cell,
+.panel-tasks-skeleton-cell,
+.panel-records-skeleton-cell {
+    flex: 1 1 auto;
+    height: 10px;
+    border-radius: 999px;
+    background: linear-gradient(
+        90deg,
+        var(--border) 0%,
+        var(--border-strong) 42%,
+        var(--border) 66%
+    );
+    background-size: 220% 100%;
+    animation: records-skeleton-shimmer 1.2s linear infinite;
+}
+
+/* The last cell of every row is short: a row of four equal bars reads as a
+   table, and these rows carry a trailing stamp. */
+.panel-skeleton-cell:last-child {
+    flex: 0 0 34px;
+}
+
+@keyframes records-skeleton-shimmer {
+    from {
+        background-position: 120% 0;
+    }
+
+    to {
+        background-position: -120% 0;
+    }
+}
+
+/* EMPTY / ERROR / STALE: one line, with the Retry the reader can actually press.
+   The note is a `<p>` with `data-state` (./records-dom.ts `recordsStateOf`), so
+   the copy and the colour come from the same attribute and cannot drift. */
+.panel-state,
+.panel-tasks-empty,
+.panel-tasks-error,
+.panel-records-empty,
+.panel-records-error {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    padding: 6px 8px;
+    border: 1px dashed var(--border);
+    border-radius: calc(var(--radius) - 2px);
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.panel-tasks-error,
+.panel-records-error {
+    border-style: solid;
+    border-color: var(--danger);
+    color: var(--text);
+}
+
+/* The Retry button, drawn by `recordsStateOf` as `<class>-action`. */
+.panel-tasks-error-action,
+.panel-records-error-action {
+    flex: 0 0 auto;
+    padding: 2px 8px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg);
+    color: var(--accent);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.panel-tasks-error-action:hover,
+.panel-records-error-action:hover {
+    border-color: var(--accent);
+}
+
+/* The chrome line every panel draws above its list: when the data last landed,
+   and what is wrong with it now. STALE is amber and readable, not a colour
+   alone — the sentence itself names the outage. */
+.panel-tasks-sync,
+.panel-records-sync {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+.panel-tasks-sync[data-state='stale'],
+.panel-records-sync[data-state='stale'] {
+    color: var(--warn);
+}
+
+.panel-tasks-sync[data-state='error'],
+.panel-records-sync[data-state='error'] {
+    color: var(--danger);
+}
+
+/* --------------------------------------------------------------------------
+   Tasks
+   -------------------------------------------------------------------------- */
+
+/* The progress summary: the figures first (a rail is not a dashboard), then the
+   bar, which is decoration for the ratio and carries the same figure in
+   `aria-valuenow`. */
+.panel-tasks-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.panel-tasks-status {
+    margin: 0;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.panel-tasks-bar {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--border);
+    /* The fill is a gradient of the completed share, drawn from the same
+       `aria-valuenow` the assistive tech reads, so the two cannot disagree. */
+    background-image: linear-gradient(to right, var(--ok), var(--ok));
+    background-repeat: no-repeat;
+    background-size: var(--records-progress, 0%) 100%;
+}
+
+.panel-tasks-group-title {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.panel-tasks-done-count {
+    color: var(--text);
+}
+
+.panel-tasks-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.panel-tasks-row,
+.panel-records-row {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 3px 4px;
+    border-radius: calc(var(--radius) - 4px);
+    border-left: 2px solid transparent;
+}
+
+/* THE "just landed" highlight. ~1.5s, then the attribute is dropped by the fresh
+   marker (./records-dom.ts `createRecordsFreshMarker`), so the panel never keeps
+   a row painted as new. The border is the marker; the tint is decoration. */
+.panel-tasks-row[data-fresh='true'],
+.panel-records-row[data-fresh='true'] {
+    border-left-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    animation: records-land 1.5s ease-out;
+}
+
+@keyframes records-land {
+    from {
+        background-color: color-mix(in srgb, var(--accent) 28%, transparent);
+    }
+
+    to {
+        background-color: transparent;
+    }
+}
+
+/* FLIP: the row's own movement is applied inline by the animator
+   (`translateY` + a `transition`), and `data-flip` is the durable fact. This
+   rule only makes sure an inverted row is never clipped by its own list. */
+.panel-tasks-row[data-flip],
+.panel-records-row[data-flip] {
+    will-change: transform;
+}
+
+.panel-tasks-row-head,
+.panel-records-row-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 5px;
+    min-width: 0;
+}
+
+/* The completion glyph: a WORD in a box, never a tick and never a strike. The
+   row also carries `data-completed` and the state word beside it, so completion
+   survives a colour-blind reader, a forced-colors mode and a screen reader. */
+.panel-tasks-glyph {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.02em;
+}
+
+.panel-tasks-glyph[data-completed='true'] {
+    color: var(--ok);
+}
+
+.panel-tasks-row-text {
+    flex: 1 1 140px;
+    min-width: 0;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+/* A row whose text a read never published (an empty title, or a `getOnly` body)
+   says so instead of showing a blank line. */
+.panel-tasks-row-text[data-missing],
+.panel-records-text[data-missing] {
+    color: var(--muted);
+    font-style: italic;
+}
+
+/* The completion word. It is visible on the task rail — a 12px word costs
+   nothing and a strike would have cost a reader. */
+.panel-tasks-state {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+}
+
+.panel-tasks-row[data-completed='true'] .panel-tasks-state {
+    color: var(--ok);
+}
+
+/* A completed row dims its TEXT, and the row's `data-completed` says why. No
+   `line-through`: a strike is the one treatment this surface refuses to make a
+   state's only signal. */
+.panel-tasks-row[data-completed='true'] .panel-tasks-row-text {
+    color: var(--muted);
+    opacity: 0.82;
+}
+
+/* --------------------------------------------------------------------------
+   Records
+   -------------------------------------------------------------------------- */
+
+.panel-records-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+.panel-records-filter-label {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+/* One chip per collection, with its live count IN the chip's text so the number
+   is part of the accessible name and not a decoration beside it. */
+.panel-records-chip {
+    padding: 2px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    cursor: pointer;
+}
+
+.panel-records-chip:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.panel-records-chip[data-active='true'] {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--text);
+}
+
+.panel-records-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.panel-records-text {
+    flex: 1 1 140px;
+    min-width: 0;
+    color: var(--text);
+    font-size: 11.5px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+/* The verb chip. `data-op` is set by the panel, so the colour and the word come
+   from the same source; the operation is also spelled out as text. */
+.panel-records-op,
+.panel-history-verb {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: lowercase;
+}
+
+.panel-records-op[data-op='add'],
+.panel-history-verb[data-op='add'] {
+    border-color: var(--ok);
+    color: var(--ok);
+}
+
+.panel-records-op[data-op='remove'],
+.panel-history-verb[data-op='remove'] {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.panel-records-collection,
+.panel-records-id,
+.panel-records-rev,
+.panel-records-seq,
+.panel-tasks-id,
+.panel-tasks-rev {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+}
+
+.panel-records-collection {
+    padding: 0 4px;
+    border-left: 2px solid var(--border-strong);
+    text-transform: lowercase;
+}
+
+/* The field-level detail of one event: `field: before → after`. An unknown value
+   renders `—` and says why in its title, which is the honest reading of a change
+   row that carries no bodies. */
+.panel-records-changes {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin: 0;
+    padding: 0 0 0 10px;
+    list-style: none;
+}
+
+.panel-records-change {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    line-height: 1.5;
+}
+
+.panel-records-change-field {
+    color: var(--text);
+}
+
+.panel-records-change-value {
+    max-width: 100%;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+}
+
+/* The value a read never published (a `getOnly` body, or a mid-burst row whose
+   intermediate value is not knowable). It renders `—` and this class is what
+   makes the em-dash read as "unknown" rather than as an empty value. */
+.panel-records-change-value[data-unknown='true'] {
+    color: var(--border-strong);
+}
+
+.panel-records-change-arrow {
+    color: var(--border-strong);
+}
+
+.panel-records-footer {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+/* --------------------------------------------------------------------------
+   Shared row furniture: actor, stamp, disclosure
+   -------------------------------------------------------------------------- */
+
+/* A live panel is denser than a tool card and has no disclosure note, so it
+   drops the card's own vertical rhythm without touching `.panel` itself. */
+.panel-tasks-body,
+.panel-records-body {
+    gap: 6px;
+}
+
+/* The actor badge. `data-actor` distinguishes an agent from the neutral
+   `system` — the store sends NO attribution keys when it has no identity, and
+   inventing a name there would be a fabricated fact (./records-client.ts). */
+.panel-actor,
+.panel-tasks-actor,
+.panel-records-actor,
+.panel-history-actor {
+    flex: 0 0 auto;
+    max-width: 45%;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.panel-actor[data-actor='system'],
+.panel-tasks-actor[data-actor='system'],
+.panel-records-actor[data-actor='system'],
+.panel-history-actor[data-actor='system'] {
+    color: var(--muted);
+}
+
+/* Relative on the surface, absolute in `title` and in `datetime`. */
+.panel-stamp,
+.panel-tasks-stamp,
+.panel-records-stamp,
+.panel-history-stamp {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The disclosure control (a real button with `aria-expanded`). It shares its
+   name with a tool card's `.panel-expand` for the border/typography rules only —
+   the tool card's own control is `.button.small.panel-expand` (main.ts) and keeps
+   its appearance from the `.button` rules above. */
+.panel-expand {
+    align-self: flex-start;
+    margin-top: 1px;
+    padding: 0;
+    border: 0;
+    border-bottom: 1px dotted var(--border-strong);
+    background: none;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    cursor: pointer;
+}
+
+.panel-expand:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.panel-expand[data-expanded='true'] {
+    color: var(--accent);
+}
+
+/* The locally accumulated history of one record. */
+.panel-tasks-disclosure,
+.panel-records-disclosure {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 2px 0 2px 10px;
+    padding: 3px 0 3px 8px;
+    border-left: 1px solid var(--border);
+}
+
+.panel-history,
+.panel-tasks-history,
+.panel-records-history {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.panel-history > li,
+.panel-tasks-history > li,
+.panel-records-history > li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.5;
+}
+
+.panel-tasks-history-truncated,
+.panel-records-history-truncated {
+    color: var(--muted);
+    font-style: italic;
+}
+
+/* The "N new" pill. A child of the panel BODY, so it pins to the scroller's box
+   and does not scroll away with the rows it counts (./records-panels.ts). The
+   count is the button's own text: `hidden` is the only state change it needs. */
+.panel-new-pill {
+    position: absolute;
+    top: 30px;
+    left: 50%;
+    z-index: 2;
+    padding: 2px 10px;
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    box-shadow: 0 2px 8px rgb(0 0 0 / 45%);
+    transform: translateX(-50%);
+    cursor: pointer;
+}
+
+.panel-new-pill[hidden] {
+    display: none;
+}
+
+/* The states that must not be blank: a loading panel keeps its chrome (the card
+   does not resize when the data lands) and hides only the list chrome. */
+.panel-tasks-body[data-phase='loading'] .panel-tasks-progress,
+.panel-records-body[data-phase='loading'] .panel-records-filters {
+    opacity: 0.6;
+}
+
+/* STALE: the rows on screen are the last honest answer, and the chrome says so.
+   A dashed frame on the body is the redundant signal — never the only one. */
+.panel-tasks-body[data-phase='stale'],
+.panel-records-body[data-phase='stale'] {
+    border-left: 2px dashed var(--warn);
+    padding-left: 4px;
+}
+
+.panel-tasks-body[data-phase='error'],
+.panel-records-body[data-phase='error'] {
+    border-left: 2px solid var(--danger);
+    padding-left: 4px;
+}
+
+/* --------------------------------------------------------------------------
+   Reduced motion: the animations are decoration, the attributes are the data
+   --------------------------------------------------------------------------
+   The skeleton shimmer and the "just landed" fade both stop. The highlight's
+   border and tint stay, because `data-fresh` is a fact about the row and a
+   reader who cannot see a fade still deserves to see which row is new. The FLIP
+   transform itself is never applied at all under this preference
+   (./records-dom.ts `recordsReducedMotion`), which is why nothing has to be
+   overridden for it here.                                                */
+@media (prefers-reduced-motion: reduce) {
+    .panel-skeleton-cell,
+    .panel-tasks-row[data-fresh='true'],
+    .panel-records-row[data-fresh='true'] {
+        animation: none !important;
+    }
+
+    .panel-new-pill,
+    .panel-expand {
+        transition: none;
+    }
+
+    .panel-tasks-row[data-flip],
+    .panel-records-row[data-flip] {
+        will-change: auto;
+    }
+}
+
+/* Forced colours: the framework drops my background tints, so the state has to
+   survive on borders and text alone — which is how the markup was written. */
+@media (forced-colors: active) {
+    .panel-tasks-row[data-fresh='true'],
+    .panel-records-row[data-fresh='true'] {
+        border-left-color: Highlight;
+        background: Canvas;
+    }
+
+    .panel-records-chip[data-active='true'] {
+        border-color: Highlight;
+        color: Highlight;
+    }
+}

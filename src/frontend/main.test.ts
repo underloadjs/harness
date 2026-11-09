@@ -4223,13 +4223,16 @@ it('deletes the running current session, stops watching and creates no replaceme
     ]);
     // Watching stops on the plane that carries the watching. The client's `unsubscribe` frame names
     // a SUBSCRIPTION (`{type:'unsubscribe', subscription_id}`, ./stream.ts:455 and :570), so the
-    // fact is the pairing: every subscription the shell registered for this conversation is closed.
-    // This is the socket equivalent of the SSE `abort` this test used to observe, and a delete is
-    // still never a cancel round trip.
+    // fact is the pairing: every subscription registered for this conversation is closed — the
+    // shell's observer AND the shared record-update channel of T6's live panels
+    // (./extensions/records-wake.ts), which the panel's dispose releases through the context's
+    // signal. A delete that orphaned either one would keep a dead conversation's slot on the
+    // plane. This is the socket equivalent of the SSE `abort` this test used to observe, and a
+    // delete is still never a cancel round trip.
     const watched = live.subscriptions.filter(
         (sub) => sub.scope === 'session' && sub.session_id === 's1'
     );
-    expect(watched.map((sub) => sub.scope)).toEqual(['session']);
+    expect(watched.map((sub) => sub.scope).sort()).toEqual(['session', 'session']);
     const watchedIds = watched.map((sub) => sub.subscription_id);
     expect(
         live.sent

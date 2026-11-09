@@ -99,6 +99,9 @@ import type {
     ProviderDefaults,
     QueuedTask,
     QueuedTaskPage,
+    // T6/R2-R4: the record store reads (the live tasks + records panels).
+    RecordsDeltaResponse,
+    RecordsSnapshotResponse,
     ResetSessionResult,
     RunnerSettingsInput,
     SessionAgentBinding,
@@ -1101,6 +1104,24 @@ export const listQueue = (id: string, query: PageQuery = {}): Promise<Page<Queue
 // reconnected client answers the right conversation.
 export const listPendingActions = (id: string): Promise<PendingActionListResponse> =>
     request<PendingActionListResponse>(HARNESS_ROUTES.sessionsBySessionIdActions(encodeURIComponent(id)));
+
+// `GET /sessions/{id}/records` — the record store's BOOTSTRAP (T6/R2-R4). No paging
+// parameters: the read is already bounded by the engine's own caps (200 entries per
+// collection, the store-wide feed trimmed to 200 events), so a second client-side
+// cursor would only duplicate the `store_rev` the response already states.
+export const getSessionRecords = (id: string): Promise<RecordsSnapshotResponse> =>
+    request<RecordsSnapshotResponse>(HARNESS_ROUTES.sessionsBySessionIdRecords(encodeURIComponent(id)));
+
+// `GET /sessions/{id}/records?since=N` — the DELTA read: the feed rows after store
+// position `N`. A `reset: true` answer is HTTP 200, not an error (the window trimmed
+// past the cursor, or the store was replaced); the caller re-bootstraps with the
+// snapshot form of the same path. `since` is validated HERE into the contract's
+// spelling (a non-negative integer) so a caller cannot send a cursor the router
+// refuses with a 400.
+export const getSessionRecordsDelta = (id: string, since: number): Promise<RecordsDeltaResponse> =>
+    request<RecordsDeltaResponse>(
+        `${HARNESS_ROUTES.sessionsBySessionIdRecords(encodeURIComponent(id))}?since=${Math.max(0, Math.trunc(Number.isFinite(since) ? since : 0))}`
+    );
 
 // `POST /sessions/{id}/actions/{requestId}/answer` — one option id or free text.
 // This resolves a question the running turn is paused on; it enqueues nothing.

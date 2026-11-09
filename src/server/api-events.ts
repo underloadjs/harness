@@ -231,6 +231,11 @@ export const resourceBaselineLink = (resource: StreamResourceKind, id?: string |
             return `${HARNESS_API_ROOT}/sessions/${key.id}/tools?limit=${BASELINE_LIMIT}`;
         case 'commands':
             return `${HARNESS_API_ROOT}/sessions/${key.id}/commands?limit=${BASELINE_LIMIT}`;
+        // The record store's re-read. No page size: this read is a bootstrap, bounded by the
+        // engine's own caps (entries per collection, feed at 200), and its continuation
+        // cursor is `?since=` — a store position, not an offset this link could state.
+        case 'records':
+            return `${HARNESS_API_ROOT}/sessions/${key.id}/records`;
         case 'harnesses':
             return `${HARNESS_API_ROOT}/harnesses?limit=${BASELINE_LIMIT}`;
         case 'agents':

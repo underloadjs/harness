@@ -103,6 +103,12 @@ import type {
     RecordsResult,
     RecordsStoreState,
     RecordsToolName,
+    RecordStoreChange,
+    RecordStoreChangeReason,
+    RecordStoreCollection,
+    RecordStoreDelta,
+    RecordStoreNotification,
+    RecordStoreView,
     Tool,
     ToolContext
 } from '../types';
@@ -2286,6 +2292,34 @@ export type RecordEngine = {
     reset: () => void;
     snapshot: () => RecordsStoreState;
     restore: (state: unknown) => void;
+    // -----------------------------------------------------------------------
+    // R2a/R3a — the OBSERVATION plane (additive; nothing here writes).
+    //
+    // A host that renders the store live (the harness server's records/tasks panels)
+    // needs three things and no more: to be told a call committed, to read the bounded
+    // snapshot once, and to page the feed after that. All three are read-only views of
+    // state the engine already keeps, so the plane costs no second source of truth.
+    //
+    // WHY A CALLBACK AND NOT AN EMITTER: one Set, no event names, no `once`/`off`
+    // surface to keep honest, and the unsubscribe is the returned closure. A harness
+    // with no subscriber pays nothing (the notification is built only when someone is
+    // listening), which is what keeps every existing record test byte-identical.
+    /**
+     * Subscribe to committed store mutations. The listener runs SYNCHRONOUSLY inside
+     * the mutating call, after the store is consistent; a listener that throws is
+     * ignored, because the write already happened and a dead transport must not fail
+     * a tool call. Returns the unsubscribe function.
+     */
+    onStoreChange: (listener: (notification: RecordStoreNotification) => void) => () => void;
+    /** The bounded store snapshot: every collection, its entries, and the retained feed. */
+    view: () => RecordStoreView;
+    /**
+     * The feed after `since`, plus the honest `reset` flag for a `since` the retained
+     * window can no longer answer (trimmed away, or a store that was replaced wholesale
+     * by a restore/reset — including a `since` ABOVE the watermark, i.e. a watermark
+     * carried across a `reset()` that rewound the store to 0).
+     */
+    changesSince: (since: number) => RecordStoreDelta;
 };
 
 export const createRecordEngine = (): RecordEngine => {
@@ -2325,6 +2359,66 @@ export const createRecordEngine = (): RecordEngine => {
     // has never been re-defined", i.e. every since >= 0 is meaningful and today's
     // behaviour is unchanged. Never persisted, for the same reason as the map above.
     const epochFloors = new Map<string, number>();
+
+    // -----------------------------------------------------------------------
+    // R2a/R3a — the store-wide feed (the observation plane's only new state).
+    //
+    // WHAT IT IS: a second, STORE-level FIFO of the same change entries `pushChange`
+    // already logs per collection, each stamped with a store-wide `seq` and its
+    // collection name. It exists because a live panel shows every collection at once
+    // and needs ONE cursor across them, while the per-collection windows (Decision B)
+    // must stay per-collection for the disjoint-merge proof. The two are views of the
+    // same events, never two truths: the per-collection entry is written first and
+    // unconditionally (that is the pinned tool contract), and the feed mirrors it.
+    //
+    // WHY IT IS RUNTIME-ONLY: `readRecordsStoreState` validates the persisted root with
+    // an exact key set, so a new persisted key would break every existing snapshot
+    // (the same reason `storeRevHighWater`/`epochFloors` above are runtime-only), and
+    // R5 forbids a persistence schema change. A restart therefore starts with an empty
+    // feed, which the delta reader reports as `reset: true` — the client re-bootstraps
+    // from the snapshot, which is exactly what a restart needs anyway.
+    //
+    // WHY IT IS ALWAYS MAINTAINED (not only while subscribed): the REST read is a poll
+    // source for a host with no live subscriber, and 200 detached entries is a bound
+    // the per-collection windows already accept.
+    let storeRev = 0;
+    let collectionsRev = 0;
+    const storeFeed: RecordStoreChange[] = [];
+
+    // The entries appended by the call currently executing, when that call is the
+    // mutating kind. One call = one notification, so a 40-record batch never becomes 40
+    // stream frames. Nothing between the apply loops' first and last push is async
+    // (`executeCollection` is synchronous end to end), so this single slot cannot be
+    // taken by an interleaved call, and it is cleared in a `finally` either way.
+    let feedCapture: RecordStoreChange[] | undefined;
+
+    const storeListeners = new Set<(notification: RecordStoreNotification) => void>();
+
+    /** Fan out one committed change. A listener that throws is dropped, never fatal. */
+    const notifyStore = (
+        reason: RecordStoreChangeReason,
+        affectedCollections: string[],
+        changes: readonly RecordStoreChange[]
+    ): void => {
+        if (storeListeners.size === 0) return;
+
+        const notification: RecordStoreNotification = {
+            storeRev,
+            collectionsRev,
+            affectedCollections,
+            // Detached, so a listener that keeps or mutates the list cannot disturb the feed.
+            changes: changes.map((change) => ({ ...change })),
+            reason
+        };
+
+        for (const listener of storeListeners) {
+            try {
+                listener(notification);
+            } catch {
+                // The write already committed; a dead observer is the observer's problem.
+            }
+        }
+    };
 
     // Records that a name has been seen at least this high. Monotonic by construction:
     // a registration, a drop and a restore all flow through here and none may lower it.
@@ -2389,11 +2483,35 @@ export const createRecordEngine = (): RecordEngine => {
     // in the task window that `mergeDisjoint` reads as "coverage unknown".
     const pushChange = (state: CollectionState, entry: Omit<RecordChange, 'rev'>): void => {
         state.storeRev += 1;
-        state.changes.push({ rev: state.storeRev, ...entry });
+
+        const change: RecordChange = { rev: state.storeRev, ...entry };
+
+        state.changes.push(change);
 
         if (state.changes.length > RECORD_MAX_CHANGES) {
             state.changes.splice(0, state.changes.length - RECORD_MAX_CHANGES);
         }
+
+        // R2a — mirror the SAME event into the store-wide feed (see the block above
+        // `freshState`). Order is fixed: the per-collection window is written first, so
+        // every existing result contract and every existing test sees exactly the bytes
+        // it saw before, and the feed is a pure addition. The entry is detached with the
+        // same `copyChange` the snapshot uses, so one event's two views never alias.
+        storeRev += 1;
+
+        const feedEntry: RecordStoreChange = {
+            seq: storeRev,
+            collection: state.definition.name,
+            ...copyChange(change)
+        };
+
+        storeFeed.push(feedEntry);
+
+        if (storeFeed.length > RECORD_MAX_CHANGES) {
+            storeFeed.splice(0, storeFeed.length - RECORD_MAX_CHANGES);
+        }
+
+        if (feedCapture !== undefined) feedCapture.push(feedEntry);
     };
 
     // Builds one budgeted page of the CURRENT collection, plus the store revision and,
@@ -2980,6 +3098,12 @@ export const createRecordEngine = (): RecordEngine => {
         // change log, so anything below it belongs to the dropped epoch.
         if (startRev > 0) epochFloors.set(definition.name, startRev);
 
+        // R2a — a NEW collection is a store change a live panel must see (its tab does
+        // not exist yet), and it mints no record event, so it moves `collectionsRev`
+        // only. A client that notices the number move re-reads the snapshot.
+        collectionsRev += 1;
+        notifyStore('define', [definition.name], []);
+
         return {
             entries: [],
             counts: { total: 0 },
@@ -3053,6 +3177,11 @@ export const createRecordEngine = (): RecordEngine => {
         seedHighWater(state.definition.name, state.storeRev);
 
         collections.delete(state.definition.name);
+
+        // R2a — the collection is gone, so a panel has to drop its tab. Same rule as
+        // `define`: a collection-set change moves `collectionsRev`, never the record feed.
+        collectionsRev += 1;
+        notifyStore('drop', [state.definition.name], []);
 
         return {
             entries: [],
@@ -3417,7 +3546,10 @@ export const createRecordEngine = (): RecordEngine => {
 
     // Executes one wrapper/engine call. `definition` is the collection it operates on
     // (undefined for `records`, which names its own collection in its input).
-    const runCall = (
+    //
+    // This is the DISPATCH half; the notification half is the `runCall` wrapper below,
+    // which is the only thing that knows where one call begins and ends.
+    const dispatchCall = (
         definition: RecordCollectionDefinition | undefined,
         parameters: unknown,
         identity: CallerIdentity
@@ -3471,6 +3603,50 @@ export const createRecordEngine = (): RecordEngine => {
         );
 
         return toWrapperResult(definition, input, result);
+    };
+
+    // R2a — the ONE entry point every record call goes through (the five tools'
+    // `execute` closures, and nothing else), wrapped so that a call's store effect is
+    // announced exactly once, after it committed.
+    //
+    // THE RULES THIS ENFORCES:
+    //   - a REJECTED call announces nothing: `dispatchCall` threw before the store moved
+    //     (the engine's own invariant — validation runs ahead of the apply loops), and a
+    //     `return` after the loops means the write is real;
+    //   - a READ announces nothing: the capture stays empty, because `pushChange` is
+    //     reached only by the apply loops (`plan.mutates`);
+    //   - one call = one notification, whatever it touched; the affected collection names
+    //     are derived from the feed entries in first-seen order, so a call that patched
+    //     and removed in one breath lists one collection;
+    //   - `define`/`drop`/`reset`/`restore` notify from their own sites (they append no
+    //     record event), and the wrapper stays quiet for them because their capture is
+    //     empty — never a double frame.
+    const runCall = (
+        definition: RecordCollectionDefinition | undefined,
+        parameters: unknown,
+        identity: CallerIdentity
+    ): unknown => {
+        const capture: RecordStoreChange[] = [];
+
+        feedCapture = capture;
+
+        try {
+            const result = dispatchCall(definition, parameters, identity);
+
+            if (capture.length > 0) {
+                const affected: string[] = [];
+
+                for (const change of capture) {
+                    if (!affected.includes(change.collection)) affected.push(change.collection);
+                }
+
+                notifyStore('mutate', affected, capture);
+            }
+
+            return result;
+        } finally {
+            feedCapture = undefined;
+        }
     };
 
     // Builds one tool per served name. The metadata (description, tags, visibility,
@@ -3543,6 +3719,64 @@ export const createRecordEngine = (): RecordEngine => {
         tools,
         collections: () => [...collections.keys()],
 
+        // -------------------------------------------------------------------
+        // R2a — the observation plane. Reads are detached copies (the same rule every
+        // result envelope follows: handing out a live entry would let a UI's scratch
+        // buffer mutate session state); the subscription is one Set with a closure
+        // unsubscribe, and a host with no listener pays nothing at all.
+        // -------------------------------------------------------------------
+        onStoreChange: (listener: (notification: RecordStoreNotification) => void): (() => void) => {
+            storeListeners.add(listener);
+
+            return () => {
+                storeListeners.delete(listener);
+            };
+        },
+
+        view: (): RecordStoreView => {
+            const listed: RecordStoreCollection[] = [];
+
+            for (const [, state] of collections) {
+                listed.push({
+                    name: state.definition.name,
+                    // The CLONED spec: `definition` is the engine's own object and a
+                    // shared reference would let a host rewrite a live collection's
+                    // field set through the read.
+                    fields: cloneDefinition(state.definition).fields,
+                    storeRev: state.storeRev,
+                    count: state.items.length,
+                    // Projected like a list page (`getOnly` bodies excluded), because
+                    // this is a list read; one body is one `records get` away.
+                    entries: state.items.map((item) => copyEntry(state.definition, item))
+                });
+            }
+
+            return {
+                storeRev,
+                collectionsRev,
+                collections: listed,
+                changes: storeFeed.map((change) => ({ ...change }))
+            };
+        },
+
+        changesSince: (since: number): RecordStoreDelta => {
+            const changes = storeFeed.filter((change) => change.seq > since).map((change) => ({ ...change }));
+
+            // THE RESET RULE, in the three cases that exist:
+            //   - `since > storeRev`: the store rewound under this watermark (a `reset()`
+            //     to 0), so the caller is holding a revision the store never had;
+            //   - `since === storeRev`: current, nothing to apply, NOT a reset;
+            //   - `since < storeRev` with an empty window, or a window whose oldest event
+            //     is above `since + 1`: the gap is real (trimmed, or a restore/restart that
+            //     cleared the feed), and an honest reader says so instead of answering a
+            //     delta that quietly skipped events.
+            const reset =
+                since > storeRev ||
+                (since < storeRev && (storeFeed.length === 0 || (storeFeed[0] as RecordStoreChange).seq > since + 1));
+
+            return { storeRev, collectionsRev, changes, reset };
+        },
+
         // "Start over": every collection's records, both counters and every change
         // window. A reset is a clean start, so the next session-shaped conversation
         // sees the same ids AND the same storeRev 0 a new harness would. `define`d
@@ -3564,6 +3798,15 @@ export const createRecordEngine = (): RecordEngine => {
             }
 
             nextId = 1;
+
+            // R2a — a reset rewinds the store-wide feed with everything else: the client
+            // rule is "`storeRev` below my watermark means the epoch moved", so a reset
+            // has to come back as 0, and the retained window is emptied because none of
+            // those events describe the store that exists now.
+            storeRev = 0;
+            storeFeed.length = 0;
+            collectionsRev += 1;
+            notifyStore('reset', [], []);
         },
 
         // Copy out, so a snapshot never aliases live state. The DEFINITION rides along
@@ -3610,6 +3853,27 @@ export const createRecordEngine = (): RecordEngine => {
             }
 
             nextId = restored.nextId;
+
+            // R2a — a restore is a wholesale replacement, so the retained feed cannot
+            // describe the store that exists now: it is emptied, and the store-wide
+            // watermark is raised to the highest revision the restored collections
+            // actually reached (a persisted watermark must never read as "behind" its own
+            // log, the same invariant Decision B's window keeps per collection).
+            //
+            // A client therefore gets `reset: true` from any `since` other than that
+            // figure, and `collectionsRev` moved as well, so the bootstrap rule
+            // ("re-read when `reset` or when `collectionsRev` moved") fires on every
+            // restart path — including a restore of an empty store, where the watermark
+            // happens to stay 0.
+            storeRev = 0;
+
+            for (const restoredState of Object.values(restored.collections)) {
+                if (restoredState.storeRev > storeRev) storeRev = restoredState.storeRev;
+            }
+
+            storeFeed.length = 0;
+            collectionsRev += 1;
+            notifyStore('restore', [], []);
         }
     };
 };

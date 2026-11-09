@@ -305,8 +305,14 @@ it('runs a session-bound call in its own session and never adopts it into the ch
     expect(sessionPills()).toEqual([CHAT]);
     expect(localStorage.getItem('underload-harness-app:session')).toBe(CHAT);
 
-    // The scratch board stayed untouched: a playground call paints no panels anywhere.
-    expect(document.querySelectorAll('.rail-right .panel')).toHaveLength(0);
+    // The scratch board stayed untouched: a playground call paints no TOOL panels
+    // anywhere. (The two live panels of T6 are always on the board for the conversation
+    // on screen — they are not a playground side effect, so they are excluded here.)
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.rail-right .panel')].filter(
+            (node) => !node.classList.contains('panel-extension')
+        )
+    ).toHaveLength(0);
 });
 
 it('keeps the same temporary context across playground calls and stays on its own harness', async () => {

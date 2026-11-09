@@ -51,6 +51,11 @@ import type {
     ProviderDefaults,
     PendingAction,
     QueuedTask,
+    RecordChangeRow,
+    RecordEntryRow,
+    RecordFieldDescriptor,
+    RecordsDeltaResponse,
+    RecordsSnapshotResponse,
     RuntimeSettings,
     SessionStatePatch,
     SessionAgentBinding,
@@ -77,6 +82,10 @@ import type {
 } from '../shared/harness-api';
 import type { AgentResultReference } from '../shared/agent-results';
 import { HARNESS_SERVICE_LIMITS } from '../shared/harness-api';
+// T4: the engine's own read model for the record store (`records()` / `recordsChanges()`),
+// which is what the two projections below turn into wire rows. Domain types come from
+// ../types, the same barrel ./sessions.ts reads, never from the runtime entry point.
+import type { RecordEntry, RecordFieldDefinition, RecordStoreChange } from '../types';
 import { previewText } from './turn-projector';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
 import type { CatalogueEntry, HarnessPreset } from './harnesses/types';
@@ -796,6 +805,126 @@ export const commandRowsOf = (record: SessionRecord): CommandDescriptor[] => {
             ...(command.usage === undefined ? {} : { usage: command.usage })
         }))
         .sort((left, right) => left.name.localeCompare(right.name));
+};
+
+// ---------------------------------------------------------------------------
+// Record store (the records/tasks panels' bootstrap and delta reads)
+// ---------------------------------------------------------------------------
+
+// T4 (data plane): the two projections behind
+// `GET /v1/harness/sessions/{session_id}/records`. They are pure and live here rather
+// than in ./api.ts because they are the ONLY place the engine's camelCase read model
+// becomes the contract's snake_case wire rows — the same rule every other resource in
+// this file follows (see the NAMING note at the top).
+//
+// WHY THE ENGINE'S `view()` AND NOT A `records list` CALL: a tool call answers the
+// MODEL, so its output carries count facets, previews of `strings` fields, and a
+// page cursor. A panel wants the declared field spec plus the rows, with no
+// decoration; `view()` is that projection, built from the same entries, and it costs
+// one synchronous read of state the engine already holds.
+
+/** One declared field, projected for a renderer: the vocabulary a panel draws columns from. */
+const recordFieldRowOf = (field: RecordFieldDefinition): RecordFieldDescriptor => ({
+    key: field.key,
+    type: field.type,
+    // The engine treats an absent `required` as optional; the wire field is a plain
+    // boolean, so a missing flag becomes `false` rather than an absent key.
+    required: field.required === true,
+    // Only an `enum` has a closed value set, and a panel needs it to build the filter
+    // control. `readonly string[]` becomes a fresh mutable array: the engine's copy is
+    // its own spec object and a response body must not hand out a live reference.
+    ...(field.values === undefined || field.values.length === 0 ? {} : { values: [...field.values] })
+});
+
+// One stored entry, projected key by key in the COLLECTION's canonical order:
+//   - `id` first, then the declared fields, then `rev`, then the attribution triple;
+//   - a field the entry does not carry is ABSENT, never null — "not set" and "set to
+//     nothing" are different facts for a renderer, and a `getOnly` field (a chapter
+//     body) is excluded by the engine's list projection before it ever reaches here;
+//   - an undeclared key is dropped, so a store edited by an older build cannot leak a
+//     field the current collection spec does not describe.
+const recordEntryRowOf = (fields: readonly RecordFieldDefinition[], entry: RecordEntry): RecordEntryRow => {
+    const row: Record<string, unknown> = { id: entry.id };
+
+    for (const field of fields) {
+        if (entry[field.key] !== undefined) row[field.key] = entry[field.key];
+    }
+
+    // `rev` is the CAS token a guarded `records` write echoes as `expects: [{id, rev}]`.
+    // It is NOT the stream revision and never a cursor for one.
+    row.rev = entry.rev;
+
+    // Attribution comes from the calling CONTEXT, never from tool arguments, and the
+    // keys stay absent when the store has no such fact (an engine restored from a
+    // snapshot written before attribution, or a caller with no agent identity).
+    if (entry.updatedBy !== undefined) row.updated_by = entry.updatedBy;
+    if (entry.updatedThreadId !== undefined) row.updated_thread_id = entry.updatedThreadId;
+    if (entry.updatedAt !== undefined) row.updated_at = entry.updatedAt;
+
+    return row as RecordEntryRow;
+};
+
+// One feed entry. `rev` inside it stays the COLLECTION's revision (Decision B's window),
+// while `seq` is the store-wide position the client cursors on — the two are deliberately
+// kept apart rather than flattened into one number, because a per-collection log is what a
+// `records since:` read answers with.
+const recordChangeRowOf = (change: RecordStoreChange): RecordChangeRow => ({
+    seq: change.seq,
+    collection: change.collection,
+    rev: change.rev,
+    id: change.id,
+    op: change.op,
+    ...(change.by === undefined ? {} : { by: change.by }),
+    ...(change.threadId === undefined ? {} : { thread_id: change.threadId }),
+    at: change.at,
+    ...(change.fields === undefined ? {} : { fields: [...change.fields] }),
+    ...(change.itemRev === undefined ? {} : { item_rev: change.itemRev })
+});
+
+/**
+ * The bootstrap read: every collection, whole, plus the retained store-wide feed.
+ *
+ * `revision` is the caller's hub counter for the `records` resource, stamped so a client
+ * can order this response against a `records.updated` frame it received at the same time
+ * (a read at or above a frame's revision supersedes that frame — the stream contract's
+ * staleness rule, identical to every other collection here).
+ */
+export const recordsSnapshotOf = (record: SessionRecord, revision: number): RecordsSnapshotResponse => {
+    const view = record.harness.records();
+
+    return {
+        session_id: record.id,
+        revision,
+        store_rev: view.storeRev,
+        collections_rev: view.collectionsRev,
+        collections: view.collections.map((collection) => ({
+            name: collection.name,
+            store_rev: collection.storeRev,
+            count: collection.count,
+            fields: collection.fields.map(recordFieldRowOf),
+            entries: collection.entries.map((entry) => recordEntryRowOf(collection.fields, entry))
+        })),
+        changes: view.changes.map(recordChangeRowOf)
+    };
+};
+
+/**
+ * The delta read: the feed after `since` and nothing else, plus the engine's honest
+ * `reset` flag when that position has aged out of the retained window (or the store was
+ * replaced by a reset/restore/restart). The flag is the engine's decision, never this
+ * projection's — a client comparing two revision numbers cannot see a trimmed gap.
+ */
+export const recordsDeltaOf = (record: SessionRecord, since: number, revision: number): RecordsDeltaResponse => {
+    const delta = record.harness.recordsChanges(since);
+
+    return {
+        session_id: record.id,
+        revision,
+        store_rev: delta.storeRev,
+        collections_rev: delta.collectionsRev,
+        changes: delta.changes.map(recordChangeRowOf),
+        reset: delta.reset
+    };
 };
 
 // ---------------------------------------------------------------------------

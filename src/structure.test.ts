@@ -814,6 +814,7 @@ describe('entry composition', () => {
         expect(starExports(readText('src/frontend/index.ts'))).toEqual([
             './api',
             './contract',
+            './extensions',
             './ui/activity',
             './ui/agents',
             './ui/create-harness',

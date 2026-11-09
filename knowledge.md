@@ -1030,6 +1030,14 @@ drift from what the engine returns and adding a collection adds no validator.
 
 ---
 
+- **One realtime surface for all of it.** The store's position is published as two
+  watermarks — `store_rev` for the append-only change feed and `collections_rev` for the
+  collection set — and `GET /sessions/{id}/records` answers both. A change row names the
+  fields it touched (`fields: string[]`) and carries no values, so a consumer that wants
+  the values re-reads; the `records.updated` stream event says only that one of those two
+  counters moved. The two live shell panels are the only consumers of that surface today —
+  see [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords).
+
 ## Agent results (R3)
 
 Two ALWAYS-registered core tools expose the session's completed agent answers to
@@ -3391,6 +3399,61 @@ value as a 200, the 400/404/405/409 matrix, restart round-trips, tolerant restor
 stale-entry dropping, and document corruption that still aborts startup),
 `ui/thread-transcript.test.ts` + `ui/thread-transcript-edit.test.ts` (the lossless
 read-only document, the editor, and the unreadable-thread open).
+
+### Live shell panels (`harness.tasks`, `harness.records`)
+
+The scratch board carries two live panels over the session record store. They are
+ordinary entries in the shell's panel registry — the definitions sit at the foot of
+`src/frontend/extensions/records-panels.ts` (`HARNESS_TASKS_PANEL_ID`, `title: 'Tasks'`,
+`slot: 'scratch'`, `requiresSession: true`, ordered above `harness.records`),
+`registerBuiltinShellPanels()` — defined in `src/frontend/extensions/records-panels.ts`
+and re-exported by `extensions/index.ts` — hands them to the runtime, and
+`src/frontend/main.ts` calls it at startup — so the extension runtime
+(`extensions/runtime.ts`) owns their mount, session scoping and teardown exactly as it
+owns a plugin panel's. Nothing in `src/server/**`, `src/shared/**` or
+`src/core/records.ts` knows they exist, and they are display-only — their controls are
+view-side only: a task row's "Show N changes" history disclosure, the collection filter
+chips, the "N new" follow pill, and a Retry where a read failed.
+
+- **Reads.** `src/frontend/api.ts` adds the two bounded REST reads (`getSessionRecords` =
+  `GET …/records`, `getSessionRecordsDelta` = `GET …/records?since=`). They are wrapped as
+  `readRecordsSnapshot` / `readRecordsDelta` in `src/frontend/view-api.ts:1188-1198`, and
+  `src/frontend/extensions/context.ts:74-76` surfaces those to panels as
+  `PanelContext.api.readRecordsSnapshot` / `readRecordsDelta` so an injected host can answer
+  them. `extensions/records-client.ts` is the
+  reconciliation half: watermarks, the capped feed window, per-record history, and the
+  rule that a wake names fields but carries no values — so a live row lands with its
+  identity and order and its values arrive with ONE debounced snapshot re-read.
+- **The plane.** `records.updated` is a watermark wake, never a payload. Each panel owns
+  its client, but the WS registration is SHARED: `extensions/records-wake.ts` brokers one
+  subscription per (seam, session) and fans its frames to every attached panel, keyed on
+  the RAW `ctx.subscribeSeam` rather than the per-context wrapper. A conversation switch
+  releases the old registration with the old client.
+- **One owner per answer.** A dead plane makes the client hold a pending resync, and the
+  next baseline answers it. A panel re-reads on that baseline only when the client is not
+  already owed the read, so a reconnect costs exactly one delta read, not two.
+- **States.** Five, derived and published as `data-phase` on the panel root: `loading`
+  (a skeleton only after the read has been slow for 250 ms), `empty`, `error` + Retry,
+  `stale`, `ready`. `recordsPanelPhaseOf` is the single derivation; the stylesheet switches
+  on the same attribute the tests assert.
+- **The surface.** `extensions/records-dom.ts` holds the pieces both panels share: the
+  pre-mounted visually-hidden `role=status` region and its coalescing announcer, the
+  follow controller (frozen reading position + "N new" pill, auto-follow only at the live
+  edge), the keyed-list FLIP mover, the "just landed" marker (a LIVE apply only), and the
+  relative-stamp ladder that renders `5m` inside `<time datetime>` with the ISO in `title`.
+- **Isolation.** Every failure is local to one panel: a refused registration, a rejected
+  read or a dead seam changes one rail, never its neighbour and never the shell.
+- **CSS.** One clearly-marked section appended at the end of `src/frontend/styles.css`,
+  namespaced `.panel-tasks-*` / `.panel-records-*`; it overrides nothing above it, and
+  `prefers-reduced-motion` plus forced-colors are part of the contract.
+
+Tests: `extensions/records-client.test.ts` (watermarks, windows, the value-honesty rule,
+the outage protocol), `extensions/records-wake.test.ts` (one shared registration, fan-out,
+release on the last panel), `extensions/records-dom.test.ts` (announcer, follow, FLIP,
+stamps), `extensions/records-panels.test.ts` (both mounts end to end: the five states, the
+live burst, the pill, the chips, the session switch, the teardown), and
+`src/frontend/records-style.test.ts` (the appended section stays at EOF, the namespace
+allow-list, every painted class is styled, the phase/motion/contrast rules).
 
 ### Lane workers: `threadExecution: 'worker'`
 

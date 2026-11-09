@@ -38,13 +38,38 @@
 // text, cells and rows are bounded so a hostile or buggy tool cannot build a
 // multi-megabyte DOM or claim a location this app does not declare.
 //
+// THE EXTENSION SEAM (T5/R1)
+// --------------------------
+// This module no longer decides alone what a panel looks like, or what else may sit
+// in a host. Two registries in ../extensions take over, and BOTH are inert until
+// somebody registers something:
+//
+//   - a PANEL KIND (../extensions/panel-kinds.ts) may draw a typed panel with its own
+//     card. `apply` asks the registry first and falls back to `renderPanel` below for
+//     an unkinded panel, an unknown kind, or a renderer that declined or threw. A kind
+//     is registered by shipped code, so the trust boundary is unchanged: a tool still
+//     contributes data, never markup.
+//   - SHELL PANELS (../extensions/shell-panels.ts, mounted by ../extensions/runtime.ts)
+//     are long-lived views the app registers into a slot. A host receives them as an
+//     ordered node list through `setExtensions` and composes them around the tool
+//     cards, so `apply`, `ids`, `clear` and the empty-host behaviour keep their exact
+//     current meaning — the note under the scratch heading still counts TOOL panels.
+//     Extension nodes are placed by identity, never rebuilt by a tool repaint, so a
+//     live panel keeps its scroll position and focus while the board re-paints.
+//
 // Cross-references:
 //   - src/frontend/main.ts — owns per-instance panel state and the hosts
+//   - src/frontend/extensions/ — the kind registry, shell panels, the mount engine
 //   - src/frontend/ui/turns.ts — renders the tool cards the panels accompany
 //   - src/frontend/styles.css — `.panel-host`, `.panel`, `.panel-table`
 
 import type { SessionTurn, ToolUiBlock, ToolUiPanel } from '../../server/protocol';
 import type { DisplayPanelSummary } from '../../shared/turn-display';
+// The kind registry: the only extension module this file needs at RUNTIME. It is a
+// one-way edge (`../extensions/panel-kinds.ts` imports only TYPES from here), so the
+// two modules can be reasoned about — and tested — separately, and neither can pull
+// the other into a cycle.
+import { applyPanelCardData, isPanelKindRegistered, renderPanelOfKind } from '../extensions/panel-kinds';
 
 // ---------------------------------------------------------------------------
 // Wire contract
@@ -184,6 +209,24 @@ export const sanitizeBlock = (value: unknown): ToolUiBlock | undefined => {
     return undefined;
 };
 
+// One block a registered KIND owns. The sanitizer above knows three shapes; a typed
+// panel carries its own (a task row, a diff hunk), and dropping it would erase the
+// payload the renderer exists to draw. So for a panel whose kind this build CAN
+// render, an unknown-typed block is kept STRUCTURALLY: the `type` name is bounded and
+// the object is otherwise passed through untouched.
+//
+// This does not widen the security model. The shape was chosen by the author of the
+// registered renderer, who is shipped code, and the renderer receives the same object
+// the tool returned — data, never markup.
+const asOpaqueBlock = (value: unknown): ToolUiBlock | undefined => {
+    if (value === null || typeof value !== 'object') return undefined;
+
+    const type = asText((value as { type?: unknown }).type, PANEL_LIMITS.idLength);
+    if (type.length === 0) return undefined;
+
+    return { ...(value as Record<string, unknown>), type } as unknown as ToolUiBlock;
+};
+
 // One panel. Unknown slot, missing id, or a non-object is not a panel: return
 // undefined and let the caller skip it. An EMPTY `blocks` array stays valid — it
 // is the removal signal handled by `applyPanels`.
@@ -191,10 +234,24 @@ export const sanitizeBlock = (value: unknown): ToolUiBlock | undefined => {
 // The return type narrows `slot` to a mounted PanelSlot: the wire type allows any
 // string (the backend contract calls slots extensible), and this app only draws
 // the ones it mounts.
-export const sanitizePanel = (value: unknown): (ToolUiPanel & { slot: PanelSlot }) | undefined => {
+//
+// `kind` — the optional wire field a later task adds — is carried through when
+// present, and `options.renderable` (does a registered renderer own this kind?)
+// decides whether unknown blocks survive. An unknown kind therefore degrades into
+// today's card exactly as an unkinded panel does.
+export const sanitizePanel = (
+    value: unknown,
+    options?: { renderable?: boolean }
+): (ToolUiPanel & { slot: PanelSlot; kind?: string }) | undefined => {
     if (value === null || typeof value !== 'object') return undefined;
 
-    const record = value as { id?: unknown; slot?: unknown; title?: unknown; blocks?: unknown };
+    const record = value as {
+        id?: unknown;
+        slot?: unknown;
+        title?: unknown;
+        blocks?: unknown;
+        kind?: unknown;
+    };
 
     // Bind the slot to a local before the guard: TypeScript does not narrow a
     // mutable property through a type-predicate call, and the local keeps the
@@ -206,10 +263,15 @@ export const sanitizePanel = (value: unknown): (ToolUiPanel & { slot: PanelSlot 
     const id = asText(record.id, PANEL_LIMITS.idLength);
     if (id.length === 0) return undefined;
 
+    // An absent kind stays absent: a card built from an unkinded panel must be
+    // byte-identical to the card this app has always drawn.
+    const kind = asText(record.kind, PANEL_LIMITS.idLength);
+    const renderable = options?.renderable === true && kind.length > 0;
+
     const blocks: ToolUiBlock[] = [];
     if (Array.isArray(record.blocks)) {
         for (const raw of record.blocks.slice(0, PANEL_LIMITS.blocksPerPanel)) {
-            const block = sanitizeBlock(raw);
+            const block = sanitizeBlock(raw) ?? (renderable ? asOpaqueBlock(raw) : undefined);
             if (block !== undefined) blocks.push(block);
         }
     }
@@ -218,18 +280,24 @@ export const sanitizePanel = (value: unknown): (ToolUiPanel & { slot: PanelSlot 
         id,
         slot,
         title: asText(record.title, PANEL_LIMITS.titleLength),
-        blocks
+        blocks,
+        ...(kind.length === 0 ? {} : { kind })
     };
 };
 
 // A wire list (`ui`/`panels`). Anything that is not an array yields no panels;
 // the list itself is bounded so one message cannot contribute thousands.
-export const sanitizePanels = (value: unknown): (ToolUiPanel & { slot: PanelSlot })[] => {
+//
+// The renderability question (does some registered kind own these blocks?) is
+// answered HERE, per panel, because `isPanelKindRegistered` is the registry's own
+// verdict and every caller of this function must therefore agree with it.
+export const sanitizePanels = (value: unknown): (ToolUiPanel & { slot: PanelSlot; kind?: string })[] => {
     if (!Array.isArray(value)) return [];
 
-    const panels: (ToolUiPanel & { slot: PanelSlot })[] = [];
+    const panels: (ToolUiPanel & { slot: PanelSlot; kind?: string })[] = [];
     for (const raw of value.slice(0, PANEL_LIMITS.panelsPerMessage)) {
-        const panel = sanitizePanel(raw);
+        const named = raw !== null && typeof raw === 'object' ? (raw as { kind?: unknown }).kind : undefined;
+        const panel = sanitizePanel(raw, { renderable: isPanelKindRegistered(named) });
         if (panel !== undefined) panels.push(panel);
     }
 
@@ -244,7 +312,12 @@ export type PanelMedia = {
     // `${toolName}\u001f${panel.id}` — see the header for why this is scoped.
     key: string;
     slot: PanelSlot;
-    panel: ToolUiPanel & { slot: PanelSlot };
+    panel: ToolUiPanel & { slot: PanelSlot; kind?: string };
+    // The kind this entry routes to, when the wire named one. `panel.kind` is the
+    // wire field itself; a caller that resolves the name elsewhere (a summary
+    // projection, a locally-built entry) may attach it here instead —
+    // ../extensions/panel-kinds.ts `panelKindOf` reads both.
+    kind?: string;
     // Display-wire expansion (T5 R1/R2): a compact summary card carries the action
     // that replaces itself with the FULL panel document (one step-detail request,
     // owned by the shell). A full panel — a manual tool result, or a summary already
@@ -280,8 +353,15 @@ export const applyPanels = (
         }
 
         // `sanitizePanel` already resolved the slot (aliases included), so it is a
-        // mounted slot here.
-        target.set(key, { key, slot: panel.slot, panel });
+        // mounted slot here. The kind rides along on the ENTRY as well as the panel
+        // so a renderer (and `applyPanelCardData`) can route without re-reading the
+        // wire shape; an unkinded panel sets neither, exactly as before.
+        target.set(key, {
+            key,
+            slot: panel.slot,
+            panel,
+            ...(panel.kind === undefined ? {} : { kind: panel.kind })
+        });
         changes += 1;
     }
 
@@ -485,18 +565,18 @@ const renderBlock = (block: ToolUiBlock): HTMLElement => {
     return list;
 };
 
+// The card this module draws when NO registered kind owns the panel. Everything
+// below is built with `createElement`/`textContent` — the data-only rule of this
+// file — and the dataset contract lives in
+// ../extensions/panel-kinds.ts `applyPanelCardData` so a kind's card and
+// this one can never disagree (the acceptance tests select on those attributes).
 const renderPanel = (slot: PanelSlot, media: PanelMedia): HTMLElement => {
     const card = el('article', 'panel');
-    card.dataset.panelId = media.panel.id;
-    card.dataset.panelSlot = slot;
-    // Display-wire state (T5): is this card the bounded SUMMARY the compact view
-    // sends, or a FULL panel document (a manual tool result, or a summary the reader
-    // expanded)? Styling and tests read this instead of counting blocks.
-    card.dataset.panelState = media.detail === undefined ? 'full' : 'summary';
-    // Attribution for styling/diagnostics. A hand-built media entry may have a key
-    // without the separator; then the whole key is the best name available.
-    const separator = media.key.indexOf('\u001f');
-    card.dataset.panelTool = separator >= 0 ? media.key.slice(0, separator) : media.key;
+
+    // `data-panel-id` / `-slot` / `-state` / `-tool`, plus `-kind` ONLY for a panel
+    // that names a kind. An unkinded card is byte-identical to the card this app has
+    // always drawn.
+    applyPanelCardData(card, slot, media);
 
     // The title is a heading for scanning; an untitled panel still shows its id so
     // the card is identifiable rather than anonymous.
@@ -533,20 +613,45 @@ const renderPanel = (slot: PanelSlot, media: PanelMedia): HTMLElement => {
     return card;
 };
 
+// The ONE place a host decides how a media entry becomes a node (T5/R1). The kind
+// registry answers first; `undefined` means it does not own this panel — unkinded,
+// unknown kind, or a renderer that declined or threw — and the data-only renderer
+// above draws it. Both paths produce the same dataset contract, so nothing down the
+// line (CSS, the acceptance selectors, the scratch note) can tell them apart.
+const renderPanelCard = (slot: PanelSlot, media: PanelMedia): HTMLElement =>
+    renderPanelOfKind(slot, media) ?? renderPanel(slot, media);
+
+// The extension seam of a host: the nodes ../extensions/runtime.ts mounts for this
+// slot, in draw order, split by which side of the tool cards they belong on.
+export type PanelHostExtensions = {
+    before?: readonly HTMLElement[];
+    after?: readonly HTMLElement[];
+};
+
 export type PanelHost = {
     element: HTMLElement;
     slot: PanelSlot;
     // Replace the host's contents with the panels addressed to its slot. Panels
     // for other slots are ignored, so one instance-level list can feed every host.
     apply: (media: readonly PanelMedia[]) => number;
+    // Drops the TOOL panels only. Extension content is owned by the runtime and
+    // leaves through `setExtensions`, never as collateral of a panel clear.
     clear: () => void;
     // Raw panel ids currently drawn, in order — used by tests and status text.
+    // Extension content is NOT in here, which is what keeps the scratch note counting
+    // tool panels after a plugin mounts a live view into the same host.
     ids: () => string[];
+    // T5/R1: replaces the extension-owned nodes around the tool cards. Idempotent,
+    // and a no-op against an empty registry (the pre-extension behaviour).
+    setExtensions: (extensions: PanelHostExtensions) => void;
+    // The `data-panel-extension` ids currently placed, in draw order.
+    extensionIds: () => string[];
 };
 
 // A host is a dumb display: it holds no panel history of its own. `main.ts` keeps
 // per-instance state and calls `apply` with the current list, which is what makes
-// a recompute after reload/poll/session-switch idempotent.
+// a recompute after reload/poll/session-switch idempotent. It hands extension nodes
+// to `setExtensions` and keeps no opinion about them either.
 export const createPanelHost = (slot: PanelSlot): PanelHost => {
     const element = el('div', 'panel-host');
     element.dataset.slot = slot;
@@ -555,12 +660,41 @@ export const createPanelHost = (slot: PanelSlot): PanelHost => {
     element.setAttribute('aria-live', 'polite');
     element.setAttribute('aria-label', `Tool panels (${slot})`);
 
+    // The tool cards, in draw order. Rebuilt by every `apply`, exactly as before.
     const current: HTMLElement[] = [];
+    // The extension-owned nodes, in draw order, owned by the runtime.
+    let extensionBefore: readonly HTMLElement[] = [];
+    let extensionAfter: readonly HTMLElement[] = [];
+
+    // What the children of this element should be, top to bottom.
+    const composed = (): HTMLElement[] => [...extensionBefore, ...current, ...extensionAfter];
+
+    // Reconciles the DOM in place: drop what is gone, place what belongs here, and
+    // never touch a child that is already where it belongs. `replaceChildren` reaches
+    // the same end state for tool cards, but it MOVES every node it is handed — and a
+    // live extension element that is moved loses its scroll position and its focus,
+    // which a stream-driven tool repaint must not cost the reader. With no extension
+    // nodes this is the same list of operations the old call produced.
+    const reconcile = (nodes: readonly HTMLElement[]): void => {
+        const keep = new Set<unknown>(nodes);
+
+        for (const child of [...element.children])
+            if (!keep.has(child)) element.removeChild(child);
+
+        for (let index = 0; index < nodes.length; index += 1) {
+            const node = nodes[index];
+            if (element.children[index] === node) continue;
+            element.insertBefore(node, element.children[index] ?? null);
+        }
+
+        // Empty hosts take no space and are not announced — the rule that keeps an
+        // unused location from adding chrome.
+        element.hidden = nodes.length === 0;
+    };
 
     const clear = (): void => {
         current.length = 0;
-        element.replaceChildren();
-        element.hidden = true;
+        reconcile(composed());
     };
 
     const apply = (media: readonly PanelMedia[]): number => {
@@ -576,17 +710,19 @@ export const createPanelHost = (slot: PanelSlot): PanelHost => {
         }
 
         current.length = 0;
-        const nodes: HTMLElement[] = [];
 
-        for (const entry of byKey.values()) {
-            const card = renderPanel(slot, entry);
-            current.push(card);
-            nodes.push(card);
-        }
+        for (const entry of byKey.values()) current.push(renderPanelCard(slot, entry));
 
-        element.replaceChildren(...nodes);
-        element.hidden = nodes.length === 0;
-        return nodes.length;
+        reconcile(composed());
+
+        return current.length;
+    };
+
+    const setExtensions = (extensions: PanelHostExtensions): void => {
+        extensionBefore = [...(extensions.before ?? [])];
+        extensionAfter = [...(extensions.after ?? [])];
+
+        reconcile(composed());
     };
 
     return {
@@ -594,6 +730,9 @@ export const createPanelHost = (slot: PanelSlot): PanelHost => {
         slot,
         apply,
         clear,
-        ids: () => current.map((card) => card.dataset.panelId ?? '')
+        ids: () => current.map((card) => card.dataset.panelId ?? ''),
+        setExtensions,
+        extensionIds: () =>
+            [...extensionBefore, ...extensionAfter].map((node) => node.dataset.panelExtension ?? '')
     };
 };

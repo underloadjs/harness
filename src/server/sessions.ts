@@ -835,7 +835,28 @@ export type StoreStreamSignal =
       }
     | { kind: 'thread.upsert'; sessionId: string; threadId: string; at: number }
     | { kind: 'thread.removed'; sessionId: string; threadId: string; at: number }
-    | { kind: 'transcript.updated'; sessionId: string; threadId: string; at: number };
+    | { kind: 'transcript.updated'; sessionId: string; threadId: string; at: number }
+    // R2a: the session's RECORD STORE moved. Like every other signal here it carries identity
+    // plus the store's own watermarks and NO record payload: a committed record mutation is one
+    // tool call, whatever it touched, and the client pages `GET .../records?since=<storeRev>` for
+    // the entries — which is the receipt philosophy the REST surface already follows, and the
+    // reason a 200-record chapter edit cannot cost 200 frames.
+    //
+    // Emitted SYNCHRONOUSLY inside the mutating call, by the harness subscription installed in
+    // `buildHarness`: the engine notifies its owner, and this store turns that into a signal. One
+    // notification per call (a batch is one frame), none for a rejected call, and one per
+    // `reset()`/`restore()`/`define`/`drop`, where `storeRev` may legitimately go DOWN (a reset
+    // rewinds the store) — a client that sees its own watermark above `storeRev`, or
+    // `collectionsRev` move, re-bootstraps from the snapshot read instead of replaying.
+    | {
+          kind: 'records.updated';
+          sessionId: string;
+          // The store-wide feed watermark after this mutation.
+          storeRev: number;
+          // The registered-collection-set watermark (define/drop/reset/restore move it).
+          collectionsRev: number;
+          at: number;
+      };
 
 /** The live-change observer shape installed by the REST owner (./api.ts owns the hub). */
 export type StoreStreamObserver = (signal: StoreStreamSignal) => void;
@@ -2203,7 +2224,7 @@ export class SessionStore {
             }
         };
 
-        return preset.create(settings, progress, {
+        const harness = preset.create(settings, progress, {
             stateChange,
             interaction,
             // T1.5's last mile: THE SERVER'S DIAGNOSTIC SINK. The library has emitted
@@ -2237,6 +2258,47 @@ export class SessionStore {
             // shared toolbox (../harnesses/toolbox.ts), exactly like `pluginSettings`.
             toolSettings: this.tools.provider
         });
+
+        // T4 (data plane): the record store's live signal.
+        //
+        // The engine notifies SYNCHRONOUSLY inside the committed tool call, so this
+        // subscription is the whole wiring — no polling, no journal hook, no second
+        // read path. It is attached here rather than at the call site because this is
+        // the one build path every session takes (fresh create AND restore), and
+        // because a record write performed by a lane worker lands on the CANONICAL
+        // harness through ../server/workers/lane-authority.ts, so worker mode needs no
+        // extra plumbing.
+        //
+        // The frame carries revisions only, never record payloads: `storeRev` is where
+        // the replay feed continues and `collectionsRev` says whether the collection
+        // SET moved (define/drop/reset/restore), which is the client's cue to re-fetch
+        // the snapshot instead of applying a delta. A dead transport must never fail
+        // the write, and the engine already swallows a throwing listener.
+        // Guarded, not assumed: `create` is a HOST seam, and a preset authored before
+        // this plane (a scripted test preset, an older host harness) returns a handle
+        // without it. Presence here is additive — every server-built preset has the
+        // method, and one that does not simply stays unobserved.
+        if (typeof harness.onRecordsChange === 'function') {
+            harness.onRecordsChange((notification) => {
+                const session = current();
+
+                // The harness is built before the Session object exists (and survives its
+                // removal), so resolve lazily and stay quiet when there is nothing to
+                // attribute the change to. Both build paths land here: `create` (line ~2082)
+                // and restore (line ~3464).
+                if (session === undefined) return;
+
+                this.notifyStream({
+                    kind: 'records.updated',
+                    sessionId: session.id,
+                    storeRev: notification.storeRev,
+                    collectionsRev: notification.collectionsRev,
+                    at: Date.now()
+                });
+            });
+        }
+
+        return harness;
     }
 
     // -----------------------------------------------------------------------

@@ -56,6 +56,14 @@ import type {
     SessionDefinitionResource,
     SessionStatePatch,
     SessionSummary,
+    // T6/R2-R4: the record store's wire rows, re-exported for the live panels.
+    RecordChangeRow,
+    RecordCollectionRow,
+    RecordEntryRow,
+    RecordFieldDescriptor,
+    RecordsDeltaResponse,
+    RecordsSignal,
+    RecordsSnapshotResponse,
     TaskReceipt,
     ThreadResource,
     ThreadSummary,
@@ -90,6 +98,8 @@ import {
     getBlockDetail,
     getSession,
     getSessionDefinition,
+    getSessionRecords,
+    getSessionRecordsDelta,
     getSessionUsage,
     getStepDetail,
     getTranscriptDocument,
@@ -1138,6 +1148,55 @@ export const readQueue = (sessionId: string, query: PageQuery = {}) => listQueue
 // unanswered question gates the composer and the answer must go to the right turn.
 export const readActions = (sessionId: string): Promise<PendingAction[]> =>
     listPendingActions(sessionId).then((body) => body.actions);
+
+// ---------------------------------------------------------------------------
+// The record store (T6/R2-R4: the live tasks + records panels)
+// ---------------------------------------------------------------------------
+//
+// The store is the session's shared scratch space — `tasks`, `chapters`, `profiles`,
+// `locations` and whatever an agent `define`s at runtime — and the two live panels
+// in the scratch board are its only readers in this UI. The reads follow the same
+// receipts philosophy as everything above: NO paging parameters, because the read is
+// already bounded by the engine's own caps (200 entries per collection, the store-wide
+// feed trimmed to 200 events), and NO polling loop — the `records.updated` stream
+// signal (./stream.ts) says WHEN to read and the watermarks say WHAT is still missing:
+//
+//   bootstrap  `GET .../records`            every collection + the retained feed
+//   delta      `GET .../records?since=N`    only the feed rows after position N
+//   reset      a 200 whose `reset` is true  "your cursor is dead" → bootstrap again
+//
+// `revision` (and the `X-Harness-Revision` header the same response stamps) is the
+// hub's `records` counter: one bump per COMMITTED mutation, never by a read, so a
+// panel can order a response against a frame it received at the same moment. The
+// store's own feed position is `store_rev` — a cursor for `?since=`, and never
+// interchangeable with `revision`.
+//
+// The wire rows are the contract's snake_case records, re-exported below so the
+// panels read them from the facade that produces them (the same rule the turn display
+// subtree follows at the top of this file). Nothing here renames them: a record's
+// field keys belong to ITS collection (`text`/`completed` for tasks), so a camelCase
+// projection would have to invent a shape per collection this UI does not own.
+export type {
+    RecordChangeRow,
+    RecordCollectionRow,
+    RecordEntryRow,
+    RecordFieldDescriptor,
+    RecordsDeltaResponse,
+    RecordsSignal,
+    RecordsSnapshotResponse
+};
+
+// The bootstrap a live panel starts from: every collection, whole, plus the retained
+// store-wide change feed.
+export const readRecordsSnapshot = (sessionId: string): Promise<RecordsSnapshotResponse> =>
+    getSessionRecords(sessionId);
+
+// The delta a live panel applies on top of its last read. `since` is the `store_rev`
+// the last successful read stated; a stale-but-answerable position is the server's
+// problem (it answers with `reset: true`), and a malformed one never leaves this file
+// (./api.ts clamps it into the contract's non-negative integer spelling).
+export const readRecordsDelta = (sessionId: string, since: number): Promise<RecordsDeltaResponse> =>
+    getSessionRecordsDelta(sessionId, since);
 
 // ---------------------------------------------------------------------------
 // Directory

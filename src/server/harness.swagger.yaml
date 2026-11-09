@@ -203,6 +203,10 @@ tags:
     description: Recorded tasks and their lazy display, event, step, block, and media surfaces.
   - name: Actions
     description: Pending owner questions a model asked and a host answers.
+  - name: Records
+    description: >-
+      The session's record store — tasks, chapters, profiles, locations, and anything an agent defines —
+      as the live panel reads it: a bounded snapshot plus a store-wide change feed.
   - name: Commands
     description: The session's slash-command registry (discovery; execution is a task submit).
   - name: Usage
@@ -1298,6 +1302,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CommandPage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /v1/harness/sessions/{session_id}/records:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [Records]
+      operationId: readSessionRecords
+      summary: Read the session record store, whole or as a delta
+      description: >-
+        The one read a live records/tasks panel is built on, and it answers two questions from one path.
+        WITHOUT `since` it is the bootstrap: every registered collection with its field spec, its entries
+        (canonical order, `getOnly` bodies excluded exactly as a list page excludes them, so one chapter
+        body is still one `records get` away), and the retained store-wide change feed. WITH `?since=N` it
+        is the delta: the feed entries after store position `N` and nothing else, so a panel that is
+        already showing the store pays for one edit rather than for 200 records. `store_rev` is the store's
+        OWN monotonic feed cursor, one counter across every collection (a collection's `store_rev` beside
+        its entries is the per-collection revision a `records` write CASes against — the two are different
+        numbers and never interchangeable). `collections_rev` counts changes to the registered collection
+        SET (`define`/`drop`/reset/restore), which mint no feed entry; a client that sees it move
+        re-bootstraps. `reset: true` on a delta is the server saying "your `since` is no longer answerable"
+        — the retained window (200 entries) trimmed past it, or the store was replaced wholesale by a
+        reset/restore/restart — and the answer is the snapshot read, never a partial replay. `changes`
+        still carries what IS retained, so a host can decide. Both forms carry the `records` counter as
+        `revision` and in `X-Harness-Revision`, so a read can be ordered against a subscription exactly
+        like every other resource here. This is a READ: nothing here writes, and the write surface stays
+        the record tools the session's agents call.
+      parameters:
+        - $ref: '#/components/parameters/RecordsSince'
+      responses:
+        '200':
+          description: >-
+            The bounded snapshot (no `since`) or the delta (`since` present). One path, two shapes,
+            discriminated by the request the client made.
+          headers:
+            X-Harness-Epoch:
+              description: The process epoch these revisions are comparable within.
+              schema: { type: string }
+            X-Harness-Revision:
+              description: The `records` counter for this session.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RecordsDeltaResponse'
+                  - $ref: '#/components/schemas/RecordsSnapshotResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
   /v1/harness/sessions/{session_id}/queue:
@@ -2957,7 +3010,7 @@ paths:
           - scope: session
             ids_required: [session_id]
             ids_forbidden: [thread_id, turn_id]
-            publishes: [session.updated, turn.upsert, turn.removed, action.opened, action.closed, usage.updated, thread.upsert, thread.removed, tool.registry_updated, agent.registry_updated, run.event]
+            publishes: [session.updated, turn.upsert, turn.removed, action.opened, action.closed, usage.updated, records.updated, thread.upsert, thread.removed, tool.registry_updated, agent.registry_updated, run.event]
             optional_filters: [status, thread_id, events]
             events_filter_allowed: true
             notes: >-
@@ -3060,7 +3113,7 @@ paths:
           ack_timeout_ms: 5000
           exceeded_subscription_close_code: 4401
           exceeded_rate_close_code: 4429
-          revision_records_per_state: 20
+          revision_records_per_state: 21
         limits_are_one_source: >-
           Every number in this map is the SAME constant as the `WsStreamLimits` property of the same name, whose
           `default` carries the identical value, and `welcome.limits` is a required field of `WsWelcome`. The
@@ -3108,17 +3161,18 @@ paths:
           - { code: 4408, reason: heartbeat_timeout, side: server, meaning: No `pong` for the advertised `heartbeat_timeout_intervals`. }
           - { code: 4429, reason: rate_limited, side: server, meaning: More than the advertised `client_messages_per_second`. }
         kind_payload_matrix: >-
-          Normative and exhaustive; the machine-checked form is the 15 per-kind variants under `WsUpdate`
+          Normative and exhaustive; the machine-checked form is the 16 per-kind variants under `WsUpdate`
           (`WsUpdateSession`, `WsUpdateTurnUpsert`, `WsUpdateTurnRemoved`, `WsUpdateDisplayOps`, `WsUpdateUsage`,
           `WsUpdateActionOpened`, `WsUpdateActionClosed`, `WsUpdateThreadUpsert`, `WsUpdateThreadRemoved`,
-          `WsUpdateTranscript`, `WsUpdateToolRegistry`, `WsUpdateAgentRegistry`, `WsUpdateRunEvent`,
+          `WsUpdateTranscript`, `WsUpdateRecords`, `WsUpdateToolRegistry`, `WsUpdateAgentRegistry`, `WsUpdateRunEvent`,
           `WsUpdateCatalogue`, `WsUpdateConfig`), each with `additionalProperties: false`. Metadata (`type`,
           `subscription_id`, `sequence`, `cursor`, `kind`, `at`) is always required. Payloads: `session.updated`
           carries `session`; `turn.upsert` carries `turn`; `turn.removed` carries `turn_id` and is otherwise
           payload-free; `display.ops` carries `turn_id` AND `ops`; `usage.updated` carries `usage_patch` and
           optionally `turn_id`; `action.opened` carries `action`; `action.closed` carries `action_closed`;
           `thread.upsert` carries `thread`; `thread.removed` carries `thread_id`; `transcript.updated` carries
-          `transcript`; `tool.registry_updated` and `agent.registry_updated` carry a non-empty `ids` array;
+          `transcript`; `records.updated` carries `records` (the store's two watermarks, never a record);
+          `tool.registry_updated` and `agent.registry_updated` carry a non-empty `ids` array;
           `run.event` carries `turn_id` AND `events`; `catalogue.updated` carries `catalogue` AND `ids`;
           `config.updated` carries NO payload field at all, because the global configuration is one named
           resource with no id set, so the subscription itself identifies it. Any other combination fails
@@ -3160,7 +3214,7 @@ paths:
                   send_queue_bytes: 1048576
                   sustained_stall_ms: 10000
                   ack_timeout_ms: 5000
-                  revision_records_per_state: 20
+                  revision_records_per_state: 21
               - type: subscription_state
                 subscription_id: s1
                 scope: session
@@ -3169,13 +3223,14 @@ paths:
                 cursor: OWYyYzE3YTQ6MA
                 replayed_frames: 0
                 filters_applied: { status: running }
-                publishes: [session.updated, turn.upsert, turn.removed, action.opened, action.closed, usage.updated, thread.upsert, thread.removed, tool.registry_updated, agent.registry_updated]
+                publishes: [session.updated, turn.upsert, turn.removed, action.opened, action.closed, usage.updated, records.updated, thread.upsert, thread.removed, tool.registry_updated, agent.registry_updated]
                 revisions:
                   - { resource: session, id: 8c1b-uuid, revision: 12, epoch: 9f2c17a4 }
                   - { resource: turns, id: 8c1b-uuid, revision: 41, epoch: 9f2c17a4 }
                   - { resource: queue, id: 8c1b-uuid, revision: 6, epoch: 9f2c17a4 }
                   - { resource: actions, id: 8c1b-uuid, revision: 3, epoch: 9f2c17a4 }
                   - { resource: usage, id: 8c1b-uuid, revision: 39, epoch: 9f2c17a4 }
+                  - { resource: records, id: 8c1b-uuid, revision: 14, epoch: 9f2c17a4 }
                   - { resource: threads, id: 8c1b-uuid, revision: 7, epoch: 9f2c17a4 }
                   - { resource: session_agents, id: 8c1b-uuid, revision: 2, epoch: 9f2c17a4 }
                   - { resource: session_tools, id: 8c1b-uuid, revision: 5, epoch: 9f2c17a4 }
@@ -3285,6 +3340,13 @@ paths:
                 at: 1762250016180
                 kind: agent.registry_updated
                 ids: [editor]
+              - type: update
+                subscription_id: s0
+                sequence: 13
+                cursor: OWYyYzE3YTQ6MTM
+                at: 1762250016185
+                kind: records.updated
+                records: { store_rev: 14, collections_rev: 2 }
               - type: update
                 subscription_id: sg
                 sequence: 1
@@ -3458,6 +3520,21 @@ components:
       schema:
         type: string
         pattern: '^[a-z][a-z0-9_-]*$'
+    RecordsSince:
+      name: since
+      in: query
+      required: false
+      description: >-
+        The store-wide feed position this client is AT, exactly as its last read or its last
+        `records.updated` frame reported it (`store_rev`). Present: the answer is a DELTA — the feed
+        entries after that position and nothing else. Absent: the answer is the bounded SNAPSHOT. A
+        non-integer or negative value is a 400 naming the parameter. A `since` the retained window can no
+        longer answer (trimmed past 200 entries, or the store replaced wholesale by a reset/restore, or a
+        position carried across a restart) answers 200 with `reset: true` rather than 4xx: the client's
+        cursor is stale, not wrong, and the fix is the snapshot read this same path answers.
+      schema:
+        type: integer
+        minimum: 0
     Limit:
       name: limit
       in: query
@@ -6476,6 +6553,291 @@ components:
         received_at:
           type: integer
           description: Epoch milliseconds when the runtime opened the request.
+    RecordFieldDescriptor:
+      type: object
+      description: >-
+        One declared field of a record collection, projected for a renderer: the key (which IS the entry's
+        property name), the value type, whether an add must supply it, and the closed value set for an `enum`.
+        The full engine spec (caps, defaults, facets, `getOnly`) is a `records describe` call away; this row
+        carries only what a panel needs to draw columns and a filter, and `key` order is the collection's
+        canonical order, so a client renders the order the store already emits entries and change logs in.
+      required: [key, type, required]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          maxLength: 128
+        type:
+          type: string
+          enum: [text, boolean, integer, enum, strings]
+          description: >-
+            The declared value type. `strings` is a bounded, de-duplicated string array; `enum` carries its
+            closed set in `values`.
+        required:
+          type: boolean
+          description: >-
+            True when an ADD must supply it. A patch may still omit any field, which leaves the stored value
+            unchanged, so this never means "every entry carries this key".
+        values:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 200
+          description: 'The closed value set, present ONLY for a field of type `enum`.'
+    RecordEntryRow:
+      type: object
+      description: >-
+        One stored record, projected exactly like a list page: `id`, then the collection's declared fields in
+        canonical order (a `getOnly` field such as a chapter body is ABSENT, never emptied - "no body" and
+        "this read does not show bodies" are different facts), then `rev`, then the attribution triple. Keys
+        are open because the declared fields are the collection's own: `tasks` has `text` and `completed`, an
+        agent-defined collection has whatever it declared. `rev` is the CAS token a guarded `records` write
+        sends back as `expects: [{id, rev}]`; it is NOT the stream's `store_rev`, and one is never a cursor
+        for the other. Attribution comes from the calling context, never from tool arguments, and its keys
+        stay absent when the store has no such fact (an engine restored from a snapshot, or a caller with no
+        agent identity).
+      required: [id, rev]
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          maxLength: 64
+          description: >-
+            Unique across EVERY collection of this session (one id counter per store), so a panel may key a
+            list on it without qualifying the collection.
+        rev:
+          type: integer
+          minimum: 1
+        updated_by:
+          type: string
+          maxLength: 200
+          description: The agent that last changed this record, when the write carried an identity.
+        updated_thread_id:
+          type: string
+          maxLength: 128
+          description: The conversation that last changed this record, when the write carried one.
+        updated_at:
+          type: string
+          maxLength: 40
+          description: 'ISO-8601 instant of the last real change (a patch that changed no field does not move it).'
+    RecordChangeRow:
+      type: object
+      description: >-
+        One entry of the store-wide change feed: the event the collection logged, tagged with the store
+        position (`seq`) and the collection it belongs to. `rev` inside it is THAT collection's revision,
+        unchanged in meaning from the per-collection log a `records since:` read returns; `item_rev` is the
+        record's content revision after the event. A `remove` names the record and stops: the entry is gone,
+        so the row's `rev`/`item_rev` is the removal's store event, not the record's last content revision.
+        `fields` lists, in canonical order, which fields an `update` actually changed - the compact statement
+        that lets a panel repaint one cell without diffing the entry.
+      required: [seq, collection, rev, id, op, at]
+      additionalProperties: false
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+          description: >-
+            The entry's position in the store-wide feed. Monotonic across collections, and the value a client
+            advances to after applying this row.
+        collection:
+          type: string
+          maxLength: 200
+          description: The collection this event belongs to (`tasks`, `chapters`, or an agent-defined name).
+        rev:
+          type: integer
+          minimum: 0
+          description: The collection's own store revision this event produced.
+        id:
+          type: string
+          maxLength: 64
+        op:
+          type: string
+          enum: [add, update, remove]
+        by:
+          type: string
+          maxLength: 200
+          description: The agent that made the change, when the write carried an identity.
+        thread_id:
+          type: string
+          maxLength: 128
+          description: The conversation that made the change, when the write carried one.
+        at:
+          type: string
+          maxLength: 40
+          description: ISO-8601 instant of the mutation (one timestamp per tool call, so a batch agrees).
+        fields:
+          type: array
+          maxItems: 16
+          items:
+            type: string
+            maxLength: 128
+          description: 'Which fields an `update` changed, in the collection''s canonical order; absent for `add`/`remove`.'
+        item_rev:
+          type: integer
+          minimum: 1
+          description: 'The record''s content revision after this event; absent for a `remove`.'
+    RecordCollectionRow:
+      type: object
+      description: >-
+        One collection of the session's record store, whole: its field spec, its entries in canonical order,
+        and the collection's own revision watermark. `tasks`, `chapters`, `profiles` and `locations` are always
+        there; anything an agent defines appears beside them, and the set a client sees is what
+        `collections_rev` describes. Entries are the whole collection up to its own bound (200 by default,
+        engine-owned), NOT a cursor-paged slice: this read is a bootstrap, and a panel that shows one
+        collection shows all of it.
+      required: [name, store_rev, count, fields, entries]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        store_rev:
+          type: integer
+          minimum: 0
+          description: >-
+            THIS collection's revision watermark - the per-collection `storeRev` of the record engine, the
+            domain a `records since:` read and a CAS guard live in. Not the store-wide `store_rev`.
+        count:
+          type: integer
+          minimum: 0
+          description: Entries in the collection (equals `entries.length` here, which is the point of the field).
+        fields:
+          type: array
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/RecordFieldDescriptor'
+        entries:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/RecordEntryRow'
+    RecordsSnapshotResponse:
+      type: object
+      description: >-
+        The bootstrap read: every collection of the session's record store plus the retained store-wide change
+        feed, in ONE bounded response (`GET /v1/harness/sessions/{session_id}/records` with no `since`). This
+        is the state a live panel starts from, and the pair of watermarks it carries is what every later delta
+        is compared against. The feed is retained FIFO at 200 entries per store, so `changes` describes the
+        recent edits and `store_rev` says where it starts; a client that wants older history reads the store,
+        not a replay.
+      required: [session_id, revision, store_rev, collections_rev, collections, changes]
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+          description: >-
+            The `records` counter of `StreamResourceKind` for this session, the same figure a `session`
+            subscription reports in `subscription_state.revisions` and the value of `X-Harness-Revision`, so a
+            read can be ordered against a subscription exactly like every other resource here.
+        store_rev:
+          type: integer
+          minimum: 0
+          description: >-
+            The store-wide feed watermark. Pass it back as `?since=` to get only what moved after this read.
+            It rewinds to 0 when the session is reset, which is a fact the client must handle by
+            re-bootstrapping, never by replaying.
+        collections_rev:
+          type: integer
+          minimum: 0
+          description: >-
+            Counts changes to the registered COLLECTION SET (a `define`, a `drop`, a reset, a restore) - events
+            that append nothing to the feed. A client that sees this move re-bootstraps from this read instead
+            of applying a delta.
+        collections:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/RecordCollectionRow'
+        changes:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/RecordChangeRow'
+    RecordsDeltaResponse:
+      type: object
+      description: >-
+        The delta read (`GET .../records?since=N`): the feed entries after position `N` and nothing else, so a
+        panel that is already showing the store pays for what moved instead of for the store. `reset: true`
+        says `N` is no longer answerable - the retained window trimmed past it, or the store was replaced
+        wholesale by a reset, a restore, or a restart - and the client re-bootstraps from the snapshot form of
+        this same path. It is a 200, not an error: a stale cursor is a normal race, and the answer names the
+        honest recovery. `changes` still carries whatever IS retained, so a host can apply the tail rather
+        than throw it away.
+      required: [session_id, revision, store_rev, collections_rev, changes, reset]
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+          description: >-
+            The `records` counter of `StreamResourceKind`, identical in meaning to the snapshot field of the
+            same name. A delta that changed nothing moves no counter, so a polling client can stop when the
+            number stops moving.
+        store_rev:
+          type: integer
+          minimum: 0
+          description: The store-wide feed watermark AFTER the entries this response carries.
+        collections_rev:
+          type: integer
+          minimum: 0
+          description: >-
+            The collection-set watermark. Compared against the value the client bootstrapped with, this is how
+            a collection defined or dropped mid-subscription is noticed.
+        changes:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/RecordChangeRow'
+        reset:
+          type: boolean
+          description: >-
+            True when `since` predates (or postdates) what this process can still answer. The recovery is the
+            snapshot read, and only that.
+    RecordsSignal:
+      type: object
+      description: >-
+        The whole `records.updated` payload: the store's two watermarks and no record, ever. A live panel is
+        woken by an identity, then pages the delta read - the same receipt philosophy every other kind of this
+        stream follows, and the reason a burst of record edits costs frames proportional to edits and not to
+        entry size.
+      required: [store_rev, collections_rev]
+      additionalProperties: false
+      properties:
+        store_rev:
+          type: integer
+          minimum: 0
+          description: >-
+            The store-wide feed watermark this frame announces. A client whose applied position is below it
+            calls `GET .../records?since=<its position>`; a client already at it ignores the frame.
+        collections_rev:
+          type: integer
+          minimum: 0
+          description: >-
+            The collection-set watermark. Present so a client can tell "a collection appeared or vanished" from
+            "records moved" without a second read.
+    WsUpdateRecords:
+      type: object
+      description: >-
+        `records.updated` carries `records` (the two store watermarks) and no other payload field: never a
+        record, never a collection body. The content is one delta read away, which is what keeps a records
+        burst cheap on the wire and identical in shape to a poll.
+      required: [type, subscription_id, sequence, cursor, kind, at, records]
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [update] }
+        subscription_id: { type: string, maxLength: 64 }
+        sequence: { type: integer, minimum: 0 }
+        cursor: { type: string, maxLength: 256 }
+        kind: { type: string, enum: [records.updated] }
+        at: { type: integer }
+        records:
+          $ref: '#/components/schemas/RecordsSignal'
     PendingActionListResponse:
       type: object
       description: >-
@@ -8724,9 +9086,9 @@ components:
             `x-websocket.backpressure.ack_paced_rule`.
         revision_records_per_state:
           type: integer
-          minimum: 20
-          maximum: 20
-          default: 20
+          minimum: 21
+          maximum: 21
+          default: 21
           description: >-
             Fixed. The size of the per-scope revision baseline array (`WsSubscriptionState.revisions`), which is
             the number of `StreamResourceKind` values a scope can publish. Bounding it is what keeps a
@@ -8773,9 +9135,15 @@ components:
         are DERIVED and mint no new counter: `turn_display` and `turn_events` carry the owning turn's `revision`
         (the display tree and the recorded events are pure folds of that record, and `TurnEventPage.total_events`
         is the event position within it), and `transcript_messages` carries the owning `transcript` revision,
-        because paging messages and replacing them move one counter. The per-scope baseline sets are:
+        because paging messages and replacing them move one counter. `records` is the session's RECORD STORE
+        (tasks, chapters, profiles, locations, plus anything an agent defines): its counter is the `revision`
+        field of `GET /v1/harness/sessions/{session_id}/records`, and it moves once per committed record
+        mutation. The store's OWN monotonic position is `store_rev` on that read and on a `records.updated`
+        frame; it is a feed cursor, not a revision, and a client pages the change feed with it (`?since=`) and
+        uses the counter only for the staleness test a revision is always for.
+        The per-scope baseline sets are:
         `global` = [harnesses, agents, tools, config]; `session` = [session, definition, turns, queue, actions,
-        usage, threads, session_agents, session_tools, commands]; `thread` = [thread, transcript];
+        usage, threads, session_agents, session_tools, commands, records]; `thread` = [thread, transcript];
         `turn` = [turn, turn_display, turn_events]. A frame never reports a kind outside its scope's set, which is
         what keeps a revision baseline small and the comparison rule meaningful. `transcript_messages` is the one
         kind that is a LINK target only: reading paged messages and replacing them move the SAME `transcript`
@@ -8802,6 +9170,7 @@ components:
         - tools
         - config
         - commands
+        - records
     WsRevisionRecord:
       type: object
       description: >-
@@ -8859,8 +9228,9 @@ components:
       description: >-
         What one update frame carries. Every kind names a bounded payload or an invalidation, and no kind carries
         a session tree: `session.updated` is a metadata patch, `turn.upsert` is one row, `display.ops` is at most
-        32 addressed ops, `transcript.updated` is counts, `run.event` is opt-in raw events, and the
-        `*.registry_updated` and `catalogue.updated` kinds are id lists a re-read resolves.
+        32 addressed ops, `transcript.updated` is counts, `records.updated` is the record store's two
+        watermarks, `run.event` is opt-in raw events, and the `*.registry_updated` and `catalogue.updated`
+        kinds are id lists a re-read resolves.
       enum:
         - session.updated
         - turn.upsert
@@ -8872,6 +9242,7 @@ components:
         - thread.upsert
         - thread.removed
         - transcript.updated
+        - records.updated
         - tool.registry_updated
         - agent.registry_updated
         - run.event
@@ -9491,7 +9862,8 @@ components:
         and nothing else; `display.ops` requires `turn_id` and `ops`; `usage.updated` requires `usage_patch`
         and may also carry `turn_id`; `action.opened` requires `action`; `action.closed` requires
         `action_closed`; `thread.upsert` requires `thread`; `thread.removed` requires `thread_id`;
-        `transcript.updated` requires `transcript`; `tool.registry_updated` requires a non-empty `ids`;
+        `transcript.updated` requires `transcript`; `records.updated` requires `records`;
+        `tool.registry_updated` requires a non-empty `ids`;
         `agent.registry_updated` requires a non-empty `ids`; `run.event` requires `turn_id` and `events`;
         `catalogue.updated` requires `catalogue` and a non-empty `ids`; `config.updated` requires no payload.
         Every variant forbids every other payload field, so no frame can be both a body and an invalidation. A
@@ -9508,6 +9880,7 @@ components:
         - $ref: '#/components/schemas/WsUpdateThreadUpsert'
         - $ref: '#/components/schemas/WsUpdateThreadRemoved'
         - $ref: '#/components/schemas/WsUpdateTranscript'
+        - $ref: '#/components/schemas/WsUpdateRecords'
         - $ref: '#/components/schemas/WsUpdateToolRegistry'
         - $ref: '#/components/schemas/WsUpdateAgentRegistry'
         - $ref: '#/components/schemas/WsUpdateRunEvent'
@@ -9526,6 +9899,7 @@ components:
           thread.upsert: '#/components/schemas/WsUpdateThreadUpsert'
           thread.removed: '#/components/schemas/WsUpdateThreadRemoved'
           transcript.updated: '#/components/schemas/WsUpdateTranscript'
+          records.updated: '#/components/schemas/WsUpdateRecords'
           tool.registry_updated: '#/components/schemas/WsUpdateToolRegistry'
           agent.registry_updated: '#/components/schemas/WsUpdateAgentRegistry'
           run.event: '#/components/schemas/WsUpdateRunEvent'

@@ -481,6 +481,9 @@ import type {
     HarnessToolRuntime,
     NestedRunPolicy,
     RecordsToolName,
+    RecordStoreDelta,
+    RecordStoreNotification,
+    RecordStoreView,
     Tool,
     ToolContext,
     ToolCreation,
@@ -11391,6 +11394,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const record = retainedBranches().find((entry) => entry.branchId === id);
             return record === undefined ? undefined : cloneBranchRecord(record);
         },
+        // R2a/R3a — the record store's observation plane (see the `Harness` contract
+        // block above for why these are host seams and not `runtime` keys). Direct
+        // pass-throughs to the ONE engine this harness owns: the notification fires
+        // where the write lands, which in worker mode is THIS harness (the authority
+        // routes a lane's `executeRecords` here), so a panel fed from the session sees
+        // every write exactly once — model turn, lane worker, manual tool call, or
+        // slash command alike.
+        records: () => recordEngine.view(),
+        recordsChanges: (since: number) => recordEngine.changesSince(since),
+        onRecordsChange: (listener: (notification: RecordStoreNotification) => void) =>
+            recordEngine.onStoreChange(listener),
         // T14 lane-worker seam: the NESTED-RUN policy of this instance, read or armed (see
         // ./core/nested-runs.ts and `NestedRunPolicy`).
         //

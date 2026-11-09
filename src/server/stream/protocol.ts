@@ -78,6 +78,7 @@ export const HARNESS_WS_SCOPE_PUBLISHES: Record<WsSubscriptionScope, readonly Ws
         'action.opened',
         'action.closed',
         'usage.updated',
+        'records.updated',
         'thread.upsert',
         'thread.removed',
         'tool.registry_updated',
@@ -118,13 +119,13 @@ export const HARNESS_WS_SCOPE_FILTERS: Record<WsSubscriptionScope, readonly (key
 /**
  * The revision-baseline set per scope, verbatim from the `StreamResourceKind` description: `global`
  * = [harnesses, agents, tools, config]; `session` = [session, definition, turns, queue, actions,
- * usage, threads, session_agents, session_tools, commands]; `thread` = [thread, transcript];
- * `turn` = [turn, turn_display, turn_events]. Every set is within `revision_records_per_state` (20),
+ * usage, threads, session_agents, session_tools, commands, records]; `thread` = [thread, transcript];
+ * `turn` = [turn, turn_display, turn_events]. Every set is within `revision_records_per_state` (21),
  * and no frame ever reports a kind outside its scope's set.
  */
 export const HARNESS_WS_SCOPE_BASELINES: Record<WsSubscriptionScope, readonly StreamResourceKind[]> = {
     global: ['harnesses', 'agents', 'tools', 'config'],
-    session: ['session', 'definition', 'turns', 'queue', 'actions', 'usage', 'threads', 'session_agents', 'session_tools', 'commands'],
+    session: ['session', 'definition', 'turns', 'queue', 'actions', 'usage', 'threads', 'session_agents', 'session_tools', 'commands', 'records'],
     thread: ['thread', 'transcript'],
     turn: ['turn', 'turn_display', 'turn_events']
 };
@@ -147,6 +148,11 @@ export const HARNESS_WS_KIND_RESOURCES: Record<WsUpdateKind, readonly StreamReso
     'thread.upsert': ['threads', 'thread'],
     'thread.removed': ['threads'],
     'transcript.updated': ['transcript'],
+    // The record store is ONE counter domain: any committed mutation — whatever the
+    // collection — bumps the session's `records` revision, and `records.updated` is the
+    // only kind that names it. The two store watermarks (`store_rev`/`collections_rev`)
+    // travel in the payload, but the counter a client compares against is this one.
+    'records.updated': ['records'],
     'tool.registry_updated': ['session_tools'],
     'agent.registry_updated': ['session_agents'],
     'run.event': [],
@@ -181,7 +187,7 @@ export const streamResourceIdFor = (
         case 'config':
             return null;
         // Every remaining kind is session-scoped (session, definition, turns, actions, usage,
-        // threads, session_agents, session_tools, commands). `transcript_messages` is a LINK target
+        // threads, session_agents, session_tools, commands, records). `transcript_messages` is a LINK target
         // only (it reuses the owning `transcript` counter) and never appears in a baseline, so it
         // falls through to the session id, which is the id its link is addressed by.
         default:
@@ -243,6 +249,11 @@ export const defaultStreamLink = (
             return HARNESS_ROUTES.config();
         case 'commands':
             return `${HARNESS_ROUTES.sessionsBySessionIdCommands(session)}?limit=25`;
+        // The record store's canonical read. No `?limit` — the snapshot is already bounded by
+        // the engine's own caps (`maxRecords` per collection, feed trimmed to 200), so paging
+        // it would invent a second cursor the client already has in `store_rev`.
+        case 'records':
+            return HARNESS_ROUTES.sessionsBySessionIdRecords(session);
         default:
             return HARNESS_ROUTES.root();
     }

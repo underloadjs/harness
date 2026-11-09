@@ -645,13 +645,15 @@ it('reconciles every open pane after a reconnect whose replay window expired, wi
     if (openDialog === null) throw new Error('the transcript dialog closed under the reader');
     expect(openDialog.textContent).toContain('"id": "thread-a"');
 
-    // 4. no leaked registrations: the client holds one session subscription, one thread
+    // 4. no leaked registrations: the client holds the session subscription, the ONE
+    //    shared record-update channel T6's live panels register together
+    //    (./extensions/records-wake.ts — two panels, one registration), one thread
     //    subscription and one turn subscription — re-registered on the new connection,
     //    never abandoned by a settled observer (the leak that closed its own socket).
     const { harnessStream } = await import('./stream');
     const live = harnessStream().subscriptions();
 
-    expect(live.map((sub) => sub.spec.scope).sort()).toEqual(['session', 'thread', 'turn']);
+    expect(live.map((sub) => sub.spec.scope).sort()).toEqual(['session', 'session', 'thread', 'turn']);
     expect(live.filter((sub) => sub.spec.scope === 'thread').map((sub) => sub.spec.threadId)).toEqual(['thread-a']);
 });
 

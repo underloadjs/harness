@@ -103,13 +103,18 @@ describe('harness contract root and headers', () => {
 });
 
 describe('harness contract route tables', () => {
-    it('covers all 48 spec paths', () => {
-        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(48);
-        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(48);
+    it('covers all 49 spec paths', () => {
+        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(49);
+        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(49);
         // R1: the stop's counterpart is addressable with the same two ids, in the same
         // order, so a client builds it exactly the way it builds `cancel`.
         expect(HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdResume('ses_1', 'thr_3')).toBe(
             '/v1/harness/sessions/ses_1/threads/thr_3/resume',
+        );
+        // T4: the record store read is session-addressed only — its continuation cursor is
+        // the `?since=` query, never a path segment, so the builder takes ONE value.
+        expect(HARNESS_ROUTES.sessionsBySessionIdRecords('ses_1')).toBe(
+            '/v1/harness/sessions/ses_1/records',
         );
     });
 
@@ -234,7 +239,10 @@ describe('harness stream contract', () => {
             send_queue_bytes: 1048576,
             sustained_stall_ms: 10000,
             ack_timeout_ms: 5000,
-            revision_records_per_state: 20,
+            // Pinned to `x-websocket.limits.revision_records_per_state` in
+            // src/server/harness.swagger.yaml, which equals the `StreamResourceKind` count —
+            // the assertion under this one is the machine check that the two cannot drift.
+            revision_records_per_state: 21,
         });
         // The constant-size guarantee the stream rests on: one revision record per published kind.
         expect(HARNESS_WS_STREAM_LIMITS.revision_records_per_state).toBe(
@@ -263,7 +271,7 @@ describe('harness stream contract', () => {
         expect(HARNESS_WS_SCOPES).toEqual(['global', 'session', 'thread', 'turn']);
     });
 
-    it('enumerates the fifteen update kinds in spec order', () => {
+    it('enumerates the sixteen update kinds in spec order', () => {
         expect(HARNESS_WS_UPDATE_KINDS).toEqual([
             'session.updated',
             'turn.upsert',
@@ -275,6 +283,10 @@ describe('harness stream contract', () => {
             'thread.upsert',
             'thread.removed',
             'transcript.updated',
+            // T4: the record store's wake-up kind. Its place in this array is the yaml's
+            // `WsUpdateKind.enum` order (src/server/harness.swagger.yaml), and it sits with
+            // the other session-scoped identity kinds, right after the transcript.
+            'records.updated',
             'tool.registry_updated',
             'agent.registry_updated',
             'run.event',

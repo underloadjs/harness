@@ -1473,6 +1473,107 @@ export type RecordChange = {
     itemRev?: number;
 };
 
+// ---------------------------------------------------------------------------
+// R2a/R3a — the store's OBSERVATION plane (records panel / tasks panel)
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Everything above describes ONE collection: its `storeRev` and its
+// own gap-free change window. A live panel is not one collection — it shows tasks AND
+// chapters AND whatever an agent `define`s, and it needs (a) to be woken when any of
+// them moves and (b) a cursor that survives a collection being added under it. That is
+// a STORE-level view, and the engine is the only place that can mint it honestly, so
+// these types describe the read side of the engine's store-wide feed.
+//
+// THE RULES:
+//   - the feed is RUNTIME state (like `storeRevHighWater`), never persisted: the
+//     snapshot's exact key sets (`nextId`, `collections`) do not change, and a feed
+//     entry survives no restart — a client whose `since` predates the retained window
+//     gets `reset: true` and re-bootstraps from the snapshot;
+//   - `seq` is store-wide and monotonic ACROSS collections (one watermark for the
+//     whole engine), while `rev` inside an entry stays the collection's own revision.
+//     A client cursors on `seq`; the CAS token a `records` write sends is `rev`, and
+//     the two are never interchangeable;
+//   - the feed is FIFO-bounded by `RECORD_MAX_CHANGES` (200), the same bound the
+//     per-collection windows use, so a chatty agent cannot grow this map without
+//     bound;
+//   - `collectionsRev` counts changes to the registered COLLECTION SET (`define`,
+//     `drop`, `reset`, `restore`). It is deliberately SEPARATE from `storeRev`: adding
+//     a collection mints no record event, so a delta would otherwise report a
+//     watermark advance with nothing to apply. A client that sees `collectionsRev`
+//     move re-reads the snapshot — that is the whole rule, and it keeps `reset`
+//     meaning exactly one thing (my `since` is no longer answerable).
+//
+// Cross-references:
+//   - ../core/records.ts    — the feed writer (`pushChange`) and the two readers
+//   - ../harness.ts         — `records()` / `recordsChanges()` / `onRecordsChange()`
+//   - ../server/sessions.ts — the `records.updated` stream signal
+//   - ../server/api.ts      — `GET /v1/harness/sessions/{id}/records`
+
+// One entry of the store-wide feed: the collection's change entry (`rev` is THAT
+// collection's revision, as in `RecordChange`) plus the store-wide position and the
+// collection it belongs to. A detached copy on every read.
+export type RecordStoreChange = RecordChange & {
+    seq: number;
+    collection: string;
+};
+
+// What kind of store mutation a notification describes. `mutate` is the record-level
+// case (patches/removals/additions of one call); `define`/`drop` are the collection-set
+// cases; `reset`/`restore` replace the whole store at once, which is why they carry no
+// `changes` — a client re-reads the snapshot for those.
+export type RecordStoreChangeReason = 'mutate' | 'define' | 'drop' | 'reset' | 'restore';
+
+// What the engine announces to its owner after every state-changing call. ONE
+// notification per call, emitted synchronously AFTER the call committed (a rejected
+// call announces nothing at all), so a 40-record batch is one signal rather than 40.
+export type RecordStoreNotification = {
+    // The store-wide feed watermark after this call — the value a client passes back
+    // as `?since=`. 0 after a `reset`, because a reset is a clean start.
+    storeRev: number;
+    // Bumps only when the registered collection set moved (define/drop/reset/restore).
+    collectionsRev: number;
+    // Collections whose RECORDS this call created, changed, or removed, in feed order.
+    // Empty for a collection-set or wholesale change, whose `reason` says what happened.
+    affectedCollections: string[];
+    // The feed entries this call appended (oldest first). Empty for define/drop and
+    // for reset/restore, which append no record events.
+    changes: RecordStoreChange[];
+    reason: RecordStoreChangeReason;
+};
+
+// One collection in the store-level read model. `entries` is the whole collection
+// (bounded by its own `maxRecords`) in canonical order, projected EXACTLY like a list
+// page — `getOnly` fields such as a chapter body are absent, not emptied — because a
+// panel list is a list, and one body is still one `get` away.
+export type RecordStoreCollection = {
+    name: string;
+    fields: readonly RecordFieldDefinition[];
+    // This collection's own revision watermark (the CAS/log domain).
+    storeRev: number;
+    count: number;
+    entries: RecordEntry[];
+};
+
+// `records()` — the bounded snapshot a client bootstraps from.
+export type RecordStoreView = {
+    storeRev: number;
+    collectionsRev: number;
+    collections: RecordStoreCollection[];
+    // The retained store-wide feed, oldest first.
+    changes: RecordStoreChange[];
+};
+
+// `recordsChanges(since)` — the delta a client applies on top of its last read.
+// `reset` is true when `since` is no longer answerable from the retained window: the
+// caller must re-bootstrap from `records()`. `changes` still carries what IS retained,
+// so a host can serve both the honest flag and the partial feed in one read.
+export type RecordStoreDelta = {
+    storeRev: number;
+    collectionsRev: number;
+    changes: RecordStoreChange[];
+    reset: boolean;
+};
+
 // One page cursor. Offset mode keeps `nextOffset`; keyset mode (`afterId`) echoes
 // the cursor and answers with `nextAfterId`, because a numeric-id cursor survives
 // another agent removing a record mid-walk while an index cannot.
@@ -3256,6 +3357,26 @@ export type Harness = {
     // N3: one branch record by id, or undefined. The returned record is a
     // detached copy, like `branches()`.
     branch: (id: string) => HarnessBranchRecord | undefined;
+
+    // -------------------------------------------------------------------
+    // R2a/R3a — the record store's OBSERVATION plane (live records/tasks panels)
+    // -------------------------------------------------------------------
+    //
+    // The record tools write through `runtime.executeRecords`; a HOST (the server
+    // store, and through it the stream hub) watches the same store through these three
+    // doors. They are on the handle, not on `runtime`, because `runtime` is the
+    // tool-visible surface a lane worker RPCs (./server/workers/capability.ts
+    // classifies every key of it) and an observer seam is host-only: a lane's write is
+    // answered by the authority ON THE CANONICAL harness, so the canonical harness's
+    // engine is the one that announces it — once per write, never per replica.
+    //
+    // Nothing here writes, and every read is detached. A store-level notification
+    // describes ONE committed tool call (`changes` carries the feed entries it
+    // appended), and a rejected call announces nothing, so a live panel never renders a
+    // write the model was refused.
+    records: () => RecordStoreView;
+    recordsChanges: (since: number) => RecordStoreDelta;
+    onRecordsChange: (listener: (notification: RecordStoreNotification) => void) => () => void;
 
     // -------------------------------------------------------------------
     // R2 persistent agent threads

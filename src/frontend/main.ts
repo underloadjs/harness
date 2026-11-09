@@ -354,7 +354,14 @@ import { looksLikeJson, prettyJson } from './ui/markdown';
 // matching repaint: a persistent box keeps its ONE node and only its rows change.
 import { createPayloadViewer, paintCodeBlock } from './ui/tools';
 import { applyPanels, createPanelHost, mediaOfTurns, panelKeyOf, mediaOfSummaries } from './ui/panels';
-import type { PanelMedia, PanelSummarySource } from './ui/panels';
+import type { PanelHost, PanelMedia, PanelSlot, PanelSummarySource } from './ui/panels';
+// The plug-and-play panel seam (T5/R1). The shell keeps its hosts and its paint
+// call-sites, and delegates what a panel LOOKS like (a registered panel KIND) and
+// what ELSE sits in a host (a registered SHELL PANEL) to this subsystem. With nothing
+// registered the board paints exactly as this file always did — and this file DOES
+// register two: the live Tasks and Records panels (./extensions/records-panels.ts),
+// which is the feature those seams exist for.
+import { createPanelRuntime, registerBuiltinShellPanels } from './extensions';
 // The two draggable seams between the chat column and the rails (styles.css
 // `.rail-resizer`). They drive the shell's outer grid tracks and store nothing, so a
 // reload repaints the stylesheet's default rail widths.
@@ -5816,13 +5823,44 @@ const clearActivity = (): void => {
 // The hosts are dumb; the instance is the source of truth. That is what makes a
 // session switch safe: the board can only ever show the panels of the conversation
 // on screen, and `current.panels` is rebuilt from that session's turns and results.
+//
+// T5/R1: the paint goes THROUGH the extension runtime instead of writing the hosts
+// itself. One call now (a) reconciles the registered shell panels against the session
+// on screen — mounting the ones this conversation should show and DISPOSING the ones
+// it should not, subscriptions and timers included — (b) hands each host the
+// extension nodes it owns, and (c) applies the tool panels, whose card each host now
+// asks the kind registry to draw and falls back to the standard card when no kind
+// owns it. With both registries empty that is the same three `apply` calls, the same
+// nodes and the same hidden/visible state as before.
+// The two live panels this app ships (T6): `harness.tasks` above `harness.records`,
+// both session-scoped and both `requiresSession`, so neither mounts at boot — the
+// board stays exactly as `scratch-board.test.ts` pins it until a conversation is on
+// screen, and then each panel mounts ONCE with a real session id to read with. The
+// registration is idempotent (re-registering an id replaces it), so a hot reload does
+// not stack a second card.
+registerBuiltinShellPanels();
+
+const panelRuntime = createPanelRuntime();
+
+// The three hosts, addressed by slot (`ui/panels.ts` owns the slot list). Read per
+// paint rather than handed to the runtime once, so the runtime can never hold a host
+// the shell has replaced.
+const panelHosts = (): Partial<Record<PanelSlot, PanelHost>> => ({
+    scratch: scratchHost,
+    center: centerPanels,
+    left: leftPanels
+});
+
 const paintPanels = (): void => {
     const media: readonly PanelMedia[] = current === undefined ? [] : [...current.panels.values()];
-    scratchHost.apply(media);
-    centerPanels.apply(media);
-    leftPanels.apply(media);
+
+    // The session pointer is what scopes a live panel: a switch, a New session or a
+    // delete moves this value, and the runtime releases the conversation it came from.
+    panelRuntime.paint({ hosts: panelHosts(), media, sessionId: current?.sessionId ?? null });
 
     // The scratch note explains an empty board instead of leaving a blank section.
+    // `ids()` is the TOOL-panel list — a registered live panel never changes this
+    // sentence, which is what keeps the rail's copy pinned by scratch-board.test.ts.
     const count = scratchHost.ids().length;
     scratchNote.textContent =
         current === undefined
@@ -12893,6 +12931,11 @@ window.addEventListener('pagehide', () => {
     stopWatching();
     stopPolling();
     clearActivity();
+
+    // T5/R1: the registered live panels' teardown travels with the page. Each one
+    // released its own listeners/subscriptions/timers through its `PanelContext`, so
+    // an unload hook another module installed cannot strand a plugin's resources.
+    panelRuntime.disposeAll();
 
     // Object URLs for draft thumbnails are page-lifetime only; release them so a
     // reload/new document does not leak blob storage. The bytes themselves are in

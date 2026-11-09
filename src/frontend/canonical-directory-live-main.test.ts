@@ -197,10 +197,14 @@ describe('the canonical directory', () => {
         await flush();
         await flush();
 
-        // Exactly one session-scoped subscription, addressed to THIS conversation: an
-        // unnormalized row left `pendingOf` false and the shell never dialed at all.
-        expect(stream.subscriptions).toHaveLength(1);
-        expect(stream.subscriptions[0]).toMatchObject({ scope: 'session', session_id: 's-live' });
+        // TWO session-scoped subscriptions, both addressed to THIS conversation: the
+        // shell's observer, and the ONE shared record-update channel the live panels of
+        // T6 register together (./extensions/records-wake.ts) — two panels, one
+        // registration, which is the point of the broker. An unnormalized row left
+        // `pendingOf` false and the shell never dialed at all.
+        expect(stream.subscriptions).toHaveLength(2);
+        expect(stream.subscriptions.map((sub) => sub.scope).sort()).toEqual(['session', 'session']);
+        expect(stream.subscriptions.every((sub) => sub.session_id === 's-live')).toBe(true);
         expect(stream.status()).toBe('open');
 
         // The pending lock is visible while the run is live: `+ New session` is disabled,

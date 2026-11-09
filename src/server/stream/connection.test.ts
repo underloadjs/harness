@@ -157,7 +157,11 @@ describe('the open conversation', () => {
                 { resource: 'threads', id: KNOWN_SESSION, revision: 0, epoch: EPOCH },
                 { resource: 'session_agents', id: KNOWN_SESSION, revision: 0, epoch: EPOCH },
                 { resource: 'session_tools', id: KNOWN_SESSION, revision: 0, epoch: EPOCH },
-                { resource: 'commands', id: KNOWN_SESSION, revision: 0, epoch: EPOCH }
+                { resource: 'commands', id: KNOWN_SESSION, revision: 0, epoch: EPOCH },
+                // T4: the record store joins the session baseline set (src/server/stream/protocol.ts
+                // `HARNESS_WS_SCOPE_BASELINES.session`), keyed by the SESSION id — a `define`/`drop`
+                // or any committed record mutation is what moves it.
+                { resource: 'records', id: KNOWN_SESSION, revision: 0, epoch: EPOCH }
             ],
             publishes: [
                 'session.updated',
@@ -166,6 +170,7 @@ describe('the open conversation', () => {
                 'action.opened',
                 'action.closed',
                 'usage.updated',
+                'records.updated',
                 'thread.upsert',
                 'thread.removed',
                 'tool.registry_updated',

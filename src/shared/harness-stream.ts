@@ -43,14 +43,14 @@ export const HARNESS_WS_STREAM_LIMITS = {
     send_queue_bytes: 1048576,
     sustained_stall_ms: 10000,
     ack_timeout_ms: 5000,
-    revision_records_per_state: 20,
+    revision_records_per_state: 21,
 } satisfies WsStreamLimits;
 
 /** Closed vocabulary of subscription scopes. */
 export const HARNESS_WS_SCOPES = ["global", "session", "thread", "turn"] as const satisfies readonly WsSubscriptionScope[];
 
 /** Closed list of `StreamResourceKind` values (the revision-counter vocabulary), for baseline iteration. */
-export const HARNESS_STREAM_RESOURCE_KINDS = ["session", "definition", "turns", "turn", "turn_display", "turn_events", "threads", "thread", "transcript", "transcript_messages", "actions", "usage", "queue", "session_agents", "session_tools", "harnesses", "agents", "tools", "config", "commands"] as const satisfies readonly StreamResourceKind[];
+export const HARNESS_STREAM_RESOURCE_KINDS = ["session", "definition", "turns", "turn", "turn_display", "turn_events", "threads", "thread", "transcript", "transcript_messages", "actions", "usage", "queue", "session_agents", "session_tools", "harnesses", "agents", "tools", "config", "commands", "records"] as const satisfies readonly StreamResourceKind[];
 
 /** Frame tags a client may send. */
 export const HARNESS_WS_CLIENT_MESSAGE_TYPES = ["hello", "subscribe", "unsubscribe", "ack", "ping", "bye"] as const satisfies readonly WsClientMessage['type'][];
@@ -59,7 +59,7 @@ export const HARNESS_WS_CLIENT_MESSAGE_TYPES = ["hello", "subscribe", "unsubscri
 export const HARNESS_WS_SERVER_MESSAGE_TYPES = ["welcome", "subscription_state", "update", "resync_required", "error", "heartbeat", "pong"] as const satisfies readonly WsServerMessage['type'][];
 
 /** Update kinds inside `update` frames (`WsUpdate.kind`, the second-level discriminator). */
-export const HARNESS_WS_UPDATE_KINDS = ["session.updated", "turn.upsert", "turn.removed", "display.ops", "usage.updated", "action.opened", "action.closed", "thread.upsert", "thread.removed", "transcript.updated", "tool.registry_updated", "agent.registry_updated", "run.event", "catalogue.updated", "config.updated"] as const satisfies readonly WsUpdate['kind'][];
+export const HARNESS_WS_UPDATE_KINDS = ["session.updated", "turn.upsert", "turn.removed", "display.ops", "usage.updated", "action.opened", "action.closed", "thread.upsert", "thread.removed", "transcript.updated", "records.updated", "tool.registry_updated", "agent.registry_updated", "run.event", "catalogue.updated", "config.updated"] as const satisfies readonly WsUpdate['kind'][];
 
 /** Protocol error codes (`WsProtocolError.code`). */
 export const HARNESS_WS_PROTOCOL_CODES = ["invalid_payload", "unknown_subscription", "unknown_resource", "unsupported_filter", "late_hello", "too_many_subscriptions", "frame_too_large", "rate_limited", "internal"] as const satisfies readonly WsProtocolError['code'][];
@@ -88,6 +88,7 @@ import type {
     HarnessPendingTool,
     HarnessUsage,
     PendingAction,
+    RecordsSignal,
     SessionStatePatch,
     SessionTurnStatus,
     ThreadSummary,
@@ -97,6 +98,22 @@ import type {
     TurnSummary,
     UsagePatch,
 } from './harness-api';
+
+/**
+ * `records.updated` carries `records` (the two store watermarks) and no other payload field: never a record,
+ * never a collection body. The content is one delta read away, which is what keeps a records burst cheap on the
+ * wire and identical in shape to a poll.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface WsUpdateRecords {
+    type: "update";
+    subscription_id: string;
+    sequence: number;
+    cursor: string;
+    kind: "records.updated";
+    at: number;
+    records: RecordsSignal;
+}
 
 /**
  * Recorded event kinds, the authoritative list of `HarnessEvent` in `src/types/index.ts`: `start` opens a run
@@ -226,14 +243,19 @@ export interface WsSubscriptionFilters {
  * DERIVED and mint no new counter: `turn_display` and `turn_events` carry the owning turn's `revision` (the
  * display tree and the recorded events are pure folds of that record, and `TurnEventPage.total_events` is the
  * event position within it), and `transcript_messages` carries the owning `transcript` revision, because paging
- * messages and replacing them move one counter. The per-scope baseline sets are: `global` = [harnesses, agents,
- * tools, config]; `session` = [session, definition, turns, queue, actions, usage, threads, session_agents,
- * session_tools, commands]; `thread` = [thread, transcript]; `turn` = [turn, turn_display, turn_events]. A
- * frame never reports a kind outside its scope's set, which is what keeps a revision baseline small and the
- * comparison rule meaningful. `transcript_messages` is the one kind that is a LINK target only: reading paged
- * messages and replacing them move the SAME `transcript` counter, so it appears in `WsResyncRequired.resources`
- * to name the read to perform but never as a separate baseline record, and a client must treat its freshness as
- * the `transcript` record of the same id.
+ * messages and replacing them move one counter. `records` is the session's RECORD STORE (tasks, chapters,
+ * profiles, locations, plus anything an agent defines): its counter is the `revision` field of `GET
+ * /v1/harness/sessions/{session_id}/records`, and it moves once per committed record mutation. The store's OWN
+ * monotonic position is `store_rev` on that read and on a `records.updated` frame; it is a feed cursor, not a
+ * revision, and a client pages the change feed with it (`?since=`) and uses the counter only for the staleness
+ * test a revision is always for. The per-scope baseline sets are: `global` = [harnesses, agents, tools,
+ * config]; `session` = [session, definition, turns, queue, actions, usage, threads, session_agents,
+ * session_tools, commands, records]; `thread` = [thread, transcript]; `turn` = [turn, turn_display,
+ * turn_events]. A frame never reports a kind outside its scope's set, which is what keeps a revision baseline
+ * small and the comparison rule meaningful. `transcript_messages` is the one kind that is a LINK target only:
+ * reading paged messages and replacing them move the SAME `transcript` counter, so it appears in
+ * `WsResyncRequired.resources` to name the read to perform but never as a separate baseline record, and a
+ * client must treat its freshness as the `transcript` record of the same id.
  */
 export type StreamResourceKind = 
     | "session"
@@ -255,7 +277,8 @@ export type StreamResourceKind =
     | "agents"
     | "tools"
     | "config"
-    | "commands";
+    | "commands"
+    | "records";
 
 /**
  * ONE counter, keyed by kind and instance id, so there is no free-form map and no ambiguity about which
@@ -291,8 +314,9 @@ export interface WsResourceLink {
 /**
  * What one update frame carries. Every kind names a bounded payload or an invalidation, and no kind carries a
  * session tree: `session.updated` is a metadata patch, `turn.upsert` is one row, `display.ops` is at most 32
- * addressed ops, `transcript.updated` is counts, `run.event` is opt-in raw events, and the `*.registry_updated`
- * and `catalogue.updated` kinds are id lists a re-read resolves.
+ * addressed ops, `transcript.updated` is counts, `records.updated` is the record store's two watermarks,
+ * `run.event` is opt-in raw events, and the `*.registry_updated` and `catalogue.updated` kinds are id lists a
+ * re-read resolves.
  */
 export type WsUpdateKind = 
     | "session.updated"
@@ -305,6 +329,7 @@ export type WsUpdateKind =
     | "thread.upsert"
     | "thread.removed"
     | "transcript.updated"
+    | "records.updated"
     | "tool.registry_updated"
     | "agent.registry_updated"
     | "run.event"
@@ -742,11 +767,12 @@ export interface WsUpdateConfig {
  * `display.ops` requires `turn_id` and `ops`; `usage.updated` requires `usage_patch` and may also carry
  * `turn_id`; `action.opened` requires `action`; `action.closed` requires `action_closed`; `thread.upsert`
  * requires `thread`; `thread.removed` requires `thread_id`; `transcript.updated` requires `transcript`;
- * `tool.registry_updated` requires a non-empty `ids`; `agent.registry_updated` requires a non-empty `ids`;
- * `run.event` requires `turn_id` and `events`; `catalogue.updated` requires `catalogue` and a non-empty `ids`;
- * `config.updated` requires no payload. Every variant forbids every other payload field, so no frame can be
- * both a body and an invalidation. A frame that names a resource a client is not showing is ignored, which is
- * what makes one shared session scope cheap for several panes.
+ * `records.updated` requires `records`; `tool.registry_updated` requires a non-empty `ids`;
+ * `agent.registry_updated` requires a non-empty `ids`; `run.event` requires `turn_id` and `events`;
+ * `catalogue.updated` requires `catalogue` and a non-empty `ids`; `config.updated` requires no payload. Every
+ * variant forbids every other payload field, so no frame can be both a body and an invalidation. A frame that
+ * names a resource a client is not showing is ignored, which is what makes one shared session scope cheap for
+ * several panes.
  */
 export type WsUpdate = 
     | WsUpdateSession
@@ -759,6 +785,7 @@ export type WsUpdate =
     | WsUpdateThreadUpsert
     | WsUpdateThreadRemoved
     | WsUpdateTranscript
+    | WsUpdateRecords
     | WsUpdateToolRegistry
     | WsUpdateAgentRegistry
     | WsUpdateRunEvent

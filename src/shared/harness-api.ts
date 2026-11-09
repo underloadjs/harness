@@ -72,6 +72,7 @@ export const HARNESS_PATH_TEMPLATES = {
     sessionsBySessionIdDefinition: '/v1/harness/sessions/{session_id}/definition',
     sessionsBySessionIdUsage: '/v1/harness/sessions/{session_id}/usage',
     sessionsBySessionIdCommands: '/v1/harness/sessions/{session_id}/commands',
+    sessionsBySessionIdRecords: '/v1/harness/sessions/{session_id}/records',
     sessionsBySessionIdQueue: '/v1/harness/sessions/{session_id}/queue',
     sessionsBySessionIdTasks: '/v1/harness/sessions/{session_id}/tasks',
     sessionsBySessionIdReset: '/v1/harness/sessions/{session_id}/reset',
@@ -144,6 +145,8 @@ export const HARNESS_ROUTES = {
     sessionsBySessionIdUsage: (sessionId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/usage`,
     /** `/v1/harness/sessions/{session_id}/commands` */
     sessionsBySessionIdCommands: (sessionId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/commands`,
+    /** `/v1/harness/sessions/{session_id}/records` */
+    sessionsBySessionIdRecords: (sessionId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/records`,
     /** `/v1/harness/sessions/{session_id}/queue` */
     sessionsBySessionIdQueue: (sessionId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/queue`,
     /** `/v1/harness/sessions/{session_id}/tasks` */
@@ -1449,6 +1452,125 @@ export interface PendingAction {
     thread_id?: string;
     agent: string;
     received_at: number;
+}
+
+/**
+ * One declared field of a record collection, projected for a renderer: the key (which IS the entry's property
+ * name), the value type, whether an add must supply it, and the closed value set for an `enum`. The full engine
+ * spec (caps, defaults, facets, `getOnly`) is a `records describe` call away; this row carries only what a
+ * panel needs to draw columns and a filter, and `key` order is the collection's canonical order, so a client
+ * renders the order the store already emits entries and change logs in.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface RecordFieldDescriptor {
+    key: string;
+    type: "text" | "boolean" | "integer" | "enum" | "strings";
+    required: boolean;
+    values?: string[];
+}
+
+/**
+ * One stored record, projected exactly like a list page: `id`, then the collection's declared fields in
+ * canonical order (a `getOnly` field such as a chapter body is ABSENT, never emptied - "no body" and "this read
+ * does not show bodies" are different facts), then `rev`, then the attribution triple. Keys are open because
+ * the declared fields are the collection's own: `tasks` has `text` and `completed`, an agent-defined collection
+ * has whatever it declared. `rev` is the CAS token a guarded `records` write sends back as `expects: [{id,
+ * rev}]`; it is NOT the stream's `store_rev`, and one is never a cursor for the other. Attribution comes from
+ * the calling context, never from tool arguments, and its keys stay absent when the store has no such fact (an
+ * engine restored from a snapshot, or a caller with no agent identity).
+ */
+export interface RecordEntryRow {
+    id: string;
+    rev: number;
+    updated_by?: string;
+    updated_thread_id?: string;
+    updated_at?: string;
+    [key: string]: unknown;
+}
+
+/**
+ * One entry of the store-wide change feed: the event the collection logged, tagged with the store position
+ * (`seq`) and the collection it belongs to. `rev` inside it is THAT collection's revision, unchanged in meaning
+ * from the per-collection log a `records since:` read returns; `item_rev` is the record's content revision
+ * after the event. A `remove` names the record and stops: the entry is gone, so the row's `rev`/`item_rev` is
+ * the removal's store event, not the record's last content revision. `fields` lists, in canonical order, which
+ * fields an `update` actually changed - the compact statement that lets a panel repaint one cell without
+ * diffing the entry.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface RecordChangeRow {
+    seq: number;
+    collection: string;
+    rev: number;
+    id: string;
+    op: "add" | "update" | "remove";
+    by?: string;
+    thread_id?: string;
+    at: string;
+    fields?: string[];
+    item_rev?: number;
+}
+
+/**
+ * One collection of the session's record store, whole: its field spec, its entries in canonical order, and the
+ * collection's own revision watermark. `tasks`, `chapters`, `profiles` and `locations` are always there;
+ * anything an agent defines appears beside them, and the set a client sees is what `collections_rev` describes.
+ * Entries are the whole collection up to its own bound (200 by default, engine-owned), NOT a cursor-paged
+ * slice: this read is a bootstrap, and a panel that shows one collection shows all of it.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface RecordCollectionRow {
+    name: string;
+    store_rev: number;
+    count: number;
+    fields: RecordFieldDescriptor[];
+    entries: RecordEntryRow[];
+}
+
+/**
+ * The bootstrap read: every collection of the session's record store plus the retained store-wide change feed,
+ * in ONE bounded response (`GET /v1/harness/sessions/{session_id}/records` with no `since`). This is the state
+ * a live panel starts from, and the pair of watermarks it carries is what every later delta is compared
+ * against. The feed is retained FIFO at 200 entries per store, so `changes` describes the recent edits and
+ * `store_rev` says where it starts; a client that wants older history reads the store, not a replay.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface RecordsSnapshotResponse {
+    session_id: string;
+    revision: number;
+    store_rev: number;
+    collections_rev: number;
+    collections: RecordCollectionRow[];
+    changes: RecordChangeRow[];
+}
+
+/**
+ * The delta read (`GET .../records?since=N`): the feed entries after position `N` and nothing else, so a panel
+ * that is already showing the store pays for what moved instead of for the store. `reset: true` says `N` is no
+ * longer answerable - the retained window trimmed past it, or the store was replaced wholesale by a reset, a
+ * restore, or a restart - and the client re-bootstraps from the snapshot form of this same path. It is a 200,
+ * not an error: a stale cursor is a normal race, and the answer names the honest recovery. `changes` still
+ * carries whatever IS retained, so a host can apply the tail rather than throw it away.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface RecordsDeltaResponse {
+    session_id: string;
+    revision: number;
+    store_rev: number;
+    collections_rev: number;
+    changes: RecordChangeRow[];
+    reset: boolean;
+}
+
+/**
+ * The whole `records.updated` payload: the store's two watermarks and no record, ever. A live panel is woken by
+ * an identity, then pages the delta read - the same receipt philosophy every other kind of this stream follows,
+ * and the reason a burst of record edits costs frames proportional to edits and not to entry size.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface RecordsSignal {
+    store_rev: number;
+    collections_rev: number;
 }
 
 /**

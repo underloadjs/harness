@@ -160,11 +160,25 @@ const ringActivity = (): string | undefined =>
 const host = (slot: 'scratch' | 'center' | 'left'): HTMLElement =>
     byClass(`.panel-host[data-slot="${slot}"]`, 'div');
 
+// TOOL-panel cards only. T6 mounted two live panels on this board (`harness.tasks`,
+// `harness.records`), and they are `.panel` elements too; their content is pinned by
+// ./extensions/records-panels.test.ts, and the assertions below are about what the TOOL
+// pipeline painted. `panel-extension` is the discriminator the runtime stamps on an
+// extension node and never on a tool card (./extensions/runtime.ts:104).
+const toolCards = (slot: 'scratch' | 'center' | 'left'): HTMLElement[] =>
+    [...host(slot).querySelectorAll<HTMLElement>('.panel')].filter((panel) => !panel.classList.contains('panel-extension'));
+
 const panelIds = (slot: 'scratch' | 'center' | 'left'): (string | undefined)[] =>
-    [...host(slot).querySelectorAll<HTMLElement>('.panel')].map((panel) => panel.dataset.panelId);
+    toolCards(slot).map((panel) => panel.dataset.panelId);
 
 const panelText = (slot: 'scratch' | 'center' | 'left'): (string | null)[] =>
     [...host(slot).querySelectorAll<HTMLElement>('.panel-text')].map((node) => node.textContent);
+
+// The live panels this board carries (T6). Asserted where the board's shape matters, so
+// "a live panel appeared on the board" is a pinned fact rather than an accident of the
+// selector.
+const extensionIds = (slot: 'scratch' | 'center' | 'left'): (string | undefined)[] =>
+    [...host(slot).querySelectorAll<HTMLElement>('.panel-extension')].map((node) => node.dataset.panelExtension);
 
 // R3: the tools view is opened from the global topbar toggle (no tab strip).
 const openTools = (): void => {
@@ -602,7 +616,13 @@ it('derives panels from a polled snapshot without replaying old activity', async
     await vi.advanceTimersByTimeAsync(50);
 
     expect(gets).toBe(1);
-    expect(host('scratch').hidden).toBe(true);
+    // The board holds NO TOOL CARD yet (`gets` is the first read, and the polled
+    // snapshot has not landed), but the host is not hidden: the two live panels of T6
+    // are mounted for the conversation on screen, and a host with content is a visible
+    // host. The tool-card count — the thing this test is about — is still zero.
+    expect(host('scratch').hidden).toBe(false);
+    expect(panelIds('scratch')).toEqual([]);
+    expect(extensionIds('scratch')).toEqual(['harness.tasks', 'harness.records']);
 
     // The run progressed SERVER-SIDE: the next read answers the snapshot that carries the tool
     // result. Nothing in this case goes through a write or a pushed frame (that is the point of a

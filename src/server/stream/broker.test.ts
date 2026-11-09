@@ -164,6 +164,10 @@ describe('subscribe registration', () => {
                 'action.opened',
                 'action.closed',
                 'usage.updated',
+                // T4: the record store's wake-up kind, in the position `HARNESS_WS_SCOPE_PUBLISHES.session`
+                // (src/server/stream/protocol.ts) puts it, which is the yaml's
+                // `subscription_scopes[].publishes` order.
+                'records.updated',
                 'thread.upsert',
                 'thread.removed',
                 'tool.registry_updated',
@@ -193,6 +197,7 @@ describe('subscribe registration', () => {
             'action.opened',
             'action.closed',
             'usage.updated',
+            'records.updated',
             'thread.upsert',
             'thread.removed',
             'tool.registry_updated',
@@ -224,7 +229,10 @@ describe('subscribe registration', () => {
             pace: 'ordered'
         });
 
-        expect(outcome.status === 'ok' && outcome.state.revisions.length).toBe(20);
+        // The cap IS `revision_records_per_state` (21 — one record per `StreamResourceKind`,
+        // src/server/harness.swagger.yaml `x-websocket.limits`), so a 25-record host baseline
+        // must be truncated to exactly that many, in the host's order.
+        expect(outcome.status === 'ok' && outcome.state.revisions.length).toBe(21);
         expect(outcome.status === 'ok' && outcome.state.revisions[0]).toEqual({ resource: 'config', id: null, revision: 0, epoch: EPOCH });
     });
 
