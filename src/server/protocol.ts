@@ -108,15 +108,20 @@ export type SessionStatus = 'idle' | 'running' | 'error';
 // events from subagents a delegation reached — in emission order.
 //
 // `startedAt`/`updatedAt` are epoch milliseconds from the server clock.
-// `startedAt` never changes once the turn opens; `updatedAt` moves on every
-// recorded event and again when the turn reaches a terminal status.
+// `startedAt` never changes once the turn opens — with ONE exception: a stopped
+// conversation whose turn is RESUMED in place (`POST .../threads/:threadId/resume`)
+// puts that row back in the shape a submit minted, so `startedAt` is dropped and
+// restamped by the resumed run. `updatedAt` moves on every recorded event and again
+// when the turn reaches a terminal status.
 //
 // QUEUED (R4): a task submitted through POST /sessions/:id/tasks exists as a turn
 // immediately, but its status is 'queued' until the server pump starts executing
 // it. A queued turn therefore has an id and an index (stable from the submit) and
 // no `startedAt` yet; the server stamps `startedAt` when execution begins. The
 // same turn id is reused for the queued, running, and terminal frames, so a client
-// upserts by id instead of guessing which row a frame belongs to.
+// upserts by id instead of guessing which row a frame belongs to. A RESUMED turn
+// re-enters that same queued state under its original id, so a client upserts the
+// row it already has rather than learning about a new one.
 export type SessionTurnStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
 
 export type SessionTurn = {
@@ -157,6 +162,9 @@ export type SessionTurn = {
     status: SessionTurnStatus;
     // Absent while 'queued' (execution has not begun); always set once the turn
     // is 'running' or terminal. Optional so a queued record is a valid turn.
+    // A turn RESUMED in place (a stopped conversation's unanswered row, see
+    // ./sessions.ts `resumeThread`) loses this field and gets a fresh one from the
+    // resumed run, because the row states the attempt now in flight.
     startedAt?: number;
     updatedAt: number;
     events: HarnessEvent[];
@@ -169,7 +177,9 @@ export type SessionTurn = {
     // event the run reported (each agent's requests included, so a delegated
     // subagent is part of the same bill). Optional because providers, not this
     // server, decide whether usage exists at all: absent means "no request
-    // reported any", which is not the same as a zero-spend turn.
+    // reported any", which is not the same as a zero-spend turn. A turn RESUMED in
+    // place starts from an empty tally like a fresh submit, because the row reports
+    // the attempt now running rather than the spend of the one that was stopped.
     usage?: HarnessUsage;
     // Focused guidance that was STEERED into this turn's run instead of starting a
     // separate turn (R5). The runtime applies steered text at the next safe model

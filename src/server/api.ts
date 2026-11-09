@@ -2409,12 +2409,15 @@ export const createHarnessApi = ({
 
     // The durable resume of ONE stopped conversation (R1, POST .../threads/:threadId/resume).
     //
-    // The store owns the whole decision (which turn to replay, and every 404/409 state guard);
+    // The store owns the whole decision (which turn to re-run, and every 404/409 state guard);
     // this route's only job is to answer with the SAME `TaskReceipt` a normal submit answers with,
     // so the browser's receipt→`turn.upsert` handling is reused verbatim (the fixed contract).
     // `200` rather than `202`: the caller asked for one already-recorded task to be re-run, not
-    // for a new one to be accepted — but execution is still server-owned and never awaited, so the
-    // body is the acceptance receipt of the continuation turn, not its answer.
+    // for a new one to be accepted — but execution is still server-owned and never awaited, so
+    // the body is the acceptance receipt of that REQUEUED row, not its answer. It names the SAME
+    // `turn_id` the stop left behind, because the resume re-runs that turn in place (same id, same
+    // index); a command-shaped input is the one case that cannot be requeued, and its receipt
+    // therefore names the command turn the command path minted (./sessions.ts `resumeThread`).
     const postThreadResume: Handler = async (ctx) => {
         const record = requireSession(ctx.params.session_id);
         const threadId = ctx.params.thread_id;
@@ -2424,8 +2427,9 @@ export const createHarnessApi = ({
         // from `cancel` for one typo'd id.
         requireThread(record, threadId);
 
-        // R1/R3: the replay itself composes the existing submit path; a refusal (not stopped,
-        // nothing recorded for it to replay, the answer already reached, or a turn/revive already
+        // R1/R3: the re-run itself composes the existing lane pump (`requeueTurnInPlace`), with
+        // the command path kept for a command-shaped input; a refusal (not stopped, nothing
+        // recorded for it to re-run, the answer already reached, or a turn/revive already
         // in flight) is the store's SessionError, and the dispatcher renders its status and
         // message unchanged so the client shows the server's own sentence.
         const submitted = await store.resumeThread(record.id, threadId);

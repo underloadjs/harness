@@ -1612,6 +1612,66 @@ export const isLiveThreadStatus = (status: string): boolean =>
 // `sync` and the press guard must ask it identically, and the DOM is the tested surface.
 const isStoppedThreadStatus = (status: string): boolean => status === 'stopped';
 
+// --- T10 (revision 2): the gate widens from the ROSTER ALONE to the ROSTER + THE ROWS -----
+//
+// WHY. A run that dies somewhere other than under the host's own Stop leaves a conversation
+// the v1 rule could never paint: an interrupted-at-restart row is restored on an `idle` thread
+// (the runtime persists a thread status as only `stopped` or `idle` — see
+// ../server/sessions.ts `resumeThread`'s gate for the whole argument), and a run that simply
+// FAILED on the provider settles its turn `error` while its conversation returns to `idle`.
+// Both are "the answer was never reached", which is the user's actual condition, and both are
+// states the SERVER's resume route now accepts. So the bar asks the same question the route
+// does, from the two signals this board holds.
+//
+// THE RULE, in one place:
+//   - `running` / `paused` (the live-work statuses) never offer a Resume: live work owns the
+//     Stop control, and the route refuses both;
+//   - otherwise the conversation's NEWEST known turn decides — `error` or `cancelled` shows the
+//     control, everything else (`done`, `queued`, `running`) hides it, so a stop made AFTER the
+//     answer landed no longer paints a button the server will only refuse;
+//   - when NO row for this conversation is known on this surface (a roster-only focus panel, or
+//     a view that ships identity without rows — the nested/roster-only case), the roster is the
+//     only authority and the v1 rule stands: `status === 'stopped'`.
+//
+// It is module-level and PURE (like `threadDeleteProtectionOf`) because the bar's `sync`, the
+// press-time re-check and a direct test must all ask the identical question; the exported form
+// exists so the matrix can be pinned without mounting a board.
+export type ThreadResumeRow = ThreadProtectionRow & { index?: number };
+
+// The terminal statuses whose answer was never reached — exactly the pair the server re-runs in
+// place (./sessions.ts `resumeThread`), and nothing else that route refuses.
+const UNANSWERED_TERMINAL_TURN_STATUSES: readonly string[] = ['error', 'cancelled'];
+
+// The newest row the board holds for ONE conversation: ordered by the monotonic `index`, never
+// by array position (a deletion or a restore reorders the list; the index is the figure that
+// states the order — the same rule the server's newest-turn guard applies).
+const newestResumeRowOf = (threadId: string, rows: readonly ThreadResumeRow[]): ThreadResumeRow | undefined => {
+    let newest: ThreadResumeRow | undefined;
+
+    for (const row of rows) {
+        if (turnThreadIdOf(row) !== threadId) continue;
+
+        const index = row.index ?? -1;
+
+        if (newest === undefined || index >= (newest.index ?? -1)) newest = row;
+    }
+
+    return newest;
+};
+
+export const threadResumabilityOf = (
+    entry: Pick<SessionThreadEntry, 'id' | 'status'>,
+    rows: readonly ThreadResumeRow[]
+): boolean => {
+    if (isLiveThreadStatus(entry.status)) return false;
+
+    const newest = newestResumeRowOf(entry.id, rows);
+
+    if (newest === undefined) return isStoppedThreadStatus(entry.status);
+
+    return UNANSWERED_TERMINAL_TURN_STATUSES.includes(newest.status);
+};
+
 export const threadDeleteProtectionOf = (
     entry: SessionThreadEntry,
     threads: readonly SessionThreadEntry[],
@@ -1902,11 +1962,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         } as SessionSnapshot;
     };
 
-    // The rows this board currently knows, for delete protection. Preference order
-    // is "most authoritative AND most recent": a raw read wins, the applied view comes
-    // next, and the tiles' own merged records are the last resort (an embedder that
-    // only calls `setThreads`).
-    const transcriptTurnsNow = (): readonly ThreadProtectionRow[] =>
+    // The rows this board currently knows, for delete protection AND for the Resume gate.
+    // Preference order is "most authoritative AND most recent": a raw read wins, the applied view
+    // comes next, and the tiles' own merged records are the last resort (an embedder that
+    // only calls `setThreads`). Widened to `ThreadResumeRow` (an `index` alongside the status)
+    // because the Resume gate needs the NEWEST row of one conversation, not merely any row.
+    const transcriptTurnsNow = (): readonly ThreadResumeRow[] =>
         sessionSnapshot?.turns ??
         (sessionView === undefined ? undefined : summariesOf(sessionView)) ??
         turns
@@ -2189,10 +2250,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const entry = roster.find((candidate) => candidate.id === threadId);
         if (
             entry === undefined ||
-            // Nothing to resume unless the SERVER says this conversation is halted. A
-            // running/idle thread has no stopped answer to continue, and a frame can settle
-            // (or start) work between the repaint and the click.
-            !isStoppedThreadStatus(entry.status) ||
+            // Nothing to resume unless the SERVER's state says this conversation is halted with an
+            // unreached answer. The SAME pure predicate `sync` paints with, re-read against the
+            // CURRENT roster/rows instead of the copy painted at the last sync: a frame can settle
+            // (or start) work, or land the answer, between the repaint and the click.
+            !threadResumabilityOf(entry, transcriptTurnsNow()) ||
             // No transport: the control stays visible-but-disabled with the unwired reason
             // (see `sync`), and a press does nothing.
             options.resumeThread === undefined ||
@@ -2383,29 +2445,34 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 : `Open the complete JSON transcript of ${name}`;
             transcriptButton.disabled = transcriptBusy;
 
-            // --- Resume (T4/R2): the stopped-thread control, gated on the ROSTER -------
-            // A `stopped` row is a conversation the host halted whose answer has not been
-            // reached, and that is the ONLY condition under which this control is painted
-            // (`idle` is live-but-not-working and has nothing to resume, and a live thread
-            // already has its Stop). The element is never removed: `sync` toggles `hidden`,
-            // exactly like the bar itself and the Delete↔Stop morph, so the tile footer, the
-            // nested card and the roster-only panel all get it from this one place. Every
+            // --- Resume (T4/R2, gate widened by T10 rev2): the halted-conversation control ---
+            // TWO signals decide it, and both are the SERVER's: the roster status (a conversation
+            // with live work belongs to Stop, not to this control) and this conversation's NEWEST
+            // known row (`error`/`cancelled` is an answer that never arrived; `done` is the
+            // opposite, and a row still `queued`/`running` means work is already in flight). The
+            // v1 roster-only rule survives as the fallback for a surface with no rows for this
+            // conversation (a roster-only focus panel), so a halted thread the board cannot see
+            // the turns of is still resumable. `threadResumabilityOf` is the whole rule, shared
+            // with the press-time re-check below. The element is never removed: `sync` toggles
+            // `hidden`, exactly like the bar itself and the Delete↔Stop morph, so the tile footer,
+            // the nested card and the roster-only panel all get it from this one place. Every
             // field is painted UNCONDITIONALLY (also while hidden) so the node stays
             // self-describing for a test or an assistive reader — the same rule the hidden
             // Delete of an undeletable default conversation follows.
             //
             // Two deliberate differences from the destructive slot:
-            //   - NO `origin === 'agent'` exclusion. A stop can land on the default
-            //     `agent:<name>` conversation exactly as on a host thread or a delegated
-            //     child, and the server states that any stopped conversation is resumable
-            //     (src/server/harness.swagger.yaml, `resumeSessionThread`), so an unreached
-            //     answer there is user work too — "a stopped thread could be anything";
-            //   - NO client-side guess about whether the ANSWER was reached. That is the
-            //     server's guard (a `done` most-recent-turn is a 409), and the rows on this
-            //     surface can legitimately be absent or stale for a roster-only thread. The
-            //     roster status is the one signal the board can trust, and a press the server
-            //     refuses arrives as an honest error notice on the same control.
-            const resumable = isStoppedThreadStatus(entry.status);
+            //   - NO `origin === 'agent'` exclusion. A stop — or a crashed/failed run — can land
+            //     on the default `agent:<name>` conversation exactly as on a host thread or a
+            //     delegated child, and the server states that any halted conversation with an
+            //     unreached answer is resumable (src/server/harness.swagger.yaml,
+            //     `resumeSessionThread`), so an unreached answer there is user work too — "a
+            //     stopped thread could be anything";
+            //   - the turn rows are read from the SAME source delete protection reads
+            //     (`transcriptTurnsNow`), so a stale frame cannot enable the control here any more
+            //     than it can enable a DELETE — and when no row for the conversation is known, the
+            //     gate falls back to the roster alone and a press the server refuses still arrives
+            //     as an honest error notice on this same control.
+            const resumable = threadResumabilityOf(entry, transcriptTurnsNow());
             const resuming = isResuming(threadId);
             const resumeWired = options.resumeThread !== undefined;
 

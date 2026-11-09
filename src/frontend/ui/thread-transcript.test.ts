@@ -1377,7 +1377,9 @@ describe('responsive thread action bar', () => {
         expect([...(childBar?.children ?? [])].map((node) => node.className)).toEqual([
             'thread-delete',
             // T4/R2: the shared bar means the nested card gets the Resume slot for free
-            // (`hidden` here — this roster row is `idle`), with Transcript still rightmost.
+            // (rev2: it is PAINTED here — this conversation's newest row, `turn-child-failed`,
+            // ended `error`, which is an answer that never arrived whatever the roster says),
+            // with Transcript still rightmost.
             'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
@@ -1411,9 +1413,11 @@ describe('responsive thread action bar', () => {
         expect(
             childBar?.querySelector('.transcript-open .action-label')?.textContent
         ).toBe('Transcript');
-        // T4/R2: same anatomy as the tile's bar — the Resume control exists here too, and
-        // stays unpainted for an `idle` conversation.
-        expect(actionButton(childBar as HTMLElement, '.resume-open').hidden).toBe(true);
+        // T4/R2: same anatomy as the tile's bar — the Resume control exists here too. REV2 is
+        // what paints it: this nested conversation's NEWEST row (`turn-child-failed`, index 3)
+        // ended `error`, so its answer never arrived, and the roster's `idle` no longer hides the
+        // control. `ui/thread-resume.test.ts` owns the full status × row matrix.
+        expect(actionButton(childBar as HTMLElement, '.resume-open').hidden).toBe(false);
     });
 
     it('gives a roster-only focused thread the same action bar', () => {

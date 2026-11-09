@@ -44,7 +44,7 @@ compaction**, no planning" (`src/core/agent.ts:3-11`), and the dependency-free r
 argues at length in its header. Compaction policy was placed at the plugin bus on purpose:
 `turn.before` is documented as "the ONLY hook whose return value matters (it may replace the
 transcript the provider is about to see) … that is what makes context compaction and the
-per-agent context limit possible" (`src/types/index.ts:3254-3260`).
+per-agent context limit possible" (`src/types/index.ts:3410-3414`).
 
 So the remaining gap is not a missing component. It is that the guard belongs nowhere in the
 documented request path, and the vocabulary for "this transcript is too big" does not exist on
@@ -57,11 +57,11 @@ the wire.
 | `agent()` explicitly owns no compaction | `src/core/agent.ts:3-11` |
 | A streamed request posts the full transcript, unguarded | `src/transport/openai.ts:770-785` |
 | Every non-2xx collapses to one error frame carrying status + raw body text | `src/transport/openai.ts:792-796` |
-| No `contextWindow` / `maxPromptTokens` field on provider or agent configuration | `src/types/index.ts:334-354` (`HarnessSampling`, `HarnessProviderConfiguration`); grep `contextWindow\|maxPromptTokens` over `src/types/index.ts` → 0 matches |
+| No `contextWindow` / `maxPromptTokens` field on provider or agent configuration | `src/types/index.ts:410-434` (`HarnessSampling`, `HarnessProviderConfiguration`); grep `contextWindow\|maxPromptTokens` over `src/types/index.ts` → 0 matches |
 | The estimator is internal: defined in core, imported by the harness, never re-exported — re-checked **2026-11-09** and still true: the hybrid sibling (`estimateContextTokensHybrid`) landed with compaction T5.4 and is **also** not on the published surface (neither `src/core/index.ts` nor the root export block re-exports either name) | `src/core/context-estimate.ts:167` (`estimateContextTokens`), `:250` (hybrid), `:221` (`anchorFromUsage`); `src/harness.ts:388-392` (imports the hybrid), `:8621`/`:8632` (the two `turn.before` estimates), `src/core/context-pruning.ts:90,361` (the floor) — and grep `estimateContextTokens` over `src/index.ts` / the root `export {` block / `dist/index.d.ts` → no match |
-| The root barrel's public-surface block exports no context helper; the only star-export is types | `src/harness.ts:10193` (the `export { agent, tool, … }` public-surface block), `:10328` (`export type * from './types'`) |
-| The limit is plugin settings, not provider config, and is checked at the turn boundary | `src/plugins/context-compaction.plugin.ts:103` (`contextLimit`), `:115` (default), `:223`, `:234` (the comparison) |
-| A per-request retry re-sends the same oversized request, so an overflow costs the full backoff ladder; cancellation is the one existing non-retriable precedent | `src/core/agent.ts:691-698` (`isAbortError` rethrows before the backoff), `:316-322` |
+| The root barrel's public-surface block exports no context helper; the only star-export is types | `src/harness.ts:11403` (the `export { agent, tool, … }` public-surface block), `:11550` (`export type * from './types'`) |
+| The limit is plugin settings, not provider config, and is checked at the turn boundary | `src/plugins/context-compaction.plugin.ts:148` (`contextLimit`), `:196` (default), `:464`, `:476` (the comparison) |
+| A per-request retry re-sends the same oversized request, so an overflow costs the full backoff ladder; cancellation is the one existing non-retriable precedent | `src/core/agent.ts:354` (`isAbortError`), `:757-765` (the abort boundary — the rethrow before the backoff), `:25-30` (the retry-policy comment) |
 | README documents none of this — re-checked **2026-11-09**: `turn.before` now appears as the hook a context policy writes through (the transcript-routes paragraph and the `plugins` configuration row), but the README still never names the estimator, the `contextLimit` setting, or the shipped `context-compaction` plugin, and the `agent()` section still states only "no compaction" | grep `context-compaction\|contextLimit\|estimatedTokens\|estimateContextTokens` over `README.md` → 0 matches (grep `turn.before` → the flag/plugins rows); the "no compaction" line stands where it was |
 
 ## Proposal

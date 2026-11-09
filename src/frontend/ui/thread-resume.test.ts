@@ -1,13 +1,20 @@
-// T4/R2 — the per-thread RESUME control: a thread the HOST halted is not a thread that
-// answered, and while that is true the reader can put the SAME conversation back to work
-// with one button, next to Transcript.
+// T4/R2, widened by T10 (revision 2) — the per-thread RESUME control: a run whose answer never
+// arrived is not a run that finished, and while that is true the reader can put the SAME
+// conversation back to work with one button, next to Transcript.
 //
-// Pins (ui/turns.ts `isStoppedThreadStatus`, `requestThreadResume`, `confirmThreadResume`,
-// `createThreadActionBar` and the styles.css rules it depends on):
-//   - visibility is the ROSTER's answer and nothing else: `status === 'stopped'` shows the
-//     control, and `idle` / `running` / `paused` do not. `idle` in particular is live-but-
-//     not-working, so "not running" would be the WRONG predicate — only a server-halted
-//     conversation has an unreached answer to continue;
+// Pins (ui/turns.ts `threadResumabilityOf`, `isStoppedThreadStatus`, `requestThreadResume`,
+// `confirmThreadResume`, `createThreadActionBar` and the styles.css rules it depends on):
+//   - visibility is the SERVER's answer read from BOTH signals the board holds: the roster
+//     status AND the conversation's NEWEST known row. `error`/`cancelled` paint the control (a
+//     stop, a run the provider killed, or the row a server restart left on an `idle`
+//     conversation — the case that offered only Delete + Transcript before); `done` hides it
+//     (the answer was reached, so this route would only refuse the press); `queued`/`running`
+//     hide it (work is in flight); and `running`/`paused` hide it whatever the rows say. With NO
+//     row for the conversation on this surface the v1 roster rule stands (`status ===
+//     'stopped'`), which is what keeps the roster-only focus panel and a nested child card
+//     working;
+//   - the row that decides is the one with the highest `index`, never the last row of the list,
+//     and another conversation's rows never decide it (pinned with an interleaved ledger);
 //   - the element is a PERMANENT bar child (like Delete and Transcript) whose `hidden`
 //     `sync` toggles, in the DOM order `[Delete, Resume, Transcript]` — "next to
 //     Transcript", with Transcript still rightmost — and that shared component is what
@@ -19,10 +26,11 @@
 //   - single flight: the control disables and relabels `Resuming…` while the promise is
 //     pending, a press burst is one request, and a rejection is reported through the board's
 //     error notice (no silent failure) with the same control pressable again;
-//   - the control retires from the ROSTER, not from a local flag: while the roster still
-//     says `stopped` it stays visible, and a press after a newer frame says otherwise sends
-//     nothing (the guard re-reads the roster at press time, exactly like the Delete↔Stop
-//     click path does);
+//   - the control retires from what the SERVER last said, never from a local flag: while the
+//     roster and the rows still describe a halted conversation whose answer never arrived it
+//     stays visible, and a press after a newer frame says otherwise sends nothing — the guard
+//     re-reads BOTH the roster and the rows at press time, exactly like the Delete↔Stop click
+//     path does;
 //   - a delete in flight owns the conversation, so Resume is disabled for its duration and
 //     the reason is stated; an unwired host renders an honest disabled Resume with the
 //     missing-transport reason and a press does nothing;
@@ -49,7 +57,7 @@ import type {
     SessionTurn
 } from '../../server/protocol';
 import type { TurnBoard, TurnHandle } from './turns';
-import { createTurnBoard } from './turns';
+import { createTurnBoard, threadResumabilityOf } from './turns';
 import { sessionThreadsOf, type SessionThreadEntry } from './threads';
 
 const flush = (): Promise<void> => new Promise((done) => setTimeout(done, 0));
@@ -95,11 +103,19 @@ const turnOf = (overrides: Partial<SessionTurn> & { id: string; index: number })
     ...overrides
 });
 
+// The one shape every status test below needs: ONE conversation whose roster status is
+// `status` and whose only row has status `turnStatus`. Revision 2 made the PAIR the question —
+// the v1 helper pinned the roster alone and let the row default to `done`, which is exactly the
+// combination the widened gate now (correctly) refuses to paint.
+//
 // The roster's `status` is a narrow union (`SessionThread.status`, server/protocol.ts;
 // `SessionThreadEntry.status`, ui/threads.ts). `'paused'` reaches the board as a string
 // through `isLiveThreadStatus`, so the fixture widens at the BOUNDARY only and every
 // assertion here is correct before and after the union grows.
-const snapshotWithStatus = (status: string): SessionSnapshot =>
+const snapshotWith = (
+    status: string,
+    turnStatus: SessionTurn['status'] = 'cancelled'
+): SessionSnapshot =>
     snapshotOf({
         threads: [
             threadOf({
@@ -109,13 +125,19 @@ const snapshotWithStatus = (status: string): SessionSnapshot =>
                 messages: [{ role: 'user', content: 'question' }]
             })
         ],
-        turns: [turnOf({ id: 'turn-a', index: 0, threadId: 'thread-a' })]
+        turns: [turnOf({ id: 'turn-a', index: 0, threadId: 'thread-a', status: turnStatus })]
     });
 
 // The canonical case: a conversation the host halted, with its turn settled at `cancelled`
 // (the answer was never reached) and the turn row STILL on screen — the state in which the
 // request asks for a resume button.
-const stoppedSnapshot = (): SessionSnapshot => snapshotWithStatus('stopped');
+const stoppedSnapshot = (): SessionSnapshot => snapshotWith('stopped');
+
+// REV2: the state the reported screenshot showed — nothing was ever stopped, the run simply
+// died (a provider failure, or the row a server restart marked interrupted). The conversation
+// is `idle` because that is the ONLY status the runtime persists besides `stopped`, so the
+// roster alone could never paint the control here.
+const interruptedSnapshot = (): SessionSnapshot => snapshotWith('idle', 'error');
 
 // The frame that arrives once the resume lands: the SAME conversation, running again. This
 // is what retires the control, and it arrives from the roster, never from the press.
@@ -371,8 +393,8 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-describe('the Resume control while the roster says the conversation is stopped', () => {
-    it('is painted for a `stopped` thread and hidden for every other status', () => {
+describe('the Resume control while the conversation has an answer that never arrived', () => {
+    it('is painted for exactly the conversations whose answer was never reached', () => {
         // Identity-normalized child order: the destructive slot ADDS `.thread-stop` while
         // work is live, so raw class names would fight the R1 morph. What is pinned here is
         // that the bar holds exactly three buttons, in the order `[Delete, Resume,
@@ -386,26 +408,96 @@ describe('the Resume control while the roster says the conversation is stopped',
                 throw new Error(`unexpected bar child: ${button.className}`);
             });
 
-        // `idle` is the sharp edge: live-but-not-working has an ANSWERED question, not a
-        // halted one, so it must NOT offer a resume. `running`/`paused` already have Stop.
-        for (const status of ['stopped', 'idle', 'running', 'paused'] as const) {
-            const { handles } = mount(snapshotWithStatus(status));
-            const button = resumeOf(at(handles, 0));
+        // THE WHOLE GATE, as a figure rather than as a re-derived rule (`true` = the control is
+        // painted). Rev2's change is the `idle` row: a conversation the host never stopped is
+        // resumable when its newest row says the answer never arrived, and the sharp edge of the
+        // v1 rule — `stopped` plus a `done` newest row, a stop made AFTER the answer — is now
+        // hidden instead of offering a button the server only refuses.
+        const painted: Record<string, Record<string, boolean>> = {
+            stopped: { cancelled: true, error: true, done: false, queued: false, running: false },
+            idle: { cancelled: true, error: true, done: false, queued: false, running: false },
+            running: { cancelled: false, error: false, done: false, queued: false, running: false },
+            paused: { cancelled: false, error: false, done: false, queued: false, running: false }
+        };
 
-            // The element is ALWAYS there, and always the MIDDLE child between Delete and
-            // Transcript — `hidden` is the only suppression path (no rebuild, no reflow).
-            expect(button.className).toBe('resume-open action-resume');
-            expect(button.type).toBe('button');
-            expect(barOrder(barOf(at(handles, 0).element))).toEqual([
-                'delete',
-                'resume',
-                'transcript'
-            ]);
-            expect(button.hidden).toBe(status !== 'stopped');
-            expect(labelText(button)).toBe('Resume');
-            expect(glyphText(button)).toBe('▶');
-            expect(button.getAttribute('aria-label')).toBe('Resume thread RR1');
+        for (const status of ['stopped', 'idle', 'running', 'paused'] as const) {
+            for (const turnStatus of ['cancelled', 'error', 'done', 'queued', 'running'] as const) {
+                const { handles } = mount(snapshotWith(status, turnStatus));
+                const button = resumeOf(at(handles, 0));
+
+                // The element is ALWAYS there, and always the MIDDLE child between Delete and
+                // Transcript — `hidden` is the only suppression path (no rebuild, no reflow).
+                expect(button.className).toBe('resume-open action-resume');
+                expect(button.type).toBe('button');
+                expect(barOrder(barOf(at(handles, 0).element))).toEqual([
+                    'delete',
+                    'resume',
+                    'transcript'
+                ]);
+                expect([status, turnStatus, button.hidden]).toEqual([
+                    status,
+                    turnStatus,
+                    !painted[status]![turnStatus]
+                ]);
+                expect(labelText(button)).toBe('Resume');
+                expect(glyphText(button)).toBe('▶');
+                expect(button.getAttribute('aria-label')).toBe('Resume thread RR1');
+            }
         }
+    });
+
+    it('is the SAME predicate the DOM paints, read as a pure figure', () => {
+        // `threadResumabilityOf` is what `sync` calls and what the press-time guard calls; this
+        // pins the figure directly, so a change to either call site cannot drift from the rule.
+        const rows = (status: SessionTurn['status'], index = 0): SessionTurn[] => [
+            turnOf({ id: `turn-${index}`, index, threadId: 'thread-a', status })
+        ];
+
+        expect(
+            (
+                [
+                    ['stopped', rows('cancelled'), true],
+                    ['stopped', rows('error'), true],
+                    ['idle', rows('error'), true],
+                    ['idle', rows('cancelled'), true],
+                    ['idle', rows('done'), false],
+                    ['stopped', rows('done'), false],
+                    ['idle', rows('queued'), false],
+                    ['idle', rows('running'), false],
+                    // Live work owns the Stop control, whatever the rows say.
+                    ['running', rows('error'), false],
+                    ['running', rows('done'), false],
+                    ['paused', rows('error'), false],
+                    // `index` decides which row is newest, never the order they arrive in.
+                    ['idle', [turnOf({ id: 'turn-old', index: 0, threadId: 'thread-a', status: 'error' }), turnOf({ id: 'turn-new', index: 1, threadId: 'thread-a', status: 'done' })], false],
+                    ['idle', [turnOf({ id: 'turn-new', index: 1, threadId: 'thread-a', status: 'done' }), turnOf({ id: 'turn-old', index: 0, threadId: 'thread-a', status: 'error' })], false],
+                    ['idle', [turnOf({ id: 'turn-old', index: 0, threadId: 'thread-a', status: 'done' }), turnOf({ id: 'turn-new', index: 1, threadId: 'thread-a', status: 'error' })], true],
+                    // Another conversation's failure is never THIS conversation's business.
+                    ['idle', [turnOf({ id: 'turn-b', index: 0, threadId: 'thread-b', status: 'error' })], false],
+                    // No row for this conversation: the roster is the whole authority (v1).
+                    ['stopped', [], true],
+                    ['idle', [], false]
+                ] as const
+            ).map(([status, known, expected]) => [status, known.map((row) => row.status).join('+'), expected, threadResumabilityOf({ id: 'thread-a', status }, known)])
+        ).toEqual([
+            ['stopped', 'cancelled', true, true],
+            ['stopped', 'error', true, true],
+            ['idle', 'error', true, true],
+            ['idle', 'cancelled', true, true],
+            ['idle', 'done', false, false],
+            ['stopped', 'done', false, false],
+            ['idle', 'queued', false, false],
+            ['idle', 'running', false, false],
+            ['running', 'error', false, false],
+            ['running', 'done', false, false],
+            ['paused', 'error', false, false],
+            ['idle', 'error+done', false, false],
+            ['idle', 'done+error', false, false],
+            ['idle', 'done+error', true, true],
+            ['idle', 'error', false, false],
+            ['stopped', '', true, true],
+            ['idle', '', false, false]
+        ]);
     });
 
     it('names the action, the thread and the play glyph it paints on a phone', () => {
@@ -559,6 +651,118 @@ describe('the Resume control while the roster says the conversation is stopped',
 
         expect(button.hidden).toBe(true);
         expect(resumeCalls).toEqual([]);
+        confirmNothing();
+    });
+
+    // REV2 (R1/R2): the case the request is actually about. Nothing was stopped here — the run
+    // died on the provider, or a server restart marked it interrupted — and the conversation is
+    // `idle`, which the v1 rule treated as "nothing to resume". The row says otherwise.
+    it('paints the control for an `idle` conversation whose row ended in error, and resumes it with one press', async () => {
+        stubDevice({ phone: false, fine: true });
+        const { handles, resumeCalls, pending } = mount(interruptedSnapshot());
+        const button = resumeOf(at(handles, 0));
+
+        expect(button.hidden).toBe(false);
+        expect(button.disabled).toBe(false);
+        expect(labelText(button)).toBe('Resume');
+        expect(glyphText(button)).toBe('▶');
+
+        button.click();
+        await flush();
+
+        expect(resumeCalls).toEqual([['s1', 'thread-a']]);
+        expect(pending).toHaveLength(1);
+        confirmNothing();
+    });
+
+    // REV2: the ROWS are enough to retire the control — no roster frame has to arrive. The
+    // requeued row comes back as `running` on the stream before the roster is re-read, and a
+    // control that stayed painted through that window would be offering a second replay of work
+    // that is already in flight.
+    it('retires the control as soon as the row says work is in flight, with no roster change', async () => {
+        stubDevice({ phone: false, fine: true });
+        const { board, handles } = mount(interruptedSnapshot());
+        const button = resumeOf(at(handles, 0));
+
+        expect(button.hidden).toBe(false);
+
+        // The roster is byte-for-byte the same `idle` row; only the ledger moved.
+        const runningAgain = snapshotWith('idle', 'running');
+        runningAgain.updatedAt = 11;
+
+        board.setSessionSnapshot(runningAgain);
+        await flush();
+
+        expect(button.hidden).toBe(true);
+        expect(button.disabled).toBe(false);
+
+        // And it stays hidden when that run answers: the stop-after-answer case is the same
+        // figure, read from the row instead of guessed from the roster.
+        const answered = snapshotWith('idle', 'done');
+        answered.updatedAt = 12;
+
+        board.setSessionSnapshot(answered);
+        await flush();
+
+        expect(button.hidden).toBe(true);
+    });
+
+    // REV2: the guard re-reads the ROWS at press time too, exactly like the roster. A frame that
+    // lands the answer between the repaint and the click must not send a request the server will
+    // only refuse.
+    it('sends nothing when a newer row lands the answer between the repaint and the press', async () => {
+        stubDevice({ phone: false, fine: true });
+        const { board, handles, resumeCalls } = mount(interruptedSnapshot());
+        const button = resumeOf(at(handles, 0));
+        expect(button.hidden).toBe(false);
+
+        const answered = snapshotWith('idle', 'done');
+        answered.updatedAt = 12;
+
+        board.setSessionSnapshot(answered);
+        board.setThreads(sessionThreadsOf(answered));
+        await flush();
+
+        button.click();
+        await flush();
+
+        expect(resumeCalls).toEqual([]);
+        expect(button.hidden).toBe(true);
+        confirmNothing();
+    });
+
+    // REV2: the roster-only fallback, pinned from BOTH sides. A conversation whose rows this
+    // surface never received is judged by the roster alone — so the roster-only focus panel keeps
+    // working exactly as before — and an `idle` conversation with nothing known about its runs
+    // still offers nothing, because inventing a resume from `idle` is what the v1 rule refused.
+    it('falls back to the roster alone when no row for the conversation is known', async () => {
+        stubDevice({ phone: false, fine: true });
+
+        // `idle` and no rows: hidden (the v1 answer, retained).
+        const blind = snapshotOf({
+            threads: [threadOf({ id: 'thread-roster', label: 'RR8', status: 'idle', messages: [] })]
+        });
+        const blindBoard = mount(blind);
+        expect(blindBoard.board.focusThread('thread-roster')).toBe(true);
+        const blindPanel = document.querySelector<HTMLElement>('.thread-focus-panel');
+        if (blindPanel === null) throw new Error('missing roster focus panel');
+        expect(actionButton(barOf(blindPanel), '.resume-open').hidden).toBe(true);
+
+        // `stopped` and no rows: painted, and one press resumes it.
+        const halted = snapshotOf({
+            threads: [threadOf({ id: 'thread-roster', label: 'RR8', status: 'stopped', messages: [] })]
+        });
+        const haltedBoard = mount(halted);
+        expect(haltedBoard.board.focusThread('thread-roster')).toBe(true);
+        const haltedPanel = document.querySelector<HTMLElement>('.thread-focus-panel');
+        if (haltedPanel === null) throw new Error('missing roster focus panel');
+        const haltedResume = actionButton(barOf(haltedPanel), '.resume-open');
+        expect(haltedResume.hidden).toBe(false);
+
+        haltedResume.click();
+        await flush();
+
+        expect(haltedBoard.resumeCalls).toEqual([['s1', 'thread-roster']]);
         confirmNothing();
     });
 

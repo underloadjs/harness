@@ -34,21 +34,21 @@ The session API is an **operator/agent console**, not a chat backend: it renders
 threads, delegation and tools, and it deliberately keeps prompt text trusted-catalogue-only
 ("a client may choose an agent, but must never supply the text a model is seeded with",
 `src/agents/types.ts:1-8`). Frozen `harnessDefinition` at creation
-(`src/server/protocol.ts:586-589`) is what makes transcripts reproducible. Both explain the
+(`src/server/protocol.ts:594`, `:889`, `:901`) is what makes transcripts reproducible. Both explain the
 two remaining gaps; neither makes them unnecessary for a consumer whose product is a chat.
 
 ## Evidence
 
 | Fact | Source |
 |---|---|
-| `POST /sessions` accepts exactly `harness`, `title`, `settings` | `src/server/api.ts:2111` (`requireKnownFields`), `src/shared/harness-api.ts:1001-1005` (`CreateSessionRequest`) |
-| The only transcript write is a whole-transcript replace on an existing thread | `src/server/api.ts:3761-3800` (`putTranscript`, body `{ messages, if_revision }`), `src/server/sessions.ts:8184-8192` (`updateThreadTranscript`), `src/server/harness.swagger.yaml:2231-2367` (the four transcript operations) |
-| `threadFork` is model-driven and needs the owning run | `README.md:65`, `:403` |
+| `POST /sessions` accepts exactly `harness`, `title`, `settings` | `src/server/api.ts:2111` (`requireKnownFields`), `src/shared/harness-api.ts:1016-1026` (`CreateSessionRequest`) |
+| The only transcript write is a whole-transcript replace on an existing thread | `src/server/api.ts:3826-3862` (`putTranscript`, body `{ messages, if_revision }`), `src/server/sessions.ts:8732` (`updateThreadTranscript`), `src/server/harness.swagger.yaml:2291-2427` (the four transcript operations) |
+| `threadFork` is model-driven and needs the owning run | `README.md:65`, `:404` |
 | Agent prompt text is trusted catalogue data by rule | `src/agents/types.ts:1-8` |
-| Harness create/patch accept agent *selection* and per-agent instruction overrides, never a tool list | `src/server/api.ts:1529-1540`, `src/shared/harness-api.ts:990-995` ("it cannot supply a provider, a credential, a transport, or a tool list") |
+| Harness create/patch accept agent *selection* and per-agent instruction overrides, never a tool list | `src/server/api.ts:1528-1537`, `:1585-1593`, `src/shared/harness-api.ts:482-489` ("it cannot supply a provider, a credential, a transport, or a tool list") |
 | All five live presets share one toolbox, by stated rule | `src/server/harnesses/presets.ts:11-15` ("Only the agents differ … These five are `presets`"), `:160`, `:189`, `:213`, `:235`, `:257` (`tools: SHARED_TOOL_NAMES`) |
-| The narrow-toolbox entries are fixtures, not live presets | `src/server/harnesses/presets.ts:278-288` (`demo`, `tools: ['timeNow']`), `:405` (`FIXTURE_PRESETS`) |
-| Sessions are host-global with no ownership: the boundary is an Origin gate | `src/server/service.ts:25-40` |
+| The narrow-toolbox entries are fixtures, not live presets | `src/server/harnesses/presets.ts:278-288` (`demo`, `tools: ['timeNow']`), `:411` (`FIXTURE_PRESETS`) |
+| Sessions are host-global with no ownership: the boundary is an Origin gate | `src/server/service.ts:18-40` |
 
 ## Proposal
 
@@ -59,7 +59,7 @@ way `attachments` are on submit, applied before the first turn), or a dedicated
 `POST /sessions/:id/seed`. This is what makes "clone a conversation up to turn N" and
 "import a history" possible; without it the store's persistence has no ingestion path for
 foreign data. The validation and the optimistic lock are already written for the transcript
-replace (`api.ts:3761-3800`) and can be reused verbatim.
+replace (`api.ts:3826-3862`) and can be reused verbatim.
 
 **(D) A `chat` preset in the app catalogue**: one primary, `tools: []`, `presets: false`,
 `maxIterations` 1, no subagents (so no `delegate`), no `interaction`, no forks — the

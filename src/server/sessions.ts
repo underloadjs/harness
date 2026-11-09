@@ -8185,43 +8185,67 @@ export class SessionStore {
         return { cancelled, session: this.snapshot(session) };
     }
 
-    // RESUME ONE STOPPED THREAD (R1, POST /sessions/:id/threads/:threadId/resume).
+    // RESUME ONE HALTED THREAD (R1 rev2, POST /sessions/:id/threads/:threadId/resume).
     //
     // WHY IT EXISTS. `cancelThread` leaves the conversation `stopped` and marks the run it
     // aborted (plus its backlog) `cancelled`, so the answer the user asked for never
-    // arrived. The stop is not the end of the work: this route replays THAT turn's recorded
-    // input as a fresh continuation turn in the same conversation. The interrupted row is
-    // never rewritten — its terminal status is the durable audit of the stop — and the
-    // revival is an ordinary submit whose `turn.upsert` traffic a client handles exactly
-    // like any other submit's.
+    // arrived. The stop is not the end of the work: this route re-runs THAT turn, in place.
+    // Rev2 widens the SAME mechanism to every other way an answer can fail to arrive: a run
+    // interrupted by a server restart (its row is restored `error`, its conversation `idle`)
+    // and a run that errored or was cancelled outright. What is resumable is therefore "a
+    // conversation this server is not currently working on, whose newest recorded turn ended
+    // without an answer" — see the status gate below and the newest-turn guards after it.
+    // The interrupted row IS the resumed row — same id, same index, same anchor in the
+    // transcript — so the ledger keeps the two rows the user acted on (the question and its
+    // answer) and never grows a third one that repeats the question.
     //
-    // WHAT IT COMPOSES (R3: no new runtime verb, no new queue, no new status). The replay
-    // goes through `dispatch`, the exact surface `POST .../tasks` uses, so a continuation
-    // into a STOPPED thread takes the path that already exists: `enqueue` validates, binds
-    // references, allocates the turn id/index/display label, pushes the row into that
-    // thread's own lane, persists it, and pumps it. The pump calls
-    // `harness.sendThreadInput`, which is the runtime's documented host-revival path (an
-    // explicit host turn flips `stopped` back to `idle` and runs, and it is what captures a
-    // NEW M1 generation so this run is not refused by the stop that preceded it). Everything
-    // else a normal run owns comes along for free: the lane's single active turn, worker-mode
-    // lane execution (`threadExecution: 'worker'`), and the stop classification flags.
+    // WHY IN PLACE AND NOT A NEW ROW (the revision this route now implements). A new
+    // continuation row read as a duplicate prompt: the transcript showed the same question
+    // twice, once `cancelled` and once running, and the second one is not new work — it is
+    // the SAME work, retried. The row is therefore put back the way `enqueue` first created
+    // it (status `queued`, no `startedAt`, no events from the attempt that is being retried)
+    // and handed to the SAME lane, which runs it as soon as it is free.
     //
-    // FIDELITY (what the interrupted turn durably persists). A `SessionTurn` row carries
-    // `prompt`, `attachments` and `references`, and ./persistence.ts revalidates all three on
-    // load (attachments at :650-665, references at :670-682), so a restart still has the real
-    // bytes and the bound block list. All three are replayed. `prompt` is the trimmed
-    // SUBMITTED text, not the reference-expanded run prompt, so the referenced blocks are
-    // re-expanded at execution the same way the interrupted run expanded them. Nothing new is
-    // persisted and nothing is guessed: a field the record never kept cannot come back.
+    // WHAT IT COMPOSES (R3: no new runtime verb, no new queue, no new status). The requeued
+    // row is drained by the ordinary `pumpLane` -> `executeTurn` path, which calls
+    // `harness.sendThreadInput` — the runtime's documented host-revival path (an explicit
+    // host turn flips `stopped` back to `idle` and runs, and it is what captures a NEW M1
+    // generation so this run is not refused by the stop that preceded it). Everything a
+    // normal run owns comes along for free: the lane's single active turn, worker-mode lane
+    // execution (`threadExecution: 'worker'`, which addresses the run by THIS turn's id and
+    // clears its slot at settle, so reusing the id is safe), the recorder closure that binds
+    // to the same row object, the display fold, and the stop classification flags. The only
+    // thing this route adds is the status transition back to `queued` on a row that had
+    // already gone terminal — the state `executeTurn` consumes unchanged.
+    //
+    // FIDELITY (what makes an in-place retry honest). The row keeps the `prompt`,
+    // `attachments` and `references` it was submitted with — the same bytes ./persistence.ts
+    // revalidates on load (attachments at :650-665, references at :670-682) — so the resumed
+    // run is the run the interrupted one would have had, reference expansion included. What
+    // the aborted attempt wrote INTO the row is what a retry must not keep: its events are
+    // rolled back to the last committed boundary, its `usage` tally is reset (the row now
+    // reports the resumed attempt's spend, not the spend of a run that was stopped), and its
+    // `startedAt` is cleared because `executeTurn` restamps it when the resumed run opens.
+    // See `requeueTurnInPlace` for the two durability steps that make the rollback stick.
+    //
+    // THE ONE CASE THAT STILL TAKES A NEW ROW. An interrupted input that is COMMAND-SHAPED
+    // (`/name …`) has no lane row to requeue: a command turn is born `running`, never
+    // queued, and carries no thread (see `executeCommandTurn`), so re-running it means the
+    // command path, which always mints its own record. That input goes through `dispatch`
+    // exactly as this route used to send every one, so a slash command still re-runs as a
+    // command rather than as a prompt that starts with `/`.
     //
     // REFUSALS. 404 for an unknown session or thread, in `cancelThread`'s exact wording.
     // Every 409 is a state guard and says "this conversation is not in the one state this
-    // route is for": not stopped; nothing recorded for it to replay; the answer already
-    // reached (`done`); a turn still queued or running; or a revive already claimed by an
-    // earlier call in the same tick.
-    // D4 (worker IO): ASYNC for the same reason `enqueue` is — the continuation turn is
-    // durable before this resolves, so the response that claims a revival happened cannot be
-    // undone by a crash.
+    // route is for": a run in flight (`running`) or a plugin park (`paused`); nothing recorded
+    // for it to replay; the answer already reached (`done`); a turn still queued or running;
+    // or a revive already claimed by an
+    // earlier call in the same tick (the claim only ever fires on the command path now — a
+    // prompt requeue flips the row synchronously, so the next caller is refused by the
+    // `queued` guard above, which is the state this call really produced).
+    // D4 (worker IO): ASYNC for the same reason `enqueue` is — the requeued row is durable
+    // before this resolves, so the response that claims a revival happened cannot be undone
+    // by a crash.
     async resumeThread(id: string, threadId: string): Promise<EnqueuedTask> {
         const session = this.require(id);
 
@@ -8235,21 +8259,40 @@ export class SessionStore {
             throw new SessionError(404, `Unknown thread "${threadId}".`);
         }
 
-        // R1: `stopped` is the only resumable state, and it is the state this server's stop
-        // puts a conversation in — whatever opened it (a host submit, the roster route, the
-        // runtime's delegation, or the default `agent:<name>` conversation), because a stop
-        // reaches every one of them. What a conversation can then be replayed FROM is its own
-        // recorded turns, which is the next check. An `idle` thread already takes input
-        // through the submit route; a `running` one has a run in flight; a `paused` one is a
-        // plugin park, not a stop.
-        if (record.status !== 'stopped') {
+        // R1 (rev2): a HALTED conversation is resumable, and two roster statuses say that.
+        // `stopped` is this server's own stop, whatever opened the conversation (a host submit,
+        // the roster route, the runtime's delegation, or the default `agent:<name>` thread),
+        // because a stop reaches every one of them. `idle` joins it because it is what an
+        // INTERRUPTED run leaves behind: the runtime persists a thread record as `stopped` or
+        // `idle` only (../harness.ts:10071), so a run that was in flight when the process died
+        // comes back on an `idle` conversation whose newest turn the restore marked `error`
+        // (see `restoreSession`'s recovery policy below) — and a run that simply FAILED on the
+        // provider settles its turn `error` while its conversation returns to `idle`. In both
+        // cases the answer was never reached and the recorded row is the input, so this route
+        // is what puts it back to work; the newest-turn guards below are what decide.
+        //
+        // WHAT STILL REFUSES. `running` has a run in flight — the wording of that refusal is
+        // unchanged, because it is the state the sentence still describes (two tests pin it and
+        // the route's own contract names it). `paused` is a PLUGIN park (a compacting or
+        // awaiting-control thread the runtime unparks on its own), not a halt, and this route
+        // has no authority over it, so it states its own reason rather than hiding behind the
+        // running sentence. Anything outside the roster's four statuses is refused with the
+        // running wording as the general form.
+        if (record.status === 'paused') {
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" is paused; the plugin that parked it unpauses it, not this route.`
+            );
+        }
+
+        if (record.status !== 'stopped' && record.status !== 'idle') {
             throw new SessionError(
                 409,
                 `Thread "${threadId}" is ${record.status}; only a stopped thread can be resumed.`
             );
         }
 
-        // THE INPUT TO REPLAY: this conversation's most recent recorded turn, newest by the
+        // THE TURN TO RE-RUN: this conversation's most recent recorded turn, newest by the
         // monotonic `index` rather than by array position (a deletion or a restore can
         // reorder the array; the index is the figure that always states the order).
         const last = [...session.turns]
@@ -8283,16 +8326,18 @@ export class SessionStore {
 
         // What is left is exactly the two "no answer" terminal states: `cancelled` (the
         // stop's own mark, including a backlog entry that never started) and `error` (a run
-        // that failed before an answer). Both are replayable; the record is the input.
+        // that failed before an answer). Both are re-runnable in place; the record itself is
+        // the input, which is why no new row is needed.
         const lane = this.laneOf(session, threadId);
 
         // DOUBLE-RESUME CLAIM, taken synchronously before the first await below. Two resumes
-        // dispatched in the same tick both pass the status check above (the runtime flag is
-        // not cleared until the revived run starts, and the continuation turn does not exist
-        // yet — `enqueue` pushes it only after its steering probe awaits), so the SECOND
-        // caller must be refused by this claim rather than queue a duplicate continuation. A
-        // caller that arrives after the claim is released needs no flag: the newest-turn
-        // guards above then read the queued/running row this call just created.
+        // dispatched in the same tick both pass the status check above, so the SECOND caller
+        // must be refused rather than re-run the turn twice. For a PROMPT requeue the newest-turn
+        // guards above already close the window — `requeueTurnInPlace` flips the row to `queued`
+        // before its first await, so the second caller reads a queued turn and is refused with
+        // its own state — and this claim is what closes it for the COMMAND path, whose new row
+        // exists only after `dispatch` has awaited. Cheap insurance either way; runtime-only,
+        // always released in a finally.
         if (lane.resumePending === true) {
             throw new SessionError(409, `Thread "${threadId}" is already being resumed.`);
         }
@@ -8302,16 +8347,19 @@ export class SessionStore {
         let submitted: EnqueuedTask;
 
         try {
-            // Full-fidelity replay of the interrupted turn, addressed at the SAME
-            // conversation. `dispatch` rather than `enqueue` so the slash-command rule the
-            // /tasks route applies is applied here too: an interrupted input that WAS a
-            // command re-runs as the same command, not as a prompt that starts with `/`.
-            submitted = await this.dispatch(id, last.prompt, last.attachments, last.references, threadId);
+            // THE FALLBACK (see the header): an interrupted input that WAS a command re-runs
+            // as the same command, on the command path, which always mints a new record.
+            // Everything else — the ordinary prompt turn a stop actually interrupts — is put
+            // back into this lane and run in place.
+            submitted =
+                parseCommandLine(last.prompt) === undefined
+                    ? await this.requeueTurnInPlace(session, last, lane)
+                    : await this.dispatch(id, last.prompt, last.attachments, last.references, threadId);
         } finally {
-            // Released as soon as the replay is accepted or refused, so a later call is
-            // refused by the newest-turn guards above (they read the row this call created)
-            // rather than by this flag; a failed replay (validation, backpressure, a lost
-            // write) records nothing, leaving the thread stopped and fully resumable again.
+            // Released as soon as the requeue is accepted or refused, so a later call is
+            // refused by the newest-turn guards above (they read the row this call requeued)
+            // rather than by this flag; a failed requeue rolls its row back, leaving the
+            // conversation halted (stopped or idle) and fully resumable again.
             lane.resumePending = false;
         }
 
@@ -8325,6 +8373,185 @@ export class SessionStore {
         this.notifyStream({ kind: 'thread.upsert', sessionId: session.id, threadId, at: Date.now() });
 
         return submitted;
+    }
+
+    // PUT ONE TERMINAL TURN BACK ON ITS OWN LANE AND RUN IT IN PLACE.
+    //
+    // This is the whole requeue: the row keeps its id, index, thread, label, prompt,
+    // attachments and references, and loses everything the aborted attempt wrote into it.
+    // It is deliberately SYNCHRONOUS up to the durability fence, so no second caller can
+    // observe the old terminal state (see the claim note in `resumeThread`), and every step
+    // below is rolled back if the write fails — the caller's `finally` then releases the
+    // claim and the conversation is halted (stopped or idle) and resumable again, exactly as
+    // it was.
+    //
+    // THE TWO STEPS THAT MAKE THE ROLLBACK STICK (skipping either one is a visible bug):
+    //   - `forgetProjections` — the compiled display cache holds a SETTLED projector for a
+    //     terminal turn (`settledStatus` is sticky and every section is `terminal`, see
+    //     ./turn-projector.ts `settle`). Without dropping it, the cold fold never happens
+    //     again and the live tile freezes at `cancelled` while the resumed run streams into
+    //     a row nobody renders.
+    //   - `compactJournal` — the per-step journal is append-only keyed by `(turnId, index)`,
+    //     and ./sessions.ts `mergeJournal` UNIONS it into the checkpoint on restore. So a
+    //     truncated record whose log still holds the dropped indices would resurrect every
+    //     event of the aborted attempt on the next start, complete with its stale stop error.
+    // Both are the same helpers a thread deletion already uses for the same reason.
+    private async requeueTurnInPlace(
+        session: Session,
+        turn: SessionTurn,
+        lane: ThreadLane
+    ): Promise<EnqueuedTask> {
+        const now = Date.now();
+
+        // ROLL THE ABORTED ATTEMPT OUT OF THE RECORD. `attempt_commit` is the runtime's own
+        // "this response is in history" boundary (../harness.ts:9231-9252 emits it exactly
+        // when a request commits without a `done`, and ../core/agent.ts keeps every committed
+        // message); everything after it belongs to the request that was abandoned, and a cold
+        // fold would render it as if it were the answer. A run stopped before its first commit
+        // has nothing to keep, so the boundary is "empty" — which is also the shape `enqueue`
+        // mints, so the resumed row is indistinguishable from a fresh submit's.
+        let boundary = -1;
+
+        for (let index = 0; index < turn.events.length; index += 1) {
+            if (turn.events[index]?.type === 'attempt_commit') boundary = index;
+        }
+
+        // The tail is kept aside (not discarded) so a failed write can put the record back
+        // exactly as it was. `eventTimes` stays parallel to `events` in both directions.
+        const droppedEvents = turn.events.splice(boundary + 1);
+        const droppedTimes = turn.eventTimes === undefined ? undefined : turn.eventTimes.splice(boundary + 1);
+
+        // BACK TO THE PRE-EXECUTION SHAPE. `startedAt` is cleared because `executeTurn`
+        // restamps it when the resumed run opens (./sessions.ts:7526) and a queued record must
+        // not carry one (./protocol.ts, and `copyTurn` omits the key). `usage` resets because
+        // the row now represents the resumed attempt: keeping the stopped run's spend would bill
+        // the same prompt twice in the row AND in the session fold, which is a sum of the
+        // per-turn tallies (./api-reads.ts `usageFoldOf`). What survives of the abandoned attempt
+        // is exactly its COMMITTED prefix — its `usage` frames before the boundary stay in the
+        // record and in the journal — and the steps after the boundary leave both, which is the
+        // same deal the runtime itself makes when it splices an aborted run out of the
+        // transcript (../harness.ts:9412).
+        const previousStatus = turn.status;
+        const previousStartedAt = turn.startedAt;
+        const previousUpdatedAt = turn.updatedAt;
+        const previousUsage = turn.usage;
+
+        turn.status = 'queued';
+        delete turn.startedAt;
+        delete turn.usage;
+        // Clients order rows by a monotonic `updatedAt` (./turn-projector.ts and the view
+        // guards), so the requeue must stamp newer than the stop did or its upsert would drop.
+        turn.updatedAt = now;
+        session.updatedAt = now;
+
+        // THE RESTART BANNER (rev2 R2). The restore's recovery policy is a PAIR of session-level
+        // writes, not a per-turn one: the in-flight row becomes `error` AND the session becomes
+        // `status: 'error'` with `lastError: INTERRUPTED_MESSAGE` (:3286-3297, and the journal
+        // recovery at :4673 does the same). That pair — never a turn field — is what the shell
+        // paints as the pane's red failure note (../frontend/main.ts `sessionFailureOf` reads
+        // `status === 'error'` and prints `lastError`), and because it is a PERSISTED session
+        // record the requeue would otherwise leave it in place: the note keeps stating "it was
+        // not replayed" until the resumed run opens (`executeTurn` clears the banner at :7535).
+        // The requeue IS the replay, so the same write that makes the requeued row durable
+        // retires the note. Scoped deliberately: only the restart sentence, and only while no
+        // other lane is working, so a failure some sibling run is still reporting keeps its
+        // banner (that run's own transition owns it, exactly as before).
+        const previousSessionStatus = session.status;
+        const previousSessionLastError = session.lastError;
+        const clearsRestartNote =
+            session.lastError === INTERRUPTED_MESSAGE &&
+            !this.laneActive(session) &&
+            !session.legacyRunning;
+
+        if (clearsRestartNote) {
+            session.lastError = undefined;
+            // BOTH halves of the pair. Clearing only the text would leave `status: 'error'`,
+            // which the same rule renders as its fallback 'session error' — a worse version of
+            // the banner this exists to remove. Nothing is running here (that is the guard
+            // above), so `idle` is the honest status for a session whose only run is queued.
+            if (session.status === 'error') session.status = 'idle';
+        }
+
+        // A FRESH settler under the SAME id: `settle` resolved and DELETED the interrupted
+        // run's promise, so the caller of a resume needs its own handle on this row's next
+        // terminal transition (./sessions.ts:7246-7253). One promise per turn id at a time —
+        // the old one is already gone.
+        let settleTurn!: () => void;
+        const settled = new Promise<void>((resolve) => {
+            settleTurn = resolve;
+        });
+
+        session.settlers.set(turn.id, settleTurn);
+
+        // BACK ON ITS OWN LANE, at the tail (FIFO, the same slot a fresh submit takes). It is
+        // NOT pushed into `session.turns` again — the row has been in that ledger since
+        // `enqueue` and the list is the record, not the backlog (./sessions.ts:555-559).
+        lane.queue.push(turn);
+
+        // Compiled artifacts die before the row is re-announced, so the very next read (this
+        // method's own `publish` -> `mirrorView`, a poll, a reload) cold-folds the truncated
+        // record instead of serving the settled one. See the header for the journal rule.
+        this.forgetProjections(session, [turn.id]);
+        this.compactJournal(session, [turn.id]);
+
+        // DURABILITY BEFORE THE RESPONSE (the same fence `enqueue` and the turn-start
+        // transition use, ./sessions.ts:7552): a requeued row the disk does not know about is
+        // a prompt the user already watched disappear once.
+        try {
+            await this.persistOrThrow();
+        } catch (error) {
+            // Full rollback, in the reverse order of the steps above. The re-derived
+            // projector and the compacted log are rebuilt from the restored record, which is
+            // what they were computed from before, so the row is byte-for-byte the interrupted
+            // one again when this path is done.
+            const at = lane.queue.indexOf(turn);
+            if (at !== -1) lane.queue.splice(at, 1);
+
+            session.settlers.delete(turn.id);
+
+            turn.status = previousStatus;
+            if (previousStartedAt !== undefined) turn.startedAt = previousStartedAt;
+            if (previousUsage !== undefined) turn.usage = previousUsage;
+            turn.updatedAt = previousUpdatedAt;
+
+            turn.events.push(...droppedEvents);
+            if (turn.eventTimes !== undefined && droppedTimes !== undefined) turn.eventTimes.push(...droppedTimes);
+
+            // The restart note goes back with the row: a requeue that never became durable did
+            // NOT replay anything, so the banner that says so is true again, and the session is
+            // an error record again — the exact state the restore wrote.
+            if (clearsRestartNote) {
+                session.status = previousSessionStatus;
+                session.lastError = previousSessionLastError;
+            }
+
+            this.compactJournal(session, [turn.id]);
+
+            throw error;
+        }
+
+        // Capture the ACCEPTED state before the pump can start the row again: the receipt must
+        // state `queued` even though execution may begin in this same tick (the rule and the
+        // shape of `enqueue`'s snapshot, ./sessions.ts:6478-6488).
+        const snapshot = this.snapshot(session);
+        const queuedTurn = copyTurn(turn);
+
+        // One upsert naming the SAME turn id replaces the cancelled row for every watcher, and
+        // the lane pump is fired, never awaited — execution is server-owned.
+        this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+
+        if (clearsRestartNote) {
+            // The banner is SESSION-scoped, so the row's upsert and this route's `thread.upsert`
+            // can neither state nor retire it: `session.state` is the signal whose patch carries
+            // `status` + `last_error` (./api.ts:1005 -> `sessionStatePatchOf`), and it is what
+            // repaints the pane note on every open view the moment the replay is accepted — not
+            // at the next poll. Only sent when this call actually cleared the note.
+            this.notifyStream({ kind: 'session.state', sessionId: session.id, at: now });
+        }
+
+        void this.pumpLane(session, lane);
+
+        return { session: snapshot, turn: queuedTurn, settled };
     }
 
     // True when `candidate` is (transitively) owned by `ancestor` in the runtime

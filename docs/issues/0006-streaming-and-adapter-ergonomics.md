@@ -16,13 +16,13 @@ must read the harness implementation and re-derive it.
 
 1. **The SSE writer is not reusable.** `createSseResponse` is module-private
    (`src/server/service.ts:184`) and there is a second, independent writer in the Node
-   adapter (`src/server/handler.ts:165-176`). Both implement the same
+   adapter (`src/server/handler.ts:163-198`). Both implement the same
    `data: <json>\n\n` frame contract, the same `: connected` preamble, the same
    `X-Accel-Buffering` header, and the same cancel→abort semantics. A host streaming harness
    events writes a third copy.
-2. **The streaming recipe is only in the source headers.** A host can learn the
-   raw-vs-`{ stream }` passthrough choice, the body caps, and the two-module mount from the
-   README, but not that a `{ stream }` handler must wire its own abort from
+2. **The streaming recipe is only in the source headers.** The README documents the
+   two-module mount, but not the raw-vs-`{ stream }` passthrough choice, not the body caps,
+   and not that a `{ stream }` handler must wire its own abort from
    `context.req.raw.signal` — the one step that decides whether a browser disconnect
    cancels a run. Today that is `service.ts` reading.
 
@@ -38,10 +38,10 @@ written independently, and nothing in the package forces them together.
 | Fact | Source |
 |---|---|
 | Private SSE writer with backpressure, preamble, abort forwarding | `src/server/service.ts:184-284` (used at `:595`) |
-| Second writer for the standalone Node adapter | `src/server/handler.ts:165-176` |
-| Loader passthroughs available to any endpoint: `{ raw: Response }` and `{ stream: AsyncIterable }` | `packages/underload/service/src/server/start.ts:363-391` |
-| The `{ stream }` path stops writing on `stream.aborted` but never signals the handler's run | `packages/underload/service/src/server/start.ts:363-381` |
-| A `{ stream }` handler gets no abort signal for its own run, so the wiring step is unstated anywhere a host would look | `packages/underload/service/src/server/start.ts:363-381`; `README.md:3344-3345` lists the route modules but not the abort wiring |
+| Second writer for the standalone Node adapter | `src/server/handler.ts:163-198` |
+| Loader passthroughs available to any endpoint: `{ raw: Response }` and `{ stream: AsyncIterable }` | `packages/underload/service/src/server/start.ts:357-361` (raw passthrough), `:363-387` (stream path) |
+| The `{ stream }` path stops writing on `stream.aborted` but never signals the handler's run | `packages/underload/service/src/server/start.ts:363-387` |
+| A `{ stream }` handler gets no abort signal for its own run, so the wiring step is unstated anywhere a host would look | `packages/underload/service/src/server/start.ts:363-387`; `README.md:3417-3420` lists the route modules but not the abort wiring |
 
 ## Proposal
 

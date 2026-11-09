@@ -3599,7 +3599,7 @@ POST   /v1/harness/sessions/:id/cancel    cancel active work ({ all } also drops
 POST   /v1/harness/sessions/:id/actions/:requestId/answer   answer one pending actionRequest
 GET    /v1/harness/sessions/:id/threads/:threadId/transcript       one transcript (editable JSON)
 PUT    /v1/harness/sessions/:id/threads/:threadId/transcript       replace it → { session, transcript }
-POST   /v1/harness/sessions/:id/threads/:threadId/resume           re-run a stopped conversation's interrupted turn → 200 submit receipt
+POST   /v1/harness/sessions/:id/threads/:threadId/resume           re-run a halted (stopped OR idle) conversation's unanswered turn → 200 submit receipt
 ```
 
 A `POST …/tasks` whose `input` starts with `/` is executed as a slash command in the

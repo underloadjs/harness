@@ -114,29 +114,61 @@ const stopped = (): SessionSnapshot =>
     }) as SessionSnapshot;
 
 // What the roster re-read answers once the resume landed: the SAME conversation running
-// again, with the continuation turn the server just submitted. Newer `updatedAt`, or
-// `applyView` would reject it as stale.
+// again, with the interrupted turn requeued IN PLACE under its own id (rev2 pinned the v1
+// fixture that invented a second `turn-b` row — the route does not mint one; the receipt and
+// the ledger both name the row the halt left behind). Newer `updatedAt`, or `applyView` would
+// reject it as stale. The resumed run also cleared the session's failure note (the row that
+// carried it is being replayed), so no `last_error` survives in this document either.
 const runningAgain = (): SessionSnapshot =>
     ({
         ...stopped(),
         status: 'running',
         updatedAt: 30,
-        turns: [turn(), turn({ id: 'turn-b', index: 1, status: 'running', startedAt: T + 500, updatedAt: T + 600, events: [{ type: 'start', agent: 'instruct', model: 'm1' }], eventTimes: [T + 500] })],
+        turns: [
+            turn({
+                status: 'running',
+                startedAt: T + 500,
+                updatedAt: T + 600,
+                events: [{ type: 'start', agent: 'instruct', model: 'm1' }],
+                eventTimes: [T + 500]
+            })
+        ],
         threads: [thread({ status: 'running' })]
     }) as SessionSnapshot;
 
+// REV2: the state the request is about, and the one the v1 gate could never paint. A run that
+// was in flight when the server died comes back as an `error` row on an `idle` conversation
+// (the runtime persists a conversation as `stopped` or `idle` only), and the restore writes a
+// SESSION-level pair with it: `status: 'error'` plus the sentence below as `last_error`. That
+// pair is the red banner the shell paints, and the bar beside it had only Delete + Transcript.
+// The literal mirrors the server's module-private `INTERRUPTED_MESSAGE` (../server/sessions.ts
+// :764) — the same convention ../server/shutdown-background.test.ts:77 uses.
+const RESTART_BANNER =
+    'The previous run was interrupted by a server restart; it was not replayed. Review the recorded events before continuing.';
+
+const interruptedByRestart = (): SessionSnapshot =>
+    ({
+        ...stopped(),
+        status: 'error',
+        lastError: RESTART_BANNER,
+        turns: [turn({ status: 'error' })],
+        threads: [thread({ status: 'idle' })]
+    }) as SessionSnapshot;
+
 // The body the resume route promises: the ORDINARY submit receipt (`TaskReceipt`), at 200,
-// for the continuation turn — never a document.
+// for the continuation turn — never a document. `turn_id` names the INTERRUPTED row (the same
+// figure the roster and the ledger name), and there is no `queue_position`: the lane was free,
+// so its pump moved the requeued row straight into the active slot — the exact pair the route's
+// own HTTP contract pins in ../server/threads.test.ts (`thread resume HTTP contract`).
 const receipt = (): TaskReceipt => ({
     session_id: 's1',
-    turn_id: 'turn-b',
+    turn_id: 'turn-a',
     status: 'queued',
     thread_id: 'thread-a',
-    queue_position: 0,
     session_revision: 31,
     accepted_at: T + 700,
     links: {
-        turn: '/v1/harness/sessions/s1/turns/turn-b',
+        turn: '/v1/harness/sessions/s1/turns/turn-a',
         turns: '/v1/harness/sessions/s1/turns',
         thread: '/v1/harness/sessions/s1/threads/thread-a',
         stream: '/v1/harness/stream'
@@ -189,8 +221,12 @@ const stubServer = (
 
             if (url === RESUME_URL && method === 'POST') {
                 if (answer === 'refuse') {
+                    // The server's OWN sentence for this guard (../server/threads.test.ts pins
+                    // the route's refusal surface verbatim): the newest turn is `done`, so the
+                    // answer was reached. A paraphrased 409 here would let the shell's notice
+                    // contract drift from what the route actually says.
                     return json(
-                        { error: { message: 'Thread "thread-a" has already reached its answer.' } },
+                        { error: { message: 'Thread "thread-a" already reached its answer (turn 0 is done).' } },
                         409
                     );
                 }
@@ -340,11 +376,11 @@ it('reports a 409 refusal through the error notice and re-arms the same control'
     const notices = [...document.querySelectorAll<HTMLElement>('.log .notice')];
     const notice = notices.find((node) => node.dataset.tone === 'error');
     expect(notices.map((node) => [node.dataset.tone, node.textContent])).toEqual([
-        ['error', 'resume thread: Thread "thread-a" has already reached its answer.']
+        ['error', 'resume thread: Thread "thread-a" already reached its answer (turn 0 is done).']
     ]);
     expect(notice?.dataset.tone).toBe('error');
     expect(notice?.textContent).toBe(
-        'resume thread: Thread "thread-a" has already reached its answer.'
+        'resume thread: Thread "thread-a" already reached its answer (turn 0 is done).'
     );
     const sessionNote = document.querySelector<HTMLElement>('.notice.session-note');
     expect(sessionNote?.hidden).toBe(true);
@@ -359,4 +395,64 @@ it('reports a 409 refusal through the error notice and re-arms the same control'
     expect(button.hidden).toBe(false);
     expect(button.disabled).toBe(false);
     expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
+});
+
+// REV2 (R1 + R2): the case the request is about, end to end through the SHELL. A run that was
+// in flight when the server died comes back as an `error` row on an `idle` conversation, with
+// the restore's banner pair on the SESSION — and the v1 bar showed Delete + Transcript only,
+// under a red note that stayed forever. Here the same conversation shows the play button next
+// to Transcript, one press posts the empty resume body, and the roster document the shell
+// re-reads afterwards repaints BOTH: the control retires (the run is in flight) and the pane's
+// restart note is gone (the replay is what the note promised).
+it('resumes the run a restart interrupted on an idle conversation, and clears the restart banner', async () => {
+    localStorage.setItem(SESSION_KEY, 's1');
+    const fixture = stubServer(interruptedByRestart());
+
+    await import('./main');
+    await flush();
+
+    // THE BANNER, before anything is pressed: the session-level note the restore wrote.
+    const banner = document.querySelector<HTMLElement>('.notice.session-note');
+    expect(banner?.hidden).toBe(false);
+    expect(banner?.dataset.tone).toBe('error');
+    expect(banner?.textContent).toBe(RESTART_BANNER);
+
+    const tile = await expandOnlyTile();
+    expect(tile.dataset.threadId).toBe('thread-a');
+
+    // REV2: the bar offers Resume even though the roster says `idle`, because the conversation's
+    // newest row ended `error`.
+    const button = resumeOf();
+    expect(button.hidden).toBe(false);
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute('aria-label')).toBe('Resume thread IN1');
+
+    const before = fixture.calls.length;
+    button.click();
+    await flush();
+    await flush();
+
+    // One resume, empty body, no dialog — the same transport contract as a stopped thread's.
+    expect(fixture.calls.slice(before).filter((call) => call.url === RESUME_URL)).toEqual([
+        { url: RESUME_URL, method: 'POST', body: undefined }
+    ]);
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
+
+    // THE TWO THINGS THE REQUEST ASKS FOR. The document the shell re-reads states the replay:
+    // the conversation is running again, so the control is unpainted…
+    expect(button.hidden).toBe(true);
+
+    // …and the restart note is retired. It is the SESSION pair (`status` + `last_error`) the
+    // restore wrote, and the resume's own write is what clears it — `sessionFailureOf` prints
+    // nothing once the session is no longer an error record.
+    expect(banner?.hidden).toBe(true);
+    expect(banner?.textContent).toBe('');
+
+    // The transcript action is untouched by either change, and the interrupted row was never
+    // replaced by a second copy of the question.
+    const transcript = byClass('.tile-transcript-action', 'div')
+        .querySelector<HTMLButtonElement>('.transcript-open');
+    if (transcript === null) throw new Error('missing the transcript control');
+    expect(transcript.hidden).toBe(false);
+    expect(document.querySelectorAll('.tile')).toHaveLength(1);
 });

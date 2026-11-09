@@ -3,9 +3,10 @@
 > **Status:** Authoring documentation for the plugin surface as it stands on
 > 2026-11-09, the day the pipeline-v2 stage landed (event bus v2, the
 > `HarnessTurnDecision` pipeline, the mutation API, and the worker-lane sync —
-> `docs/tasks/2026-11-09-plugin-pipeline-v2.md` carries the dated decisions and
-> the landing notes). This document describes the code and its tests; it does
-> not assert a passing production verification run.
+> `docs/tasks/2026-11-09-plugin-pipeline-v2.md` now carries only the remaining
+> work — the two probes and the boundaries closed by decision). This document
+> describes the code and its tests; it does not assert a passing production
+> verification run.
 > **Source of truth:** `src/plugin/hooks.ts` (the dispatch rules, header
 > "THE RULES"), `src/plugin/host.ts` (the per-plugin api view),
 > `src/plugin/settings.ts` (the settings read/write edges), `src/types/index.ts`
@@ -529,8 +530,9 @@ with what it observed.
   per-role allowlists, or your transcript stops restoring.
 
 Companion reading: `docs/tasks/2026-11-09-plugin-pipeline-v2.md` (framework
-decisions), `docs/tasks/2026-11-09-context-inclusion-followups.md` (the
-inclusion primitive's edges), `docs/tasks/2026-11-09-progressive-compaction.md`
+decisions), `docs/tasks/2026-11-09-context-inclusion-followups.md` (now only
+the missing UI marker for an excluded turn),
+`docs/tasks/2026-11-09-progressive-compaction.md`
 (the policy that consumes all of this), and the shipped built-ins
 `src/plugins/context-compaction.plugin.ts` and
 `src/plugins/async-ping.plugin.ts` as worked examples.

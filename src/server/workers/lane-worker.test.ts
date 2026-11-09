@@ -645,6 +645,96 @@ describe('worker mode: stop and crash have no late effects', () => {
     }, 180_000);
 });
 
+describe('worker mode: a stopped conversation resumes IN PLACE', () => {
+    // R1 (revised) measured against a REAL lane. Two worker-mode facts make this shape worth
+    // pinning, and one of them chooses the setup:
+    //
+    //   - a lane run that SETTLES mirrors its conversation back to `idle` on the authority
+    //     (./lane-host.ts `mirrorThreadStatus`, :905-916), so a stop taken while a run is in
+    //     flight is undone by that run's own settlement - `resumeThread` then correctly reports
+    //     the conversation `idle` rather than `stopped`. The resumable state in worker mode is
+    //     therefore a stop that drops work the lane never started: a queued backlog row.
+    //   - reusing the interrupted turn's id on a lane is safe, because the host releases its
+    //     slot BY TURN ID at settle (./lane-host.ts:920) and the store's recorder relays into
+    //     the same row object the requeue put back on the lane.
+    //
+    // The session's exclusive gate is what parks the lane: a manual core call takes it in BOTH
+    // modes (../sessions.ts `busyOrPending`/:3579), so the submit below stays `queued` and its
+    // stop is a pure backlog drop with no run to mirror the status away again.
+    it('re-runs the interrupted row on a lane under the SAME turn id, with no second row', async () => {
+        const store = storeOf();
+        const session = await store.create('demo');
+
+        // Hold the gate first (a cold operator lane makes this window comfortably long), then
+        // submit: the row is accepted, queued in its own lane, and never starts.
+        const gateHeld = store.callTool(session.id, 'tasks', {});
+        const submit = await store.dispatch(session.id, 'stop me and resume me');
+        const target = submit.turn.threadId as string;
+
+        // PROVE the lane is parked before stopping it (that is what makes this a pure backlog
+        // drop with no run to mirror the conversation's status away later). The manual call
+        // takes the session's gate synchronously, so the submit stays `queued` behind it.
+        await sleep(50);
+
+        expect(turnOf(store.get(session.id), submit.turn.id)?.status).toBe('queued');
+        expect(store.get(session.id).queueDepth).toBe(1);
+
+        const stopped = await store.cancelThread(session.id, target);
+
+        // The stop dropped accepted-but-unstarted work (that is what `cancelled` reports), and
+        // with no lane run for this conversation the `stopped` state SURVIVES settlement.
+        expect(stopped.cancelled).toBe(true);
+        await gateHeld;
+
+        const interrupted = await settle(store, session.id, submit.turn.id);
+
+        expect(interrupted.status).toBe('cancelled');
+        expect(store.get(session.id).turns).toHaveLength(1);
+        expect(store.get(session.id).threads!.find((thread) => thread.id === target)!.status).toBe('stopped');
+
+        const resumed = await store.resumeThread(session.id, target);
+
+        // SAME ROW, `queued`, and still exactly ONE row for this prompt: no continuation record,
+        // no duplicate prompt. `startedAt` is cleared for the lane run to restamp it.
+        expect(resumed.turn.id).toBe(submit.turn.id);
+        expect(resumed.turn.index).toBe(submit.turn.index);
+        expect(resumed.turn.threadId).toBe(target);
+        expect(resumed.turn.status).toBe('queued');
+        expect(resumed.turn.startedAt).toBeUndefined();
+        expect(resumed.turn.events).toEqual([]);
+        expect(store.get(session.id).turns).toHaveLength(1);
+
+        // The requeued row really runs ON A LANE (role == the conversation), which is the only
+        // way this assertion distinguishes worker mode from a silent inline fallback.
+        const lanes = await hostReady(store);
+        let sawLaneRun = false;
+
+        for (let attempt = 0; attempt < 400 && !sawLaneRun; attempt += 1) {
+            sawLaneRun = lanes.lanes().some((lane) => lane.role === target && lane.busy);
+
+            if (!sawLaneRun) await sleep(20);
+        }
+
+        expect(sawLaneRun).toBe(true);
+
+        const settled = await settle(store, session.id, submit.turn.id);
+
+        expect(settled.status).toBe('done');
+
+        // ONE answered row, under the id the stop left behind, and the conversation took input
+        // again on a lane (the runtime's host-revival path, `sendThreadInput`).
+        expect(store.get(session.id).turns).toHaveLength(1);
+        expect(store.get(session.id).turns[0]!.id).toBe(submit.turn.id);
+        expect(store.get(session.id).turns[0]!.index).toBe(submit.turn.index);
+        expect(store.get(session.id).threads!.find((thread) => thread.id === target)!.status).toBe('idle');
+
+        // The resumed attempt is the record now: the row carries a full answer and none of the
+        // stop's bookkeeping.
+        expect(settled.events.some((event) => event.type === 'error')).toBe(false);
+        expect(settled.events.some((event) => event.type === 'done')).toBe(true);
+    }, 180_000);
+});
+
 describe('worker mode: an unrebuildable harness is refused, not run inline', () => {
     it('rejects a session whose preset cannot be rebuilt from a record', async () => {
         const registry = createHarnessRegistry([

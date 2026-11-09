@@ -2235,34 +2235,44 @@ paths:
     post:
       tags: [Threads]
       operationId: resumeSessionThread
-      summary: Re-run the interrupted turn of one stopped conversation
+      summary: Re-run the interrupted turn of one halted conversation
       description: >-
-        The counterpart of `POST .../cancel`: a conversation that was stopped stays addressable and is revived
-        by re-running the input of its most recent turn that never reached an answer. The route takes no body -
-        the server re-submits the input it durably recorded for that turn (its prompt, plus the composer
-        attachments and result references stored on the same turn record) through the SAME durable submit path
-        an ordinary continuation uses, so the conversation's transcript, lane, display label, generation guard,
-        and worker-mode execution are exactly what a normal continuation gets. Nothing is invented: the
-        interrupted row stays in `turns` as its terminal record, and the revival appears as a NEW continuation
-        turn whose `turn.upsert` traffic is indistinguishable from any other submit's.
-        Any stopped conversation is reachable from this route whatever opened it - a host submit, an explicitly
-        created thread, the default `agent:<name>` conversation, or a delegated child - because a stop lands on
-        every one of them and an answer that never arrived is user work worth re-running. What decides whether a
-        stop CAN be replayed is what this server recorded: a conversation whose runs live only inside its
-        parent's turn has no input of its own in the durable record, and that is a 409 that says so rather than
-        an invented prompt.
-        The answer is the ordinary submit receipt (`TaskReceipt`) for that continuation turn, at 200 rather
-        than 202 because the caller asked for a specific already-recorded task, not for a new one to be
-        accepted; execution is still owned by the server and is not awaited.
+        The counterpart of `POST .../cancel`: a conversation whose last run never reached an answer stays
+        addressable and is revived by re-running that turn, IN PLACE. The route takes no body -
+        the server re-runs the input it durably recorded on that very turn record (its prompt, plus the composer
+        attachments and result references stored on the same record) through the SAME lane pump an ordinary
+        continuation uses, so the conversation's transcript, display label, generation guard, and worker-mode
+        execution are exactly what a normal continuation gets. Nothing is invented and nothing is duplicated:
+        the interrupted row IS the resumed row - same id, same index, put back in the shape a submit mints
+        (`queued`, no `startedAt`, its events rolled back to the last committed step so the abandoned attempt
+        is not rendered as an answer) - so the transcript keeps the rows the user acted on instead of growing
+        a second copy of the same question. Its `turn.upsert` traffic is indistinguishable from any other
+        submit's, because it is the same row moving through the same states.
+        The one input that cannot be requeued is a slash command: a command turn is born running, never joins a
+        lane, and has no lane row to put back, so a command-shaped input re-runs on the command path and does
+        appear as its own new record.
+        WHICH CONVERSATIONS ARE REACHABLE: any one this server is not currently working on - a roster status of
+        `stopped` OR `idle` - whatever opened it (a host submit, an explicitly created thread, the default
+        `agent:<name>` conversation, or a delegated child). `stopped` is what an explicit cancel leaves behind;
+        `idle` is what every OTHER unreached answer leaves behind, because a conversation that fails on the
+        provider returns to `idle` and the runtime persists a conversation status as only `stopped` or `idle`,
+        so the run a SERVER RESTART cut short is restored on an `idle` one too. The route then decides on what
+        it recorded: the conversation's most recent turn must have ended without an answer (`cancelled` or
+        `error`). A conversation whose runs live only inside its parent's turn has no input of its own in the
+        durable record, and that is a 409 that says so rather than an invented prompt.
+        The answer is the ordinary submit receipt (`TaskReceipt`) for that requeued turn - it names the SAME
+        turn id the halt left behind - at 200 rather than 202 because the caller asked for a specific
+        already-recorded task, not for a new one to be accepted; execution is still owned by the server and is
+        not awaited.
         The refusal surface is 404 and 409 only. An unknown session or conversation is 404. Every 409 is a
-        state guard: the conversation is not `stopped` (an idle or running one already takes ordinary input
-        through `POST .../tasks`, and a revive that is already in flight is the same conflict), it has no
-        recorded turn of its own to replay, or its most recent turn is `done` - the answer WAS reached, so
-        there is nothing to resume. A still-queued or still-running most recent turn is refused for the same
-        reason: work is already in flight.
+        state guard: a run is in flight on the conversation (`running`, which already takes ordinary input
+        through `POST .../tasks`), the conversation is parked by its plugin (`paused`, which the plugin's own
+        control unpauses), a revive of it is already in flight, it has no recorded turn of its own to re-run,
+        its most recent turn is `done` - the answer WAS reached, so there is nothing to resume - or its most
+        recent turn is still `queued` or `running`, which means work is already in flight.
       responses:
         '200':
-          description: Continuation accepted; execution is owned by the server.
+          description: The interrupted turn was requeued in place; execution is owned by the server.
           headers:
             X-Harness-Revision:
               description: The session revision this receipt was produced at, for stream reconciliation.
