@@ -702,11 +702,11 @@ paths:
       description: >-
         GLOBAL metadata, answerable without constructing a harness. Rows are `ToolSummary`: `name`,
         display `group`, `description`, `tags`, `visibility` (`core` is the harness-owned set,
-        `searchable` is discovery-eligible), `availability`, `session_bound`, and the two enablement
-        fields a Tools pane needs to render a working switch: `enabled` (this deployment runs the tool
-        right now - the GLOBAL switch, resolved live) and `protected` (the entry is part of the
-        harness-owned control plane the runtime is built on, so the switch does not apply to it).
-        A protected row is always `enabled: true`. The argument JSON
+        `searchable` is discovery-eligible), `availability`, `session_bound`, and the enablement
+        field a Tools pane needs to render a working switch: `enabled` (this deployment runs the tool
+        right now - the GLOBAL switch, resolved live). A row carries NO "protected" marker: the
+        switch applies to EVERY listed entry, the harness-owned control tools included, so nothing
+        on this surface is permanently on. The argument JSON
         Schema is omitted from a row and lives on the identified read, where a client that is about to
         execute the tool needs it. An unconfigured credential-dependent entry has no runnable
         implementation, so its state is `unconfigured` with the environment VARIABLE NAMES and a
@@ -750,8 +750,7 @@ paths:
       description: >-
         The identified read adds `parameters` (the JSON Schema the model is given) and `execution` -
         whether this entry can be executed without a session - to everything a row already carries,
-        including the enablement fields: `enabled` is this deployment's live global state and
-        `protected` states that the switch does not apply to a harness-owned entry. A `session_bound`
+        including `enabled`, this deployment's live global state. A `session_bound`
         entry has no standalone implementation, and `execution.scope` states that instead of leaving a
         client to infer it from `group`.
       responses:
@@ -789,12 +788,13 @@ paths:
         Discovery is not delayed even inside that window, because a lane's `toolRequest` is answered by
         the coordinator against the live switch, and a name disabled here is therefore reported
         `forbidden` and never written into the session's enabled set.)
-        A `protected` entry - a harness-owned control tool the runtime is built on (`toolRegistry`,
-        `toolRequest`, `task`, ...) - is refused with 403 WHEN DISABLED, because switching the control plane
-        off would strand every conversation; `{ "enabled": true }` on the same name is accepted as the
-        idempotent no-op it is and answers 200 with `enabled: true`. An unknown tool is 404, and a body
-        that is not exactly one boolean `enabled` is 400. The response is the whole identified read, so a client sees the row it changed
-        (including `protected`, which is the honest reason a refused row never changes).
+        EVERY listed entry takes this write, the harness-owned control tools (`toolRequest`, `tasks`,
+        ...) included: the switch gates what an AGENT may reach, nothing more. Disabling one hides it
+        from every model declaration and refuses it at the launch gate with a readable tool result,
+        while the entry stays REGISTERED, a host's manual call on this surface still runs it, and a
+        nested call made by another tool is never consulted against it; `{ "enabled": true }` puts it
+        back on the next request. An unknown tool is 404, and a body
+        that is not exactly one boolean `enabled` is 400. The response is the whole identified read, so a client sees the row it changed.
       requestBody:
         required: true
         content:
@@ -819,8 +819,6 @@ paths:
                 $ref: '#/components/schemas/ToolDetailResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '405':
@@ -4808,9 +4806,9 @@ components:
       type: object
       description: >-
         One catalogue entry as a list projects it: identity, display group, description, tags, visibility,
-        availability, whether the entry can only run inside a session, and the two enablement fields the
+        availability, whether the entry can only run inside a session, and the enablement field the
         Tools pane switches on. The argument JSON Schema is on the identified read.
-      required: [name, group, description, tags, visibility, session_bound, enabled, protected]
+      required: [name, group, description, tags, visibility, session_bound, enabled]
       additionalProperties: false
       properties:
         name:
@@ -4845,15 +4843,8 @@ components:
             the entry stays REGISTERED, so re-enabling costs nothing and needs no restart. It COMPOSES
             with the per-run gates rather than replacing them: a delegation's `scope.tools` allowlist and
             a session's own enabled set keep deciding independently, and a name has to pass all three to
-            reach a request. A `protected` row always reports `true`, because the switch does not apply
-            to the control plane the runtime is built on.
-        protected:
-          type: boolean
-          description: >-
-            True when the entry is harness-owned (the runtime control plane plus `delegate`/`threadSend`):
-            the global switch refuses it with 403, exactly as a session refuses enabling or disabling one.
-            Stated on the row so a client renders a disabled control with its real reason instead of
-            discovering it from a 403 after the click.
+            reach a request. Every listed entry takes that switch, the harness-owned control tools
+            included - a row states no exception, because there is none on this surface.
     ToolSettingsUpdate:
       type: object
       description: >-

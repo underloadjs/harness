@@ -12,6 +12,13 @@ security rule, a dependency rule, a gateway-compatibility rule) that is stated i
 **Why it is the way it is**, and the proposal works inside the rule instead
 of against it.
 
+The records-store entries (0008-0011) came from a stress test of the shared store
+— 7 threads across 5 agents writing the same collections concurrently. The
+concurrency contract **held**: no lost updates under a same-`rev` race,
+`mergeDisjoint` refused an overlapping-field merge, and every batch was atomic
+(no partial write on a rejected call). Those four issues are the ergonomics and
+consistency gaps that surfaced around that core, not defects in it.
+
 ## Index
 
 | Issue | Area | Severity | One line |
@@ -22,7 +29,11 @@ of against it.
 | [0004](./0004-context-window-and-token-budget.md) | context | Minor | No pre-request context-window guard and no provider overflow classification; the estimator exists but is not published. |
 | [0005](./0005-server-api-chat-product-parity.md) | server API | Significant | The built-in session API cannot seed a transcript at creation, and every live preset ships the full toolbox. |
 | [0006](./0006-streaming-and-adapter-ergonomics.md) | server / adapters | Minor | Two independent SSE writers, and the `{ stream }` abort wiring is documented only in the source headers. |
-| [0007](./0007-improvements-review-list.md) | cross-cutting | Review list | Everything else found during review, listed separately for the package owner to triage. |
+| [0007](./0007-improvements-review-list.md) | cross-cutting | Review list | Everything else found during review — plus the records-store stress-test items that are doc wording or a wrong unit on one key — listed separately for the package owner to triage. |
+| [0008](./0008-multi-record-mutation-names-no-ids.md) | records store | Significant | A batch that changes several records returns no `entry` and no id list, so additions and patches cannot be confirmed without a re-read — the fix removals already got (`removedIds`) was never applied to them. |
+| [0009](./0009-guarded-write-refusal-omits-the-record.md) | records store | Minor | The `guarded-write` refusal says "read it first" but returns only the id, while `stale-record` on the same record returns the whole entry — so the error that needs the `rev` is the one that omits it. |
+| [0010](./0010-define-plus-collection-two-paths-disagree.md) | records store | Minor | `define` beside `collection` is refused by the engine as "ambiguous" but silently consumed by the tool entry point, which registers the collection and echoes a different name. |
+| [0011](./0011-change-feed-has-no-floor-watermark.md) | records store | Minor | The change feed reports that a gap was lost (`changesTruncated`) but never exposes the oldest retained revision, so a poller cannot size its lag and one refusal must guess between two causes. |
 
 ## Format
 

@@ -3084,9 +3084,10 @@ export type HarnessConfiguration = {
     //
     // A DISABLED TOOL STAYS REGISTERED. Discovery can still list it, a host can still
     // execute it through `harness.executeTool`, and re-enabling costs nothing; only a
-    // model's view of it (declared / callable / promiseable) changes. The core control
-    // plane is excluded at the WRITE edge (the server refuses a protected name with 403),
-    // so a document can never hide `toolRequest` or `task` from a conversation.
+    // model's view of it (declared / callable / promiseable) changes. The switch applies to
+    // EVERY name, the core control plane included (the server has no protected-name
+    // exception), so hiding `toolRequest` from a conversation is an operator decision the
+    // host writes exactly like any other.
     toolSettings?: HarnessToolSettingsProvider;
 };
 

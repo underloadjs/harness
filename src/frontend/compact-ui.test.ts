@@ -595,42 +595,73 @@ it('has no tab strip rules left and styles the global icon toggle', () => {
     expect(rules).not.toContain('.plugins-toggle, .tools-toggle');
 });
 
-// R1/R3: the two catalogues grew a per-row enablement switch, and a row is now a
-// WRAPPER (`.tool-tab-row` / `.plugin-tab-row`) holding the dialog trigger and the
-// switch as siblings — a `<button>` cannot contain a control. These rules are the
-// layout that wrapper needs, and the on/off vocabulary is the same in both panes so
-// the two catalogues read identically. Every rule stays scoped per pane: restyling one
-// row can never move the other.
-it('lays out each catalogue row as a trigger plus its own enablement switch', () => {
-    // The wrapper is a flex line; the trigger takes the remaining width and can shrink,
-    // so a long tool name still clamps instead of pushing the switch out of the card.
+// R1/R2: each catalogue row now carries its own enablement TICK BOX in the tile's
+// top-right corner, and a row is a WRAPPER (`.tool-tab-row` / `.plugin-tab-row`) holding
+// the dialog trigger and the box as siblings — a `<button>` cannot contain a control.
+// These rules are the layout that wrapper needs, and the tick/wash vocabulary is the same
+// in both panes so the two catalogues read identically. Every rule stays scoped per pane:
+// restyling one row can never move the other.
+it('lays out each catalogue row as a trigger plus its own corner enablement box', () => {
+    // The wrapper is a flex line AND the positioning context the corner box anchors to;
+    // the trigger takes the remaining width and can shrink (a long tool name still clamps
+    // instead of pushing the layout), and it reserves the corner so text never runs under
+    // the box.
     expect(blockOf('.tool-tab-row {')).toContain('display: flex');
+    expect(blockOf('.tool-tab-row {')).toContain('position: relative');
     expect(blockOf('.tool-tab-row .tool-tab-button {')).toContain('flex: 1 1 auto');
     expect(blockOf('.tool-tab-row .tool-tab-button {')).toContain('min-width: 0');
+    expect(blockOf('.tool-tab-row .tool-tab-button {')).toContain('padding-right: 32px');
     expect(blockOf('.plugin-tab-row {')).toContain('display: flex');
+    expect(blockOf('.plugin-tab-row {')).toContain('position: relative');
     expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('flex: 1 1 auto');
     expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('min-width: 0');
+    expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('padding-right: 34px');
 
-    // The switch is a fixed-width control pinned to the centre of the row, with the same
-    // state vocabulary in both panes (`is-on` reads as the accent-ok, `is-off` as muted).
-    for (const selector of ['.tool-tab-toggle', '.plugin-tab-toggle']) {
-        expect(blockOf(`${selector} {`)).toContain('flex: 0 0 auto');
-        expect(blockOf(`${selector} {`)).toContain('align-self: center');
-        expect(blockOf(`${selector}.is-on {`)).toContain('border-color: var(--ok)');
-        expect(blockOf(`${selector}.is-off {`)).toContain('color: var(--muted)');
+    // The box is a native checkbox absolutely positioned in the corner and LIFTED above the
+    // tile by `z-index` — that pairing is what makes a click on the box land on the box
+    // and never open the runner/dialog. Both panes use the same 17px box and the same
+    // green tick, as two separate blocks.
+    for (const selector of ['.tool-tab-enable', '.plugin-tab-enable']) {
+        expect(blockOf(`${selector} {`)).toContain('position: absolute');
+        expect(blockOf(`${selector} {`)).toContain('z-index: 1');
+        expect(blockOf(`${selector} {`)).toContain('width: 17px');
+        expect(blockOf(`${selector} {`)).toContain('accent-color: var(--ok)');
+        expect(blockOf(`${selector} {`)).toContain('cursor: pointer');
+        expect(blockOf(`${selector}.is-off {`)).toContain('accent-color: var(--muted)');
+        expect(blockOf(`${selector}:focus-visible {`)).toContain('outline: 2px solid var(--accent)');
         // R1: the ONLY disabled state is the control's own in-flight write.
         expect(blockOf(`${selector}:disabled {`)).toContain('cursor: progress');
     }
 
-    // A withheld row reads as withheld in the card too, from the SAME figure the switch
-    // states (main.ts paints both together).
-    expect(blockOf(".tool-tab-button[data-enabled='false'] {")).toContain('opacity: 0.65');
-    expect(blockOf(".plugin-tab-button[data-enabled='false'] {")).toContain('opacity: 0.65');
+    // An ENABLED tile is the light-green one: the wash composited over the tile's own
+    // elevated surface plus a green-tinted border, driven by the SAME `[data-enabled]`
+    // figure the box states (main.ts paints the two together).
+    for (const button of ['.tool-tab-button', '.plugin-tab-button']) {
+        const enabled = blockOf(`${button}[data-enabled='true'] {`);
 
-    // The harness-owned set has no control at all, so it gets a static pin: same
-    // footprint, no pointer affordance.
-    expect(blockOf('.tool-tab-pin {')).toContain('cursor: help');
-    expect(blockOf('.tool-tab-pin {')).not.toContain('cursor: pointer');
+        expect(enabled).toContain('background-image: linear-gradient(var(--ok-wash), var(--ok-wash))');
+        expect(enabled).toContain('background-color: var(--bg-elevated)');
+        expect(enabled).toContain('border-color: var(--ok-line)');
+
+        // The tile whose runner is open still reads as the selected one: the wash is
+        // declared BEFORE the accent rule at equal specificity, so `[aria-pressed]` wins.
+        expect(rules.indexOf(`${button}[data-enabled='true'] {`)).toBeLessThan(
+            rules.indexOf(`${button}[aria-pressed='true'] {`)
+        );
+    }
+
+    // The wash is a token pair, not two magic alphas repeated per pane.
+    expect(blockOf(':root {')).toContain('--ok-wash: rgba(74, 222, 128, 0.16)');
+    expect(blockOf(':root {')).toContain('--ok-line: rgba(74, 222, 128, 0.5)');
+
+    // A DISABLED tile is the PLAIN one: the old `[data-enabled='false']` opacity dim is
+    // gone, so "off" is the default appearance and no catalogue row is faded.
+    expect(rules).not.toContain("[data-enabled='false']");
+
+    // The pill and the "core" pin left the sheet with the markup that used to carry them.
+    expect(rules).not.toContain('.tool-tab-toggle');
+    expect(rules).not.toContain('.plugin-tab-toggle');
+    expect(rules).not.toContain('.tool-tab-pin');
 
     // The switch outcome lines are separate from the catalogue count lines, and a failure
     // is marked by class as well as colour.
@@ -638,8 +669,8 @@ it('lays out each catalogue row as a trigger plus its own enablement switch', ()
     expect(blockOf('.plugins-tab-status-error {')).toContain('color: var(--danger)');
 
     // The two panes still own their own rules (no shared selector list was introduced).
-    expect(rules).not.toContain('.tool-tab-toggle, .plugin-tab-toggle');
-    expect(rules).not.toContain('.plugin-tab-toggle, .tool-tab-toggle');
+    expect(rules).not.toContain('.tool-tab-enable, .plugin-tab-enable');
+    expect(rules).not.toContain('.plugin-tab-enable, .tool-tab-enable');
 });
 
 it('leaves the create-harness close baseline alone (F2 cascade guard)', () => {

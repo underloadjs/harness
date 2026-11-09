@@ -1,32 +1,39 @@
 // R3 — the GLOBAL tool switch over REST (src/server/api.ts `patchTool`, plus the row fields).
 //
 // WHAT THIS FILE PROVES (one block per acceptance criterion):
-//   1. ROWS      - `GET /v1/harness/tools` carries `enabled` and `protected` on EVERY row
-//                  (the pair the Tools pane switches on), and the identified read carries
-//                  them beside `parameters`/`execution`.
+//   1. ROWS      - `GET /v1/harness/tools` carries `enabled` on EVERY row (the figure the
+//                  Tools pane switches on), and the identified read carries it beside
+//                  `parameters`/`execution`. No row states a `protected` flag: the switch
+//                  applies to the whole catalogue (R5).
 //   2. WRITE     - `PATCH /v1/harness/tools/{tool_id}` with `{enabled:false}` answers 200
 //                  with the updated identified read, bumps the collection revision, and the
 //                  next list reflects it. `{enabled:true}` puts it back.
-//   3. REFUSALS  - unknown tool => 404 (identity BEFORE body or protection); a protected
-//                  entry => 403 with the store's own sentence; a missing/blank/mistyped
+//   3. REFUSALS  - unknown tool => 404 (identity BEFORE the body); a missing/blank/mistyped
 //                  `enabled` or an unknown body field => 400. A refused write changes nothing.
+//                  A harness-owned core tool is NOT a refusal (R5): it takes the same 200.
 //   4. ANYTIME   - there is NO idle gate: the switch lands on a session that is ALIVE, and
 //                  the same running session's very NEXT model request is built without the
 //                  disabled tool (the wiring proof is the report identity below).
-//   5. DURABLE   - `state.json` carries `toolSettings: { disabled: [...] }` and nothing else,
+//   5. CORE      - a core tool (`tasks`) is switchable end to end: the row reports
+//                  `enabled: false`, the deny list survives a restart, the next request
+//                  hides the name from its declarations, the launch gate answers a guess
+//                  with the switch's readable tool result, `toolRequest` reports it under
+//                  `forbidden`, and re-enabling puts all of it back.
+//   6. DURABLE   - `state.json` carries `toolSettings: { disabled: [...] }` and nothing else,
 //                  a deployment that never switched anything writes no field at all, and a
-//                  fresh runtime on the same root boots with the switch applied. A protected
-//                  name smuggled into a hand-edited document is dropped, not honoured.
+//                  fresh runtime on the same root boots with the switch applied. A hand-edited
+//                  document listing a core name is HONOURED, not dropped.
 //
 // Determinism: every status, key list, sentence and value below is an EXACT assertion. The
 // session harness is scripted (no provider, no network), and the captured stream requests
 // ARE the observation of what the model was told.
 //
 // Cross-references:
-//   - ./tool-settings.ts            — the store, the 403 rule, the live provider
+//   - ./tool-settings.ts            — the store, the deny list, the live provider
 //   - ./api.ts                      — `patchTool`, `toolEnablementOf`, the route table
 //   - ./sessions.ts                 — `updateToolEnabled` (persist-before-answer) and `buildHarness`
-//   - ../harness.ts                 — the declaration filter that reads the provider per request
+//   - ../harness.ts                 — the declaration filter, launch gate and discovery that read the provider
+//   - ../harness.tool-settings.test.ts — the same three consumers at the library boundary
 //   - ./plugins-api.test.ts         — the sibling REST+durability suite this one mirrors
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
@@ -130,6 +137,20 @@ const answer = (text: string): HarnessStreamEvent[] => [
     { type: 'done', stopReason: 'stop', toolCalls: [] }
 ];
 
+/** One scripted model turn that emits a single tool call (the guessed/queried name). */
+const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] => [
+    { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: args }] }
+];
+
+// The scripted turns the NEXT probe harness runs, one entry per model request (the last
+// entry repeats once the list runs out — see `scripted`). A test that needs the model to
+// CALL a tool reassigns this BEFORE the session is created, because `probePreset().create`
+// captures the array when the harness is built. `createRuntime` resets it, so a test never
+// inherits another test's script.
+const defaultTurns = (): HarnessStreamEvent[][] => [answer('one'), answer('two'), answer('three')];
+
+let probeTurns: HarnessStreamEvent[][] = defaultTurns();
+
 const probePreset = (): HarnessPreset => ({
     name: 'probe',
     title: 'Probe',
@@ -152,7 +173,7 @@ const probePreset = (): HarnessPreset => ({
                 probe: agent({
                     model: settings.model,
                     instruction: 'Scripted tool-switch probe agent.',
-                    stream: scripted([answer('one'), answer('two'), answer('three')])
+                    stream: scripted(probeTurns)
                 })
             },
             primary: 'probe',
@@ -189,6 +210,9 @@ const createRuntime = (options: Partial<HarnessRuntimeOptions> = {}): HarnessRun
     stubSearchKeys();
     builtReports = [];
     probeRequests = [];
+    // The default script is three plain answers; a test that needs a tool call reassigns
+    // `probeTurns` after this call and BEFORE the session is created.
+    probeTurns = defaultTurns();
 
     return createHarnessRuntime({
         settings: SETTINGS,
@@ -242,6 +266,19 @@ const createSession = async (runtime: HarnessRuntime): Promise<string> => {
 const declaredNames = (request: HarnessStreamRequest | undefined): string[] =>
     (request?.tools ?? []).map((entry) => entry.name);
 
+/**
+ * The content of one tool result in a session's transcript, by call id. The transcript is
+ * the live harness's own record (`harness.agent.messages`), so this reads what the MODEL was
+ * answered — a refusal is a tool result, never a failed run.
+ */
+const toolResultOf = (harness: { agent: { messages: readonly unknown[] } }, callId: string): string => {
+    const found = (harness.agent.messages as { role: string; toolCallId?: string; content?: string }[]).find(
+        (message) => message.role === 'tool' && message.toolCallId === callId
+    );
+
+    return found?.content ?? '';
+};
+
 afterEach(() => {
     vi.unstubAllEnvs();
 });
@@ -251,7 +288,7 @@ afterEach(async () => {
 });
 
 describe('GET /v1/harness/tools — the enablement fields', () => {
-    it('carries enabled and protected on every row, and nothing else changed', async () => {
+    it('carries enabled on every row, and nothing else changed', async () => {
         const runtime = createRuntime();
         const page = await call(runtime, 'GET', `${MOUNT}/tools`, {}, 'limit=100');
 
@@ -261,16 +298,16 @@ describe('GET /v1/harness/tools — the enablement fields', () => {
 
         expect(rows.length).toBeGreaterThan(0);
 
-        // The closed `ToolSummary` row: the eight fields are on EVERY row (R3 added the last
-        // two), and the one optional member the schema allows is `availability` — a
-        // credential-dependent entry only. Asserted as "the required set, plus at most
-        // availability", so a new field on the wire fails loudly instead of riding along.
+        // The closed `ToolSummary` row: the seven fields are on EVERY row, and the one
+        // optional member the schema allows is `availability` — a credential-dependent
+        // entry only. Asserted as "the required set, plus at most availability", so a new
+        // field on the wire fails loudly instead of riding along. R6: `protected` is gone —
+        // the switch applies to every entry, so a row has no exception to advertise.
         const requiredRowKeys = [
             'description',
             'enabled',
             'group',
             'name',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
@@ -278,7 +315,7 @@ describe('GET /v1/harness/tools — the enablement fields', () => {
 
         for (const row of rows) {
             expect(typeof row.enabled).toBe('boolean');
-            expect(typeof row.protected).toBe('boolean');
+            expect(Object.hasOwn(row, 'protected')).toBe(false);
 
             const extra = Object.keys(row)
                 .sort()
@@ -287,13 +324,18 @@ describe('GET /v1/harness/tools — the enablement fields', () => {
             expect(extra).toEqual(row.availability === undefined ? [] : ['availability']);
         }
 
-        // Nothing has been switched: every row is enabled, and only the harness-owned set
-        // is protected. A protected row is enabled BY DEFINITION, which is what lets a
-        // client render its switch disabled with the real reason instead of a 403.
+        // Nothing has been switched, so every row — the harness-owned core entries
+        // included — reads enabled (./tool-settings.ts: a deny list, empty by default).
         expect(rows.every((row) => row.enabled === true)).toBe(true);
-        expect(rows.filter((row) => row.protected).map((row) => row.name).sort()).toEqual(
+        // The core entries are still LISTED, and are ordinary switchable rows now: the
+        // shipped control-plane set appears among them with no special marker.
+        const coreRows = rows.filter((row) => CORE_TOOL_NAMES.includes(row.name));
+
+        expect(coreRows.map((row) => row.name).sort()).toEqual(
             [...CORE_TOOL_NAMES].sort((left, right) => left.localeCompare(right))
         );
+        expect(coreRows.every((row) => row.enabled === true)).toBe(true);
+        expect(coreRows.map((row) => row.group).sort()).toEqual(['Core tools', 'Core tools']);
     });
 
     it('reports the live switch on the row and on the identified read', async () => {
@@ -302,7 +344,7 @@ describe('GET /v1/harness/tools — the enablement fields', () => {
         const before = await call(runtime, 'GET', `${MOUNT}/tools/timeNow`);
 
         expect(before.status).toBe(200);
-        expect(before.body.tool).toMatchObject({ name: 'timeNow', enabled: true, protected: false });
+        expect(before.body.tool).toMatchObject({ name: 'timeNow', enabled: true });
         expect(Object.keys(before.body.tool).sort()).toEqual([
             'description',
             'enabled',
@@ -310,7 +352,6 @@ describe('GET /v1/harness/tools — the enablement fields', () => {
             'group',
             'name',
             'parameters',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
@@ -320,16 +361,18 @@ describe('GET /v1/harness/tools — the enablement fields', () => {
 
         const after = await call(runtime, 'GET', `${MOUNT}/tools/timeNow`);
 
-        expect(after.body.tool).toMatchObject({ enabled: false, protected: false });
+        expect(after.body.tool).toMatchObject({ enabled: false });
         expect((await call(runtime, 'GET', `${MOUNT}/tools`, {}, 'limit=100')).body.items).toContainEqual(
             expect.objectContaining({ name: 'timeNow', enabled: false })
         );
 
-        // A protected row reports enabled forever, whatever a document claims.
+        // A core entry is an ordinary row of an untouched deployment: listed, enabled, and
+        // with no marker saying the switch skips it (R5/R6).
         const core = CORE_TOOL_NAMES[0];
         const row = (await call(runtime, 'GET', `${MOUNT}/tools/${core}`)).body.tool;
 
-        expect(row).toMatchObject({ name: core, protected: true, enabled: true });
+        expect(row).toMatchObject({ name: core, enabled: true });
+        expect(Object.hasOwn(row, 'protected')).toBe(false);
     });
 });
 
@@ -340,7 +383,7 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
         const patched = await patchTool(runtime, 'timeNow', { enabled: false });
 
         expect(patched.status).toBe(200);
-        expect(patched.body.tool).toMatchObject({ name: 'timeNow', enabled: false, protected: false });
+        expect(patched.body.tool).toMatchObject({ name: 'timeNow', enabled: false });
 
         // The whole identified read comes back, so a client never re-reads to confirm its
         // own click (the plugins response precedent).
@@ -351,7 +394,6 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
             'group',
             'name',
             'parameters',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
@@ -377,25 +419,22 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
         expect((await call(runtime, 'POST', `${MOUNT}/tools`, {})).status).toBe(405);
     });
 
-    it('refuses a protected entry with 403, an unknown tool with 404, and a bad body with 400', async () => {
+    it('accepts a core entry, refuses an unknown tool with 404 and a bad body with 400', async () => {
         const runtime = createRuntime();
 
+        // R5: the write that used to answer 403 is now an ordinary switch. A harness-owned
+        // name goes on the same deny list as a preset tool, and the response is the same
+        // whole identified read (./api.ts `patchTool` — the 403 branch is gone with it).
         const core = CORE_TOOL_NAMES[0];
+        const disabled = await patchTool(runtime, core, { enabled: false });
 
-        expect(await patchTool(runtime, core, { enabled: false })).toEqual({
-            status: 403,
-            body: {
-                error: {
-                    message: `Tool "${core}" is harness-owned; it is part of the control plane every session runs on and cannot be disabled.`
-                }
-            },
-            headers: expect.any(Object)
-        });
+        expect(disabled.status).toBe(200);
+        expect(disabled.body.tool).toMatchObject({ name: core, enabled: false });
+        expect(toolsOf(runtime).disabled()).toEqual([core]);
+        expect(toolsOf(runtime).isEnabled(core)).toBe(false);
+        expect(disabled.headers[HARNESS_REVISION_HEADER]).toBe('1');
 
-        expect(toolsOf(runtime).disabled()).toEqual([]);
-
-        // Identity FIRST: an unknown name is a 404 even with a body that would also fail,
-        // and even when the name is protected-shaped.
+        // Identity FIRST: an unknown name is a 404 even with a body that would also fail.
         const missing = await patchTool(runtime, 'no-such-tool', { enabled: 'yesterday' });
 
         expect(missing.status).toBe(404);
@@ -415,16 +454,106 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
 
         expect(unknownField.status).toBe(400);
         expect(unknownField.body.error.message).toContain('group');
-        expect(toolsOf(runtime).disabled()).toEqual([]);
 
-        // Nothing moved, and the protected row still reads enabled on the wire.
+        // Every refusal above was a no-op: the ONLY state that moved is the core switch this
+        // test made first, and `timeNow` is still enabled.
+        expect(toolsOf(runtime).disabled()).toEqual([core]);
+        expect(toolsOf(runtime).isEnabled('timeNow')).toBe(true);
+
         const page = await call(runtime, 'GET', `${MOUNT}/tools`, {}, 'limit=100');
+        const rows = page.body.items as Record<string, any>[];
 
-        expect((page.body.items as Record<string, any>[]).every((row) => row.enabled === true)).toBe(true);
+        expect(rows.filter((row) => row.enabled === false).map((row) => row.name)).toEqual([core]);
         expect((await call(runtime, 'GET', `${MOUNT}/tools/${core}`)).body.tool).toMatchObject({
-            protected: true,
-            enabled: true
+            name: core,
+            enabled: false
         });
+    });
+
+    it('switches a harness-owned core tool off and back on, end to end (R5)', async () => {
+        const runtime = createRuntime();
+
+        // The scripted model, one entry per model request: it GUESSES the core name `tasks`
+        // (the launch-gate case) and answers; then asks `toolRequest` for the same name (the
+        // discovery case) and answers; then answers plainly on the run AFTER the name is put
+        // back. Assigned BEFORE the session is created, because the preset builds the harness
+        // (and captures this array) there.
+        probeTurns = [
+            callTool('c1', 'tasks', '{}'),
+            answer('refused'),
+            callTool('d1', 'toolRequest', '{"names":["tasks"]}'),
+            answer('forbidden'),
+            callTool('c2', 'tasks', '{}'),
+            answer('ran')
+        ];
+
+        const sessionId = await createSession(runtime);
+        const record = runtime.store.liveSession(sessionId);
+
+        expect((await patchTool(runtime, 'tasks', { enabled: false })).status).toBe(200);
+
+        // --- 1. DECLARATIONS. The core name is hidden from the request the NEXT run builds;
+        // the only other shipped core entry stays, so this is a per-name decision and not the
+        // control plane being switched off wholesale (../harness.ts `declared`).
+        const first = await record.harness('go');
+
+        expect(declaredNames(probeRequests[0])).toEqual(['toolRequest']);
+
+        // --- 2. LAUNCH GATE. The model guessed the disabled name anyway, and the answer is a
+        // readable TOOL RESULT — the run SURVIVES (../harness.ts, the global gate).
+        expect(first.content).toBe('refused');
+        expect(record.harness.agent.messages.filter((message) => message.role === 'tool').length).toBe(1);
+        expect(toolResultOf(record.harness, 'c1')).toBe('Tool "tasks" is disabled on this server by the operator.');
+
+        // --- 3. DISCOVERY. `toolRequest` answers with the denial, not a promise, and the
+        // session-wide enabled set is untouched (one search cannot undo the operator here).
+        const second = await record.harness('search');
+
+        expect(second.content).toBe('forbidden');
+
+        // One entry per denied match, and `tasks` is a DECLARED core entry: the searchable
+        // selection is empty, so the vocabulary hint rides along with the denial (the tag
+        // list is deployment data, not this switch's contract — the field set is pinned).
+        const discovery = JSON.parse(toolResultOf(record.harness, 'd1')) as Record<string, unknown>;
+
+        expect(Object.keys(discovery).sort()).toEqual([
+            'availableTags',
+            'enabled',
+            'forbidden',
+            'matched',
+            'omitted',
+            'tools'
+        ]);
+        expect(discovery.enabled).toEqual([]);
+        expect(discovery.tools).toEqual([]);
+        expect(discovery.matched).toBe(0);
+        expect(discovery.omitted).toBe(0);
+        expect(discovery.forbidden).toEqual([
+            {
+                name: 'tasks',
+                reason:
+                    'Tool "tasks" is disabled on this server by the operator. Requesting it again will not change this answer — adapt to the available tools or report the limitation.',
+                allowed: []
+            }
+        ]);
+        expect(record.harness.discoveredTools).toEqual([]);
+
+        // --- 4. RE-ENABLE. The same live session, no rebuild: the next request declares the
+        // name again, and a call to it executes for real (turns 5-6 of the script).
+        expect((await patchTool(runtime, 'tasks', { enabled: true })).status).toBe(200);
+
+        const third = await record.harness('again');
+
+        expect(declaredNames(probeRequests[4])).toEqual(['toolRequest', 'tasks']);
+        expect(third.content).toBe('ran');
+
+        // The call result is the session's (empty) task page, not the gate's refusal sentence.
+        expect(JSON.parse(toolResultOf(record.harness, 'c2')).tasks).toEqual([]);
+
+        // The bypass the switch must never reach (R7): a HOST execution still runs a name the
+        // model cannot see at all — the tool stayed REGISTERED the whole time.
+        expect((await patchTool(runtime, 'tasks', { enabled: false })).status).toBe(200);
+        expect(await record.harness.executeTool('tasks', {})).toBeDefined();
     });
 
     it('is write-anytime: it lands on a live session and changes its very next request', async () => {
@@ -498,7 +627,7 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
         const page = await call(second, 'GET', `${MOUNT}/tools`, {}, 'limit=100');
         const row = (page.body.items as Record<string, any>[]).find((candidate) => candidate.name === 'timeNow');
 
-        expect(row).toMatchObject({ enabled: false, protected: false });
+        expect(row).toMatchObject({ enabled: false });
 
         // The revision counter is epoch-local, so a restart reports 0 while the STATE does
         // not move.
@@ -525,7 +654,7 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
         );
     });
 
-    it('drops a protected name smuggled into a hand-edited document instead of honouring it', async () => {
+    it('honours a core name listed by a hand-edited document, and restores a core switch across a restart', async () => {
         const root = await fixture();
         const first = createRuntime({ root });
 
@@ -534,26 +663,49 @@ describe('PATCH /v1/harness/tools/{tool_id}', () => {
         const saved = documentOf(root);
 
         // `disabled` must be an array of strings (./persistence.ts is strict about SHAPE)...
-        saved.toolSettings = { disabled: CORE_TOOL_NAMES };
+        saved.toolSettings = { disabled: [...CORE_TOOL_NAMES].reverse() };
 
         await writeDocument(root, saved);
 
         const second = createRuntime({ root });
 
-        // ...while the STORE decides what is still meaningful: every protected name is
-        // dropped, so the control plane stays on after a boot from a hostile file.
-        expect(second.store.toolSettings.disabled()).toEqual([]);
-        expect(second.store.toolSettings.snapshot()).toEqual({});
+        // ...while the STORE decides what is still meaningful, and R5 removed the only rule
+        // that used to discard a name: every listed name is honoured, the harness-owned
+        // control tools included, in sorted order (the writer's order).
+        expect(second.store.toolSettings.disabled()).toEqual(['tasks', 'toolRequest']);
+        expect(second.store.toolSettings.snapshot()).toEqual({ disabled: ['tasks', 'toolRequest'] });
 
         const page = await call(second, 'GET', `${MOUNT}/tools`, {}, 'limit=100');
+        const rows = page.body.items as Record<string, any>[];
 
-        expect((page.body.items as Record<string, any>[]).every((row) => row.enabled === true)).toBe(true);
+        expect(rows.filter((row) => row.enabled === false).map((row) => row.name).sort()).toEqual([
+            'tasks',
+            'toolRequest'
+        ]);
 
-        // A wrong SHAPES is corruption of a named slot: it throws on load, like every other
+        // A switch MADE through the route round-trips exactly the same way: the write is
+        // durable, re-enabling removes it, and the next boot reports the state on the row.
+        await patchTool(second, 'toolRequest', { enabled: true });
+
+        expect(documentOf(root).toolSettings).toEqual({ disabled: ['tasks'] });
+
+        const third = createRuntime({ root });
+
+        expect(third.store.toolSettings.disabled()).toEqual(['tasks']);
+        expect((await call(third, 'GET', `${MOUNT}/tools/tasks`)).body.tool).toMatchObject({
+            name: 'tasks',
+            enabled: false
+        });
+        expect((await call(third, 'GET', `${MOUNT}/tools/toolRequest`)).body.tool).toMatchObject({
+            name: 'toolRequest',
+            enabled: true
+        });
+
+        // A wrong SHAPE is corruption of a named slot: it throws on load, like every other
         // field in this document, rather than being silently accepted.
         const broken = documentOf(root);
 
-        broken.toolSettings = { disabled: 'timeNow' };
+        broken.toolSettings = { disabled: 'toolRequest' };
 
         await writeDocument(root, broken);
 

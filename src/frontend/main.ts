@@ -5356,18 +5356,21 @@ let currentTool: ToolRowEntry | undefined;
 //
 // WHY THIS IS A LOCAL EXTENSION AND NOT A PROTOCOL CHANGE
 // ------------------------------------------------------
-// `GET /tools` rows carry the two enablement fields (../shared/harness-api.ts
-// `ToolSummary`:741-752) and ./api.ts `toolRowOf` maps BOTH through, but the shell's row
-// type is the server protocol's `ToolDescriptor` (../server/protocol.ts:414), which
-// predates the switch and is not this surface's to widen. A catalogue entry therefore
-// reaches the pane as `ToolRowEntry`: the descriptor plus what `toolRowOf` carried.
+// `GET /tools` rows state the enablement figure (../shared/harness-api.ts `ToolSummary`)
+// and ./api.ts `toolRowOf` maps it through, but the shell's row type is the server
+// protocol's `ToolDescriptor` (../server/protocol.ts:414), which predates the switch and
+// is not this surface's to widen. A catalogue entry therefore reaches the pane as
+// `ToolRowEntry`: the descriptor plus what `toolRowOf` carried.
 //
-// Both fields are OPTIONAL on purpose. A row from a server that never states enablement
-// (an older build, or a fixture modelling one) renders NO switch — the pane only ever
-// shows an enablement the server actually reported, never a guessed one.
+// The field is OPTIONAL on purpose. A row from a server that never states enablement (an
+// older build, or a fixture modelling one) renders NO tick box — the pane only ever shows
+// an enablement the server actually reported, never a guessed one.
+//
+// The corner tick box replaced the old "core" pin: EVERY catalogue entry — the
+// harness-owned core set included — is switchable now, so the frontend reads no
+// pinned-set flag anywhere and never renders an affordance-less row.
 type ToolRowEntry = ToolDescriptor & {
     enabled?: boolean;
-    protected?: boolean;
 };
 
 // The complete server catalogue (core entries included) for the global tools view —
@@ -7730,9 +7733,9 @@ const toolTabButtons = new Map<string, HTMLButtonElement>();
 // One PATCH per name at a time (the same single-flight discipline `loadPlugins` and the
 // settings save follow).
 const togglingTools = new Set<string>();
-// The switch controls, keyed by tool name, so a write repaints its OWN row in place and
-// `paintControls` can lock/unlock exactly that control.
-const toolToggleButtons = new Map<string, HTMLButtonElement>();
+// The corner tick boxes, keyed by tool name, so a write repaints its OWN row in place
+// and a busy pass can lock/unlock exactly that control.
+const toolEnableBoxes = new Map<string, HTMLInputElement>();
 // The tools pane's own live line for enablement writes. `toolsSessionNote` belongs to the
 // playground note, and the head note belongs to the count — this is the third state the
 // pane has to say ("the switch was refused, and here is the server's sentence").
@@ -7746,7 +7749,7 @@ const toolsTabHead = el('div', 'tools-tab-head');
 const toolsTabHint = el(
     'p',
     'tools-tab-hint',
-    'Every tool the server lists, core tools included. Select one to open its runner. Each row also carries that tool’s switch: clicking it enables or disables the tool for EVERY conversation on this harness server, from the next request onwards, and a run already in flight keeps the tool list it was given. Harness-owned core tools are pinned on and have no switch. Calls execute on the harness server — nothing runs in this browser. This playground is independent of the conversation you have selected: session-bound tools (toolRequest, toolCreate, task, and delegate when the playground harness has subagents) run in a temporary session the playground creates for itself and deletes when this view closes, and every other tool, including the core file and search tools, runs directly.'
+    'Every tool the server lists, core tools included. Select one to open its runner. The tick box in a row’s top-right corner is that tool’s switch: ticked means enabled, unticked means the tool is withheld from agents. The switch applies to EVERY conversation on this harness server, from the next request onwards; a worker lane already running adopts it when next created. It gates agents only: a tool may still call any other tool, enabled or not, and the request being served keeps the tool list it was given. Tools created with toolCreate are enabled at once and have no switch of their own. Calls execute on the harness server — nothing runs in this browser. This playground is independent of the conversation you have selected: session-bound tools (toolRequest, toolCreate, tasks, and delegate when the playground harness has subagents) run in a temporary session the playground creates for itself and deletes when this view closes, and every other tool, including the core file and search tools, runs directly.'
 );
 const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
 toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote, toolsTabNote);
@@ -8029,51 +8032,52 @@ toolsToggle.addEventListener('click', () => {
     setToolsView(!showingTools);
 });
 
-// The row's enablement control (R3). A row is one `.tool-tab-row` holding the listing
-// button and, beside it, EITHER a switch OR a pin:
+// The row's enablement control (R1). A row is one `.tool-tab-row` holding the listing
+// button and, in the wrapper's top-right corner, ONE tick box:
 //
-//   - `protected === true` — a harness-owned core entry (toolRequest, toolCreate, task,
-//     delegate). The store answers `enabled: true` for it and its PATCH is a 403
-//     (../server/api.ts `patchTool` → `store.updateToolEnabled`), so the row states the
-//     pin as text and offers NO control. An affordance that can only ever be refused is
-//     worse than a sentence that says why.
-//   - otherwise — a real `role="switch"` button whose `aria-checked` is the server's
-//     `enabled`. One click writes it for EVERY session (`PATCH /tools/{tool_id}`); the
-//     row is repainted from the answer, never from a guess.
+//   - every catalogue entry gets one, harness-owned core tools included — the server
+//     makes every tool switchable and no longer states a pinned set, so there is no
+//     affordance-less row shape left to render (the old "core" pin is gone);
+//   - the box is a real `input[type=checkbox]`, so `checked` IS the state for assistive
+//     tech (no `role`/`aria-checked` to keep honest), and one click writes it for EVERY
+//     session (`PATCH /tools/{tool_id}`); the row is repainted from the answer, never
+//     from a guess.
+//
+// The box is the button's SIBLING and absolutely positioned in the wrapper (see
+// styles.css `.tool-tab-enable`), which is what keeps the two activations apart: a click
+// on the box writes enablement and never opens the runner, and a click anywhere else on
+// the tile opens the runner and never writes.
 //
 // A row that states NO enablement (`enabled === undefined`, an older server or a fixture
-// modelling one) renders NEITHER: inventing a control for a state the server never
-// reported is a lie the reader cannot act on.
-const toolEnablementPinOf = (entry: ToolRowEntry): HTMLSpanElement => {
-    const pin = el('span', 'tool-tab-pin', 'core');
-
-    pin.title = `${entry.name} is a harness-owned core tool: always enabled, and it cannot be switched off.`;
-
-    return pin;
-};
-
-// The switch itself. The visible word is the STATE (`on`/`off`), the accessible name is
-// the ACTION, and `aria-checked` carries the state for assistive tech — three readings of
-// one figure, never a colour-only signal.
-const toolToggleControlOf = (entry: ToolRowEntry): HTMLButtonElement => {
+// modelling one) renders NEITHER control nor state attribute: inventing a tick for a
+// state the server never reported is a lie the reader cannot act on.
+//
+// The box itself. The accessible name is the ACTION (`Enable`/`Disable` + the tool name),
+// `checked` carries the state, and the tile's green wash is painted from the same figure
+// by `paintToolRowEnablement` — three readings of one state, never a colour-only signal.
+const toolEnableCheckboxOf = (entry: ToolRowEntry): HTMLInputElement => {
     const enabled = entry.enabled === true;
-    const control = el('button', enabled ? 'tool-tab-toggle is-on' : 'tool-tab-toggle is-off', enabled ? 'on' : 'off');
+    const control = el('input', enabled ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off');
 
-    control.type = 'button';
+    control.type = 'checkbox';
+    // The native state, not an ARIA mirror: assistive tech, the keyboard and the CSS all
+    // read this one figure.
+    control.checked = enabled;
     control.dataset.tool = entry.name;
     control.dataset.enabled = enabled ? 'true' : 'false';
-    control.setAttribute('role', 'switch');
-    control.setAttribute('aria-checked', enabled ? 'true' : 'false');
-    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name} for every conversation`);
+    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name}`);
     control.title = enabled
-        ? 'Enabled for every conversation · click to switch this tool off'
-        : 'Switched off for every conversation · click to switch it on';
+        ? 'Enabled for every conversation on this harness server · click to switch this tool off'
+        : 'Disabled for every conversation on this harness server · click to switch it on';
     // R1: a run never locks this control — the only thing that can is its own write
     // (the same rule `paintControls` paints from).
     control.disabled = togglingTools.has(entry.name);
     // The click reads the CACHED row, not the `entry` this node was built from: a
     // successful write replaces the cache, and a second press must invert the figure the
-    // server last reported rather than the one this frame was painted with.
+    // server last reported rather than the one this frame was painted with. The value the
+    // browser just ticked is deliberately ignored — the server's answer is what repaints
+    // it, and the busy pass in `setToolEnabled`'s `finally` pulls the tick back to the
+    // cached figure when the write is refused.
     control.addEventListener('click', () => {
         void setToolEnabled(entry.name, !(toolEntryOf(entry.name)?.enabled ?? false));
     });
@@ -8082,14 +8086,14 @@ const toolToggleControlOf = (entry: ToolRowEntry): HTMLButtonElement => {
 };
 
 // The catalogue row the pane currently holds for one name — the figure every repaint and
-// every click of the switch reads.
+// every click of the tick box reads.
 const toolEntryOf = (name: string): ToolRowEntry | undefined =>
     toolEntries.find((entry) => entry.name === name);
 
-// Repaint ONE row's switch from the row's own enablement figure, in place (no list
-// rebuild, so focus and the dialog's `returnFocus` target survive). Both the control's
-// state and the row button's `data-enabled` figure move together, so the list can never
-// show the switch on and the row dim at the same time.
+// Repaint ONE row's tick box from the row's own enablement figure, in place (no list
+// rebuild, so focus and the dialog's `returnFocus` target survive). The box's `checked`,
+// its `data-enabled` and the tile button's `data-enabled` move together, so the list can
+// never show a tick on a row the server says is off (or the green wash without the tick).
 //
 // The parameter is the ENABLEMENT figure, not a whole row: a `ToolRowView` (what
 // `toolRowOf` maps a PATCH answer into) has no `parameters` field, and this painter reads
@@ -8097,7 +8101,7 @@ const toolEntryOf = (name: string): ToolRowEntry | undefined =>
 type ToolEnablement = { name: string; enabled?: boolean };
 
 const paintToolRowEnablement = (entry: ToolEnablement): void => {
-    const control = toolToggleButtons.get(entry.name);
+    const control = toolEnableBoxes.get(entry.name);
     const button = toolTabButtons.get(entry.name);
 
     if (button !== undefined && entry.enabled !== undefined) {
@@ -8108,25 +8112,38 @@ const paintToolRowEnablement = (entry: ToolEnablement): void => {
 
     const enabled = entry.enabled;
 
-    control.className = enabled ? 'tool-tab-toggle is-on' : 'tool-tab-toggle is-off';
-    control.textContent = enabled ? 'on' : 'off';
+    control.className = enabled ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off';
+    // THE state. A native checkbox carries no `aria-checked` to keep honest, so `checked`
+    // is the single figure assistive tech reads — and it is also what the CSS tick and the
+    // row's green wash follow.
+    control.checked = enabled;
     control.dataset.enabled = enabled ? 'true' : 'false';
-    control.setAttribute('aria-checked', enabled ? 'true' : 'false');
-    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name} for every conversation`);
+    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name}`);
     control.title = enabled
-        ? 'Enabled for every conversation · click to switch this tool off'
-        : 'Switched off for every conversation · click to switch it on';
+        ? 'Enabled for every conversation on this harness server · click to switch this tool off'
+        : 'Disabled for every conversation on this harness server · click to switch it on';
 };
 
-// Lock/unlock one row's switch while ITS OWN write is in flight. This is the only
+// Lock/unlock one row's tick box while ITS OWN write is in flight. This is the only
 // disabled state the control has after R1 removed the run/pending lock.
-const paintToolToggleBusy = (name: string, busy: boolean): void => {
-    const control = toolToggleButtons.get(name);
+//
+// Unlocking also REPAINTS from the cache, which is the revert path: a native checkbox
+// flips itself the instant it is clicked, so a REFUSED write must have its tick pulled
+// back to the figure the server actually holds. The cache only ever moves with a
+// successful answer, so repainting from it is exactly "what the server says".
+const paintToolEnableBusy = (name: string, busy: boolean): void => {
+    const control = toolEnableBoxes.get(name);
 
     if (control === undefined) return;
 
     control.disabled = busy;
     control.setAttribute('aria-busy', busy ? 'true' : 'false');
+
+    if (!busy) {
+        const row = toolEntryOf(name);
+
+        if (row !== undefined) paintToolRowEnablement(row);
+    }
 };
 
 // The pane's one line about a switch write: the server's sentence on a refusal, the
@@ -8146,19 +8163,19 @@ const noteToolsToggleResult = (text: string, failed: boolean): void => {
 const rememberToolRow = (detail: ToolDetail): void => {
     const row = toolRowOf(detail);
     toolEntries = toolEntries.map((entry) =>
-        entry.name === row.name ? { ...entry, enabled: row.enabled, protected: row.protected } : entry
+        entry.name === row.name ? { ...entry, enabled: row.enabled } : entry
     );
 
     const known = toolDetails.get(row.name);
 
     if (known !== undefined) {
-        toolDetails.set(row.name, { ...known, enabled: row.enabled, protected: row.protected });
+        toolDetails.set(row.name, { ...known, enabled: row.enabled });
     }
 
     paintToolRowEnablement(row);
     // The dialog's runner is showing this tool: its availability line is the same figure.
     if (currentTool !== undefined && currentTool.name === row.name) {
-        currentTool = { ...currentTool, enabled: row.enabled, protected: row.protected };
+        currentTool = { ...currentTool, enabled: row.enabled };
     }
 
     // A refused or accepted switch is a fact about the LISTING, and the list is what the
@@ -8168,7 +8185,7 @@ const rememberToolRow = (detail: ToolDetail): void => {
 
 // R3's one global write. Deliberately NOT guarded by `running`/`submitting`: the route
 // is write-anytime (../server/api.ts `patchTool` — no `assertIdleForToolMutation`), and
-// a run already in flight keeps the tool list it was given, so the switch simply takes
+// the request being served keeps the tool list it was given, so the switch simply takes
 // effect on the NEXT request.
 //
 // Single-flight per name (a double press must not send two PATCHes), and every repaint
@@ -8178,7 +8195,7 @@ const setToolEnabled = async (name: string, enabled: boolean): Promise<void> => 
     if (togglingTools.has(name)) return;
 
     togglingTools.add(name);
-    paintToolToggleBusy(name, true);
+    paintToolEnableBusy(name, true);
     // An app-scoped config write: the topbar pill reports the window exactly like the
     // plugin settings save does.
     setStatus('saving', `tool enablement: ${name}`);
@@ -8190,30 +8207,33 @@ const setToolEnabled = async (name: string, enabled: boolean): Promise<void> => 
         noteToolsToggleResult(`${name} is now ${enabled ? 'enabled' : 'disabled'} for every conversation.`, false);
         setStatus('idle');
     } catch (error) {
-        // The server's own sentence (a 403 for a protected name, a 404 for an unknown
-        // one), reported where the reader is looking: the pane's live note plus the pill.
+        // The server's own sentence (a 404 for an unknown name, a 4xx for a write this
+        // server refuses), reported where the reader is looking: the pane's live note
+        // plus the pill. Nothing was written, so the `finally` pass pulls the tick back
+        // to the figure the cache still holds.
         const message = messageOf(error);
 
         noteToolsToggleResult(message, true);
         setStatus('error', `tool enablement: ${message}`);
     } finally {
         togglingTools.delete(name);
-        paintToolToggleBusy(name, false);
+        paintToolEnableBusy(name, false);
     }
 };
 // R1: rows are NEVER disabled by a run — the list stays clickable while a thread
 // streams, and `selectTool` no longer refuses the click.
 //
-// R3: every row carries the tool's GLOBAL enablement switch next to it. The row itself
-// is a `<button>`, so the switch is its SIBLING inside `.tool-tab-row` (a button inside
-// a button is not valid HTML and assistive tech would read one control where there are
-// two). A harness-owned (`protected`) entry has no switch at all: the server answers
-// `enabled: true` for it and refuses the write with 403, so the row states the pin
-// instead of offering an action that can only fail.
+// R1 (this pass): EVERY row carries the tool's global enablement tick box in its
+// top-right corner, harness-owned core entries included — the "core" pin and the
+// pinned-set branch it keyed on are gone, because the server now makes the whole
+// catalogue switchable. The tile itself is a `<button>`, which cannot contain a control, so the
+// box is the button's SIBLING inside `.tool-tab-row` (a button inside a button is not
+// valid HTML and assistive tech would read one control where there are two) and CSS
+// pins it to the corner above the tile.
 const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
     toolsTabList.replaceChildren();
     toolTabButtons.clear();
-    toolToggleButtons.clear();
+    toolEnableBoxes.clear();
 
     let lastGroup = '';
 
@@ -8241,8 +8261,8 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
             ...(unavailable ? ['unconfigured'] : [])
         ].join(' · ');
         if (unavailable) button.dataset.availability = 'unconfigured';
-        // R3: the row states the switch's state too, so the list is readable with the
-        // control off-screen (and `data-enabled` is what styles the off rows).
+        // R1: the tile states the tick box's state too, so the list is readable with the
+        // control off-screen — and `data-enabled='true'` is what paints the green wash.
         if (entry.enabled !== undefined) button.dataset.enabled = entry.enabled ? 'true' : 'false';
 
         button.append(
@@ -8252,17 +8272,13 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
         button.addEventListener('click', () => selectTool(entry, button));
         row.append(button);
 
-        // The enablement affordance: a pin for a harness-owned entry, a switch for
-        // everything else, and NOTHING for a row that never stated an enablement.
+        // The enablement affordance: one corner tick box for EVERY row that states an
+        // enablement (core tools included), and NOTHING for a row that never stated one.
         if (entry.enabled !== undefined) {
-            if (entry.protected === true) {
-                row.append(toolEnablementPinOf(entry));
-            } else {
-                const control = toolToggleControlOf(entry);
+            const control = toolEnableCheckboxOf(entry);
 
-                row.append(control);
-                toolToggleButtons.set(entry.name, control);
-            }
+            row.append(control);
+            toolEnableBoxes.set(entry.name, control);
         }
 
         toolTabButtons.set(entry.name, button);
@@ -8295,9 +8311,9 @@ const toolDetails = new Map<string, ToolRowEntry>();
 
 // Row + identified read, as one descriptor. The row's display facts stay (that is what the list
 // showed and what the click was made on); the schema, availability and session scope come from
-// the detail, because that is the only read that states them. R3: so do `enabled`/`protected` —
-// the identified row is the fresher statement of the switch, and a runner opened from an older
-// page must not offer a switch the server has since moved.
+// the detail, because that is the only read that states them. R3: so does `enabled` — the
+// identified row is the fresher statement of the tick box, and a runner opened from an older
+// page must not describe a switch the server has since moved.
 const toolDescriptorOf = (row: ToolRowEntry, detail: ToolDetail): ToolRowEntry => {
     const merged = toolRowOf(detail);
 
@@ -8307,7 +8323,6 @@ const toolDescriptorOf = (row: ToolRowEntry, detail: ToolDetail): ToolRowEntry =
         sessionBound: merged.sessionBound,
         // R3: the switch's state comes from the read that states it freshest.
         enabled: merged.enabled,
-        protected: merged.protected,
         parameters: (detail.parameters ?? {}) as Record<string, unknown>
     };
 };
@@ -8408,29 +8423,29 @@ let currentPlugin: string | undefined;
 
 // The catalogue rows, keyed by plugin name, so a save repaints its own row; the
 // `values` span is the line that carries the effective settings, and `toggle` is the
-// row's enablement switch (R2) — a SIBLING of the row button inside `.plugin-tab-row`,
-// never a control nested in another control.
+// row's enablement tick box (R2) — a SIBLING of the row button inside `.plugin-tab-row`,
+// absolutely positioned in the wrapper's corner, never a control nested in another.
 const pluginTabButtons = new Map<string, HTMLButtonElement>();
 const pluginRowNodes = new Map<string, {
     button: HTMLButtonElement;
     values: HTMLSpanElement;
-    toggle?: HTMLButtonElement;
+    toggle?: HTMLInputElement;
 }>();
-// R2: the switches, keyed by plugin name, so `paintControls` can lock exactly the one
+// R2: the tick boxes, keyed by plugin name, so `paintControls` can lock exactly the one
 // whose write is in flight (`togglingPlugins`) — and nothing else, ever.
-const pluginToggleButtons = new Map<string, HTMLButtonElement>();
+const pluginEnableBoxes = new Map<string, HTMLInputElement>();
 const togglingPlugins = new Set<string>();
 
 const pluginsPane = el('div', 'pane plugins-pane');
 const pluginsTabHead = el('div', 'plugins-tab-head');
 // R2 (this pass): the copy the old pane carried was WRONG — enablement is no longer
 // "read-only". Every built-in is still auto-scanned (nothing is installed from here),
-// but each row now carries a one-click global switch whose effect the server states:
+// but each row now carries a one-click corner tick box whose effect the server states:
 // every conversation, from its next turn.
 const pluginsTabHint = el(
     'p',
     'plugins-tab-hint',
-    'Auto-scanned · one-click enable/disable. Every plugin this harness server ships is listed here, and each row’s switch turns that plugin on or off for EVERY conversation on this server, from its next turn — the plugin stays loaded and listed either way. The settings a plugin declares are editable in its dialog, and a saved value applies the same way: to every conversation, from its next turn.'
+    'Auto-scanned · tick to enable. Every plugin this harness server ships is listed here, and the tick box in a row’s top-right corner turns that plugin on or off: ticked means enabled, unticked means the plugin’s hooks stop firing. The switch applies to EVERY conversation on this server, from its next turn — the plugin stays loaded and listed either way, and the tools, agents, and commands it contributed stay registered, while the request being served keeps the plugin set it was given. It gates agents only: enabling or disabling a plugin never stops one tool from calling another. The settings a plugin declares are editable in its dialog, and a saved value applies the same way: to every conversation, from its next turn.'
 );
 // The count/error line. `aria-live` carries the load transition to assistive tech
 // because nothing here moves focus.
@@ -8593,40 +8608,44 @@ const paintPluginRow = (plugin: PluginSummary): void => {
     if (nodes.toggle !== undefined) paintPluginToggle(nodes.toggle, plugin);
 };
 
-// Paint one switch from its row. Shared by the list builder and the repaint so the two
+// Paint one tick box from its row. Shared by the list builder and the repaint so the two
 // can never disagree about what "on" looks like, sounds like, or is labelled as.
-const paintPluginToggle = (control: HTMLButtonElement, plugin: PluginSummary): void => {
+const paintPluginToggle = (control: HTMLInputElement, plugin: PluginSummary): void => {
     const enabled = plugin.enabled === true;
 
-    control.className = enabled ? 'plugin-tab-toggle is-on' : 'plugin-tab-toggle is-off';
-    control.textContent = enabled ? 'on' : 'off';
+    control.className = enabled ? 'plugin-tab-enable is-on' : 'plugin-tab-enable is-off';
+    // THE state — a native checkbox has no `aria-checked` to maintain, and `checked` is
+    // also what the row's green wash (`.plugin-tab-button[data-enabled='true']`) follows.
+    control.checked = enabled;
     control.dataset.enabled = enabled ? 'true' : 'false';
-    control.setAttribute('aria-checked', enabled ? 'true' : 'false');
-    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${plugin.title} for every conversation`);
+    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${plugin.title}`);
     control.title = enabled
-        ? `Enabled for every conversation · click to switch ${plugin.name} off`
-        : `Switched off for every conversation · click to switch ${plugin.name} on`;
+        ? `Enabled for every conversation on this server · click to switch ${plugin.name} off`
+        : `Disabled for every conversation on this server · click to switch ${plugin.name} on`;
     // R1: the only lock this control answers to is its OWN in-flight write.
     control.disabled = togglingPlugins.has(plugin.name) || !booted;
 };
 
-// R2's switch. `role="switch"` + `aria-checked` for assistive tech, the visible word for
-// the eye, and the ACTION in the accessible name — the same three readings the tool
-// switch uses, so the two catalogues behave identically.
+// R2's tick box, in the row's top-right corner. A real `input[type=checkbox]`: `checked`
+// is the state for assistive tech, the accessible name is the ACTION, and the tile's wash
+// carries the same figure for the eye — the same three readings the tool rows use, so the
+// two catalogues behave identically. The box is the button's SIBLING and CSS lifts it
+// above the tile, so clicking it writes enablement and never opens the dialog.
 //
 // `PluginSummary.enabled` is the field this paints from. It is a TOP-LEVEL row field,
 // NOT `values.enabled`: `values` carries declared settings only
 // (../shared/harness-api.ts `PluginSummary` and ../server/plugins.ts's own memo), so a
 // plugin that never declares `enabled` has nothing under that key.
-const pluginToggleControlOf = (plugin: PluginSummary): HTMLButtonElement => {
-    const control = el('button', 'plugin-tab-toggle');
+const pluginEnableCheckboxOf = (plugin: PluginSummary): HTMLInputElement => {
+    const control = el('input', 'plugin-tab-enable');
 
-    control.type = 'button';
+    control.type = 'checkbox';
     control.dataset.plugin = plugin.name;
-    control.setAttribute('role', 'switch');
     paintPluginToggle(control, plugin);
     // The click reads the CACHE, so a second press inverts what the server last reported
-    // rather than what this frame was built from.
+    // rather than what this frame was built from. The value the browser just ticked is
+    // ignored on purpose: `paintPluginToggleBusy` repaints the box from the cache when the
+    // write lands (or is refused), so the tick always ends up where the server says.
     control.addEventListener('click', () => {
         const current = pluginRows.find((row) => row.name === plugin.name) ?? plugin;
 
@@ -8636,10 +8655,10 @@ const pluginToggleControlOf = (plugin: PluginSummary): HTMLButtonElement => {
     return control;
 };
 
-// Lock/unlock one row's switch while its own write is in flight (R1 left the rows and
+// Lock/unlock one row's tick box while its own write is in flight (R1 left the rows and
 // the pane untouched — this is the single remaining disabled state).
 const paintPluginToggleBusy = (name: string, busy: boolean): void => {
-    const control = pluginToggleButtons.get(name);
+    const control = pluginEnableBoxes.get(name);
     const row = pluginRows.find((candidate) => candidate.name === name);
 
     if (control === undefined) return;
@@ -8648,7 +8667,9 @@ const paintPluginToggleBusy = (name: string, busy: boolean): void => {
     control.setAttribute('aria-busy', busy ? 'true' : 'false');
 
     // A repaint after the write lands must not re-enable a control whose PATCH is still
-    // out, so the state painter reads the same set the paint pass does.
+    // out, so the state painter reads the same set the paint pass does. This is also the
+    // REVERT path for a refused write: a native checkbox flipped itself on click, and the
+    // cache never moved, so repainting from the row pulls the tick back.
     if (!busy && row !== undefined) paintPluginToggle(control, row);
 };
 
@@ -8707,8 +8728,8 @@ const buildPluginsTab = (): void => {
     pluginsTabList.replaceChildren();
     pluginTabButtons.clear();
     pluginRowNodes.clear();
-    // The switches are rebuilt with the list, so the key set follows the nodes exactly.
-    pluginToggleButtons.clear();
+    // The tick boxes are rebuilt with the list, so the key set follows the nodes exactly.
+    pluginEnableBoxes.clear();
     pluginsTabNote.textContent = pluginsCountNote();
     pluginsRefresh.disabled = pluginsLoading || !booted;
 
@@ -8743,9 +8764,10 @@ const buildPluginsTab = (): void => {
 
     for (const plugin of pluginRows) {
         // R2: the row is a WRAPPER with two siblings — the dialog trigger and the
-        // enablement switch. A `<button>` cannot contain a control, so the nesting that
-        // used to hold the whole row becomes a flex row instead and each control keeps
-        // its own accessible name.
+        // enablement tick box. A `<button>` cannot contain a control, so the nesting that
+        // used to hold the whole row becomes a flex row instead, and CSS pins the box to
+        // the wrapper's top-right corner above the tile. Each control keeps its own
+        // accessible name, and a click on the box can never open the dialog.
         const row = el('div', 'plugin-tab-row');
 
         const button = el('button', 'plugin-tab-button');
@@ -8754,8 +8776,9 @@ const buildPluginsTab = (): void => {
         button.setAttribute('aria-pressed', plugin.name === currentPlugin ? 'true' : 'false');
         button.setAttribute('aria-haspopup', 'dialog');
         button.title = plugin.description ?? plugin.title;
-        // R2: the row states the switch's state on the trigger too (`data-enabled`), so
-        // the list is readable with the control out of view, and CSS can mark off rows.
+        // R2: the row states the tick box's state on the trigger too (`data-enabled`), so
+        // the list is readable with the control out of view — and it is the figure CSS
+        // paints the enabled green wash from.
         button.dataset.enabled = plugin.enabled === true ? 'true' : 'false';
         // The whole row is kept, never truncated away: the description is the part a
         // reader scans, so CSS clamps it to two lines (`.plugin-tab-desc`) and the full
@@ -8786,11 +8809,11 @@ const buildPluginsTab = (): void => {
         // R1: no run/submit lock on the row — the catalogue is clickable while a thread
         // streams, and the dialog's own save handler is single-flight on its own write.
 
-        const toggle = pluginToggleControlOf(plugin);
+        const toggle = pluginEnableCheckboxOf(plugin);
 
         row.append(button, toggle);
         pluginTabButtons.set(plugin.name, button);
-        pluginToggleButtons.set(plugin.name, toggle);
+        pluginEnableBoxes.set(plugin.name, toggle);
         pluginRowNodes.set(plugin.name, { button, values, toggle });
         pluginsTabList.append(row);
     }
@@ -12154,10 +12177,10 @@ const paintControls = (): void => {
     // one opens a modal runner whose call goes straight to the server. Nothing here
     // tears down the transcript, so a run never dims the list.
     //
-    // R3: the row's ENABLEMENT toggle is not painted from run state either; it is
+    // R3: the row's ENABLEMENT tick box is not painted from run state either; it is
     // painted from ITS OWN in-flight write (`togglingTools`), because that is the only
     // race the control can create with itself.
-    for (const [name, control] of toolToggleButtons) {
+    for (const [name, control] of toolEnableBoxes) {
         control.disabled = togglingTools.has(name) || !booted;
     }
 
@@ -12174,9 +12197,9 @@ const paintControls = (): void => {
     // dialled twice (`loadPlugins` is single-flight, and a disabled control says so).
     pluginsRefresh.disabled = pluginsLoading || !booted;
 
-    // R1: plugin rows are always clickable once boot has answered; their toggle is
+    // R1: plugin rows are always clickable once boot has answered; their tick box is
     // locked only while ITS OWN write is in flight (`togglingPlugins`).
-    for (const [name, control] of pluginToggleButtons) {
+    for (const [name, control] of pluginEnableBoxes) {
         control.disabled = togglingPlugins.has(name) || !booted;
     }
 

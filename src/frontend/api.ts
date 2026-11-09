@@ -888,9 +888,9 @@ export const getTool = (name: string): Promise<ToolDetail> =>
 //
 // Write-anytime: the route has no idle gate (a run in flight keeps the tool list it was
 // given, and the next request rebuilds it), so the Tools pane can offer this control
-// while a thread streams. A protected (harness-owned) name is a 403 and an unknown name
-// a 404; `request` flattens both to a `ErrorBody.message` throw, which is the sentence
-// the pane prints.
+// while a thread streams. Every catalogue entry accepts it — the harness-owned core set
+// is switchable too — and an unknown name is a 404; `request` flattens either into an
+// `ErrorBody.message` throw, which is the sentence the pane prints.
 export const updateToolEnabled = (name: string, enabled: boolean): Promise<ToolDetail> =>
     request<ToolDetailResponse>(HARNESS_ROUTES.toolsByToolId(encodeURIComponent(name)), {
         method: 'PATCH',
@@ -1507,12 +1507,12 @@ export const descriptorOf = (card: HarnessCard | HarnessDefinition): HarnessCard
 // A catalogue row as the tools view renders it. `session_bound` is the contract's
 // spelling of "this entry only runs inside a conversation".
 //
-// R3 (the global enablement switch): `enabled` and `protected` are NOT dropped any more —
-// they are the two fields the Tools pane paints its toggle from, and both ride every
-// `GET /tools` row and the identified read (../shared/harness-api.ts `ToolSummary` at
-// :741-752). `protected` is the harness-owned set (toolRequest/toolCreate/task/delegate):
-// the server answers `enabled: true` for it and refuses a switch with 403, so the row
-// renders a pin instead of a control.
+// R3 (the global enablement switch): `enabled` is NOT dropped — it is the figure the
+// Tools pane paints its corner tick box from, and it rides every `GET /tools` row and
+// the identified read (../shared/harness-api.ts `ToolSummary`). The row no longer
+// carries a pinned-set flag: every catalogue entry is switchable now (the
+// harness-owned core set included), so the frontend has no pinned-on branch to paint and
+// reads no such figure.
 export type ToolRowView = {
     name: string;
     group: string;
@@ -1521,7 +1521,6 @@ export type ToolRowView = {
     visibility: 'core' | 'searchable';
     sessionBound: boolean;
     enabled: boolean;
-    protected: boolean;
     availability?: ToolSummary['availability'];
 };
 
@@ -1533,7 +1532,6 @@ export const toolRowOf = (tool: ToolSummary | ToolDetail): ToolRowView => ({
     visibility: tool.visibility,
     sessionBound: tool.session_bound,
     enabled: tool.enabled,
-    protected: tool.protected,
     ...(tool.availability === undefined ? {} : { availability: tool.availability })
 });
 

@@ -322,9 +322,9 @@ export type HarnessPluginSettingsRecord = Record<string, Record<string, number |
 // credentials), so a stored name may legitimately not exist in this build. The store
 // (./tool-settings.ts) keeps it anyway — re-adding the tool in a later release restores
 // the operator's decision — and the runtime simply never consults a name it does not know.
-// Names that belong to the protected control plane are DROPPED by the store on restore
-// (./tool-settings.ts), because no write path can produce them and a hand-edited document
-// must not be able to strand a conversation without its `toolRequest`.
+// Every listed name is honoured on restore, the harness-owned control tools included: the
+// switch applies to the whole catalogue (./tool-settings.ts R5), and this layer validates
+// SHAPE only - it never decides which names are meaningful.
 export type HarnessToolSettingsRecord = {
     disabled?: string[];
 };

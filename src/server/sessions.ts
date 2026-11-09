@@ -1955,11 +1955,10 @@ export class SessionStore {
     }
 
     /**
-     * R3: the runtime's global TOOL switch store - the disabled-name set, the
-     * `protected` answer every row reports, and the LIVE provider every harness in this
-     * store is built with. Reads (`disabled`, `isEnabled`, `snapshot`, `revision`) are
-     * synchronous; writes go through `updateToolEnabled` so the durable commit happens
-     * before the caller answers.
+     * R3: the runtime's global TOOL switch store - the disabled-name set and the LIVE
+     * provider every harness in this store is built with. Reads (`disabled`, `isEnabled`,
+     * `snapshot`, `revision`) are synchronous; writes go through `updateToolEnabled` so the
+     * durable commit happens before the caller answers.
      */
     get toolSettings(): HarnessToolSettingsStore {
         return this.tools;
@@ -1972,9 +1971,10 @@ export class SessionStore {
      * response row reports the state the server now applies, so a client that got a 200 must
      * not be able to restart the process and lose it.
      *
-     * Validation is the store's (`./tool-settings.ts`): a blank name is 400 and a protected
-     * (harness-owned) name is 403, both thrown BEFORE anything mutates, so a refused write
-     * is a no-op. An unknown tool is the ROUTE's 404 - only the route can see the catalogue.
+     * Validation is the store's (`./tool-settings.ts`): a blank name is 400, thrown BEFORE
+     * anything mutates, so a refused write is a no-op. Every listed name is accepted, the
+     * harness-owned control tools included (R5). An unknown tool is the ROUTE's 404 - only
+     * the route can see the catalogue.
      *
      * There is deliberately NO idle gate here, unlike a session's tool switch
      * (`assertIdleForToolMutation` in ./api.ts): this write moves no registration and

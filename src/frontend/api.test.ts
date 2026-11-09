@@ -136,10 +136,11 @@ const card: HarnessCard = {
     definition_revision: 3
 };
 
-// R3: every catalogue row states its GLOBAL enablement (`enabled`) and whether the
-// switch applies to it at all (`protected`, the harness-owned core set). Both are
-// REQUIRED on the wire (../shared/harness-api.ts `ToolSummary`:741-752), and ./api.ts
-// `toolRowOf` maps BOTH through — the row the Tools pane paints its switch from.
+// R3: every catalogue row states its GLOBAL enablement (`enabled`), and ./api.ts
+// `toolRowOf` maps it through — the figure the Tools pane paints its corner tick box
+// from. The row states NO pinned-set flag: every entry is switchable, the harness-owned
+// core set included (../shared/harness-api.ts `ToolSummary` dropped the field together
+// with the server's refusal for a core name), so the client reads nothing but `enabled`.
 const tool: ToolSummary = {
     name: 'read',
     group: 'files',
@@ -147,8 +148,7 @@ const tool: ToolSummary = {
     tags: ['files'],
     visibility: 'core',
     session_bound: false,
-    enabled: true,
-    protected: false
+    enabled: true
 };
 
 const agentRow: AgentSummary = {
@@ -833,10 +833,11 @@ describe('loadBootstrap', () => {
                     tags: ['files'],
                     visibility: 'core',
                     sessionBound: false,
-                    // R3: the enablement pair survives the mapper. Dropping either field
-                    // here would leave the Tools pane with no switch to paint.
-                    enabled: true,
-                    protected: false
+                    // R3: the enablement figure survives the mapper — it is the row the
+                    // Tools pane paints its corner tick box from. The mapped row carries no
+                    // pinned-set figure at all: every entry is switchable, so the frontend
+                    // has no pinned-on branch to paint and the wire states no such field.
+                    enabled: true
                 }
             ],
             // A row carries no instruction TEXT, so the picker's preview stays empty
@@ -936,10 +937,9 @@ describe('tool calls', () => {
         // An enabled=false answer is a real row, not an absence: `enabled` stays a
         // boolean on the mapped row the pane reads.
         expect(updated.enabled).toBe(false);
-        expect(updated.protected).toBe(false);
     });
 
-    it('encodes a tool id like any other path segment, and surfaces a protected refusal', async () => {
+    it('encodes a tool id like any other path segment, and surfaces a refused switch', async () => {
         serve({ 'PATCH /v1/harness/tools/a%2Fb': { tool: { ...tool, name: 'a/b' } } });
 
         const module = await import('./api');
@@ -948,15 +948,16 @@ describe('tool calls', () => {
 
         expect(calls[0].url).toBe('/v1/harness/tools/a%2Fb');
 
-        // A harness-owned name is refused with 403 by the store's own predicate; the
-        // client's job is to hand the pane the server's sentence verbatim.
+        // Every catalogue entry accepts the switch — the harness-owned core set included,
+        // which is why no 403 shape is pinned here. A REFUSED write still reaches the pane
+        // as the server's own sentence, verbatim.
         serve(
-            { 'PATCH /v1/harness/tools/toolRequest': { error: { message: '"toolRequest" is a core tool and cannot be switched off.' } } },
-            { 'PATCH /v1/harness/tools/toolRequest': 403 }
+            { 'PATCH /v1/harness/tools/toolRequest': { error: { message: 'toolRequest is mid-run; try the switch again.' } } },
+            { 'PATCH /v1/harness/tools/toolRequest': 409 }
         );
 
         await expect(module.updateToolEnabled('toolRequest', false)).rejects.toThrow(
-            '"toolRequest" is a core tool and cannot be switched off.'
+            'toolRequest is mid-run; try the switch again.'
         );
     });
 

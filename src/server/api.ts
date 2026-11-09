@@ -234,9 +234,10 @@ import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
 // unknown key / mistyped / out-of-range value). The store itself is reached through
 // `store.pluginSettings`, so this dispatcher never constructs a second one.
 import { HarnessPluginSettingsError } from './plugins';
-// R3: the global tool switch's status-carrying error (403 protected name, 400 blank name),
-// mapped exactly like its plugin sibling below.
-import { HarnessToolSettingsError, isProtectedToolName } from './tool-settings';
+// R3: the global tool switch's status-carrying error (400 blank name), mapped exactly like
+// its plugin sibling below. Every listed tool — core tools included — is switchable, so the
+// store never refuses a name for being harness-owned.
+import { HarnessToolSettingsError } from './tool-settings';
 import type { HarnessIndex, SessionStreamItem, SessionViewStreamItem } from './protocol';
 import { HttpError, capabilityDenied } from './api-errors';
 import { HARNESS_RUNTIME_EPOCH, createHarnessEventHub, resourceKeyOf } from './api-events';
@@ -773,13 +774,12 @@ export const createHarnessApi = ({
     // (./tool-settings.ts, ./sessions.ts `buildHarness`, ../harness.ts).
     const toolSettings = store.toolSettings;
 
-    // The two enablement fields every catalogue row carries, read live at the moment the row
-    // is built. `isProtectedToolName` is the same predicate a session row's `protected`
-    // projection uses (./api-reads.ts), and a protected name's `isEnabled` answers `true` by
-    // construction, so a row can never show the control plane as switched off.
-    const toolEnablementOf = (name: string): { enabled: boolean; protected: boolean } => ({
-        enabled: toolSettings.isEnabled(name),
-        protected: toolSettings.isProtected(name)
+    // The enablement field every catalogue row carries, read live at the moment the row is
+    // built. The switch applies to EVERY listed entry — a harness-owned core tool is
+    // disabled exactly like a catalogue preset (R5) — so a row states one figure and there is
+    // nothing beside it to explain why a write would be refused.
+    const toolEnablementOf = (name: string): { enabled: boolean } => ({
+        enabled: toolSettings.isEnabled(name)
     });
 
     // T19: the global agent overlay, reached THROUGH the registry (its owner). Every agent
@@ -1920,10 +1920,13 @@ export const createHarnessApi = ({
             throw new HttpError(400, '"enabled" must be a boolean (true runs the tool, false disables it for every session).');
         }
 
-        // The protected-name refusal (403) is the STORE's rule — the same predicate its
-        // restore filter and a session row's `protected` field use — thrown before any
-        // mutation, so a refused switch is a no-op. An idempotent write is accepted: the
-        // contract's switches never punish a client for stating the current state.
+        // R5: NO protected-name exception here. A harness-owned core tool takes this write
+        // exactly like a catalogue entry — the switch gates what an AGENT may reach, so
+        // disabling `toolRequest` or `tasks` hides it from every model declaration and
+        // nothing else. The only refusals left are the route's 404 (unknown name, checked
+        // first) and the store's 400 (blank name), both thrown before any mutation, so a
+        // refused switch is a no-op. An idempotent write is accepted: the contract's
+        // switches never punish a client for stating the current state.
         await store.updateToolEnabled(name, body.enabled);
 
         const response: ToolDetailResponse = { tool: toolDetailOf(entry, name, toolEnablementOf(name)) };
@@ -3202,9 +3205,12 @@ export const createHarnessApi = ({
 
         if (row === undefined) throw missing('tool', name, record.id);
 
-        // A `protected` entry is the control plane the session runs on: the switch is not a
+        // A `protected` entry is the control plane THIS session runs on: the switch is not a
         // user-level edit, and the runtime would refuse it anyway (a core declaration is
-        // always in context).
+        // always in context). Note the scope: this is the SESSION-scoped route, whose
+        // `protected` row field is a per-conversation fact (./api-reads.ts
+        // `isCoreToolName` or the frozen definition). The GLOBAL route above has no such
+        // exception — every listed tool is switchable there (R5).
         if (row.protected) {
             throw new HttpError(
                 403,

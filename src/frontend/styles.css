@@ -26,6 +26,14 @@
     --accent: #7aa2ff;
     --accent-soft: rgba(122, 162, 255, 0.12);
     --ok: #4ade80;
+    /* Enabled catalogue tile (Tools + Plugins corner tick box). The tick itself is the
+       native mark painted with `--ok`; the tile it belongs to carries the SAME green only
+       as a WASH composited over the tile's own surface (`--ok-wash` under
+       `--ok-line` for the border). These are background values, never text colours, so an
+       enabled row keeps exactly the foreground contrast of a disabled one — the reader is
+       told "live", not "brighter". */
+    --ok-wash: rgba(74, 222, 128, 0.16);
+    --ok-line: rgba(74, 222, 128, 0.5);
     --danger: #f87171;
     --warn: #fbbf24;
 
@@ -1015,6 +1023,25 @@ body.is-resizing-rail {
     border-color: var(--border-strong);
 }
 
+/* R1: a TICKED row is enabled and the TILE says so — the green wash composited over the
+   tile's own elevated surface plus a green-tinted border. An unticked row keeps the base
+   rules above EXACTLY as they are: the `[data-enabled='false']` dim is gone, because
+   "off" is now the plain look rather than a de-emphasised one. `background-image` is the
+   wash layer and `background-color` stays `--bg-elevated`, so the tile is opaque.
+   `paintToolRowEnablement` moves this attribute and the tick together.
+   Placement matters: this sits BEFORE the `[aria-pressed='true']` rule below, at equal
+   specificity, so the accent border of the row whose runner is open still wins —
+   "selected" and "enabled" stay two readable, separate figures. */
+.tool-tab-button[data-enabled='true'] {
+    border-color: var(--ok-line);
+    background-image: linear-gradient(var(--ok-wash), var(--ok-wash));
+    background-color: var(--bg-elevated);
+}
+
+.tool-tab-button[data-enabled='true']:hover:not(:disabled) {
+    border-color: var(--ok);
+}
+
 .tool-tab-button[aria-pressed='true'] {
     border-color: var(--accent);
     background: var(--accent-soft);
@@ -1040,86 +1067,72 @@ body.is-resizing-rail {
     font-size: 10.5px;
 }
 
-/* --- R3: the row and its GLOBAL enablement switch --------------------------
+/* --- R1: the row and its corner enablement tick box ------------------------
    `.tool-tab-list` used to place the `<button>` itself; a button cannot contain a
-   control, so the row is now a wrapper with two SIBLINGS — the listing button (which
-   opens the runner) and the switch (which writes `PATCH /tools/{tool_id}`). The wrapper
-   is the grid item, so the card grid is unchanged; the button keeps every rule above by
-   simply filling the remaining width.                                                        */
+   control, so the row is a wrapper with two SIBLINGS — the listing button (which opens
+   the runner) and the tick box (which writes `PATCH /tools/{tool_id}`). The box is
+   absolutely positioned in the wrapper's top-right corner, which is why the wrapper is
+   the positioning context. The wrapper is still the grid item, so the card grid is
+   unchanged; the button keeps every rule above by simply filling the whole width.   */
 .tool-tab-row {
     display: flex;
     align-items: stretch;
     gap: 6px;
+    position: relative;
 }
 
 .tool-tab-row .tool-tab-button {
     flex: 1 1 auto;
     min-width: 0;
+    /* Reserve the corner the tick box sits in, so a long tool name never runs under it. */
+    padding-right: 32px;
 }
 
-/* The switch: a small control whose VISIBLE word is the state. `is-on` and `is-off` are
-   painted by main.ts from the server's `enabled`, never from a click handler's guess.
-   Scoped on its own (no selector list with `.tool-tab-pin`) for the same reason the two
-   topbar icons are: restyling one must never move the other. */
-.tool-tab-toggle {
-    flex: 0 0 auto;
-    align-self: center;
-    min-width: 40px;
-    padding: 0 8px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
-    background: var(--bg-input);
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
+/* The corner tick box: a real `input[type=checkbox]`, so `checked` IS the state for
+   assistive tech and the native mark needs no invented glyph. It is the button's
+   SIBLING, lifted above the tile by `z-index`, so a click lands on the box and the
+   tile's own handler (open the runner) never sees it. `accent-color` paints the tick
+   with `--ok`, the same green as the tile wash, so "ticked" and "green tile" are one
+   figure rather than two signals that could drift. The box keeps its NATIVE painting —
+   `color-scheme: dark` on `:root` already gives it a dark-theme surface, and overriding
+   `background`/`border` here would fight `accent-color` in some engines for no gain.
+   Styled per pane (no selector list with `.plugin-tab-enable`) for the same reason the
+   two topbar icons are separate: restyling one catalogue must never move the other. */
+.tool-tab-enable {
+    position: absolute;
+    top: 9px;
+    right: 10px;
+    z-index: 1;
+    width: 17px;
+    height: 17px;
+    margin: 0;
+    border-radius: 4px;
     cursor: pointer;
+    accent-color: var(--ok);
 }
 
-.tool-tab-toggle.is-on {
-    border-color: var(--ok);
-    color: var(--ok);
+/* An unticked box reads muted; a ticked one takes the ok green from the rule above. The
+   checked state also moves the tile (`[data-enabled='true']`), so the two are painted by
+   the same pass and cannot disagree about which rows are live. */
+.tool-tab-enable.is-off {
+    accent-color: var(--muted);
 }
 
-.tool-tab-toggle.is-off {
-    border-color: var(--border-strong);
-    color: var(--muted);
+.tool-tab-enable:hover:not(:disabled) {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
 }
 
-.tool-tab-toggle:hover:not(:disabled) {
-    border-color: var(--accent);
+.tool-tab-enable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
-/* A switch that is waiting for its own PATCH. R1 removed every OTHER disabled state
+/* A tick box that is waiting for its own PATCH. R1 removed every OTHER disabled state
    from this control, so this is the only dimming the list ever shows for a control. */
-.tool-tab-toggle:disabled {
+.tool-tab-enable:disabled {
     opacity: 0.55;
     cursor: progress;
-}
-
-/* A disabled tool's card reads as withheld, and `[data-enabled='false']` is the same
-   figure the switch states — the two are painted together by `paintToolRowEnablement`. */
-.tool-tab-button[data-enabled='false'] {
-    opacity: 0.65;
-}
-
-/* The harness-owned set has no switch at all (its PATCH is a 403), so its row carries a
-   static pin instead: the SAME footprint as the control, so the two row shapes line up,
-   and `cursor: help` because the only thing it offers is its explanation. Self-contained
-   (it no longer shares a rule with `.tool-tab-toggle`) for the same reason the topbar
-   icons keep separate blocks. */
-.tool-tab-pin {
-    flex: 0 0 auto;
-    align-self: center;
-    min-width: 40px;
-    padding: 0 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-input);
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-    text-align: center;
-    cursor: help;
 }
 
 /* The pane's enablement line (main.ts `toolsTabNote`): a polite live region, so a
@@ -1208,6 +1221,22 @@ body.is-resizing-rail {
     border-color: var(--border-strong);
 }
 
+/* R2: a TICKED plugin row is enabled and the row carries the same light-green wash the
+   tools pane uses — composited over the row's own `--bg-elevated`, with a green-tinted
+   border. An unticked row keeps the plain look above: the old `[data-enabled='false']`
+   dim is gone, so "off" is the default appearance and not a faded one. Declared BEFORE
+   the `[aria-pressed='true']` rule at equal specificity, so the accent border of the row
+   whose dialog is open still reads as the selected one. */
+.plugin-tab-button[data-enabled='true'] {
+    border-color: var(--ok-line);
+    background-image: linear-gradient(var(--ok-wash), var(--ok-wash));
+    background-color: var(--bg-elevated);
+}
+
+.plugin-tab-button[data-enabled='true']:hover:not(:disabled) {
+    border-color: var(--ok);
+}
+
 .plugin-tab-button[aria-pressed='true'] {
     border-color: var(--accent);
     background: var(--accent-soft);
@@ -1254,65 +1283,68 @@ body.is-resizing-rail {
     color: var(--text);
 }
 
-/* --- R2: the row and its GLOBAL enablement switch --------------------------
-   A `<button>` cannot contain a control, so the row became a wrapper with two
-   SIBLINGS: the listing button (the dialog trigger, everything above styles it) and
-   the switch that writes `PATCH /plugins/{id} { settings: { enabled } }`. The wrapper
-   takes the grid slot, the button takes the remaining width, and the switch is pinned
-   to the right edge where a reader finds a control, not a label.                     */
+/* --- R2: the row and its corner enablement tick box ------------------------
+   A `<button>` cannot contain a control, so the row is a wrapper with two SIBLINGS: the
+   listing button (the dialog trigger, everything above styles it) and the tick box that
+   writes `PATCH /plugins/{id} { settings: { enabled } }`. The wrapper owns the grid slot
+   AND the positioning context, the button takes the whole width, and the box is
+   absolutely positioned over the row's top-right corner — where a reader finds a
+   control, and where it cannot be mistaken for part of the label.                    */
 .plugin-tab-row {
     display: flex;
     align-items: stretch;
     gap: 8px;
+    position: relative;
 }
 
 .plugin-tab-row .plugin-tab-button {
     flex: 1 1 auto;
     min-width: 0;
+    /* Reserve the corner the tick box sits in, so the clamped description never runs
+       under the control. */
+    padding-right: 34px;
 }
 
-/* The visible word is the STATE; `aria-checked` and the accessible name carry the same
-   figure for assistive tech (main.ts `paintPluginToggle` paints all three together). */
-.plugin-tab-toggle {
-    flex: 0 0 auto;
-    align-self: center;
-    min-width: 44px;
-    padding: 0 9px;
+/* A real checkbox: `checked` is the state for assistive tech, `accent-color` paints the
+   native mark with `--ok`, and `z-index` lifts it above the tile so a click on the box
+   never opens the plugin dialog. `paintPluginToggle` moves `checked`, `data-enabled` and
+   the tile's wash together — the three readings of one figure (main.ts). */
+.plugin-tab-enable {
+    position: absolute;
+    top: 11px;
+    right: 12px;
+    z-index: 1;
+    width: 17px;
+    height: 17px;
+    margin: 0;
     border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
+    border-radius: 4px;
     background: var(--bg-input);
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
     cursor: pointer;
+    accent-color: var(--ok);
 }
 
-.plugin-tab-toggle.is-on {
-    border-color: var(--ok);
-    color: var(--ok);
+/* The unticked box is muted; the ticked one keeps the base rule's `--ok`. Same state
+   vocabulary as the tools pane, written as its OWN block so restyling the plugin rows
+   cannot move the tool rows. */
+.plugin-tab-enable.is-off {
+    accent-color: var(--muted);
 }
 
-.plugin-tab-toggle.is-off {
-    border-color: var(--border-strong);
-    color: var(--muted);
-}
-
-.plugin-tab-toggle:hover:not(:disabled) {
+.plugin-tab-enable:hover:not(:disabled) {
     border-color: var(--accent);
+}
+
+.plugin-tab-enable:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 /* R1: the ONLY disabled state this control has is its own in-flight PATCH. A run in
    flight never dims a plugin row, so this rule is the whole lock. */
-.plugin-tab-toggle:disabled {
+.plugin-tab-enable:disabled {
     opacity: 0.55;
     cursor: progress;
-}
-
-/* A switched-off plugin reads as withheld in the list itself, which is what keeps the
-   state legible when the switch is scrolled out of view. `[data-enabled='false']` and
-   the switch are painted by the same pass, so they cannot disagree. */
-.plugin-tab-button[data-enabled='false'] {
-    opacity: 0.65;
 }
 
 /* The enablement outcome line (main.ts `pluginsTabStatus`). Separate from

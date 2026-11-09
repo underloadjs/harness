@@ -593,29 +593,28 @@ describe('canonical REST contract', () => {
         // `availability` rides a row only when the entry has something to say (an
         // environment-backed tool with a missing credential); item[0] is a core entry, which
         // does state its state. The argument schema NEVER rides a row.
-        // R3: `enabled` and `protected` are part of the closed row, on every page.
+        // R3: `enabled` is part of the closed row, on every page; R5/R6 removed the
+        // `protected` marker, because the switch applies to every entry.
         expect(Object.keys(tools.body.items[0]).sort()).toEqual([
             'availability',
             'description',
             'enabled',
             'group',
             'name',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
         ]);
-        // `enabled` is on by default, and this row is not in the protected control plane
-        // (`CORE_TOOL_NAMES`), so it is a switchable entry (./tool-settings.ts).
+        // `enabled` is on by default, and every row is a switchable entry (./tool-settings.ts).
         expect(tools.body.items[0].enabled).toBe(true);
-        expect(tools.body.items[0].protected).toBe(false);
+        expect(Object.hasOwn(tools.body.items[0], 'protected')).toBe(false);
         expect('parameters' in tools.body.items[0]).toBe(false);
 
         const detail = jsonOf(await call(api, 'GET', `${MOUNT}/tools/${tools.body.items[0].name}`));
 
         expect(detail.status).toBe(200);
         // The detail read is the row PLUS the argument schema and the execution gate, and
-        // the row half now includes R3's `enabled`/`protected`.
+        // the row half now includes R3's `enabled`.
         expect(Object.keys(detail.body.tool).sort()).toEqual([
             'availability',
             'description',
@@ -624,7 +623,6 @@ describe('canonical REST contract', () => {
             'group',
             'name',
             'parameters',
-            'protected',
             'session_bound',
             'tags',
             'visibility'

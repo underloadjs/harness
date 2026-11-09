@@ -59,7 +59,7 @@ const brain = (stream: HarnessStream): ReturnType<typeof agent> =>
     agent({ model: 'test/model', stream });
 
 // Two searchable capabilities, named so the selection order is obvious, plus one CORE
-// capability that must never be affected by a switch the server refuses to make.
+// capability — the switch is a pure deny list, so a core name is switchable like any other.
 const capabilities = {
     read: tool({
         description: 'Read a file.',

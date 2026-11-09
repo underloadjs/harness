@@ -81,11 +81,7 @@ import { previewText } from './turn-projector';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
 import type { CatalogueEntry, HarnessPreset } from './harnesses/types';
 import type { ToolCatalogue } from './harnesses';
-// R3: the protection predicate (`isProtectedToolName`) is imported from ./tool-settings.ts
-// (the module that owns the global switch), which is itself built on `CORE_TOOL_NAMES`
-// from ./harnesses/toolbox — one definition for the session `protected` projection, the
-// global row's `protected` field, and the 403 a global disable of a control tool earns.
-import { isProtectedToolName } from './tool-settings';
+import { CORE_TOOL_NAMES } from './harnesses/toolbox';
 // T19: the global agent overlay type (the one authority behind `has_global_override`,
 // `instruction_source: 'global'`, and a roster row's provenance).
 import type { AgentState } from './harnesses/agent-state';
@@ -105,11 +101,13 @@ export const THREAD_PREVIEW_CHARS = 160;
 /** `TurnResource.prompt` is the verbatim task text, which THAT route is allowed to carry. */
 export const TURN_PROMPT_PREVIEW_CHARS = 320;
 
-// The four harness-owned control tools plus `delegate`/`threadSend` are the entries a
-// session can never un-register or switch off; `CORE_TOOL_NAMES` is the shipped set.
-// R3: the predicate is IMPORTED from ./tool-settings.ts (the module that owns the global
-// switch), so the session-scoped `protected` projection, the global row's `protected`
-// field, and the 403 the global PATCH refuses are one rule with one definition.
+// The shipped harness-owned control tools (`toolRequest`, `tasks`, ...). This is the ONLY
+// remaining use of that list on the read side, and it is a SESSION fact, not a global one:
+// it decides which live registry entries a conversation can neither un-register nor switch
+// off (./api.ts `setSessionToolEnabled` / `deleteSessionTool` read the row's `protected`
+// field), and which entries have no standalone implementation (the execution gate below).
+// The GLOBAL deployment switch (./tool-settings.ts) no longer consults it: every listed
+// name is switchable there.
 
 // ---------------------------------------------------------------------------
 // Context
@@ -805,6 +803,15 @@ export const commandRowsOf = (record: SessionRecord): CommandDescriptor[] => {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether a name is one of the harness-owned control tools the runtime ships (`toolRequest`,
+ * `tasks`, ...). SESSION semantics only: it is half of a session row's `protected` field (the
+ * entry a conversation can neither un-register nor switch off) and it decides the execution
+ * gate below. The GLOBAL deployment switch does not consult it — every listed tool is
+ * switchable there (./tool-settings.ts).
+ */
+const isCoreToolName = (name: string): boolean => CORE_TOOL_NAMES.includes(name);
+
+/**
  * Every live registry entry as a session row.
  *
  * The state a catalogue row CANNOT state comes from the running harness:
@@ -812,9 +819,11 @@ export const commandRowsOf = (record: SessionRecord): CommandDescriptor[] => {
  *   - `enabled`   - the live enabled set (`harness.discoveredTools`);
  *   - `origin`    - `created` when a source revision is installed, `discovered` when the
  *                   enabled set contains a non-declared name, `catalogue` otherwise;
- *   - `protected` - a harness-owned control tool (toolRegistry/toolRequest/toolCreate/
- *                   task/delegate/threadSend), which a session can neither drop nor switch
- *                   off, so the write routes refuse it with 403;
+ *   - `protected` - a harness-owned control tool (see `isCoreToolName`) or a name this
+ *                   session's frozen definition declares, which that conversation can
+ *                   neither drop nor switch off, so its write routes refuse it with 403.
+ *                   This is a per-conversation fact; the global Tools rows carry no such
+ *                   field, because the deployment-wide switch applies to every name;
  *   - `source_*`  - the installed source revision, which is what makes the source route
  *                   worth calling.
  */
@@ -841,7 +850,7 @@ export const sessionToolRowsOf = (record: SessionRecord, context: ReadContext): 
             // `created` is what this session registered; `discovered` is a catalogue tool the
             // run enabled through `toolRequest`; `catalogue` is everything else.
             origin: created.has(name) ? 'created' : !isDeclared && isEnabled ? 'discovered' : 'catalogue',
-            protected: isProtectedToolName(name) || isDeclared,
+            protected: isCoreToolName(name) || isDeclared,
             source_available: source !== undefined,
             ...(source === undefined ? {} : { source_revision: source.revision })
         };
@@ -919,7 +928,9 @@ const toolDetailsOf = (
 
 /** How one entry may be called over HTTP, stated rather than inferred by the client. */
 export const toolExecutionScopeOf = (name: string): ToolExecutionScope => ({
-    scope: isProtectedToolName(name) ? 'session_required' : 'session_only',
+    // A harness-owned control tool has no standalone implementation, so the session route
+    // is the only one that can run it.
+    scope: isCoreToolName(name) ? 'session_required' : 'session_only',
     // Manual execution is the documented session surface for every live entry.
     manual: true
 });
@@ -1199,24 +1210,20 @@ export const instructionTextOf = (
  * A catalogue row. `session_bound` is the entry's own flag (the harness-owned control
  * tools have no standalone implementation), projected snake_case.
  *
- * R3 — `enablement` is the pair a Tools pane switches on, and the CALLER decides both
- * halves because only the caller can see the live state:
- *   - `enabled`   - the deployment's global switch (./tool-settings.ts `isEnabled`, read
- *                   per row so a row reflects a click that happened after this request
- *                   started);
- *   - `protected` - the entry is harness-owned, so the switch does not apply to it and the
- *                   write route refuses it with 403.
- * Both DEFAULT to "on, and switchable" — the state of a deployment with no global store
- * consulted, and what a caller that does not care (a session row, which states its OWN
- * `enabled`/`protected` after this spread) gets. A protected row's caller passes
- * `enabled: true` (the store's `isEnabled` already answers that way), so the two fields
- * can never contradict each other on the wire.
+ * R3 — `enablement` is the state a Tools pane switches on, and the CALLER decides it
+ * because only the caller can see the live deployment:
+ *   - `enabled` - the global switch (./tool-settings.ts `isEnabled`, read per row so a row
+ *                 reflects a click that happened after this request started).
+ * It DEFAULTS to "on" — the state of a deployment with no global store consulted, and what
+ * a caller that does not care (a session row, which states its OWN `enabled` after this
+ * spread) gets. There is no `protected` field on a catalogue row: the global switch applies
+ * to EVERY listed entry, core tools included (R5), so a row has nothing to withhold.
  */
 export const toolSummaryOf = (
     entry: CatalogueEntry | undefined,
     name: string,
     liveDescription?: string,
-    enablement?: { enabled: boolean; protected: boolean }
+    enablement?: { enabled: boolean }
 ): ToolSummary => ({
     name,
     group: entry?.group ?? 'Created tools',
@@ -1235,15 +1242,14 @@ export const toolSummaryOf = (
               }
           }),
     session_bound: entry?.sessionBound === true,
-    enabled: enablement?.enabled ?? true,
-    protected: enablement?.protected ?? isProtectedToolName(name)
+    enabled: enablement?.enabled ?? true
 });
 
 /** A catalogue entry plus the schema and the execution gate only the detail read carries. */
 export const toolDetailOf = (
     entry: CatalogueEntry | undefined,
     name: string,
-    enablement?: { enabled: boolean; protected: boolean }
+    enablement?: { enabled: boolean }
 ): ToolDetail => ({
     ...toolSummaryOf(entry, name, undefined, enablement),
     ...(entry?.parameters === undefined ? {} : { parameters: { ...entry.parameters } }),

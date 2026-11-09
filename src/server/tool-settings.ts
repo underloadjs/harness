@@ -37,15 +37,20 @@
 // Only the model's view changes — hidden from declarations, refused at the launch gate
 // with a readable tool result, and answered as `forbidden` by discovery.
 //
-// PROTECTED NAMES
-// ---------------
-// `CORE_TOOL_NAMES` is the control plane a session runs on (the runtime tools plus
-// `delegate`/`threadSend`). Switching it off would strand every conversation, so a
-// protected name is refused with 403 at the write edge, dropped at restore (a
-// hand-edited document cannot smuggle one in), and reported `enabled: true` forever on
-// every read. This is the SAME predicate the session-scoped route already uses
-// (../api-reads.ts `isProtectedToolName`, which imports it from here) and the same rule
-// the runtime enforces through `requireSwitchableTool` (../harness.ts).
+// EVERY NAME IS SWITCHABLE
+// ------------------------
+// There is no protected set. A core tool (`toolRequest`, `tasks`, ...) is disabled here
+// exactly like a catalogue entry: the switch gates what an AGENT may reach, and nothing
+// else. A harness that loses `toolRequest` still answers a host's manual
+// `POST /tools/{name}/executions`, still runs a nested call made by another tool, and can
+// put the name back with one more PATCH — a deny-list entry is a model-visibility decision,
+// not a teardown. The default is ENABLED in every direction: an empty deny list, a restore
+// that honours every stored name (core included), and no write-edge refusal.
+//
+// The session-scoped surface keeps its OWN, unrelated notion of an entry a conversation
+// cannot detach (a harness-owned control tool, or a name its frozen definition declares —
+// ./api-reads.ts `isCoreToolName` plus `declared`). That gate is a property of one live
+// harness's enabled set, not of this deployment-wide switch, and it is unchanged.
 //
 // WORKER MODE (the provider cannot cross; the SET can)
 // ---------------------------------------------------
@@ -77,15 +82,15 @@
 //   - ../harness.ts           — the three consumers of the provider
 //   - ../types/index.ts       — `HarnessToolSettingsProvider`, `HarnessConfiguration.toolSettings`
 
-import { CORE_TOOL_NAMES } from './harnesses/toolbox';
 import type { HarnessToolSettingsProvider } from '../types';
 import type { HarnessToolSettingsRecord } from './persistence';
 
 /**
- * A tool-settings failure with the HTTP status the route should answer: 403 for a
- * protected (harness-owned) name the switch does not apply to, 400 for a blank name. The
- * dispatcher maps it the same way it maps `HarnessPluginSettingsError` (./api.ts). An
- * unknown TOOL is the route's 404 — only the route can see the catalogue.
+ * A tool-settings failure with the HTTP status the route should answer: 400 for a blank
+ * name. The dispatcher maps it the same way it maps `HarnessPluginSettingsError`
+ * (./api.ts). An unknown TOOL is the route's 404 — only the route can see the catalogue.
+ * Every listed name, core tools included, is switchable, so this store never refuses a
+ * name for being harness-owned.
  */
 export class HarnessToolSettingsError extends Error {
     constructor(
@@ -97,12 +102,9 @@ export class HarnessToolSettingsError extends Error {
     }
 }
 
-/** True when a name is part of the harness-owned control plane, and therefore not switchable. */
-export const isProtectedToolName = (name: string): boolean => CORE_TOOL_NAMES.includes(name);
-
 export type HarnessToolSettingsStoreOptions = {
     // The deny list restored from `state.json` (./persistence.ts). Names are not checked
-    // against the catalogue; protected names are dropped (see the header).
+    // against the catalogue, and no name is dropped for being harness-owned (see the header).
     values?: HarnessToolSettingsRecord;
 };
 
@@ -111,12 +113,10 @@ export type HarnessToolSettingsStore = {
     disabled: () => string[];
     /** The provider's question: is this name switched off for this deployment right now? */
     isDisabled: (name: string) => boolean;
-    /** The row-facing answer: a protected name is ALWAYS enabled, whatever a document says. */
+    /** The row-facing answer: a name is off exactly when it is on the deny list. */
     isEnabled: (name: string) => boolean;
-    /** Whether the switch applies to this name at all (protected => never). */
-    isProtected: (name: string) => boolean;
     /**
-     * Validate and apply one switch. Throws `HarnessToolSettingsError` (400/403) BEFORE
+     * Validate and apply one switch. Throws `HarnessToolSettingsError` (400) BEFORE
      * mutating, so a refused write is a no-op. Durability and the revision bump are the
      * store owner's decision (./sessions.ts `updateToolEnabled`).
      */
@@ -143,10 +143,10 @@ export const createToolSettingsStore = (
     const disabledNames = new Set<string>();
 
     // Restore body, shared by the constructor seed and the exposed `restore`. Tolerant by
-    // design: an older build's document may hold a blank entry, a duplicate, or a name this
-    // build no longer ships, and none of those may abort a server boot. A PROTECTED name is
-    // dropped here rather than honoured, so the invariant "the control plane is always on"
-    // survives a hand-edited `state.json` — the write edge cannot produce one.
+    // design: an older build's document may hold a blank entry or a duplicate, or a name
+    // this build no longer ships, and none of those may abort a server boot. Every real
+    // name is HONOURED, core tools included — the switch applies to the whole catalogue,
+    // so a deny list the operator wrote is the state a boot comes back with.
     const applyRestore = (values?: HarnessToolSettingsRecord): void => {
         disabledNames.clear();
 
@@ -157,7 +157,7 @@ export const createToolSettingsStore = (
 
             const name = raw.trim();
 
-            if (name.length === 0 || isProtectedToolName(name)) continue;
+            if (name.length === 0) continue;
 
             disabledNames.add(name);
         }
@@ -182,12 +182,10 @@ export const createToolSettingsStore = (
 
         isDisabled: (name: string) => disabledNames.has(name),
 
-        // A protected name reports `true` even if a stale document listed it (restore drops
-        // those, so this is the second line of the same rule): a row must never show the
-        // control plane as off when the runtime can never switch it off.
-        isEnabled: (name: string) => isProtectedToolName(name) || !disabledNames.has(name),
-
-        isProtected: isProtectedToolName,
+        // A name is off exactly when the operator put it on the deny list. Nothing is off
+        // by construction: the default state is ENABLED, and a restore that listed a core
+        // tool honours it, so this read and the write edge can never disagree.
+        isEnabled: (name: string) => !disabledNames.has(name),
 
         setEnabled: (name: string, enabled: boolean) => {
             if (typeof name !== 'string' || name.trim().length === 0) {
@@ -196,15 +194,9 @@ export const createToolSettingsStore = (
 
             const tool = name.trim();
 
-            if (!enabled && isProtectedToolName(tool)) {
-                throw new HarnessToolSettingsError(
-                    403,
-                    `Tool "${tool}" is harness-owned; it is part of the control plane every session runs on and cannot be disabled.`
-                );
-            }
-
             // An enable is always a plain remove (idempotent: enabling an enabled tool is a
             // no-op write, never an error), and a disable is an insert into the deny list.
+            // A harness-owned name takes either write exactly like any other entry (R5).
             if (enabled) disabledNames.delete(tool);
             else disabledNames.add(tool);
 

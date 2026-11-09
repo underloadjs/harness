@@ -734,7 +734,7 @@ export interface ToolAvailability {
 
 /**
  * One catalogue entry as a list projects it: identity, display group, description, tags, visibility,
- * availability, whether the entry can only run inside a session, and the two enablement fields the Tools pane
+ * availability, whether the entry can only run inside a session, and the enablement field the Tools pane
  * switches on. The argument JSON Schema is on the identified read.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
@@ -747,7 +747,6 @@ export interface ToolSummary {
     availability?: ToolAvailability;
     session_bound: boolean;
     enabled: boolean;
-    protected: boolean;
 }
 
 /**

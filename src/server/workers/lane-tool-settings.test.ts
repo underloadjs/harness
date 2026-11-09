@@ -639,10 +639,10 @@ afterAll(async () => {
 });
 
 describe('R3 lane propagation: a worker lane omits a disabled tool from its request toolset', () => {
-    // `glob` is the name this proves with, and it is chosen for two reasons: it is declared
-    // on EVERY request by the shared toolbox (core visibility, so no discovery round is
-    // needed to make the omission observable), and it is not harness-owned, so the store
-    // accepts the switch at all (`CORE_TOOL_NAMES` would be a 403).
+    // `glob` is the name this proves with for one reason: it is declared on EVERY request by
+    // the shared toolbox (core visibility, so no discovery round is needed to make the
+    // omission observable). A harness-owned name would work too — the store accepts every
+    // switch (R5) — but `glob` keeps this proof about the lane snapshot, not the control plane.
     const DISABLED = 'glob';
 
     // One session, one lane, one model request, built with `disabled` switched off BEFORE the

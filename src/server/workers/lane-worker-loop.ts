@@ -1140,9 +1140,10 @@ export const nestedRunHandshakeLimitations = (refusedTools: readonly string[]): 
 // same thing rather than two shapes.
 //
 // EDGE CASES, all deliberate:
-//   - a protected (harness-owned) name can never appear in the list: the store refuses the
-//     write with 403 and drops one at restore (../tool-settings.ts), so the replica never
-//     sees `toolRequest` switched off;
+//   - the list may name ANY deployment tool, the harness-owned core names included: since
+//     R5 the store accepts every switch, so a replica can absolutely see `toolRequest`
+//     switched off, and it must answer that exactly like the in-process harness does
+//     (../tool-settings.ts is a plain deny list, and this is its snapshot);
 //   - the list is COPIED into a Set, so a caller mutating the array afterwards cannot move
 //     this lane's answer mid-turn (a snapshot that changes under a run is not a snapshot).
 // The worker's OWN read of the two deployment-wide switches, built from the blueprint's

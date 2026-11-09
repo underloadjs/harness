@@ -119,11 +119,10 @@ describe('search catalogue', () => {
                     hint: WEBSEARCH_UNCONFIGURED_HINT
                 },
                 session_bound: false,
-                // R3: every `ToolSummary` row carries the global switch. `search` is
-                // credential-gated, not control-plane-owned, so it is ENABLED and NOT
-                // protected (./tool-settings.ts); "unconfigured" is a different axis.
-                enabled: true,
-                protected: false
+                // R3: every `ToolSummary` row carries the global switch. A row states no
+                // exception (R5/R6): `search` is ENABLED, and "unconfigured" is a different
+                // axis entirely (./tool-settings.ts).
+                enabled: true
             });
 
             // The identified read is the same row PLUS the schema and the execution gate.
@@ -143,10 +142,9 @@ describe('search catalogue', () => {
                     hint: WEBSEARCH_UNCONFIGURED_HINT
                 },
                 session_bound: false,
-                // The identified read is the row PLUS schema/execution, so the R3 pair is
+                // The identified read is the row PLUS schema/execution, so R3's `enabled` is
                 // here as well.
                 enabled: true,
-                protected: false,
                 parameters: WEB_SEARCH_METADATA.parameters,
                 execution: { scope: 'global', manual: false }
             });

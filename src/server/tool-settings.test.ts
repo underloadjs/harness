@@ -5,9 +5,9 @@
 //                  harness is identity-stable (that reference is the live feature).
 //   2. SWITCH    - disable/enable are idempotent plain writes to a deny list, `disabled()`
 //                  and `snapshot()` are sorted, and a blank name is the store's 400.
-//   3. PROTECTED - a harness-owned name can NEVER be disabled: 403 at the write edge,
-//                  dropped at restore, and reported enabled by `isEnabled` either way
-//                  (the same predicate a session row's `protected` field uses).
+//   3. EVERY NAME - R5: there is no protected set. A core tool (`toolRequest`, `tasks`) is
+//                  disabled exactly like a catalogue entry, at the write edge AND on a
+//                  restore, and `isEnabled` answers from the deny list and nothing else.
 //   4. DURABLE   - the snapshot is the whole persisted shape (a deny list, or `{}` when
 //                  nothing is off), and a restored store reads back exactly it.
 //   5. LIVE      - the provider answers a write made AFTER a harness captured it, which is
@@ -18,18 +18,13 @@
 //
 // Cross-references:
 //   - ./tool-settings.ts        — the module under test
-//   - ./harnesses/toolbox.ts    — `CORE_TOOL_NAMES`, the protected set
+//   - ./harnesses/toolbox.ts    — `CORE_TOOL_NAMES`, the set that is now switchable too
 //   - ./persistence.ts          — `HarnessToolSettingsRecord`, the durable shape asserted here
 //   - ../harness.ts             — the provider's three consumers
 import { describe, expect, it } from 'vitest';
 
 import { CORE_TOOL_NAMES } from './harnesses/toolbox';
-import {
-    HarnessToolSettingsError,
-    createToolSettingsStore,
-    isProtectedToolName,
-    toolSettingsProviderOf
-} from './tool-settings';
+import { HarnessToolSettingsError, createToolSettingsStore, toolSettingsProviderOf } from './tool-settings';
 import type { HarnessToolSettingsRecord } from './persistence';
 
 /** One rejected switch, as the message + status the route would answer. */
@@ -145,45 +140,49 @@ describe('tool settings store — a switch', () => {
     });
 });
 
-describe('tool settings store — protected (harness-owned) names', () => {
-    it('refuses to disable any core tool with 403, naming the reason', () => {
+describe('tool settings store — every name is switchable (R5)', () => {
+    it('disables a core tool exactly like a catalogue entry', () => {
         const tools = createToolSettingsStore();
 
         // The shipped control plane, taken from the catalogue rather than retyped here: the
-        // set is `CORE_TOOL_NAMES` (./harnesses/toolbox.ts), the same list a session row's
-        // `protected` field is computed from (./api-reads.ts).
-        expect(CORE_TOOL_NAMES.length).toBeGreaterThan(0);
+        // set is `CORE_TOOL_NAMES` (./harnesses/toolbox.ts). It is no longer an exception —
+        // the switch gates what an AGENT may reach, so a core name goes on the deny list
+        // like any other (there is no `isProtected` question left on the store either).
+        expect(CORE_TOOL_NAMES).toEqual(['toolRequest', 'tasks']);
 
         for (const name of CORE_TOOL_NAMES) {
-            expect(isProtectedToolName(name)).toBe(true);
-
-            expect(failureOf(() => tools.setEnabled(name, false))).toEqual({
-                status: 403,
-                message: `Tool "${name}" is harness-owned; it is part of the control plane every session runs on and cannot be disabled.`
-            });
+            expect(tools.setEnabled(name, false)).toBeUndefined();
+            expect(tools.isDisabled(name)).toBe(true);
+            expect(tools.isEnabled(name)).toBe(false);
         }
 
-        expect(tools.disabled()).toEqual([]);
-        expect(tools.revision()).toBe(0);
+        // One bump per accepted write, and the deny list is the whole stored state.
+        expect(tools.disabled()).toEqual(['tasks', 'toolRequest']);
+        expect(tools.revision()).toBe(2);
+        expect(tools.snapshot()).toEqual({ disabled: ['tasks', 'toolRequest'] });
     });
 
-    it('accepts enabling a protected name, because that is the state it is already in', () => {
+    it('accepts re-enabling a core tool, which is the same write in the other direction', () => {
         const tools = createToolSettingsStore();
 
+        tools.setEnabled(CORE_TOOL_NAMES[0], false);
         tools.setEnabled(CORE_TOOL_NAMES[0], true);
 
         expect(tools.isDisabled(CORE_TOOL_NAMES[0])).toBe(false);
         expect(tools.isEnabled(CORE_TOOL_NAMES[0])).toBe(true);
+        expect(tools.disabled()).toEqual([]);
+        expect(tools.snapshot()).toEqual({});
     });
 
-    it('answers enabled for a protected name even when a hand-edited document listed it', () => {
+    it('honours a core name listed by a hand-edited document instead of dropping it', () => {
         const tools = createToolSettingsStore({ values: { disabled: [CORE_TOOL_NAMES[0], 'write'] } });
 
-        // Restore drops the protected entry and keeps the real one: the invariant "the
-        // control plane is always on" survives a hand-edited `state.json`.
-        expect(tools.disabled()).toEqual(['write']);
-        expect(tools.isEnabled(CORE_TOOL_NAMES[0])).toBe(true);
-        expect(tools.isDisabled(CORE_TOOL_NAMES[0])).toBe(false);
+        // Restore keeps EVERY real name: a deny list the operator wrote (or a file edited by
+        // hand) is the state a boot comes back with, core tools included.
+        expect(tools.disabled()).toEqual(['toolRequest', 'write']);
+        expect(tools.isEnabled(CORE_TOOL_NAMES[0])).toBe(false);
+        expect(tools.isDisabled(CORE_TOOL_NAMES[0])).toBe(true);
+        expect(tools.provider.isToolDisabled(CORE_TOOL_NAMES[0])).toBe(true);
     });
 });
 

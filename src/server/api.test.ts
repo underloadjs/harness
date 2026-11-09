@@ -1123,24 +1123,24 @@ describe('harness catalogue reads', () => {
         expect(page.body.next_cursor).toBeNull();
 
         // A row is the picker shape: description, gate and availability - the argument schema never
-        // rides it, which is the size signal the whole read model exists for. R3 added the two
-        // enablement fields (`enabled`, `protected`) every Tools row now carries.
+        // rides it, which is the size signal the whole read model exists for. R3 added the
+        // `enabled` figure every Tools row carries; R5/R6 added no exception beside it, so a
+        // row states no `protected` flag and every entry is switchable.
         expect(Object.keys(page.body.items[0]).sort()).toEqual([
             'availability',
             'description',
             'enabled',
             'group',
             'name',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
         ]);
         // Nothing has been switched off on this deployment. `toolRegistry` is demoted to a
-        // searchable entry in this build, so the global switch DOES apply to it and the
-        // pair reads `enabled: true, protected: false` (./tool-settings.ts).
+        // searchable entry in this build, and the switch applies to it like every other row
+        // (./tool-settings.ts).
         expect(page.body.items[0].enabled).toBe(true);
-        expect(page.body.items[0].protected).toBe(false);
+        expect(Object.hasOwn(page.body.items[0], 'protected')).toBe(false);
         expect('parameters' in page.body.items[0]).toBe(false);
         expect(page.body.items[0].name).toBe('toolRegistry');
         expect(page.body.items[0].group).toBe('Core tools');
@@ -1168,20 +1168,19 @@ describe('harness catalogue reads', () => {
             hint: WEBSEARCH_UNCONFIGURED_HINT
         });
         // A tool with nothing to add omits `availability` rather than repeating "available",
-        // and still carries the two R3 enablement fields.
+        // and still carries the R3 `enabled` figure.
         expect(Object.keys(rows.get('timeNow')).sort()).toEqual([
             'description',
             'enabled',
             'group',
             'name',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
         ]);
 
         // The detail read is the row PLUS the schema and the execution gate — which
-        // includes R3's `enabled`/`protected`, so the identified read a PATCH answers with
+        // includes R3's `enabled`, so the identified read a PATCH answers with
         // is the same shape a client just read (./tools-api.test.ts pins the write).
         const clock = await call(runtime, 'GET', HARNESS_ROUTES.toolsByToolId('timeNow'));
         expect(clock.status).toBe(200);
@@ -1192,7 +1191,6 @@ describe('harness catalogue reads', () => {
             'group',
             'name',
             'parameters',
-            'protected',
             'session_bound',
             'tags',
             'visibility'
