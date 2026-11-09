@@ -95,6 +95,39 @@ const WORKSPACE_ROOT = findWorkspaceRoot(PACKAGE_ROOT) ?? PACKAGE_ROOT;
 const SCRATCH_ROOT = join(WORKSPACE_ROOT, 'Temp', 'T5');
 
 // ---------------------------------------------------------------------------
+// One scratch database per durability test, under the repo's scratch root
+// (AGENTS.md: throwaway work lives in `Temp/`, never in OS temp). Module-scoped
+// because BOTH durability describes need it — the declared-key round trip and the
+// R2 reserved-`enabled` round trip read and hand-edit the same `state.json`.
+// ---------------------------------------------------------------------------
+
+const roots: string[] = [];
+
+const fixture = async (): Promise<string> => {
+    await mkdir(join(WORKSPACE_ROOT, 'Temp'), { recursive: true });
+    await mkdir(SCRATCH_ROOT, { recursive: true });
+
+    const root = await mkdtemp(join(SCRATCH_ROOT, 'plugins-'));
+
+    roots.push(root);
+
+    return root;
+};
+
+const fileOf = (root: string): string => join(root, 'harness', 'state.json');
+
+const documentOf = (root: string): Record<string, any> =>
+    JSON.parse(readFileSync(fileOf(root), 'utf8')) as Record<string, any>;
+
+const writeDocument = async (root: string, document: unknown): Promise<void> => {
+    await writeFile(fileOf(root), JSON.stringify(document, null, 2), 'utf8');
+};
+
+afterEach(async () => {
+    for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
 // The scripted probe harness
 // ---------------------------------------------------------------------------
 
@@ -300,6 +333,7 @@ describe('GET /v1/harness/plugins', () => {
         expect(Object.keys(page.body.items[0]).sort()).toEqual([
             'builtin',
             'description',
+            'enabled',
             'hooks',
             'name',
             'settings',
@@ -321,6 +355,10 @@ describe('GET /v1/harness/plugins', () => {
             tags: ['background', 'async', 'lifecycle'],
             hooks: ASYNC_PING.hooks,
             builtin: true,
+            // R2: the reserved switch, reported on EVERY row — including async-ping, which
+            // declares no `enabled` setting of its own. Default on, and NOT part of `values`
+            // (that map stays the projection of the DECLARED keys only).
+            enabled: true,
             settings: [
                 {
                     key: 'intervalMs',
@@ -343,6 +381,9 @@ describe('GET /v1/harness/plugins', () => {
             tags: ['context', 'compaction', 'lifecycle'],
             hooks: COMPACTION.hooks,
             builtin: true,
+            // R2: same reserved switch; context-compaction DECLARES this key, so the row
+            // field and `values.enabled` are one stored value read two ways.
+            enabled: true,
             settings: [
                 {
                     key: 'contextLimit',
@@ -902,33 +943,8 @@ describe('the server installs a plugin-diagnostic sink (T1.5 last mile)', () => 
 });
 
 describe('plugin settings survive a restart', () => {
-    // One fixture database per test, under the repo's scratch root (AGENTS.md: throwaway work
-    // lives in `Temp/`, never in OS temp). Removal happens in the local `afterEach`.
-    const roots: string[] = [];
-
-    const fixture = async (): Promise<string> => {
-        await mkdir(join(WORKSPACE_ROOT, 'Temp'), { recursive: true });
-        await mkdir(SCRATCH_ROOT, { recursive: true });
-
-        const root = await mkdtemp(join(SCRATCH_ROOT, 'plugins-'));
-
-        roots.push(root);
-
-        return root;
-    };
-
-    const fileOf = (root: string): string => join(root, 'harness', 'state.json');
-
-    const documentOf = (root: string): Record<string, any> =>
-        JSON.parse(readFileSync(fileOf(root), 'utf8')) as Record<string, any>;
-
-    const writeDocument = async (root: string, document: unknown): Promise<void> => {
-        await writeFile(fileOf(root), JSON.stringify(document, null, 2), 'utf8');
-    };
-
-    afterEach(async () => {
-        for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
-    });
+    // The scratch helpers (`fixture`, `documentOf`, `writeDocument`) and their `afterEach`
+    // are module-scoped now, because the R2 enablement round trip below uses them too.
 
     it('writes only the override to state.json and restores it on the next boot', async () => {
         const root = await fixture();
@@ -1097,5 +1113,214 @@ describe('the boot document advertises the plugin collection', () => {
             sessions: `${MOUNT}/sessions`,
             stream: `${MOUNT}/stream`
         });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — THE GLOBAL PLUGIN SWITCH (the operator's one-click enable/disable)
+//
+// Every assertion below is exact. `async-ping` is the case that does NOT declare an
+// `enabled` setting of its own (the framework's reserved key is the only reason the write
+// is accepted) and `context-compaction` is the case that DOES (its Rule-0 read and the
+// framework gate are one stored value). The scripted probe plugin replaces compaction and
+// records every `turn.before` delivery, which is what makes "the hook stopped" an
+// observation rather than an inference.
+//
+// Cross-references:
+//   - ./plugins.ts                — `PLUGIN_ENABLED_KEY`, `RESERVED_ENABLED_DESCRIPTOR`, `enabled()`
+//   - ../plugin/host.ts           — the gate that turns the stored value into "no delivery"
+//   - ../plugin/hooks.ts          — rule 9, and the `harness.dispose` exemption
+//   - ./api.ts                    — `patchPlugin` / `pluginRowOf`, the route table
+// ---------------------------------------------------------------------------
+
+describe('R2 — the global plugin switch', () => {
+    it('answers 200 with the row switched off for a plugin that never declares the key', async () => {
+        const runtime = createRuntime();
+
+        // On by default, and reported on the row even though async-ping declares no such
+        // setting: the switch belongs to the framework, not to the plugin.
+        const before = await call(runtime, 'GET', `${MOUNT}/plugins`);
+
+        expect(before.status).toBe(200);
+        expect(before.body.items[0]).toMatchObject({ name: 'async-ping', enabled: true });
+        expect(Object.keys(before.body.items[0].values)).toEqual(['intervalMs']);
+
+        const patched = await patchSettings(runtime, 'async-ping', { enabled: false });
+
+        expect(patched.status).toBe(200);
+        expect(patched.body.plugin).toMatchObject({ name: 'async-ping', builtin: true, enabled: false });
+
+        // `values` stays the declared projection: the switch is the row's own field, so a
+        // client that edits `values` never accidentally edits enablement.
+        expect(patched.body.plugin.values).toEqual({ intervalMs: 600000 });
+        expect(patched.body.plugin.settings.map((entry: { key: string }) => entry.key)).toEqual(['intervalMs']);
+
+        // The collection revision is the store's own counter: one bump per accepted write.
+        const after = await call(runtime, 'GET', `${MOUNT}/plugins`);
+
+        expect(after.body.revision).toBe(1);
+        expect(after.body.items[0]).toMatchObject({ name: 'async-ping', enabled: false });
+        expect(after.body.items[1]).toMatchObject({ name: 'context-compaction', enabled: true });
+
+        // A second click turns it back on, and the store keeps no override at its default.
+        const on = await patchSettings(runtime, 'async-ping', { enabled: true });
+
+        expect(on.status).toBe(200);
+        expect(on.body.plugin).toMatchObject({ enabled: true });
+        expect(pluginsOf(runtime).snapshot()).toEqual({ 'async-ping': { enabled: true } });
+
+        // `null` is the documented RESET: the override goes away and the default (true) applies.
+        const reset = await patchSettings(runtime, 'async-ping', { enabled: null });
+
+        expect(reset.status).toBe(200);
+        expect(reset.body.plugin).toMatchObject({ enabled: true });
+        expect(pluginsOf(runtime).snapshot()).toEqual({});
+    });
+
+    it('unifies with a plugin that DECLARES `enabled`: one stored value, read by the row and by the plugin', async () => {
+        const runtime = createRuntime();
+
+        const patched = await patchSettings(runtime, 'context-compaction', { enabled: false });
+
+        expect(patched.status).toBe(200);
+        // The row field and the declared `values` entry are the SAME value: compaction's
+        // own Rule-0 read consults the identical key, so a row can never disagree with
+        // what the running plugin does.
+        expect(patched.body.plugin).toMatchObject({ name: 'context-compaction', enabled: false });
+        expect(patched.body.plugin.values).toMatchObject({ enabled: false });
+        expect(pluginsOf(runtime).provider.get('context-compaction', 'enabled')).toBe(false);
+
+        const page = await call(runtime, 'GET', `${MOUNT}/plugins`);
+
+        expect(page.body.items[1]).toMatchObject({ enabled: false });
+    });
+
+    it('refuses a non-boolean `enabled` with 400 and changes nothing', async () => {
+        const runtime = createRuntime();
+
+        // A number, a string that is not one of the two words the runtime parses, an
+        // object, and an array: every one is a 400 that names the declared type, and none
+        // of them mutates the store.
+        for (const submitted of ['nope', 1, {}, []]) {
+            const refused = await patchSettings(runtime, 'async-ping', { enabled: submitted });
+
+            expect(refused.status).toBe(400);
+            expect(refused.body.error.message).toBe(
+                '"enabled" of plugin "async-ping" must be true or false (it is declared "boolean").'
+            );
+            expect(pluginsOf(runtime).enabled('async-ping')).toBe(true);
+        }
+
+        // A refused write never moved the counter either: the row is exactly as it was.
+        const page = await call(runtime, 'GET', `${MOUNT}/plugins`);
+
+        expect(page.body.revision).toBe(0);
+        expect(page.body.items[0]).toMatchObject({ enabled: true });
+
+        // An unknown plugin is still 404 before any of this, and an unknown FIELD is still 400.
+        expect((await patchSettings(runtime, 'nope-plugin', { enabled: false })).status).toBe(404);
+        expect((await call(runtime, 'PATCH', `${MOUNT}/plugins/async-ping`, { enabled: false })).status).toBe(400);
+    });
+
+    it('stops a LIVE session\'s hook from the next turn, with no rebuild, while the session is running', async () => {
+        const runtime = createRuntime();
+        const sessionId = await createSession(runtime);
+        const record = runtime.store.liveSession(sessionId);
+
+        // Turn 1: the probe plugin's `turn.before` handler runs and records the read.
+        await record.harness('one');
+
+        expect(probeReads).toEqual([100000]);
+
+        // The write lands with a session ALIVE and needs no idle window (R1: the page is
+        // reachable while a thread is running, and this route has no 409 path at all).
+        const patched = await patchSettings(runtime, 'context-compaction', { enabled: false });
+
+        expect(patched.status).toBe(200);
+        expect(runtime.store.liveSession(sessionId).harness).toBe(record.harness);
+
+        // Turn 2: the gate in ../plugin/host.ts consults the live provider, so this
+        // plugin's handler is NOT delivered — and the run still answers normally.
+        const second = await record.harness('two');
+
+        expect(probeReads).toEqual([100000]);
+        expect(second.content).toBe('second');
+
+        // Turn 3 after the click back on: the same registration is live again, with no
+        // re-registration and no new session.
+        await patchSettings(runtime, 'context-compaction', { enabled: true });
+        await record.harness('three');
+
+        expect(probeReads).toEqual([100000, 100000]);
+
+        // `has()` follows the gate too, so an emit site guarded by it skips the payload
+        // construction: a disabled permanent subscriber costs what no subscriber costs.
+        expect(runtime.store.liveSession(sessionId).harness).toBe(record.harness);
+    });
+
+    it('persists the reserved key as the only override and restores it on the next boot', async () => {
+        const root = await fixture();
+        const first = createRuntime({ root });
+
+        await first.store.persistRegistry();
+
+        const clean = documentOf(root);
+
+        expect(Object.hasOwn(clean, 'pluginSettings')).toBe(false);
+
+        const patched = await patchSettings(first, 'async-ping', { enabled: false });
+
+        expect(patched.status).toBe(200);
+
+        const saved = documentOf(root);
+
+        // One key, one plugin, no defaults beside it — and the reserved key is stored exactly
+        // like a declared one, because it IS a normal entry in the same override map.
+        expect(saved.pluginSettings).toEqual({ 'async-ping': { enabled: false } });
+        expect(JSON.stringify(saved)).not.toContain('server-secret');
+
+        const second = createRuntime({ root });
+        const page = await call(second, 'GET', `${MOUNT}/plugins`);
+
+        // Read back before the first answer: a restart does not silently switch the plugin on.
+        expect(second.store.pluginSettings.enabled('async-ping')).toBe(false);
+        expect(second.store.pluginSettings.provider.get('async-ping', 'enabled')).toBe(false);
+        expect(page.body.items[0]).toMatchObject({ name: 'async-ping', enabled: false });
+        expect(page.body.revision).toBe(0);
+
+        // The restored provider is still THE live one: a click after the restart moves it.
+        await patchSettings(second, 'async-ping', { enabled: true });
+
+        expect(documentOf(root).pluginSettings).toEqual({ 'async-ping': { enabled: true } });
+        expect((await call(createRuntime({ root }), 'GET', `${MOUNT}/plugins`)).body.items[0]).toMatchObject({
+            enabled: true
+        });
+    });
+
+    it('survives a hand-edited document the same tolerant way a declared key does', async () => {
+        const root = await fixture();
+        const first = createRuntime({ root });
+
+        // Boot once so the file exists, then hand-edit it the way an operator or a bad
+        // release would.
+        await first.store.persistRegistry();
+
+        const saved = documentOf(root);
+
+        // A mistyped enablement value, and a retired plugin that also names `enabled`:
+        // neither may abort the boot, and the bad entry is simply not restored.
+        saved.pluginSettings = {
+            'async-ping': { enabled: 'maybe' },
+            'retired-plugin': { enabled: false }
+        };
+
+        await writeDocument(root, saved);
+
+        const second = createRuntime({ root });
+        const page = await call(second, 'GET', `${MOUNT}/plugins`);
+
+        expect(page.status).toBe(200);
+        expect(page.body.items[0]).toMatchObject({ name: 'async-ping', enabled: true });
+        expect(second.store.pluginSettings.snapshot()).toEqual({});
     });
 });

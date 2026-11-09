@@ -114,6 +114,39 @@ export type AgentResultContentEntry = {
     content: string;
 };
 
+// A reference whose target produced NOTHING to reuse: it ended non-`done` (a stop,
+// a cancel, a failure), or its turn/conversation disappeared while the requesting
+// turn waited for it. The composer injects this NOTE as the section body instead of
+// result content, in the same delimited block, so the run keeps the full reference
+// context it was accepted with and the assistant can tell the user what happened AND
+// still answer. The server never fails the requesting turn over a dead target: only
+// the target is gone, not the request.
+export type AgentResultNoteEntry = {
+    // The label the user typed / the reference bound — always present, even when the
+    // target block itself is gone (a deleted conversation has no block left to name).
+    label: string;
+    note: string;
+};
+
+// Either kind of section the composer can emit.
+export type AgentResultSection = AgentResultContentEntry | AgentResultNoteEntry;
+
+// Section header marker for a note: it replaces the `agent … | turn …` locator, which
+// is meaningless once there is no block to locate. Exported so tests pin the exact
+// wire prompt without re-typing the literal.
+export const REFERENCED_RESULTS_NO_RESULT_MARKER = 'no result available';
+
+// The note text for a target that reached a terminal status without a result
+// (`cancelled` from a stop, `error` from a failure). `status` is the SERVER's own
+// word for how that turn ended, so the model repeats the truth rather than a guess.
+export const referencedResultUnavailableNote = (label: string, status: string): string =>
+    `#${label} ended as ${status} and left no result to reuse. That part of the request cannot be answered from it: tell the user what happened to #${label}, then answer the rest of the request as normal.`;
+
+// The note text for a target that is simply GONE: its conversation was deleted while
+// this request waited for it (or before it could read the recorded block).
+export const referencedResultDeletedNote = (label: string): string =>
+    `#${label} is gone: its conversation was deleted before it produced a result, so there is no result to reuse. Tell the user that #${label} was deleted, then answer the rest of the request as normal.`;
+
 // Bounds. A submission may reference at most this many blocks; each block's
 // injected content is truncated to the per-block bound; and the WHOLE composed
 // run prompt (raw prompt + wrappers + content + truncation notices) is capped at
@@ -852,10 +885,22 @@ export const boundAgentResultContent = (
     return `${content.slice(0, keep)}${marker}`;
 };
 
+// The locator line above one block's content. Extracted from the composer loop so a
+// note section (which has no locator) and a content section are built in one place.
+const blockSectionStart = (block: AgentResultBlock): string => {
+    const location = block.threadId === undefined ? '' : ` | thread ${block.threadId}`;
+    return `--- #${block.label} | agent ${block.agent} | turn ${block.turnId}${location} ---`;
+};
+
 // Compose the run prompt. The user-facing `prompt` is preserved verbatim at the
 // start; referenced content follows inside delimiters. The TOTAL string is capped
 // at MAX_REFERENCE_TOTAL_CHARS (the same 200k ceiling as a raw prompt), counting
 // the raw prompt, wrappers, separators, content, and truncation notices.
+//
+// A section is either result CONTENT (a `done` block) or a NOTE (a target that ended
+// without a result, or disappeared). Both occupy the same delimited slot and count
+// against the same budget, so a dead reference costs the note's few hundred chars and
+// nothing else changes — the run still sees exactly which `#LABEL` it was asked about.
 //
 // Policy: the user prompt is never trimmed. Reference content is truncated to the
 // remaining budget; when even an empty/truncated section cannot fit, this throws
@@ -863,7 +908,7 @@ export const boundAgentResultContent = (
 // of sending an over-budget prompt or silently dropping a reference.
 export const composeAgentResultPrompt = (
     prompt: string,
-    entries: readonly AgentResultContentEntry[]
+    entries: readonly AgentResultSection[]
 ): string => {
     if (entries.length === 0) return prompt;
 
@@ -877,10 +922,18 @@ export const composeAgentResultPrompt = (
     const sections: string[] = [];
 
     for (let index = 0; index < entries.length; index++) {
-        const { block, content } = entries[index];
-        const location = block.threadId === undefined ? '' : ` | thread ${block.threadId}`;
-        const start = `--- #${block.label} | agent ${block.agent} | turn ${block.turnId}${location} ---`;
-        const end = `--- end #${block.label} ---`;
+        const entry = entries[index];
+
+        // A note entry has no block, so its header carries the label plus the
+        // explicit "no result available" marker; a content entry keeps the full
+        // locator so the model can attribute the text it is reading.
+        const isNote = 'note' in entry;
+        const label = isNote ? entry.label : entry.block.label;
+        const body = isNote ? entry.note : entry.content;
+        const start = isNote
+            ? `--- #${label} | ${REFERENCED_RESULTS_NO_RESULT_MARKER} ---`
+            : blockSectionStart(entry.block);
+        const end = `--- end #${label} ---`;
 
         // Separator before this section (header newline for the first) plus the
         // two newlines that wrap the content and the closing line.
@@ -893,11 +946,11 @@ export const composeAgentResultPrompt = (
         const bounded =
             contentBudget <= 0
                 ? ''
-                : boundAgentResultContent(content, Math.min(contentBudget, MAX_REFERENCE_CONTENT_CHARS));
+                : boundAgentResultContent(body, Math.min(contentBudget, MAX_REFERENCE_CONTENT_CHARS));
 
         // A non-empty block that cannot even carry its truncation notice has no
         // capacity: reject rather than claim a reference that contributed nothing.
-        if (content.length > 0 && bounded.length === 0) {
+        if (body.length > 0 && bounded.length === 0) {
             throw new Error(REFERENCED_RESULTS_BUDGET_MESSAGE);
         }
 

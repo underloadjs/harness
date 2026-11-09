@@ -36,6 +36,17 @@
 //     ../harness.ts), and the server reaches it through `disposeSession` in
 //     ../server/sessions.ts — so this handler is real teardown behaviour, not a guard.
 //
+// HOW ENABLEMENT INTERACTS WITH THE TIMERS (R2)
+// ---------------------------------------------
+// The framework gates this plugin's HOOKS while `enabled` is off, but the handles above
+// are the plugin's own: a heartbeat armed before the switch was flipped would otherwise
+// keep waking the conversation with nobody listening. So `arm` and `tick` re-read the
+// reserved `enabled` key on every decision — a disable costs at most one interval, then
+// the plugin holds no timer and emits no wake; a re-enable arms again on the next
+// `async.pending`. This is also why the key is NOT declared in `metadata.settings`: the
+// framework owns it (../server/plugins.ts, `RESERVED_ENABLED_DESCRIPTOR`) and a generated
+// manifest entry would only give the UI a second control over one stored value.
+//
 // WHY THE SETTING DEFAULT IS 600000
 // ---------------------------------
 // `harness({ wakeIntervalMs })` documents 600000 (10 minutes) as the background-work
@@ -110,6 +121,17 @@ export const setup: NonNullable<HarnessPlugin['setup']> = (api: HarnessPluginApi
     // (which would fire again on its own cadence and double-ping).
     const timers = new Map<string, ReturnType<typeof setTimeout>>();
 
+    // Global enablement (R2). The framework gate already stops this plugin's HOOKS while
+    // it is switched off (../plugin/host.ts, ../plugin/hooks.ts rule 9), but a heartbeat
+    // this plugin armed BEFORE the switch was flipped is a `setTimeout` handle the bus has
+    // no claim on: it would keep firing, keep waking the conversation, and keep re-arming
+    // forever. So the two places that decide to WAKE or to CONTINUE read the same reserved
+    // key, and a disable therefore takes effect within one interval - the tick drops its
+    // own entry and neither wakes nor re-arms, so the plugin is genuinely stopped, not
+    // merely unheard. `harness.dispose` is delivered even while disabled, so a teardown
+    // still clears whatever survived the switch.
+    const isEnabled = (): boolean => api.settings.boolean('enabled', true);
+
     // Resolve the interval at ARM time, not at setup: `api.settings` re-reads the host
     // provider on every call, so a settings change applies to the next ping instead of
     // requiring a restart. `wakeIntervalMs` is the legacy spelling of the same policy
@@ -165,6 +187,14 @@ export const setup: NonNullable<HarnessPlugin['setup']> = (api: HarnessPluginApi
         // An empty/unknown identity cannot address a board — ignore rather than
         // inventing a shared `''` timer that would wake unrelated agents.
         if (agent === undefined || agent.length === 0 || !hasWork) return;
+
+        // Switched off: release the key instead of arming, so a re-enable starts a clean
+        // heartbeat rather than resuming one whose board may have drained meanwhile.
+        if (!isEnabled()) {
+            clear(agent);
+            return;
+        }
+
         if (timers.has(agent)) return;
 
         const intervalMs = intervalOf();
@@ -183,6 +213,11 @@ export const setup: NonNullable<HarnessPlugin['setup']> = (api: HarnessPluginApi
     // `async.drained` → clear()) can never leave a dead handle registered.
     const tick = (agent: string): void => {
         timers.delete(agent);
+
+        // Switched off between ticks: stop here. The entry is already dropped above, so
+        // nothing is re-armed and no `wakeup` is emitted — the conversation is not woken
+        // for a plugin the operator turned off, and no handle is left behind.
+        if (!isEnabled()) return;
 
         // Re-read LIVE: work may have finished between ticks, and a wake would then
         // claim pending calls that no longer exist. This is also the last-resort

@@ -1399,6 +1399,39 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         });
 
     // ------------------------------------------------------------------
+    // R3 — THE GLOBAL TOOL SWITCH
+    // ------------------------------------------------------------------
+    // The host's one provider over the tool NAMES this deployment has switched off. It
+    // is stored BY REFERENCE and called per decision, exactly like the plugin settings
+    // provider above, which is what makes `PATCH /v1/harness/tools/{tool_id}` apply to an
+    // existing session on its next request: `declared()` is rebuilt from live state on
+    // every model turn (see below), so nothing has to be re-registered.
+    //
+    // THREE consumers, one predicate — the same discipline `isToolInScope` already
+    // enforces for a delegation's `scope.tools`, and for the same reason (a discovery
+    // answer that promises what the launch gate refuses makes a model loop):
+    //   - `declared()` (what the model is SHOWN),
+    //   - the launch gate in `launchToolCall` (what a call may EXECUTE), and
+    //   - `requestToolsFor` (what discovery may PROMISE, as an honest `forbidden` entry).
+    // Absent provider (a CLI, a test, an example) => nothing is disabled, byte-identical
+    // to the pre-R3 behaviour.
+    const toolSettings = configuration.toolSettings;
+
+    const isToolGloballyDisabled = (name: string): boolean =>
+        toolSettings !== undefined && toolSettings.isToolDisabled(name) === true;
+
+    // The denial sentence, in ONE place so the launch gate and `toolRequest`'s
+    // `forbidden` report cannot state two different REASONS for one name. Same shape as
+    // the scope refusal beside it; the discovery form adds the loop-breaker clause the
+    // scope entry already carries ("asking again will not change this answer"), because
+    // that is the sentence that stops a model re-searching a tool it cannot get.
+    const globalDisableReason = (name: string): string =>
+        `Tool "${name}" is disabled on this server by the operator.`;
+
+    const globalDisableDiscoveryReason = (name: string): string =>
+        `${globalDisableReason(name)} Requesting it again will not change this answer — adapt to the available tools or report the limitation.`;
+
+    // ------------------------------------------------------------------
     // R3 plugin api: the plugin-agnostic half, built ONCE per harness
     // ------------------------------------------------------------------
     //
@@ -2999,7 +3032,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         parameters: { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown } | unknown,
         // T28: the calling tool call's id, so the pending-only `toolCancel` report is
         // not triggered by the `toolRequest` call that is asking.
-        selfCallId?: string
+        selfCallId?: string,
+        // T11 (RR4 loop): the CALLING RUN's tool allowlist (ToolContext.toolScope — a
+        // delegation's `scope.tools`). Absent means the run is unrestricted and the
+        // result keeps its historical shape byte for byte. When present, matches the
+        // run's scope excludes are answered with an explicit `forbidden` entry instead
+        // of `enabled`, and they are never written to the session-wide enabled set —
+        // the old behaviour told the model a tool it could not call was "enabled",
+        // polluted every sibling thread's discovery state, and livelocked the child.
+        scope?: readonly string[]
     ): unknown => {
         // Tolerate a bare array (a legacy/model call that sends only tags) and
         // non-string members; selectTools performs its own query validation
@@ -3043,8 +3084,36 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // grant, so nothing is enabled and no cap slot is spent.
         const declared = declaredForDiscovery(caller ?? primary, selfCallId);
         const selection = selectTools(catalogue, query, { declared });
-        const narrowed =
-            limit === undefined ? selection.tools : selection.tools.slice(0, limit);
+
+        // T11 SCOPE SPLIT — filter candidate matches with the SAME predicate the
+        // declaration filter and the launch gate use (`isToolInScope`), never a
+        // duplicated rule. In an unscoped run every predicate check passes, so the
+        // partitions below are the historical lists and the result is unchanged.
+        // R3 GLOBAL SWITCH — discovery is the THIRD consumer of one rule (T11's whole
+        // point: an answer that promises what the gate refuses makes the model loop). A
+        // name the operator disabled for everyone is answered exactly like an out-of-scope
+        // one: reported under `forbidden` with its real reason, never under `enabled`, and
+        // — the part that protects every OTHER session — never written into the
+        // session-wide enabled set, so one thread's search cannot quietly re-enable a
+        // globally disabled tool. Scope is reported FIRST because it is the narrower
+        // (per-run) reason, and with no provider wired every check passes exactly as before.
+        const denialOf = (name: string): 'scope' | 'disabled' | undefined => {
+            if (!isToolInScope(name, scope)) return 'scope';
+            if (isToolGloballyDisabled(name)) return 'disabled';
+
+            return undefined;
+        };
+
+        const isPermittedMatch = (match: { name: string }): boolean => denialOf(match.name) === undefined;
+        // Searchable enable candidates: only a permitted match may reach `enableTools`, so
+        // an out-of-scope or globally-disabled name never enters the persistent
+        // (session-wide) enabled set — no cross-thread pollution, and no promise the
+        // launch gate breaks.
+        const permitted = selection.tools.filter(isPermittedMatch);
+        const deniedCapabilities = selection.tools.filter((match) => !isPermittedMatch(match));
+        // `limit` narrows the ENABLE candidates of this query; a denied match is a
+        // denial regardless of where the cut falls, so it is partitioned BEFORE the cut.
+        const narrowed = limit === undefined ? permitted : permitted.slice(0, limit);
 
         // Enabling mutates the persistent set. The newest call's matches lead the
         // capped set; prior entries fill leftover capacity and are evicted only when
@@ -3053,6 +3122,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const enabledResult = enableTools(narrowed.map((match) => match.name));
         const enabledSet = new Set(enabledResult.enabled);
         const returned = narrowed.filter((match) => enabledSet.has(match.name));
+
+        // T11: the same split applies to the `alreadyAvailable` half. A core tool the
+        // agent can see but the RUN's scope hides is NOT callable in this run, so
+        // reporting it as "callable right now" would be the same lie in a different
+        // field — it moves to `forbidden` instead.
+        const coreMatches = selection.alreadyAvailable ?? [];
+        const availableInScope = coreMatches.filter(isPermittedMatch);
+        const deniedCore = coreMatches.filter((match) => !isPermittedMatch(match));
 
         // Vocabulary is only useful when nothing matched; keep the historical
         // "retry with real tags" affordance. Only SEARCHABLE tools contribute:
@@ -3080,17 +3157,48 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             enabled: enabledResult.enabled,
             tools: returned,
             // `matched` is the whole union; `tools`/`enabled` are what the bound
-            // admitted. `omitted` is the exact difference, not an arbitrary cap.
+            // admitted. `omitted` is the exact difference, not an arbitrary cap. In a
+            // scoped run the explicitly-denied searchable matches are reported by name
+            // under `forbidden`, so they are subtracted here and `omitted` keeps its
+            // meaning: matched but neither admitted nor denied (cut by `limit`/bound).
             matched: selection.tools.length,
-            omitted: selection.tools.length - returned.length
+            omitted: selection.tools.length - returned.length - deniedCapabilities.length
         };
 
         if (unmatchedTags.length > 0) result.unmatchedTags = unmatchedTags;
         if (availableTags !== undefined) result.availableTags = availableTags;
-        if (selection.alreadyAvailable !== undefined) {
-            result.alreadyAvailable = selection.alreadyAvailable;
-        }
+        // T11: only the IN-SCOPE core hits stay in `alreadyAvailable` ("you can call
+        // this right now"); out-of-scope hits moved to `forbidden`. An unscoped run
+        // never moves anything, so this reproduces the historical field exactly
+        // (selectTools omits `alreadyAvailable` unless it is non-empty).
+        if (availableInScope.length > 0) result.alreadyAvailable = availableInScope;
         if (enabledResult.evicted.length > 0) result.evicted = enabledResult.evicted;
+
+        // T11 (RR4 loop) — the honest denial. One entry per out-of-scope match, in
+        // selection order (capability denials first, then core denials), each naming
+        // the tool, mirroring the launch gate's sentence ("is outside this run's
+        // scope. Allowed: …") plus the loop-breaker, and carrying the allowed list as
+        // data. Nothing here is stateful: the answer is a pure function of the request
+        // and the run's scope, so a second identical round cannot flip — which is what
+        // lets the model adapt immediately instead of re-requesting forever.
+        if (deniedCapabilities.length > 0 || deniedCore.length > 0) {
+            const allowedLabel = (scope ?? []).join(', ') || 'none';
+
+            // One entry per denied match, with the reason that ACTUALLY denied it: a
+            // per-run scope denial names the allowlist (the model can adapt to it), a
+            // global denial names the operator (the model cannot, so re-asking is
+            // pointless either way). `allowed` keeps its meaning — the run's scope as the
+            // delegation stated it — and is empty for an unscoped run whose only denial is
+            // the global switch.
+            result.forbidden = [...deniedCapabilities, ...deniedCore].map((match) => ({
+                name: match.name,
+                reason:
+                    denialOf(match.name) === 'disabled'
+                        ? globalDisableDiscoveryReason(match.name)
+                        : `Tool "${match.name}" is outside this run's scope. Allowed: ${allowedLabel}. Requesting it again will not change this answer — adapt to the allowed tools or report the limitation.`,
+                allowed: [...(scope ?? [])]
+            }));
+        }
 
         return result;
     };
@@ -4144,6 +4252,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // result, which is the clean denial the finding asked for.
     const isScopeEscapeHatch = (name: string): boolean => name === TOOL_REQUEST;
 
+    // T28 SCOPE + T11 (RR4 loop): THE one "may this run use this tool" predicate, so
+    // the three places that must never disagree share one rule:
+    //   - `declared` below (what the model is SHOWN),
+    //   - the launch gate in `launchToolCall` (what a call may EXECUTE), and
+    //   - `requestToolsFor` (what discovery may PROMISE).
+    // A name is usable when the run is unscoped, when the allowlist names it, or when
+    // it is the escape hatch. T11 is exactly the third consumer: a scoped run's
+    // toolRequest used to answer `enabled: ["shell"]` for a tool the gate then
+    // refused, and the child looped between the two answers.
+    const isToolInScope = (name: string, scope?: readonly string[]): boolean =>
+        scope === undefined || scope.includes(name) || isScopeEscapeHatch(name);
+
     // The tools a request may declare: every core tool first (file tools, a
     // configured search, and the harness-owned set), then everything discovered
     // so far. Everything else stays out of the context window on purpose.
@@ -4165,11 +4285,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T28 SCOPE: a delegation may restrict the child to an explicit allowlist, so a
         // pure-reasoning child cannot reach a file or shell tool. The filter is applied
         // to the DECLARATION here and to the LAUNCH gate below, so a scoped child can
-        // neither see nor call a tool outside its scope.
-        if (scope === undefined) return all;
+        // neither see nor call a tool outside its scope. T11: the shared `isToolInScope`
+        // predicate now also decides `requestToolsFor`, so what discovery reports can
+        // never outrun what this filter declares.
+        //
+        // R3 GLOBAL SWITCH, applied beside that scope filter and for the same reason: what
+        // the model is SHOWN must be what the launch gate will ACCEPT. The provider read
+        // is live, so an operator's `PATCH /v1/harness/tools/{tool_id}` changes this list
+        // on the NEXT request of an existing session with no rebuild and no
+        // re-registration — the tool stays registered the whole time, which is why a
+        // disabled name still answers discovery with `forbidden` rather than silence.
+        //
+        // FAST PATH: with no provider wired (a CLI, an example, most tests) and an
+        // unscoped run, the list is returned as built, exactly as before.
+        if (toolSettings === undefined && scope === undefined) return all;
 
-        const allowed = new Set(scope);
-        return all.filter((definition) => allowed.has(definition.name) || isScopeEscapeHatch(definition.name));
+        const enabled = all.filter((definition) => !isToolGloballyDisabled(definition.name));
+
+        if (scope === undefined) return enabled;
+
+        return enabled.filter((definition) => isToolInScope(definition.name, scope));
     };
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
@@ -6771,10 +6906,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // The ONE exemption is `toolRequest` (see `isScopeEscapeHatch`): the discovery
         // door stays open so a restricted child can report what it needs instead of
         // spinning. Everything else still needs a name in the allowlist.
-        if (run.toolScope !== undefined && !run.toolScope.includes(call.name) && !isScopeEscapeHatch(call.name)) {
+        if (run.toolScope !== undefined && !isToolInScope(call.name, run.toolScope)) {
             await fail(
                 `Tool "${call.name}" is outside this run's scope. Allowed: ${run.toolScope.join(', ') || 'none'}.`
             );
+            return;
+        }
+
+        // R3 GLOBAL SWITCH GATE — the defence-in-depth half of the same rule the
+        // declaration filter above already applies, in exactly the position the scope gate
+        // occupies for the same reason: a model that GUESSES a disabled name (or was told
+        // the name on a request built before the operator clicked) gets a readable tool
+        // RESULT, not a failed run. Checked after the scope gate so an out-of-scope call
+        // keeps reporting its allowlist, the pre-existing answer.
+        //
+        // This is deliberately a per-launch read, not a snapshot: the switch can move
+        // between the request that offered the tool and the call that asks for it, and the
+        // state that matters is the one in force when the call would actually run. A
+        // manual host execution (`harness.executeTool`, and the server's tool-execution
+        // routes) is NOT gated here — an operator who disabled a tool for the MODEL can
+        // still run it themselves, exactly as they can run a tool the session never
+        // discovered.
+        if (isToolGloballyDisabled(call.name)) {
+            await fail(globalDisableReason(call.name));
             return;
         }
 
@@ -6973,13 +7127,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // member refuses whenever it is called (T15, `toolHandleView` above).
                     harness: toolHandleView(),
                     // Nested calls resolve through the live registry at call time and
-                    // inherit this invocation's cancellation/caller/thread/depth.
+                    // inherit this invocation's cancellation/caller/thread/depth — and
+                    // T11: the run's tool scope, so a `toolRequest` reached through a
+                    // nested `callTool` still answers against this run's allowlist.
                     callTool: (name: string, nestedParameters: unknown) =>
                         callToolInternal(name, nestedParameters, {
                             agent: brain,
                             signal,
                             runDepth: run.depth,
-                            ...(run.threadId === undefined ? {} : { threadId: run.threadId })
+                            ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
+                            ...(run.toolScope === undefined ? {} : { toolScope: run.toolScope })
                         }),
                     // Always present now: a background call is always cancelable.
                     signal,
@@ -6989,6 +7146,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // T28: the calling run's scope, so a child run can be identified
                     // unambiguously (a call id is unique only within one run).
                     runScope: run.scope,
+                    // T11 (RR4 loop): the run's tool allowlist (a delegation's
+                    // `scope.tools`), so `toolRequest` reports out-of-scope matches as
+                    // forbidden instead of enabling a tool this run cannot launch.
+                    ...(run.toolScope === undefined ? {} : { toolScope: run.toolScope }),
                     runDepth: run.depth,
                     // T14: the live nested-run policy, so a tool with a real local path takes it
                     // on a lane instead of failing on the refusal (src/harness.ts `refuseNestedRun`
@@ -10707,6 +10868,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(options.agent === undefined ? {} : { agent: options.agent }),
             ...(signal === undefined ? {} : { signal }),
             runDepth: options.runDepth ?? 1,
+            // T11: the caller's tool allowlist when it carries one (a nested
+            // `context.callTool` from a scoped run inherits it; a host `callTool` may
+            // state it explicitly). Absent means unrestricted.
+            ...(options.toolScope === undefined ? {} : { toolScope: options.toolScope }),
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
             ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
@@ -10809,6 +10974,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // harness invocation; delegation and the depth rule see it that
             // way.
             runDepth: 1,
+            // T11: no `toolScope` here is deliberate — a manual host call runs OUTSIDE
+            // any delegation, so it has no run allowlist and discovery answers for the
+            // whole session. A `toolRequest` from `POST /tools/:name` therefore keeps
+            // the historical full-catalogue shape (unrestricted = the R2 baseline).
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
             run: (agentName: string, input: string, options?: { signal?: AbortSignal; tools?: readonly string[] }) => {

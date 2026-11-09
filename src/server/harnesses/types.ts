@@ -12,6 +12,7 @@ import type {
     HarnessPluginSettingsProvider,
     HarnessProgress,
     HarnessStateChangeEvent,
+    HarnessToolSettingsProvider,
     Tool,
     ToolVisibility
 } from '../../harness';
@@ -52,6 +53,20 @@ export type HarnessPresetReport = {
     // rebuild. SessionStore passes one provider for the whole process (../sessions.ts
     // `buildHarness`); the worker lane cannot (see ../plugins.ts, "WORKER MODE").
     pluginSettings?: HarnessPluginSettingsProvider;
+    // R3: the host's LIVE global tool provider (the tool names this deployment has switched
+    // off for every session), forwarded verbatim into
+    // `HarnessConfiguration.toolSettings` by the shared toolbox factory. Same optional-third
+    // -argument discipline as `pluginSettings` above: every existing factory signature and
+    // caller keeps compiling, and a factory that ignores it simply produces a harness with
+    // nothing disabled globally.
+    //
+    // A PROVIDER, never a snapshot, for the same reason: `harness()` keeps the reference and
+    // re-reads it while building each request's tool list (src/harness.ts `declared`), so
+    // `PATCH /v1/harness/tools/{tool_id}` reaches an ALREADY RUNNING session on its next
+    // turn. The store is process-wide (../tool-settings.ts) and `../sessions.ts`
+    // `buildHarness` passes one provider for the whole runtime; the worker lane cannot
+    // (../tool-settings.ts, "WORKER MODE").
+    toolSettings?: HarnessToolSettingsProvider;
     // Plugin diagnostics (pipeline T1.5's last mile). Same optional-third-argument discipline
     // as `stateChange`, `interaction` and `pluginSettings` above, so every existing factory
     // signature and caller keeps compiling and a factory that ignores it simply produces a

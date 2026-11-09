@@ -702,13 +702,18 @@ paths:
       description: >-
         GLOBAL metadata, answerable without constructing a harness. Rows are `ToolSummary`: `name`,
         display `group`, `description`, `tags`, `visibility` (`core` is the harness-owned set,
-        `searchable` is discovery-eligible), `availability`, and `session_bound`. The argument JSON
+        `searchable` is discovery-eligible), `availability`, `session_bound`, and the two enablement
+        fields a Tools pane needs to render a working switch: `enabled` (this deployment runs the tool
+        right now - the GLOBAL switch, resolved live) and `protected` (the entry is part of the
+        harness-owned control plane the runtime is built on, so the switch does not apply to it).
+        A protected row is always `enabled: true`. The argument JSON
         Schema is omitted from a row and lives on the identified read, where a client that is about to
         execute the tool needs it. An unconfigured credential-dependent entry has no runnable
         implementation, so its state is `unconfigured` with the environment VARIABLE NAMES and a
-        non-secret hint - never a value. There is no global write surface: the catalogue is composed at
-        host startup from configuration and credentials, and per-session registration has its own home
-        under `/v1/harness/sessions/{session_id}/tools`.
+        non-secret hint - never a value. The catalogue itself is composed at host startup from
+        configuration and credentials and has no global write surface; the one global write is
+        `PATCH /v1/harness/tools/{tool_id}`, which switches an entry on or off for EVERY session, and
+        per-session registration has its own home under `/v1/harness/sessions/{session_id}/tools`.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -744,9 +749,11 @@ paths:
       summary: Read one catalogue entry with its argument schema
       description: >-
         The identified read adds `parameters` (the JSON Schema the model is given) and `execution` -
-        whether this entry can be executed without a session - to everything a row already carries.
-        A `session_bound` entry has no standalone implementation, and `execution.scope` states that
-        instead of leaving a client to infer it from `group`.
+        whether this entry can be executed without a session - to everything a row already carries,
+        including the enablement fields: `enabled` is this deployment's live global state and
+        `protected` states that the switch does not apply to a harness-owned entry. A `session_bound`
+        entry has no standalone implementation, and `execution.scope` states that instead of leaving a
+        client to infer it from `group`.
       responses:
         '200':
           description: Catalogue entry.
@@ -756,6 +763,61 @@ paths:
                 $ref: '#/components/schemas/ToolDetailResponse'
         '404':
           $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Tools]
+      operationId: updateTool
+      summary: Enable or disable one catalogue entry for every session
+      description: >-
+        GLOBAL write, one field, IMMEDIATE, and WRITE-ANYTIME. A body of `{ "enabled": false }` stops the
+        tool for EVERY session and EVERY thread on this deployment; `{ "enabled": true }` puts it back.
+        It composes with the two per-run gates that already exist rather than replacing them: a name
+        disabled here is hidden from a model's declarations, refused at the launch gate with a readable
+        tool result, and reported as `forbidden` by `toolRequest` - while a delegation's `scope.tools`
+        allowlist and a session's own enabled set keep exactly the rules they have today. Turning a tool
+        back on does not re-enable it by itself for a session whose enabled set had dropped it; discovery
+        re-enables it on the next search, as before.
+        There is NO idle gate on this route (unlike `PATCH /v1/harness/sessions/{session_id}/tools/
+        {tool_id}`, which mutates a live harness and therefore needs the session quiet): the tool stays
+        REGISTERED, only its availability changes, and the change is read live when the next request's
+        tool list is built - so a run in flight is never invalidated and the Tools page is reachable
+        whether or not a thread is running. The write is durable before the response.
+        A `protected` entry - a harness-owned control tool the runtime is built on (`toolRegistry`,
+        `toolRequest`, `task`, ...) - is refused with 403, because switching the control plane off would
+        strand every conversation. An unknown tool is 404, and a body that is not exactly one boolean
+        `enabled` is 400. The response is the whole identified read, so a client sees the row it changed
+        (including `protected`, which is the honest reason a refused row never changes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolSettingsUpdate'
+            examples:
+              disable:
+                summary: Take a searchable tool away from every model
+                value:
+                  enabled: false
+              enable:
+                summary: Put it back
+                value:
+                  enabled: true
+      responses:
+        '200':
+          description: The updated catalogue entry, with the enablement the server now applies.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalError'
   /v1/harness/tools/{tool_id}/executions:
     parameters:
       - $ref: '#/components/parameters/ToolId'
@@ -819,8 +881,11 @@ paths:
         `default`, and the `min`/`max`/`step` editor hints); `values` is the EFFECTIVE value of each declared key
         right now - the stored override when the operator changed it, otherwise the declared default - resolved
         through the same read a plugin performs, so a row can never disagree with what a running session does.
-        Order is the manifest's own and is stable across restarts. Rows carry no enable/disable state: plugin
-        loading is auto-scanned, and this contract exposes no HTTP toggle.
+        Order is the manifest's own and is stable across restarts. `enabled` is R2's GLOBAL switch: the
+        reserved per-plugin `enabled` setting the runtime consults before delivering ANY lifecycle hook to
+        that plugin, in every session. It is reported on every row - including a plugin that declares no
+        settings of its own, because the key is the framework's, not the plugin's - and a row that says
+        `false` means the plugin is loaded and listed but is not running its hooks right now.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -852,19 +917,28 @@ paths:
       operationId: updatePlugin
       summary: Change one built-in plugin's settings
       description: >-
-        GLOBAL write, declarative only, and IMMEDIATE. The runtime holds ONE live settings provider and a plugin's
-        `api.settings` re-reads it on every access, so an accepted patch changes what an EXISTING session reads on
-        its next turn - no rebuild and no new session. (A CPU-isolated lane worker rebuilds its replica from the
-        frozen blueprint it was handed, so a worker lane that is already running picks the new value up the next
-        time its lane is created; every in-process session sees it at once.)
-        Only `settings` is writable, and only the keys the plugin DECLARES: an unknown key is a 400 naming the
-        declared set, a value of the wrong type is a 400 naming the key, and a number outside the declared `min`
-        or `max` is a 400 naming the bound. `step` is an editor hint and is deliberately NOT enforced, because the
-        runtime that has to live with the value accepts it. A `null` value RESETS that key to the plugin's declared
-        default. `builtin` metadata, the declared defaults, and which hooks a plugin subscribes to are never
-        writable over HTTP - the plugin file is the single owner of its own description, and the next release
-        changing a default needs no migration because only overrides are stored. The write is durable before the
-        response. An unknown plugin is 404.
+        GLOBAL write, declarative only, IMMEDIATE, and WRITE-ANYTIME. The runtime holds ONE live settings
+        provider and a plugin's `api.settings` re-reads it on every access, so an accepted patch changes what an
+        EXISTING session reads on its next turn - no rebuild and no new session. (A CPU-isolated lane worker
+        rebuilds its replica from the frozen blueprint it was handed, so a worker lane that is already running
+        picks the new value up the next time its lane is created; every in-process session sees it at once.)
+        There is NO idle gate on this route, unlike a session's tool switch: a settings write moves no
+        registration and removes no schema the model was promised, so the Plugins pane stays usable while a
+        conversation is running and the Plugins page is reachable with a thread in flight.
+        Only `settings` is writable. The accepted keys are the ones the plugin DECLARES plus the framework's
+        reserved `enabled` boolean, which every plugin answers to whether or not it declares one:
+        `{ "settings": { "enabled": false } }` is the one-click global off switch for that plugin's lifecycle
+        hooks, in every session, effective from the next turn, and `{ "settings": { "enabled": null } }` puts it
+        back on the plugin's declared default (`true` unless the plugin says otherwise). Turning a plugin off
+        does NOT unregister its tools, agents or commands and does not remove its row: the row stays listed with
+        `enabled: false`, and the plugin still receives `harness.dispose` so its own cleanup runs. An unknown key
+        is a 400 naming the accepted set, a value of the wrong type is a 400 naming the key, and a number
+        outside the declared `min` or `max` is a 400 naming the bound. `step` is an editor hint and is
+        deliberately NOT enforced, because the runtime that has to live with the value accepts it. A `null` value
+        RESETS that key to the plugin's declared default. `builtin` metadata, the declared defaults, and which
+        hooks a plugin subscribes to are never writable over HTTP - the plugin file is the single owner of its
+        own description, and the next release changing a default needs no migration because only overrides are
+        stored. The write is durable before the response. An unknown plugin is 404.
       requestBody:
         required: true
         content:
@@ -882,6 +956,11 @@ paths:
                 value:
                   settings:
                     contextLimit: null
+              disable:
+                summary: Stop this plugin's hooks in every session, from the next turn
+                value:
+                  settings:
+                    enabled: false
       responses:
         '200':
           description: The updated plugin row, with the effective values it now runs.
@@ -2175,8 +2254,13 @@ paths:
       summary: Delete one conversation
       description: >-
         Removes the conversation, its descendants, and their turns, result references, and transcripts,
-        including the persisted copies. A running or queued conversation is refused with 409 - stop it
-        first - and an agent's default `agent:<name>` conversation is not deletable (400: use reset),
+        including the persisted copies. A conversation is deletable whatever is happening in it: live or queued
+        work - a running turn, a turn parked in a reference wait, an accepted backlog - is stopped and aborted
+        first (the same cascade a stop performs, descendants included) and the aborted rows are awaited, so
+        running work is NOT a 409 - no prior stop is required. The 409s that survive the force are the ones a
+        stop cannot answer for: the runtime still owns the conversation with no server-side turn row to wait on
+        (a tool-started run), a descendant in that state, or an aborted row that refuses to settle within 2
+        seconds. An agent's default `agent:<name>` conversation is not deletable (400: use reset),
         because it is implicit rather than a record. A repeat delete is 404. The receipt names what was
         removed and the resulting session revision; it never echoes the session aggregate.
       responses:
@@ -2207,10 +2291,11 @@ paths:
         because a reference is an edge and not ownership - only `owner_thread_id` lineage is honoured, and a
         conversation this one owns IS stopped and its backlog discarded. The
         thread is left `stopped`, which an explicit later submit to this thread revives.
-        Read the receipt as a report about the CALL, not about what was running: `cancelled` is always true,
-        because this route discards the store's computed "did a live run actually abort" and answers with the
-        fact that the stop was performed - an idle conversation with no work at all still gets `cancelled: true`
-        alongside `status: stopped`, so `false` is a value that never appears here. `dropped_queued_tasks`
+        Read the receipt as a report about what the stop ACTUALLY terminated: `cancelled` is the store's own
+        answer - true when a live run was aborted, a parked reference wait was released, or a queued continuation
+        of this conversation (or one it owns) was dropped, and false when the conversation was idle with nothing
+        queued, which is still a 200 because the stop landed. `status` is the conversation's resulting status
+        read from its roster row, normally `stopped`. `dropped_queued_tasks`
         counts only the named conversation's own lane backlog, measured before the stop began: a descendant's
         backlog and any session-level (legacy) queue this stop also drains are real drops that the number
         leaves out, so treat it as a floor rather than a total. The refusal surface is 400 and 404 only: an
@@ -4577,11 +4662,11 @@ components:
     PluginSummary:
       type: object
       description: >-
-        One built-in plugin as an operator sees it: identity, the lifecycle hooks it declares, its settings
-        descriptors, and the values that are in force right now. `builtin` is always true on this route - the
-        catalogue is the auto-scanned set this build ships - and it stays on the wire so a client renders the
-        same row shape for a plugin a future release makes configurable.
-      required: [name, title, builtin, settings, values]
+        One built-in plugin as an operator sees it: identity, the lifecycle hooks it declares, whether it
+        RUNS right now, its settings descriptors, and the values that are in force right now. `builtin` is
+        always true on this route - the catalogue is the auto-scanned set this build ships - and it stays on
+        the wire so a client renders the same row shape for a plugin a future release makes configurable.
+      required: [name, title, builtin, enabled, settings, values]
       additionalProperties: false
       properties:
         name:
@@ -4607,13 +4692,23 @@ components:
           description: >-
             The lifecycle stages this plugin DECLARES it subscribes to (`turn.before`, `async.pending`, ...).
             Informational by contract: the bus records what setup() actually registered, and this list is the
-            declared description shown to an operator.
+            declared description shown to an operator. A disabled plugin's subscriptions are still listed,
+            because it is still loaded.
           items:
             type: string
             maxLength: 60
         builtin:
           type: boolean
           description: True when the plugin ships with the application (every row on this route).
+        enabled:
+          type: boolean
+          description: >-
+            R2's GLOBAL switch, resolved live as stored override -> the plugin's declared `enabled` default ->
+            true, and therefore present on EVERY row - including a plugin that declares no settings at all,
+            because this key belongs to the framework rather than to the plugin. False means the plugin is
+            loaded, listed, and still receives `harness.dispose`, but NO other lifecycle hook is delivered to
+            it, in any session, from the next turn. It is the same stored value a plugin that declares
+            `enabled` reads itself, so a row and a running session can never disagree.
         settings:
           type: array
           description: >-
@@ -4654,10 +4749,12 @@ components:
     PluginSettingsUpdate:
       type: object
       description: >-
-        Settings patch for one plugin. Each key must be one the plugin declares; a value REPLACES that key's
-        override, an explicit `null` clears it (the declared default applies again), and an omitted key is no
-        change. Unknown keys are refused rather than ignored, so a client is never left believing it edited
-        something. There is no enable/disable field: plugin loading is auto-scanned.
+        Settings patch for one plugin. Each key must be one the plugin declares OR the framework's reserved
+        `enabled` boolean, which every plugin answers to; a value REPLACES that key's override, an explicit
+        `null` clears it (the declared default applies again), and an omitted key is no change. Unknown keys
+        are refused rather than ignored, so a client is never left believing it edited something. Enabling and
+        disabling a plugin is a write on this same body - `{ "settings": { "enabled": false } }` - and it
+        needs no idle window: it takes effect in every session from the next turn.
       minProperties: 1
       additionalProperties: false
       required: [settings]
@@ -4702,9 +4799,9 @@ components:
       type: object
       description: >-
         One catalogue entry as a list projects it: identity, display group, description, tags, visibility,
-        availability, and whether the entry can only run inside a session. The argument JSON Schema is on the
-        identified read.
-      required: [name, group, description, tags, visibility, session_bound]
+        availability, whether the entry can only run inside a session, and the two enablement fields the
+        Tools pane switches on. The argument JSON Schema is on the identified read.
+      required: [name, group, description, tags, visibility, session_bound, enabled, protected]
       additionalProperties: false
       properties:
         name:
@@ -4729,6 +4826,40 @@ components:
           description: >-
             True for a harness-owned entry with no standalone implementation, which must be executed through a
             session's registry.
+        enabled:
+          type: boolean
+          description: >-
+            R3's GLOBAL switch, resolved live as "this name is not on the deployment's disabled list".
+            It applies to every session and every thread at once, and it is what a
+            `PATCH /v1/harness/tools/{tool_id}` body changes. A disabled name is hidden from a model's
+            tool declarations, refused at the launch gate, and answered as `forbidden` by `toolRequest`;
+            the entry stays REGISTERED, so re-enabling costs nothing and needs no restart. It COMPOSES
+            with the per-run gates rather than replacing them: a delegation's `scope.tools` allowlist and
+            a session's own enabled set keep deciding independently, and a name has to pass all three to
+            reach a request. A `protected` row always reports `true`, because the switch does not apply
+            to the control plane the runtime is built on.
+        protected:
+          type: boolean
+          description: >-
+            True when the entry is harness-owned (the runtime control plane plus `delegate`/`threadSend`):
+            the global switch refuses it with 403, exactly as a session refuses enabling or disabling one.
+            Stated on the row so a client renders a disabled control with its real reason instead of
+            discovering it from a 403 after the click.
+    ToolSettingsUpdate:
+      type: object
+      description: >-
+        The one global write a catalogue entry has: switch it on or off for every session. There is no
+        per-session meaning here (that is the session-scoped route's job) and no idle window: the change
+        is read when the next request's tool list is built, so a run in flight keeps running with what
+        it was given.
+      required: [enabled]
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          description: >-
+            The state to apply. `false` adds the name to the deployment's disabled set; `true` removes it.
+            Applying the state it already has is accepted and changes nothing, like every other switch here.
     ToolDetail:
       type: object
       description: >-
@@ -6747,21 +6878,27 @@ components:
       properties:
         cancelled:
           type: boolean
-          enum: [true]
           description: >-
-            ALWAYS true, and it reports the call, not the work: this route performs the stop and answers true
-            whether or not anything was running, discarding the store's own "did a live run actually abort"
-            result. An idle conversation with no queued turn gets the same `true` alongside `status: stopped`, so
-            a client must not read `false` as "nothing to stop" - that value is never sent - and must use the
-            thread row's own status for that.
+            True exactly when this call TERMINATED WORK: it aborted a live run, released a turn parked in a
+            reference wait (its lane had claimed work the runtime had not started yet), or dropped at least one
+            queued continuation - counting the named conversation and every conversation it owns. False when
+            there was nothing in flight and nothing queued: the stop still lands - the row goes `stopped`, the
+            backlog is cleared, its open questions expire - it just terminated no work. This is the store's own
+            answer, relayed verbatim; an earlier contract discarded it and always claimed `true`.
         thread_id:
           type: string
         session_id:
           type: string
         status:
           type: string
-          enum: [stopped]
-          description: The conversation's state after the call, which a later submit to this thread revives.
+          enum: [idle, running, paused, stopped]
+          description: >-
+            The conversation's status AFTER the call, taken from its own runtime thread record - the value the
+            roster list and a stream `thread.upsert` row carry, because both are projections of that same
+            record (and a roster row exists only for a host-origin conversation, so the record is the source
+            in every case). A stop marks the conversation `stopped`, which an explicit later submit revives,
+            and that is what the route reports in practice; the wider vocabulary is stated because the field
+            mirrors the record rather than a constant.
         dropped_queued_tasks:
           type: integer
           minimum: 0

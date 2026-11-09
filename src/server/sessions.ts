@@ -176,9 +176,16 @@ import {
     listAgentResultBlocks,
     MAX_AGENT_REFERENCES,
     parseAgentReferenceLabels,
-    readAgentResultReferenceList
+    readAgentResultReferenceList,
+    referencedResultDeletedNote,
+    referencedResultUnavailableNote
 } from '../shared/agent-results';
-import type { AgentResultBlock, AgentResultReference, AgentResultTurn } from '../shared/agent-results';
+import type {
+    AgentResultBlock,
+    AgentResultReference,
+    AgentResultSection,
+    AgentResultTurn
+} from '../shared/agent-results';
 // T16: the stream contract's resource-kind vocabulary, deep-imported (the shared barrel collides
 // with the server's own names). It is a TYPE-only dependency: the store answers the broker's
 // existence question with the same key the hub and REST stamp revisions under.
@@ -261,6 +268,8 @@ import type { HarnessDatabase, HarnessGlobalSettingsRecord, HarnessInvalidThread
 // state written through the same `state.json` commit as everything else here.
 import { createPluginSettingsStore } from './plugins';
 import type { HarnessPluginSettingsStore, HarnessPluginSettingValues } from './plugins';
+import { createToolSettingsStore } from './tool-settings';
+import type { HarnessToolSettingsStore } from './tool-settings';
 import type {
     CancelThreadResult,
     HarnessDescriptor,
@@ -361,6 +370,18 @@ const ACTION_RUN_ENDED_MESSAGE =
 const ACTION_SESSION_GONE_MESSAGE =
     'The session was removed before the action request was answered.';
 const ACTION_DUPLICATE_MESSAGE = 'An action request with this requestId is already pending.';
+
+// The release text of a reference park that THIS turn's stop interrupted (Fix 1).
+// `executeTurn` classifies the turn from the abort signal itself — `wasCancelled()` —
+// so this string only surfaces if a stop lands while that flag is somehow unset; the
+// turn still ends `cancelled`, never `error`.
+const REFERENCE_WAIT_CANCELLED_MESSAGE = 'The wait for a referenced block was cancelled.';
+
+// How long `deleteThread` lets the work it just aborted unwind before refusing the
+// delete with the F4 atomicity 409 (Fix 2). The wait is event-driven — the drain fan
+// wakes it on every settlement — so the bound only ever decides for a transport that
+// ignores its abort signal and keeps the runtime's run object alive.
+const DELETION_ABORT_SETTLE_MS = 2_000;
 
 /**
  * T16: map an action settlement to the contract's closed `action.closed` reason set
@@ -661,6 +682,15 @@ export type Session = {
     // means this is normally a no-op (prior turns finish first), but the wait is
     // explicit so a reference can never expand partial/still-streaming content.
     turnWaiters: (() => void)[];
+    // Turn ids whose conversation `deleteThread` is purging RIGHT NOW (Fix 2). A
+    // reference waiter parks while its target is queued/running; a forced deletion
+    // makes that row terminal long before the purge removes it, and waking the
+    // waiter in that window would inject a "ended as cancelled" note for a block
+    // that is about to be gone. The mark keeps the waiter parked through the purge,
+    // and `deleteThread` releases it (with a final wake) on EVERY exit — success,
+    // refusal, or rollback — so a waiter can never be stranded. Runtime-only: the
+    // durable record never sees it, because the marked rows themselves are deleted.
+    deletingTurnIds: Set<string>;
     // enqueue()'s per-turn completion resolvers, keyed by turn id. Resolved when
     // the turn reaches a terminal status or is dropped by cancel-all.
     settlers: Map<string, () => void>;
@@ -1020,6 +1050,12 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     ...(turn.references === undefined || turn.references.length === 0
         ? {}
         : { references: turn.references.map((reference) => ({ ...reference })) }),
+    // Gap (c): the labels a deletion took away are copied like every other field — a
+    // snapshot consumer must not be able to rewrite the record through the response it
+    // was handed, and the durable write projects this same copy. Absent otherwise.
+    ...(turn.strippedReferences === undefined || turn.strippedReferences.length === 0
+        ? {}
+        : { strippedReferences: [...turn.strippedReferences] }),
     status: turn.status,
     ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
     updatedAt: turn.updatedAt,
@@ -1483,6 +1519,9 @@ export class SessionStore {
     // a restored process reads exactly what the operator last saved, and `buildHarness` hands
     // every session (fresh or restored) this one object's LIVE provider.
     private readonly plugins: HarnessPluginSettingsStore;
+    // R3: the global tool switch's store — the deny list this process runs with, and the
+    // LIVE provider every harness in this store is built with (./tool-settings.ts).
+    private readonly tools: HarnessToolSettingsStore;
 
     private host?: LaneHost;
 
@@ -1558,6 +1597,15 @@ export class SessionStore {
         // deployment that never touched the Plugins pane stores nothing.
         this.plugins = createPluginSettingsStore({
             ...(options.database === undefined ? {} : { values: options.database.pluginSettings })
+        });
+
+        // R3: the GLOBAL tool switch, seeded from the same document (./persistence.ts
+        // `toolSettings`). One deny list for the process, exposed to every harness as a live
+        // provider, so `PATCH /v1/harness/tools/{tool_id}` applies to a session that is
+        // already running — see ./tool-settings.ts for the full rule and how it composes
+        // with a session's own enabled set and a delegation's `scope.tools`.
+        this.tools = createToolSettingsStore({
+            ...(options.database === undefined ? {} : { values: options.database.toolSettings })
         });
 
         // R3: the runtime is already validated (./config.ts resolveRuntimeConfiguration), and
@@ -1907,6 +1955,45 @@ export class SessionStore {
     }
 
     /**
+     * R3: the runtime's global TOOL switch store - the disabled-name set, the
+     * `protected` answer every row reports, and the LIVE provider every harness in this
+     * store is built with. Reads (`disabled`, `isEnabled`, `snapshot`, `revision`) are
+     * synchronous; writes go through `updateToolEnabled` so the durable commit happens
+     * before the caller answers.
+     */
+    get toolSettings(): HarnessToolSettingsStore {
+        return this.tools;
+    }
+
+    /**
+     * R3: switch one tool on or off for EVERY session (`PATCH /v1/harness/tools/{tool_id}`)
+     * and make the change durable BEFORE the answer - the same commit discipline
+     * `updatePluginSettings` uses one feature earlier, and for the same reason: the route's
+     * response row reports the state the server now applies, so a client that got a 200 must
+     * not be able to restart the process and lose it.
+     *
+     * Validation is the store's (`./tool-settings.ts`): a blank name is 400 and a protected
+     * (harness-owned) name is 403, both thrown BEFORE anything mutates, so a refused write
+     * is a no-op. An unknown tool is the ROUTE's 404 - only the route can see the catalogue.
+     *
+     * There is deliberately NO idle gate here, unlike a session's tool switch
+     * (`assertIdleForToolMutation` in ./api.ts): this write moves no registration and
+     * invalidates no schema a model was promised - it changes what the NEXT request's tool
+     * list is built from (../harness.ts `declared` is rebuilt from live state on every
+     * turn). A run in flight keeps running with what it was given.
+     *
+     * A failed durable write leaves the in-process value applied and reports the 500, the
+     * exact `updatePluginSettings` behaviour: the value is live for every session from the
+     * moment it is applied, so rolling it back on a disk failure would tell an operator
+     * "the change failed" while their running sessions kept the new state.
+     */
+    async updateToolEnabled(name: string, enabled: boolean): Promise<void> {
+        this.tools.setEnabled(name, enabled);
+
+        await this.persistOrThrow();
+    }
+
+    /**
      * Change the global defaults (`PATCH /config`) and make the change durable BEFORE the answer.
      * A `null` value resets that field to the shipped default, which is what the contract's
      * `null`-means-reset rule requires, so the reset target survives a restart too.
@@ -2029,6 +2116,7 @@ export class SessionStore {
             busyWaiters: [],
             drainWaiters: [],
             turnWaiters: [],
+            deletingTurnIds: new Set(),
             settlers: new Map(),
             pendingActions: new Map(),
             completedActions: [],
@@ -2137,7 +2225,17 @@ export class SessionStore {
             // why a PATCH takes effect with no rebuild. Proven by src/server/plugins-api.test.ts
             // ("the live settings provider reaches an existing session"): with this line removed,
             // a plugin's `turn.before` read still sees the declared default on turn 2.
-            pluginSettings: this.plugins.provider
+            pluginSettings: this.plugins.provider,
+            // R3: the runtime's LIVE global tool provider, on the same by-reference rule as
+            // the line above. `harness()` stores the object and calls `isToolDisabled` while
+            // it builds every request's tool list, while the launch gate and `toolRequest`'s
+            // forbidden report ask the same question per call (../harness.ts) — so a
+            // `PATCH /v1/harness/tools/{tool_id}` changes what an existing session can see
+            // and call on its very next turn, with no rebuild. Every build path lands here:
+            // `create` for a fresh session and the restore path for one rebuilt from
+            // `state.json`. Forwarded through `HarnessPresetReport.toolSettings` by the
+            // shared toolbox (../harnesses/toolbox.ts), exactly like `pluginSettings`.
+            toolSettings: this.tools.provider
         });
     }
 
@@ -2829,6 +2927,15 @@ export class SessionStore {
 
                 return Object.keys(pluginSettings).length === 0 ? {} : { pluginSettings };
             })(),
+            // R3: the global tool deny list, written only once ANY tool has been switched
+            // off (a deployment that never opened the Tools pane keeps its exact previous
+            // document). The store answers with `{}` when the set is empty, so the same
+            // omit-when-empty rule the plugin block above uses applies here.
+            ...(() => {
+                const toolSettings = this.tools.snapshot();
+
+                return Object.keys(toolSettings).length === 0 ? {} : { toolSettings };
+            })(),
             sessions: [...this.sessions.values()].map(
                 (session) => overrides?.get(session.id) ?? this.sessionRecord(session)
             )
@@ -3368,6 +3475,7 @@ export class SessionStore {
                 busyWaiters: [],
                 drainWaiters: [],
                 turnWaiters: [],
+                deletingTurnIds: new Set(),
                 settlers: new Map(),
                 pendingActions: new Map(),
                 // Nothing from disk may be answered: a restart expires every
@@ -6150,66 +6258,109 @@ export class SessionStore {
     // runs at EXECUTION, after the fresh-conversation reset, so:
     //   - a target that was still streaming has had time to finish;
     //   - the content is the recorded terminal `done` text, never a delta stream;
-    //   - a target that failed/cancelled after binding rejects THIS turn clearly
-    //     instead of injecting nothing and silently running.
-    private async expandReferences(session: Session, turn: SessionTurn): Promise<string> {
-        return this.composeReferences(session, turn.prompt, turn.references);
+    //   - a target that failed/cancelled/was deleted after binding contributes an
+    //     informational NOTE (see composeReferences) instead of chaining its death
+    //     onto this turn: the user still gets an answer that says what is missing.
+    // `signal` is this turn's abort signal, forwarded to the park below so a stop
+    // aimed at THIS turn releases it from a wait that will never be satisfied.
+    private async expandReferences(
+        session: Session,
+        turn: SessionTurn,
+        signal?: AbortSignal
+    ): Promise<string> {
+        return this.composeReferences(session, turn.prompt, turn.references, signal, turn.strippedReferences);
     }
 
     // The shared composer: wait for every referenced target to settle, resolve its
     // recorded block, and inject the terminal `done` content. Used by BOTH an
     // executing turn and a steered submit (F3), so focused guidance carries exactly
     // the same reference context as a normal prompt.
+    //
+    // `signal` is the EXECUTING turn's own abort signal. A target that dies is not
+    // this turn's failure (see the note branches below), but a stop aimed at THIS
+    // turn must still release it from the wait instead of leaving it parked until
+    // its target happens to settle.
     private async composeReferences(
         session: Session,
         prompt: string,
-        references: readonly AgentResultReference[] | undefined
+        references: readonly AgentResultReference[] | undefined,
+        signal?: AbortSignal,
+        // Gap (c): labels this turn was submitted with that a DELETION stripped (the target
+        // row is gone; its id no longer exists to wait on). They contribute the same
+        // deleted-result note a mid-park deletion does, so a turn that was still QUEUED when
+        // its target's conversation was deleted never runs bare.
+        strippedLabels?: readonly string[]
     ): Promise<string> {
-        if (references === undefined || references.length === 0) return prompt;
+        const hasReferences = references !== undefined && references.length > 0;
+        const hasStripped = strippedLabels !== undefined && strippedLabels.length > 0;
 
-        const entries: { block: AgentResultBlock; content: string }[] = [];
+        if (!hasReferences && !hasStripped) return prompt;
+
+        const entries: AgentResultSection[] = [];
+
+        // A stripped label has NO target to resolve, so it is emitted first and unconditionally:
+        // the note is the whole answer for that input. Order matches the labels the user saw.
+        if (hasStripped) {
+            for (const label of strippedLabels ?? []) {
+                entries.push({ label, note: referencedResultDeletedNote(label) });
+            }
+        }
+
+        if (references === undefined) return composeAgentResultPrompt(prompt, entries);
 
         for (const reference of references) {
             const target = session.turns.find((candidate) => candidate.id === reference.turnId);
 
+            // The target is gone (its thread was deleted between binding and this
+            // read, or before this turn even started): an informational note, NOT a
+            // failure. The user asked for an answer, and a dead reference is only
+            // one missing input.
             if (target === undefined) {
-                throw new Error(
-                    `Referenced block "#${reference.label}" is no longer available: turn "${reference.turnId}" is gone.`
-                );
+                entries.push({
+                    label: reference.label,
+                    note: referencedResultDeletedNote(reference.label)
+                });
+                continue;
             }
 
             // Coarse but honest: wait for the whole target TURN to settle. FIFO
             // normally means it already has; this is the explicit guarantee for a
-            // target that was streaming when the task was accepted.
-            await this.waitForTurnTerminal(session, target);
+            // target that was streaming when the task was accepted. Throws when this
+            // turn is stopped mid-wait (the caller classifies it as cancelled).
+            await this.waitForTurnTerminal(session, target, signal);
 
             if (session.disposed) {
                 throw new Error('The session was removed while waiting for a referenced block.');
             }
 
             // Conversation prefix (not just `[target]`): see `turnsThrough`. The
-        // recorded seeds keep a surviving turn's labels stable after a deletion.
-        const block = findAgentResultBlock(
-            this.projectionTurns(session, this.turnsThrough(session, target.index)),
-            reference
-        );
+            // recorded seeds keep a surviving turn's labels stable after a deletion.
+            const block = findAgentResultBlock(
+                this.projectionTurns(session, this.turnsThrough(session, target.index)),
+                reference
+            );
 
+            // No block left: the target's row was deleted while this turn waited
+            // (the prefix above no longer names it) or it never recorded one.
             if (block === undefined) {
-                throw new Error(
-                    `Referenced block "#${reference.label}" is missing from turn "${target.id}".`
-                );
+                entries.push({
+                    label: reference.label,
+                    note: referencedResultDeletedNote(reference.label)
+                });
+                continue;
             }
 
-            if (block.status !== 'done') {
-                throw new Error(
-                    `Referenced block "#${reference.label}" cannot be used because it ended as ${block.status}.`
-                );
-            }
-
-            if (block.content === undefined) {
-                throw new Error(
-                    `Referenced block "#${reference.label}" has no completed result content.`
-                );
+            // A target that ended cancelled/error/stopped, or that ended `done` with
+            // no recorded content, contributes its NOTE instead of failing this turn:
+            // the waiter runs, and the model is told to report the missing input to
+            // the user. Only the TARGET died — chaining its death onto every turn
+            // that referenced it is what this branch replaces.
+            if (block.status !== 'done' || block.content === undefined) {
+                entries.push({
+                    label: block.label,
+                    note: referencedResultUnavailableNote(block.label, block.status)
+                });
+                continue;
             }
 
             entries.push({ block, content: block.content });
@@ -6257,12 +6408,55 @@ export class SessionStore {
     }
 
     // Park until one turn is no longer queued/running. `turnWaiters` is woken by
-    // every settlement path (executeTurn finally, cancel-all, dispose) and the
-    // caller re-checks the status, so a wake for a different turn is harmless.
-    private async waitForTurnTerminal(session: Session, turn: SessionTurn): Promise<void> {
-        while (!session.disposed && (turn.status === 'queued' || turn.status === 'running')) {
-            await new Promise<void>((resolve) => {
-                session.turnWaiters.push(resolve);
+    // every settlement path (executeTurn finally, cancel-all, cancelThread,
+    // deleteThread, dispose) and the caller re-checks the status, so a wake for a
+    // different turn is harmless.
+    //
+    // THREE exits, because a bare promise parked a turn that could never be
+    // released (T10/Fix 1):
+    //   1. the target settled (the historical exit);
+    //   2. THIS turn was stopped — its own abort signal fires, so a per-thread stop,
+    //      a cancel-all, or a dispose releases the waiter promptly and settles it as
+    //      `cancelled` (the caller's `wasCancelled()` reads the same signal);
+    //   3. a deletion of the TARGET's conversation is in flight — the row may already
+    //      be terminal while the purge has not run yet, and waking there would read
+    //      "cancelled" for what is about to become "deleted". Staying parked until
+    //      `deleteThread` releases the mark keeps the note the waiter sees honest.
+    // The resolver is removed from `session.turnWaiters` and the signal listener is
+    // detached on EVERY exit, so a released waiter never leaves an orphan wake or a
+    // listener behind.
+    private async waitForTurnTerminal(session: Session, turn: SessionTurn, signal?: AbortSignal): Promise<void> {
+        while (
+            !session.disposed &&
+            (turn.status === 'queued' ||
+                turn.status === 'running' ||
+                session.deletingTurnIds.has(turn.id))
+        ) {
+            if (signal?.aborted === true) throw new Error(REFERENCE_WAIT_CANCELLED_MESSAGE);
+
+            await new Promise<void>((resolve, reject) => {
+                // One cleanup for both exits: the resolver drops out of the wake fan
+                // (a broadcast splice is idempotent, but this keeps the array honest
+                // for any waiter released by the abort path) and the listener goes.
+                const settle = (): void => {
+                    const at = session.turnWaiters.indexOf(wake);
+                    if (at !== -1) session.turnWaiters.splice(at, 1);
+                    signal?.removeEventListener('abort', abort);
+                };
+
+                const wake = (): void => {
+                    settle();
+                    resolve();
+                };
+
+                const abort = (): void => {
+                    settle();
+                    reject(new Error(REFERENCE_WAIT_CANCELLED_MESSAGE));
+                };
+
+                session.turnWaiters.push(wake);
+
+                if (signal !== undefined) signal.addEventListener('abort', abort, { once: true });
             });
         }
     }
@@ -7721,8 +7915,11 @@ export class SessionStore {
 
             // Expand AFTER the reset and only once every referenced turn is
             // terminal, so the injected text is the recorded `done` content. With
-            // no references this is the user's prompt by identity.
-            const composed = await this.expandReferences(session, turn);
+            // no references this is the user's prompt by identity. THIS run's
+            // controller is handed to the park: a stop aimed at this turn aborts the
+            // wait (the signal is the lane's/legacy controller's, which every stop
+            // path aborts) instead of stranding the turn until its target settles.
+            const composed = await this.expandReferences(session, turn, controller.signal);
 
             // An attachment-only task has an EMPTY prompt, which the legacy root
             // call accepts (the media parts travel separately). A persistent thread
@@ -7752,7 +7949,23 @@ export class SessionStore {
             //
             // The async context is what attributes this run's progress events when
             // a sibling lane is emitting at the same time (see buildHarness).
-            if (this.workerExecution) {
+            //
+            // D4 (T14): SAME-TICK STOP GUARD, the one branch above the dispatch. When a
+            // referenced target settles in the SAME macrotask a stop arrives, this turn's
+            // park resolves normally instead of rejecting: `releaseTurnWaiters` runs the
+            // parked resolver, and that resolver's cleanup removes the abort listener, so
+            // the `controller.abort()` that follows has nothing left to reject. The turn is
+            // therefore still flagged stopped (`stopRequested` / an aborted signal) while
+            // `expandReferences` above returned a composed prompt, and dispatching the run
+            // here would spend provider time on an answer the classification below throws
+            // away. Settle it as `cancelled` WITHOUT starting the run; the classification
+            // below is reached unchanged and states the same outcome.
+            const stoppedBeforeRun = wasCancelled();
+
+            if (stoppedBeforeRun) {
+                failure = 'The run was cancelled.';
+                turn.status = 'cancelled';
+            } else if (this.workerExecution) {
                 // T5 (R1/D1): the whole turn - agent loop, provider stream handling, and
                 // every synchronous tool body - runs on this conversation's lane worker. The
                 // recorder `record` above is the lane's event sink, so the durable turn record,
@@ -7806,8 +8019,11 @@ export class SessionStore {
 
             // Record the run's invocation identity for the roster join. A root run
             // may report none; the thread record's latest invocation id is the
-            // fallback the roster already exposes.
-            if (threadId !== undefined) {
+            // fallback the roster already exposes. Skipped for a turn the guard
+            // above never dispatched (D4): its conversation has no NEW invocation,
+            // and joining the row to the previous run's invocation would put an
+            // answer this turn never produced on the roster.
+            if (threadId !== undefined && !stoppedBeforeRun) {
                 const invocationId = session.harness.thread(threadId)?.invocationId;
                 if (invocationId !== undefined) session.turnInvocations.set(turn.id, invocationId);
             }
@@ -8063,10 +8279,16 @@ export class SessionStore {
 
     // STOP ONE THREAD (R6, POST /sessions/:id/threads/:threadId/cancel).
     //
-    // Aborts that thread's live run, drops its queued turns (they can never run
-    // now), marks it stopped, and cascades to any thread it owns. A sibling lane is
-    // untouched. `cancelled` reports whether live work was aborted or a queued turn
-    // dropped; an idle thread is still marked stopped and answers false.
+    // Aborts that thread's live work — a run inside the harness OR a turn parked in a
+    // reference wait (Fix 1: the lane's own controller is aborted, not just the
+    // runtime's) — drops its queued turns (they can never run now), marks it stopped,
+    // and cascades to any thread it owns. A sibling lane is untouched, and a turn in
+    // ANOTHER thread that merely references this one keeps running: it is woken and
+    // composes an informational note (see composeReferences).
+    //
+    // `cancelled` is the store's honest result: true when this call terminated real
+    // work (an aborted run, a released park, or dropped queued turns), false for a
+    // thread that only got marked stopped with nothing in flight.
     // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
     // still returns after the synchronous rename; with an IO client it resolves on the
     // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
@@ -8087,6 +8309,10 @@ export class SessionStore {
         const lane = session.lanes.get(threadId);
         let cancelled = false;
 
+        // D2 (T14): every lane THIS call pre-flags, with the value it held before, so the
+        // runtime-refusal path below can restore it (see the catch).
+        const flagged: { lane: ThreadLane; previous: boolean }[] = [];
+
         // The thread itself plus every conversation it owns: the runtime's stop
         // cascades, and the server drops the matching backlogs.
         const stoppedThreads = new Set<string>([threadId]);
@@ -8099,15 +8325,50 @@ export class SessionStore {
         // "cancelled" instead of "error". Set it on EVERY lane the runtime stop
         // cascades to (the thread and its owner-linked children), so a cascaded
         // child run is never misclassified. An idle lane needs no flag.
+        //
+        // `cancelled` is the honest answer (Fix 2 / R4): a lane holding a turn — a live
+        // run OR a turn parked in a reference wait — is real work this call terminates,
+        // whether or not the runtime had a run object to abort. `harness.stopThread`
+        // returns false for a parked turn (the runtime never started it), so it alone
+        // under-reported exactly the state this fix is about.
         for (const targetId of stoppedThreads) {
             const target = session.lanes.get(targetId);
-            if (target !== undefined && target.active !== undefined) target.stopRequested = true;
+            if (target === undefined || target.active === undefined) continue;
+
+            // D2 (T14): remember the lane and the value it had BEFORE this call, so the
+            // refusal below can hand it back exactly as it was found. Only lanes this call
+            // actually flipped appear here, and a lane that was already flagged keeps that
+            // flag (restoring `false` would erase another stop's still-pending request).
+            flagged.push({ lane: target, previous: target.stopRequested });
+            target.stopRequested = true;
+            cancelled = true;
         }
 
         try {
             if (session.harness.stopThread(threadId, reason)) cancelled = true;
         } catch (error) {
+            // D2 (T14): the RUNTIME refused the stop, so nothing this call started has
+            // happened — no abort ran (the abort loop below is never reached) and the turn
+            // keeps running. Every flag pre-set above must therefore go back, or a turn that
+            // completes normally is later misclassified `cancelled` by `wasCancelled()`
+            // (./sessions.ts ~:7576) even though nothing was stopped. Newly reachable
+            // because `deleteThread` calls this method internally.
+            for (const flaggedLane of flagged) flaggedLane.lane.stopRequested = flaggedLane.previous;
+
             throw new SessionError(400, messageOf(error));
+        }
+
+        // Fix 1: abort each stopped lane's OWN controller too, mirroring the
+        // session-wide `cancel()` lane loop. `harness.stopThread` only aborts a
+        // conversation the runtime is actually running; a turn that is parked in
+        // `waitForTurnTerminal` (its prompt references another turn) has no runtime
+        // run yet, so without this its lane stays claimed until the TARGET settles —
+        // which may never happen if the target was itself stopped. The abort releases
+        // that park immediately; the `stopRequested` flag above is what then records
+        // the turn as `cancelled` rather than `error`.
+        for (const targetId of stoppedThreads) {
+            const target = session.lanes.get(targetId);
+            if (target !== undefined && target.active !== undefined) target.controller?.abort();
         }
 
         // An UNFOCUSED submit runs on the session's exclusive gate (no lane). When
@@ -8750,8 +9011,13 @@ export class SessionStore {
         }
 
         // Live work owns the transcript. The record's status plus a lane still
-        // holding an active run is the same predicate `deleteThread` uses for its
-        // 409 (a stopped-but-still-unwinding run reports 'stopped').
+        // holding an active run is THIS route's own live-work gate (a stopped-but-
+        // still-unwinding run reports 'stopped', which is why the lane is checked
+        // too). D6 (T14): it is no longer "the same predicate `deleteThread` uses" —
+        // a delete now STOPS the conversation first and only then purges it, so a
+        // live row is the normal input to a delete; the purge's remaining 409s cover
+        // only the live state a stop cannot release (a `threadSend` revival this
+        // server has no row for). See `deleteThread` / `purgeDeletedThread`.
         if (record.status === 'running' || session.lanes.get(threadId)?.active !== undefined) {
             throw new SessionError(
                 409,
@@ -8815,21 +9081,169 @@ export class SessionStore {
         };
     }
 
+    // Rows in `session.turns` that still describe queued/running work for one of the
+    // conversations being deleted, marked so a reference waiter parked on them stays
+    // parked through the purge (see `Session.deletingTurnIds`). Returns the marked ids
+    // so the caller can release them on EVERY exit.
+    private markTurnsForDeletion(session: Session, doomed: ReadonlySet<string>): string[] {
+        const marked: string[] = [];
+
+        // A queued turn IS a row here (enqueue pushes the row and the backlog entry),
+        // so this one scan covers both live runs and accepted-but-unstarted work —
+        // including a turn parked in a reference wait, whose row reads 'running' from
+        // the moment its lane claimed it (see executeTurn).
+        for (const turn of session.turns) {
+            if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
+            if (turn.status !== 'running' && turn.status !== 'queued') continue;
+
+            session.deletingTurnIds.add(turn.id);
+            marked.push(turn.id);
+        }
+
+        return marked;
+    }
+
+    // Release the deletion marks and wake every parked waiter: a waiter that re-parked
+    // because of the mark needs one more read, which now sees the rows either gone (the
+    // deletion succeeded → the "was deleted" note) or terminal in a live conversation
+    // (the deletion was refused → the "ended as cancelled" note).
+    private releaseDeletingTurnIds(session: Session, marked: readonly string[]): void {
+        if (marked.length === 0) return;
+
+        for (const turnId of marked) session.deletingTurnIds.delete(turnId);
+        this.releaseTurnWaiters(session);
+    }
+
+    // Bounded, event-driven wait for the rows a forced deletion just aborted to reach a
+    // terminal status. The park rides the session's drain fan-out — released by every
+    // settlement path, exactly like `waitForIdle` — so the happy path costs one wake;
+    // the deadline only ever decides for a transport that ignores its abort signal, and
+    // a deadline miss falls through to the existing F4 409 instead of purging under a
+    // live run.
+    private async waitForTurnsSettled(
+        session: Session,
+        turnIds: readonly string[],
+        timeoutMs: number
+    ): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+
+        const stillLive = (): boolean =>
+            session.turns.some(
+                (turn) =>
+                    turnIds.includes(turn.id) && (turn.status === 'queued' || turn.status === 'running')
+            );
+
+        while (!session.disposed && stillLive()) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) return false;
+
+            await new Promise<void>((resolve) => {
+                // A wake for unrelated work is harmless: the loop re-checks the rows.
+                // The timer is the bound for a run that never settles at all.
+                const timer = setTimeout(wake, remaining);
+
+                function wake(): void {
+                    clearTimeout(timer);
+
+                    const at = session.drainWaiters.indexOf(wake);
+                    if (at !== -1) session.drainWaiters.splice(at, 1);
+                    resolve();
+                }
+
+                session.drainWaiters.push(wake);
+            });
+        }
+
+        return true;
+    }
+
     // DELETE ONE THREAD (R6, DELETE /sessions/:id/threads/:threadId).
     //
-    // Removes the thread, its descendants, every owning turn, every result
-    // reference that pointed at those turns, and their persisted copies. A running
-    // thread (or one with queued work) is a 409 — stop it first. The default
-    // `agent:<name>` conversation is a 400 (use reset).
+    // R2 (Fix 2): a thread is deletable whatever is happening in it. Any live or
+    // queued work — a run inside the harness, a turn parked in a reference wait, or an
+    // accepted backlog — is stopped FIRST (the same cascade `cancelThread` performs,
+    // descendants included), the aborted rows are awaited, and only then does the
+    // purge run. A conversation that merely REFERENCEs one of these turns is never
+    // stopped by this call; its parked waiter is released with the "was deleted" note.
     //
-    // ORDERING: the new document is written BEFORE the live harness is touched, so
-    // a failed write rolls back cleanly with nothing lost (the in-memory state and
-    // the disk still describe the same session).
+    // The refusals that survive the force are the ones a stop cannot answer for, and
+    // they keep the historical 409 message: a conversation the RUNTIME reports running
+    // with no server row to wait on (a tool-started `threadSend` run — the store has no
+    // settler to await, so purging it would be refused inside the runtime and surface
+    // as a 500), a descendant in that state, and a doomed row that refuses to settle
+    // within `DELETION_ABORT_SETTLE_MS` (the F4 atomicity rule: purging under a live
+    // run would drop the durable file while the runtime still writes the conversation).
     // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
     // still returns after the synchronous rename; with an IO client it resolves on the
     // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
     // drops the await cannot claim the mutation survived a restart.
     async deleteThread(id: string, threadId: string): Promise<SessionSnapshot> {
+        const session = this.require(id);
+
+        // The same pre-checks the purge itself makes, up here because the forced stop
+        // must not run for a thread that does not exist or is not deletable at all.
+        if (!this.threadsSupported(session)) throw new SessionError(404, `Unknown thread "${threadId}".`);
+
+        const record = session.harness.thread(threadId);
+        if (record === undefined) throw new SessionError(404, `Unknown thread "${threadId}".`);
+
+        if (record.origin === 'agent') {
+            throw new SessionError(
+                400,
+                `Thread "${threadId}" is the agent's own conversation and cannot be deleted; use reset to clear the session.`
+            );
+        }
+
+        // The conversation plus everything it OWNS (delegation lineage) — the exact
+        // set the purge computes, so the stop cascades over the same threads.
+        const doomed = new Set<string>([threadId]);
+        for (const candidate of session.harness.threads()) {
+            if (this.isDescendantThread(session, candidate.id, threadId)) doomed.add(candidate.id);
+        }
+
+        const marked = this.markTurnsForDeletion(session, doomed);
+
+        try {
+            if (marked.length > 0) {
+                // Stop-then-delete: `cancelThread` already does the whole job — the
+                // runtime stop (with its cascade), the lane/legacy backlog drop, the
+                // lane aborts that release any parked waiter, the durable write, and
+                // the roster notification. Re-implementing it here would fork the rules.
+                // The reason text names the deletion, so the stopped rows say why the
+                // conversation went away.
+                await this.cancelThread(id, threadId, `Thread "${threadId}" was deleted.`);
+
+                // The abort is async: the run rejects, `executeTurn` settles the row, and
+                // only then is the conversation free. A forced delete that skipped this
+                // would be refused INSIDE the runtime (its own live-run predicate) and
+                // read as a 500 after a durable projection had already been written.
+                await this.waitForTurnsSettled(session, marked, DELETION_ABORT_SETTLE_MS);
+            }
+
+            return await this.purgeDeletedThread(id, threadId);
+        } finally {
+            this.releaseDeletingTurnIds(session, marked);
+        }
+    }
+
+    // The purge: removes the thread, its descendants, every owning turn, every result
+    // reference that pointed at those turns, and their persisted copies. The default
+    // `agent:<name>` conversation is a 400 (use reset).
+    //
+    // ORDERING: the new document is written BEFORE the live harness is touched, so a
+    // failed write rolls back cleanly with nothing lost (the in-memory state and the
+    // disk still describe the same session).
+    //
+    // Preflights that do NOT depend on stopping work first stay here: the agent
+    // conversation, a conversation the RUNTIME reports running with no server row to
+    // wait on (a `threadSend` revival — nothing here can prove when it frees the
+    // conversation), and a descendant the runtime still owns. Those keep the historical
+    // 409; every live/queued ROW the store can address is stopped by the caller first.
+    // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
+    // still returns after the synchronous rename; with an IO client it resolves on the
+    // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
+    // drops the await cannot claim the mutation survived a restart.
+    private async purgeDeletedThread(id: string, threadId: string): Promise<SessionSnapshot> {
         const session = this.require(id);
 
         if (!this.threadsSupported(session)) {
@@ -8858,8 +9272,13 @@ export class SessionStore {
         // F4: a STOPPED-but-still-unwinding run (an abort-ignoring transport) is a
         // live run. Deleting it now would leave the durable file purged while the
         // runtime still owns the conversation. Every such turn is a 409, whether it
-        // runs in a lane or on the exclusive gate (the runtime's `status` may
-        // already read 'stopped', which is why the TURN is authoritative here).
+        // runs in a lane, the legacy gate, or a conversation the caller just
+        // stopped (the runtime's `status` may already read 'stopped', which is why
+        // the TURN is authoritative here).
+        //
+        // D3 (T14): this is the ONLY copy of that preflight. It used to appear a
+        // second time after the queued-backlog check below, verbatim and unreachable
+        // — the loop here already refuses every live/queued doomed row.
         for (const turn of session.turns) {
             if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
             if (turn.status !== 'running' && turn.status !== 'queued') continue;
@@ -8909,45 +9328,16 @@ export class SessionStore {
             }
         }
 
-        // A LIVE task in another thread that is waiting for (or about to expand) a
-        // doomed turn would hang once that turn disappears — its waiter would never
-        // be signalled. Refuse until that task settles.
-        for (const turn of session.turns) {
-            if (turn.threadId !== undefined && doomed.has(turn.threadId)) continue;
-            if (turn.status !== 'queued' && turn.status !== 'running') continue;
-            if (turn.references === undefined) continue;
+        // A LIVE task in ANOTHER thread that references a doomed turn used to be a
+        // refusal here ("stop that work first"), because the waiter would wake to a
+        // vanished row and park forever. Fix 1 + Fix 3 removed both halves: the waiter
+        // is abort-aware, and a target that disappears mid-wait composes the "was
+        // deleted" note and keeps running. Deleting a conversation therefore never
+        // needs the reader to stop the conversations that merely point at it.
 
-            const waitsOnDoomed = turn.references.some((reference) => {
-                const target = session.turns.find((candidate) => candidate.id === reference.turnId);
-                return (
-                    target !== undefined &&
-                    target.threadId !== undefined &&
-                    doomed.has(target.threadId)
-                );
-            });
-
-            if (waitsOnDoomed) {
-                throw new SessionError(
-                    409,
-                    `Thread "${threadId}" is referenced by a live task; stop that work before deleting it.`
-                );
-            }
-        }
-
-        // F4: a STOPPED-but-still-unwinding run (an abort-ignoring transport) is a
-        // live run. Deleting it now would leave the durable file purged while the
-        // runtime still owns the conversation. Every such turn is a 409, whether it
-        // runs in a lane, the legacy gate, or a conversation the caller just
-        // stopped (the runtime's `status` may already read 'stopped').
-        for (const turn of session.turns) {
-            if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
-            if (turn.status !== 'running' && turn.status !== 'queued') continue;
-
-            throw new SessionError(
-                409,
-                `Thread "${threadId}" still has live work; wait for it to stop before deleting it.`
-            );
-        }
+        // D3 (T14): the live/queued doomed-row preflight is the ONE loop above (the
+        // comment there names this spot as where the duplicate used to sit); the
+        // exclusive-gate check below covers the legacy run that owns no lane.
         if (session.status === 'running' && session.controller !== undefined) {
             const active = [...session.turns]
                 .sort((left, right) => left.index - right.index)
@@ -8982,6 +9372,25 @@ export class SessionStore {
                 .map((turn) => turn.id)
         );
 
+        // Gap (c): the `#LABEL`s each SURVIVING turn loses to this deletion, in the order it
+        // submitted them, merged with anything an earlier deletion already stripped. Both the
+        // persisted copy and the live row carry them as `strippedReferences` — the ids cannot
+        // (their rows are gone) but the labels can, and they are what the composer needs to
+        // tell the user which input vanished. Computed ONCE here so the durable projection and
+        // the live record cannot drift.
+        const strippedLabels = new Map<string, string[]>();
+        for (const turn of survivors) {
+            if (turn.references === undefined) continue;
+
+            const dropped = turn.references
+                .filter((reference) => removedIds.has(reference.turnId))
+                .map((reference) => reference.label);
+
+            if (dropped.length === 0) continue;
+
+            strippedLabels.set(turn.id, [...(turn.strippedReferences ?? []), ...dropped]);
+        }
+
         const projectedTurns = survivors.map((turn) => {
             const copy = copyTurn(turn);
 
@@ -8990,9 +9399,13 @@ export class SessionStore {
             const kept = turn.references.filter((reference) => !removedIds.has(reference.turnId));
 
             // A link to a deleted turn is dropped from the persisted copy too: the
-            // record must not promise a target that no longer exists.
+            // record must not promise a target that no longer exists. What it named is
+            // kept by LABEL (gap (c)), which is what the composer later reports.
             if (kept.length === 0) delete copy.references;
             else copy.references = kept.map((reference) => ({ ...reference }));
+
+            const stripped = strippedLabels.get(turn.id);
+            if (stripped !== undefined) copy.strippedReferences = [...stripped];
 
             return copy;
         });
@@ -9142,6 +9555,12 @@ export class SessionStore {
 
             if (kept.length === 0) delete turn.references;
             else turn.references = kept;
+
+            // Gap (c): the live row records the same labels the durable copy does, so the
+            // turn that eventually composes can inject the deleted-result note instead of
+            // running bare.
+            const stripped = strippedLabels.get(turn.id);
+            if (stripped !== undefined) turn.strippedReferences = [...stripped];
         }
 
         for (const removed of removedIds) {

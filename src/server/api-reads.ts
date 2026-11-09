@@ -81,7 +81,11 @@ import { previewText } from './turn-projector';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
 import type { CatalogueEntry, HarnessPreset } from './harnesses/types';
 import type { ToolCatalogue } from './harnesses';
-import { CORE_TOOL_NAMES } from './harnesses/toolbox';
+// R3: the protection predicate (`isProtectedToolName`) is imported from ./tool-settings.ts
+// (the module that owns the global switch), which is itself built on `CORE_TOOL_NAMES`
+// from ./harnesses/toolbox — one definition for the session `protected` projection, the
+// global row's `protected` field, and the 403 a global disable of a control tool earns.
+import { isProtectedToolName } from './tool-settings';
 // T19: the global agent overlay type (the one authority behind `has_global_override`,
 // `instruction_source: 'global'`, and a roster row's provenance).
 import type { AgentState } from './harnesses/agent-state';
@@ -103,7 +107,9 @@ export const TURN_PROMPT_PREVIEW_CHARS = 320;
 
 // The four harness-owned control tools plus `delegate`/`threadSend` are the entries a
 // session can never un-register or switch off; `CORE_TOOL_NAMES` is the shipped set.
-const isProtectedToolName = (name: string): boolean => CORE_TOOL_NAMES.includes(name);
+// R3: the predicate is IMPORTED from ./tool-settings.ts (the module that owns the global
+// switch), so the session-scoped `protected` projection, the global row's `protected`
+// field, and the 403 the global PATCH refuses are one rule with one definition.
 
 // ---------------------------------------------------------------------------
 // Context
@@ -1192,11 +1198,25 @@ export const instructionTextOf = (
 /**
  * A catalogue row. `session_bound` is the entry's own flag (the harness-owned control
  * tools have no standalone implementation), projected snake_case.
+ *
+ * R3 — `enablement` is the pair a Tools pane switches on, and the CALLER decides both
+ * halves because only the caller can see the live state:
+ *   - `enabled`   - the deployment's global switch (./tool-settings.ts `isEnabled`, read
+ *                   per row so a row reflects a click that happened after this request
+ *                   started);
+ *   - `protected` - the entry is harness-owned, so the switch does not apply to it and the
+ *                   write route refuses it with 403.
+ * Both DEFAULT to "on, and switchable" — the state of a deployment with no global store
+ * consulted, and what a caller that does not care (a session row, which states its OWN
+ * `enabled`/`protected` after this spread) gets. A protected row's caller passes
+ * `enabled: true` (the store's `isEnabled` already answers that way), so the two fields
+ * can never contradict each other on the wire.
  */
 export const toolSummaryOf = (
     entry: CatalogueEntry | undefined,
     name: string,
-    liveDescription?: string
+    liveDescription?: string,
+    enablement?: { enabled: boolean; protected: boolean }
 ): ToolSummary => ({
     name,
     group: entry?.group ?? 'Created tools',
@@ -1214,12 +1234,18 @@ export const toolSummaryOf = (
                   ...(entry.availability.hint === undefined ? {} : { hint: entry.availability.hint })
               }
           }),
-    session_bound: entry?.sessionBound === true
+    session_bound: entry?.sessionBound === true,
+    enabled: enablement?.enabled ?? true,
+    protected: enablement?.protected ?? isProtectedToolName(name)
 });
 
 /** A catalogue entry plus the schema and the execution gate only the detail read carries. */
-export const toolDetailOf = (entry: CatalogueEntry | undefined, name: string): ToolDetail => ({
-    ...toolSummaryOf(entry, name),
+export const toolDetailOf = (
+    entry: CatalogueEntry | undefined,
+    name: string,
+    enablement?: { enabled: boolean; protected: boolean }
+): ToolDetail => ({
+    ...toolSummaryOf(entry, name, undefined, enablement),
     ...(entry?.parameters === undefined ? {} : { parameters: { ...entry.parameters } }),
     execution: {
         scope: entry?.sessionBound === true ? 'session_required' : 'global',

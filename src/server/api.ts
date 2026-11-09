@@ -131,6 +131,7 @@ import type {
     AttachmentResponse,
     CancelSessionRequest,
     CancelSessionResult,
+    CancelThreadResult,
     CommandPage,
     CreateHarnessRequest,
     CreateSessionAgentRequest,
@@ -175,6 +176,9 @@ import type {
     TaskReceipt,
     ThreadResponse,
     ThreadSummaryPage,
+    // R3: the global tool switch (the identified read a PATCH answers with, and its body).
+    ToolDetailResponse,
+    ToolSettingsUpdate,
     TranscriptDocumentResponse,
     TranscriptMessagePage,
     TranscriptMetadataResponse,
@@ -230,6 +234,9 @@ import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
 // unknown key / mistyped / out-of-range value). The store itself is reached through
 // `store.pluginSettings`, so this dispatcher never constructs a second one.
 import { HarnessPluginSettingsError } from './plugins';
+// R3: the global tool switch's status-carrying error (403 protected name, 400 blank name),
+// mapped exactly like its plugin sibling below.
+import { HarnessToolSettingsError, isProtectedToolName } from './tool-settings';
 import type { HarnessIndex, SessionStreamItem, SessionViewStreamItem } from './protocol';
 import { HttpError, capabilityDenied } from './api-errors';
 import { HARNESS_RUNTIME_EPOCH, createHarnessEventHub, resourceKeyOf } from './api-events';
@@ -759,6 +766,21 @@ export const createHarnessApi = ({
     // copy the harness registers, so a descriptor cannot advertise a different schema.
     const coreEntries = createCoreToolEntries();
     const toolEntries = (): CatalogueEntry[] => [...coreEntries, ...catalogue.entries];
+
+    // R3: the runtime's GLOBAL tool switch, reached THROUGH the store that owns it, so this
+    // dispatcher never builds a second disabled set: a `PATCH /tools/{tool_id}` here writes
+    // the same live set every harness consults while it builds a request's tool list
+    // (./tool-settings.ts, ./sessions.ts `buildHarness`, ../harness.ts).
+    const toolSettings = store.toolSettings;
+
+    // The two enablement fields every catalogue row carries, read live at the moment the row
+    // is built. `isProtectedToolName` is the same predicate a session row's `protected`
+    // projection uses (./api-reads.ts), and a protected name's `isEnabled` answers `true` by
+    // construction, so a row can never show the control plane as switched off.
+    const toolEnablementOf = (name: string): { enabled: boolean; protected: boolean } => ({
+        enabled: toolSettings.isEnabled(name),
+        protected: toolSettings.isProtected(name)
+    });
 
     // T19: the global agent overlay, reached THROUGH the registry (its owner). Every agent
     // read resolves effective text through it, and every agent write commits through it.
@@ -1843,7 +1865,7 @@ export const createHarnessApi = ({
 
         const result = pageMeta(
             {
-                items: page.items.map((entry) => toolSummaryOf(entry, entry.name)),
+                items: page.items.map((entry) => toolSummaryOf(entry, entry.name, undefined, toolEnablementOf(entry.name))),
                 next: page.next
             },
             events.getRevision('tools')
@@ -1861,9 +1883,56 @@ export const createHarnessApi = ({
 
         if (entry === undefined) throw missing('tool', name);
 
-        const response = { tool: toolDetailOf(entry, name) };
+        const response: ToolDetailResponse = { tool: toolDetailOf(entry, name, toolEnablementOf(name)) };
 
         return json(200, response);
+    };
+
+    // `PATCH /tools/{tool_id}` — R3's GLOBAL tool switch, one boolean, for every session.
+    //
+    // WRITE-ANYTIME (R1): no `assertIdleForToolMutation` here, unlike the session-scoped
+    // switch (./api.ts `setSessionToolEnabled`), and the difference is real rather than
+    // convenient. That route mutates ONE live harness (an entry leaves a cap slot or a
+    // declaration a run was promised), so it needs its session quiet; this one changes a
+    // deployment-wide ANSWER that the runtime re-reads when it builds the NEXT request's
+    // tool list (../harness.ts `declared`, the launch gate, and `toolRequest`'s forbidden
+    // report). Nothing is un-registered, no schema disappears mid-turn, and a run in flight
+    // keeps exactly the declarations it was given — so there is no disagreement to 409
+    // about, and the Tools page stays reachable while a thread is running.
+    //
+    // DURABLE BEFORE THE ANSWER (the plugins precedent): the commit runs inside
+    // `store.updateToolEnabled` and a failed write is a 500 whose in-process value stays
+    // applied, because the sessions already honour it and a rollback would claim a failure
+    // the running conversations did not have.
+    const patchTool: Handler = async (ctx) => {
+        const name = ctx.params.tool_id;
+        const entry = coreEntries.find((candidate) => candidate.name === name) ?? catalogue.find(name);
+
+        // Identity FIRST, so a typo on a name that does not exist is a 404 and never a
+        // 403 about protection or a 400 about a body the client has not sent yet.
+        if (entry === undefined) throw missing('tool', name);
+
+        const body = requireObjectBody<ToolSettingsUpdate>(await ctx.body());
+
+        requireKnownFields(body, ['enabled']);
+
+        if (typeof body.enabled !== 'boolean') {
+            throw new HttpError(400, '"enabled" must be a boolean (true runs the tool, false disables it for every session).');
+        }
+
+        // The protected-name refusal (403) is the STORE's rule — the same predicate its
+        // restore filter and a session row's `protected` field use — thrown before any
+        // mutation, so a refused switch is a no-op. An idempotent write is accepted: the
+        // contract's switches never punish a client for stating the current state.
+        await store.updateToolEnabled(name, body.enabled);
+
+        const response: ToolDetailResponse = { tool: toolDetailOf(entry, name, toolEnablementOf(name)) };
+
+        // The collection revision is the tool settings store's own counter (one bump per
+        // accepted switch), on the same rule `GET /plugins` uses for its pane: `tools`
+        // enablement is not a `StreamResourceKind` update, and the Tools pane rereads on
+        // save. The catalogue's own hub revision is unaffected — no registration changed.
+        return json(200, response, toolSettings.revision());
     };
 
     // Global execution resolves through the DEPLOYMENT catalogue only: there is no session
@@ -1942,6 +2011,9 @@ export const createHarnessApi = ({
      * (via the generated manifest) beside the EFFECTIVE values this runtime reads right now.
      * `values` comes from the store's settings-view resolution, so a row and a live plugin can
      * never disagree; `settings[].default` is the reset target a `null` patch restores.
+     * `enabled` is R2's global switch — the reserved key the hook gate consults
+     * (./plugins.ts, ../plugin/host.ts), read through the same live store, so a row that says
+     * `false` means the plugin is not running its hooks in ANY session right now.
      */
     const pluginRowOf = (metadata: HarnessPluginMetadata): PluginSummary => {
         const tags = metadata.tags === undefined ? undefined : [...metadata.tags];
@@ -1958,6 +2030,10 @@ export const createHarnessApi = ({
             // the field stays explicit (never inferred client-side) for the same reason the
             // harness card states it.
             builtin: metadata.builtin ?? true,
+            // R2 — read live from the same store the harness's gate consults, so the row
+            // and the runtime answer with one voice. A plugin that declares no `enabled`
+            // setting still has one (the reserved key); `values` stays declared-only.
+            enabled: plugins.enabled(metadata.name),
             settings: (metadata.settings ?? []).map(pluginSettingOf),
             values: plugins.values(metadata.name)
         };
@@ -1994,12 +2070,19 @@ export const createHarnessApi = ({
         );
     };
 
-    // `PATCH /plugins/{plugin_id}` — edit one plugin's settings.
+    // `PATCH /plugins/{plugin_id}` — edit one plugin's settings, including its `enabled` switch.
     //
     // IMMEDIATE and durable: the store applies the value to the live map the harness reads, then
     // the document carrying it is written BEFORE the answer (the store's rule for every
     // structural mutation, ./sessions.ts `updatePluginSettings`). No stream publish: there is no
     // `plugins` update kind in the contract's vocabulary, and the Plugins pane rereads.
+    //
+    // WRITE-ANYTIME by design (R1): there is NO idle gate here, unlike a session's tool switch
+    // (`assertIdleForToolMutation`). A setting write is not a structural change to a harness — no
+    // registration moves, no schema the model was promised disappears — and the page has to stay
+    // usable while a conversation is running, so the value simply takes effect on the next turn
+    // of every session. `{settings:{enabled:false}}` is the one-click global off switch; the
+    // response row reports the new state, so the client never re-reads to confirm its own click.
     const patchPlugin: Handler = async (ctx) => {
         const name = ctx.params.plugin_id;
         const body = requireObjectBody<PluginSettingsUpdate>(await ctx.body());
@@ -3711,9 +3794,29 @@ export const createHarnessApi = ({
 
         requireThread(record, threadId);
 
+        // Counted BEFORE the stop: this is the named conversation's own backlog at
+        // the moment the call begins (the contract's stated floor).
         const droppedQueued = record.lanes.get(threadId)?.queue.length ?? 0;
 
-        await store.cancelThread(record.id, threadId);
+        // R4 (T10): the receipt is the STORE's answer, not a constant. `cancelled`
+        // says whether this call actually terminated work (an aborted run, a released
+        // reference park, dropped queued turns), and `status` is where the conversation
+        // really stands afterwards. The store also cascades the stop to owner-linked
+        // children and may drop a legacy backlog, so a claimed total here would be a
+        // guess; the named-thread figures stay exactly as documented.
+        const stopped = await store.cancelThread(record.id, threadId);
+
+        // D1 (T14): the status is the CONVERSATION's own state as the harness reports it,
+        // read AFTER the stop. The roster projection is not a usable source here: it only
+        // publishes `origin === 'host'` rows (./sessions.ts `snapshot` ~:3704), so the
+        // default `agent:<name>` conversation has no row at all, and the previous
+        // `?? 'stopped'` fallback quoted a constant the record never confirmed. The harness
+        // thread record IS the source the roster row is projected from, so a host thread
+        // still answers with exactly the value its roster row carries (the contract's
+        // wording) while an `agent:` conversation answers with its real state.
+        // `requireThread` above guarantees this thread exists, so the fallback is only for
+        // a thread the runtime removed underneath this call.
+        const stoppedStatus = record.harness.thread(threadId)?.status ?? 'stopped';
 
         // T16 counter domains: the store signalled `thread.upsert` for the stop, which moved the
         // conversation and roster counters; the session row is the REST-owned figure here.
@@ -3723,13 +3826,18 @@ export const createHarnessApi = ({
         publish('thread.upsert', [
             { resource: 'thread', id: threadKey(record.id, threadId) },
             { resource: 'threads', id: record.id }
-        ], { thread_id: threadId, status: 'stopped' });
+        ], { thread_id: threadId, status: stoppedStatus });
 
-        const result: import('../shared/harness-api').CancelThreadResult = {
-            cancelled: true,
+        // T12 contract sync: the wire pair is now the GENERATED shape itself — the spec
+        // documents `cancelled` as an honest boolean and `status` as the conversation's
+        // post-stop status (`CancelThreadResult`, ../shared/harness-api.ts:1613 from
+        // ./harness.swagger.yaml:6748), so no widening cast or dropped annotation is needed
+        // here. The literals `true`/`"stopped"` were the answer this route used to hardcode.
+        const result: CancelThreadResult = {
+            cancelled: stopped.cancelled,
             thread_id: threadId,
             session_id: record.id,
-            status: 'stopped',
+            status: stoppedStatus,
             dropped_queued_tasks: droppedQueued,
             revision
         };
@@ -4119,7 +4227,8 @@ export const createHarnessApi = ({
         agents: { GET: getAgents },
         agentsByAgentId: { GET: getAgentOne, PATCH: patchAgent, DELETE: deleteAgent },
         tools: { GET: getTools },
-        toolsByToolId: { GET: getToolOne },
+        // R3: the identified read plus the one global write a catalogue entry has.
+        toolsByToolId: { GET: getToolOne, PATCH: patchTool },
         toolsByToolIdExecutions: { POST: postToolExecution },
         // T5 (R2/R3): the built-in plugin catalogue and the one writable field it has.
         plugins: { GET: getPlugins },
@@ -4230,7 +4339,14 @@ export const createHarnessApi = ({
                 return { kind: 'json', status: error.status, body: { error: { message: messageOf(error) } } };
             }
 
-            if (isInstanceOf(error, SessionError) || isInstanceOf(error, HarnessRegistryError) || isInstanceOf(error, AgentStateError) || isInstanceOf(error, HarnessPluginSettingsError)) {
+            if (
+                isInstanceOf(error, SessionError) ||
+                isInstanceOf(error, HarnessRegistryError) ||
+                isInstanceOf(error, AgentStateError) ||
+                isInstanceOf(error, HarnessPluginSettingsError) ||
+                // R3: the global tool switch's 400/403, status-carrying like the plugin one.
+                isInstanceOf(error, HarnessToolSettingsError)
+            ) {
                 return {
                     kind: 'json',
                     status: error.status,

@@ -86,29 +86,21 @@ describe('plugin manifest parity', () => {
         });
     });
 
-    it('ships the two preset plugins with their declared settings', () => {
+    it('ships the three preset plugins with their declared settings', () => {
         // Exact catalogue. A new `src/plugins/*.plugin.ts` changes this list ON PURPOSE,
         // which is the point: adding a preset is a visible, reviewed edit.
         expect(BUILTIN_PLUGIN_DESCRIPTORS).toEqual([
+            // Scan order is path-ascending: async-ping, context-compaction, context-trimmer.
+            // Every string below is copied from the plugin's own `metadata` export, because
+            // the plugin file is the single owner of its description (see the header memo).
             {
                 name: 'async-ping',
                 title: 'Background Ping',
-                description:
-                    'Keeps a conversation waiting on background tool work moving by emitting a periodic ping with the calls that are still running, replacing the fixed scheduler heartbeat.',
+                description: 'Keeps a conversation waiting on background tool work moving by emitting a periodic ping with the calls that are still running, replacing the fixed scheduler heartbeat.',
                 version: '1.0.0',
                 tags: ['background', 'async', 'lifecycle'],
                 builtin: true,
-                // R4: the ping plugin now OWNS the wake, so it also subscribes to the
-                // teardown events that clear its timer (there is no scheduler timer left
-                // to stop). Declared here = what `setup()` actually registers.
-                hooks: [
-                    'async.pending',
-                    'async.drained',
-                    'run.failed',
-                    'thread.stopped',
-                    'thread.deleted',
-                    'harness.dispose'
-                ],
+                hooks: ['async.pending', 'async.drained', 'run.failed', 'thread.stopped', 'thread.deleted', 'harness.dispose'],
                 settings: [
                     {
                         key: 'intervalMs',
@@ -117,16 +109,14 @@ describe('plugin manifest parity', () => {
                         default: 600000,
                         min: 1000,
                         step: 1000,
-                        description:
-                            'How often a still-running background tool is reported while work is pending. Defaults to the historical 10-minute wake.'
+                        description: 'How often a still-running background tool is reported while work is pending. Defaults to the historical 10-minute wake.'
                     }
                 ]
             },
             {
                 name: 'context-compaction',
                 title: 'Context Compaction',
-                description:
-                    'Watches each agent conversation against a context limit and, when the limit is reached, prunes the tool units a later success already answered at the turn boundary before the next model request is sent. Nothing is deleted: a pruned unit keeps its place in history and can be switched back on.',
+                description: 'Watches each agent conversation against a context limit and, when the limit is reached, prunes the tool units a later success already answered at the turn boundary before the next model request is sent. Nothing is deleted: a pruned unit keeps its place in history and can be switched back on. The limit is a ceiling, not the firing point: compaction starts gapTokens before the effective limit, where the effective limit is the per-model override for the model the conversation is running, capped by that model\'s declared context window when one is declared.',
                 version: '1.0.0',
                 tags: ['context', 'compaction', 'lifecycle'],
                 builtin: true,
@@ -139,45 +129,74 @@ describe('plugin manifest parity', () => {
                         default: 100000,
                         min: 1000,
                         step: 1000,
-                        description:
-                            'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost.'
+                        description: 'The global ceiling: estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. It is NOT the firing point. The firing point is the effective limit MINUS gapTokens, and the effective limit is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
                     },
-{
-                        key: "enabled",
-                        label: "Compact conversations",
-                        type: "boolean",
+                    {
+                        key: 'gapTokens',
+                        label: 'Headroom before the limit (tokens)',
+                        type: 'number',
+                        default: 65536,
+                        min: 0,
+                        step: 1024,
+                        description: 'How far BEFORE the effective limit compaction fires. The estimate measures the request that is about to go out; the request that comes back from it is bigger, because the answer plus the next tool block are appended to the same context — so firing exactly AT the limit is firing too late, and on a model with a hard window it is firing past the point the provider rejects. 0 restores the historical behaviour of acting exactly at the limit. It cannot take the firing point below 1 token: a limit smaller than the gap compacts as early as it possibly can.'
+                    },
+                    {
+                        key: 'modelLimits',
+                        label: 'Per-model limits (JSON)',
+                        type: 'string',
+                        default: '{}',
+                        description: 'A JSON object keyed by model id, each value `{ "limit": number, "window": number }` — both optional. `limit` replaces contextLimit for that model, for an operator who is willing to pay more (or less) for one model than for the rest. `window` states the model\'s HARD context window: it caps whatever limit is in force, so a 512000 ceiling on a 262144-token model still compacts around the 256k behaviour rather than waiting for a size the provider never accepts. Example: `{"gpt-4o": {"limit": 512000, "window": 131072}, "llama-8b": {"window": 8192}}`. The model id is read live from the agent, so switching models changes the ceiling on the next turn. Anything malformed — broken JSON, a value that is not an object, a non-positive or non-numeric limit — is ignored and the global limit applies, never an error.'
+                    },
+                    {
+                        key: 'enabled',
+                        label: 'Compact conversations',
+                        type: 'boolean',
                         default: true,
-                        description:
-                            "Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in."
-                        },
-{
-                        key: "minTokens",
-                        label: "Minimum saving per pass (tokens)",
-                        type: "number",
+                        description: 'Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in.'
+                    },
+                    {
+                        key: 'minTokens',
+                        label: 'Minimum saving per pass (tokens)',
+                        type: 'number',
                         default: 200,
                         min: 0,
                         step: 50,
-                        description:
-                            "A pass must withhold at least this many estimated tokens, or it does nothing at all \u2014 no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count."
-                        },
-{
-                        key: "safetyTurns",
-                        label: "Recent units to protect",
-                        type: "number",
+                        description: 'A pass must withhold at least this many estimated tokens, or it does nothing at all — no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count.'
+                    },
+                    {
+                        key: 'safetyTurns',
+                        label: 'Recent units to protect',
+                        type: 'number',
                         default: 6,
                         min: 0,
                         step: 1,
-                        description:
-                            "How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon."
-                        },
-{
-                        key: "mode",
-                        label: "Compaction mode",
-                        type: "string",
-                        default: "exclude",
-                        description:
-                            "What a compaction does with a unit it removes. Only \"exclude\" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. \"annotate\" \u2014 replace the result with a one-line handle back to the full text \u2014 is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than \"exclude\" (including that one) behaves as \"exclude\" until it lands. The value actually used is reported in the pass diagnostic."
-                        }
+                        description: 'How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon.'
+                    },
+                    {
+                        key: 'mode',
+                        label: 'Compaction mode',
+                        type: 'string',
+                        default: 'exclude',
+                        description: 'What a compaction does with a unit it removes. Only "exclude" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. "annotate" — replace the result with a one-line handle back to the full text — is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than "exclude" (including that one) behaves as "exclude" until it lands. The value actually used is reported in the pass diagnostic.'
+                    }
+                ]
+            },
+            {
+                name: 'context-trimmer',
+                title: 'Context Trimmer',
+                description: 'At the start of each assistant turn, finds tool calls that failed or were rejected and were later replaced by a successful call to the same tool, and excludes those paired call+result units from the context. Nothing is deleted: a trimmed unit keeps its place in history and can be switched back on.',
+                version: '1.0.0',
+                tags: ['context', 'trimming', 'lifecycle'],
+                builtin: true,
+                hooks: ['turn.before'],
+                settings: [
+                    {
+                        key: 'enabled',
+                        label: 'Trim superseded tool calls',
+                        type: 'boolean',
+                        default: true,
+                        description: 'Runs the trimming pass on or off. Off changes nothing else: units an earlier turn already trimmed stay trimmed until they are switched back on from the context view, no other plugin is affected, and the transcript is never rewritten. It is the switch an operator expects when they want the behaviour gone without removing the built-in.'
+                    }
                 ]
             }
         ]);

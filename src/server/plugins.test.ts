@@ -34,6 +34,7 @@ import { createPluginSettingsView } from '../plugin/settings';
 import type { HarnessPluginMetadata } from '../types';
 import {
     HarnessPluginSettingsError,
+    PLUGIN_ENABLED_KEY,
     createPluginSettingsStore,
     pluginSettingsProviderOf
 } from './plugins';
@@ -228,11 +229,11 @@ describe('plugin settings store — validation at the write edge', () => {
             message: 'Unknown setting "nope" for plugin "alpha". Allowed settings: limit, name, enabled.'
         });
 
-        // A plugin that declares nothing says so, rather than listing an empty allowlist.
+        // A plugin that declares nothing still has ONE accepted key: the framework's
+        // reserved `enabled` switch, which every plugin answers to (./plugins.ts).
         expect(failureOf(() => plugins.update('beta', { anything: 1 }))).toEqual({
             status: 400,
-            message:
-                'Unknown setting "anything" for plugin "beta". Allowed settings: none (this plugin declares no settings).'
+            message: 'Unknown setting "anything" for plugin "beta". Allowed settings: enabled.'
         });
     });
 
@@ -407,11 +408,11 @@ describe('plugin settings store — persistence round trip', () => {
 });
 
 describe('plugin settings store — the shipped built-in catalogue', () => {
-    it('seeds from the generated manifest and lists both built-ins', () => {
+    it('seeds from the generated manifest and lists the three built-ins', () => {
         const plugins = createPluginSettingsStore();
 
         // Manifest order is scan order (path ascending), which is what `GET /plugins` answers in.
-        expect(plugins.names()).toEqual(['async-ping', 'context-compaction']);
+        expect(plugins.names()).toEqual(['async-ping', 'context-compaction', 'context-trimmer']);
         expect(plugins.descriptors).toBe(BUILTIN_PLUGIN_DESCRIPTORS);
     });
 
@@ -420,18 +421,24 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
 
         expect(plugins.get('context-compaction', 'contextLimit')).toBeUndefined();
         expect(
-            // All FIVE declared defaults (compaction T4.6), in the order the descriptors are
-            // declared: this is the map the UI renders and the plugin reads when the host has
-            // stored nothing.
+            // EVERY declared default (compaction's limit/gap/model-map/switch/floor/horizon/
+            // mode, copied from src/plugins/context-compaction.plugin.ts), in the order the
+            // descriptors are declared: this is the map the UI renders and the plugin reads
+            // when the host has stored nothing.
             plugins.values('context-compaction')
         ).toEqual({
             contextLimit: 100000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
             mode: 'exclude'
         });
         expect(plugins.values('async-ping')).toEqual({ intervalMs: 600000 });
+        // The third built-in declares ONLY `enabled` — the key the framework owns — so its
+        // effective map is one entry, and the row's switch and its Rule-0 read agree on it.
+        expect(plugins.values('context-trimmer')).toEqual({ enabled: true });
         expect(plugins.snapshot()).toEqual({});
     });
 
@@ -445,9 +452,11 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
         // `max` is undeclared, so any larger finite limit is a legitimate operator choice.
         // `update` answers with the FULL effective map, so a UI that re-renders the row after
         // a PATCH shows every declared setting at its effective value: the override for
-        // `contextLimit`, and the declared default for the other four.
+        // `contextLimit`, and the declared default for the other six.
         expect(plugins.update('context-compaction', { contextLimit: 250000 })).toEqual({
             contextLimit: 250000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -458,5 +467,181 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
 
         // And a 0 (compact every turn) is below the declared floor.
         expect(failureOf(() => plugins.update('context-compaction', { contextLimit: 0 })).status).toBe(400);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — THE RESERVED `enabled` KEY (the operator's global plugin switch)
+//
+// Appended by the enablement work. Every assertion is exact (`toEqual`/`toBe`), and the
+// fixture catalogue is the one at the top of this file: `alpha` DECLARES `enabled`
+// (default false, its own descriptor) and `beta` declares NOTHING (so the synthesized
+// reserved descriptor is the only key it answers to).
+//
+// Cross-references:
+//   - ./plugins.ts       — `PLUGIN_ENABLED_KEY`, `RESERVED_ENABLED_DESCRIPTOR`, `enabled()`
+//   - ../plugin/host.ts  — the hook gate that reads the same stored value through the provider
+//   - ../plugin/hooks.ts — rule 9 (a gated owner is inert, not unregistered)
+describe('plugin settings store — the reserved `enabled` switch (R2)', () => {
+    it('answers the declared default for a declaring plugin and `true` for one that declares nothing', () => {
+        const plugins = store();
+
+        // `alpha` declares `enabled: false`, so the plugin owns the answer and the
+        // framework honours it — one stored value, read the same way by the gate.
+        expect(plugins.enabled('alpha')).toBe(false);
+
+        // `beta` declares no settings at all and still answers to the switch: the
+        // synthesized descriptor's `default: true` is the fallback.
+        expect(plugins.enabled('beta')).toBe(true);
+
+        // Nothing was stored to get there: the key is resolved, never seeded.
+        expect(plugins.get('alpha', PLUGIN_ENABLED_KEY)).toBeUndefined();
+        expect(plugins.get('beta', PLUGIN_ENABLED_KEY)).toBeUndefined();
+        expect(plugins.snapshot()).toEqual({});
+
+        // An unknown plugin is a total read (the ROUTE resolves identity with a 404), and
+        // its answer is the same default.
+        expect(plugins.enabled('missing')).toBe(true);
+    });
+
+    it('accepts `enabled` for a plugin that never declares it, and keeps `values` declared-only', () => {
+        const plugins = store();
+
+        // The update result is the EFFECTIVE map of declared keys, which for `beta` is
+        // still empty — the switch is the row's own `enabled` field, never a `values` entry
+        // (../shared/harness-api.ts `PluginSummary.values`: a key absent from `settings`
+        // can never appear there).
+        expect(plugins.update('beta', { [PLUGIN_ENABLED_KEY]: false })).toEqual({});
+        expect(plugins.enabled('beta')).toBe(false);
+        expect(plugins.get('beta', PLUGIN_ENABLED_KEY)).toBe(false);
+
+        // A second flip is a normal write, not a special case.
+        plugins.update('beta', { [PLUGIN_ENABLED_KEY]: true });
+        expect(plugins.enabled('beta')).toBe(true);
+
+        // `values('beta')` never grew a key: the declared projection is unchanged.
+        expect(plugins.values('beta')).toEqual({});
+        expect(plugins.settingsOf('beta')).toEqual([]);
+
+        // And the write IS allowlisted, so the accepted set names the reserved key.
+        expect(plugins.effectiveSettingsOf('beta').map((entry) => entry.key)).toEqual([PLUGIN_ENABLED_KEY]);
+        expect(plugins.effectiveSettingsOf('alpha').map((entry) => entry.key)).toEqual([
+            'limit',
+            'name',
+            'enabled'
+        ]);
+    });
+
+    it('persists the switch for a non-declaring plugin and restores it on the next boot', () => {
+        const plugins = store();
+
+        plugins.update('beta', { [PLUGIN_ENABLED_KEY]: false });
+
+        // The snapshot carries the override even though `beta` declares no descriptor of
+        // its own — `snapshotOf` walks the EFFECTIVE list.
+        expect(plugins.snapshot()).toEqual({ beta: { [PLUGIN_ENABLED_KEY]: false } });
+
+        const reopened = createPluginSettingsStore({
+            descriptors: FIXTURES,
+            values: plugins.snapshot()
+        });
+
+        expect(reopened.enabled('beta')).toBe(false);
+        expect(reopened.snapshot()).toEqual({ beta: { [PLUGIN_ENABLED_KEY]: false } });
+
+        // A restore is not a write, so the new process starts its own counter at zero.
+        expect(reopened.revision()).toBe(0);
+    });
+
+    it('honours a declaring plugin\'s own default, and puts the switch back on a null reset', () => {
+        const plugins = store();
+
+        // `alpha` defaults to OFF, and a reset lands back on THAT, not on `true`.
+        expect(plugins.enabled('alpha')).toBe(false);
+
+        plugins.update('alpha', { [PLUGIN_ENABLED_KEY]: true });
+        expect(plugins.enabled('alpha')).toBe(true);
+        expect(plugins.snapshot()).toEqual({ alpha: { [PLUGIN_ENABLED_KEY]: true } });
+
+        plugins.update('alpha', { [PLUGIN_ENABLED_KEY]: null });
+        expect(plugins.enabled('alpha')).toBe(false);
+        expect(plugins.get('alpha', PLUGIN_ENABLED_KEY)).toBeUndefined();
+
+        // The reset is a mutation, so it moves the collection counter (two accepted PATCHes).
+        expect(plugins.revision()).toBe(2);
+        expect(plugins.snapshot()).toEqual({});
+    });
+
+    it('refuses a non-boolean `enabled` with the declared-type message, accepting the words the runtime parses', () => {
+        const plugins = store();
+
+        expect(failureOf(() => plugins.update('beta', { [PLUGIN_ENABLED_KEY]: 'yes' }))).toEqual({
+            status: 400,
+            message: '"enabled" of plugin "beta" must be true or false (it is declared "boolean").'
+        });
+
+        expect(failureOf(() => plugins.update('beta', { [PLUGIN_ENABLED_KEY]: 0 }))).toEqual({
+            status: 400,
+            message: '"enabled" of plugin "beta" must be true or false (it is declared "boolean").'
+        });
+
+        // A refused switch mutated nothing.
+        expect(plugins.enabled('beta')).toBe(true);
+        expect(plugins.revision()).toBe(0);
+
+        // The string forms the read path also accepts are normalized to a real boolean, so
+        // a stored override is always exactly the declared type (and JSON-representable).
+        plugins.update('beta', { [PLUGIN_ENABLED_KEY]: 'FALSE' });
+        expect(plugins.get('beta', PLUGIN_ENABLED_KEY)).toBe(false);
+        expect(plugins.enabled('beta')).toBe(false);
+    });
+
+    it('drives the SAME provider read the harness gate performs, live and by reference', () => {
+        const plugins = store();
+        const provider = plugins.provider;
+
+        // The provider is the harness's only path to the switch (`../plugin/host.ts` builds
+        // each plugin's settings view over it), so this is the exact question the gate asks.
+        expect(plugins.enabled('beta')).toBe(true);
+        expect(provider.get('beta', PLUGIN_ENABLED_KEY)).toBeUndefined();
+
+        plugins.update('beta', { [PLUGIN_ENABLED_KEY]: false });
+
+        expect(provider.get('beta', PLUGIN_ENABLED_KEY)).toBe(false);
+        expect(plugins.enabled('beta')).toBe(false);
+
+        // Identity is stable for the process, which is what lets a harness built before the
+        // write see the value after it.
+        expect(plugins.provider).toBe(provider);
+    });
+
+    it('leaves the shipped catalogue resolvable through the reserved key', () => {
+        // The real built-ins, no fixtures: `async-ping` does NOT declare `enabled`, and
+        // `context-compaction` DOES, so one shipped build exercises both halves of the
+        // synthesized-vs-declared rule.
+        const plugins = createPluginSettingsStore();
+
+        expect(BUILTIN_PLUGIN_DESCRIPTORS.map((entry) => entry.name)).toEqual([
+            'async-ping',
+            'context-compaction',
+            'context-trimmer'
+        ]);
+        expect(plugins.settingsOf('async-ping').map((entry) => entry.key)).toEqual(['intervalMs']);
+        expect(plugins.effectiveSettingsOf('async-ping').map((entry) => entry.key)).toEqual([
+            'intervalMs',
+            PLUGIN_ENABLED_KEY
+        ]);
+
+        expect(plugins.update('async-ping', { [PLUGIN_ENABLED_KEY]: false })).toEqual({ intervalMs: 600000 });
+        expect(plugins.enabled('async-ping')).toBe(false);
+        expect(plugins.snapshot()).toEqual({ 'async-ping': { [PLUGIN_ENABLED_KEY]: false } });
+
+        // Compaction's declared key is the one its Rule-0 read already consults, so the
+        // framework gate and the plugin cannot disagree.
+        expect(plugins.enabled('context-compaction')).toBe(true);
+        expect(plugins.update('context-compaction', { [PLUGIN_ENABLED_KEY]: false })).toMatchObject({
+            enabled: false
+        });
+        expect(plugins.enabled('context-compaction')).toBe(false);
     });
 });

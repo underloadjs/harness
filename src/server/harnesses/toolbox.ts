@@ -591,7 +591,14 @@ export const createToolboxHarness = (
         // Only the REFERENCE crosses, and `harness()` never copies it: the settings view
         // built per plugin calls `provider.get` on every read (src/plugin/settings.ts:145-153),
         // so a value written after this harness was constructed is what its next turn sees.
-        ...(observer?.pluginSettings === undefined ? {} : { pluginSettings: observer.pluginSettings })
+        ...(observer?.pluginSettings === undefined ? {} : { pluginSettings: observer.pluginSettings }),
+        // R3: the host's live GLOBAL tool provider, on the identical rule (it is a
+        // HarnessConfiguration field, src/types/index.ts `HarnessConfiguration.toolSettings`).
+        // Presence means the harness honours the operator's disabled set at the three tool
+        // decisions (declarations, the launch gate, discovery); absence means nothing is
+        // disabled globally, which is what a lane worker still gets, because a closure cannot
+        // cross a `worker_threads` boundary (see ../tool-settings.ts "WORKER MODE").
+        ...(observer?.toolSettings === undefined ? {} : { toolSettings: observer.toolSettings })
     };
 
     return harness(liveConfiguration);

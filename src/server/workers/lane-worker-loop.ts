@@ -315,6 +315,26 @@ let localThreads: LocalThreadReads = {
     record: () => undefined
 };
 
+// T11 (RR4 loop) + T14 gap (d): the payload a lane raises for a routed `toolRequest`, extracted
+// to module scope and EXPORTED so the mapping is pinnable without a spawned thread. The 3rd
+// runtime argument (the toolRequest call's own id) is deliberately DROPPED — the canonical
+// pending board has no lane calls, and forwarding a lane id could mask a real canonical pending
+// task in the `toolCancel` report — while the 4th (`ToolContext.toolScope`, absent when the run
+// is unrestricted) is forwarded, because that is what makes the authority answer a scoped lane
+// with the honest `forbidden` shape instead of enabling a tool the lane's run cannot launch.
+// Dropping `scope` here is silent everywhere else: the authority simply answers the historical
+// unrestricted shape, and only this mapping (and the test over it) notices.
+export const requestToolsRoutePayload = (
+    caller: unknown,
+    parameters: unknown,
+    _selfCallId: unknown,
+    scope?: unknown
+): Record<string, unknown> => ({
+    parameters,
+    ...(scope === undefined ? {} : { scope }),
+    identity: identityOf(caller)
+});
+
 export const installAuthorityRuntime = (replica: Harness): void => {
     const runtime = replica.runtime as unknown as Record<string, unknown>;
 
@@ -357,7 +377,19 @@ export const installAuthorityRuntime = (replica: Harness): void => {
 
     route('manageTool', (caller, parameters) => ({ parameters, identity: identityOf(caller) }));
     route('createToolForAgent', (caller, creation) => ({ creation, identity: identityOf(caller) }));
-    route('requestTools', (caller, parameters) => ({ parameters, identity: identityOf(caller) }));
+    // T11 (RR4 loop): the 3rd runtime argument (the toolRequest call's id) is
+    // deliberately NOT forwarded — the canonical pending board has no lane calls, and
+    // forwarding a lane id could mask a real canonical pending task in the
+    // `toolCancel` report. The 4th (ToolContext.toolScope, absent when unrestricted)
+    // IS forwarded so the authority answers a scoped lane with the honest `forbidden`
+    // shape rather than enabling a tool the lane's run cannot launch (finding S-parity:
+    // the R1 denial must exist on the lane exactly as inline).
+    // T14 gap (d): the `requestTools` payload builder lives at module scope and is EXPORTED
+    // (`requestToolsRoutePayload`, above the install helper) so a test can pin the exact
+    // request body a lane raises — the one place the calling run's `toolScope` could be
+    // dropped on its way to the authority without any suite noticing. The registration below
+    // uses that function, so the pin cannot drift from the route.
+    route('requestTools', requestToolsRoutePayload);
     route('threadSend', (caller, threadId, parameters) => ({
         threadId: threadId as string | undefined,
         parameters,
@@ -501,6 +533,13 @@ const applySync = (sync: LaneRequestReplyValue['sync']): void => {
         if (granted.length > 0) {
             // LOCAL replay: `requestTools` is the core's only enabled-set writer and is
             // idempotent for names already enabled.
+            //
+            // T11 consistency: a FORBIDDEN lane toolRequest grants nothing canonically,
+            // so it produces no replay at all — the denial cannot leak into this or any
+            // sibling replica. And a name granted to an UNRESTRICTED lane that a later
+            // SCOPED run cannot use is still filtered at the declaration boundary by
+            // `declared(run.agent, run.toolScope)` (src/harness.ts), so replaying the
+            // canonical set unrestricted here never makes a scoped run see more.
             localRuntime.requestTools(undefined, { names: granted });
         }
     }

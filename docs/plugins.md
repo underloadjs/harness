@@ -78,6 +78,79 @@ does not exist until foreign code is ever loadable.
 
 ---
 
+## Global enablement — the operator's switch
+
+Every plugin answers to **one reserved setting key, `enabled`**, and the framework —
+not the plugin — acts on it. An operator flips it with a single click:
+
+```http
+PATCH /v1/harness/plugins/{plugin_id}
+{ "settings": { "enabled": false } }
+```
+
+**Resolution** is the ordinary settings order, and there is only one rule:
+
+```
+effective = stored override  ??  the plugin's declared `enabled` default  ??  true
+```
+
+A plugin that **declares** `enabled` in its own `metadata.settings`
+(`src/plugins/context-compaction.plugin.ts` does, as its Rule 0) keeps its own
+descriptor and its own default, and the framework gate and the plugin's own
+`api.settings.boolean('enabled', …)` read the **same stored value** — they can
+never disagree. A plugin that does **not** declare it (`async-ping`) still
+answers to it, because the key belongs to the framework: `src/server/plugins.ts`
+synthesizes the descriptor for the write edge, the persisted snapshot, the
+restore filter, and the read. The key is therefore accepted for every plugin and
+`GET /plugins` reports it on every row as the top-level `enabled` field — while
+`values` stays the projection of the **declared** keys only (a key absent from
+`settings` never appears there, so a client editing a form never edits
+enablement by accident).
+
+**What "off" means, precisely.** Nothing is un-loaded and nothing is
+un-registered:
+
+| Off stops | Off leaves alone |
+|---|---|
+| every lifecycle **hook delivery** to that plugin's handlers | its tools, agents, commands and slash commands |
+| the payload construction behind an `if (bus.has(event))` emit guard | its row in `GET /plugins` (still listed, with `enabled: false`) |
+| a plugin-owned timer from re-arming and waking (`async-ping` re-reads the key in its own `arm`/`tick`) | its settings, its source revision, and every other plugin |
+
+The gate lives in one place — `runPlugins` in `src/plugin/host.ts` builds each
+plugin's settings view and hands the bus a **live** `enabled()` predicate per
+registration — and `src/plugin/hooks.ts` rule 9 applies it at dispatch. Three
+consequences worth knowing:
+
+* **`harness.dispose` is exempt.** A disabled plugin still receives the
+  teardown event, so its timers, listeners and handles are always released. A
+  `'*'` observer is exempt for that event too, because the gate is applied to
+  the event being **delivered**, not to the event that was subscribed.
+* **A gate that throws reads as enabled.** Fail-open, like every other hook
+  rule: a host that cannot read its own settings document must not silence
+  every plugin in the process. A skipped delivery is *not* reported through
+  `onHandlerError` — an operator turning a plugin off is not a plugin failure.
+* **The switch is live, so it is global.** `harness()` stores the provider by
+  reference and the settings view re-reads it on every access, so an accepted
+  PATCH changes what **every existing session and thread** does on its very next
+  turn: no rebuild, no re-registration, no restart. There is deliberately no
+  idle gate on the route — a settings write moves no registration and removes no
+  schema a model was promised — so the Plugins page is usable while a
+  conversation is running. The value is durable before the response
+  (`state.json`, under `pluginSettings`), and a restart reads it back before the
+  first request.
+
+`count()` follows dispatch (it answers "how many handlers would this event
+reach right now"), while `live()` stays registration-based on purpose: the
+Plugins pane compares an author's declared `metadata.hooks` with what
+`setup()` actually subscribed to, and a disabled plugin did still subscribe.
+
+A CPU-isolated **lane worker** sees the same limit as every other settings
+read: a provider closure cannot cross `worker_threads`, so a replica that is
+already running picks the new value up when its lane is next created
+(`src/server/plugins.ts`, `WORKER MODE`).
+
+---
+
 ## The event catalogue
 
 Eighteen events (`HarnessLifecycleEvent`), payload per event in

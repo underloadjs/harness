@@ -15,7 +15,12 @@
 //   - `pluginSettings` (T5/R2-R3, optional) — the operator's per-plugin setting
 //     OVERRIDES, plugin name -> key -> value. Only what changed is stored: a
 //     plugin's declared default lives in its own `*.plugin.ts` metadata, so a
-//     release that changes a default needs no migration here.
+//     release that changes a default needs no migration here. The reserved
+//     `enabled` key of that map is R2's global plugin switch (./plugins.ts).
+//   - `toolSettings` (R3, optional) — the tool NAMES the operator has switched off
+//     for EVERY session (a deny list; everything else is enabled). Read back by the
+//     runtime's tool store (./tool-settings.ts) and consulted live by every harness,
+//     so a click applies to a running conversation on its next turn.
 //   - `sessions` — per-session identity, the FROZEN preset metadata and
 //     descriptor the session was created with (a later registry patch cannot
 //     change what an old session must rebuild), provider settings WITHOUT the
@@ -305,6 +310,25 @@ export type HarnessGlobalSettingsRecord = {
 // cannot resurrect itself on the next boot.
 export type HarnessPluginSettingsRecord = Record<string, Record<string, number | string | boolean>>;
 
+// R3 (ADDITIVE): the persisted shape of the GLOBAL tool switch — the tool NAMES this
+// deployment has switched off, for every session and every thread at once.
+//
+// A DENY LIST, not a per-tool record: "everything is enabled unless listed" is the state
+// every harness already has by default, so the document carries only the exceptions and a
+// deployment that never opened the Tools pane keeps its exact previous shape (the field is
+// optional in both directions, exactly like `pluginSettings`).
+//
+// Names, not definitions: the catalogue is composed at host startup (configuration plus
+// credentials), so a stored name may legitimately not exist in this build. The store
+// (./tool-settings.ts) keeps it anyway — re-adding the tool in a later release restores
+// the operator's decision — and the runtime simply never consults a name it does not know.
+// Names that belong to the protected control plane are DROPPED by the store on restore
+// (./tool-settings.ts), because no write path can produce them and a hand-edited document
+// must not be able to strand a conversation without its `toolRequest`.
+export type HarnessToolSettingsRecord = {
+    disabled?: string[];
+};
+
 // T19 (ADDITIVE): one trusted-catalogue agent profile as the GLOBAL override layer
 // records it. The shipped profile itself is compiled in (`src/agents`), so a record
 // stores ONLY what the operator changed plus the retirement flag — never a copy of the
@@ -360,6 +384,12 @@ export type HarnessDatabase = {
     // absent on a round trip. Values are JSON scalars only; the declared defaults they
     // override are NOT stored (they belong to the plugin's own metadata).
     pluginSettings?: HarnessPluginSettingsRecord;
+    // R3 (ADDITIVE): the tool NAMES the operator has switched off GLOBALLY, written by
+    // `PATCH /v1/harness/tools/{tool_id}` and read back at construction by the runtime's
+    // tool settings store (./tool-settings.ts, via `SessionStore`). Absent means "nothing
+    // is disabled", and an absent field stays absent on a round trip. Names only — the
+    // deny-list rule that makes the common case store nothing at all.
+    toolSettings?: HarnessToolSettingsRecord;
     sessions: HarnessSessionRecord[];
 };
 
@@ -684,6 +714,36 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
                   }
               })();
 
+    // T14 gap (c): the LABELS a deletion stripped from this turn (./protocol.ts
+    // `SessionTurn.strippedReferences`). Revalidated as labels, not free text, for exactly
+    // the reason `threadLabel` above is: this list is what `composeReferences` injects as a
+    // `#HEADING` when the turn runs, so a corrupt value would put a label the allocator can
+    // never mint in front of the model. Only labels are stored — the vanished target IDS are
+    // not, because a durable record must not name rows the document no longer lists. An
+    // absent key (every document written before this build, and every turn that never lost a
+    // reference) stays absent.
+    const strippedReferences =
+        record.strippedReferences === undefined
+            ? undefined
+            : (() => {
+                  if (!Array.isArray(record.strippedReferences)) {
+                      throw new TypeError(`${label}.strippedReferences must be an array.`);
+                  }
+
+                  return record.strippedReferences.map((entry, index) => {
+                      const value = requireString(entry, `${label}.strippedReferences[${index}]`);
+                      const parts = agentLabelParts(value);
+
+                      if (parts === undefined) {
+                          throw new TypeError(
+                              `${label}.strippedReferences[${index}] must be a conversation label such as "RR1".`
+                          );
+                      }
+
+                      return parts.label;
+                  });
+              })();
+
     // R1-R6: the persistent thread that owns this turn. OPTIONAL so every
     // pre-thread turn keeps its exact recorded shape; a non-empty string when
     // present (a thread id is opaque but never blank).
@@ -728,6 +788,12 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
         ...(threadId === undefined ? {} : { threadId }),
         ...(threadLabel === undefined ? {} : { threadLabel }),
         ...(references === undefined ? {} : { references }),
+        // T14 gap (c): the stripped labels, normalized and non-empty only (see the reader
+        // above). An empty list is dropped so a restored row has the exact shape `copyTurn`
+        // writes.
+        ...(strippedReferences === undefined || strippedReferences.length === 0
+            ? {}
+            : { strippedReferences }),
         ...(attachments === undefined ? {} : { attachments }),
         status: status as SessionTurn['status'],
         ...(record.startedAt === undefined
@@ -1405,6 +1471,44 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
                   return Object.keys(values).length === 0 ? undefined : values;
               })();
 
+    // R3 / the global tool switch (durability): the tool NAMES the operator switched off.
+    //
+    // Same discipline as `pluginSettings` two blocks above, in one fewer dimension:
+    //   - OPTIONAL in both directions — a deployment that never touched the Tools pane
+    //     keeps its exact previous document;
+    //   - STRICT about shape: the slot must be an object, `disabled` must be an array of
+    //     non-empty strings, and anything else is corruption of a named slot and throws
+    //     like every other field here (a wrong shape is a bug; a stale NAME is not, so
+    //     names are never checked against this build's catalogue);
+    //   - normalized, not preserved: duplicates and blank entries are dropped and the
+    //     order is sorted, because the writer emits a sorted set and a load->save round
+    //     trip of a hand-edited file must land on the same bytes;
+    //   - an empty list normalizes to ABSENT, because the writer never emits
+    //     `{ disabled: [] }` — gating here is what keeps load -> save byte-stable.
+    const toolSettings =
+        record.toolSettings === undefined
+            ? undefined
+            : (() => {
+                  const entry = requireRecord(record.toolSettings, 'The harness database toolSettings');
+
+                  const unknown = Object.keys(entry).filter((key) => key !== 'disabled');
+
+                  if (unknown.length > 0) {
+                      throw new TypeError(
+                          `The harness database toolSettings has unknown field(s): ${unknown.join(', ')}. Only "disabled" is defined.`
+                      );
+                  }
+
+                  if (entry.disabled === undefined) return undefined;
+
+                  const names = [...new Set(requireStringArray(entry.disabled, 'The harness database toolSettings.disabled'))]
+                      .map((name) => name.trim())
+                      .filter((name) => name.length > 0)
+                      .sort((left, right) => left.localeCompare(right));
+
+                  return names.length === 0 ? undefined : { disabled: names };
+              })();
+
     // Duplicate ids would make the Map silently keep only one session.
     const ids = new Set<string>();
     for (const session of sessions) {
@@ -1424,6 +1528,9 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
         // already carries the field does not reorder it.
         ...(globalSettings === undefined ? {} : { globalSettings }),
         ...(pluginSettings === undefined ? {} : { pluginSettings }),
+        // Same rule for the R3 tool switch: the writer (./sessions.ts `databaseRecord`)
+        // emits it directly after `pluginSettings`, so a restored document keeps its order.
+        ...(toolSettings === undefined ? {} : { toolSettings }),
         sessions
     };
 };

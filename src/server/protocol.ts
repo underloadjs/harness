@@ -143,6 +143,7 @@ export type SessionTurn = {
     // block and a nested block draw from it too), and a restored turn's recorded
     // label is adopted before anything is allocated, so a surviving `RR3` stays
     // `RR3` and the next conversation is `RR4`.
+    // `#` resolution, so it fails the load like any other corruption. Old documents simply have no key.
     threadLabel?: string;
     // Result blocks this task was submitted with (R2). A block is referenced by
     // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
@@ -153,6 +154,19 @@ export type SessionTurn = {
     // block has completed. Omitted for a task that references nothing, so every
     // pre-reference record keeps its exact shape.
     references?: AgentResultReference[];
+    // T14 gap (c): the `#LABEL`s this turn was submitted with that a DELETION took away.
+    //
+    // A turn can be QUEUED (its lane had not claimed it yet) when the conversation it
+    // references is deleted, and `purgeDeletedThread` strips the dangling link because a
+    // persisted record must not name a target that no longer exists. Before this field the
+    // label simply VANISHED: the turn later ran bare, with no trace of the input it lost.
+    // The LABELS are kept and the ids are not — ids point at rows that are gone — so
+    // `composeReferences` injects the same "was deleted, no result available" note that a
+    // waiter whose target died mid-park gets, and the user is told what is missing.
+    //
+    // Persisted (./persistence.ts revalidates it) and additive: a document written before
+    // this build has no key, and every turn that never lost a reference keeps its exact shape.
+    strippedReferences?: string[];
     // Composer attachments the user submitted with this turn (T3). Omitted for a
     // text-only turn, so every pre-attachment record and response keeps its exact
     // old shape. The server validates and deep-copies them before the turn exists,
@@ -984,12 +998,20 @@ export type SubmitTaskResult = {
     steeredThreadId?: string;
 };
 
-// Response of POST /sessions/:id/threads/:threadId/cancel (R6 stop-one).
+// Response of POST /sessions/:id/threads/:threadId/cancel (R6 stop-one), the STORE's
+// answer (./sessions.ts `cancelThread`) — not the REST receipt. The wire body is the
+// generated 6-field `CancelThreadResult` (../shared/harness-api.ts, built from
+// ./harness.swagger.yaml): this pair plus `thread_id`, `session_id`, the post-stop
+// `status`, `dropped_queued_tasks`, and `revision`.
 //
-// `cancelled` is true when a live run was aborted or at least one queued turn of
-// that thread was dropped; a thread that was merely marked stopped (idle, no work)
-// answers false. `session` is the post-stop snapshot so a client can repaint
-// without a second request.
+// `cancelled` is honest about what this call TERMINATED: true when it aborted a live
+// run, released a turn PARKED in a reference wait (its lane had claimed work the
+// runtime never started, so `harness.stopThread` alone reports false there), or dropped
+// at least one queued continuation — counting the named conversation and every
+// conversation it owns. False when the thread was only marked stopped: the stop still
+// lands (the row goes `stopped`, the backlog clears, its open questions expire), it just
+// ended no work. `session` is the post-stop snapshot so a client can repaint without a
+// second request.
 export type CancelThreadResult = {
     cancelled: boolean;
     session: SessionSnapshot;

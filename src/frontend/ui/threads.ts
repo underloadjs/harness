@@ -37,8 +37,8 @@
 //       (src/server/protocol.ts; aliased below as `InvalidThreadRecord`)
 //   SessionTurn.threadId?: string          // the turn's persistent thread
 //   SubmitTaskRequest.threadId?: string    // absent = create a NEW thread
-//   POST   /sessions/:id/threads/:threadId/cancel -> { cancelled, session? }
-//   DELETE /sessions/:id/threads/:threadId        -> { deleted: true, session }
+//   POST   /sessions/:id/threads/:threadId/cancel -> { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }
+//   DELETE /sessions/:id/threads/:threadId        -> { deleted, thread_id, session_id, removed_descendants, removed_turns, revision }
 //
 // The persisted `HarnessThreadSnapshot` (src/types/index.ts) is a DIFFERENT shape
 // (snapshot v1, with `messages`); it is not rendered here. A client must not join

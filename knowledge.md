@@ -2965,6 +2965,8 @@ paths below `/v1/harness` **plus** the bare root:
 | `PUT /api/sessions/:id/threads/:threadId/transcript` | `{ messages }` → `{ session, transcript }`. Wholesale transcript replace. A structurally invalid value is a **200**: it is persisted, the live transcript becomes the `[transcript unreadable: …]` placeholder, and `transcript.invalid` explains why. `400` absent `messages`/non-object body, `404` unknown thread, `405` other methods, `409` running thread or a harness handle without `setThreadMessages` |
 | `GET /api/sessions/:id/events` | SSE watcher: one `snapshot`, `turn` upserts (queued/running/terminal), `event` frames, one final `snapshot` on drain. Disconnect only unsubscribes |
 | `POST /api/sessions/:id/reset` | Reset every agent + discovery + tasks + record stores; `409` while a run or queued work is pending |
+| `POST /api/sessions/:id/threads/:threadId/cancel` | `{}` → `200 { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }` (the generated `CancelThreadResult`, `src/shared/harness-api.ts`). `cancelled` is the STORE's honest answer: true exactly when this call terminated work — an aborted run, a turn released from a reference PARK (its lane had claimed work the runtime never started), or at least one dropped queued continuation, counting the named conversation and every conversation it owns; false when the stop only marked the conversation `stopped`. `status` is the conversation's real post-stop status read from its own record (never a constant), `dropped_queued_tasks` is the NAMED conversation's own backlog measured before the stop (a floor, not the cascade's total), and `revision` is the thread resource's counter the roster repaint reads |
+| `DELETE /api/sessions/:id/threads/:threadId` | `200 { deleted, thread_id, session_id, removed_descendants, removed_turns, revision }`. Stops that conversation first (the cancel above, so live and queued rows are dropped as `cancelled`) and only then purges it: the conversations it owns, their owning turns, transcripts and persisted copies. The agent's own `agent:<name>` conversation is `400` (use reset) |
 | `POST /api/sessions/:id/cancel` | `{ all?: boolean }` → `{ cancelled }`. Default aborts the active run only; `all: true` also cancels every queued turn, which stays in `turns` as `cancelled` |
 | `POST /api/sessions/:id/actions/:requestId/answer` | `{ choice: HarnessActionChoice }` → `{ ok: true }`. Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
 | `DELETE /api/sessions/:id` | Forget the session: abort active work, drop queued work, close watchers |
@@ -3335,8 +3337,9 @@ memory (tasks/profiles/chapters/locations), and not a result a connected thread
   editor with that banner plus the raw value. Only an absent `messages` property is a
   `400`: the service adapter hands an unparseable body as `{}`, so accepting it would
   silently EMPTY a transcript. The rest of the contract is `409` for a running thread
-  (record `running` or a lane with an active run — the same predicate `deleteThread`
-  uses), `404` for an unknown session/thread, `405` for any other method, and `409`
+  (record `running` or a lane with an active run — this route's own live-work gate;
+  `deleteThread` no longer refuses on it, because a delete now STOPS the conversation
+  first and only then purges it), `404` for an unknown session/thread, `405` for any other method, and `409`
   when the session's harness handle predates `setThreadMessages`.
 - **`harness.setThreadMessages(threadId, messages)` is the write primitive
   (`src/harness.ts`), and its order is fixed.** Resolve the thread (an unknown id is

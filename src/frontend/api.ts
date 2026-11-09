@@ -66,6 +66,7 @@ import type {
     AttachmentResponse,
     CancelSessionRequest,
     CancelSessionResult,
+    CancelThreadResult,
     CommandPage,
     CreateHarnessRequest as HarnessCreateRequest,
     CreateSessionAgentRequest,
@@ -124,6 +125,7 @@ import type {
     ToolCallResult,
     ToolDetail,
     ToolDetailResponse,
+    ToolSettingsUpdate,
     ToolSummary,
     ToolSummaryPage,
     TranscriptDocumentResponse,
@@ -879,6 +881,22 @@ export const listTools = (query: PageQuery = {}): Promise<Page<ToolSummary>> =>
 export const getTool = (name: string): Promise<ToolDetail> =>
     request<ToolDetailResponse>(HARNESS_ROUTES.toolsByToolId(encodeURIComponent(name))).then((body) => body.tool);
 
+// `PATCH /tools/{id}` — R3's ONE global switch for one catalogue entry: on or off for
+// EVERY session. The body is exactly `{ enabled: boolean }` (../shared/harness-api.ts
+// `ToolSettingsUpdate`), and the answer is the whole updated `ToolDetail` row, so the
+// caller repaints from the server's figure rather than from an optimistic guess.
+//
+// Write-anytime: the route has no idle gate (a run in flight keeps the tool list it was
+// given, and the next request rebuilds it), so the Tools pane can offer this control
+// while a thread streams. A protected (harness-owned) name is a 403 and an unknown name
+// a 404; `request` flattens both to a `ErrorBody.message` throw, which is the sentence
+// the pane prints.
+export const updateToolEnabled = (name: string, enabled: boolean): Promise<ToolDetail> =>
+    request<ToolDetailResponse>(HARNESS_ROUTES.toolsByToolId(encodeURIComponent(name)), {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled } satisfies ToolSettingsUpdate)
+    }).then((body) => body.tool);
+
 // `POST /tools/{id}/executions` — the manual playground call. Both outcomes are a
 // 200; the caller branches on `ok`, never on the status code.
 export const executeGlobalTool = (name: string, parameters?: unknown): Promise<ToolCallResult> =>
@@ -941,19 +959,66 @@ export const updatePluginSettings = (
         body: JSON.stringify({ settings } satisfies PluginSettingsUpdate)
     }).then((body) => body.plugin);
 
+// Compact, deterministic description of a parsed JSON body, for the discovery
+// failure below. Only the SHAPE is reported: a proxy body can be megabytes of
+// provider HTML that happens to parse, and the operator needs "an object with
+// fields ok", not a dump.
+const describeShape = (value: unknown): string => {
+    if (value === null) return 'null';
+    if (value === undefined) return 'no body';
+    if (Array.isArray(value)) return `an array of ${value.length} item(s)`;
+
+    if (typeof value === 'object') {
+        const keys = Object.keys(value as Record<string, unknown>);
+
+        return keys.length === 0 ? 'an object with no fields' : `an object with fields ${keys.join(', ')}`;
+    }
+
+    // A primitive carries its own value, truncated: `"404 Not Found"` is the
+    // sentence a mis-proxied mount answers with, and it is worth naming.
+    const preview = typeof value === 'string' ? `"${value.slice(0, 40)}"` : String(value);
+
+    return `a ${typeof value} (${preview})`;
+};
+
 // `POST /models` — provider discovery. `api_key` is write-only and travels in
 // this body (never a query string), and `signal` abandons a superseded lookup.
+//
+// R2a: this is the one read whose success is a SHAPE rather than a status, so a
+// 200 is not enough. The contract answer is `ModelIndex` = `{ models: string[],
+// observed_at: number }` (../shared/harness-api.ts:889-897); anything else throws
+// with the route and what actually arrived, in the same voice as the transport's
+// non-JSON failure (:627-629). Silently answering `[]` for a malformed body — the
+// previous behavior — is what made a stale server in front of the API look like "no
+// models exist": the caller's catalogue went empty with no error to report and the
+// picker kept only the remembered model (distribution/chat-assistant
+// src/dashboard/plugins/source.ts:854-887, `refreshModels`).
+//
+// A legitimately EMPTY catalogue still resolves to `[]` (the contract's "the
+// provider answered and served nothing usable"), so the empty case stays a value,
+// never a failure.
 export const listProviderModels = async (
     settings: RunnerSettingsInput,
     signal?: AbortSignal
 ): Promise<string[]> => {
-    const body = await request<ModelIndex>(HARNESS_ROUTES.models(), {
+    const route = pathOf(HARNESS_ROUTES.models());
+    // `request` types the parsed body from the caller's declaration, so the value
+    // is validated as `unknown` before it is trusted as a `ModelIndex`.
+    const body: unknown = await request<ModelIndex>(HARNESS_ROUTES.models(), {
         method: 'POST',
         body: JSON.stringify({ settings } satisfies ModelDiscoveryRequest),
         ...(signal === undefined ? {} : { signal })
     });
 
-    return Array.isArray(body.models) ? body.models : [];
+    const models = (body as Partial<ModelIndex> | null | undefined)?.models;
+
+    if (!Array.isArray(models)) {
+        throw new Error(
+            `The harness server returned an unexpected response for ${route} (expected the contract's {models: string[]} object, received ${describeShape(body)}).`
+        );
+    }
+
+    return models as string[];
 };
 
 // ---------------------------------------------------------------------------
@@ -1240,7 +1305,10 @@ export const createSessionThread = (id: string, input: CreateSessionThreadReques
 // `POST .../threads/{id}/cancel` and `DELETE .../threads/{id}` answer receipts that
 // name what moved (`revision`), not a post-mutation document: the stream is the
 // document's update plane, so a stop no longer costs a full view round trip.
-export const cancelSessionThread = (id: string, threadId: string): Promise<{ cancelled: boolean; thread_id: string; session_id: string; status: 'stopped'; dropped_queued_tasks: number; revision: number }> =>
+// R4 (T12): the receipt is the GENERATED contract type, not a hand-rolled mirror -
+// the mirror pinned `status: 'stopped'`, which the honest wire value (the thread
+// row's post-stop status) may widen. See `CancelThreadResult`, ../shared/harness-api.ts.
+export const cancelSessionThread = (id: string, threadId: string): Promise<CancelThreadResult> =>
     request(
         HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdCancel(
             encodeURIComponent(id),
@@ -1438,6 +1506,13 @@ export const descriptorOf = (card: HarnessCard | HarnessDefinition): HarnessCard
 
 // A catalogue row as the tools view renders it. `session_bound` is the contract's
 // spelling of "this entry only runs inside a conversation".
+//
+// R3 (the global enablement switch): `enabled` and `protected` are NOT dropped any more —
+// they are the two fields the Tools pane paints its toggle from, and both ride every
+// `GET /tools` row and the identified read (../shared/harness-api.ts `ToolSummary` at
+// :741-752). `protected` is the harness-owned set (toolRequest/toolCreate/task/delegate):
+// the server answers `enabled: true` for it and refuses a switch with 403, so the row
+// renders a pin instead of a control.
 export type ToolRowView = {
     name: string;
     group: string;
@@ -1445,6 +1520,8 @@ export type ToolRowView = {
     tags: string[];
     visibility: 'core' | 'searchable';
     sessionBound: boolean;
+    enabled: boolean;
+    protected: boolean;
     availability?: ToolSummary['availability'];
 };
 
@@ -1455,6 +1532,8 @@ export const toolRowOf = (tool: ToolSummary | ToolDetail): ToolRowView => ({
     tags: [...tool.tags],
     visibility: tool.visibility,
     sessionBound: tool.session_bound,
+    enabled: tool.enabled,
+    protected: tool.protected,
     ...(tool.availability === undefined ? {} : { availability: tool.availability })
 });
 

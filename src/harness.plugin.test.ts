@@ -103,10 +103,11 @@ describe('plugin auto-discovery', () => {
 
         // The generated manifest, in scan order — no host configuration was needed to
         // get the presets, which is what "automatically scanned and loaded" means.
-        expect(writer.plugins).toEqual(['async-ping', 'context-compaction']);
+        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'context-trimmer']);
         expect(writer.pluginMetadata.map((entry) => entry.title)).toEqual([
             'Background Ping',
-            'Context Compaction'
+            'Context Compaction',
+            'Context Trimmer'
         ]);
 
         // The catalogue is data only: exactly what a server needs to hand a UI, and
@@ -119,47 +120,58 @@ describe('plugin auto-discovery', () => {
                 default: 100000,
                 min: 1000,
                 step: 1000,
-                description:
-                    'Estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost.'
+                description: 'The global ceiling: estimated tokens a conversation may reach before this plugin compacts it. Measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. It is NOT the firing point. The firing point is the effective limit MINUS gapTokens, and the effective limit is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
             },
-{
-                key: "enabled",
-                label: "Compact conversations",
-                type: "boolean",
+            {
+                key: 'gapTokens',
+                label: 'Headroom before the limit (tokens)',
+                type: 'number',
+                default: 65536,
+                min: 0,
+                step: 1024,
+                description: 'How far BEFORE the effective limit compaction fires. The estimate measures the request that is about to go out; the request that comes back from it is bigger, because the answer plus the next tool block are appended to the same context — so firing exactly AT the limit is firing too late, and on a model with a hard window it is firing past the point the provider rejects. 0 restores the historical behaviour of acting exactly at the limit. It cannot take the firing point below 1 token: a limit smaller than the gap compacts as early as it possibly can.'
+            },
+            {
+                key: 'modelLimits',
+                label: 'Per-model limits (JSON)',
+                type: 'string',
+                default: '{}',
+                description: 'A JSON object keyed by model id, each value `{ "limit": number, "window": number }` — both optional. `limit` replaces contextLimit for that model, for an operator who is willing to pay more (or less) for one model than for the rest. `window` states the model\'s HARD context window: it caps whatever limit is in force, so a 512000 ceiling on a 262144-token model still compacts around the 256k behaviour rather than waiting for a size the provider never accepts. Example: `{"gpt-4o": {"limit": 512000, "window": 131072}, "llama-8b": {"window": 8192}}`. The model id is read live from the agent, so switching models changes the ceiling on the next turn. Anything malformed — broken JSON, a value that is not an object, a non-positive or non-numeric limit — is ignored and the global limit applies, never an error.'
+            },
+            {
+                key: 'enabled',
+                label: 'Compact conversations',
+                type: 'boolean',
                 default: true,
-                description:
-                    "Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in."
-                },
-{
-                key: "minTokens",
-                label: "Minimum saving per pass (tokens)",
-                type: "number",
+                description: 'Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in.'
+            },
+            {
+                key: 'minTokens',
+                label: 'Minimum saving per pass (tokens)',
+                type: 'number',
                 default: 200,
                 min: 0,
                 step: 50,
-                description:
-                    "A pass must withhold at least this many estimated tokens, or it does nothing at all \u2014 no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count."
-                },
-{
-                key: "safetyTurns",
-                label: "Recent units to protect",
-                type: "number",
+                description: 'A pass must withhold at least this many estimated tokens, or it does nothing at all — no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count.'
+            },
+            {
+                key: 'safetyTurns',
+                label: 'Recent units to protect',
+                type: 'number',
                 default: 6,
                 min: 0,
                 step: 1,
-                description:
-                    "How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon."
-                },
-{
-                key: "mode",
-                label: "Compaction mode",
-                type: "string",
-                default: "exclude",
-                description:
-                    "What a compaction does with a unit it removes. Only \"exclude\" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. \"annotate\" \u2014 replace the result with a one-line handle back to the full text \u2014 is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than \"exclude\" (including that one) behaves as \"exclude\" until it lands. The value actually used is reported in the pass diagnostic."
-                }
+                description: 'How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon.'
+            },
+            {
+                key: 'mode',
+                label: 'Compaction mode',
+                type: 'string',
+                default: 'exclude',
+                description: 'What a compaction does with a unit it removes. Only "exclude" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. "annotate" — replace the result with a one-line handle back to the full text — is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than "exclude" (including that one) behaves as "exclude" until it lands. The value actually used is reported in the pass diagnostic.'
+            }
         ]);
-        expect(writer.pluginMetadata.map((entry) => entry.builtin)).toEqual([true, true]);
+        expect(writer.pluginMetadata.map((entry) => entry.builtin)).toEqual([true, true, true]);
     });
 
     it('lists a metadata-free host plugin after the built-ins with a synthesized entry', () => {
@@ -168,8 +180,8 @@ describe('plugin auto-discovery', () => {
             plugins: [{ name: 'extras', setup: () => undefined }]
         });
 
-        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'extras']);
-        expect(writer.pluginMetadata[2]).toEqual({ name: 'extras', title: 'extras', builtin: false });
+        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'context-trimmer', 'extras']);
+        expect(writer.pluginMetadata[3]).toEqual({ name: 'extras', title: 'extras', builtin: false });
     });
 
     it('replaces a same-name built-in in place instead of registering it twice', () => {
@@ -185,8 +197,9 @@ describe('plugin auto-discovery', () => {
         });
 
         // One entry, same slot: the shipped compaction plugin's hooks were never
-        // registered, so an operator swapping it out does not get two compactors.
-        expect(writer.plugins).toEqual(['async-ping', 'context-compaction']);
+        // registered, so an operator swapping it out does not get two compactors. The
+        // OTHER two built-ins keep their own slots (trimmer after compaction, in scan order).
+        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'context-trimmer']);
         expect(writer.pluginMetadata[1]).toEqual({
             name: 'context-compaction',
             title: 'My Compactor',
@@ -262,7 +275,7 @@ describe('plugin auto-discovery', () => {
         expect(seen).toEqual({ stored: 42, undeclared: 3 });
         expect(asked).toEqual(['reader.limit', 'reader.other']);
         // The built-ins still loaded; a host provider is additive, not a replacement.
-        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'reader']);
+        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'context-trimmer', 'reader']);
     });
 });
 

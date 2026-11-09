@@ -22,7 +22,7 @@ export const TOOL_REQUEST_NAME = 'toolRequest';
 export const TOOL_REQUEST_METADATA: CoreToolMetadata = {
     name: TOOL_REQUEST_NAME,
     description:
-        'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.',
+        'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.',
     tags: ['discovery', 'tools', 'catalogue'],
     visibility: 'core',
     parameters: {
@@ -76,5 +76,10 @@ export const execute = (context: ToolContext) => {
         throw new Error('toolRequest requires the live harness reference.');
     }
 
-    return harness.runtime.requestTools(context.agent, context.parameters, context.callId);
+    // T11 (RR4 loop): `context.toolScope` is the CALLING RUN's allowlist (a delegation's
+    // `scope.tools`; absent for an unscoped or manual call). Passing it is what lets the
+    // harness answer out-of-scope matches as `forbidden` instead of `enabled` — the
+    // toolRequest TOOL itself stays callable from any scope (the escape hatch), only its
+    // ANSWER becomes scope-aware.
+    return harness.runtime.requestTools(context.agent, context.parameters, context.callId, context.toolScope);
 };

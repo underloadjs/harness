@@ -108,7 +108,18 @@ export type LaneRuntimeCall =
     | { op: 'runtime'; method: 'executeRecords'; name: RecordToolName; parameters: unknown; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'manageTool'; parameters: unknown; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'createToolForAgent'; creation: unknown; identity: LaneCallIdentity }
-    | { op: 'runtime'; method: 'requestTools'; parameters: unknown; identity: LaneCallIdentity }
+    // T11 (RR4 loop): `scope` is the CALLER'S run tool allowlist (ToolContext.toolScope)
+    // carried with a routed toolRequest, so the canonical harness answers a scoped lane
+    // with the same honest `forbidden` shape an inline scoped child gets. It is
+    // optional: every pre-T11 request — and every unscoped lane turn — stays
+    // byte-for-byte identical on the wire and in the coordinator.
+    | {
+          op: 'runtime';
+          method: 'requestTools';
+          parameters: unknown;
+          scope?: readonly string[];
+          identity: LaneCallIdentity;
+      }
     | { op: 'runtime'; method: 'listTools'; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'agentManage'; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'agentResult'; parameters: Record<string, unknown>; identity: LaneCallIdentity }
@@ -697,7 +708,20 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         return { value, sync: { enabled: enabledNow() } };
                     }
                     case 'requestTools': {
-                        const value = await runtime.requestTools(callerFor(request.identity), request.parameters);
+                        // T11 (RR4 loop): the lane's run scope (when it carries one) is
+                        // passed to the canonical harness's own `requestToolsFor`, so
+                        // the DENIAL is computed at the single writer of the enabled set
+                        // — an out-of-scope name is neither enabled canonically nor
+                        // replayed into this replica (the `sync.enabled` below simply
+                        // does not contain it). `selfCallId` stays unset on purpose: the
+                        // canonical pending board has no lane tool calls, and a lane
+                        // call id must not mask a real canonical pending task.
+                        const value = await runtime.requestTools(
+                            callerFor(request.identity),
+                            request.parameters,
+                            undefined,
+                            request.scope
+                        );
 
                         return { value, sync: { enabled: enabledNow() } };
                     }

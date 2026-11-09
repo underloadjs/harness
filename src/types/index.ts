@@ -638,6 +638,27 @@ export type ToolMatch = {
     tags: string[];
 };
 
+// T11 (RR4 loop): ONE honest denial in a scoped run's toolRequest result.
+//
+// A delegation `scope.tools` is a hard allowlist, and the SAME predicate that hides a
+// tool from the run's declarations and refuses its launch (`isToolInScope` in
+// src/harness.ts) also decides this entry. Before T11 discovery ignored the scope and
+// reported such a match under `enabled` — the model called the tool, hit the launch-gate
+// refusal, re-requested, and livelocked (observed live: 135 round-trips, 5.6k→152k
+// tokens). The entry is pure data so it survives JSON delivery:
+//   - `name`   — the exact wire name that was requested,
+//   - `reason` — why it is denied, the allowed list, and an explicit statement that
+//                re-requesting will not change the answer (so the model adapts instead
+//                of looping),
+//   - `allowed`— the run's scope exactly as the delegation stated it (the same list the
+//                launch-gate refusal names; `toolRequest` itself is always callable via
+//                the escape hatch and needs no entry here).
+export type ToolRequestForbidden = {
+    name: string;
+    reason: string;
+    allowed: string[];
+};
+
 // The result of a LEGACY toolRequest-style search call, and the return value of the
 // pure `searchTools()` helper. Shaped as data because it travels back to the model
 // as a tool result.
@@ -696,6 +717,16 @@ export type ToolSearchResult = {
     // 'primary' policy too), which is what keeps this list honest rather than a
     // registry dump.
     alreadyAvailable?: ToolMatch[];
+    // T11 (RR4 loop): matches the CALLER'S RUN cannot use because its delegation scope
+    // (`delegate`'s `scope.tools`) excludes them — for both halves of the answer: a
+    // searchable match that would have been enabled, and a core match that would have
+    // been reported as `alreadyAvailable`. A forbidden name is NEVER added to
+    // `enabled`/`tools` and never touches the session-wide enabled set, so discovery
+    // can no longer promise a capability the launch gate will refuse.
+    //
+    // Present only in a SCOPED run and only when at least one match is denied, so an
+    // unscoped result keeps its pre-T11 shape byte for byte.
+    forbidden?: ToolRequestForbidden[];
 };
 
 // Optional context for `searchTools()`. Purely additive: a caller that omits it
@@ -892,12 +923,19 @@ export type HarnessMemory = {
 export type HarnessToolRuntime = {
     // toolRequest: select/enable catalogue matches with this harness's enabled-set
     // bound and caller-specific core view.
+    //
+    // T11 (RR4 loop): `scope` is the CALLING RUN's tool allowlist (a delegation's
+    // `scope.tools`, carried on ToolContext.toolScope). When present, matches outside
+    // it are reported under `forbidden` instead of `enabled`, and nothing about them
+    // is written to the session-wide enabled set. Omitted means the historical
+    // unrestricted run — the result shape is unchanged byte for byte.
     requestTools: (
         caller: Agent | undefined,
         parameters:
             | { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown }
             | unknown,
-        selfCallId?: string
+        selfCallId?: string,
+        scope?: readonly string[]
     ) => unknown;
     // toolList: every live registry entry, in insertion order, name+description only.
     listTools: () => HarnessToolListEntry[];
@@ -979,6 +1017,10 @@ export type HarnessToolCallOptions = {
     signal?: AbortSignal;
     threadId?: string;
     runDepth?: number;
+    // T11: the tool allowlist to carry into the call's ToolContext (the run scope a
+    // nested `context.callTool` inherits, or an explicit host bound). `toolRequest`
+    // reads it from the context; absent means unrestricted.
+    toolScope?: readonly string[];
 };
 
 // Who may create tools at runtime (R12). See HarnessConfiguration.toolCreation:
@@ -1737,6 +1779,14 @@ export type ToolContext<TParameters = any> = {
     // otherwise indistinguishable, and a delegation would report its sibling's
     // identity. Absent for a manual `executeTool` call, which has no run.
     runScope?: string;
+    // T11 (RR4 loop): the tool ALLOWLIST of the run executing this call (a delegation's
+    // `scope.tools`, T28). Absent means the run is unrestricted. `toolRequest` reads
+    // this so a scoped child gets an honest `forbidden` answer for a capability its
+    // scope excludes, instead of an `enabled` claim the launch gate then refuses — the
+    // contradiction that livelocked RR4 for 135 round-trips. The same `isToolInScope`
+    // predicate (src/harness.ts) decides declarations, launch refusals, and this
+    // field, so the three can never disagree again.
+    toolScope?: readonly string[];
     // Cancellation for the run that invoked this tool (R10), forwarded from
     // `HarnessRunOptions.signal`. Present for every HARNESS invocation (a direct
     // standalone call has none).
@@ -3024,6 +3074,20 @@ export type HarnessConfiguration = {
     // declared setting defaults, with `wakeIntervalMs` mapped onto the `async-ping`
     // plugin's `intervalMs` so the legacy configuration field keeps working.
     pluginSettings?: HarnessPluginSettingsProvider;
+    // The host's GLOBAL tool switch (R3): one live provider over the tool names this
+    // deployment has disabled for every session. Presence means the harness consults it
+    // at the three tool-availability decisions (declarations, the launch gate, and
+    // `toolRequest`'s forbidden report); absence means nothing is disabled globally,
+    // which is the historical behaviour. It COMPOSES with the two per-run gates that
+    // already exist — a delegation's `scope.tools` allowlist and this harness's own
+    // session-wide enabled set — and changes neither.
+    //
+    // A DISABLED TOOL STAYS REGISTERED. Discovery can still list it, a host can still
+    // execute it through `harness.executeTool`, and re-enabling costs nothing; only a
+    // model's view of it (declared / callable / promiseable) changes. The core control
+    // plane is excluded at the WRITE edge (the server refuses a protected name with 403),
+    // so a document can never hide `toolRequest` or `task` from a conversation.
+    toolSettings?: HarnessToolSettingsProvider;
 };
 
 // The callable harness. `await writer('...')` runs the entry agent to
@@ -3577,6 +3641,26 @@ export type HarnessPluginSettingsProvider = {
     // never has to accept a numeric string for a `number` setting (src/plugin/settings.ts
     // `setOwnValue`, mirroring src/server/plugins.ts `checkValue`).
     set?(plugin: string, key: string, value: number | string | boolean): void;
+};
+
+// Host-side read model for the GLOBAL tool switch (R3). The deployment keeps one set of
+// tool NAMES that are switched off for every session; everything else is enabled unless
+// listed, so the set is a delta and a harness built without a provider behaves exactly as
+// it did before this field existed.
+//
+// LIVE BY REFERENCE, exactly like `HarnessPluginSettingsProvider`: `harness()` stores the
+// object, never a copy of its contents, and the three places that decide tool availability
+// (the declaration filter, the launch gate, and `toolRequest`'s forbidden report — all in
+// src/harness.ts) call it per decision. An operator's
+// `PATCH /v1/harness/tools/{tool_id}` therefore changes what an ALREADY RUNNING session
+// declares on its next request, with no rebuild and no re-registration.
+//
+// Read-only by contract: the write edge is the server's (src/server/tool-settings.ts),
+// which owns validation, protection, and durability. Synchronous and total; a provider
+// that throws fails the read, the same rule the plugin provider follows — a wrong answer
+// about which tools exist must not be silently swallowed inside a turn.
+export type HarnessToolSettingsProvider = {
+    isToolDisabled(name: string): boolean;
 };
 
 // What one plugin's `api.settings` looks like. Every accessor coerces: a stored value

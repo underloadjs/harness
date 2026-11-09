@@ -71,11 +71,27 @@
 //      `'invalid-decision'`). Absent a reporter the drop is still silent — but
 //      harness.ts always installs one and routes it to `report.diagnostic` (T1.5), so
 //      in production a broken plugin is never invisible.
+//   9. A GATED OWNER IS INERT, NOT UNREGISTERED (R2 global enablement). A plugin
+//      registration may carry a live `enabled()` predicate (../host.ts builds it from
+//      that plugin's settings view); dispatch and the `has()` guard both consult it
+//      per EVENT, so flipping the switch off mid-session makes the plugin cost
+//      nothing — no handler call, no payload construction, and on `turn.before` no
+//      microtask boundary either (rule 6 still holds: a gated round is a synchronous
+//      empty round). It is NOT unregistration: a disabled plugin stays loaded and
+//      listed, and turning it back on needs nothing but the next emit. `live()` stays
+//      REGISTRATION-based on purpose (the Plugins pane compares an author's declared
+//      `metadata.hooks` with what setup() actually subscribed to, and a disabled
+//      plugin did still subscribe); `count()` follows DISPATCH, because its
+//      documented meaning is "handlers that run for this event". `harness.dispose` is
+//      the one exempt event, so teardown always runs. A gate that throws reads as
+//      enabled (fail-open, rule 2 — a broken settings read must not silence hooks).
 //
 // Cross-references:
 //   - ../types               — HarnessLifecycleEvent / Payloads / Handler, HarnessHookResult,
 //                              HarnessTurnDecision, HarnessHookOptions, HarnessHookSubscribe
 //   - ./host.ts              — wraps `on` per plugin and owns this bus's lifetime
+//   - ../server/plugins.ts   — the operator's stored `enabled` override behind that gate
+//   - ../server/api.ts       — `PATCH /v1/harness/plugins/{plugin_id}`, the write edge
 //   - ../harness.ts          — the only emitter (createThreadState, runAgent, requestTurn
 //                              (`turn.before` via `emitMaybeSync`), launchToolCall,
 //                              launchThreadFork, launchActionRequest, deliverTask,
@@ -157,6 +173,9 @@ type HookEntry = {
     // True for a `'*'` registration: it receives the `{ event, payload }` envelope and
     // its result is ignored (rule 7).
     wildcard: boolean;
+    // R2 global enablement — the owner's LIVE gate, copied from the registration
+    // (undefined = always deliver, rule 9). Read at dispatch, never cached.
+    enabled?: () => boolean;
     // Stored type-erased: the map keys the event, and the ONLY way a caller reaches a
     // handler is through the typed `on`/`emit` pair above, which cannot mix them.
     handler: (payload: never) => unknown;
@@ -169,6 +188,23 @@ export type HarnessHookRegistration = {
     api?: HarnessPluginApi;
     priority?: number;
     timeoutMs?: number;
+    // GLOBAL ENABLEMENT (R2/R3, operator switch) — the live "may this owner be
+    // delivered a hook right now" predicate, supplied by the plugin host from THAT
+    // plugin's own settings view (`boolean('enabled', true)`, ../host.ts). Absent
+    // means "always deliver", which is every host-level registration (`api.on` on
+    // the harness's own fallback api, a test subscription) and every plugin on a
+    // deployment that never touched the switch.
+    //
+    // It is a FUNCTION, not a boolean, and that is the whole feature: an operator
+    // flips the setting over HTTP and the next turn of an ALREADY RUNNING session
+    // reads the new answer, with no re-registration and no harness rebuild. The bus
+    // calls it at DISPATCH time per event, so `has()` can also skip the payload
+    // construction a disabled subscriber would otherwise pay for (rule 5's argument
+    // applies to a disabled plugin exactly as it applies to an unregistered one).
+    //
+    // `harness.dispose` is EXEMPT from the gate at every call site (see
+    // `isDeliverable`), so a disabled plugin still tears its own state down.
+    enabled?: () => boolean;
 };
 
 // Merged result of one emit. Only `turn.before` can produce a transcript or a decision;
@@ -240,13 +276,15 @@ export type HarnessHookBus = {
     // deliverable event true, which is exactly the audit-plugin case.
     has: (event: HarnessLifecycleEvent) => boolean;
     // Handler count for one event, wildcard registrations included (they DO run).
+    // A gated-off owner is NOT counted: this accessor answers "how many handlers would
+    // this event reach right now" (rule 9), which is the only question a caller can act on.
     count: (event: HarnessLifecycleEvent) => number;
     // Every event that currently has listeners, plus the owners per event. This is
     // what the server reports as the LIVE hook surface of a plugin (declared
     // `metadata.hooks` is the intent; this is the fact). A `'*'` registration is
-    // expanded into the events it will actually receive (rule 7), because this
-    // accessor's return type is keyed by HarnessLifecycleEvent and cannot carry a
-    // wildcard key.
+    // expanded into the events it will actually receive (rule 7). R2: this stays
+    // REGISTRATION-based — a disabled plugin did still subscribe, and the Plugins
+    // pane's declared-vs-subscribed comparison would otherwise go blank on a toggle.
     live: () => Partial<Record<HarnessLifecycleEvent, string[]>>;
     // Drop every subscription (harness teardown / tests).
     clear: () => void;
@@ -280,6 +318,46 @@ const isEventName = (value: unknown): value is HarnessLifecycleEvent =>
 // exhaustive map above is what keeps the catalogue current.
 const isWildcardDeliverable = (event: HarnessLifecycleEvent): boolean =>
     WILDCARD_DELIVERABLE[event] === true;
+
+// The one event an owner receives even when its global enablement gate is off (rule 9).
+// Cleanup must always run: a plugin that is switched off mid-session still has to see
+// the teardown point, or its timers, listeners and handles leak for the life of the
+// process (async-ping's `harness.dispose` handler is exactly such a timer sweep).
+const ALWAYS_DELIVERED: HarnessLifecycleEvent = 'harness.dispose';
+
+// Whether one registration is DELIVERED this event: gated owners are skipped, and the
+// teardown point is never skipped. The gate is a live read, so this is re-decided on
+// every emit — which is what makes an operator's click reach a running session.
+//
+// Fail-OPEN (rule 2's reasoning): a gate that throws — a host provider that cannot read
+// its own document — must not silence every hook in the process, so a throw means
+// "enabled". Skipping is also deliberately NOT reported through `onHandlerError`: a
+// drop there means "this plugin broke", and an operator turning a plugin off is neither
+// a failure nor a surprise.
+const isDeliverable = (entry: HookEntry, event: HarnessLifecycleEvent): boolean => {
+    if (entry.enabled === undefined || event === ALWAYS_DELIVERED) return true;
+
+    try {
+        return entry.enabled() !== false;
+    } catch {
+        return true;
+    }
+};
+
+// The dispatch list for one event, gate applied. The fast path matters: this runs on
+// every emit, and a bus whose registrations carry no gate (every host-level `on`, and
+// every deployment that never touched the switch) must cost exactly what it cost before
+// rule 9 — one property read per entry, then the same array copy as before.
+const gated = (list: HookEntry[] | undefined, event: HarnessLifecycleEvent): HookEntry[] => {
+    if (list === undefined || list.length === 0) return [];
+    if (event === ALWAYS_DELIVERED) return [...list];
+
+    for (const entry of list) {
+        if (entry.enabled !== undefined) return list.filter((candidate) => isDeliverable(candidate, event));
+    }
+
+    return [...list];
+};
 
 // A rejected budget, recognised structurally so it survives a round trip through the
 // promise machinery untouched (and cannot be confused with a handler's own rejection).
@@ -453,22 +531,22 @@ export const createHookBus = (options: HarnessHookBusOptions = {}): HarnessHookB
     const listenersOf = (event: HarnessLifecycleEvent): HookEntry[] => {
         if (!isEventName(event)) return [];
 
-        const named = registrations.get(event);
+        const named = gated(registrations.get(event), event);
 
         if (!isWildcardDeliverable(event)) {
-            if (named === undefined || named.length === 0) return [];
-            return orderedDispatch ? byPriority([...named]) : [...named];
+            if (named.length === 0) return [];
+            return orderedDispatch ? byPriority(named) : named;
         }
 
-        const wild = registrations.get(WILDCARD);
+        const wild = gated(registrations.get(WILDCARD), event);
 
-        if (named === undefined || named.length === 0) {
-            if (wild === undefined || wild.length === 0) return [];
-            return byPriority([...wild]);
+        if (named.length === 0) {
+            if (wild.length === 0) return [];
+            return byPriority(wild);
         }
 
-        if (wild === undefined || wild.length === 0) {
-            return orderedDispatch ? byPriority([...named]) : [...named];
+        if (wild.length === 0) {
+            return orderedDispatch ? byPriority(named) : named;
         }
 
         return byPriority([...named, ...wild]);
@@ -478,6 +556,22 @@ export const createHookBus = (options: HarnessHookBusOptions = {}): HarnessHookB
     // emit site runs, and an array copy there is paid for on every emit.
     const namedListOf = (event: HarnessLifecycleEvent): HookEntry[] | undefined =>
         isEventName(event) ? registrations.get(event) : undefined;
+
+    // Rule 9 applied to the guard: `has()` answers for what a round would ACTUALLY run,
+    // so an emit site guarded by `has()` skips the payload construction as well as the
+    // handler call. `emitTurnBefore` in ../harness.ts is the case that matters — the
+    // shipped compaction plugin subscribes permanently, and a disabled compaction must
+    // be as free as no compaction at all, including the microtask boundary of rule 6.
+    const listDeliverable = (list: HookEntry[] | undefined, event: HarnessLifecycleEvent): boolean => {
+        if (list === undefined || list.length === 0) return false;
+        if (event === ALWAYS_DELIVERED) return true;
+
+        for (const entry of list) {
+            if (isDeliverable(entry, event)) return true;
+        }
+
+        return false;
+    };
 
     const on = (
         event: HarnessLifecycleEvent | typeof WILDCARD,
@@ -517,6 +611,11 @@ export const createHookBus = (options: HarnessHookBusOptions = {}): HarnessHookB
             ...(registration?.api === undefined ? {} : { api: registration.api }),
             priority: priority ?? 0,
             ...(timeoutMs === undefined ? {} : { timeoutMs }),
+            // R2 — the owner's live gate travels with the registration (rule 9). A
+            // non-function value is treated as absent rather than thrown: unlike
+            // `priority`/`timeoutMs`, a bad gate would only be observable as "no hooks
+            // ever fire", which is a worse failure than ignoring it.
+            ...(typeof registration?.enabled === 'function' ? { enabled: registration.enabled } : {}),
             seq: ++sequence,
             wildcard,
             handler: handler as unknown as (payload: never) => unknown
@@ -771,16 +870,16 @@ export const createHookBus = (options: HarnessHookBusOptions = {}): HarnessHookB
         emitMaybeSync,
         fire,
         has: (event: HarnessLifecycleEvent) => {
-            const named = namedListOf(event);
-            if (named !== undefined && named.length > 0) return true;
+            // Rule 9: a gated-off owner does not make an event "had", so the emit site
+            // skips the payload build exactly as it skips a plugin that is not installed.
+            if (listDeliverable(namedListOf(event), event)) return true;
 
             // A wildcard registration makes every deliverable event live (rule 7). The
             // whole point of `has()` is that an audit plugin paying for no payload
             // construction is still reached, so this cannot be omitted.
             if (!isWildcardDeliverable(event)) return false;
 
-            const wild = registrations.get(WILDCARD);
-            return wild !== undefined && wild.length > 0;
+            return listDeliverable(registrations.get(WILDCARD), event);
         },
         count: (event: HarnessLifecycleEvent) => listenersOf(event).length,
         live: () => {

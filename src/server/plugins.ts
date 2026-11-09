@@ -25,6 +25,28 @@
 // projection the UI paints: declared default + stored override, resolved through the SAME
 // view a plugin reads, so a row can never disagree with runtime behaviour.
 //
+// THE RESERVED `enabled` KEY (R2 — the operator's global switch)
+// --------------------------------------------------------------
+// `enabled` is a framework-owned boolean that EVERY plugin answers to, whether or not
+// its own metadata declares one, and it is the one setting whose meaning is not the
+// plugin's to define: it turns the plugin's HOOK DELIVERY on and off (../plugin/host.ts
+// registers each handler with a live `enabled()` predicate; ../plugin/hooks.ts rule 9
+// consults it per event, exempting `harness.dispose` so cleanup still runs).
+//
+// Resolution is the ordinary one - stored override -> declared default -> `true` -
+// because the reserved key is carried as a synthesized descriptor
+// (`RESERVED_ENABLED_DESCRIPTOR`) wherever a descriptor would be consulted: the view a
+// value resolves through, the patch allowlist, the persisted snapshot, and the restore
+// filter. A plugin that declares `enabled` itself (context-compaction) keeps its own
+// descriptor, so its Rule-0 read and the framework gate are one value with one write
+// path. Consequences an operator can rely on:
+//   - one click, every thread: the provider is process-wide and read live, so a running
+//     session honours the switch on its next turn, with no rebuild and no re-registration;
+//   - a disabled plugin stays LOADED and LISTED - its tools, agents, commands and
+//     settings are untouched, and `GET /plugins` reports the row with `enabled: false`;
+//   - `values` keeps reporting only DECLARED keys (the contract states a key absent from
+//     `settings` never appears there); enablement is the row's own `enabled` field.
+//
 // VALIDATION AT THE WRITE EDGE, COERCION AT THE READ EDGE
 // -------------------------------------------------------
 // `plugin/settings.ts` is deliberately coercion-only: a corrupt stored value must not throw
@@ -89,6 +111,36 @@ export type HarnessPluginSettingValue = number | string | boolean;
 export type HarnessPluginSettingValues = Record<string, HarnessPluginSettingValue>;
 
 /**
+ * THE RESERVED KEY — R2's global plugin switch. `enabled` is a framework-owned boolean
+ * that EVERY plugin answers to, whether or not its own metadata declares one, and the
+ * same key the plugin itself may declare and read (context-compaction does, as Rule 0).
+ *
+ * The rule is one line: effective enablement = stored override ?? declared default ??
+ * `true`. Nothing else about a plugin changes — it stays loaded, its tools/agents/
+ * commands stay registered, and `GET /plugins` still lists it with `enabled: false`;
+ * only hook delivery stops (../plugin/host.ts, ../plugin/hooks.ts rule 9).
+ *
+ * It is deliberately a normal key in the same override map rather than a second
+ * per-plugin boolean column: the durable document, the validation edge, the live
+ * provider and the settings view all already know how to carry a boolean per plugin, so
+ * the switch costs one allowlisted descriptor and no new storage shape.
+ */
+export const PLUGIN_ENABLED_KEY = 'enabled';
+
+// The synthesized descriptor for a plugin that does not declare the key itself. Its
+// `default: true` is the "a plugin nobody switched off runs" answer the gate falls back
+// to, and it is what lets the settings view resolve `enabled` through the SAME stored →
+// declared → fallback chain as every other key (no special-case read anywhere).
+const RESERVED_ENABLED_DESCRIPTOR: HarnessPluginSettingDescriptor = {
+    key: PLUGIN_ENABLED_KEY,
+    label: 'Enabled',
+    type: 'boolean',
+    default: true,
+    description:
+        'Framework switch: off stops this plugin\'s lifecycle hooks from running, in every session, from the next turn. The plugin stays loaded and listed; its tools and commands are unaffected.'
+};
+
+/**
  * A plugin-settings failure with the HTTP status the route should answer: 404 for a plugin
  * this build does not ship, 400 for an unknown key or an out-of-bounds/mistyped value. The
  * dispatcher maps it the same way it maps `SessionError`/`HarnessRegistryError` (./api.ts).
@@ -124,8 +176,22 @@ export type HarnessPluginSettingsStore = {
     metadata: (plugin: string) => HarnessPluginMetadata | undefined;
     /** Declared setting descriptors of one plugin (empty when it declares none). */
     settingsOf: (plugin: string) => readonly HarnessPluginSettingDescriptor[];
+    /**
+     * The descriptors a WRITE is validated against: the plugin's declared list plus the
+     * reserved `enabled` key appended when the plugin does not declare it. That is the
+     * allowlist, so `PATCH ... {settings:{enabled:false}}` is accepted for EVERY plugin
+     * while an unknown key is still a 400 that names the whole accepted set.
+     */
+    effectiveSettingsOf: (plugin: string) => readonly HarnessPluginSettingDescriptor[];
     /** The raw STORED override of one key, `undefined` when nothing is stored. */
     get: (plugin: string, key: string) => HarnessPluginSettingValue | undefined;
+    /**
+     * R2 — whether one plugin RUNS right now: stored `enabled` override, otherwise the
+     * plugin's declared `enabled` default, otherwise `true`. This is the exact value the
+     * framework gate consults inside the harness (../plugin/host.ts), so a row and a
+     * live session can never disagree about whether a plugin is on.
+     */
+    enabled: (plugin: string) => boolean;
     /**
      * The EFFECTIVE map the plugin reads right now: declared default unless an override is
      * stored, resolved through the same view the plugin's `api.settings` uses.
@@ -286,6 +352,28 @@ export const createPluginSettingsStore = (
     // change in a release without a migration touching the file.
     const overrides = new Map<string, Map<string, HarnessPluginSettingValue>>();
 
+    const settingsOf = (plugin: string): readonly HarnessPluginSettingDescriptor[] =>
+        byName.get(plugin)?.settings ?? [];
+
+    // DECLARED descriptors + the reserved `enabled` key, in that order. Computed per call
+    // (a catalogue lookup, no allocation cost worth caching) and used for EVERYTHING the
+    // host decides about a key: the view it resolves values through, the allowlist a
+    // patch is validated against, the error message's accepted set, the persisted
+    // snapshot, and the restore filter. A plugin that declares `enabled` itself keeps its
+    // own descriptor (and its own default), so the framework switch and the plugin's
+    // Rule-0 read are one and the same stored value.
+    //
+    // Declared ABOVE `viewOf`/`applyRestore` on purpose: the restore seed runs during
+    // construction, and a `const` arrow defined later would still be in its temporal dead
+    // zone there.
+    const effectiveSettingsOf = (plugin: string): readonly HarnessPluginSettingDescriptor[] => {
+        const declared = settingsOf(plugin);
+
+        if (declared.some((entry) => entry.key === PLUGIN_ENABLED_KEY)) return declared;
+
+        return [...declared, RESERVED_ENABLED_DESCRIPTOR];
+    };
+
     // The LIVE provider. `get` reads this same map on every call, so an edit is visible to a
     // harness built hours earlier - the property the whole feature exists for.
     const provider: HarnessPluginSettingsProvider = {
@@ -301,8 +389,10 @@ export const createPluginSettingsStore = (
 
         if (existing !== undefined) return existing;
 
-        const metadata = byName.get(plugin);
-        const created = createPluginSettingsView(plugin, provider, metadata?.settings);
+        // The EFFECTIVE descriptor list, so `enabled` resolves through this view exactly
+        // like a declared key: stored override, then the declared default (the plugin's
+        // own when it declares one, else the reserved descriptor's `true`).
+        const created = createPluginSettingsView(plugin, provider, effectiveSettingsOf(plugin));
 
         views.set(plugin, created);
 
@@ -320,9 +410,6 @@ export const createPluginSettingsStore = (
         entries.set(key, value);
     };
 
-    const settingsOf = (plugin: string): readonly HarnessPluginSettingDescriptor[] =>
-        byName.get(plugin)?.settings ?? [];
-
     const requirePlugin = (plugin: string): HarnessPluginMetadata => {
         const metadata = byName.get(plugin);
 
@@ -338,15 +425,18 @@ export const createPluginSettingsStore = (
         return metadata;
     };
 
-    // Every override of one plugin, in DECLARED order (a document written by an older build
-    // may hold keys in a different order, and a snapshot must be diff-stable).
+    // Every override of one plugin, in EFFECTIVE-DESCRIPTOR order (a document written by an
+    // older build may hold keys in a different order, and a snapshot must be diff-stable).
+    // The reserved `enabled` key is part of that order, so a switch flipped on a plugin
+    // that does NOT declare it is still persisted — and a declared `enabled` keeps the
+    // position the plugin gave it.
     const snapshotOf = (plugin: string): Record<string, HarnessPluginSettingValue> => {
         const entries = overrides.get(plugin);
         const result: Record<string, HarnessPluginSettingValue> = {};
 
         if (entries === undefined) return result;
 
-        for (const descriptor of settingsOf(plugin)) {
+        for (const descriptor of effectiveSettingsOf(plugin)) {
             const value = entries.get(descriptor.key);
 
             if (value !== undefined) result[descriptor.key] = value;
@@ -370,7 +460,10 @@ export const createPluginSettingsStore = (
             if (metadata === undefined || !entries || typeof entries !== 'object') continue;
 
             for (const [key, value] of Object.entries(entries)) {
-                const descriptor = descriptorOf(metadata.settings ?? [], key);
+                // The EFFECTIVE set is the allowlist here too, so an `enabled` override
+                // saved for a plugin that never declares the key survives the restart
+                // exactly like a declared one (R2's durability criterion).
+                const descriptor = descriptorOf(effectiveSettingsOf(plugin), key);
 
                 if (descriptor === undefined) continue;
 
@@ -398,6 +491,12 @@ export const createPluginSettingsStore = (
         // `view.get` is the plugin's OWN read: stored value when present, otherwise the
         // declared default (src/plugin/settings.ts:175-178). Resolving here rather than
         // merging maps by hand is what keeps the row identical to runtime behaviour.
+        //
+        // Deliberately DECLARED-only: `values` is the projection of the plugin's own form
+        // fields, and the contract states a key absent from `settings` can never appear
+        // here. Enablement therefore travels in its own `enabled` row field (the store's
+        // `enabled()` below), which is the same value for a declaring and a
+        // non-declaring plugin, and is what lets a pre-R2 row shape survive unchanged.
         for (const descriptor of settingsOf(plugin)) {
             const value = view.get(descriptor.key);
 
@@ -418,7 +517,15 @@ export const createPluginSettingsStore = (
 
         settingsOf,
 
+        effectiveSettingsOf,
+
         get: (plugin: string, key: string) => overrides.get(plugin)?.get(key),
+
+        // R2 — resolved through the plugin's OWN view over the reserved descriptor, so
+        // this answer and the harness's hook gate (../plugin/host.ts) are the same read
+        // of the same stored value. An unknown plugin answers `true`: identity is the
+        // ROUTE's decision (404), and this accessor must stay total so no read path throws.
+        enabled: (plugin: string) => viewOf(plugin).boolean(PLUGIN_ENABLED_KEY, true),
 
         values: valuesOf,
 
@@ -438,17 +545,20 @@ export const createPluginSettingsStore = (
                 );
             }
 
-            const declared = settingsOf(plugin);
+            // The EFFECTIVE list is the allowlist: the plugin's declared keys plus the
+            // reserved `enabled`, so the operator's switch works on EVERY plugin
+            // (R2) while an invented key is still a 400 that names everything accepted.
+            const allowedDescriptors = effectiveSettingsOf(plugin);
 
             // Validate EVERY entry before mutating any of them, so one bad value cannot
             // leave the others applied (the same all-or-nothing rule `PATCH /config` follows).
             const prepared: Array<{ key: string; value: HarnessPluginSettingValue | null }> = [];
 
             for (const key of keys) {
-                const descriptor = descriptorOf(declared, key);
+                const descriptor = descriptorOf(allowedDescriptors, key);
 
                 if (descriptor === undefined) {
-                    const allowed = declared.map((entry) => entry.key);
+                    const allowed = allowedDescriptors.map((entry) => entry.key);
 
                     throw new HarnessPluginSettingsError(
                         400,

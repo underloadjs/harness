@@ -595,6 +595,53 @@ it('has no tab strip rules left and styles the global icon toggle', () => {
     expect(rules).not.toContain('.plugins-toggle, .tools-toggle');
 });
 
+// R1/R3: the two catalogues grew a per-row enablement switch, and a row is now a
+// WRAPPER (`.tool-tab-row` / `.plugin-tab-row`) holding the dialog trigger and the
+// switch as siblings — a `<button>` cannot contain a control. These rules are the
+// layout that wrapper needs, and the on/off vocabulary is the same in both panes so
+// the two catalogues read identically. Every rule stays scoped per pane: restyling one
+// row can never move the other.
+it('lays out each catalogue row as a trigger plus its own enablement switch', () => {
+    // The wrapper is a flex line; the trigger takes the remaining width and can shrink,
+    // so a long tool name still clamps instead of pushing the switch out of the card.
+    expect(blockOf('.tool-tab-row {')).toContain('display: flex');
+    expect(blockOf('.tool-tab-row .tool-tab-button {')).toContain('flex: 1 1 auto');
+    expect(blockOf('.tool-tab-row .tool-tab-button {')).toContain('min-width: 0');
+    expect(blockOf('.plugin-tab-row {')).toContain('display: flex');
+    expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('flex: 1 1 auto');
+    expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('min-width: 0');
+
+    // The switch is a fixed-width control pinned to the centre of the row, with the same
+    // state vocabulary in both panes (`is-on` reads as the accent-ok, `is-off` as muted).
+    for (const selector of ['.tool-tab-toggle', '.plugin-tab-toggle']) {
+        expect(blockOf(`${selector} {`)).toContain('flex: 0 0 auto');
+        expect(blockOf(`${selector} {`)).toContain('align-self: center');
+        expect(blockOf(`${selector}.is-on {`)).toContain('border-color: var(--ok)');
+        expect(blockOf(`${selector}.is-off {`)).toContain('color: var(--muted)');
+        // R1: the ONLY disabled state is the control's own in-flight write.
+        expect(blockOf(`${selector}:disabled {`)).toContain('cursor: progress');
+    }
+
+    // A withheld row reads as withheld in the card too, from the SAME figure the switch
+    // states (main.ts paints both together).
+    expect(blockOf(".tool-tab-button[data-enabled='false'] {")).toContain('opacity: 0.65');
+    expect(blockOf(".plugin-tab-button[data-enabled='false'] {")).toContain('opacity: 0.65');
+
+    // The harness-owned set has no control at all, so it gets a static pin: same
+    // footprint, no pointer affordance.
+    expect(blockOf('.tool-tab-pin {')).toContain('cursor: help');
+    expect(blockOf('.tool-tab-pin {')).not.toContain('cursor: pointer');
+
+    // The switch outcome lines are separate from the catalogue count lines, and a failure
+    // is marked by class as well as colour.
+    expect(blockOf('.tools-tab-note-error {')).toContain('color: var(--danger)');
+    expect(blockOf('.plugins-tab-status-error {')).toContain('color: var(--danger)');
+
+    // The two panes still own their own rules (no shared selector list was introduced).
+    expect(rules).not.toContain('.tool-tab-toggle, .plugin-tab-toggle');
+    expect(rules).not.toContain('.plugin-tab-toggle, .tool-tab-toggle');
+});
+
 it('leaves the create-harness close baseline alone (F2 cascade guard)', () => {
     // The close button in the create form is the original `icon-button`. The FIRST
     // `.icon-button {` rule in the sheet must still be that control's compact look;

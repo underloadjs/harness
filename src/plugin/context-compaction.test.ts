@@ -7,13 +7,16 @@
 // src/core/context-pruning.test.ts; this file pins the PLUGIN half: settings, guards,
 // writes, reports, and behaviour through a real harness):
 //
-//   1. BELOW the limit: nothing happens at all (no park, no action, no transcript change);
-//   2. AT/ABOVE the limit: park -> action (exactly once, with the SAME api and the SAME
+//   1. BELOW the trigger: nothing happens at all (no park, no action, no transcript
+//      change); and the TRIGGER itself — `max(1, min(resolved limit, model window) −
+//      gapTokens)` — including the `modelLimits` JSON map (per-model limit, per-model
+//      window, and every malformed input ignored in favour of the global limit);
+//   2. AT/ABOVE the trigger: park -> action (exactly once, with the SAME api and the SAME
 //      turn context object) -> un-park, and the un-park also happens when the action
 //      throws, because a failed compaction must not strand a conversation in 'paused';
-//   3. the per-thread COOLDOWN: an unchanged over-limit estimate does not fire again,
-//      growth past the 5%-of-limit margin does, and dropping below the limit makes the
-//      next crossing fresh again;
+//   3. the per-thread COOLDOWN: an unchanged over-trigger estimate does not fire again,
+//      growth past the 5%-of-effective-limit margin does, and dropping below the trigger
+//      makes the next crossing fresh again;
 //   4. the internal `summarizer` conversation is never compacted (recursion guard), and a
 //      BRANCH round never triggers a pass at all (ratified 2026-11-09: its flag writes are
 //      ephemeral and its cooldown key could never be cleared);
@@ -40,11 +43,20 @@
 //                                               `setIncluded` write, and the per-round
 //                                               notification coalescing (T4.4)
 //   - ./hooks.ts                              — fail-open dispatch of a throwing handler
+//   - ../core/agent.ts                        — `registerAgentThreader` and the thread model
+//                                               sync that make `api.agents[name].model()`
+//                                               the model the run is about to send
+//   - ../transport/models.ts                  — checked as a window source and REJECTED: it
+//                                               returns `string[]` (ids only), so the
+//                                               provider's per-model context length never
+//                                               reaches the harness, and the `modelLimits`
+//                                               map's `window` is the only one in this build
 //   - ../harness.plugin.test.ts               — the transport helpers mirrored below
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness } from '@underload/harness';
 import type {
+    Agent,
     Harness,
     HarnessContextEntry,
     HarnessDiagnosticEvent,
@@ -68,6 +80,8 @@ import {
     executeCompaction,
     isInternalAgent,
     metadata,
+    parseModelLimits,
+    resolveContextTrigger,
     setup
 } from '../plugins/context-compaction.plugin';
 
@@ -112,11 +126,20 @@ type FakeApi = {
     touches: string[];
     // T4.5 — every diagnostic the action reported, in order.
     diagnostics: HarnessPluginDiagnosticReport[];
+    // The live agent registry the trigger reads the model id from. Mutable by identity:
+    // `api.agents` is this same object, so a test can register a brain between turns.
+    agents: Record<string, Agent>;
     // Simulates an operator changing the stored limit between turns.
     setLimit: (value: number) => void;
     // ...or any other setting the action reads.
     setSetting: (key: string, value: number | string | boolean) => void;
 };
+
+// A registered brain that does one thing: answer `model()`. The guard reads that accessor
+// and nothing else, so the fake carries only it — `as unknown as Agent` rather than a stub
+// of all twelve members, which would let a test keep passing while the plugin reached for a
+// member the real registry happens not to populate.
+const fakeBrain = (model: unknown): Agent => ({ model }) as unknown as Agent;
 
 // A complete `HarnessPluginApi`. Any control other than a settings read and the diagnostic
 // channel is a FAILURE: `skip` records it and throws, so an action that tried to spawn a
@@ -124,13 +147,21 @@ type FakeApi = {
 // silently. The settings are backed by a MAP rather than one number for every key: the
 // action now reads four of them, and a test that wants `minTokens: 20` has to be able to
 // say so without also changing the limit.
+//
+// `gapTokens: 0` is seeded on purpose. R4's default headroom (65536) dwarfs the toy limits
+// these tests use — a limit of 100 with the default gap triggers at 1 token, so every
+// estimate in this file would fire — and the trigger arithmetic has its own table below.
+// These tests pin the limit/cooldown/lifecycle against the limit itself, which is what a
+// gap of 0 makes it. A test that wants the DECLARED default passes `gapTokens: undefined`
+// ("the host has stored nothing"), and the fake then answers with the plugin's own fallback.
 const createFakeApi = (
     limit: number,
-    stored: Record<string, number | string | boolean> = {}
+    stored: Record<string, number | string | boolean | undefined> = {},
+    agents: Record<string, Agent> = {}
 ): FakeApi => {
     const touches: string[] = [];
     const diagnostics: HarnessPluginDiagnosticReport[] = [];
-    const values: Record<string, unknown> = { contextLimit: limit, ...stored };
+    const values: Record<string, unknown> = { contextLimit: limit, gapTokens: 0, ...stored };
 
     const skip = (name: string): never => {
         touches.push(name);
@@ -138,7 +169,7 @@ const createFakeApi = (
     };
 
     const api: HarnessPluginApi = {
-        agents: {},
+        agents,
         tools: {},
         createAgent: () => skip('createAgent'),
         addTool: () => skip('addTool'),
@@ -209,6 +240,7 @@ const createFakeApi = (
         api,
         touches,
         diagnostics,
+        agents,
         setLimit: (value: number) => {
             values.contextLimit = value;
         },
@@ -359,6 +391,18 @@ const createRecordingAction = (calls: string[]) => {
 // readable instead of repeating the same three strings eleven times.
 const TRIPLE = ['pause', 'action', 'resume'];
 
+// The exact settings reads one NON-SKIPPED turn performs, in order. Pinned because a silent
+// extra read on the hot path is a silent per-turn cost, and because the ORDER proves the
+// internal-agent and branch guards run BEFORE the trigger is resolved: those rounds stop
+// after `contextLimit` and never pay for the gap read or the map parse (the branch test
+// below pins the two-read sequence).
+const TRIGGER_READS = [
+    'settings.boolean:enabled',
+    'settings.number:contextLimit',
+    'settings.number:gapTokens',
+    'settings.string:modelLimits'
+];
+
 // `count` triples, built with a plain loop (no `Array.prototype.flat`, which the package's
 // `lib` list does not include).
 const triples = (count: number): string[] => {
@@ -397,9 +441,16 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // The settings an operator would type in the Plugins pane, as a stored document. Every key
 // this plugin reads may appear; anything it does NOT store falls back to its DECLARED
 // default, which is what the default-floor case below depends on.
-const settingsOf = (values: Record<string, number | string | boolean>): HarnessPluginSettingsProvider => ({
-    get: (plugin, key) => (plugin === 'context-compaction' ? values[key] : undefined)
-});
+//
+// `gapTokens: 0` is seeded unless a test names a gap of its own (R4): the declared default
+// of 65536 dwarfs the toy limits these fixtures use — a limit of 100 with the default gap
+// triggers at 1 token, so every conversation here would compact on its first turn — and the
+// headroom itself is pinned at its own scale in the trigger tables below.
+const settingsOf = (values: Record<string, number | string | boolean>): HarnessPluginSettingsProvider => {
+    const stored: Record<string, number | string | boolean> = { gapTokens: 0, ...values };
+
+    return { get: (plugin, key) => (plugin === 'context-compaction' ? stored[key] : undefined) };
+};
 
 // The one-key spelling: just the limit.
 const limitAt = (value: number): HarnessPluginSettingsProvider => settingsOf({ contextLimit: value });
@@ -430,10 +481,12 @@ describe('context-compaction metadata', () => {
         // and the declared intent stay identical.
         expect(metadata.hooks).toEqual(['turn.before']);
 
-        // T4.6: `enabled`, the limit, the savings floor, the horizon, and the mode. The
-        // numbers below ARE the ratified answers (T0 Q2's floor, Q3's horizon), and each
-        // default is duplicated as a fallback constant beside the plugin's own reads — a
-        // drift between the two changes one of the assertions in this file.
+        // T4.6: `enabled`, the limit, the savings floor, the horizon, and the mode. R4 adds
+        // the two trigger settings beside the limit they modify: the headroom and the
+        // per-model map. The numbers below ARE the ratified answers (T0 Q2's floor, Q3's
+        // horizon, and the 64k gap from the operator's request), and each default is
+        // duplicated as a fallback constant beside the plugin's own reads — a drift between
+        // the two changes one of the assertions in this file.
         expect(
             metadata.settings?.map((setting) => [
                 setting.key,
@@ -444,6 +497,8 @@ describe('context-compaction metadata', () => {
             ])
         ).toEqual([
             ['contextLimit', 'number', 100000, 1000, 1000],
+            ['gapTokens', 'number', 65536, 0, 1024],
+            ['modelLimits', 'string', '{}', undefined, undefined],
             ['enabled', 'boolean', true, undefined, undefined],
             ['minTokens', 'number', 200, 0, 50],
             ['safetyTurns', 'number', 6, 0, 1],
@@ -467,9 +522,254 @@ describe('context-compaction metadata', () => {
         expect(descriptionOf('mode')).toContain('"annotate"');
         expect(descriptionOf('mode')).toContain('behaves as "exclude"');
 
+        // R4 — the texts that tell an operator WHERE the firing point actually is. A ceiling
+        // that reads like a trigger is how "compaction fired early" becomes a bug report
+        // against the plugin instead of a settings edit, so the limit's own description has
+        // to disclaim it, the gap has to name the value that restores the old behaviour, and
+        // the map has to state that a bad value is IGNORED (an operator who fears breaking
+        // compaction never types the per-model fact they need).
+        expect(descriptionOf('contextLimit')).toContain('NOT the firing point');
+        expect(descriptionOf('contextLimit')).toContain('gapTokens');
+        expect(descriptionOf('gapTokens')).toContain('0 restores the historical behaviour');
+        expect(descriptionOf('modelLimits')).toContain('"window"');
+        expect(descriptionOf('modelLimits')).toContain('ignored');
+        expect(String(metadata.description)).toContain('gapTokens');
+
         // `mode` enumerates ONLY what this build implements, so the UI cannot offer a value
         // that does nothing, and the list the plugin falls back to is that one value.
         expect(COMPACTION_MODES).toEqual(['exclude']);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R4 — THE TRIGGER MATH, as a table.
+//
+// Every expected number is computed by HAND from the ratified rule
+//
+//     resolved  = modelLimits[<model>].limit ?? contextLimit
+//     effective = window is declared ? min(resolved, window) : resolved
+//     trigger   = max(1, effective − max(0, gapTokens))
+//
+// rather than read back out of a run, so a change in the rule fails loudly here. The
+// headline numbers are the operator's own examples: a 100000 ceiling with the shipped 64k
+// gap fires at 34464, and a 512000 ceiling on a 262144-token model fires at 197608.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction trigger math (parseModelLimits + resolveContextTrigger)', () => {
+    // Shorthand for the common call: no per-model facts, no model in play.
+    const globalOnly = (contextLimit: number, gapTokens: number) =>
+        resolveContextTrigger({ contextLimit, gapTokens, modelLimits: {} });
+
+    it('fires 64k before the global ceiling at the shipped defaults', () => {
+        // 100000 − 65536 = 34464. The intentional behaviour change: the old code compared
+        // against 100000 itself, so every default deployment now compacts earlier.
+        //
+        // The map names a DIFFERENT model: a window declared for one model must not cap
+        // another model's conversation, which is why `window` is absent from the answer.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100000,
+                gapTokens: 65536,
+                modelLimits: parseModelLimits('{"other/model": {"window": 131072}}'),
+                modelId: 'openai/gpt-4o'
+            })
+        ).toEqual({ limit: 100000, effective: 100000, trigger: 34464 });
+    });
+
+    it('fires exactly at the ceiling when the gap is 0 (the historical behaviour)', () => {
+        expect(globalOnly(100000, 0)).toEqual({ limit: 100000, effective: 100000, trigger: 100000 });
+        expect(globalOnly(1000, 0)).toEqual({ limit: 1000, effective: 1000, trigger: 1000 });
+    });
+
+    it('takes the per-model limit in place of the global ceiling', () => {
+        const modelLimits = parseModelLimits('{"fast/small": {"limit": 50}}');
+
+        // The model named in the map gets its own ceiling...
+        expect(
+            resolveContextTrigger({ contextLimit: 100000, gapTokens: 0, modelLimits, modelId: 'fast/small' })
+        ).toEqual({ limit: 50, effective: 50, trigger: 50 });
+
+        // ...and every other model keeps the global one, unchanged.
+        expect(
+            resolveContextTrigger({ contextLimit: 100000, gapTokens: 0, modelLimits, modelId: 'big/model' })
+        ).toEqual({ limit: 100000, effective: 100000, trigger: 100000 });
+    });
+
+    it('caps the ceiling at the model window — the operator\'s 512k-on-a-256k-model case', () => {
+        const modelLimits = parseModelLimits('{"wide/model": {"window": 262144}}');
+        const resolved = resolveContextTrigger({
+            contextLimit: 512000,
+            gapTokens: 65536,
+            modelLimits,
+            modelId: 'wide/model'
+        });
+
+        // min(512000, 262144) = 262144, minus the 64k headroom = 196608. (`window` is
+        // reported so a caller can see WHY the number moved.) The brief's worked example
+        // names 197608; that is off by a thousand — 262144 − 65536 is 196608 — and the RULE,
+        // which is what is ratified, is what this test pins.
+        expect(resolved).toEqual({ limit: 512000, window: 262144, effective: 262144, trigger: 196608 });
+
+        // The same answer when the operator spells the ceiling on the entry as well: the
+        // window caps it either way.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100000,
+                gapTokens: 65536,
+                modelLimits: parseModelLimits('{"wide/model": {"limit": 512000, "window": 262144}}'),
+                modelId: 'wide/model'
+            })
+        ).toEqual({ limit: 512000, window: 262144, effective: 262144, trigger: 196608 });
+    });
+
+    it('never lets a window RAISE the ceiling', () => {
+        // A generous window on a conservative operator is still the operator's number — the
+        // window is a cap, not an override.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100000,
+                gapTokens: 65536,
+                modelLimits: parseModelLimits('{"huge/model": {"window": 1000000}}'),
+                modelId: 'huge/model'
+            })
+        ).toEqual({ limit: 100000, window: 1000000, effective: 100000, trigger: 34464 });
+    });
+
+    it('degrades to the global ceiling when the model is unknown or unresolved', () => {
+        const modelLimits = parseModelLimits('{"known/model": {"limit": 1000}}');
+
+        // An id nobody declared simply misses the map.
+        expect(
+            resolveContextTrigger({ contextLimit: 100, gapTokens: 0, modelLimits, modelId: 'other/model' })
+        ).toEqual({ limit: 100, effective: 100, trigger: 100 });
+
+        // And a turn whose model could not be read passes `undefined` — the guard's
+        // "model unknown" answer, which must mean the global limit, never 0 and never a
+        // crash.
+        expect(
+            resolveContextTrigger({ contextLimit: 100, gapTokens: 0, modelLimits, modelId: undefined })
+        ).toEqual({ limit: 100, effective: 100, trigger: 100 });
+    });
+
+    it('clamps a gap larger than the ceiling at 1 token, and a negative gap at 0', () => {
+        // The ONLY clamp in the rule. An 8k model under a 64k gap compacts as early as it
+        // possibly can rather than never.
+        expect(globalOnly(8192, 65536)).toEqual({ limit: 8192, effective: 8192, trigger: 1 });
+        expect(globalOnly(65536, 65536)).toEqual({ limit: 65536, effective: 65536, trigger: 1 });
+        expect(globalOnly(65537, 65536)).toEqual({ limit: 65537, effective: 65537, trigger: 1 });
+
+        // A negative gap is a typo, not "fire after the ceiling".
+        expect(globalOnly(100000, -1000)).toEqual({ limit: 100000, effective: 100000, trigger: 100000 });
+
+        // A fractional gap floors, so the trigger stays a whole token count.
+        expect(globalOnly(100000, 65536.5)).toEqual({ limit: 100000, effective: 100000, trigger: 34463 });
+
+        // A non-finite gap (a host that stored `1e999`) behaves as 0.
+        expect(globalOnly(100000, Number.POSITIVE_INFINITY)).toEqual({
+            limit: 100000,
+            effective: 100000,
+            trigger: 100000
+        });
+    });
+
+    // The map comes from a free-text settings field, so EVERY bad shape has to land on "no
+    // per-model knowledge" rather than on an error or on a partial guess.
+    it('ignores malformed modelLimits JSON instead of throwing', () => {
+        for (const raw of ['{', '{"a":', 'not json', '', '   ', '[]', 'null', '"text"', '5', '{}']) {
+            expect(parseModelLimits(raw)).toEqual({});
+        }
+
+        // And the handler-relevant consequence: the global ceiling still fires the pass.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100000,
+                gapTokens: 65536,
+                modelLimits: parseModelLimits('{"openai/gpt-4o": {"window": 8192},}'),
+                modelId: 'openai/gpt-4o'
+            })
+        ).toEqual({ limit: 100000, effective: 100000, trigger: 34464 });
+    });
+
+    it('keeps the usable halves of an entry and drops the unusable ones', () => {
+        // A JSON document typed by hand, so the input is exactly what the settings field
+        // holds (no `JSON.stringify` surprises: it turns `1e400` into `null`).
+        const raw =
+            '{' +
+            '  "both/model":      { "limit": 200000, "window": 128000 },' +
+            '  "window-only":     { "window": 8192 },' +
+            '  "limit-only":      { "limit": 4096 },' +
+            '  "floored/model":   { "limit": 1000.9, "window": 128000.9 },' +
+            '  " spaced key ":    { "window": 1024 },' +
+            '  "extra-keys":      { "limit": 700, "bogus": true, "note": "comment" },' +
+            '  "bad-numbers":     { "limit": "200000", "window": 0 },' +
+            '  "zero-limit":      { "limit": 0 },' +
+            '  "negative":        { "limit": -5, "window": -1 },' +
+            '  "not-an-entry":    "128000",' +
+            '  "array-entry":     [128000],' +
+            '  "null-entry":      null,' +
+            '  "empty-entry":     {},' +
+            '  "":                { "window": 512 },' +
+            '  "infinite":        { "window": null },' +
+            '  "case-sensitive":  { "window": 64 }' +
+            '}';
+
+        expect(parseModelLimits(raw)).toEqual({
+            'both/model': { limit: 200000, window: 128000 },
+            'window-only': { window: 8192 },
+            'limit-only': { limit: 4096 },
+            // Token counts are whole numbers, so a fractional entry is floored rather than
+            // refused — refusing it would throw away a fact the operator typed correctly.
+            'floored/model': { limit: 1000, window: 128000 },
+            // Provider ids are exact and case-sensitive: the key is TRIMMED (a hand-typed
+            // field picks up spaces) and never lower-cased (that would merge two models).
+            'spaced key': { window: 1024 },
+            'case-sensitive': { window: 64 },
+            // Unknown sibling keys are ignored, not merged away: the usable fact stays.
+            'extra-keys': { limit: 700 }
+            // EVERYTHING ELSE IS ABSENT, and each absence is its own rule: a string number
+            // (`"200000"`) is not a number, because the settings view coerces the SETTING and
+            // never the values inside a JSON document; 0 and a negative are not ceilings;
+            // `null` is not a finite window; a non-object entry, an array and an empty object
+            // state nothing; and an empty key cannot be looked up by any model id.
+        });
+    });
+
+    it('is unfazed by an entry that names neither a limit nor a window', () => {
+        // `'{"bad": {"limit": "text"}}'` parses to an entry with no usable half, which the
+        // parser drops so the key MISSES the map — a stored `{}` and an absent key have to
+        // mean the same thing, or a typo would silently mean "this model has no facts" in
+        // one place and "this model's ceiling is the global one" in another.
+        expect(parseModelLimits('{"bad": {"limit": "text"}, "empty": {}}')).toEqual({});
+
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100000,
+                gapTokens: 65536,
+                modelLimits: parseModelLimits('{"bad": {"limit": "text"}}'),
+                modelId: 'bad'
+            })
+        ).toEqual({ limit: 100000, effective: 100000, trigger: 34464 });
+    });
+
+    it('refuses a non-string input rather than coercing it', () => {
+        // The settings view already guarantees a string for a `string` setting; this guard
+        // is for a host that calls the parser directly with a stored object, which is not a
+        // documented spelling and must not half-work.
+        expect(parseModelLimits({ 'a/model': { window: 1024 } })).toEqual({});
+        expect(parseModelLimits(undefined)).toEqual({});
+    });
+
+    it('does not mistake an inherited Object member for a per-model entry', () => {
+        // A model id that collides with something on the prototype chain: a bare index read
+        // would find `Object.prototype.constructor` and treat it as an entry.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100,
+                gapTokens: 0,
+                modelLimits: parseModelLimits('{"real/model": {"limit": 10}}'),
+                modelId: 'constructor'
+            })
+        ).toEqual({ limit: 100, effective: 100, trigger: 100 });
     });
 });
 
@@ -481,14 +781,15 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
 
         const handler = createContextCompactionHandler(api, action);
 
-        // 99 < 100: one settings read, and that is the whole turn. The fast path returns
-        // `undefined` SYNCHRONOUSLY (no promise), which is the point — see the plugin's
-        // "WHY THE FAST PATH IS SYNCHRONOUS".
+        // 99 < 100 (the trigger, because this fake stores `gapTokens: 0`): the four trigger
+        // reads, and that is the whole turn. The fast path returns `undefined` SYNCHRONOUSLY
+        // (no promise), which is the point — see the plugin's "WHY THE FAST PATH IS
+        // SYNCHRONOUS".
         expect(handler(createFakeTurn({ api, estimatedTokens: 99, calls }))).toBeUndefined();
 
         expect(calls).toEqual([]);
         expect(seen).toEqual([]);
-        expect(touches).toEqual(['settings.boolean:enabled', 'settings.number:contextLimit']);
+        expect(touches).toEqual(TRIGGER_READS);
     });
 
     it('parks, runs the action once with the same api and context, then un-parks', async () => {
@@ -512,7 +813,7 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
         // parked turn it is compacting.
         expect(seen[0].api).toBe(api);
         expect(seen[0].context).toBe(context);
-        expect(touches).toEqual(['settings.boolean:enabled', 'settings.number:contextLimit']);
+        expect(touches).toEqual(TRIGGER_READS);
     });
 
     it('un-parks when the action throws and lets the error reach the bus', async () => {
@@ -531,7 +832,7 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
         );
 
         expect(calls).toEqual(TRIPLE);
-        expect(touches).toEqual(['settings.boolean:enabled', 'settings.number:contextLimit']);
+        expect(touches).toEqual(TRIGGER_READS);
     });
 
     it('fires on a fresh crossing, holds inside the 5% margin, and fires again past it', async () => {
@@ -707,6 +1008,233 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
                 isInternalAgent
             )
         ).toEqual([false, false, false, false, false, false, false, false, false]);
+    });
+
+    // -------------------------------------------------------------------------
+    // R4 — the guard resolves the TRIGGER before it compares. These cases pin
+    // the same arithmetic as the table above from the other side: what a turn
+    // does, at the exact token counts either side of the new firing point.
+    // -------------------------------------------------------------------------
+
+    it('fires at the shipped default trigger: 100000 − 65536 = 34464', async () => {
+        // `gapTokens: undefined` means "the host has stored nothing", so the read falls back
+        // to the DECLARED default (65536) exactly as a fresh session's would.
+        const { api } = createFakeApi(100000, { gapTokens: undefined });
+        const calls: string[] = [];
+        const { seen, action } = createRecordingAction(calls);
+
+        const handler = createContextCompactionHandler(api, action);
+        const run = async (threadId: string, estimatedTokens: number): Promise<void> => {
+            await handler(createFakeTurn({ api, threadId, estimatedTokens, calls }));
+        };
+
+        // One token under the trigger, and nothing happens at all — under the OLD rule this
+        // turn would have been under the limit too, so the pair that proves the change is the
+        // next two.
+        await run('under', 34463);
+        expect(calls).toEqual([]);
+
+        // 34464 crosses the TRIGGER while still 65536 tokens under the ceiling the operator
+        // typed. This is the intentional behaviour change.
+        await run('crossing', 34464);
+        expect(calls).toEqual(TRIPLE);
+        expect(seen).toHaveLength(1);
+
+        // And a conversation sitting comfortably under the old limit but over the new trigger
+        // is compacted, which is the whole point of the headroom.
+        await run('mid', 100000 - 34464);
+        expect(calls).toEqual([...TRIPLE, ...TRIPLE]);
+    });
+
+    it('uses the per-model limit for the model this conversation runs', async () => {
+        const agents: Record<string, Agent> = {
+            writer: fakeBrain(() => 'fast/small'),
+            other: fakeBrain(() => 'big/model')
+        };
+        const { api } = createFakeApi(
+            100000,
+            { gapTokens: 0, modelLimits: '{"fast/small": {"limit": 50}}' },
+            agents
+        );
+        const calls: string[] = [];
+        const { seen, action } = createRecordingAction(calls);
+
+        const handler = createContextCompactionHandler(api, action);
+        const run = async (agent: string, threadId: string, estimatedTokens: number): Promise<void> => {
+            await handler(createFakeTurn({ api, agent, threadId, estimatedTokens, calls }));
+        };
+
+        // 49 < 50 and 50 = 50: the model's own ceiling, not the global one.
+        await run('writer', 'under', 49);
+        expect(calls).toEqual([]);
+
+        await run('writer', 'crossing', 50);
+        expect(calls).toEqual(TRIPLE);
+        expect(seen).toHaveLength(1);
+
+        // A conversation on a model the map does not name keeps the global ceiling: the same
+        // size that just fired for `fast/small` is nowhere near 100000 here, and only crosses
+        // when the GLOBAL number is reached.
+        await run('other', 'other-under', 50);
+        expect(calls).toEqual(triples(1));
+
+        await run('other', 'other-crossing', 100000);
+        expect(calls).toEqual(triples(2));
+        expect(seen).toHaveLength(2);
+    });
+
+    it('caps the trigger at the model window and scales the regrowth margin off the cap', async () => {
+        // The operator's example end to end: a 512000 ceiling on a 262144-token model, gap
+        // 65536 -> min(512000, 262144) − 65536 = 196608.
+        const { api } = createFakeApi(
+            512000,
+            { gapTokens: 65536, modelLimits: '{"wide/model": {"window": 262144}}' },
+            { writer: fakeBrain(() => 'wide/model') }
+        );
+        const calls: string[] = [];
+        const { seen, action } = createRecordingAction(calls);
+
+        const handler = createContextCompactionHandler(api, action);
+        const run = async (estimatedTokens: number): Promise<void> => {
+            await handler(createFakeTurn({ api, estimatedTokens, calls }));
+        };
+
+        await run(196607);
+        expect(calls).toEqual([]);
+
+        await run(196608);
+        expect(calls).toEqual(TRIPLE);
+
+        // The re-trigger margin is 5% of the EFFECTIVE (capped) limit — floor(262144 * 0.05)
+        // = 13107 — not of the 512000 ceiling. Off the ceiling the margin would be 25600, a
+        // tenth of the window, and a conversation stuck just over the trigger would go
+        // unexamined for far longer than the rule intends.
+        await run(209714);
+        expect(calls).toEqual(triples(1));
+
+        await run(209715);
+        expect(calls).toEqual(triples(2));
+        expect(seen).toHaveLength(2);
+
+        // Back under the trigger clears the cooldown, so the next crossing is fresh — the
+        // Rule 2 memory is keyed off the TRIGGER, not off the raw ceiling.
+        await run(196000);
+        await run(196608);
+        expect(calls).toEqual(triples(3));
+    });
+
+    it('degrades to the global ceiling when the per-model facts are unusable', async () => {
+        // A per-model limit of 1000 is in force ONLY when the lookup and the map both work;
+        // every degraded shape below must therefore still fire at the global 100.
+        const modelLimits = '{"known/model": {"limit": 1000}}';
+        const stored = { gapTokens: 0, modelLimits };
+
+        // The control: with a resolvable model the override applies and 100 is nowhere near
+        // the trigger.
+        const control = createFakeApi(100, stored, { writer: fakeBrain(() => 'known/model') });
+        const controlCalls: string[] = [];
+        const controlHandler = createContextCompactionHandler(
+            control.api,
+            createRecordingAction(controlCalls).action
+        );
+
+        await controlHandler(createFakeTurn({ api: control.api, estimatedTokens: 100, calls: controlCalls }));
+        expect(controlCalls).toEqual([]);
+
+        // The degraded shapes, each in its own handler so no cooldown can mask another.
+        const degraded: Array<{ name: string; agents?: Record<string, Agent>; limits?: string }> = [
+            // No brain registered under this agent name at all.
+            { name: 'unregistered agent', agents: {} },
+            // A host-built api that carries no agent registry.
+            { name: 'no agent registry' },
+            // `model` is not the accessor the Agent type declares.
+            { name: 'model is not a function', agents: { writer: fakeBrain('merge/ds4-flash') } },
+            // An accessor that throws (a stub, or a brain mid-replacement).
+            {
+                name: 'model() throws',
+                agents: {
+                    writer: fakeBrain(() => {
+                        throw new Error('no model yet');
+                    })
+                }
+            },
+            // An accessor that answers the empty string.
+            { name: 'model() is blank', agents: { writer: fakeBrain(() => '') } },
+            // An id the map does not name.
+            { name: 'unknown model id', agents: { writer: fakeBrain(() => 'other/model') } },
+            // A syntax error in the field, and an entry whose only half is unusable.
+            {
+                name: 'malformed JSON',
+                agents: { writer: fakeBrain(() => 'known/model') },
+                limits: '{ "known/model": {"limit": 1000 },, }'
+            },
+            {
+                name: 'unusable entry',
+                agents: { writer: fakeBrain(() => 'known/model') },
+                limits: '{"known/model": {"limit": "1000"}}'
+            }
+        ];
+
+        for (const variant of degraded) {
+            const fake = createFakeApi(100, {
+                ...stored,
+                ...(variant.limits === undefined ? {} : { modelLimits: variant.limits })
+            });
+
+            if (variant.name === 'no agent registry') {
+                delete (fake.api as Partial<HarnessPluginApi>).agents;
+            } else {
+                (fake.api as HarnessPluginApi).agents = variant.agents ?? {};
+            }
+
+            const calls: string[] = [];
+            const handler = createContextCompactionHandler(fake.api, createRecordingAction(calls).action);
+
+            // 100 is at the global ceiling, so "fired" is the assertion that the plugin
+            // refused to guess a per-model number it could not read.
+            await handler(createFakeTurn({ api: fake.api, estimatedTokens: 100, calls }));
+
+            expect(calls).toEqual(TRIPLE);
+        }
+    });
+
+    it('re-resolves the trigger every turn, from live settings and the live model', async () => {
+        let model = 'fast/small';
+        const { api, setSetting } = createFakeApi(100000, { gapTokens: 0, modelLimits: '{}' }, {
+            writer: fakeBrain(() => model)
+        });
+        const calls: string[] = [];
+        const { seen, action } = createRecordingAction(calls);
+
+        const handler = createContextCompactionHandler(api, action);
+        const run = async (threadId: string, estimatedTokens: number): Promise<void> => {
+            await handler(createFakeTurn({ api, threadId, estimatedTokens, calls }));
+        };
+
+        // Turn 1: no per-model facts, so a 100000 ceiling and 100 tokens is nowhere near it.
+        await run('thread-1', 100);
+        expect(calls).toEqual([]);
+
+        // The operator edits the map from the UI. The parsed map is CACHED behind the stored
+        // string, so this is the assertion that the cache is keyed on the value and not on
+        // the first thing it ever saw.
+        setSetting('modelLimits', '{"fast/small": {"limit": 50}}');
+        await run('thread-1', 100);
+        expect(calls).toEqual(TRIPLE);
+        expect(seen).toHaveLength(1);
+
+        // The operator switches the AGENT to another model. The id is read from the live
+        // registry per turn, so the new model's facts apply on the next turn with no restart
+        // — and this model declares nothing, so the global ceiling is back in force.
+        model = 'big/model';
+        await run('thread-1', 100);
+        expect(calls).toEqual(TRIPLE);
+
+        setSetting('modelLimits', '{"big/model": {"limit": 50}}');
+        await run('thread-2', 40);
+        await run('thread-2', 50);
+        expect(calls).toEqual(triples(2));
+        expect(seen).toHaveLength(2);
     });
 });
 
@@ -1102,6 +1630,8 @@ describe('context-compaction action (executeCompaction)', () => {
         expect(touches).toEqual([
             'settings.boolean:enabled',
             'settings.number:contextLimit',
+            'settings.number:gapTokens',
+            'settings.string:modelLimits',
             ...POLICY_READS,
             'report.diagnostic'
         ]);
@@ -1577,5 +2107,141 @@ describe('context-compaction action (executeCompaction)', () => {
                 .threadMessages(threadId)
                 .filter((message) => message.included === false)
         ).toHaveLength(6);
+    });
+
+    // -----------------------------------------------------------------------
+    // R4 — the new threshold gates a REAL pass, not just the pure helper.
+    //
+    // The model id these tests key the map on is `merge/ds4-flash`: that is the model the
+    // `writer` brain is built with (see `brain` above), and the trigger reads it from the
+    // live registry through `api.agents[context.agent].model()` — `context.agent` is the
+    // registry key `writer` (src/harness.ts `emitTurnBefore` hands `brain.name`, and the
+    // harness overwrites that with the registry key on registration). The estimates are the
+    // harness's own ceil(chars / 4) over an agent with no instruction blocks, so every
+    // number below is derived from the documented formula, not from a run.
+    // -----------------------------------------------------------------------
+
+    it('leaves the conversation alone when the per-model limit lifts the trigger past the estimate', async () => {
+        const events: string[] = [];
+        const estimates: number[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            // The global ceiling of 100 would fire at this 100-token estimate (every other
+            // test in this file does exactly that). This model's own ceiling of 1000 does
+            // not, and it is the model the run is actually on.
+            pluginSettings: settingsOf({
+                contextLimit: 100,
+                gapTokens: 0,
+                modelLimits: '{"merge/ds4-flash": {"limit": 1000}}'
+            }),
+            plugins: [probe(events, estimates)]
+        });
+
+        const thread = writer.createThread('writer', { label: 'Per-model ceiling' });
+        expect((await writer.sendThreadInput(thread.id, CROSSING)).content).toBe('ok');
+
+        expect(estimates).toEqual([100]);
+        expect(events).toEqual([]);
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+
+        // Nothing parked means nothing pruned: the transcript is the two committed messages,
+        // with no `included` flag anywhere.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: CROSSING },
+            { role: 'assistant', content: 'ok' }
+        ]);
+    });
+
+    it('runs a real pass at the window-capped trigger, and only for the model that declares the window', async () => {
+        const events: string[] = [];
+        const estimates: number[] = [];
+
+        const capped = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            pluginSettings: settingsOf({
+                contextLimit: 1000,
+                gapTokens: 50,
+                // effective = min(1000, 100) = 100 — the declared window caps the ceiling —
+                // so the trigger is 100 − 50 = 50 and this 100-token turn crosses it.
+                modelLimits: '{"merge/ds4-flash": {"window": 100}}'
+            }),
+            plugins: [probe(events, estimates)]
+        });
+
+        const cappedThread = capped.createThread('writer', { label: 'Window capped' });
+        expect((await capped.sendThreadInput(cappedThread.id, CROSSING)).content).toBe('ok');
+
+        expect(estimates).toEqual([100]);
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(capped.thread(cappedThread.id)?.status).toBe('idle');
+
+        // Identical settings except for the key the map names: a window declared for a model
+        // this run is NOT on caps nothing, so the global 1000 ceiling stands and the turn is
+        // left alone. One token estimate apart, the whole difference is the lookup.
+        const uncappedEvents: string[] = [];
+        const uncappedEstimates: number[] = [];
+
+        const uncapped = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            pluginSettings: settingsOf({
+                contextLimit: 1000,
+                gapTokens: 50,
+                modelLimits: '{"other/model": {"window": 100}}'
+            }),
+            plugins: [probe(uncappedEvents, uncappedEstimates)]
+        });
+
+        const uncappedThread = uncapped.createThread('writer', { label: 'Window elsewhere' });
+        await uncapped.sendThreadInput(uncappedThread.id, CROSSING);
+
+        expect(uncappedEstimates).toEqual([100]);
+        expect(uncappedEvents).toEqual([]);
+    });
+
+    it('moves the real firing point by exactly the configured gap', async () => {
+        const events: string[] = [];
+        const estimates: number[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('a'), answer('b')])) },
+            // trigger = 100 − 50 = 50.
+            pluginSettings: settingsOf({ contextLimit: 100, gapTokens: 50 }),
+            plugins: [probe(events, estimates)]
+        });
+
+        // 196 chars -> 49 tokens: one token under the new point, and 61 under the ceiling the
+        // setting names. Before R4 this pair of turns behaved identically, which is the
+        // change.
+        const under = writer.createThread('writer', { label: 'Just under the trigger' });
+        expect((await writer.sendThreadInput(under.id, 'u'.repeat(196))).content).toBe('a');
+        expect(estimates).toEqual([49]);
+        expect(events).toEqual([]);
+
+        const at = writer.createThread('writer', { label: 'At the trigger' });
+        expect((await writer.sendThreadInput(at.id, 'v'.repeat(200))).content).toBe('b');
+        expect(estimates).toEqual([49, 50]);
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(writer.thread(at.id)?.status).toBe('idle');
+    });
+
+    it('leaves a small conversation alone under the shipped defaults (trigger 34464)', async () => {
+        const events: string[] = [];
+        const estimates: number[] = [];
+
+        // No `pluginSettings` at all: the in-memory provider is seeded from the DECLARED
+        // defaults, so this is a fresh install — ceiling 100000, gap 65536, empty map, and a
+        // trigger of 34464 that a 100-token conversation is nowhere near.
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('ok')])) },
+            plugins: [probe(events, estimates)]
+        });
+
+        const thread = writer.createThread('writer', { label: 'Fresh install' });
+        expect((await writer.sendThreadInput(thread.id, CROSSING)).content).toBe('ok');
+
+        expect(estimates).toEqual([100]);
+        expect(events).toEqual([]);
+        expect(writer.thread(thread.id)?.status).toBe('idle');
     });
 });

@@ -109,7 +109,9 @@ const fakeBase = (used: string[]): HarnessPluginApiBase => {
 };
 
 // Runs the host with a fresh bus/provider and returns what setup() used plus the
-// recorded lifecycle names.
+// recorded lifecycle names. R2: the provider itself is returned too, because the global
+// enablement tests write the reserved `enabled` key through it AFTER setup() — that is the
+// exact shape of an operator's click reaching an already-built harness.
 const apply = (
     builtins: readonly HarnessPlugin[],
     plugins: readonly HarnessPlugin[],
@@ -126,7 +128,7 @@ const apply = (
 
     const result = runPlugins({ builtins, plugins, hooks, settings, apiBase, ...options });
 
-    return { used, hooks, result };
+    return { used, hooks, result, settings };
 };
 
 describe('resolvePluginList', () => {
@@ -347,5 +349,190 @@ describe('runPlugins', () => {
         // Without per-registration api wiring, both handlers would read one plugin's
         // settings and the second plugin would compact against the wrong limit.
         expect(names).toEqual(['alpha', 'beta']);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — THE GLOBAL ENABLEMENT GATE (the framework half of the operator's switch)
+//
+// What is pinned here is the rule a plugin author can rely on but cannot implement
+// themselves: every hook delivery is gated on the plugin's OWN live settings view
+// (`boolean('enabled', true)`), `harness.dispose` is the one exempt event, and the
+// provider is re-read per delivery so a write after setup() changes behaviour on the
+// very next emit. The bus side of the same rule (rule 9: inert, not unregistered) is
+// pinned in ./hooks.test.ts; the REST + durability side in ../server/plugins.test.ts
+// and ../server/plugins-api.test.ts.
+//
+// Cross-references:
+//   - ./hooks.ts              — `isDeliverable`, `gated`, the `has()` skip, rule 9
+//   - ../server/plugins.ts    — the reserved key, the synthesized descriptor, the live provider
+//   - ../harness.ts           — `emitDispose`, and the emit sites guarded by `has()`
+// ---------------------------------------------------------------------------
+
+describe('runPlugins — the global enablement gate (R2)', () => {
+    // A minimal `run.started` payload: the bus passes payloads through untouched, so the
+    // smallest member the contract allows is the honest test input.
+    const runContext = { agent: 'writer', depth: 0, input: 'hello' };
+
+    /** A plugin that declares NOTHING — the async-ping shape, gated only by the reserved key. */
+    const plainPlugin = (name: string, log: string[]): HarnessPlugin => ({
+        name,
+        metadata: { name, title: name, builtin: true },
+        setup: (api) => {
+            api.on('run.started', () => {
+                log.push(`${name}:run.started`);
+            });
+
+            api.on('harness.dispose', () => {
+                log.push(`${name}:harness.dispose`);
+            });
+        }
+    });
+
+    /** A plugin that declares its OWN `enabled` key with an explicit default. */
+    const declaringPlugin = (name: string, log: string[], enabledDefault: boolean): HarnessPlugin => ({
+        name,
+        metadata: {
+            name,
+            title: name,
+            builtin: true,
+            settings: [
+                { key: 'enabled', label: 'Enabled', type: 'boolean', default: enabledDefault }
+            ]
+        },
+        setup: (api) => {
+            api.on('run.started', () => {
+                log.push(`${name}:run.started`);
+            });
+
+            api.on('harness.dispose', () => {
+                log.push(`${name}:harness.dispose`);
+            });
+        }
+    });
+
+    it('delivers every hook to a plugin with nothing stored (the switch defaults on)', async () => {
+        const log: string[] = [];
+        const { hooks } = apply([plainPlugin('alpha', log)], []);
+
+        expect(hooks.count('run.started')).toBe(1);
+
+        await hooks.emit('run.started', runContext);
+        hooks.fire('harness.dispose', {});
+
+        expect(log).toEqual(['alpha:run.started', 'alpha:harness.dispose']);
+    });
+
+    it('stops delivering every gated event to a disabled plugin, and still delivers harness.dispose', async () => {
+        const log: string[] = [];
+        const { hooks, settings } = apply([plainPlugin('alpha', log)], []);
+
+        // The write edge of the switch is a plain boolean override under the reserved key
+        // (../server/plugins.ts); nothing was declared, so the framework's synthesized
+        // descriptor is what makes this value meaningful.
+        settings.set('alpha', 'enabled', false);
+
+        await hooks.emit('run.started', runContext);
+        await hooks.emit('run.started', runContext);
+
+        // Not one delivery, and no error report either: an operator turning a plugin off is
+        // not a handler failure (./hooks.ts rule 9).
+        expect(log).toEqual([]);
+
+        // Teardown is exempt, so a disabled plugin still releases its own timers and handles.
+        hooks.fire('harness.dispose', {});
+
+        expect(log).toEqual(['alpha:harness.dispose']);
+    });
+
+    it('honours a plugin that declares `enabled` with its own default of false', async () => {
+        const log: string[] = [];
+        const { hooks, settings, result } = apply([declaringPlugin('alpha', log, false)], []);
+
+        // Declared default OFF => off from the first turn, with nothing else stored: the
+        // plugin's own descriptor is the fallback the gate resolves, so a host with no
+        // settings document at all still honours what the plugin published.
+        expect(result.metadata[0].settings?.map((entry) => entry.key)).toEqual(['enabled']);
+        await hooks.emit('run.started', runContext);
+        expect(log).toEqual([]);
+
+        // The plugin's own Rule-0 style read and the framework gate consult the SAME key, so
+        // one stored `true` turns both on at once — and a reset (`undefined`/absent) lands
+        // back on the plugin's declared false, not on the framework's `true`.
+        settings.set('alpha', 'enabled', true);
+        await hooks.emit('run.started', runContext);
+        expect(log).toEqual(['alpha:run.started']);
+
+        settings.set('alpha', 'enabled', false);
+        await hooks.emit('run.started', runContext);
+        expect(log).toEqual(['alpha:run.started']);
+    });
+
+    it('applies a flip made AFTER setup() on the very next emit, with no re-registration', async () => {
+        const log: string[] = [];
+        const { hooks, settings } = apply([plainPlugin('alpha', log)], []);
+
+        await hooks.emit('run.started', runContext);
+        expect(log).toEqual(['alpha:run.started']);
+
+        // Off: the handler registration is untouched, only delivery stops.
+        settings.set('alpha', 'enabled', false);
+        await hooks.emit('run.started', runContext);
+        expect(log).toEqual(['alpha:run.started']);
+        expect(hooks.has('run.started')).toBe(false);
+        expect(hooks.count('run.started')).toBe(0);
+
+        // But the SUBSCRIBED surface is still reported, because the plugin is loaded and
+        // its `live()` rows are a fact about what setup() registered (./hooks.ts rule 9).
+        expect(hooks.live()['run.started']).toEqual(['alpha']);
+
+        // On again: the same registration runs, and `has()` stops letting an emit site skip.
+        settings.set('alpha', 'enabled', true);
+        await hooks.emit('run.started', runContext);
+
+        expect(log).toEqual(['alpha:run.started', 'alpha:run.started']);
+        expect(hooks.has('run.started')).toBe(true);
+        expect(hooks.count('run.started')).toBe(1);
+    });
+
+    it('gates a `*` observer per DELIVERED event, so it still sees harness.dispose', async () => {
+        const log: string[] = [];
+        const observer: HarnessPlugin = {
+            name: 'audit',
+            metadata: { name: 'audit', title: 'Audit', builtin: true },
+            setup: (api) => {
+                api.on('*', (context) => {
+                    log.push(`audit:${context.event}`);
+                });
+            }
+        };
+
+        const { hooks, settings } = apply([observer], []);
+
+        settings.set('audit', 'enabled', false);
+
+        await hooks.emit('run.started', runContext);
+        expect(log).toEqual([]);
+
+        // The wildcard envelope carries the event, and the gate is applied at dispatch with
+        // THAT event, which is why teardown is exempt for a `*` subscriber exactly as it is
+        // for a named one.
+        hooks.fire('harness.dispose', {});
+
+        expect(log).toEqual(['audit:harness.dispose']);
+    });
+
+    it('leaves a host-level subscription (owner "harness") ungated', async () => {
+        const log: string[] = [];
+        const hooks = createHookBus();
+
+        // A host `on` carries no `enabled` predicate at all, so no operator switch can
+        // silence the host's own observers — only plugin registrations are gated.
+        hooks.on('run.started', () => log.push('host'), { owner: 'harness' });
+
+        await hooks.emit('run.started', runContext);
+
+        expect(log).toEqual(['host']);
+        expect(hooks.has('run.started')).toBe(true);
     });
 });

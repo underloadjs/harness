@@ -136,13 +136,19 @@ const card: HarnessCard = {
     definition_revision: 3
 };
 
+// R3: every catalogue row states its GLOBAL enablement (`enabled`) and whether the
+// switch applies to it at all (`protected`, the harness-owned core set). Both are
+// REQUIRED on the wire (../shared/harness-api.ts `ToolSummary`:741-752), and ./api.ts
+// `toolRowOf` maps BOTH through — the row the Tools pane paints its switch from.
 const tool: ToolSummary = {
     name: 'read',
     group: 'files',
     description: 'Read a file.',
     tags: ['files'],
     visibility: 'core',
-    session_bound: false
+    session_bound: false,
+    enabled: true,
+    protected: false
 };
 
 const agentRow: AgentSummary = {
@@ -826,7 +832,11 @@ describe('loadBootstrap', () => {
                     description: 'Read a file.',
                     tags: ['files'],
                     visibility: 'core',
-                    sessionBound: false
+                    sessionBound: false,
+                    // R3: the enablement pair survives the mapper. Dropping either field
+                    // here would leave the Tools pane with no switch to paint.
+                    enabled: true,
+                    protected: false
                 }
             ],
             // A row carries no instruction TEXT, so the picker's preview stays empty
@@ -909,6 +919,47 @@ describe('tool calls', () => {
         ]);
     });
 
+    it('patches one catalogue entry\'s GLOBAL switch with the bare {enabled} body', async () => {
+        // R3: `PATCH /tools/{tool_id}` is the one global write a catalogue entry has
+        // (../shared/harness-api.ts `ToolSettingsUpdate`), and it answers the whole
+        // updated row — the Tools pane repaints from that answer, never from the click.
+        serve({ 'PATCH /v1/harness/tools/read': { tool: { ...tool, enabled: false } } });
+
+        const module = await import('./api');
+        const updated = await module.updateToolEnabled('read', false);
+
+        expect(updated).toEqual({ ...tool, enabled: false });
+        expect(calls).toEqual([
+            { method: 'PATCH', url: '/v1/harness/tools/read', body: { enabled: false }, keepalive: undefined }
+        ]);
+
+        // An enabled=false answer is a real row, not an absence: `enabled` stays a
+        // boolean on the mapped row the pane reads.
+        expect(updated.enabled).toBe(false);
+        expect(updated.protected).toBe(false);
+    });
+
+    it('encodes a tool id like any other path segment, and surfaces a protected refusal', async () => {
+        serve({ 'PATCH /v1/harness/tools/a%2Fb': { tool: { ...tool, name: 'a/b' } } });
+
+        const module = await import('./api');
+
+        await module.updateToolEnabled('a/b', true);
+
+        expect(calls[0].url).toBe('/v1/harness/tools/a%2Fb');
+
+        // A harness-owned name is refused with 403 by the store's own predicate; the
+        // client's job is to hand the pane the server's sentence verbatim.
+        serve(
+            { 'PATCH /v1/harness/tools/toolRequest': { error: { message: '"toolRequest" is a core tool and cannot be switched off.' } } },
+            { 'PATCH /v1/harness/tools/toolRequest': 403 }
+        );
+
+        await expect(module.updateToolEnabled('toolRequest', false)).rejects.toThrow(
+            '"toolRequest" is a core tool and cannot be switched off.'
+        );
+    });
+
     it('posts provider discovery with the key in the body, never the URL', async () => {
         serve({ 'POST /v1/harness/models': { models: ['m1', 'm2'], observed_at: 1 } });
 
@@ -931,6 +982,47 @@ describe('tool calls', () => {
         const module = await import('./api');
 
         expect(await module.listProviderModels({})).toEqual([]);
+    });
+
+    it('hands the provider order over untouched, duplicates included', async () => {
+        // Sorting and dedup are NOT this client's job: the contract keeps provider
+        // order (`../shared/harness-api.ts:889-897`), and the chat assistant applies
+        // its own stripped-name order in its own facade. R2a returns the array the
+        // server sent, so that split stays observable.
+        serve({ 'POST /v1/harness/models': { models: ['m2', 'm1', 'm2'], observed_at: 1 } });
+
+        const module = await import('./api');
+
+        expect(await module.listProviderModels({ base_url: 'http://provider/v1' })).toEqual(['m2', 'm1', 'm2']);
+    });
+
+    it('refuses a 200 whose models body is not the contract shape', async () => {
+        // R2a: the route used to answer `[]` for ANY body without an array under
+        // `models`, which turned a malformed 200 into "this provider has no models"
+        // — an empty dropdown, no banner, nothing actionable. Every body below now
+        // throws the sentence below, and only the shape of the received value varies.
+        const malformed: Array<[unknown, string]> = [
+            [{ observed_at: 1 }, 'an object with fields observed_at'],
+            [{ models: 'alpha/flash', observed_at: 1 }, 'an object with fields models, observed_at'],
+            [{ models: { alpha: 'flash' }, observed_at: 1 }, 'an object with fields models, observed_at'],
+            [{}, 'an object with no fields'],
+            [['alpha/flash'], 'an array of 1 item(s)'],
+            ['404 Not Found', 'a string ("404 Not Found")']
+        ];
+
+        for (const [body, shape] of malformed) {
+            serve({ 'POST /v1/harness/models': body });
+
+            const module = await import('./api');
+
+            await expect(module.listProviderModels({})).rejects.toThrow(
+                `The harness server returned an unexpected response for /models (expected the contract's {models: string[]} object, received ${shape}).`
+            );
+        }
+
+        // One request per body above — the shape check is post-transport, so a
+        // malformed answer is never retried or re-read here.
+        expect(calls).toHaveLength(malformed.length);
     });
 });
 

@@ -3147,11 +3147,25 @@ without `threadId` renders no badge, and a submit with no target omits `threadId
 POST   /sessions/:id/tasks                    { input, attachments?, references?, threadId? }
 GET    /sessions/:id/threads/:threadId/transcript                           -> { transcript }
 PUT    /sessions/:id/threads/:threadId/transcript { messages }              -> { session, transcript }
-POST   /sessions/:id/threads/:threadId/cancel { }                        -> { cancelled, session? }
+POST   /sessions/:id/threads/:threadId/cancel { }   -> { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }
 POST   /sessions/:id/threads/:threadId/resume { }     -> the submit receipt, re-running the interrupted turn
 DELETE /sessions/:id/threads/:threadId                                  -> { deleted: true, session }
 POST   /sessions/:id/cancel                   { all: true }              -> { cancelled }
 ```
+
+- The thread-cancel receipt is the store's own answer, never a constant: `cancelled` is
+  true exactly when this call TERMINATED work — it aborted a live run, released a turn
+  parked in a reference wait, or dropped at least one queued continuation — and `status`
+  is the conversation's real post-stop status read from its own record (the value its
+  roster row carries, when it has one). `dropped_queued_tasks` counts the NAMED
+  conversation's own backlog, measured before the stop, so it is a floor and not the
+  total the cascade discarded.
+- The thread-delete route now STOPS that conversation first (the same stop above) and
+  then purges it, so deleting a conversation with live or queued work no longer needs a
+  preceding cancel. A turn in ANOTHER conversation that merely `#`-references a turn of
+  the deleted one keeps running: its link is dropped, its label is kept as
+  `turn.strippedReferences`, and it composes the "result was deleted" note instead of
+  running without its input.
 
 A `/tasks` submit whose `input` starts with `/` is a **slash command**, not a prompt:
 the `202` envelope is identical, but its `turn` is already terminal because the server

@@ -999,7 +999,12 @@ const threadOf = (snapshot: SessionSnapshot, turnId: string): string => {
 };
 
 describe('SessionStore thread deletion', () => {
-    it('rejects running work (409), the default conversation (400), and unknown ids (404)', async () => {
+    // T10 (R2): live work no longer blocks a deletion. The store STOPS the conversation
+    // first (runtime stop + the lane's own abort, backlog dropped) and only then purges,
+    // so the reader never has to press Stop and Delete again. The refusals that remain
+    // are the ones a stop cannot answer for: an id that does not exist, and the agent's
+    // own conversation.
+    it('stops running work and deletes it, refuses the default conversation (400) and unknown ids (404)', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
         const created = await store.create('probe');
@@ -1012,26 +1017,27 @@ describe('SessionStore thread deletion', () => {
         const held = await store.enqueue(created.id, 'hold', undefined, undefined, 'thread-1');
         await fixture.started('hold').promise;
 
-        await expect(store.deleteThread(created.id, 'thread-1')).rejects.toThrow(SessionError);
-        await expect(store.deleteThread(created.id, 'thread-1')).rejects.toThrow(
-            'Thread "thread-1" still has live work; wait for it to stop before deleting it.'
-        );
+        // The delete settles the aborted row before purging, so the row leaves with the
+        // conversation instead of surviving as an orphaned `cancelled` record.
+        const deleted = await store.deleteThread(created.id, 'thread-1');
+        expect(deleted.threads).toBeUndefined();
+        expect(deleted.turns).toEqual([]);
+
+        // The released gate is never needed: the run was aborted, and the turn's own
+        // completion resolved as part of the delete.
+        await held.settled;
+        await store.waitForIdle(created.id);
+
+        expect(store.get(created.id).turns).toEqual([]);
+        expect(fixture.log.filter((entry) => entry === 'end:hold')).toHaveLength(1);
+
+        await expect(store.deleteThread(created.id, 'thread-404')).rejects.toThrow(SessionError);
         await expect(store.deleteThread(created.id, 'thread-404')).rejects.toThrow(
             'Unknown thread "thread-404".'
         );
         await expect(store.deleteThread(created.id, 'agent:probe')).rejects.toThrow(
             'Thread "agent:probe" is the agent\'s own conversation and cannot be deleted; use reset to clear the session.'
         );
-
-        await store.cancel(created.id, { all: true });
-        fixture.gate('hold').resolve();
-        await held.settled;
-        await store.waitForIdle(created.id);
-
-        // A stopped, idle thread deletes cleanly and its turns/transcript go with it.
-        const deleted = await store.deleteThread(created.id, 'thread-1');
-        expect(deleted.threads).toBeUndefined();
-        expect(deleted.turns).toEqual([]);
     });
 
     it('keeps indices monotonic and surviving labels stable across a deletion', async () => {
@@ -3493,7 +3499,14 @@ describe('thread deletion atomicity', () => {
         return { preset, started, release };
     };
 
-    it('rejects a delete while the stopped run is unwinding, leaving disk and memory unchanged', async () => {
+    // T10 (R2): the forced stop is what makes this case work. The store aborts the
+    // signal the RUNTIME call itself holds, so even a transport that never looks at
+    // its abort stops owning the conversation: the row settles `cancelled`, the purge
+    // proceeds, and the late answer is discarded with the conversation. The durable
+    // file is written BEFORE the runtime purge, so it only ever names a state the
+    // runtime actually reached — the F4 ordering rule is intact, only the refusal is
+    // gone now that the store can honestly free the conversation first.
+    it('stops the unwinding run and deletes the conversation, discarding its late answer', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const fixture = stubbornPreset();
         const persistence = new HarnessPersistence(root);
@@ -3504,35 +3517,33 @@ describe('thread deletion atomicity', () => {
         await fixture.started.promise;
 
         expect((await store.cancelThread(created.id, 'thread-1')).cancelled).toBe(true);
-        // The run ignores the abort: the turn is still live.
+        // The run ignores the abort: the turn is still live at this instant.
         expect(store.get(created.id).turns[0].status).toBe('running');
 
         const diskBefore = fs.readFileSync(persistence.file, 'utf8');
-        const memoryBefore = store.get(created.id);
-
-        let refusal: unknown;
-        try {
-            await store.deleteThread(created.id, 'thread-1');
-        } catch (error) {
-            refusal = error;
-        }
-        expect(refusal).toMatchObject({ status: 409 });
-        expect((refusal as Error).message).toBe(
-            'Thread "thread-1" still has live work; wait for it to stop before deleting it.'
-        );
-
-        // F4: no durable write and no in-memory mutation happened.
-        expect(fs.readFileSync(persistence.file, 'utf8')).toBe(diskBefore);
-        expect(store.get(created.id)).toEqual(memoryBefore);
-
-        // Once the late answer settles (discarded by the runtime), deletion works.
-        fixture.release.resolve();
-        await task.settled;
-        await store.waitForIdle(created.id);
 
         const deleted = await store.deleteThread(created.id, 'thread-1');
         expect(deleted.turns).toEqual([]);
         expect(deleted.threads).toBeUndefined();
+
+        // The delete is durable, and memory agrees with the file: no orphan row, no
+        // phantom conversation.
+        const durable = persistence.load();
+        if (durable === undefined) throw new Error('the delete did not persist');
+
+        expect(fs.readFileSync(persistence.file, 'utf8')).not.toBe(diskBefore);
+        expect(durable.sessions.find((candidate) => candidate.id === created.id)?.turns).toEqual([]);
+        expect(store.get(created.id).turns).toEqual([]);
+
+        // The abandoned transport answers after its conversation is gone; nothing it
+        // emits can bring the row or the thread back.
+        fixture.release.resolve();
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        expect(store.get(created.id).turns).toEqual([]);
+        expect(store.get(created.id).threads).toBeUndefined();
+        expect(persistence.load()?.sessions.find((candidate) => candidate.id === created.id)?.turns).toEqual([]);
 
         store.dispose();
         fs.rmSync(root, { recursive: true, force: true });

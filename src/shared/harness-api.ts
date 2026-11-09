@@ -670,10 +670,10 @@ export interface PluginSetting {
 }
 
 /**
- * One built-in plugin as an operator sees it: identity, the lifecycle hooks it declares, its settings
- * descriptors, and the values that are in force right now. `builtin` is always true on this route - the
- * catalogue is the auto-scanned set this build ships - and it stays on the wire so a client renders the same
- * row shape for a plugin a future release makes configurable.
+ * One built-in plugin as an operator sees it: identity, the lifecycle hooks it declares, whether it RUNS right
+ * now, its settings descriptors, and the values that are in force right now. `builtin` is always true on this
+ * route - the catalogue is the auto-scanned set this build ships - and it stays on the wire so a client renders
+ * the same row shape for a plugin a future release makes configurable.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PluginSummary {
@@ -684,6 +684,7 @@ export interface PluginSummary {
     tags?: string[];
     hooks?: string[];
     builtin: boolean;
+    enabled: boolean;
     settings: PluginSetting[];
     values: {
       [key: string]: unknown;
@@ -706,10 +707,12 @@ export interface PluginDetailResponse {
 }
 
 /**
- * Settings patch for one plugin. Each key must be one the plugin declares; a value REPLACES that key's
- * override, an explicit `null` clears it (the declared default applies again), and an omitted key is no change.
- * Unknown keys are refused rather than ignored, so a client is never left believing it edited something. There
- * is no enable/disable field: plugin loading is auto-scanned.
+ * Settings patch for one plugin. Each key must be one the plugin declares OR the framework's reserved `enabled`
+ * boolean, which every plugin answers to; a value REPLACES that key's override, an explicit `null` clears it
+ * (the declared default applies again), and an omitted key is no change. Unknown keys are refused rather than
+ * ignored, so a client is never left believing it edited something. Enabling and disabling a plugin is a write
+ * on this same body - `{ "settings": { "enabled": false } }` - and it needs no idle window: it takes effect in
+ * every session from the next turn.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PluginSettingsUpdate {
@@ -731,8 +734,8 @@ export interface ToolAvailability {
 
 /**
  * One catalogue entry as a list projects it: identity, display group, description, tags, visibility,
- * availability, and whether the entry can only run inside a session. The argument JSON Schema is on the
- * identified read.
+ * availability, whether the entry can only run inside a session, and the two enablement fields the Tools pane
+ * switches on. The argument JSON Schema is on the identified read.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ToolSummary {
@@ -743,6 +746,18 @@ export interface ToolSummary {
     visibility: "core" | "searchable";
     availability?: ToolAvailability;
     session_bound: boolean;
+    enabled: boolean;
+    protected: boolean;
+}
+
+/**
+ * The one global write a catalogue entry has: switch it on or off for every session. There is no per-session
+ * meaning here (that is the session-scoped route's job) and no idle window: the change is read when the next
+ * request's tool list is built, so a run in flight keeps running with what it was given.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface ToolSettingsUpdate {
+    enabled: boolean;
 }
 
 /**
@@ -1611,10 +1626,10 @@ export interface DeleteThreadResult {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CancelThreadResult {
-    cancelled: true;
+    cancelled: boolean;
     thread_id: string;
     session_id: string;
-    status: "stopped";
+    status: "idle" | "running" | "paused" | "stopped";
     dropped_queued_tasks: number;
     revision: number;
 }

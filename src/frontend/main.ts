@@ -261,6 +261,10 @@ import {
     // mapper it shares with the page. A `ToolSummary` row has no schema; this is the read
     // that supplies one, asked for only when a tool is opened.
     getTool,
+    // R3: the ONE global write a catalogue entry has — `PATCH /tools/{id}` with
+    // `{ enabled }`, answered by the whole updated row. The Tools pane's switch is its
+    // only caller, and the write is anytime (no idle window on the server).
+    updateToolEnabled,
     toolRowOf
 } from './api';
 import type { HarnessBootstrap } from './api';
@@ -5347,10 +5351,28 @@ type SessionRecord = {
 // `SessionSnapshot`: same header fields the rail, the pills and the harness totals
 // read, and NO event list anywhere (which is the payload this surface removes).
 let sessions: SessionRecord[] = [];
-let currentTool: ToolDescriptor | undefined;
+let currentTool: ToolRowEntry | undefined;
+// R3 — the row shape the global tools view actually paints.
+//
+// WHY THIS IS A LOCAL EXTENSION AND NOT A PROTOCOL CHANGE
+// ------------------------------------------------------
+// `GET /tools` rows carry the two enablement fields (../shared/harness-api.ts
+// `ToolSummary`:741-752) and ./api.ts `toolRowOf` maps BOTH through, but the shell's row
+// type is the server protocol's `ToolDescriptor` (../server/protocol.ts:414), which
+// predates the switch and is not this surface's to widen. A catalogue entry therefore
+// reaches the pane as `ToolRowEntry`: the descriptor plus what `toolRowOf` carried.
+//
+// Both fields are OPTIONAL on purpose. A row from a server that never states enablement
+// (an older build, or a fixture modelling one) renders NO switch — the pane only ever
+// shows an enablement the server actually reported, never a guessed one.
+type ToolRowEntry = ToolDescriptor & {
+    enabled?: boolean;
+    protected?: boolean;
+};
+
 // The complete server catalogue (core entries included) for the global tools view —
 // the ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
-let toolEntries: readonly ToolDescriptor[] = [];
+let toolEntries: readonly ToolRowEntry[] = [];
 // Which centre view is showing: the chat (transcript + composer) or the GLOBAL tools
 // view (catalogue + manual runner). There is no tab strip (R3); the topbar's
 // icon-only Tools toggle drives this through `setToolsView`.
@@ -7705,15 +7727,29 @@ const renderPlaygroundNote = (): void => {
 
 const toolTabButtons = new Map<string, HTMLButtonElement>();
 
+// One PATCH per name at a time (the same single-flight discipline `loadPlugins` and the
+// settings save follow).
+const togglingTools = new Set<string>();
+// The switch controls, keyed by tool name, so a write repaints its OWN row in place and
+// `paintControls` can lock/unlock exactly that control.
+const toolToggleButtons = new Map<string, HTMLButtonElement>();
+// The tools pane's own live line for enablement writes. `toolsSessionNote` belongs to the
+// playground note, and the head note belongs to the count — this is the third state the
+// pane has to say ("the switch was refused, and here is the server's sentence").
+const toolsTabNote = el('p', 'tools-tab-note field-hint', '');
+toolsTabNote.setAttribute('role', 'status');
+toolsTabNote.setAttribute('aria-live', 'polite');
+toolsTabNote.hidden = true;
+
 const toolsPane = el('div', 'pane tools-pane');
 const toolsTabHead = el('div', 'tools-tab-head');
 const toolsTabHint = el(
     'p',
     'tools-tab-hint',
-    'Every tool the server lists, core tools included. Select one to open its runner. Calls execute on the harness server — nothing runs in this browser. This playground is independent of the conversation you have selected: session-bound tools (toolRequest, toolCreate, task, and delegate when the playground harness has subagents) run in a temporary session the playground creates for itself and deletes when this view closes, and every other tool, including the core file and search tools, runs directly.'
+    'Every tool the server lists, core tools included. Select one to open its runner. Each row also carries that tool’s switch: clicking it enables or disables the tool for EVERY conversation on this harness server, from the next request onwards, and a run already in flight keeps the tool list it was given. Harness-owned core tools are pinned on and have no switch. Calls execute on the harness server — nothing runs in this browser. This playground is independent of the conversation you have selected: session-bound tools (toolRequest, toolCreate, task, and delegate when the playground harness has subagents) run in a temporary session the playground creates for itself and deletes when this view closes, and every other tool, including the core file and search tools, runs directly.'
 );
 const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
-toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote);
+toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote, toolsTabNote);
 const toolsTabList = el('div', 'tool-tab-list');
 // The list is the whole content area. The runner is NOT mounted here any more: it
 // is adopted by `openToolDialog` only while the reader is testing that tool.
@@ -7804,10 +7840,16 @@ const openToolDialog = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     toolDialog = handle;
 };
 
-const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
-    if (running) return;
-
-    stopPolling();
+const selectTool = (entry: ToolRowEntry, trigger?: HTMLElement): void => {
+    // R1: no `running` gate. The catalogue and its runner are server facts, and the
+    // conversation's observer keeps streaming underneath this pane; the transcript
+    // painters all early-return on `showingTools` (`renderHarnessChrome`, main.ts:6189).
+    //
+    // The `stopPolling()` this function used to open with is GONE, and that is part of
+    // the same change: the bounded refresh is how a conversation with no live socket
+    // stays current, and removing the run gate made "select a tool mid-run" reachable.
+    // Stopping the follow there would freeze the transcript under the catalogue and only
+    // resume it when the reader happens to re-open the conversation.
 
     // Replace, never stack: close the previous runner first so its `onClose` reset
     // runs against the state that was actually on screen.
@@ -7889,13 +7931,19 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
 // topbar icon toggle calls it and harness selection closes it. The panel (`stage`)
 // is shared; the rest of the centre chrome (head and composer, with both flanking
 // controls) is shown or
-// hidden to match. A run in flight keeps the view locked, exactly as the removed
-// tabs were.
+// hidden to match.
+//
+// R1 (this pass): a run in flight NO LONGER locks the view. The catalogue and its
+// runner are server facts, and leaving/entering this column only swaps the centre
+// pane — the conversation's observer, its queue and its tiles are untouched, so a
+// stream keeps being folded into `instance.view` while the list is on screen
+// (`renderHarnessChrome` and the head painters early-return on `showingTools`). The
+// old lock bought nothing except a hidden catalogue.
 //
 // Opening NEVER auto-opens a tool any more: the content area is the list, and a
 // dialog appears only after the reader activates one entry.
 const setToolsView = (open: boolean): void => {
-    if (running || showingTools === open) return;
+    if (showingTools === open) return;
 
     // Lifecycle: entering the Tools view dismisses the agent dialog; the chat starts
     // with it closed when the view returns. The harness details dialog is also closed
@@ -7981,12 +8029,191 @@ toolsToggle.addEventListener('click', () => {
     setToolsView(!showingTools);
 });
 
-// Full-width tools view listing: the single catalogue (R21.2). Every entry is a
-// keyed button with enough room to show what it is and whether a session is needed.
-// Group headings come from the server order, core entries included.
-const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
+// The row's enablement control (R3). A row is one `.tool-tab-row` holding the listing
+// button and, beside it, EITHER a switch OR a pin:
+//
+//   - `protected === true` — a harness-owned core entry (toolRequest, toolCreate, task,
+//     delegate). The store answers `enabled: true` for it and its PATCH is a 403
+//     (../server/api.ts `patchTool` → `store.updateToolEnabled`), so the row states the
+//     pin as text and offers NO control. An affordance that can only ever be refused is
+//     worse than a sentence that says why.
+//   - otherwise — a real `role="switch"` button whose `aria-checked` is the server's
+//     `enabled`. One click writes it for EVERY session (`PATCH /tools/{tool_id}`); the
+//     row is repainted from the answer, never from a guess.
+//
+// A row that states NO enablement (`enabled === undefined`, an older server or a fixture
+// modelling one) renders NEITHER: inventing a control for a state the server never
+// reported is a lie the reader cannot act on.
+const toolEnablementPinOf = (entry: ToolRowEntry): HTMLSpanElement => {
+    const pin = el('span', 'tool-tab-pin', 'core');
+
+    pin.title = `${entry.name} is a harness-owned core tool: always enabled, and it cannot be switched off.`;
+
+    return pin;
+};
+
+// The switch itself. The visible word is the STATE (`on`/`off`), the accessible name is
+// the ACTION, and `aria-checked` carries the state for assistive tech — three readings of
+// one figure, never a colour-only signal.
+const toolToggleControlOf = (entry: ToolRowEntry): HTMLButtonElement => {
+    const enabled = entry.enabled === true;
+    const control = el('button', enabled ? 'tool-tab-toggle is-on' : 'tool-tab-toggle is-off', enabled ? 'on' : 'off');
+
+    control.type = 'button';
+    control.dataset.tool = entry.name;
+    control.dataset.enabled = enabled ? 'true' : 'false';
+    control.setAttribute('role', 'switch');
+    control.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name} for every conversation`);
+    control.title = enabled
+        ? 'Enabled for every conversation · click to switch this tool off'
+        : 'Switched off for every conversation · click to switch it on';
+    // R1: a run never locks this control — the only thing that can is its own write
+    // (the same rule `paintControls` paints from).
+    control.disabled = togglingTools.has(entry.name);
+    // The click reads the CACHED row, not the `entry` this node was built from: a
+    // successful write replaces the cache, and a second press must invert the figure the
+    // server last reported rather than the one this frame was painted with.
+    control.addEventListener('click', () => {
+        void setToolEnabled(entry.name, !(toolEntryOf(entry.name)?.enabled ?? false));
+    });
+
+    return control;
+};
+
+// The catalogue row the pane currently holds for one name — the figure every repaint and
+// every click of the switch reads.
+const toolEntryOf = (name: string): ToolRowEntry | undefined =>
+    toolEntries.find((entry) => entry.name === name);
+
+// Repaint ONE row's switch from the row's own enablement figure, in place (no list
+// rebuild, so focus and the dialog's `returnFocus` target survive). Both the control's
+// state and the row button's `data-enabled` figure move together, so the list can never
+// show the switch on and the row dim at the same time.
+//
+// The parameter is the ENABLEMENT figure, not a whole row: a `ToolRowView` (what
+// `toolRowOf` maps a PATCH answer into) has no `parameters` field, and this painter reads
+// exactly two fields, so widening it to the full entry would only add a cast.
+type ToolEnablement = { name: string; enabled?: boolean };
+
+const paintToolRowEnablement = (entry: ToolEnablement): void => {
+    const control = toolToggleButtons.get(entry.name);
+    const button = toolTabButtons.get(entry.name);
+
+    if (button !== undefined && entry.enabled !== undefined) {
+        button.dataset.enabled = entry.enabled ? 'true' : 'false';
+    }
+
+    if (control === undefined || entry.enabled === undefined) return;
+
+    const enabled = entry.enabled;
+
+    control.className = enabled ? 'tool-tab-toggle is-on' : 'tool-tab-toggle is-off';
+    control.textContent = enabled ? 'on' : 'off';
+    control.dataset.enabled = enabled ? 'true' : 'false';
+    control.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name} for every conversation`);
+    control.title = enabled
+        ? 'Enabled for every conversation · click to switch this tool off'
+        : 'Switched off for every conversation · click to switch it on';
+};
+
+// Lock/unlock one row's switch while ITS OWN write is in flight. This is the only
+// disabled state the control has after R1 removed the run/pending lock.
+const paintToolToggleBusy = (name: string, busy: boolean): void => {
+    const control = toolToggleButtons.get(name);
+
+    if (control === undefined) return;
+
+    control.disabled = busy;
+    control.setAttribute('aria-busy', busy ? 'true' : 'false');
+};
+
+// The pane's one line about a switch write: the server's sentence on a refusal, the
+// accepted figure on a success. `role="status"`, because nothing here moves focus. The
+// ROW itself is repainted by `rememberToolRow` from the server's answer, so this line
+// only ever adds the outcome sentence.
+const noteToolsToggleResult = (text: string, failed: boolean): void => {
+    toolsTabNote.textContent = text;
+    toolsTabNote.hidden = false;
+    // Text AND class: colour is never the only signal (the shell's standing rule).
+    toolsTabNote.className = failed ? 'tools-tab-note tools-tab-note-error' : 'tools-tab-note field-hint';
+};
+
+// Take the PATCH answer as the new state of one row. The answer is a whole `ToolDetail`,
+// so the cache, the memoized identified read (its schema stays where it was) and the
+// runner all move to the server's figure.
+const rememberToolRow = (detail: ToolDetail): void => {
+    const row = toolRowOf(detail);
+    toolEntries = toolEntries.map((entry) =>
+        entry.name === row.name ? { ...entry, enabled: row.enabled, protected: row.protected } : entry
+    );
+
+    const known = toolDetails.get(row.name);
+
+    if (known !== undefined) {
+        toolDetails.set(row.name, { ...known, enabled: row.enabled, protected: row.protected });
+    }
+
+    paintToolRowEnablement(row);
+    // The dialog's runner is showing this tool: its availability line is the same figure.
+    if (currentTool !== undefined && currentTool.name === row.name) {
+        currentTool = { ...currentTool, enabled: row.enabled, protected: row.protected };
+    }
+
+    // A refused or accepted switch is a fact about the LISTING, and the list is what the
+    // head describes; keep the row states in sync with the cache.
+    if (showingTools && currentTool === undefined) paintToolsHead();
+};
+
+// R3's one global write. Deliberately NOT guarded by `running`/`submitting`: the route
+// is write-anytime (../server/api.ts `patchTool` — no `assertIdleForToolMutation`), and
+// a run already in flight keeps the tool list it was given, so the switch simply takes
+// effect on the NEXT request.
+//
+// Single-flight per name (a double press must not send two PATCHes), and every repaint
+// comes from the server's answer: the PATCH returns the whole updated `ToolDetail`, so
+// the row shows the figure the store holds, not the value that was sent.
+const setToolEnabled = async (name: string, enabled: boolean): Promise<void> => {
+    if (togglingTools.has(name)) return;
+
+    togglingTools.add(name);
+    paintToolToggleBusy(name, true);
+    // An app-scoped config write: the topbar pill reports the window exactly like the
+    // plugin settings save does.
+    setStatus('saving', `tool enablement: ${name}`);
+
+    try {
+        const detail = await updateToolEnabled(name, enabled);
+
+        rememberToolRow(detail);
+        noteToolsToggleResult(`${name} is now ${enabled ? 'enabled' : 'disabled'} for every conversation.`, false);
+        setStatus('idle');
+    } catch (error) {
+        // The server's own sentence (a 403 for a protected name, a 404 for an unknown
+        // one), reported where the reader is looking: the pane's live note plus the pill.
+        const message = messageOf(error);
+
+        noteToolsToggleResult(message, true);
+        setStatus('error', `tool enablement: ${message}`);
+    } finally {
+        togglingTools.delete(name);
+        paintToolToggleBusy(name, false);
+    }
+};
+// R1: rows are NEVER disabled by a run — the list stays clickable while a thread
+// streams, and `selectTool` no longer refuses the click.
+//
+// R3: every row carries the tool's GLOBAL enablement switch next to it. The row itself
+// is a `<button>`, so the switch is its SIBLING inside `.tool-tab-row` (a button inside
+// a button is not valid HTML and assistive tech would read one control where there are
+// two). A harness-owned (`protected`) entry has no switch at all: the server answers
+// `enabled: true` for it and refuses the write with 403, so the row states the pin
+// instead of offering an action that can only fail.
+const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
     toolsTabList.replaceChildren();
     toolTabButtons.clear();
+    toolToggleButtons.clear();
 
     let lastGroup = '';
 
@@ -7996,6 +8223,8 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
             lastGroup = entry.group;
         }
 
+        const row = el('div', 'tool-tab-row');
+
         const button = el('button', 'tool-tab-button');
         button.type = 'button';
         button.dataset.tool = entry.name;
@@ -8004,7 +8233,6 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
         // control advertises the popup kind to assistive technology. The button is
         // passed back as `returnFocus` so closing restores focus here.
         button.setAttribute('aria-haspopup', 'dialog');
-        button.disabled = running;
 
         const unavailable = entry.availability?.state === 'unconfigured';
         const kind = [
@@ -8013,15 +8241,32 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
             ...(unavailable ? ['unconfigured'] : [])
         ].join(' · ');
         if (unavailable) button.dataset.availability = 'unconfigured';
+        // R3: the row states the switch's state too, so the list is readable with the
+        // control off-screen (and `data-enabled` is what styles the off rows).
+        if (entry.enabled !== undefined) button.dataset.enabled = entry.enabled ? 'true' : 'false';
 
         button.append(
             el('span', 'tool-tab-name', entry.name),
             el('span', 'tool-tab-kind', kind)
         );
         button.addEventListener('click', () => selectTool(entry, button));
+        row.append(button);
+
+        // The enablement affordance: a pin for a harness-owned entry, a switch for
+        // everything else, and NOTHING for a row that never stated an enablement.
+        if (entry.enabled !== undefined) {
+            if (entry.protected === true) {
+                row.append(toolEnablementPinOf(entry));
+            } else {
+                const control = toolToggleControlOf(entry);
+
+                row.append(control);
+                toolToggleButtons.set(entry.name, control);
+            }
+        }
 
         toolTabButtons.set(entry.name, button);
-        toolsTabList.append(button);
+        toolsTabList.append(row);
     }
 
     if (entries.length === 0) {
@@ -8046,25 +8291,30 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
 // catalogue refresh) and drops the memo, which is the revision boundary this resource actually
 // publishes (`ToolDetail` carries no counter of its own). A failed read is not memoized, so the
 // next open asks again, and no list render ever waits on or fans out these reads.
-const toolDetails = new Map<string, ToolDescriptor>();
+const toolDetails = new Map<string, ToolRowEntry>();
 
 // Row + identified read, as one descriptor. The row's display facts stay (that is what the list
 // showed and what the click was made on); the schema, availability and session scope come from
-// the detail, because that is the only read that states them.
-const toolDescriptorOf = (row: ToolDescriptor, detail: ToolDetail): ToolDescriptor => {
+// the detail, because that is the only read that states them. R3: so do `enabled`/`protected` —
+// the identified row is the fresher statement of the switch, and a runner opened from an older
+// page must not offer a switch the server has since moved.
+const toolDescriptorOf = (row: ToolRowEntry, detail: ToolDetail): ToolRowEntry => {
     const merged = toolRowOf(detail);
 
     return {
         ...row,
         ...(merged.availability === undefined ? {} : { availability: merged.availability }),
         sessionBound: merged.sessionBound,
+        // R3: the switch's state comes from the read that states it freshest.
+        enabled: merged.enabled,
+        protected: merged.protected,
         parameters: (detail.parameters ?? {}) as Record<string, unknown>
     };
 };
 
 // Pull one entry's schema, then repaint ONLY if that tool is still the one on screen. A late
 // answer for a tool the reader already left must not replace the runner underneath them.
-const hydrateToolDetail = async (row: ToolDescriptor): Promise<void> => {
+const hydrateToolDetail = async (row: ToolRowEntry): Promise<void> => {
     const detail = await getTool(row.name).catch<ToolDetail | undefined>(() => undefined);
     if (detail === undefined) return;
 
@@ -8083,7 +8333,7 @@ const hydrateToolDetail = async (row: ToolDescriptor): Promise<void> => {
 // Boot entry for the catalogue. R21.2: the tools view is the sole listing, so this
 // only caches the entries (for `setToolsView`) and rebuilds that list — no
 // right-rail duplicate to keep in sync any more.
-const buildTools = (entries: readonly ToolDescriptor[]): void => {
+const buildTools = (entries: readonly ToolRowEntry[]): void => {
     toolEntries = entries;
     // A new catalogue page is a new revision of every row in it, so every memoized identified
     // read describes a list the server has since replaced.
@@ -8099,17 +8349,29 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
 // the shipped Context Compaction plugin with an EDITABLE context limit. The two halves
 // of that answer are deliberately different:
 //
-//   - ENABLEMENT is read-only. Plugin loading is auto-scanned by the host, so the
-//     contract carries no enable/disable field at all (../shared/harness-api.ts
-//     `PluginSettingsUpdate` is settings-only) and this pane offers no toggle to invent
-//     one. The catalogue is a listing plus a detail dialog.
-//   - SETTINGS are editable, and the row dialog is the only write path:
+//   - ENABLEMENT is a ONE-CLICK GLOBAL WRITE (R2, this pass). Loading is still
+//     auto-scanned — nothing here installs or uninstalls a plugin — but every row carries
+//     a switch, and `PluginSummary.enabled` is the TOP-LEVEL field it paints from
+//     (../shared/harness-api.ts:676-689). The write is the ordinary settings PATCH with
+//     the framework's RESERVED `enabled` key:
+//     `PATCH /plugins/{id}` `{ settings: { enabled: <boolean> } }`. It is accepted for
+//     EVERY plugin, whether or not that plugin declares the key itself, it has no idle
+//     window, and it takes effect in every conversation from its next turn
+//     (../server/plugins.ts "THE RESERVED `enabled` KEY").
+//
+//     WHY `values.enabled` IS NEVER READ: `values` reports DECLARED settings only
+//     (../server/plugins.ts:47-50 — "a key absent from `settings` never appears there"),
+//     so for a plugin that declares no `enabled` the map has nothing under that key while
+//     the row's own `enabled` field still states the switch. Painting the toggle from
+//     `values` would show every undeclared plugin as off.
+//   - SETTINGS stay editable, and the row dialog is the only write path for them:
 //     `PATCH /plugins/{id}` with `{ settings: { key: value } }`.
 //
 // STRUCTURE mirrors the tools view (the code directly above) on purpose: a topbar
-// icon-only toggle, a full-width `.plugins-pane` in `stage`, `.plugin-tab-button` rows,
-// and the SHARED modal (`ui/dialog.ts`) for the detail. The centre column has ONE owner,
-// so `setPluginsView` and `setToolsView` close each other.
+// icon-only toggle, a full-width `.plugins-pane` in `stage`, `.plugin-tab-row` rows (a
+// dialog trigger plus its own enablement switch), and the SHARED modal (`ui/dialog.ts`)
+// for the detail. The centre column has ONE owner, so `setPluginsView` and `setToolsView`
+// close each other.
 //
 // WHY THE PAGE IS CACHED AND RE-READ BY HAND
 // ------------------------------------------
@@ -8145,35 +8407,63 @@ let pluginDialog: DialogHandle | undefined;
 let currentPlugin: string | undefined;
 
 // The catalogue rows, keyed by plugin name, so a save repaints its own row; the
-// `values` span is the line that carries the effective settings.
+// `values` span is the line that carries the effective settings, and `toggle` is the
+// row's enablement switch (R2) — a SIBLING of the row button inside `.plugin-tab-row`,
+// never a control nested in another control.
 const pluginTabButtons = new Map<string, HTMLButtonElement>();
-const pluginRowNodes = new Map<string, { button: HTMLButtonElement; values: HTMLSpanElement }>();
+const pluginRowNodes = new Map<string, {
+    button: HTMLButtonElement;
+    values: HTMLSpanElement;
+    toggle?: HTMLButtonElement;
+}>();
+// R2: the switches, keyed by plugin name, so `paintControls` can lock exactly the one
+// whose write is in flight (`togglingPlugins`) — and nothing else, ever.
+const pluginToggleButtons = new Map<string, HTMLButtonElement>();
+const togglingPlugins = new Set<string>();
 
 const pluginsPane = el('div', 'pane plugins-pane');
 const pluginsTabHead = el('div', 'plugins-tab-head');
-// R2/R3 wording the user asked for: the catalogue is auto-scanned, and enablement is
-// not a decision this UI makes.
+// R2 (this pass): the copy the old pane carried was WRONG — enablement is no longer
+// "read-only". Every built-in is still auto-scanned (nothing is installed from here),
+// but each row now carries a one-click global switch whose effect the server states:
+// every conversation, from its next turn.
 const pluginsTabHint = el(
     'p',
     'plugins-tab-hint',
-    'Auto-scanned · read-only enablement. Every plugin this harness server ships is loaded, so there is nothing to enable or disable here. The settings a plugin declares are editable in its dialog, and a saved value applies to every conversation from its next turn.'
+    'Auto-scanned · one-click enable/disable. Every plugin this harness server ships is listed here, and each row’s switch turns that plugin on or off for EVERY conversation on this server, from its next turn — the plugin stays loaded and listed either way. The settings a plugin declares are editable in its dialog, and a saved value applies the same way: to every conversation, from its next turn.'
 );
 // The count/error line. `aria-live` carries the load transition to assistive tech
 // because nothing here moves focus.
 const pluginsTabNote = el('p', 'plugins-tab-note field-hint', '');
 pluginsTabNote.setAttribute('role', 'status');
 pluginsTabNote.setAttribute('aria-live', 'polite');
+// The enablement line (R2): the outcome of a row's switch write — the accepted figure or
+// the server's refusal, never a colour-only signal. It is SEPARATE from `pluginsTabNote`
+// (the count/error line that `pluginsCountNote` owns) so a refusal can never be mistaken
+// for a failed catalogue read, and neither writer can paint the other's sentence away.
+const pluginsTabStatus = el('p', 'plugins-tab-status field-hint', '');
+pluginsTabStatus.setAttribute('role', 'status');
+pluginsTabStatus.setAttribute('aria-live', 'polite');
+pluginsTabStatus.hidden = true;
+
 const pluginsRefresh = el('button', 'button plugins-refresh', 'Reload plugins');
 pluginsRefresh.type = 'button';
 // Same gate as the toggle it belongs to: nothing is readable before boot has answered,
-// and `buildPluginsTab`/`paintControls` are the only writers afterwards.
+// and `buildPluginsTab`/`paintControls` are the only writers afterwards. R1 removed the
+// run lock — a re-read is a GET, and a streaming queue does not make it meaningless.
 pluginsRefresh.disabled = true;
 // Deferred read (the same discipline every other control in this file follows):
 // `loadPlugins` is a module-level `const` declared below this listener's installation.
 pluginsRefresh.addEventListener('click', () => {
     void loadPlugins(true);
 });
-pluginsTabHead.append(el('h2', 'plugins-tab-title', 'Plugins'), pluginsTabHint, pluginsTabNote, pluginsRefresh);
+pluginsTabHead.append(
+    el('h2', 'plugins-tab-title', 'Plugins'),
+    pluginsTabHint,
+    pluginsTabNote,
+    pluginsTabStatus,
+    pluginsRefresh
+);
 // The list is the whole content area, exactly like `.tool-tab-list`.
 const pluginsTabList = el('div', 'plugin-tab-list');
 pluginsPane.append(pluginsTabHead, pluginsTabList);
@@ -8273,21 +8563,141 @@ const closePluginDialog = (): void => {
 // Merge a fresh row into the cached page. Both the PATCH answer and a reload land here,
 // so the cache is never a stale copy of a row the server just restated.
 const rememberPlugin = (plugin: PluginSummary): void => {
-    const index = pluginRows.findIndex((row) => row.name === plugin.name);
-    if (index >= 0) pluginRows[index] = plugin;
-    else pluginRows = [...pluginRows, plugin];
-
+    replacePluginRow(plugin);
+    // A settings save happens INSIDE one plugin's dialog, so the merged row is also the
+    // row the head is currently naming.
     currentPlugin = plugin.name;
 };
 
+// The same cache merge WITHOUT claiming a dialog is open: the row's enablement switch
+// writes from the LIST, and a head painter that read `currentPlugin` would then describe
+// a plugin whose layer was never opened.
+const replacePluginRow = (plugin: PluginSummary): void => {
+    const index = pluginRows.findIndex((row) => row.name === plugin.name);
+
+    if (index >= 0) pluginRows[index] = plugin;
+    else pluginRows = [...pluginRows, plugin];
+};
+
 // Repaint ONE row from its row data, without touching the list's other nodes (see the
-// in-place-repaint note at the top of this section).
+// in-place-repaint note at the top of this section). The settings line AND the
+// enablement switch move together, so a row can never show `enabled` on a dead switch.
 const paintPluginRow = (plugin: PluginSummary): void => {
     const nodes = pluginRowNodes.get(plugin.name);
     if (nodes === undefined) return;
 
     nodes.values.textContent = pluginValuesOf(plugin);
     nodes.button.title = plugin.description ?? plugin.title;
+    nodes.button.dataset.enabled = plugin.enabled === true ? 'true' : 'false';
+
+    if (nodes.toggle !== undefined) paintPluginToggle(nodes.toggle, plugin);
+};
+
+// Paint one switch from its row. Shared by the list builder and the repaint so the two
+// can never disagree about what "on" looks like, sounds like, or is labelled as.
+const paintPluginToggle = (control: HTMLButtonElement, plugin: PluginSummary): void => {
+    const enabled = plugin.enabled === true;
+
+    control.className = enabled ? 'plugin-tab-toggle is-on' : 'plugin-tab-toggle is-off';
+    control.textContent = enabled ? 'on' : 'off';
+    control.dataset.enabled = enabled ? 'true' : 'false';
+    control.setAttribute('aria-checked', enabled ? 'true' : 'false');
+    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${plugin.title} for every conversation`);
+    control.title = enabled
+        ? `Enabled for every conversation · click to switch ${plugin.name} off`
+        : `Switched off for every conversation · click to switch ${plugin.name} on`;
+    // R1: the only lock this control answers to is its OWN in-flight write.
+    control.disabled = togglingPlugins.has(plugin.name) || !booted;
+};
+
+// R2's switch. `role="switch"` + `aria-checked` for assistive tech, the visible word for
+// the eye, and the ACTION in the accessible name — the same three readings the tool
+// switch uses, so the two catalogues behave identically.
+//
+// `PluginSummary.enabled` is the field this paints from. It is a TOP-LEVEL row field,
+// NOT `values.enabled`: `values` carries declared settings only
+// (../shared/harness-api.ts `PluginSummary` and ../server/plugins.ts's own memo), so a
+// plugin that never declares `enabled` has nothing under that key.
+const pluginToggleControlOf = (plugin: PluginSummary): HTMLButtonElement => {
+    const control = el('button', 'plugin-tab-toggle');
+
+    control.type = 'button';
+    control.dataset.plugin = plugin.name;
+    control.setAttribute('role', 'switch');
+    paintPluginToggle(control, plugin);
+    // The click reads the CACHE, so a second press inverts what the server last reported
+    // rather than what this frame was built from.
+    control.addEventListener('click', () => {
+        const current = pluginRows.find((row) => row.name === plugin.name) ?? plugin;
+
+        void setPluginEnabled(plugin.name, current.enabled !== true);
+    });
+
+    return control;
+};
+
+// Lock/unlock one row's switch while its own write is in flight (R1 left the rows and
+// the pane untouched — this is the single remaining disabled state).
+const paintPluginToggleBusy = (name: string, busy: boolean): void => {
+    const control = pluginToggleButtons.get(name);
+    const row = pluginRows.find((candidate) => candidate.name === name);
+
+    if (control === undefined) return;
+
+    control.disabled = busy;
+    control.setAttribute('aria-busy', busy ? 'true' : 'false');
+
+    // A repaint after the write lands must not re-enable a control whose PATCH is still
+    // out, so the state painter reads the same set the paint pass does.
+    if (!busy && row !== undefined) paintPluginToggle(control, row);
+};
+
+// The pane's one sentence about a switch write. Separate from `pluginsTabNote` on
+// purpose: that line is the catalogue count and the read failure.
+const notePluginToggleResult = (text: string, failed: boolean): void => {
+    pluginsTabStatus.textContent = text;
+    pluginsTabStatus.hidden = false;
+    // Text AND class: colour is never the only signal (the shell's standing rule).
+    pluginsTabStatus.className = failed ? 'plugins-tab-status plugins-tab-status-error' : 'plugins-tab-status field-hint';
+};
+
+// R2's one global write. Like the tool switch it is NOT gated by `running`/`submitting`:
+// `PATCH /plugins/{id}` with the reserved `enabled` key takes effect in every session
+// from its next turn and has no idle window (../shared/harness-api.ts
+// `PluginSettingsUpdate`, ../server/plugins.ts "THE RESERVED `enabled` KEY").
+//
+// The answer is the WHOLE row, so the cache, the row and the head all take the server's
+// figure; a refusal touches none of them (nothing was written) and prints the server's
+// sentence verbatim, the same way the settings save does.
+const setPluginEnabled = async (name: string, enabled: boolean): Promise<void> => {
+    if (togglingPlugins.has(name)) return;
+
+    togglingPlugins.add(name);
+    paintPluginToggleBusy(name, true);
+    // An app-scoped config write, exactly like the settings save.
+    setStatus('saving', `plugin enablement: ${name}`);
+
+    try {
+        const updated = await updatePluginSettings(name, { enabled });
+
+        replacePluginRow(updated);
+        paintPluginRow(updated);
+        pluginsTabNote.textContent = pluginsCountNote();
+        if (showingPlugins) paintPluginsChrome();
+        notePluginToggleResult(
+            `${updated.title} is now ${updated.enabled ? 'enabled' : 'disabled'} for every conversation.`,
+            false
+        );
+        setStatus('idle');
+    } catch (error) {
+        const message = messageOf(error);
+
+        notePluginToggleResult(message, true);
+        setStatus('error', `plugin enablement: ${message}`);
+    } finally {
+        togglingPlugins.delete(name);
+        paintPluginToggleBusy(name, false);
+    }
 };
 
 // Build the catalogue list: loading, empty, and an error WITH a retry are real states of
@@ -8297,6 +8707,8 @@ const buildPluginsTab = (): void => {
     pluginsTabList.replaceChildren();
     pluginTabButtons.clear();
     pluginRowNodes.clear();
+    // The switches are rebuilt with the list, so the key set follows the nodes exactly.
+    pluginToggleButtons.clear();
     pluginsTabNote.textContent = pluginsCountNote();
     pluginsRefresh.disabled = pluginsLoading || !booted;
 
@@ -8330,12 +8742,21 @@ const buildPluginsTab = (): void => {
     }
 
     for (const plugin of pluginRows) {
+        // R2: the row is a WRAPPER with two siblings — the dialog trigger and the
+        // enablement switch. A `<button>` cannot contain a control, so the nesting that
+        // used to hold the whole row becomes a flex row instead and each control keeps
+        // its own accessible name.
+        const row = el('div', 'plugin-tab-row');
+
         const button = el('button', 'plugin-tab-button');
         button.type = 'button';
         button.dataset.plugin = plugin.name;
         button.setAttribute('aria-pressed', plugin.name === currentPlugin ? 'true' : 'false');
         button.setAttribute('aria-haspopup', 'dialog');
         button.title = plugin.description ?? plugin.title;
+        // R2: the row states the switch's state on the trigger too (`data-enabled`), so
+        // the list is readable with the control out of view, and CSS can mark off rows.
+        button.dataset.enabled = plugin.enabled === true ? 'true' : 'false';
         // The whole row is kept, never truncated away: the description is the part a
         // reader scans, so CSS clamps it to two lines (`.plugin-tab-desc`) and the full
         // text stays in the row's accessible description.
@@ -8362,11 +8783,16 @@ const buildPluginsTab = (): void => {
         button.addEventListener('click', () => {
             selectPlugin(pluginRows.find((row) => row.name === plugin.name) ?? plugin, button);
         });
-        button.disabled = running || submitting;
+        // R1: no run/submit lock on the row — the catalogue is clickable while a thread
+        // streams, and the dialog's own save handler is single-flight on its own write.
 
+        const toggle = pluginToggleControlOf(plugin);
+
+        row.append(button, toggle);
         pluginTabButtons.set(plugin.name, button);
-        pluginRowNodes.set(plugin.name, { button, values });
-        pluginsTabList.append(button);
+        pluginToggleButtons.set(plugin.name, toggle);
+        pluginRowNodes.set(plugin.name, { button, values, toggle });
+        pluginsTabList.append(row);
     }
 };
 
@@ -8694,8 +9120,9 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
 // "one listing" rule `selectTool` follows), the head names that plugin, and the detail
 // opens in the shared modal.
 const selectPlugin = (plugin: PluginSummary, trigger?: HTMLElement): void => {
-    if (running) return;
-
+    // R1: no `running` gate — same rule as `selectTool`. The plugin catalogue is
+    // server-wide data, and the stream painters all early-return while
+    // `showingPlugins` owns the centre column.
     stopPolling();
     closePluginDialog();
 
@@ -8731,14 +9158,15 @@ const selectPlugin = (plugin: PluginSummary, trigger?: HTMLElement): void => {
 
 // Open or close the PLUGINS view. One function both directions, exactly like
 // `setToolsView`: the topbar toggle calls it, harness selection and the Tools toggle
-// close it, and a run in flight keeps the view locked (leaving the transcript of a
-// streaming queue is not offered).
+// close it, and the view is NEVER locked by a run (R1) — the catalogue is server-wide
+// data, the write-anytime contract on `PATCH /plugins/{id}` has no idle window, and
+// every transcript painter already early-returns while a catalogue owns the column.
 //
 // The dialogs that belong to the view being entered are dismissed first (agent +
 // harness details, as Tools does), because their titles describe the chat head that is
 // being replaced.
 const setPluginsView = (open: boolean): void => {
-    if (running || showingPlugins === open) return;
+    if (showingPlugins === open) return;
 
     if (open) {
         closeAgentDialog();
@@ -11687,9 +12115,15 @@ const newSession = (): void => {
 //   - The composer switches to its STOP action whenever work is pending, including
 //     a session observed after a reload (Stop then cancels ALL explicitly via
 //     cancelSession(id, true)).
-//   - New session/harness switching/the tools view stay locked while pending, because
-//     they would tear down the view of a queue that is still running. Reset is gone
-//     (R10), so there is no third composer control to paint.
+//   - New session/harness switching stays locked while pending, because they would
+//     tear down the view of a queue that is still running. Reset is gone (R10), so
+//     there is no third composer control to paint.
+//   - R1: the TWO CATALOGUES (Tools and Plugins) are NOT locked by a run. They are
+//     server-wide surfaces whose own writes have no idle window, and every transcript
+//     painter early-returns while a catalogue owns the centre column, so a stream keeps
+//     being folded into the conversation underneath the pane. Their only remaining gate
+//     is `!booted` (there is nothing to list before the catalogue answers) — plus
+//     `pluginsLoading` for the plugin re-read.
 const paintControls = (): void => {
     const pending = running || current?.pending === true;
 
@@ -11715,19 +12149,35 @@ const paintControls = (): void => {
     for (const [name, button] of harnessDeleteButtons) {
         button.disabled = harnessDeletionsBlocked || removingHarnesses.has(name);
     }
-    for (const button of toolTabButtons.values()) button.disabled = submitting || pending;
-    // R3: the global tools toggle is locked while a run is pending, like the tabs it
-    // replaced; leaving the transcript of a streaming queue is not offered. It is also
-    // locked before boot has a catalogue (`booted`) and after `showOffline` disables it.
-    toolsToggle.disabled = submitting || pending || !booted;
-    // T7 (R2): the Plugins toggle carries the identical lock, because it replaces the
-    // same centre column for the same reasons — and its rows/dialog are locked the way
-    // the tool rows are, so a save cannot be started against a view that is about to be
-    // torn down by a run.
-    pluginsToggle.disabled = submitting || pending || !booted;
-    pluginsRefresh.disabled = submitting || pending || pluginsLoading || !booted;
+    // R1: the tool rows are a server listing, not a conversation affordance — pressing
+    // one opens a modal runner whose call goes straight to the server. Nothing here
+    // tears down the transcript, so a run never dims the list.
+    //
+    // R3: the row's ENABLEMENT toggle is not painted from run state either; it is
+    // painted from ITS OWN in-flight write (`togglingTools`), because that is the only
+    // race the control can create with itself.
+    for (const [name, control] of toolToggleButtons) {
+        control.disabled = togglingTools.has(name) || !booted;
+    }
 
-    for (const button of pluginTabButtons.values()) button.disabled = submitting || pending;
+    // R3 + R1: the global tools toggle is gated by ONE thing — the catalogue has to
+    // exist before the pane can list it. The run lock the removed tabs carried is gone
+    // (`setToolsView` has no `running` gate), and `showOffline` disables the control
+    // again the moment the transport is lost.
+    toolsToggle.disabled = !booted;
+    // T7 (R2) + R1: the Plugins toggle answers to the identical gate. Its writes
+    // (`PATCH /plugins/{id}`, including the reserved `enabled` key) are write-anytime
+    // on the server, so nothing here has to fear a streaming queue.
+    pluginsToggle.disabled = !booted;
+    // The re-read keeps its own extra gate: a read already in flight must not be
+    // dialled twice (`loadPlugins` is single-flight, and a disabled control says so).
+    pluginsRefresh.disabled = pluginsLoading || !booted;
+
+    // R1: plugin rows are always clickable once boot has answered; their toggle is
+    // locked only while ITS OWN write is in flight (`togglingPlugins`).
+    for (const [name, control] of pluginToggleButtons) {
+        control.disabled = togglingPlugins.has(name) || !booted;
+    }
 
     // R1/T3: pills replace the rail rows, and an archived conversation's pill is the same
     // control, so the busy-state pass walks every live strip instead of two lists.
@@ -12604,7 +13054,7 @@ const boot = async (): Promise<void> => {
         configureBaselineAgentColors();
 
         buildHarnesses();
-        buildTools(data.tools as unknown as readonly ToolDescriptor[]);
+        buildTools(data.tools as unknown as readonly ToolRowEntry[]);
 
         // T5 R1 / T38: the conversation directory is the COMPACT surface. The bootstrap already
         // embedded one row per conversation, and a row is the CONTRACT's snake_case metadata

@@ -954,16 +954,28 @@ describe('delegation scope (T28)', () => {
             (message) => message.role === 'tool' && message.toolCallId === 'r1'
         ) as { content: string };
 
-        expect(discovery.content).not.toContain("is outside this run's scope");
-
-        // A REAL discovery answer, not a refusal: `write` is searchable, so the query
-        // matched and enabled it — and enabling is still not the same as being allowed,
-        // which the next assertion pins.
+        // 2. Callable: the discovery call ANSWERED (no scope REFUSAL — the tool call
+        //    itself ran), so the child got a real result to reason about rather than a
+        //    dead end. T11: the answer is now an explicit DENIAL, not an `enabled`
+        //    promise. `write` is searchable and matched, but the run's scope excludes
+        //    it, so it is reported under `forbidden` with the launch gate's own
+        //    sentence and the allowed list — and it was never added to the enabled set
+        //    (the session-wide pollution the old shape caused is gone). The exact JSON
+        //    below is also the proof the call was not refused: a launch-gate refusal is
+        //    plain text and would not parse to this discovery envelope at all.
         expect(JSON.parse(discovery.content)).toEqual({
-            enabled: ['write'],
-            tools: [{ name: 'write', description: 'Write.', tags: ['files'] }],
+            enabled: [],
+            tools: [],
             matched: 1,
-            omitted: 0
+            omitted: 0,
+            forbidden: [
+                {
+                    name: 'write',
+                    reason:
+                        "Tool \"write\" is outside this run's scope. Allowed: read, glob. Requesting it again will not change this answer — adapt to the allowed tools or report the limitation.",
+                    allowed: ['read', 'glob']
+                }
+            ]
         });
 
         // 3. Still scoped: the escape hatch opens the discovery door only. A tool the
@@ -976,6 +988,205 @@ describe('delegation scope (T28)', () => {
             content: 'write is not available to me',
             status: 'completed'
         });
+    });
+
+    // -------------------------------------------------------------------------
+    // T11 (RR4 loop) — toolRequest must answer a SCOPED run honestly.
+    //
+    // The escape hatch kept `toolRequest` callable from a scoped child, but the answer
+    // itself was scope-BLIND: an out-of-scope match came back under `enabled`, the very
+    // next declaration list hid the tool again (the scope filter is correct), and a
+    // guessed call hit the launch-gate refusal. RR4 answered that contradiction by
+    // re-requesting — 135 round-trips, 5.6k→152k tokens — and every such enable also
+    // landed in the SESSION-wide enabled set, leaking the child's discovery into every
+    // sibling thread. The tests below pin the three contract halves: the denial shape
+    // and its determinism, the untouched enabled set, and the unchanged in-scope path.
+    // -------------------------------------------------------------------------
+
+    // One builder for the two denial tests: the same scoped writer/researcher pair as
+    // the escape-hatch test; only the allowlist and the child's script vary. `scope`
+    // is passed as the delegate arguments so a test can name a scope that hides even a
+    // core tool (the `alreadyAvailable` half of the T11 fix).
+    const scopedDiscoveryPair = (
+        childScript: HarnessStreamEvent[][],
+        scope: string,
+        seenChild: HarnessStreamRequest[]
+    ) => {
+        const researcher = brain(scripted(childScript, seenChild));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    `{"agent":"researcher","input":"need write","scope":{"tools":${scope}}}`
+                ),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: {
+                read: tool({
+                    description: 'Read.',
+                    tags: ['files'],
+                    visibility: 'core',
+                    execute: () => 'contents'
+                }),
+                glob: tool({
+                    description: 'Glob.',
+                    tags: ['files'],
+                    visibility: 'core',
+                    execute: () => 'a.ts'
+                }),
+                write: tool({
+                    description: 'Write.',
+                    tags: ['files'],
+                    visibility: 'searchable',
+                    execute: () => 'written'
+                })
+            },
+            presets: false
+        });
+
+        return { writer, writerAgent, researcher };
+    };
+
+    it('denies an out-of-scope request with the allowed list, twice identically, and never touches the enabled set (T11)', async () => {
+        // The loop-prevention regression: TWO consecutive rounds asking for the same
+        // out-of-scope tool. Both answers are byte-identical (the denial is a pure
+        // function of request + scope, no state can flip it), the tool never reaches
+        // the next turn's declarations, and `discoveredTools` — the session-wide
+        // enabled set that used to gain `write` from the child's doomed enable — stays
+        // empty.
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, researcher } = scopedDiscoveryPair(
+            [
+                callTool('w1', 'toolRequest', '{"names":["write"]}'),
+                callTool('w2', 'toolRequest', '{"names":["write"]}'),
+                answer('write is forbidden here')
+            ],
+            '["read","glob"]',
+            seenChild
+        );
+
+        await writer('go');
+
+        const expected = {
+            enabled: [],
+            tools: [],
+            matched: 1,
+            omitted: 0,
+            forbidden: [
+                {
+                    name: 'write',
+                    reason:
+                        "Tool \"write\" is outside this run's scope. Allowed: read, glob. Requesting it again will not change this answer — adapt to the allowed tools or report the limitation.",
+                    allowed: ['read', 'glob']
+                }
+            ]
+        };
+
+        const toolResults = researcher.messages.filter((message) => message.role === 'tool');
+        const first = JSON.parse((toolResults[0] as { content: string }).content);
+        const second = JSON.parse((toolResults[1] as { content: string }).content);
+
+        // Round 1 and round 2: the SAME honest denial — deterministic, no flip.
+        expect(first).toEqual(expected);
+        expect(second).toEqual(expected);
+        expect(second).toEqual(first);
+
+        // The escape hatch is untouched: the child was never blocked from asking (no
+        // launch-gate refusal on either round — the denial lives INSIDE the discovery
+        // envelope, which only an executed toolCall produces).
+        expect(toolResults).toHaveLength(2);
+
+        // The very next model request still declares only the allowlist plus the
+        // discovery door: the denial did not declare `write`, and the enabled set did
+        // not grow behind the scope filter (both would have put `write` in this list in
+        // an unscoped run).
+        expect(declaredNames(seenChild[1])).toEqual(['toolRequest', 'read', 'glob']);
+
+        // R1, no-pollution half: the session-wide enabled set is exactly what it was —
+        // empty. Before T11 this read ['write'] even though the child could never call
+        // it, and every sibling thread inherited the leak.
+        expect(writer.discoveredTools).toEqual([]);
+    });
+
+    it('moves an out-of-scope CORE tool from alreadyAvailable to forbidden (T11)', async () => {
+        // The lie was not only in `enabled`. A core tool the agent can SEE but the run
+        // scope HIDES used to be reported under `alreadyAvailable` — "you can call this
+        // right now" — while the launch gate refused it. Same predicate, same honest
+        // answer: it moves to `forbidden` and `alreadyAvailable` drops.
+        const { writer, researcher } = scopedDiscoveryPair(
+            [callTool('w1', 'toolRequest', '{"names":["read","write"]}'), answer('done')],
+            '["glob"]',
+            []
+        );
+
+        await writer('go');
+
+        const toolResults = researcher.messages.filter((message) => message.role === 'tool');
+        const answer1 = JSON.parse((toolResults[0] as { content: string }).content);
+
+        // One query, both halves of the denial: the searchable `write` (an enable
+        // candidate the scope hides) and the CORE `read` (an `alreadyAvailable` hit the
+        // scope hides). Capability denials lead, core denials follow, both in selection
+        // order; neither is enabled, and `alreadyAvailable` is absent because its only
+        // match was the denied core tool.
+        expect(answer1).toEqual({
+            enabled: [],
+            tools: [],
+            matched: 1,
+            omitted: 0,
+            forbidden: [
+                {
+                    name: 'write',
+                    reason:
+                        "Tool \"write\" is outside this run's scope. Allowed: glob. Requesting it again will not change this answer — adapt to the allowed tools or report the limitation.",
+                    allowed: ['glob']
+                },
+                {
+                    name: 'read',
+                    reason:
+                        "Tool \"read\" is outside this run's scope. Allowed: glob. Requesting it again will not change this answer — adapt to the allowed tools or report the limitation.",
+                    allowed: ['glob']
+                }
+            ]
+        });
+
+        // The denial promised nothing anywhere: the session-wide enabled set is empty.
+        expect(writer.discoveredTools).toEqual([]);
+    });
+
+    it('keeps the in-scope toolRequest answer byte-for-byte historical in a scoped run (T11 R2)', async () => {
+        // R2's scoped half: an allowlisted SEARCHABLE tool still enables exactly like an
+        // unscoped request would — same fields, same values, NO `forbidden` key (the
+        // `toEqual` below is exact; a stray field would fail it). The session-wide
+        // enabled set gains it, because an in-scope grant is still a real grant.
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, researcher } = scopedDiscoveryPair(
+            [callTool('w1', 'toolRequest', '{"names":["write"]}'), answer('writing now')],
+            '["read","glob","write"]',
+            seenChild
+        );
+
+        await writer('go');
+
+        const toolResults = researcher.messages.filter((message) => message.role === 'tool');
+
+        expect(JSON.parse((toolResults[0] as { content: string }).content)).toEqual({
+            enabled: ['write'],
+            tools: [{ name: 'write', description: 'Write.', tags: ['files'] }],
+            matched: 1,
+            omitted: 0
+        });
+
+        // The grant is live for this run: `write` joins the next turn's declarations
+        // (scope-allowed AND enabled — the old test's "enabling is still not the same
+        // as being allowed" case, now with both halves true).
+        expect(declaredNames(seenChild[1])).toEqual(['toolRequest', 'read', 'glob', 'write']);
+        expect(writer.discoveredTools).toEqual(['write']);
     });
 });
 

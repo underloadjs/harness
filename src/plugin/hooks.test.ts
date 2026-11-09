@@ -909,3 +909,149 @@ describe('createHookBus — event bus v2', () => {
         expect(bus.live()).toEqual({ 'turn.before': ['named'] });
     });
 });
+
+// ---------------------------------------------------------------------------
+// RULE 9 — THE GLOBAL ENABLEMENT GATE (R2, the operator's plugin switch)
+//
+// The bus half of the gate, independent of the plugin host: a registration may carry a
+// live `enabled()` predicate, and dispatch (`emit`/`emitMaybeSync`/`fire`), the `has()`
+// guard and `count()` all consult it PER EVENT, while `live()` keeps reporting the
+// subscription. `harness.dispose` is the one exempt event, and a gate that throws reads
+// as enabled (fail-open, rule 2).
+//
+// The end-to-end side (a plugin host building the predicate out of a settings view) is
+// pinned in ./host.test.ts; the REST and durability side in
+// ../server/plugins.test.ts and ../server/plugins-api.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('createHookBus — the enablement gate (rule 9)', () => {
+    const disposePayload = {} as const;
+
+    it('skips a gated-off owner on every dispatch path, and still fires harness.dispose', async () => {
+        let enabled = false;
+        const log: string[] = [];
+        const bus = createHookBus();
+
+        bus.on('run.started', () => log.push('named:run.started'), { owner: 'alpha', enabled: () => enabled });
+        bus.on('*', (context) => log.push(`wild:${context.event}`), { owner: 'alpha', enabled: () => enabled });
+        bus.on('harness.dispose', () => log.push('named:dispose'), { owner: 'alpha', enabled: () => enabled });
+
+        // `fire` is the synchronous path a thread teardown uses; `emit` the awaited one.
+        bus.fire('run.started', { agent: 'writer', depth: 0, input: 'x' });
+        await bus.emit('run.started', { agent: 'writer', depth: 0, input: 'x' });
+
+        expect(log).toEqual([]);
+
+        // The teardown point is exempt for BOTH a named and a `'*'` registration, so a
+        // disabled plugin still releases its own timers and handles. Order is the bus's
+        // documented dispatch order (priority, then registration `seq`): the wildcard
+        // registered second, so it runs second-last and the named dispose last... a `*`
+        // registration flips the bus onto ordered dispatch, and `seq` decides the tie —
+        // asserted as the exact array rather than as a set, because dispatch order is the
+        // one thing a plugin author can rely on.
+        bus.fire('harness.dispose', disposePayload);
+
+        expect(log).toEqual(['wild:harness.dispose', 'named:dispose']);
+
+        enabled = true;
+        await bus.emit('run.started', { agent: 'writer', depth: 0, input: 'x' });
+
+        // Same registrations, next emit, back on — no re-subscription happened. Here the
+        // named `run.started` registration (seq 1) precedes the wildcard (seq 2), exactly as
+        // the dispose pair above is ordered the other way (seq 2 before seq 3).
+        expect(log).toEqual([
+            'wild:harness.dispose',
+            'named:dispose',
+            'named:run.started',
+            'wild:run.started'
+        ]);
+    });
+
+    it('makes has() and count() answer for what a round would RUN, while live() keeps the subscription', async () => {
+        let enabled = true;
+        const bus = createHookBus();
+
+        bus.on('turn.before', () => undefined, { owner: 'alpha', enabled: () => enabled });
+
+        expect(bus.has('turn.before')).toBe(true);
+        expect(bus.count('turn.before')).toBe(1);
+        expect(bus.live()['turn.before']).toEqual(['alpha']);
+
+        enabled = false;
+
+        // `has()` false is what lets an emit site skip the payload construction as well as
+        // the call — the argument every `if (bus.has(event))` guard in ../harness.ts makes,
+        // applied to a disabled plugin exactly as to an unregistered one.
+        expect(bus.has('turn.before')).toBe(false);
+        expect(bus.count('turn.before')).toBe(0);
+
+        // `live()` is the Plugins pane's declared-vs-subscribed comparison, and a disabled
+        // plugin DID subscribe: that row does not go blank on a toggle.
+        expect(bus.live()['turn.before']).toEqual(['alpha']);
+
+        // `host.state_change` is not wildcard-deliverable and is unaffected either way.
+        expect(bus.has('host.state_change')).toBe(false);
+    });
+
+    it('stays SYNCHRONOUS for a gated-off permanent subscriber (rule 6 preserved)', () => {
+        const bus = createHookBus();
+
+        bus.on('turn.before', () => ({ transcript: [user('compacted')] }), {
+            owner: 'context-compaction',
+            enabled: () => false
+        });
+
+        // A disabled compaction must be event-order identical to no compaction at all:
+        // the round returns on the caller's tick with an empty merge, so `turn.before`
+        // adds no microtask boundary (the regression src/server/queue.test.ts pins).
+        const round = bus.emitMaybeSync('turn.before', turnPayload([user('go')]));
+
+        expect(round.sync).toBe(true);
+
+        if (!round.sync) throw new Error('A gated round must not hand the caller a promise.');
+
+        expect(round.value).toEqual({});
+    });
+
+    it('treats a gate that THROWS as enabled, and never reports a skipped delivery as a handler error', async () => {
+        const errors: unknown[] = [];
+        const log: string[] = [];
+        const bus = createHookBus({ onHandlerError: (context) => errors.push(context.error) });
+
+        bus.on('run.started', () => log.push('ran'), {
+            owner: 'alpha',
+            enabled: () => {
+                throw new Error('the host could not read its settings document');
+            }
+        });
+
+        await bus.emit('run.started', { agent: 'writer', depth: 0, input: 'x' });
+
+        // Fail-open: a broken settings read must not silence every hook in the process.
+        expect(log).toEqual(['ran']);
+        expect(errors).toEqual([]);
+
+        // And an operator switch-off is silent by design — it is not a plugin failure.
+        const other = createHookBus({ onHandlerError: (context) => errors.push(context.error) });
+
+        other.on('run.started', () => log.push('never'), { owner: 'beta', enabled: () => false });
+        await other.emit('run.started', { agent: 'writer', depth: 0, input: 'x' });
+
+        expect(log).toEqual(['ran']);
+        expect(errors).toEqual([]);
+    });
+
+    it('leaves a registration without a gate exactly as fast as before', async () => {
+        const log: string[] = [];
+        const bus = createHookBus();
+
+        bus.on('run.started', () => log.push('a'), { owner: 'host' });
+        bus.on('run.started', () => log.push('b'), { owner: 'alpha' });
+
+        await bus.emit('run.started', { agent: 'writer', depth: 0, input: 'x' });
+
+        // Registration order within one priority, unchanged by rule 9.
+        expect(log).toEqual(['a', 'b']);
+        expect(bus.has('run.started')).toBe(true);
+    });
+});

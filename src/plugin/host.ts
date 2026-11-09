@@ -35,9 +35,28 @@
 // plugin. The result is that a plugin can never read or write another plugin's settings
 // namespace by accident.
 //
+// THE GLOBAL ENABLEMENT GATE (R2 — the operator's click)
+// -----------------------------------------------------
+// One reserved boolean setting key, `enabled`, decides whether a plugin's handlers are
+// DELIVERED anything. It is gated HERE, in the one place that knows both the plugin's
+// declared defaults and the host's live provider, so (a) no plugin has to implement the
+// switch itself, (b) a plugin that declares the key (context-compaction) and the
+// framework agree on one stored value, and (c) a plugin that does NOT declare it
+// (async-ping) still answers to it, default `true`.
+//
+// The gate is a function handed to the bus registration, not a boolean captured at
+// setup: `api.settings.boolean('enabled', true)` re-reads the provider every time, so a
+// `PATCH /v1/harness/plugins/{plugin_id}` lands on every live session at its next turn
+// with no rebuild and no re-registration. A disabled plugin stays LOADED and LISTED
+// (its tools, agents and commands stay registered, its row still shows in `GET
+// /plugins` with `enabled: false`) — only hook delivery stops, and `harness.dispose`
+// is exempt so cleanup always runs (./hooks.ts rule 9).
+//
 // Cross-references:
 //   - ./manifest.ts  — generated: BUILTIN_PLUGINS / BUILTIN_PLUGIN_DESCRIPTORS
-//   - ./hooks.ts     — the bus `on` subscribes to, and its fail-open rules
+//   - ./hooks.ts     — the bus `on` subscribes to, its fail-open rules, and rule 9
+//   - ../server/plugins.ts — the stored `enabled` override and the live provider
+//   - ../server/api.ts     — `PATCH /v1/harness/plugins/{plugin_id}`, the write edge
 //   - ./settings.ts  — the provider read model and the coercion rules
 //   - ../types       — HarnessPlugin, HarnessPluginApi, HarnessPluginMetadata
 //   - ../harness.ts  — calls runPlugins() while constructing the writer
@@ -69,6 +88,9 @@ export type HarnessPluginHostOptions = {
     // The harness's hook bus.
     hooks: HarnessHookBus;
     // Host-side settings read model (already defaulted by the caller when absent).
+    // The reserved `enabled` boolean key of this provider is ALSO the plugin's global
+    // switch: it gates every hook delivery (see the gate inside `runPlugins` and
+    // ./hooks.ts rule 9), because a settings read is re-resolved on every access.
     settings: HarnessPluginSettingsProvider;
     // Plugin-agnostic api surface from the harness.
     apiBase: HarnessPluginApiBase;
@@ -140,7 +162,10 @@ export const resolvePluginList = (
 
 // Apply every resolved plugin in order and report what the harness now consists of.
 export const runPlugins = (options: HarnessPluginHostOptions): HarnessPluginHostResult => {
-    const { builtins = [], plugins = [], hooks, settings, apiBase } = options;
+    // The HOST provider is renamed here: `settings` below is the per-plugin scoped view
+    // built on top of it, and conflating the two is how a plugin would end up reading
+    // another plugin's namespace.
+    const { builtins = [], plugins = [], hooks, settings: provider, apiBase } = options;
     const resolved = resolvePluginList(builtins, plugins);
 
     const names: string[] = [];
@@ -152,9 +177,28 @@ export const runPlugins = (options: HarnessPluginHostOptions): HarnessPluginHost
         // Scoped settings need the DECLARED descriptors: the fallback default of
         // `api.settings.number(key)` comes from what the plugin itself declares, so a
         // host with no settings document still gets a sensible value.
+        const settings = createPluginSettingsView(plugin.name, provider, declared.settings);
+
+        // GLOBAL ENABLEMENT (R2/R3, the operator's click) — the framework gate, stated
+        // ONCE here so no plugin has to implement it. The reserved `enabled` boolean
+        // key of THIS plugin's settings view decides whether its handlers are delivered
+        // a hook, and the view re-reads the host provider on every access
+        // (./settings.ts:266-271), so an operator's `PATCH /v1/harness/plugins/
+        // {plugin_id}` changes what an ALREADY RUNNING session does on its next turn —
+        // every session, because every harness was built with the one live provider
+        // (../server/sessions.ts `buildHarness`, ../server/plugins.ts `provider`).
+        //
+        // `?? true` order matters: stored override → the plugin's own declared default
+        // (context-compaction declares `enabled: true`, and its Rule-0 read and this
+        // gate therefore agree) → `true` for a plugin that declares no such key. The
+        // plugin is NOT unregistered: it stays loaded, stays listed with
+        // `enabled: false`, and `harness.dispose` still reaches it so its own teardown
+        // runs (plugin/hooks.ts rule 9).
+        const isEnabled = (): boolean => settings.boolean('enabled', true);
+
         const api: HarnessPluginApi = {
             ...apiBase,
-            settings: createPluginSettingsView(plugin.name, settings, declared.settings),
+            settings,
             // T4.5 — the diagnostic channel, attributed. The base api is shared by every
             // plugin and reports as 'harness'; a policy report has to name the plugin that
             // made it, or an operator reading one stream cannot tell the compactor's decisions
@@ -181,7 +225,7 @@ export const runPlugins = (options: HarnessPluginHostOptions): HarnessPluginHost
                 hooks.on(
                     event as HarnessLifecycleEvent,
                     handler as HarnessLifecycleHandler<HarnessLifecycleEvent>,
-                    { owner: plugin.name, api, ...(options ?? {}) }
+                    { owner: plugin.name, api, enabled: isEnabled, ...(options ?? {}) }
                 )) as unknown as HarnessPluginApi['on']
         };
 
