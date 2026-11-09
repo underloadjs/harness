@@ -884,4 +884,66 @@ describe('the latest-request context through a document paint', () => {
         expect(row?.querySelector('.thread-tokens')?.textContent).toBe('90,000 (80,000)');
         expect(tile.tokens()).toBe('200,000 (330,000)');
     });
+
+    // T3 (user-reported display bug): with the projector publishing the turn-level PRIMARY
+    // figure from the turn's OWN section only (../server/turn-projector.ts `rootLatestInput`),
+    // a task part that only DELEGATED arrives with the turn tally and NO `latestInput`. The
+    // header then prints nothing rather than `usage.input` — that sum folds every child AND
+    // every re-sent transcript, so printing it as a context gauge would fabricate a request
+    // the parent never made (the reported symptom was a parent row reading its child's
+    // 100,666 beside a 27,668,349 bracket).
+    it('hides the primary figure when only a delegated child reported a context', () => {
+        const noOwnRequest: TurnSummary = {
+            ...summary({ status: 'done', state: 'done', updatedAt: T + 5_000 }),
+            usage: TALLY,
+            cachedInput: TALLY.cached
+            // NO `latestInput`: the turn's own flow made no model request.
+        };
+
+        const reloaded = documentOf([noOwnRequest], {
+            t1: [
+                rootSection({ state: 'done' }),
+                childSection({
+                    state: 'done',
+                    latestInput: 90_000,
+                    cachedInput: 80_000,
+                    nodes: [{ kind: 'text', id: 'n5', text: 'delegated answer', committed: true }]
+                })
+            ]
+        });
+        const { board } = mount();
+        const [tile] = board.hydrateView(reloaded);
+
+        tile.flush();
+
+        // Nothing fabricated: no primary figure, and `formatTokens` hides the whole label
+        // rather than printing an empty bracket (../ui/tokens.ts).
+        expect(tile.tokens()).toBe('');
+        expect(tile.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(true);
+        expect(tile.tokens()).not.toBe('410,000 (330,000)');
+
+        // The child row keeps its own figure — the scope restriction never travels DOWN.
+        const row = board.element.querySelector<HTMLElement>('.thread-row[data-thread-id="t1:1"]');
+
+        expect(row?.querySelector('.thread-tokens')?.textContent).toBe('90,000 (80,000)');
+    });
+
+    it('hides then restores the primary figure as the live turn-level usage ops arrive', () => {
+        // The live frame of the same rule: the child's `usage` op emits a `sectionId:'turn'`
+        // op with the tally and no figure (the root has not reported yet), and the root's own
+        // request re-arms the header the moment it lands.
+        const document = documentOf([summary()], { t1: [rootSection()] });
+        const { board } = mount();
+        const tile = board.upsertView(summary(), document);
+
+        frame(board, document, 't1', [{ op: 'usage', turnId: 't1', sectionId: 'turn', usage: TALLY }]);
+
+        expect(tile.tokens()).toBe('');
+
+        frame(board, document, 't1', [
+            { op: 'usage', turnId: 't1', sectionId: 'turn', latestInput: LATEST, usage: TALLY }
+        ]);
+
+        expect(tile.tokens()).toBe('200,000 (330,000)');
+    });
 });

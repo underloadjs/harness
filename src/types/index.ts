@@ -1441,6 +1441,10 @@ export type RecordsPageInfo = {
     nextOffset?: number;
     afterId?: string;
     nextAfterId?: string;
+    // M10 — present ONLY when the collection's `responseBudgetBytes` stopped this page
+    // before `limit` did. Without it a budget-cut page and a limit-cut page are
+    // indistinguishable, and the two call for different fixes.
+    budgetTruncated?: boolean;
 };
 
 // Counts are always derived from the whole collection, never from the page: a
@@ -1645,6 +1649,11 @@ export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> &
     // The one record this call deleted; absent on every other answer, including a
     // removal of two or more records (the singular/conditional rule above).
     removed?: TaskItem;
+    // M3 — the ids deleted when a call removed TWO OR MORE records. `removed` stays
+    // single-typed (one record, never an array) and this stays array-typed, so a caller
+    // branches on which KEY is present rather than on a union. Absent at one deletion,
+    // where `removed` already names the record and its body.
+    removedIds?: string[];
 };
 
 // The shared CRUD action set is declared above with the engine types.

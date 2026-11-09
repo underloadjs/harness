@@ -1209,10 +1209,19 @@ export const createToolCallCard = (
 //
 // The pill is a PERCENTAGE OF THE CONTEXT, not a character count. Nobody reads the
 // thinking or cares how intricate it was; what is worth seeing is how much of the
-// context the conversation now carries went into it. The denominator is the block's own
-// latest-request context — the same figure the header tally prints (`blockMeta`) — so one
-// chip answers "how much of what this conversation currently costs did this round add?",
-// every chip in one block stays comparable, and the shares sum to the thinking budget.
+// context the conversation now carries went into it. The CLIENT denominator is the
+// block's OWN context figure exactly as its header prints it (`(entry.meta ??
+// blockMeta).context()`, ../frontend/ui/turns.ts `syncThinkingShares`): for a nested
+// row that is that invocation's latest request, and for the root tile it is the
+// root-scoped turn-level primary (T3 — a delegated child's request is NOT the tile's
+// figure), or `undefined` while the header's primary is suppressed, in which case the
+// pill stays hidden rather than inventing a scale. So one chip answers "how much of
+// what this conversation currently costs did this round add?", every chip in one block
+// stays comparable, and the shares sum to the thinking budget.
+// The SERVER-computed `DisplayReasoningNode.share` rides the display wire on a
+// deliberately DIFFERENT scale: the turn-wide tally `turn.usage.input`, falling back to
+// the newest request seen anywhere in the turn (../server/turn-projector.ts
+// `applyShares` ~2768-2769) — a denominator, not the figure the row prints.
 // The exact character count is not lost: it is in the hover title and in the dialog
 // title, which is where a reader who wants it looks.
 //

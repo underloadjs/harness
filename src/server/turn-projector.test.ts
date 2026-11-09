@@ -799,8 +799,10 @@ describe('pending, wakeups and tokens', () => {
                 { type: 'start', agent: 'one', model: 'gpt-x', thread: { id: 'inv-root' } },
                 toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })),
                 { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread },
-                // Each request reports its OWN context; the child reports last, so it is
-                // the turn's latest request (the emission-order rule the row publishes).
+                // Each request reports its OWN context. The child reports LAST, so under the
+                // old emission-order rule it became the turn's "latest" request; T3 reversed
+                // that (see the tests below), and the per-section pair is emission-order-free
+                // either way because every frame lands on its own section.
                 { type: 'usage', agent: 'one', thread: { id: 'inv-root' }, usage: { input: 1_000, output: 20, total: 1_020, cached: 400 } },
                 { type: 'usage', agent: 'two', thread: childThread, usage: { input: 620, output: 8, total: 628, cached: 300 } }
             ],
@@ -819,9 +821,99 @@ describe('pending, wakeups and tokens', () => {
         // The document agrees with the row shipped beside it, and the cumulative tally that
         // the accounting surfaces read is untouched.
         expect(result.summary()).toMatchObject({
-            latestInput: 620,
+            latestInput: 1_000,
             cachedInput: 700,
             usage: { input: 1_620, output: 28, total: 1_648, cached: 700 }
+        });
+    });
+
+    // T3 (user-reported display bug, REVERSAL): the turn-level PRIMARY figure used to be
+    // published from the last `usage` event of ANY section — the "emission-order rule" this
+    // file used to pin as intended. In the transcript's task tree that made a parent task
+    // part print its delegated child's context as its own headline figure (reported as
+    // `50m49s | 100,666 (27,668,349)` beside a child row of `100,666 (3,571,950)`), while the
+    // bracket stayed turn-wide. The user declared that display wrong, so the rule is reversed:
+    // the turn-level figure comes ONLY from the turn's own (root) section, the child keeps its
+    // figure on the child row, and the turn-wide bracket is untouched accounting.
+    it('publishes the turn-level context from the root section, never from a delegated child', () => {
+        const childThread = { id: 'inv-child', parentId: 'inv-root', callId: 'call-1', kind: 'delegation' as const, input: 'sub task' };
+        const result = fold(
+            [
+                { type: 'start', agent: 'one', model: 'gpt-x', thread: { id: 'inv-root' } },
+                toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })),
+                { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread },
+                // The PARENT's own last request is the 1_000-context one; the child answers
+                // afterwards with 620. Order alone must not decide the headline figure.
+                { type: 'usage', agent: 'one', thread: { id: 'inv-root' }, usage: { input: 1_000, output: 20, total: 1_020, cached: 400 } },
+                { type: 'usage', agent: 'two', thread: childThread, usage: { input: 620, output: 8, total: 628, cached: 300 } }
+            ],
+            turnOf({ usage: { input: 1_620, output: 28, total: 1_648, cached: 700 } })
+        );
+
+        // The row: the parent's OWN context, not the last-reporting child's.
+        expect(result.summary()).toMatchObject({
+            latestInput: 1_000,
+            cachedInput: 700,
+            usage: { input: 1_620, output: 28, total: 1_648, cached: 700 }
+        });
+
+        // The live ops agree with the row and with the document: the child's figure rides its
+        // OWN section op, the `turn` op carries the parent's.
+        expect(flatten(result.ops)).toContainEqual({
+            op: 'usage',
+            turnId: 'turn-1',
+            sectionId: 'turn-1:1',
+            latestInput: 620,
+            cachedInput: 300
+        });
+        expect(flatten(result.ops)).toContainEqual({
+            op: 'usage',
+            turnId: 'turn-1',
+            sectionId: 'turn',
+            latestInput: 1_000,
+            usage: { input: 1_620, output: 28, total: 1_648, cached: 700 }
+        });
+
+        // The child row keeps its own figure (D2: per-section figures are unchanged).
+        const child = result.display().sections[1];
+
+        expect(child?.latestInput).toBe(620);
+        expect(child?.cachedInput).toBe(300);
+    });
+
+    it('states no turn-level context when only a delegated child made a request', () => {
+        const childThread = { id: 'inv-child', parentId: 'inv-root', callId: 'call-1', kind: 'delegation' as const, input: 'sub task' };
+        const result = fold(
+            [
+                { type: 'start', agent: 'one', model: 'gpt-x', thread: { id: 'inv-root' } },
+                toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })),
+                { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread },
+                { type: 'usage', agent: 'two', thread: childThread, usage: { input: 620, output: 8, total: 628, cached: 300 } }
+            ],
+            // The store still folds the child's spend into the turn-wide tally: accounting is
+            // untouched, only the displayed primary figure changes.
+            turnOf({ usage: { input: 620, output: 8, total: 628, cached: 300 } })
+        );
+
+        // `undefined`, not a stand-in: the row must not fabricate a context figure the turn's
+        // own flow never had (the frontend hides the label — see ../frontend/ui/turns.ts
+        // `applyRowFigures` and the `latestUnknown` path of `createBlockMeta`).
+        expect(result.summary().latestInput).toBeUndefined();
+
+        // The tally and the child's own row are unaffected.
+        expect(result.summary()).toMatchObject({
+            cachedInput: 300,
+            usage: { input: 620, output: 8, total: 628, cached: 300 }
+        });
+        expect(result.display().sections[1]?.latestInput).toBe(620);
+
+        // The turn-level op carries the tally with NO `latestInput` field (an absent figure,
+        // never a zero or a borrowed one).
+        expect(flatten(result.ops)).toContainEqual({
+            op: 'usage',
+            turnId: 'turn-1',
+            sectionId: 'turn',
+            usage: { input: 620, output: 8, total: 628, cached: 300 }
         });
     });
 });

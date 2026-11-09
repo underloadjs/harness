@@ -1725,9 +1725,33 @@ const readPlan = (
     // rejected rather than ignored.
     for (const id of expects.keys()) {
         if (!touched.has(id)) {
+            // m11 — the refusal was correct but unhelpful: the common cause is a stale or
+            // mistyped id in `expects`, and the caller had the right ids somewhere else in
+            // the same call. Naming the ids the call DOES change turns a guess into a diff.
+            //
+            // `touched.keys()` IS exactly that set, verified against STEP 2: it registers a
+            // patch (`:1630`, under the batch key) and a removal (`:1638`, under 'remove'),
+            // while an addition has no id to register (`:1625` returns early) and a READ is
+            // only conflict-checked and pushed to `lookups` (`:1652-1661`) — never into
+            // `touched`. So nothing that merely gets read can be named here as changed.
+            const changed = [...touched.keys()];
+
             throw recordError(
                 RECORD_ERROR_CODES.invalidInput,
-                `${label} "expects" names id "${id}", which this call does not change.`
+                `${label} "expects" names id "${id}", which this call does not change`
+                    + (changed.length === 0
+                        // An ADDITION has no id to register (`:1625` returns before
+                        // `touchId`), so an empty `touched` here does NOT mean the call
+                        // changes nothing — it may be adding records and minting their ids.
+                        // Saying "changes no records" would contradict the call's own batch.
+                        ? additions.length > 0
+                            ? `; this call changes no existing record — it adds ${additions.length}.`
+                            : '; this call changes no record.'
+                        : `; this call changes ${changed.length === 1 ? 'id' : 'ids'} ${changed
+                            .slice(0, 5)
+                            .map((touchedId) => `"${touchedId}"`)
+                            .join(', ')}`
+                            + (changed.length > 5 ? ` (+${changed.length - 5} more)` : '.'))
             );
         }
     }
@@ -2424,12 +2448,21 @@ export const createRecordEngine = (): RecordEngine => {
 
         const entries: RecordEntry[] = [];
         let bytes = 0;
+        // M10 — whether the BYTE BUDGET, not `limit`, is what stopped this page. A caller
+        // that sees a short page must know which bound bit: a `limit`-short page means
+        // "ask for more per page", a budget-short page means "your records are too big to
+        // page at this size" and raising `limit` would change nothing. Absent unless true,
+        // so every existing whole-object `page` assertion on small records stays exact.
+        let budgetTruncated = false;
 
         for (const item of ordered.slice(start, start + request.limit)) {
             const copy = copyEntry(definition, item);
             const size = Buffer.byteLength(JSON.stringify(copy), 'utf8') + 1;
 
-            if (entries.length > 0 && bytes + size > definition.responseBudgetBytes) break;
+            if (entries.length > 0 && bytes + size > definition.responseBudgetBytes) {
+                budgetTruncated = true;
+                break;
+            }
 
             entries.push(copy);
             bytes += size;
@@ -2444,6 +2477,8 @@ export const createRecordEngine = (): RecordEngine => {
             limit: request.limit,
             hasMore: consumed < ordered.length
         };
+
+        if (budgetTruncated) page.budgetTruncated = true;
 
         if (keyset) page.afterId = request.afterId as string;
 
@@ -2912,6 +2947,7 @@ export const createRecordEngine = (): RecordEngine => {
         name: string;
         fields: unknown[];
         maxRecords?: number;
+        responseBudgetBytes?: number;
     }): RecordsResult => {
         const definition = readCollectionDefinition(
             `records "define"`,
@@ -2920,7 +2956,10 @@ export const createRecordEngine = (): RecordEngine => {
                 fields: input.fields,
                 ...(input.maxRecords === undefined
                     ? {}
-                    : { maxRecords: input.maxRecords })
+                    : { maxRecords: input.maxRecords }),
+                ...(input.responseBudgetBytes === undefined
+                    ? {}
+                    : { responseBudgetBytes: input.responseBudgetBytes })
             },
             registeredNames()
         );
@@ -3030,12 +3069,24 @@ export const createRecordEngine = (): RecordEngine => {
     const readDefineInput = (
         label: string,
         value: unknown
-    ): { name: string; fields: unknown[]; maxRecords?: number } => {
+    ): { name: string; fields: unknown[]; maxRecords?: number; responseBudgetBytes?: number } => {
         const raw = readSnapshotRecord(value, `${label} "define"`);
 
         // 'maxRecords' is optional: the engine default (RECORD_MAX_RECORDS) fills it in,
         // which is what makes define { name, fields } a complete call (Decision C).
-        readSnapshotKeys(raw, ['name', 'fields', 'maxRecords'], `${label} "define"`, ['maxRecords']);
+        //
+        // 'responseBudgetBytes' was RESTORED-only: `readCollectionDefinition` validated it
+        // on a snapshot (`:1140-1146`, min 1024 / max RECORD_RESPONSE_BUDGET_BYTES) and
+        // `describe` reported it, but no agent could SET it — so the one number that
+        // decides when a page starts losing records (M10's `budgetTruncated`) was readable
+        // and not writable from the tool surface. Admitted here as optional; the range is
+        // enforced by the shared validator below, so a bad value is refused, not clamped.
+        readSnapshotKeys(
+            raw,
+            ['name', 'fields', 'maxRecords', 'responseBudgetBytes'],
+            `${label} "define"`,
+            ['maxRecords', 'responseBudgetBytes']
+        );
 
         const name = readSnapshotString(raw.name, `${label} "define".name`, {
             min: 1,
@@ -3077,6 +3128,30 @@ export const createRecordEngine = (): RecordEngine => {
                           }
 
                           return cap;
+                      })()
+                  }),
+            // M10 companion — the page budget, settable from the tool surface for the
+            // first time. Same refuse-don't-clamp rule as `maxRecords`, and the same
+            // 1024..RECORD_RESPONSE_BUDGET_BYTES range the snapshot path already enforced
+            // (`:1140-1146`), so a `define` and a `restore` of the same number agree.
+            ...(raw.responseBudgetBytes === undefined
+                ? {}
+                : {
+                      responseBudgetBytes: (() => {
+                          const budget = readSnapshotInteger(
+                              raw.responseBudgetBytes,
+                              `${label} "define".responseBudgetBytes`,
+                              { min: 1 }
+                          );
+
+                          if (budget < 1024 || budget > RECORD_RESPONSE_BUDGET_BYTES) {
+                              throw recordError(
+                                  RECORD_ERROR_CODES.recordCap,
+                                  `${label} "define".responseBudgetBytes is ${budget}; a page budget must be between 1024 and ${RECORD_RESPONSE_BUDGET_BYTES} bytes.`
+                              );
+                          }
+
+                          return budget;
                       })()
                   })
         };
@@ -3258,7 +3333,23 @@ export const createRecordEngine = (): RecordEngine => {
                 page: result.page,
                 storeRev: result.storeRev,
                 ...(result.entry === undefined ? {} : { entry: result.entry }),
-                ...(result.removed?.length === 1 ? { removed: result.removed[0] } : {})
+                ...(result.removed?.length === 1 ? { removed: result.removed[0] } : {}),
+                // M3 — a removal of TWO OR MORE records used to answer with nothing that
+                // named what it deleted: `removed` is singular-only by the rule above, so
+                // `tasks {"remove":[5 ids]}` returned only a survivor page and the caller
+                // had to re-read the list to confirm its own write landed. The bodies stay
+                // withheld (the documented trade-off just above: the un-wrapped `records`
+                // surface answers with the full array), but the IDS cost ~20 bytes and
+                // close the confirmation gap.
+                //
+                // A SEPARATE key, deliberately, rather than widening `removed` to
+                // `TaskItem | TaskItem[]`: `removed` keeps one stable type (a single
+                // record) and `removedIds` keeps another (an array), so a caller never has
+                // to branch on count to read either. Emitted only when more than one record
+                // went, because at exactly one `removed` already says everything.
+                ...(result.removed && result.removed.length > 1
+                    ? { removedIds: result.removed.map((entry) => entry.id) }
+                    : {})
             };
 
             if (result.changes !== undefined) shaped.changes = result.changes;

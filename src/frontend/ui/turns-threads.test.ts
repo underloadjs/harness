@@ -1141,6 +1141,50 @@ describe('invocation thread entries', () => {
         );
     });
 
+    // T3 (user-reported display bug, REVERSAL of the raw fold's emission-order rule): on a
+    // REPLAYED record the tile used to adopt the LAST `usage` event of ANY section, so a
+    // parent part printed its delegated child's context as its own headline figure (the
+    // reported symptom: a parent row of `100,666 (27,668,349)` beside a child row of
+    // `100,666 (3,571,950)`). A frame a nested ROW consumed no longer moves the tile's
+    // primary figure; the child keeps its own, and the tile's bracket keeps folding the
+    // child's cache (turn-wide accounting is unchanged).
+    it('keeps a delegated child usage event off the tile context figure', () => {
+        const board = mount();
+        const [turn] = board.hydrate([
+            serverTurn({
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    // The parent's OWN request: input 300, cache 100.
+                    { type: 'usage', agent: 'writer', usage: { input: 300, output: 7, total: 307, cached: 100 } },
+                    delegateCall('helper', 'child task', 'd1'),
+                    withThread(
+                        { type: 'start', agent: 'helper', model: 'h1' },
+                        { id: 't1', callId: 'd1', input: 'child task' }
+                    ),
+                    // The child reports LAST — under the old rule this 120 became the tile's
+                    // headline figure.
+                    withThread(
+                        { type: 'usage', agent: 'helper', usage: { input: 120, output: 5, total: 125, cached: 40 } },
+                        { id: 't1' }
+                    ),
+                    withThread({ type: 'done', agent: 'helper', message: doneMessage('helper') }, { id: 't1' })
+                ]
+            })
+        ]);
+
+        // The parent tile: its OWN latest context (300), never the child's 120. The bracket
+        // sums BOTH requests (100 + 40), because that figure is turn-wide accounting.
+        expect(turn.tokens()).toBe('300 (140)');
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.title).toBe(
+            'Latest request context: 300 input tokens · Total cached input sent: 140 tokens'
+        );
+
+        // The child row keeps its own figure (D2: per-section figures are unchanged).
+        const row = threadRows(turn)[0];
+
+        expect(row.querySelector<HTMLElement>('.thread-tokens')?.textContent).toBe('120 (40)');
+    });
+
     // R1: the nested clock is honest about unknown data — a record with no event
     // stamps shows no duration rather than 0ms.
     it('leaves a nested duration hidden when its events carry no stamps', () => {

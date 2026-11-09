@@ -857,16 +857,27 @@ type BlockMeta = {
     paint: () => void;
     stop: () => void;
     // One request's usage, from that block's own `usage` events.
-    noteUsage: (usage: HarnessUsage | undefined) => void;
+    //
+    // `ownsContext` (T3, user-reported display bug): `false` means "this event belongs to a
+    // DELEGATED child row, which painted its own figure — do NOT move MY primary figure".
+    // The cumulative cache sum still folds in, because the bracket is turn-wide accounting
+    // (the server's `SessionTurn.usage` fold); only the latest-request context is
+    // scope-restricted.
+    noteUsage: (usage: HarnessUsage | undefined, ownsContext?: boolean) => void;
     // Display-wire path (T5 R1): the server pre-computes the two figures this line
     // prints (`TurnSummary.latestInput` / `cachedInput`, and the same pair per
     // section), so the compact view sets them directly instead of accumulating
     // `usage` events. Absent figures leave the current value alone — an unknown
     // number stays hidden, never zero-filled.
+    //
+    // `latestUnknown` (T3): an explicit statement from the TURN-LEVEL authority that the
+    // tally is known but this scope has no latest-request figure. It suppresses the
+    // cumulative `tally.input` fallback for the primary figure (see `contextInput`).
     setFigures: (figures: {
         latestInput?: number;
         cachedInput?: number;
         usage?: HarnessUsage;
+        latestUnknown?: boolean;
     }) => void;
     // Authoritative cumulative tally (the root tile's `SessionTurn.usage`).
     setTally: (usage: HarnessUsage | undefined) => void;
@@ -907,6 +918,17 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
     let latestInput: number | undefined;
     let eventCached = 0;
     let eventCachedReported = false;
+    // T3 (user-reported): set when the TURN-LEVEL authority explicitly states "the tally is
+    // known, this scope has no latest request" (`setFigures({ latestUnknown: true })`, from
+    // `applyRowFigures` and the `sectionId:'turn'` usage op). The projector now derives the
+    // turn-level figure from the turn's OWN section only, so a turn that only delegated work
+    // legitimately reports none; the cumulative `tally.input` must then stay hidden rather
+    // than be printed as a context gauge — that sum folds every delegated child AND every
+    // re-sent transcript, so it reads as tens of millions beside a few-hundred-thousand
+    // window. Only the two turn-level callers pass the flag, so a legacy record whose latest
+    // request is genuinely unknowable keeps the documented cumulative fallback (`turns.test.ts`
+    // "falls back to the cumulative input only when no usage event was recorded").
+    let latestSuppressed = false;
 
     // Same grouping as the visible figure, for the explanatory title only.
     const titleNumber = new Intl.NumberFormat('en-US');
@@ -945,7 +967,12 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
     // reported request context, falling back to the cumulative input ONLY when no usage
     // event was recorded (never on a live/hydrated block that has one, so the two scopes
     // cannot silently collapse). Shared by the tally and by a think chip's denominator.
-    const contextInput = (): number | undefined => latestInput ?? tally?.input;
+    //
+    // T3: `latestSuppressed` turns the fallback OFF for a turn-level block the server has
+    // told us has no latest request of its own — the sum is turn-wide data and would be
+    // printed as if it were one request's context.
+    const contextInput = (): number | undefined =>
+        latestInput ?? (latestSuppressed ? undefined : tally?.input);
 
     const paintTokens = (): void => {
         const input = contextInput();
@@ -1050,12 +1077,19 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         paint();
     };
 
-    const noteUsage = (usage: HarnessUsage | undefined): void => {
+    const noteUsage = (usage: HarnessUsage | undefined, ownsContext?: boolean): void => {
         if (usage === undefined) return;
 
-        const reported = finiteOf(usage.input);
-        if (reported !== undefined) latestInput = reported;
+        // T3: a delegated child's request moves the CHILD row's primary figure, never the
+        // caller's. The tile passes `ownsContext: false` for an event a nested row consumed,
+        // so the parent task part keeps its own context figure.
+        if (ownsContext !== false) {
+            const reported = finiteOf(usage.input);
+            if (reported !== undefined) latestInput = reported;
+        }
 
+        // The bracket is turn-wide accounting and always folds, whatever the scope of the
+        // primary figure.
         const cached = finiteOf(usage.cached);
         if (cached !== undefined) {
             eventCachedReported = true;
@@ -1065,13 +1099,24 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         paintTokens();
     };
 
-    const setFigures = (figures: { latestInput?: number; cachedInput?: number; usage?: HarnessUsage }): void => {
+    const setFigures = (figures: {
+        latestInput?: number;
+        cachedInput?: number;
+        usage?: HarnessUsage;
+        latestUnknown?: boolean;
+    }): void => {
         // Server-authoritative cumulative tally first: the tile prints this figure,
         // so a compact row and a live stream show the identical total.
         if (figures.usage !== undefined) tally = usageOf(figures.usage) ?? tally;
 
         const latest = finiteOf(figures.latestInput);
         if (latest !== undefined) latestInput = latest;
+
+        // T3: only an EXPLICIT statement from a turn-level caller changes this; a per-section
+        // caller (which never passes the flag) leaves the row's decision standing, so the
+        // section-first / row-second ordering of `renderCompiledDisplay` cannot re-arm the
+        // cumulative fallback behind the row.
+        if (figures.latestUnknown !== undefined) latestSuppressed = figures.latestUnknown && latest === undefined;
 
         // `cachedInput` is the turn-wide cached figure the projector already summed;
         // it replaces the per-event accumulation rather than adding to it, so a
@@ -1104,6 +1149,10 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         },
         clearUsage(): void {
             latestInput = undefined;
+            // T3: a rebuild (raw `discardAttempt`/replay, `resetCompiled`) forgets every
+            // event-derived fact, including the turn-level "no latest request" statement; the
+            // row or the next `usage` op re-states it.
+            latestSuppressed = false;
             eventCached = 0;
             eventCachedReported = false;
             paintTokens();
@@ -3871,13 +3920,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // --- token tally ----------------------------------------------------
         // TWO scopes, deliberately different (user-selected semantics, R1/R2):
-        //   - primary: the LATEST model request's input/context size. The provider
-        //     `input` (prompt_tokens) includes that request's cached subset, so
-        //     this is "latest prompt sent", not a sum. Derived from the LAST
-        //     `usage` event applied (emission order — so a delegated subagent's
-        //     request counts as latest if it reported last, deterministically).
-        //   - bracket: total cached (replayed) input sent across the whole turn.
-        //     Taken from the SERVER's cumulative tally (`SessionTurn.usage.cached`,
+        //   - primary: the LATEST model request's input/context size FOR THIS TILE'S
+        //     OWN (root) SCOPE. The provider `input` (prompt_tokens) includes that
+        //     request's cached subset, so this is "latest prompt sent", not a sum.
+        //     Emission order no longer decides it: T3 (user-reported display bug)
+        //     REVERSED the old "last `usage` event of ANY section wins" rule, so a
+        //     delegated subagent's request paints its OWN nested row's figure and
+        //     never becomes the tile's headline context, whichever section reported
+        //     last. The raw fold enforces that at the `usage` case below (a frame a
+        //     row-backed nested entry consumed is noted for the bracket only), and
+        //     the compiled path simply receives the root-scope figure from the server
+        //     (`TurnSummary.latestInput`, ../shared/turn-display.ts:1064-1072, folded
+        //     by ../server/turn-projector.ts `rootLatestInput`).
+        //   - bracket: total cached (replayed) input sent across the whole turn —
+        //     turn-wide, children INCLUDED, and unchanged by the reversal. Taken from
+        //     the SERVER's cumulative tally (`SessionTurn.usage.cached`,
         //     src/server/sessions.ts addUsage), with a per-event sum as the fallback
         //     for a legacy record that carries events but no tally.
         // The cumulative tally's `input` is NOT used as the primary when events
@@ -3885,10 +3942,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // conservative fallback for a record whose events were trimmed/absent
         // (the latest request is then unknowable and the cumulative input is an
         // upper bound that never understates the context). See ui/tokens.ts.
+        // That fallback is deliberately turned OFF when a turn-level authority states
+        // the tally while carrying NO root figure — a part that only delegated has no
+        // context of its own, and `usage.input` would print a child's/turn-wide SUM as
+        // if it were one request (`createBlockMeta`'s `latestSuppressed` state, fed by
+        // `setFigures({ latestUnknown })` from `applyRowFigures` and the
+        // `sectionId:'turn'` usage op; the label then hides entirely).
         // The figures themselves live in `blockMeta`, which also paints a nested
-        // entry's tally from that entry's own `usage` events (R1). The server tally is a
-        // context figure too, so the think chips of this tile re-measure against it here
-        // exactly as they do on a live `usage` event.
+        // entry's tally from that entry's own `usage` events (R1). The think chips of
+        // this tile re-measure against `blockMeta.context()` — the figure THIS header
+        // prints — so the pill and the tally can never disagree; while the primary is
+        // suppressed that denominator is `undefined` and the pills stay hidden. (The
+        // SERVER's own `DisplayReasoningNode.share` is a different scale: see
+        // ../server/turn-projector.ts `applyShares` ~2768.)
         const setUsage = (usage?: HarnessUsage): void => {
             blockMeta.setTally(usage);
             syncThinkingShares();
@@ -8160,10 +8226,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                     case 'usage': {
                         if (op.sectionId === 'turn') {
+                            // T3: the op now carries the ROOT section's latest request only, so
+                            // a child-only run arrives with the tally and NO `latestInput`. Say
+                            // so explicitly: the header hides the primary figure instead of
+                            // falling back to the turn-wide sum.
                             blockMeta.setFigures({
                                 ...(op.latestInput === undefined ? {} : { latestInput: op.latestInput }),
                                 ...(op.cachedInput === undefined ? {} : { cachedInput: op.cachedInput }),
-                                ...(op.usage === undefined ? {} : { usage: op.usage })
+                                ...(op.usage === undefined ? {} : { usage: op.usage }),
+                                latestUnknown: op.usage !== undefined && op.latestInput === undefined
                             });
                             syncThinkingShares();
                             break;
@@ -8278,7 +8349,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             blockMeta.setFigures({
                 ...(summary.latestInput === undefined ? {} : { latestInput: summary.latestInput }),
                 ...(summary.cachedInput === undefined ? {} : { cachedInput: summary.cachedInput }),
-                ...(summary.usage === undefined ? {} : { usage: summary.usage })
+                ...(summary.usage === undefined ? {} : { usage: summary.usage }),
+                // T3 (REVERSAL, user-reported): the projector states the turn-level figure from
+                // the turn's OWN section, so `usage` present + `latestInput` absent means "the
+                // turn's own flow made no model request this part" — a delegation-only part.
+                // Stating that explicitly keeps the header from printing the turn-wide
+                // `usage.input` sum (which folds every child and every re-sent transcript) as if
+                // it were one request's context.
+                latestUnknown: summary.usage !== undefined && summary.latestInput === undefined
             });
         };
 
@@ -8691,13 +8769,32 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // (never zero-filled).
                 //
                 // R1: the NESTED block that emitted the request also shows its own
-                // usage (`thread-tokens`), from exactly these events; the root block
-                // keeps the turn-wide figure below.
+                // usage (`thread-tokens`), from exactly these events.
+                //
+                // T3 (REVERSAL of the old rule, user-reported): the root/tile block used to
+                // adopt the LAST usage event of ANY section — including a delegated child's —
+                // so a parent task part printed its child's context as its own headline figure.
+                // The tile's primary figure now follows the tile's OWN scope (a threadless
+                // legacy frame with no row of its own still paints the tile, as before); the
+                // turn-wide bracket keeps folding every section, unchanged.
                 case 'usage': {
                     const owner = usageOwner();
+
+                    // T3 (user-reported display bug): a frame that belongs to a DELEGATED child
+                    // row is painted by that row's own meta, and it must not also move the
+                    // TILE's primary figure — the parent part's headline context is the parent's
+                    // own request, not its child's. Only a row-backed entry (`entry.meta`, the
+                    // one thing a root/inline entry never has: lines 5123/5184) counts as a
+                    // nested owner; a threadless legacy frame has no row of its own, so the tile
+                    // keeps painting it exactly as before ("genuinely threadless" records stay
+                    // sensible, and the `usageOwner` heuristic itself is untouched).
+                    const nestedOwnerConsumed = owner?.meta !== undefined;
+
                     if (owner?.meta !== undefined) owner.meta.noteUsage(event.usage);
 
-                    blockMeta.noteUsage(event.usage);
+                    // The bracket keeps folding the child's cache (turn-wide accounting), so the
+                    // event is still noted — only its context gauge is scoped out.
+                    blockMeta.noteUsage(event.usage, !nestedOwnerConsumed);
                     // The denominator moved, so every think chip in the tile re-measures
                     // against it (a stale percentage would disagree with the tally a
                     // reader sees two lines above it).

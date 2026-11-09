@@ -652,7 +652,21 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
     let sectionOrdinal = 0;
     let stepCount = 0;
+    // The newest request seen ANYWHERE in the turn. This is ONLY the think-chip share
+    // denominator (`applyShares`), never a displayed figure: a denominator is a scale,
+    // so "the biggest context this turn ever worked in" is the honest choice there.
     let turnLatestInput: number | undefined;
+    // T3 (user-reported display bug): the turn-level PRIMARY figure — `TurnSummary.latestInput`
+    // and the `sectionId:'turn'` usage op — must describe the TURN'S OWN (root section) latest
+    // model request. Before this, `turnLatestInput` was republished from the last usage event of
+    // ANY section, so on a turn whose delegated child reported last the parent task part's row
+    // printed the CHILD's context (e.g. parent row `100,666 (27,668,349)` while the figure shown
+    // was subagent RR4's 100,666) — the emission-order rule that `turn-projector.test.ts` used to
+    // pin as intended. The user declared that display wrong, so the rule is REVERSED here: root
+    // frames only, and `undefined` (not a stand-in) when the root section made no request.
+    // The bracket (`turn.usage`, folded turn-wide by ../sessions.ts `addUsage` ~1064) is
+    // unchanged accounting and keeps folding children.
+    let rootLatestInput: number | undefined;
     let lastError: string | undefined;
     let settledStatus: TurnRecordStatus | undefined;
     let settledAt: number | undefined;
@@ -2362,7 +2376,17 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 const usage = event.usage ?? ({} as { input?: number; cached?: number });
 
                 record.latestInput = finiteNumber(usage.input) ? usage.input : record.latestInput;
+                // Share denominator only (see the declaration): every section's request can
+                // move it, because it is a scale, not the figure the row prints.
                 turnLatestInput = record.latestInput;
+
+                // T3: the turn's OWN section is the only source of the turn-level primary
+                // figure. A child/subagent/inline frame reports its OWN context and that
+                // figure rides its own `sectionId` op (below) and its `TurnSection.latestInput`;
+                // it must never become the parent task part's headline context.
+                const isRootSection = record.key === ROOT_KEY;
+
+                if (isRootSection) rootLatestInput = record.latestInput;
 
                 if (finiteNumber(usage.cached)) {
                     record.cachedReported = true;
@@ -2390,7 +2414,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     op: 'usage',
                     turnId: turn.id,
                     sectionId: 'turn',
-                    ...(turnLatestInput === undefined ? {} : { latestInput: turnLatestInput }),
+                    ...(rootLatestInput === undefined ? {} : { latestInput: rootLatestInput }),
                     ...(turn.usage === undefined ? {} : { usage: copyValue(turn.usage) })
                 });
 
@@ -2992,7 +3016,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
             updatedAt: turn.updatedAt,
             ...(turn.usage === undefined ? {} : { usage: copyValue(turn.usage) }),
-            ...(turnLatestInput === undefined ? {} : { latestInput: turnLatestInput }),
+            // T3: the turn-level PRIMARY figure is the ROOT section's own latest request
+            // (see `rootLatestInput`); absent when the turn's own flow made no model request.
+            ...(rootLatestInput === undefined ? {} : { latestInput: rootLatestInput }),
             ...(turn.usage?.cached === undefined ? {} : { cachedInput: turn.usage.cached }),
             ...(detail === undefined || detail.length === 0 ? {} : { detail }),
             sectionCount: visibleSections,

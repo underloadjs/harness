@@ -1041,6 +1041,19 @@ it('keeps the last tally when later frames carry none', async () => {
     const tally = { input: 48, output: 18, total: 66, cached: 0 };
 
     const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+    // T3: the turn-level PRIMARY figure the header prints is the ROOT section's own latest
+    // request, published by the projector from its `usage` frames (`TurnSummary.latestInput`,
+    // root scope only). This record therefore carries its own reported requests, and their
+    // inputs are deliberately DIFFERENT from the turn-wide tally: the earlier round cost 8 and
+    // the latest one 40, so the server's running sum is exactly `input: 48`
+    // (src/server/sessions.ts `addUsage`), while the primary figure can only come from the
+    // ROOT usage frame — `'40 (0)'` is NOT satisfiable from the tally, which would print 48.
+    // Without any root figure the tile now honestly hides the primary rather than printing the
+    // `usage.input` sum (the reversal pinned in ui/turns-compiled.test.ts "hides the primary
+    // figure when only a delegated child reported a context"). What THIS test owns is
+    // stickiness: frames that carry no `usage` must never clear or re-sum the figure.
+    const firstUsage = { type: 'usage' as const, agent: 'instruct', usage: { input: 8, output: 2, total: 10, cached: 0 } };
+    const usage = { type: 'usage' as const, agent: 'instruct', usage: { input: 40, output: 16, total: 56, cached: 0 } };
     const text = { type: 'text' as const, agent: 'instruct', delta: 'hi' };
     const done = { type: 'done' as const, agent: 'instruct', message: assistant({ content: 'hi' }) };
 
@@ -1060,7 +1073,7 @@ it('keeps the last tally when later frames carry none', async () => {
     // the canonical reads are composed from.
     const finished = snapshot({
         harnessDefinition: descriptor(),
-        turns: [{ ...opening, status: 'done', events: [start, text, done] }]
+        turns: [{ ...opening, status: 'done', events: [start, firstUsage, text, usage, done] }]
     });
 
     // The record the server holds, moved forward by the frames below (see the boot test).
@@ -1114,7 +1127,11 @@ it('keeps the last tally when later frames carry none', async () => {
     live.push([
         { type: 'turn', turn: opening },
         { type: 'event', turnId: 't1', event: start, at: T, usage: tally },
-        { type: 'event', turnId: 't1', event: text, at: T + 100 },
+        // The running tally each frame carries is what the server's own fold produces:
+        // 8 after the first reported request, the full 48 once the second one lands.
+        { type: 'event', turnId: 't1', event: firstUsage, at: T + 20, usage: firstUsage.usage },
+        { type: 'event', turnId: 't1', event: text, at: T + 100, usage: firstUsage.usage },
+        { type: 'event', turnId: 't1', event: usage, at: T + 150, usage: tally },
         { type: 'event', turnId: 't1', event: done, at: T + 200 }
     ]);
     await flush();
@@ -1127,9 +1144,11 @@ it('keeps the last tally when later frames carry none', async () => {
 
     const tile = byClass('.tile', 'article');
     expect(tile.dataset.state).toBe('done');
-    // The frames after the tallied one carried no `usage`, so the figure is
-    // untouched — never cleared, never re-summed.
-    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.textContent).toBe('48 (0)');
+    // The PRIMARY is the root section's latest request (40), never the turn-wide
+    // `usage.input` sum (48) — the T3 scoping — and the bracket is the tally's cache.
+    // The frames after the tallied one (and the terminal snapshot) carried no `usage`, so
+    // the figure is untouched — never cleared, never re-summed.
+    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.textContent).toBe('40 (0)');
     expect(tile.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
 });
 

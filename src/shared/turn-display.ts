@@ -1061,6 +1061,14 @@ export type TurnSummary = {
     updatedAt: number;
     /** Server-owned token tally (protocol.ts:163-168) plus the two tile figures. */
     usage?: HarnessUsage;
+    /** The LATEST single model request's input FOR THIS TURN'S OWN (root) SECTION, and
+     *  only that (T3, user-reported display bug — this reverses the old emission-order
+     *  rule, see ../server/turn-projector.ts `rootLatestInput`). A delegated child's
+     *  request never moves it: its figure rides its own `TurnSection.latestInput`.
+     *  ABSENT means the turn's own flow made no request with a reported context; a
+     *  renderer then shows NO primary figure rather than falling back to `usage.input`,
+     *  which is a turn-wide SUM (children included). `cachedInput` below keeps folding
+     *  children — that pairing of scopes is the intentional accounting. */
     latestInput?: number;
     cachedInput?: number;
     /** Short status line for a settled tile (the model name, the error text, the
@@ -1159,6 +1167,11 @@ export type TurnDisplayOp =
     | { op: 'pending:set'; turnId: string; sectionId: string; pending?: HarnessPendingTool[] }
     // `sectionId` is the literal 'turn' for the turn-wide figures (the tile line),
     // a section id for that invocation's own line (../frontend/ui/turns.ts:5199).
+    //
+    // T3: for `sectionId: 'turn'`, `latestInput` is the turn's OWN (root) section's latest
+    // request ONLY — never a delegated child's, whatever reported last — and it is ABSENT
+    // when the root flow made no reported request (see `TurnSummary.latestInput`). `usage`
+    // remains the turn-wide tally that folds every section.
     | { op: 'usage'; turnId: string; sectionId: string | 'turn'; latestInput?: number; cachedInput?: number; usage?: HarnessUsage }
     | { op: 'attempt:commit'; turnId: string; sectionId: string }
     | { op: 'attempt:discard'; turnId: string; sectionId: string; nodeIds: string[] };

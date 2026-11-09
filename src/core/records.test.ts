@@ -2028,3 +2028,165 @@ describe('records engine — chapters: declared facets, sort and projection (F9)
         expect(got.counts).toEqual({ total: 2, planned: 1, draft: 1, complete: 0 });
     });
 });
+
+// The read-surface fixes M1/M3/M10/m11. Each pins a behaviour the LIVE session could not
+// get: a page cut by the byte budget was indistinguishable from one cut by `limit` (M10),
+// a removal of two or more records named nothing it deleted (M3), an `expects` coverage
+// refusal said which id was wrong but not what the call DID change (m11), and the fact
+// that `limit` bounds a MUTATION's echo — the single biggest cost lever on this tool —
+// was unstated (M1, pinned here so the prose cannot rot).
+describe('records engine — page-budget marker, bulk-removal ids, and the mutation echo (M1/M3/M10/m11)', () => {
+    it('M10: marks a page the byte budget cut short of `limit`, and only such a page', async () => {
+        const engine = createRecordEngine();
+
+        await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'bulky',
+                    fields: [{ key: 'body', type: 'text', required: true }],
+                    responseBudgetBytes: 1024
+                }
+            },
+            'author'
+        );
+
+        const wide = 'x'.repeat(600);
+
+        for (let index = 0; index < 4; index += 1) {
+            await run(engine, 'records', { collection: 'bulky', entries: [{ body: wide }] }, 'author');
+        }
+
+        const cut = await run(engine, 'records', { collection: 'bulky', limit: 20 }, 'author');
+
+        // `limit` asked for 20 and 4 exist, so a short page here can ONLY be the budget.
+        expect((cut.entries as RecordEntry[]).length).toBe(1);
+        expect(cut.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 1,
+            budgetTruncated: true
+        });
+
+        // A page that fits is byte-identical to before: the key is absent, not false, so
+        // every whole-object `page` assertion on small records stays exact.
+        const small = await run(engine, 'records', { collection: 'bulky', limit: 1 }, 'author');
+
+        expect(small.page).toEqual({ offset: 0, limit: 1, hasMore: true, nextOffset: 1 });
+        expect('budgetTruncated' in (small.page as Record<string, unknown>)).toBe(false);
+    });
+
+    it('M3: a removal of two or more records answers with the ids it deleted', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 3);
+        const all = (await tasks(engine, {})).tasks as RecordEntry[];
+        const doomed = all.slice(0, 2);
+
+        const multi = await tasks(
+            engine,
+            {
+                remove: doomed.map((task) => task.id as string),
+                expects: doomed.map((task) => ({ id: task.id as string, rev: 1 })),
+                limit: 1
+            },
+            'author'
+        );
+
+        // The confirmation gap this closes: before, this call carried NEITHER `removed`
+        // (singular-only) nor anything else naming what it deleted.
+        expect(multi.removed).toBeUndefined();
+        expect(multi.removedIds).toEqual(doomed.map((task) => task.id));
+        expect(multi.counts).toEqual({ total: 1, completed: 0, pending: 1 });
+
+        // At exactly one deletion `removed` already names the record, so `removedIds`
+        // stays absent — the two keys never describe the same fact twice.
+        const [last] = (await tasks(engine, {})).tasks as RecordEntry[];
+        const single = await tasks(
+            engine,
+            { remove: [last.id as string], expects: [{ id: last.id as string, rev: 1 }] },
+            'author'
+        );
+
+        expect((single.removed as RecordEntry).id).toBe(last.id);
+        expect(single.removedIds).toBeUndefined();
+    });
+
+    it('m11: an `expects` token for an untouched id names what the call DID change', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 2);
+
+        const failure = await expectCode(
+            tasks(
+                engine,
+                {
+                    tasks: [{ id: '1', text: 'renamed' }],
+                    expects: [
+                        { id: '1', rev: 1 },
+                        { id: '2', rev: 1 }
+                    ]
+                },
+                'author'
+            ),
+            RECORD_ERROR_CODES.invalidInput
+        );
+
+        expect(failure.message).toContain('expects" names id "2", which this call does not change');
+        expect(failure.message).toContain('this call changes id "1"');
+
+        // A READ must never be named as a change: `ids` registers nothing in `touched`
+        // (`:1652-1661`), so a call that only reads a record guards nothing, and the
+        // refusal must say it changed nothing rather than listing the record it read.
+        const readOnly = await expectCode(
+            tasks(engine, { ids: ['2'], expects: [{ id: '2', rev: 1 }] }, 'author'),
+            RECORD_ERROR_CODES.invalidInput
+        );
+
+        expect(readOnly.message).toContain('this call changes no record.');
+        expect(readOnly.message.includes('changes id "2"')).toBe(false);
+
+        // An ADDITION mints its id, so an empty `touched` beside one is not "changes no
+        // record" — the wording has to name the add. The token must name an EXISTING id:
+        // STEP 3 (`:1665+`) rejects a token for an unknown id as `stale-record` before
+        // STEP 5 ever reaches the coverage check.
+        const added = await expectCode(
+            tasks(engine, { tasks: [{ text: 'fresh' }], expects: [{ id: '1', rev: 1 }] }, 'author'),
+            RECORD_ERROR_CODES.invalidInput
+        );
+
+        expect(added.message).toContain('changes no existing record — it adds 1.');
+        expect(added.message.includes('changes no record.')).toBe(false);
+    });
+
+    it('M1: `limit` bounds the page a mutation echoes, and the changed record still arrives', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 5);
+
+        const loud = await tasks(
+            engine,
+            { tasks: [{ id: '1', completed: true }], expects: [{ id: '1', rev: 1 }] },
+            'author'
+        );
+        const quiet = await tasks(
+            engine,
+            {
+                tasks: [{ id: '2', completed: true }],
+                expects: [{ id: '2', rev: 1 }],
+                limit: 1
+            },
+            'author'
+        );
+
+        // Default page vs `limit: 1` — the claim the schema now states.
+        expect((loud.tasks as RecordEntry[]).length).toBe(5);
+        expect((quiet.tasks as RecordEntry[]).length).toBe(1);
+
+        // The echo shrinks; the answer does not. `entry` is the record the call changed.
+        expect((quiet.entry as RecordEntry).id).toBe('2');
+        expect((quiet.entry as RecordEntry).completed).toBe(true);
+    });
+});
