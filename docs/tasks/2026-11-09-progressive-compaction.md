@@ -7,7 +7,7 @@ superseded LARGE results (the `annotate` writer), blocked on Open decisions 2 an
 else; **T6** — the summarize-and-reinitialize checkpoint, deliberately unbuilt, whose design
 text is kept below because it IS the design for that work; and **T7's residue** — real-corpus
 and live-provider observations only. **T5.5** (provider overflow recovery) belongs to
-[../issues/0004-context-window-and-token-budget.md](../issues/0004-context-window-and-token-budget.md)
+[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
 and stays here as a pointer, not a task. The roadmap anchor is `knowledge.md:3861`
 ("Not built yet"), item 2 at `:3866-3882`, which names both T6 and the storage question that
 blocks T5.3. The original framing still holds — a persisted tool outcome and a canonical
@@ -21,7 +21,7 @@ Companion entries:
 do**; this entry is the first policy that should do it),
 [2026-11-09-context-inclusion-followups.md](./2026-11-09-context-inclusion-followups.md) (the
 exclusion primitive's own edges), and the budget/overflow gaps tracked once in
-[../issues/0004-context-window-and-token-budget.md](../issues/0004-context-window-and-token-budget.md)
+[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
 — linked, never duplicated here.
 
 ## Date / Method / Scope
@@ -116,7 +116,7 @@ the decision was.
 ### T5.5 — Provider overflow recovery (pointer, not a task)
 
 Recognizing "input too long", compacting, and retrying is
-[../issues/0004-context-window-and-token-budget.md](../issues/0004-context-window-and-token-budget.md)'s.
+[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)'s.
 It was not touched by this stage and is not work this file owns; the only thing this stage
 contributed to it is a more honest estimate to guard against.
 

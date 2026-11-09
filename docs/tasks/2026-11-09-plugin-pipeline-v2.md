@@ -21,7 +21,7 @@ Companion entries:
 (Stage 1's own edges — now only the UI marker) and
 [2026-11-09-progressive-compaction.md](./2026-11-09-progressive-compaction.md) (the policy that
 consumes this surface), plus
-[../issues/0007-improvements-review-list.md](../issues/0007-improvements-review-list.md)
+[../issues/review-list-improvements-review-list.md](../issues/review-list-improvements-review-list.md)
 (cross-cutting review items; not duplicated here).
 
 ## Date / Method / Scope
@@ -42,9 +42,9 @@ protocol (`src/server/workers/*`).
 **Out of scope (deliberately):** the *policy* of compaction —
 [2026-11-09-progressive-compaction.md](./2026-11-09-progressive-compaction.md); the token-budget
 and provider-overflow gaps —
-[../issues/0004-context-window-and-token-budget.md](../issues/0004-context-window-and-token-budget.md);
+[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md);
 and tool-registry lifecycle —
-[../issues/0007-improvements-review-list.md](../issues/0007-improvements-review-list.md).
+[../issues/review-list-improvements-review-list.md](../issues/review-list-improvements-review-list.md).
 
 ## Invariants the probes trade against
 

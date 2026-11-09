@@ -19,8 +19,8 @@ Companion entries:
 [2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) (the framework work
 this feeds) and [2026-11-09-progressive-compaction.md](./2026-11-09-progressive-compaction.md)
 (the consumer that writes the flag). Related issues:
-[../issues/0004-context-window-and-token-budget.md](../issues/0004-context-window-and-token-budget.md),
-[../issues/0007-improvements-review-list.md](../issues/0007-improvements-review-list.md).
+[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md),
+[../issues/review-list-improvements-review-list.md](../issues/review-list-improvements-review-list.md).
 
 ## Date / Method / Scope
 
@@ -39,7 +39,7 @@ this is a documentation-only change.
 
 **Out of scope:** compaction policy (the compaction entry), the decision/pipeline questions
 (the pipeline entry), and the token-budget gaps that
-[../issues/0004-context-window-and-token-budget.md](../issues/0004-context-window-and-token-budget.md)
+[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
 owns.
 
 ## The substrate the remaining work stands on

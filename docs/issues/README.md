@@ -23,17 +23,17 @@ consistency gaps that surfaced around that core, not defects in it.
 
 | Issue | Area | Severity | One line |
 |---|---|---|---|
-| [0001](./0001-provider-request-body-extension.md) | transport | Blocking | No extension point for outbound chat-completion request fields: `stream_options.include_usage` cannot be requested and no response format can be enforced. |
-| [0002](./0002-standalone-tool-source-compilation.md) | tools / published surface | Significant | TypeScript tool-source compile/validate is only reachable through a live harness instance; the standalone kernel helper is not published. |
-| [0003](./0003-tool-registry-instance-lifecycle.md) | tools / lifecycle | Significant | The tool registry and the `maxCreatedTools` budget are per-harness-instance state, so a per-conversation host re-registers and recompiles on every conversation. |
-| [0004](./0004-context-window-and-token-budget.md) | context | Minor | No pre-request context-window guard and no provider overflow classification; the estimator exists but is not published. |
-| [0005](./0005-server-api-chat-product-parity.md) | server API | Significant | The built-in session API cannot seed a transcript at creation, and every live preset ships the full toolbox. |
-| [0006](./0006-streaming-and-adapter-ergonomics.md) | server / adapters | Minor | Two independent SSE writers, and the `{ stream }` abort wiring is documented only in the source headers. |
-| [0007](./0007-improvements-review-list.md) | cross-cutting | Review list | Everything else found during review — plus the records-store stress-test items that are doc wording or a wrong unit on one key — listed separately for the package owner to triage. |
-| [0008](./0008-multi-record-mutation-names-no-ids.md) | records store | Significant | A batch that changes several records returns no `entry` and no id list, so additions and patches cannot be confirmed without a re-read — the fix removals already got (`removedIds`) was never applied to them. |
-| [0009](./0009-guarded-write-refusal-omits-the-record.md) | records store | Minor | The `guarded-write` refusal says "read it first" but returns only the id, while `stale-record` on the same record returns the whole entry — so the error that needs the `rev` is the one that omits it. |
-| [0010](./0010-define-plus-collection-two-paths-disagree.md) | records store | Minor | `define` beside `collection` is refused by the engine as "ambiguous" but silently consumed by the tool entry point, which registers the collection and echoes a different name. |
-| [0011](./0011-change-feed-has-no-floor-watermark.md) | records store | Minor | The change feed reports that a gap was lost (`changesTruncated`) but never exposes the oldest retained revision, so a poller cannot size its lag and one refusal must guess between two causes. |
+| [0001](./blocking-provider-request-body-extension.md) | transport | Blocking | No extension point for outbound chat-completion request fields: `stream_options.include_usage` cannot be requested and no response format can be enforced. |
+| [0002](./significant-standalone-tool-source-compilation.md) | tools / published surface | Significant | TypeScript tool-source compile/validate is only reachable through a live harness instance; the standalone kernel helper is not published. |
+| [0003](./significant-tool-registry-instance-lifecycle.md) | tools / lifecycle | Significant | The tool registry and the `maxCreatedTools` budget are per-harness-instance state, so a per-conversation host re-registers and recompiles on every conversation. |
+| [0004](./minor-context-window-and-token-budget.md) | context | Minor | No pre-request context-window guard and no provider overflow classification; the estimator exists but is not published. |
+| [0005](./significant-server-api-chat-product-parity.md) | server API | Significant | The built-in session API cannot seed a transcript at creation, and every live preset ships the full toolbox. |
+| [0006](./minor-streaming-and-adapter-ergonomics.md) | server / adapters | Minor | Two independent SSE writers, and the `{ stream }` abort wiring is documented only in the source headers. |
+| [0007](./review-list-improvements-review-list.md) | cross-cutting | Review list | Everything else found during review — plus the records-store stress-test items that are doc wording or a wrong unit on one key — listed separately for the package owner to triage. |
+| [0008](./significant-multi-record-mutation-names-no-ids.md) | records store | Significant | A batch that changes several records returns no `entry` and no id list, so additions and patches cannot be confirmed without a re-read — the fix removals already got (`removedIds`) was never applied to them. |
+| [0009](./minor-guarded-write-refusal-omits-the-record.md) | records store | Minor | The `guarded-write` refusal says "read it first" but returns only the id, while `stale-record` on the same record returns the whole entry — so the error that needs the `rev` is the one that omits it. |
+| [0010](./minor-define-plus-collection-two-paths-disagree.md) | records store | Minor | `define` beside `collection` is refused by the engine as "ambiguous" but silently consumed by the tool entry point, which registers the collection and echoes a different name. |
+| [0011](./minor-change-feed-has-no-floor-watermark.md) | records store | Minor | The change feed reports that a gap was lost (`changesTruncated`) but never exposes the oldest retained revision, so a poller cannot size its lag and one refusal must guess between two causes. |
 
 ## Format
 
