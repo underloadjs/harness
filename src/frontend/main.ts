@@ -9121,9 +9121,10 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
 // opens in the shared modal.
 const selectPlugin = (plugin: PluginSummary, trigger?: HTMLElement): void => {
     // R1: no `running` gate — same rule as `selectTool`. The plugin catalogue is
-    // server-wide data, and the stream painters all early-return while
-    // `showingPlugins` owns the centre column.
-    stopPolling();
+    // server-wide data, and the stream painters all early-return while `showingPlugins`
+    // owns the centre column. The `stopPolling()` this opened with is gone for the same
+    // reason `selectTool`'s went: a run that starts while the catalogue is on screen has
+    // to keep being followed, and the pane's own paint path is the one that reports it.
     closePluginDialog();
 
     currentPlugin = plugin.name;
