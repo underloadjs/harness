@@ -21,8 +21,21 @@ export const TASKS_NAME = 'tasks';
 
 export const TASKS_METADATA: CoreToolMetadata = {
     name: TASKS_NAME,
+    // T2.2 SWEEP — same fix as records.tool.ts:32. The paging sentence called `afterId`
+    // "the last id of the previous page", which contradicted the reworded param below
+    // (`:127`): a keyset walk runs in ID ORDER, which on a `sortable` collection is NOT
+    // the page order, and one walk may not mix `offset` and `afterId`. Only that clause
+    // changed — `:77`'s ids/`entry` sentence and every other sentence stay verbatim, and
+    // this text is pinned by harness.metadata.test.ts and regenerated into
+    // core/tool-manifest.ts.
+    //
+    // Review F2 — that same description stopped short of the two keys the batch projection
+    // now answers (R1/T1.1 and its extension, src/core/records.ts:3260-3261): it enumerated
+    // `{ tasks, counts, page, storeRev }` and never said `entry`/`removed` exist. Only that
+    // envelope clause grew, mirroring `records.tool.ts`'s `entries | entry | removed`; the
+    // ids sentence below is still byte-identical (stop-condition 1).
     description:
-        'Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no "id" ADDS a task and must carry "text"; an entry with a known "id" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev } - 20 items by default, at most 100, and a serialized page budget below the result cap. Page by `offset`/`limit`, or by `afterId` (the last id of the previous page) when tasks may be removed mid-walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the task events since that revision (add/update/remove) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text. If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all.',
+        'Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no "id" ADDS a task and must carry "text"; an entry with a known "id" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev, entry? when one record answers and removed? when exactly one record was deleted } - 20 items by default, at most 100, and a serialized page budget below the result cap. Page by `offset`/`limit`, or by `afterId` (an id cursor - the walk runs in ID order, which on a sortable collection is NOT the page order) when tasks may be removed mid-walk, and never mix the two modes inside one walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the task events since that revision (add/update/remove) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text. If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all.',
     tags: ['task', 'tasks', 'todo', 'todos', 'checklist', 'plan'],
     // Decision I: `tasks` stays CORE. A session plan is useless if the model has to
     // discover its task list before the first turn, so this is the one store tool the
@@ -109,8 +122,25 @@ export const TASKS_METADATA: CoreToolMetadata = {
             afterId: {
                 type: 'string',
                 pattern: '^[0-9]+$',
+                // R2/T2.2 — the old sentence ("the last id of the previous page",
+                // "cannot skip or repeat one") is what cost a live session two records:
+                // both halves are true only of a page that came FROM keyset mode, and a
+                // sortable collection's id order is not its page order. The reworded
+                // text states the order the cursor walks, forbids mixing the modes in
+                // one walk, and names the complete walk. The trailing sentence is the
+                // one the engine already honoured and is kept verbatim.
                 description:
-                    'Keyset cursor: the last id of the previous page. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike "offset". Sets page.nextAfterId while page.hasMore.'
+                    'Keyset cursor: an id, and the walk it drives runs in ID ORDER - not the page order, which on a collection with a sortable field is a different order. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike "offset". Never mix the two modes inside one walk: switching from "offset" to "afterId" part-way (or back) can skip or repeat records, so follow one cursor throughout; if you do switch, the only safe cursor is the page.nextAfterId an offset page of a sortable collection sets to the LARGEST id it returned. Walking "afterId" from below the smallest id is the complete walk. Sets page.nextAfterId while page.hasMore.'
+            },
+            // R7/T7.1 — the engine's list-read filter. Declared here as well because
+            // `additionalProperties: false` would otherwise refuse the call before the
+            // engine could answer it; the key set stays open because the fields belong to
+            // the collection, not to this schema.
+            where: {
+                type: 'object',
+                description:
+                    'Equality filter for a list read: { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and "counts" - facets and total - describe the FILTERED set; an unfiltered read still counts the whole collection. Values are text, integer or boolean; a strings field cannot be filtered. Cannot be combined with "since", because the change feed is the unfiltered log, nor with "ids", which answers with the records it names rather than a filtered page.',
+                additionalProperties: { type: ['string', 'integer', 'boolean'] }
             },
             mergeDisjoint: {
                 type: 'boolean',

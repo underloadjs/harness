@@ -2909,7 +2909,18 @@ describe('manual tool execution', () => {
                 counts: { total: 1, completed: 0, pending: 1 },
                 // R9-R11: every successful task call returns the current bounded page.
                 page: { offset: 0, limit: 20, hasMore: false },
-                storeRev: 1
+                storeRev: 1,
+                // R1/T1.1 — this POST affected exactly ONE record, so the same record
+                // answers beside the page. `updatedAt` is matched BY SHAPE here exactly
+                // like the page entry above, and by IDENTITY in the read below.
+                entry: {
+                    id: '1',
+                    text: 'check bounds',
+                    completed: false,
+                    rev: 1,
+                    updatedBy: 'demo',
+                    updatedAt: expect.any(String)
+                }
             },
             duration_ms: expect.any(Number)
         });

@@ -264,7 +264,22 @@ describe('core tool metadata', () => {
                     "afterId": {
                         "type": "string",
                         "pattern": "^[0-9]+$",
-                        "description": "Keyset cursor: the last id of the previous page. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Sets page.nextAfterId while page.hasMore."
+                        // R2/T2.2 reworded this sentence (src/tools/runtime/tasks.tool.ts):
+                        // it now names the order the cursor walks and forbids mixing
+                        // offset and keyset inside one walk. Pinned verbatim, like every
+                        // other schema text in this file.
+                        "description": "Keyset cursor: an id, and the walk it drives runs in ID ORDER - not the page order, which on a collection with a sortable field is a different order. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Never mix the two modes inside one walk: switching from \"offset\" to \"afterId\" part-way (or back) can skip or repeat records, so follow one cursor throughout; if you do switch, the only safe cursor is the page.nextAfterId an offset page of a sortable collection sets to the LARGEST id it returned. Walking \"afterId\" from below the smallest id is the complete walk. Sets page.nextAfterId while page.hasMore."
+                    },
+                    "where": {
+                        "type": "object",
+                        "description": "Equality filter for a list read: { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered read still counts the whole collection. Values are text, integer or boolean; a strings field cannot be filtered. Cannot be combined with \"since\", because the change feed is the unfiltered log, nor with \"ids\", which answers with the records it names rather than a filtered page.",
+                        "additionalProperties": {
+                            "type": [
+                                "string",
+                                "integer",
+                                "boolean"
+                            ]
+                        }
                     },
                     "mergeDisjoint": {
                         "type": "boolean",
@@ -290,7 +305,7 @@ describe('core tool metadata', () => {
         // and the `storeRev`/`afterId`/`since` result contract all have to be
         // stated here as well as in the schema above.
         expect(writer.tools.tasks.description).toEqual(
-            "Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev } - 20 items by default, at most 100, and a serialized page budget below the result cap. Page by `offset`/`limit`, or by `afterId` (the last id of the previous page) when tasks may be removed mid-walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the task events since that revision (add/update/remove) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text. If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all."
+            "Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev, entry? when one record answers and removed? when exactly one record was deleted } - 20 items by default, at most 100, and a serialized page budget below the result cap. Page by `offset`/`limit`, or by `afterId` (an id cursor - the walk runs in ID order, which on a sortable collection is NOT the page order) when tasks may be removed mid-walk, and never mix the two modes inside one walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the task events since that revision (add/update/remove) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text. If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all."
         );
     });
 
@@ -378,6 +393,17 @@ describe('core tool metadata', () => {
                         "minimum": 1,
                         "maximum": 100,
                         "description": "For \"list\" only: page size, 1-100. Defaults to 20."
+                    },
+                    "where": {
+                        "type": "object",
+                        "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
+                        "additionalProperties": {
+                            "type": [
+                                "string",
+                                "integer",
+                                "boolean"
+                            ]
+                        }
                     }
                 },
                 "required": [
@@ -488,6 +514,17 @@ describe('core tool metadata', () => {
                         "minimum": 1,
                         "maximum": 100,
                         "description": "For \"list\" only: page size, 1-100. Defaults to 20."
+                    },
+                    "where": {
+                        "type": "object",
+                        "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered, including one a list withholds (a chapter body). Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
+                        "additionalProperties": {
+                            "type": [
+                                "string",
+                                "integer",
+                                "boolean"
+                            ]
+                        }
                     }
                 },
                 "required": [
@@ -582,6 +619,17 @@ describe('core tool metadata', () => {
                         "minimum": 1,
                         "maximum": 100,
                         "description": "For \"list\" only: page size, 1-100. Defaults to 20."
+                    },
+                    "where": {
+                        "type": "object",
+                        "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type.",
+                        "additionalProperties": {
+                            "type": [
+                                "string",
+                                "integer",
+                                "boolean"
+                            ]
+                        }
                     }
                 },
                 "required": [

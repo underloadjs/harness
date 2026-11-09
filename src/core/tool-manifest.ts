@@ -385,7 +385,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "records",
     metadata: {
         name: "records",
-        description: "The one session store: every record the session keeps, in named collections. Built in: tasks, chapters, profiles, locations. Actions are ONE batch per call, in this fixed apply order: patches, then removals, then additions. `collection` names which collection to operate on and MUST be one that exists - an unknown name is an ERROR naming the defined collections, never an empty list, so a typo cannot read as \"nothing stored\". `entries` is the batch: an entry with no \"id\" ADDS a record (every field the collection marks required must be present) and an entry with a known \"id\" PATCHES it, leaving every field it omits unchanged; `remove` is a list of ids to delete; `ids` reads specific records; with no batch at all the call reads the current page. Pass `define` { name, fields: [{ key, type, ... }] } on its own to register a NEW collection - a name that already exists is refused rather than merged, `define`d collections are dropped only when empty, and definitions persist across a restart. Pass `drop: true` with a `collection` to remove a `define`d one. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. EVERY PATCH IS ACCEPTED UNLESS IT IS STALE: there are no locks and no claims, so any agent on any thread may write any record, and the only conflict control is `expects: [{ id, rev }]` with the rev you READ - a call that has an agent identity must send it for every record it patches or removes. A stale token rejects the WHOLE call atomically and returns the CURRENT RECORD in the refusal, so you never re-read to recover; when the concurrent change touched only fields your patch leaves out, `mergeDisjoint: true` applies your patch anyway. EVERY success answers with the same envelope: { entries | entry | removed, counts, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev } - 20 per page by default, at most 100, budgeted well below the result cap. Page by `offset`/`limit`, or by `afterId` (the last id of the previous page) when records may be removed mid-walk; ids are unique across ALL collections. Pass `since: storeRev` to also get `changes`, `changesHasMore` and `changesTruncated`: that collection's events since a revision (add/update/remove) instead of re-reading it. Caps: 200 records per collection, 4000 characters per text field, 32 array entries. This tool is searchable: it can be evicted from your enabled set between turns by the session's tool cap, which costs you nothing - call toolRequest with tags like records, store or collection to bring it back. Prefer the named wrappers (tasks, chapters, profiles, locations) when one fits: they cost less context. Use records when a wrapper's schema is what stops you.",
+        description: "The one session store: every record the session keeps, in named collections. Built in: tasks, chapters, profiles, locations. Actions are ONE batch per call, in this fixed apply order: patches, then removals, then additions. `collection` names which collection to operate on and MUST be one that exists - an unknown name is an ERROR naming the defined collections, never an empty list, so a typo cannot read as \"nothing stored\". `entries` is the batch: an entry with no \"id\" ADDS a record (every field the collection marks required must be present) and an entry with a known \"id\" PATCHES it, leaving every field it omits unchanged; `remove` is a list of ids to delete; `ids` reads specific records; with no batch at all the call reads the current page. Pass `define` { name, fields: [{ key, type, ... }] } on its own to register a NEW collection - a name that already exists is refused rather than merged, `define`d collections are dropped only when empty, and definitions persist across a restart. Pass `drop: true` with a `collection` to remove a `define`d one. Pass `describe: true` with a `collection` to read that collection's OWN definition back - every field with its type, caps, values, default, getOnly, sortable and count facet, plus maxRecords and the page budget - because a `define`d spec is otherwise invisible to the agent that wrote it. With NO `collection` the call lists every defined collection name, so discovery no longer has to trip the unknown-collection error. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. EVERY PATCH IS ACCEPTED UNLESS IT IS STALE: there are no locks and no claims, so any agent on any thread may write any record, and the only conflict control is `expects: [{ id, rev }]` with the rev you READ - a call that has an agent identity must send it for every record it patches or removes. A stale token rejects the WHOLE call atomically and returns the CURRENT RECORD in the refusal, so you never re-read to recover; when the concurrent change touched only fields your patch leaves out, `mergeDisjoint: true` applies your patch anyway. EVERY success answers with the same envelope: { entries | entry | removed, counts, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev } - 20 per page by default, at most 100, budgeted well below the result cap. Page by `offset`/`limit`, or by `afterId` (an id cursor - the walk runs in ID order, which on a collection with a sortable field is NOT the page order) when records may be removed mid-walk, and never mix the two modes inside one walk; ids are unique across ALL collections. Pass `since: storeRev` to also get `changes`, `changesHasMore` and `changesTruncated`: that collection's events since a revision (add/update/remove) instead of re-reading it. Caps: 200 records per collection, 4000 characters per text field, 32 array entries. This tool is searchable: it can be evicted from your enabled set between turns by the session's tool cap, which costs you nothing - call toolRequest with tags like records, store or collection to bring it back. Prefer the named wrappers (tasks, chapters, profiles, locations) when one fits: they cost less context. Use records when a wrapper's schema is what stops you.",
         tags: [
             "records",
             "record",
@@ -471,7 +471,22 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                 afterId: {
                     type: "string",
                     pattern: "^[0-9]+$",
-                    description: "Keyset cursor: the last id of the previous page. Returns the records of THAT collection with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Sets page.nextAfterId while page.hasMore."
+                    description: "Keyset cursor: an id, and the walk it drives runs in ID ORDER - not the page order, which on a collection with a sortable field is a different order. Returns the records of THAT collection with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Never mix the two modes inside one walk: switching from \"offset\" to \"afterId\" part-way (or back) can skip or repeat records, so follow one cursor throughout; if you do switch, the only safe cursor is the page.nextAfterId an offset page of a sortable collection sets to the LARGEST id it returned. Walking \"afterId\" from below the smallest id is the complete walk. Sets page.nextAfterId while page.hasMore."
+                },
+                where: {
+                    type: "object",
+                    description: "Equality filter for a list read: { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered read still counts the whole collection. Any declared field may be filtered, including a getOnly field a page withholds. Values are text, integer or boolean; an enum value must be one the field declares; a strings field cannot be filtered. Cannot be combined with \"since\", because the change feed is the unfiltered log of the whole collection, nor with \"ids\", which answers with the records it names rather than a filtered page.",
+                    additionalProperties: {
+                        type: [
+                            "string",
+                            "integer",
+                            "boolean"
+                        ]
+                    }
+                },
+                describe: {
+                    type: "boolean",
+                    description: "true with a \"collection\" and nothing else returns that collection's own definition: every field with key, type, required, maxLength, maxItems, values, max, default, getOnly, sortable and count, plus maxRecords and responseBudgetBytes. Read on its own - it takes no \"entries\", \"remove\", \"ids\", \"since\", \"offset\", \"limit\", \"afterId\" or \"where\" - and it never writes."
                 },
                 mergeDisjoint: {
                     type: "boolean",
@@ -594,7 +609,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "tasks",
     metadata: {
         name: "tasks",
-        description: "Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev } - 20 items by default, at most 100, and a serialized page budget below the result cap. Page by `offset`/`limit`, or by `afterId` (the last id of the previous page) when tasks may be removed mid-walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the task events since that revision (add/update/remove) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text. If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all.",
+        description: "Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId? }, storeRev, entry? when one record answers and removed? when exactly one record was deleted } - 20 items by default, at most 100, and a serialized page budget below the result cap. Page by `offset`/`limit`, or by `afterId` (an id cursor - the walk runs in ID order, which on a sortable collection is NOT the page order) when tasks may be removed mid-walk, and never mix the two modes inside one walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`: the task events since that revision (add/update/remove) instead of re-reading the list. Caps: 200 tasks, 4000 characters of text. If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all.",
         tags: [
             "task",
             "tasks",
@@ -684,7 +699,18 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                 afterId: {
                     type: "string",
                     pattern: "^[0-9]+$",
-                    description: "Keyset cursor: the last id of the previous page. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Sets page.nextAfterId while page.hasMore."
+                    description: "Keyset cursor: an id, and the walk it drives runs in ID ORDER - not the page order, which on a collection with a sortable field is a different order. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Never mix the two modes inside one walk: switching from \"offset\" to \"afterId\" part-way (or back) can skip or repeat records, so follow one cursor throughout; if you do switch, the only safe cursor is the page.nextAfterId an offset page of a sortable collection sets to the LARGEST id it returned. Walking \"afterId\" from below the smallest id is the complete walk. Sets page.nextAfterId while page.hasMore."
+                },
+                where: {
+                    type: "object",
+                    description: "Equality filter for a list read: { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered read still counts the whole collection. Values are text, integer or boolean; a strings field cannot be filtered. Cannot be combined with \"since\", because the change feed is the unfiltered log, nor with \"ids\", which answers with the records it names rather than a filtered page.",
+                    additionalProperties: {
+                        type: [
+                            "string",
+                            "integer",
+                            "boolean"
+                        ]
+                    }
                 },
                 mergeDisjoint: {
                     type: "boolean",
@@ -797,6 +823,17 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     minimum: 1,
                     maximum: 100,
                     description: "For \"list\" only: page size, 1-100. Defaults to 20."
+                },
+                where: {
+                    type: "object",
+                    description: "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
+                    additionalProperties: {
+                        type: [
+                            "string",
+                            "integer",
+                            "boolean"
+                        ]
+                    }
                 }
             },
             required: [
@@ -914,6 +951,17 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     minimum: 1,
                     maximum: 100,
                     description: "For \"list\" only: page size, 1-100. Defaults to 20."
+                },
+                where: {
+                    type: "object",
+                    description: "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered, including one a list withholds (a chapter body). Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
+                    additionalProperties: {
+                        type: [
+                            "string",
+                            "integer",
+                            "boolean"
+                        ]
+                    }
                 }
             },
             required: [
@@ -1017,6 +1065,17 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     minimum: 1,
                     maximum: 100,
                     description: "For \"list\" only: page size, 1-100. Defaults to 20."
+                },
+                where: {
+                    type: "object",
+                    description: "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type.",
+                    additionalProperties: {
+                        type: [
+                            "string",
+                            "integer",
+                            "boolean"
+                        ]
+                    }
                 }
             },
             required: [

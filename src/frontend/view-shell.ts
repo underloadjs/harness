@@ -70,6 +70,9 @@ import {
     type DisplayLoader,
     type SessionView,
     type SubmitInput,
+    // T3: the per-thread transcript plane (./view-api.ts `createThreadTranscriptLoader`)
+    // and the roster row a `thread.upsert` frame patches in place.
+    type ThreadRow,
     type TurnRowView
 } from './view-api';
 import { harnessStream } from './stream';
@@ -79,6 +82,7 @@ import type {
     WsUpdate,
     WsUpdateDisplayOps,
     WsUpdateSession,
+    WsUpdateThreadUpsert,
     WsUpdateTurnUpsert
 } from '../shared/harness-stream';
 import type { ThreadTranscriptPayload } from './view-model';
@@ -492,6 +496,19 @@ export type ViewStreamItem =
     | { type: 'view'; view: SessionView }
     | { type: 'header'; view: SessionView }
     | { type: 'ops'; turnId: string; at: number; ops: TurnDisplayOp[] }
+    // T3: ONE roster row moved (`thread.upsert` carries a whole `ThreadSummary`,
+    // ../shared/harness-stream.ts:619-627), so the row is patched in place. Before this a
+    // thread frame triggered a full `openSession` re-read — every thread's roster row, the
+    // whole rows page and the pending-action list — for information the frame already
+    // carried, and that re-read ran on the hot path of every running conversation.
+    //
+    // T3b (R4): the frame's OWN stamp travels with the row. A patch is applied to a live
+    // document, and a replay (a resumed stream after an outage, a re-registered baseline
+    // inside a retained replay window) can deliver an OLDER row than the document a
+    // `pollSession`/`resyncSession` re-read already installed — so the caller needs the
+    // server's `at` (and the resume `cursor`) to refuse a stale patch, exactly as
+    // `applyView` refuses a stale document.
+    | { type: 'thread'; threadId: string; row: ThreadRow; at: number; cursor: string }
     | { type: 'failed'; error: { message: string }; view: SessionView };
 
 export type ObserveOptions = {
@@ -500,6 +517,12 @@ export type ObserveOptions = {
     pace?: 'ordered' | 'ack';
     // Opt in to the verbatim `run.event` frames (the raw-transcript pane only).
     events?: boolean;
+    // T3: the observation lost its position — a dropped connection, a detected gap, a
+    // server `resync_required`, or a re-registration whose replay window had expired.
+    // The re-read below restores the ROWS; this callback is where the caller drops the
+    // render state a re-read cannot reach (the cached display trees and the per-thread
+    // transcripts, which stay 'done' in their loaders otherwise).
+    onRecover?: (reason: 'dropped' | 'resync' | 'stale_baseline') => void;
 };
 
 // One subscription on the shared socket for one conversation.
@@ -513,13 +536,21 @@ export type ObserveOptions = {
 //   `session.updated`    → a `header` item (session facts onto the live document) —
 //                          NEVER a `view`: a patch carries no rows, and a `view` is
 //                          authoritative for them (T44)
-//   `thread.upsert`/
-//    `thread.removed`    → a roster re-read
+//   `thread.upsert`      → a `thread` item: ONE roster row patched in place (T3 — the
+//                          frame carries the whole row, so a roster re-read was a cost
+//                          the frame did not ask for)
+//   `turn.removed`/
+//    `thread.removed`    → a window re-read: the frames are pure invalidation, and the
+//                          re-read is the one path that reconciles rows, roster and
+//                          tombstones (see the note in `applyUpdate`)
 //   `action.opened`/
 //    `action.closed`     → an actions re-read (a question gates the composer)
 //   `resync_required` /
-//   a detected gap       → a re-read of the loaded window, per the resources the
-//                          frame names
+//   a detected gap /
+//   a DROPPED CONNECTION → a re-read of the loaded window, plus `onRecover` for the
+//                          render state a document cannot repair (T3: the client now
+//                          reports a drop to every subscription, and a re-registered
+//                          baseline without `replayed_frames` reconciles on its own)
 //
 // A frame naming a turn this client is not showing is ignored by the reducers
 // downstream (./view-state.ts drops an op whose turn it never adopted), which is
@@ -553,6 +584,34 @@ export const observeView = async (
             // A failed re-read is an observation problem, not a task failure; the
             // next frame or the caller's poll path recovers it.
         }
+    };
+
+    // T3: has this registration been ANCHORED by a baseline yet? The first
+    // `subscription_state` is the anchor of the document the shell already read over REST
+    // (the pre-existing rule below). A SECOND one on the same registration can only mean
+    // the client re-dialled — `stream.ts`'s `onopen` flushes every registration — and the
+    // broker then answers one of two things: `replayed_frames > 0` (the parked replay
+    // window was still there, so the frames missed during the outage arrived as `update`
+    // frames and the pane applied them), or a FRESH baseline with no counter at all,
+    // because an expired window is not a `resync_required` — it is a quiet restart
+    // (../server/stream/broker.ts:749-768). In that second case every frame this pane
+    // missed is gone forever and the client had no way to know: THAT is the stale-state
+    // bug the reconciliation below closes.
+    let anchored = false;
+
+    // T3: a LOST position. Set by every resync path (a dropped connection, a gap, a server
+    // `resync_required`) and consumed by the next baseline, because only the baseline can
+    // say which kind of loss this was: a resumed one replays the missing frames (nothing to
+    // re-read), a fresh one means they are gone (re-read). The flag also makes the pair
+    // idempotent — a connection that answers the same registration twice reconciles ONCE.
+    let pendingBaseline = false;
+
+    // The reconciliation the re-read alone cannot do: the render state a document does NOT
+    // carry. The cached display trees and the cached per-thread transcripts stay 'done' in
+    // their loaders otherwise, so a turn that was mid-flight across an outage would keep a
+    // stale tree forever; the caller drops them from here.
+    const recover = (reason: 'dropped' | 'resync' | 'stale_baseline'): void => {
+        options.onRecover?.(reason);
     };
 
     const applyUpdate = (update: WsUpdate): void => {
@@ -591,7 +650,38 @@ export const observeView = async (
             return;
         }
 
-        if (update.kind === 'turn.removed' || update.kind === 'thread.upsert' || update.kind === 'thread.removed') {
+        if (update.kind === 'thread.upsert') {
+            // T3: the frame carries the WHOLE roster row (`ThreadSummary`, and a
+            // `ThreadResource` satisfies the same mapper), so the patch is one row — the
+            // card header, its status word, its preview and its counts. A full
+            // `openSession` here re-read the rows page, the roster page and the pending
+            // actions for a fact the frame already stated, and it ran on the hot path of
+            // every running conversation (one frame per thread status change).
+            const frame = update as WsUpdateThreadUpsert;
+
+            // The frame's stamp rides along: `at` is the server's own clock for the
+            // mutation, and `cursor` is this subscription's resume position at that
+            // instant — the pair the caller needs to refuse a replayed older row.
+            onItem({
+                type: 'thread',
+                threadId: frame.thread.id,
+                row: threadRowOf(frame.thread),
+                at: frame.at,
+                cursor: frame.cursor
+            });
+
+            return;
+        }
+
+        // T3 (decision, recorded for review): `turn.removed` and `thread.removed` stay on
+        // the window re-read. Both frames are PURE INVALIDATION — one id, no body
+        // (../shared/harness-stream.ts:543/633) — and the reconciliation they need is the
+        // one `applyView` owns: tombstone learning, the record-cache rebuild, the roster
+        // rows that no longer name the conversation, and the descendants a thread delete
+        // cascades into. A targeted per-thread read would be a SECOND authority path
+        // running next to that guard, and removals are rare (a delete, not a frame storm),
+        // so the honest bounded recovery stays the loaded-window re-read.
+        if (update.kind === 'turn.removed' || update.kind === 'thread.removed') {
             void reRead();
 
             return;
@@ -620,20 +710,78 @@ export const observeView = async (
         sessionId,
         ...(options.pace === undefined ? {} : { pace: options.pace }),
         ...(options.events === true ? { filters: { events: true } } : {}),
-        onState: () => {
-            // The baseline is the anchor, not a document: the shell already opened
-            // the window over REST, so nothing is fetched on registration.
+        onState: (state) => {
+            if (!anchored) {
+                anchored = true;
+                pendingBaseline = false;
+
+                // The baseline is the anchor, not a document: the shell already opened
+                // the window over REST, so nothing is fetched on registration.
+                return;
+            }
+
+            // A re-registration. Frames were replayed ⇒ the pane has been applying them
+            // through `onUpdate`, and this baseline is simply the new anchor; nothing to
+            // fetch. Frames were NOT replayed AND the position was lost ⇒ the server
+            // restarted this subscription at its own current position, so the outage's
+            // worth of mutations never arrived and the document on screen is exactly as
+            // stale as if the socket had closed quietly. Re-read, and drop the render state
+            // a document cannot repair.
+            if ((state.replayed_frames ?? 0) > 0) {
+                pendingBaseline = false;
+
+                return;
+            }
+
+            if (!pendingBaseline) return;
+
+            pendingBaseline = false;
+            recover('stale_baseline');
+            void reRead();
         },
         onUpdate: applyUpdate,
         onResync: (frame: WsResyncRequired) => {
-            // Re-read ONLY what the frame names, as bounded pages. With no resource
-            // list (a client-detected gap) the loaded window is the thing to refresh.
+            // T3: `stream.ts` now routes a DROPPED CONNECTION here too (a synthetic
+            // `frames_dropped` carrying no resource list), which is the only way a pane
+            // learns the socket died — before this, `onclose` re-dialled in silence and
+            // every pane kept its pre-drop document.
+            //
+            // A SYNTHETIC frame (a drop, or a sequence gap this client detected) means the
+            // position is lost and the client is ALREADY re-registering the subscription
+            // (./stream.ts `reregister`), so the next baseline is what says whether the
+            // missing frames were replayed. Re-reading at this instant would race that
+            // answer — and against a server whose REST answer is captured before the
+            // frames land, a document applied here deletes rows the frames already
+            // delivered (the N2/T44 hazard this file keeps re-learning). So the window
+            // re-read waits for the baseline, and only the part that cannot be wrong runs
+            // now: the render state the flow no longer backs is dropped.
+            //
+            // A SERVER frame with named resources is an instruction to re-read those
+            // resources, and it is re-read immediately — nothing is in flight to wait for.
+            pendingBaseline = true;
+
+            if (frame.reason === 'frames_dropped' && frame.resources.length === 0) {
+                recover('dropped');
+
+                return;
+            }
+
+            recover('resync');
             void reRead();
-            void frame;
         },
         onError: () => {
             // A refused subscription is reported once and the caller's bounded polling
             // takes over; it never cancels the run.
+            //
+            // T3: and it releases the registration on the way out. The client keeps
+            // re-sending every entry in its subscription map on each `onopen`, so a
+            // settled observer that never unsubscribed was re-registered on every
+            // reconnect FOREVER — against the 64-subscriptions-per-connection budget
+            // (../server/stream/broker.ts:708, close 4401) and the 32 messages/second
+            // reconnect burst limit (../server/stream/connection.ts:305, close 4429).
+            // Those leaked registrations are a direct cause of the "random drops" this
+            // task reports: the reconnect storm closes its own socket.
+            sub?.unsubscribe();
             settle();
         }
     });
@@ -720,10 +868,36 @@ export const observeTurn = async (
         settle = resolve;
     });
 
+    // T3: same registration rule as `observeView` above. A second baseline without
+    // `replayed_frames` means the replay window expired during the outage, so the tile's
+    // tree is missing the flow it would have streamed; the turn's own tree re-read (the
+    // `onResync` recovery below) is the bounded repair.
+    let anchored = false;
+    let pendingBaseline = false;
+
     const sub = client.subscribe({
         scope: 'turn',
         sessionId,
         turnId,
+        onState: (state) => {
+            if (!anchored) {
+                anchored = true;
+                pendingBaseline = false;
+
+                return;
+            }
+
+            if ((state.replayed_frames ?? 0) > 0) {
+                pendingBaseline = false;
+
+                return;
+            }
+
+            if (!pendingBaseline) return;
+
+            pendingBaseline = false;
+            options.onResync?.(turnId);
+        },
         onUpdate: (update: WsUpdate) => {
             // `display.ops` and `turn.upsert` only. Every other kind is already
             // delivered on the session subscription, and applying it twice would
@@ -745,11 +919,18 @@ export const observeTurn = async (
             }
         },
         onResync: () => {
+            // T3: a lost position (including the drop notification ./stream.ts now sends).
+            // The tile's own tree is the recovery payload, so the caller re-reads exactly
+            // that — bounded, one call, never a window re-read.
+            pendingBaseline = true;
             options.onResync?.(turnId);
         },
         onError: () => {
             // A refused/failed turn subscription costs the reader its live flow and
-            // nothing else; the session plane still carries the rows.
+            // nothing else; the session plane still carries the rows. T3: release the
+            // registration first — it would otherwise be re-sent on every reconnect
+            // (the leak `observeView` documents above).
+            sub.unsubscribe();
             settle();
         }
     });
@@ -772,9 +953,173 @@ export const observeTurn = async (
     );
 
     return done;
+};// ---------------------------------------------------------------------------
+// The followed thread (T3: live observation is per-thread, and ONLY for a thread the
+// reader opened)
+// ---------------------------------------------------------------------------
+
+// A thread card the reader expanded, and the conversation they are looking at, are the
+// two surfaces whose content cannot be reconstructed from the session subscription: the
+// committed transcript document (the session scope publishes `transcript.updated` as
+// counts only — message bodies never ride the wire, ../shared/harness-stream.ts:648-656)
+// and the row's own live state. This subscription is therefore registered when a thread
+// becomes EXPANDED or VIEWED and released when it collapses, which is what the request
+// asks for: "expanding a thread re-establishes the socket for that thread; collapsing it
+// means no longer following it".
+//
+// What the scope carries (../shared/harness-stream.ts:72-89 — the thread scope publishes
+// `transcript.updated` and `thread.upsert`, and NOTHING else):
+//   `thread.upsert`      → the whole roster row → `onThread` (one card repaints)
+//   `transcript.updated` → the transcript moved → `onTranscript` (re-read THAT document,
+//                          bounded to one thread: this is the frame the all-threads
+//                          fan-out used to pay for on every open)
+//   a drop, a gap, a refused cursor, or a re-registration with an expired replay window
+//                        → `onResync` (the caller re-reads what it is showing)
+//
+// `display.ops` deliberately does NOT ride this scope — the streamed token flow stays on
+// the ONE expanded tile's `turn` subscription above, which is the difference between
+// streaming a conversation and streaming a roster.
+//
+// The budget is honest: a session's roster page is 25 rows (./view-api.ts
+// `ROSTER_PAGE_LIMIT`) and only the expanded/focused ones are ever followed, against the
+// contract's 64 subscriptions per connection — and there is still exactly ONE socket for
+// the whole page (./stream.ts).
+export type ObserveThreadOptions = {
+    // The roster row moved. The frame carries the whole row, so this is a patch, not a
+    // read. `at`/`cursor` are the frame's OWN stamp (T3b): the caller refuses a patch older
+    // than the row it already holds, the same strictly-older rule `applyView` applies to a
+    // document.
+    onThread?: (threadId: string, row: ThreadRow, stamp: { at: number; cursor: string }) => void;
+    // The thread's transcript document changed (counts + revision; the bodies are the
+    // caller's own read).
+    onTranscript?: (threadId: string) => void;
+    // This thread's live position is gone: re-read what this surface is showing.
+    onResync?: (threadId: string) => void;
+    // A protocol error naming this subscription (an unknown thread id, most often).
+    onError?: (message: string) => void;
+    pace?: 'ordered' | 'ack';
+};
+
+export const observeThread = async (
+    sessionId: string,
+    threadId: string,
+    signal: AbortSignal,
+    options: ObserveThreadOptions = {}
+): Promise<void> => {
+    const client = harnessStream();
+
+    // Same degradation as the other two observers: no socket in this host means no live
+    // thread flow, and the caller's bounded reads stay correct.
+    if (client.status() === 'closed' && typeof (globalThis as { WebSocket?: unknown }).WebSocket !== 'function') {
+        return;
+    }
+
+    let settle: () => void = () => undefined;
+
+    const done = new Promise<void>((resolve) => {
+        settle = resolve;
+    });
+
+    // T3: a second `subscription_state` for the SAME registration means the client
+    // re-dialled; without `replayed_frames` the server restarted the subscription, so the
+    // frames this pane missed during the outage are gone (see `observeView`).
+    let anchored = false;
+    let pendingBaseline = false;
+
+    const sub = client.subscribe({
+        scope: 'thread',
+        sessionId,
+        threadId,
+        ...(options.pace === undefined ? {} : { pace: options.pace }),
+        onState: (state) => {
+            if (!anchored) {
+                anchored = true;
+                pendingBaseline = false;
+
+                return;
+            }
+
+            if ((state.replayed_frames ?? 0) > 0) {
+                pendingBaseline = false;
+
+                return;
+            }
+
+            if (!pendingBaseline) return;
+
+            pendingBaseline = false;
+            options.onResync?.(threadId);
+        },
+        onUpdate: (update: WsUpdate) => {
+            if (update.kind === 'thread.upsert') {
+                const frame = update as WsUpdateThreadUpsert;
+
+                options.onThread?.(threadId, threadRowOf(frame.thread), {
+                    at: frame.at,
+                    cursor: frame.cursor
+                });
+
+                return;
+            }
+
+            if (update.kind === 'transcript.updated') {
+                // The subscription is addressed to ONE thread, so the signal belongs to it
+                // even though `TranscriptSignal` names no thread id of its own.
+                options.onTranscript?.(threadId);
+
+                return;
+            }
+        },
+        onResync: () => {
+            // T3 (R2/R4): this thread's live position is gone — a drop, a gap, or a
+            // refused cursor. The caller re-reads the ONE document this surface shows, so
+            // an expanded card converges on the current state without a page refresh.
+            pendingBaseline = true;
+            options.onResync?.(threadId);
+        },
+        onError: (error) => {
+            // T3: unsubscribe BEFORE settling. Every settled-but-unreleased registration
+            // is replayed by `onopen` on the next connection, and the connection budget
+            // (64 subs, a 32 msg/s resume burst) is what closes the socket next time —
+            // the leak that made drops look random.
+            sub.unsubscribe();
+            options.onError?.(error.message);
+            settle();
+        }
+    });
+
+    // An undeliverable plane settles immediately, exactly as `observeView` does: the
+    // caller's bounded read is the degraded observation, never a hung promise.
+    if (client.status() === 'closed') {
+        sub.unsubscribe();
+        settle();
+
+        return done;
+    }
+
+    if (signal.aborted) {
+        sub.unsubscribe();
+        settle();
+
+        return done;
+    }
+
+    signal.addEventListener(
+        'abort',
+        () => {
+            // R3: collapsing a thread releases its live position — an unsubscribe only,
+            // never a cancel (execution is server-owned).
+            sub.unsubscribe();
+            settle();
+        },
+        { once: true }
+    );
+
+    return done;
 };
 
 // A minimal header stub for a frame that only changes the pending-action list. It is
+
 // applied as a `header` patch (T44), so the rows this client already holds survive it —
 // a card answer repaints without a rows read, and without a rows wipe.
 const sessionStub = (sessionId: string): SessionView => ({
@@ -806,7 +1151,26 @@ const sessionStub = (sessionId: string): SessionView => ({
 // transcript documents, which the caller reads through this same function.
 export const getRawSession = async (
     sessionId: string,
-    turnIds?: readonly string[]
+    turnIds?: readonly string[],
+    // T3b (owner decision on the R1/T3 trade): which transcript DOCUMENTS this read
+    // composes.
+    //
+    //   OMITTED  -> EVERY roster thread, in roster order. This is the lossless-export
+    //              contract (`ui/thread-transcript.test.ts` pins a document whose thread
+    //              rows carry their committed `messages`, and the editor quotes the stored
+    //              bytes of an unreadable one), and it is what an EXPLICIT export pays: a
+    //              reader who asks for the document gets the whole document, including the
+    //              conversations this page never opened.
+    //   GIVEN    -> exactly those ids (intersected with the roster, so a stale id costs no
+    //              request). This is the bounded form the shell uses when it needs ONE
+    //              conversation's bytes without re-reading the roster.
+    //
+    // The reason the parameter exists at all: the same composition sat on the LOAD and
+    // every viewing path, where 2 identified reads per roster row (50 for a full page)
+    // bought bytes no collapsed card renders. The fan-out is therefore not removed from
+    // the export — it is removed from everything that is not an export (./main.ts: a load
+    // reads no transcript, an expanded thread reads its own).
+    threadIds?: readonly string[]
 ): Promise<import('../server/protocol').SessionSnapshot> => {
     const [session, page, roster] = await Promise.all([
         getSession(sessionId),
@@ -819,15 +1183,20 @@ export const getRawSession = async (
     const rows = page === undefined ? [] : ascRows(page);
     const ids = turnIds === undefined || turnIds.length === 0 ? rows.map((row) => row.id) : [...new Set(turnIds)];
 
-    // The transcript DOCUMENTS ride the same read, because the dialog this document feeds
-    // renders `threads[].messages` (ui/thread-transcript.ts `buildThreadTranscriptJson`) and
-    // the roster row carries only transcript SIGNALS. Bounded by the roster page it walks,
-    // concurrent because the documents are independent identified reads, and failure-tolerant:
-    // a thread whose document is unreadable keeps its roster row (and the `invalidThreads`
-    // marker the roster already states) rather than failing the whole export.
+    // The documents the export quotes: every roster row when the caller asked for the
+    // whole (lossless) document, or exactly the named ids when it asked for a bounded one.
+    // Concurrent because the documents are independent identified reads, and
+    // failure-tolerant — a thread whose document is unreadable keeps its roster row (and
+    // the `invalidThreads` marker the roster already states) rather than failing the whole
+    // export.
+    const wanted = threadIds === undefined ? null : new Set(threadIds);
+    const targets =
+        wanted === null
+            ? roster.items.map((row) => row.id)
+            : roster.items.filter((row) => wanted.has(row.id)).map((row) => row.id);
     const [rawTurns, documents] = await Promise.all([
         readRawTurns(sessionId, ids),
-        Promise.allSettled(roster.items.map((row) => readTranscript(sessionId, row.id)))
+        Promise.allSettled(targets.map((threadId) => readTranscript(sessionId, threadId)))
     ]);
 
     // A thread id -> the transcript payload read for it. Kept whole (not just `messages`)
@@ -835,7 +1204,7 @@ export const getRawSession = async (
     // editor quotes those verbatim — the roster row alone states only the verdict.
     const transcripts = new Map<string, Awaited<ReturnType<typeof readTranscript>>>();
     documents.forEach((result, index) => {
-        if (result.status === 'fulfilled') transcripts.set(roster.items[index].id, result.value);
+        if (result.status === 'fulfilled') transcripts.set(targets[index] as string, result.value);
     });
 
     // The stored value behind an unreadable transcript, parsed back out of the document text so
@@ -888,6 +1257,12 @@ export const getRawSession = async (
 
 export const getStepDetail = readStepDetail;
 export const getBlockDetail = readBlockDetail;
+
+// T3: the per-thread transcript queue (./view-api.ts `createThreadTranscriptLoader`) is
+// re-exported here so the shell wires every lazy read through THIS module, exactly like
+// the two detail reads above: one place owns "what does the UI ask the server for".
+export { createThreadTranscriptLoader } from './view-api';
+export type { ThreadTranscriptLoader } from './view-api';
 
 // The stream URL the socket dials, re-exported for the diagnostics pane.
 export const streamUrl = (): string => apiUrl(HARNESS_ROUTES.stream());

@@ -484,6 +484,9 @@ describe('persistent agent threads (R2)', () => {
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false },
             storeRev: 1
+            // R1/T1.1: NO `entry` here on purpose — this is the SECOND conversation's
+            // plain read, and a read affects no record. The `entry` the ADD produced is
+            // asserted in the cross-conversation comparison further below.
         });
 
         // Transcripts stay separate.
@@ -507,9 +510,15 @@ describe('persistent agent threads (R2)', () => {
         ]);
         // R9-R11: every successful task call answers with the same bounded list, so
         // both conversations recorded the SAME page (one store, one revision).
-        expect(pageOf(toolResultsOf(writer.threadMessages(planner.id))[0])).toEqual(
-            pageOf(toolMessage.content)
-        );
+        //
+        // R1/T1.1 — the two answers now differ by exactly ONE per-CALL key: the
+        // planner's ADD affected a single record and answers with that record as
+        // `entry`, while the lister's plain read affected none. Naming the difference
+        // here keeps the comparison exact instead of loosening it into a subset check.
+        expect(pageOf(toolResultsOf(writer.threadMessages(planner.id))[0])).toEqual({
+            ...(pageOf(toolMessage.content) as Record<string, unknown>),
+            entry: task('1', 'Shared plan', { by: 'writer', threadId: planner.id })
+        });
         expect(textOf(writer.threadMessages(planner.id))).toEqual([
             'plan',
             '',

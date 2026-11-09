@@ -75,6 +75,10 @@ import type {
     TurnDisplayOp,
     TurnStepDetail as InternalTurnStepDetail
 } from '../shared/turn-display';
+// T3: the per-thread transcript payload the transcript loader below holds. Type-only, so
+// it is erased at build time (the same convention `readTranscript` follows with its inline
+// `import('./view-model')` annotation).
+import type { ThreadTranscriptPayload } from './view-model';
 import { pendingSectionsOf, projectDisplay, projectNode, projectRow, projectSection, projectStep } from './display-project';
 import {
     cancelSession,
@@ -832,8 +836,189 @@ export const createDisplayLoader = (
     };
 };
 
+// ---------------------------------------------------------------------------
+// The per-thread transcript plane (T3)
+// ---------------------------------------------------------------------------
+
+// A transcript document is the ONE per-thread payload the collapsed screen cannot derive
+// from a roster row (the compact wire publishes `messageCount`/`hasTranscript`/`preview`
+// precisely so it never has to ship one, ../server/protocol.ts `ThreadSummary`), so it is
+// now read on demand, for the threads the reader actually opened. Before this, the shell
+// pulled one per roster thread on every transcript open — 25 threads cost 50 identified
+// reads to show ONE conversation — which is the "loading the session pulls every thread"
+// cost this loader replaces.
+//
+// The four rules are the display loader's, restated for this payload class:
+//   1. BOUNDED CONCURRENCY (default 2 — a transcript document is far heavier than a
+//      display tree, and only the handful of followed threads can ever want one);
+//   2. DEDUPE + CACHE, so a repaint, a focus change and a `transcript.updated` frame
+//      re-asking for the same thread cost nothing while its answer is in flight;
+//   3. GENERATION GUARD — `invalidate()` runs when the realtime plane drops or the
+//      reader leaves the conversation, and an answer from a superseded generation is
+//      resolved but never painted (a document read before the outage is not current);
+//   4. A `refresh()` ALWAYS re-reads: expanding a thread is the reader asking for its
+//      CURRENT state, and a cached document from before a collapse (or before
+//      `transcript.updated`) cannot prove what the thread holds now.
+export type ThreadTranscriptLoader = {
+    // The cached document if there is one, otherwise the read (deduped, bounded).
+    load(threadId: string): Promise<ThreadTranscriptPayload | undefined>;
+    // Ignores the cache, and re-reads once more if an answer was already in flight when
+    // the request arrived (a frame that lands mid-read must not be swallowed).
+    refresh(threadId: string): Promise<ThreadTranscriptPayload | undefined>;
+    // A collapsed thread shows nothing, so its document stops being held: the next
+    // expand reads again, which is what makes "expand ⇒ current state" true.
+    forget(threadId: string): void;
+    // True while this thread's document is held, in flight or queued.
+    tracked(threadId: string): boolean;
+    // The plane dropped / the conversation changed: every held document is stale.
+    invalidate(): number;
+    generation(): number;
+};
+
+export const createThreadTranscriptLoader = (
+    sessionId: string,
+    options: {
+        concurrency?: number;
+        fetch?: (sessionId: string, threadId: string) => Promise<ThreadTranscriptPayload>;
+        // Every document this loader successfully reads, including a re-read nobody is
+        // awaiting (the frame-landed-mid-read case). The shell paints through here, so a
+        // thread's surface cannot stay one revision behind simply because its reader
+        // happened to ask at the wrong moment.
+        onResolved?: (threadId: string, payload: ThreadTranscriptPayload) => void;
+    } = {}
+): ThreadTranscriptLoader => {
+    const limit = Math.max(1, options.concurrency ?? 2);
+    const read = options.fetch ?? ((session, thread) => readTranscript(session, thread));
+
+    let generation = 0;
+    let running = 0;
+
+    const cached = new Map<string, ThreadTranscriptPayload>();
+    // Ids with a read in flight; the dedupe key, and the guard that keeps the cap real.
+    const active = new Set<string>();
+    // Ids whose document must be read AGAIN after the in-flight answer lands (a forced
+    // refresh that arrived mid-read).
+    const rerun = new Set<string>();
+    const waiters = new Map<string, Set<(payload: ThreadTranscriptPayload | undefined) => void>>();
+    const backlog: string[] = [];
+
+    const settle = (threadId: string, payload: ThreadTranscriptPayload | undefined): void => {
+        const waiting = waiters.get(threadId);
+        if (waiting === undefined) return;
+
+        waiters.delete(threadId);
+        for (const resolve of waiting) resolve(payload);
+    };
+
+    const drain = (): void => {
+        while (running < limit && backlog.length > 0) {
+            const threadId = backlog.shift() as string;
+            if (active.has(threadId)) continue;
+
+            start(threadId, generation);
+        }
+    };
+
+    const finish = (threadId: string, owner: number, payload: ThreadTranscriptPayload | undefined): void => {
+        running -= 1;
+        active.delete(threadId);
+
+        // A superseded generation resolves its waiters with nothing and holds nothing:
+        // the reader is on another conversation, or the plane dropped and this document
+        // predates the outage.
+        if (owner === generation && payload !== undefined) {
+            cached.set(threadId, payload);
+            options.onResolved?.(threadId, payload);
+        }
+
+        settle(threadId, owner === generation ? payload : undefined);
+
+        if (owner === generation && rerun.delete(threadId)) void request(threadId, true);
+
+        drain();
+    };
+
+    function start(threadId: string, owner: number): void {
+        running += 1;
+        active.add(threadId);
+
+        read(sessionId, threadId).then(
+            (payload) => finish(threadId, owner, payload),
+            () => finish(threadId, owner, undefined)
+        );
+    }
+
+    const request = (threadId: string, force: boolean): Promise<ThreadTranscriptPayload | undefined> => {
+        const owner = generation;
+
+        return new Promise<ThreadTranscriptPayload | undefined>((resolve) => {
+            // A plain `load` is free while the document is held — that is the whole point
+            // of the cache, and the rule that replaces the old per-open fan-out.
+            if (!force) {
+                const known = cached.get(threadId);
+                if (known !== undefined) {
+                    resolve(known);
+
+                    return;
+                }
+            }
+
+            const waiting = waiters.get(threadId) ?? new Set<(payload: ThreadTranscriptPayload | undefined) => void>();
+            waiting.add(resolve);
+            waiters.set(threadId, waiting);
+
+            // In flight: join it, and ask for one more pass if the caller needs the
+            // answer AFTER the frame that just moved this thread.
+            if (active.has(threadId)) {
+                if (force) rerun.add(threadId);
+
+                return;
+            }
+
+            if (running < limit) start(threadId, owner);
+            else if (!backlog.includes(threadId)) backlog.push(threadId);
+        });
+    };
+
+    return {
+        load: (threadId) => request(threadId, false),
+
+        refresh: (threadId) => request(threadId, true),
+
+        forget: (threadId) => {
+            cached.delete(threadId);
+            rerun.delete(threadId);
+
+            const queued = backlog.indexOf(threadId);
+            if (queued >= 0) backlog.splice(queued, 1);
+        },
+
+        tracked: (threadId) => cached.has(threadId) || active.has(threadId) || backlog.includes(threadId),
+
+        invalidate: () => {
+            generation += 1;
+            cached.clear();
+            rerun.clear();
+            backlog.length = 0;
+
+            // Every waiter of the dropped generation resolves instead of hanging; the
+            // caller's repaint simply finds no document, which reads as "not asked yet".
+            for (const [, waiting] of waiters) {
+                for (const resolve of waiting) resolve(undefined);
+            }
+
+            waiters.clear();
+
+            return generation;
+        },
+
+        generation: () => generation
+    };
+};
+
 // One tree plus the background calls it states per section, in ONE read. The render
 // model has no `pending` field on a section (../shared/turn-display.ts keeps the
+
 // live figure in `pending:set` ops, and ./view-state.ts stores it in a side map), so
 // a COLD document must carry its pending tools out-of-band or the "N still running"
 // affordance would silently vanish after a reload. `readTurnDisplay` alone cannot

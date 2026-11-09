@@ -84,6 +84,16 @@ export const LOCATIONS_METADATA: CoreToolMetadata = {
                 minimum: 1,
                 maximum: 100,
                 description: 'For "list" only: page size, 1-100. Defaults to 20.'
+            },
+            // R7/T7.1 — the engine's list-read filter, forwarded by the wrapper
+            // (src/core/records.ts toCollectionInput). Declared here because
+            // `additionalProperties: false` would refuse the call before the engine
+            // could answer it.
+            where: {
+                type: 'object',
+                description:
+                    'For "list" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and "counts" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type.',
+                additionalProperties: { type: ['string', 'integer', 'boolean'] }
             }
         },
         required: ['action'],

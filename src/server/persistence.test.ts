@@ -260,16 +260,22 @@ afterEach(() => {
 });
 
 // The ONE result shape of the `task` tool (src/core/task.ts), including `storeRev`.
+//
+// R1/T1.1 — `entry` is optional and is passed ONLY where the call affected exactly one
+// record (src/core/records.ts:2857); reads and multi-record calls keep the page-only
+// shape, so the pins that omit it stay byte-exact.
 const taskPage = (
     tasks: TaskItem[],
     total: number,
     completed: number,
-    storeRev: number
+    storeRev: number,
+    entry?: TaskItem
 ) => ({
     tasks,
     counts: { total, completed, pending: total - completed },
     page: { offset: 0, limit: 20, hasMore: false },
-    storeRev
+    storeRev,
+    ...(entry === undefined ? {} : { entry })
 });
 
 // One persisted record. `store.callTool` runs `harness.executeTool`, which hands the
@@ -341,7 +347,10 @@ describe('R3b durable harness database', () => {
             tasks: [taskItem('1', 'one', 'keep me', { at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false },
-            storeRev: 1
+            storeRev: 1,
+            // R1/T1.1 — the call created exactly ONE record, so it also answers with
+            // that record as `entry`; the snapshot below has to carry it back too.
+            entry: taskItem('1', 'one', 'keep me', { at: EPOCH_ISO })
         });
         expect(
             await first.store.callTool(id, 'toolCreate', {
@@ -386,7 +395,10 @@ describe('R3b durable harness database', () => {
                 [taskItem('1', 'one', 'keep me', { completed: true, rev: 2, at: EPOCH_ISO })],
                 1,
                 1,
-                2
+                2,
+                // R1/T1.1 — the guarded patch affected exactly ONE record, so it also
+                // answers with that record (the state it was patched INTO).
+                taskItem('1', 'one', 'keep me', { completed: true, rev: 2, at: EPOCH_ISO })
             )
         );
 
@@ -1441,7 +1453,14 @@ describe('R3b durable harness database', () => {
         // Durable session state on the doomed record: a todo (core snapshot), a
         // live per-agent model map and its own settings model.
         expect(await first.store.callTool(doomed.id, 'tasks', { tasks: [{ text: 'delete me too' }] })).toEqual(
-            taskPage([taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })], 1, 0, 1)
+            // R1/T1.1 — one record was created, so the same record answers as `entry`.
+            taskPage(
+                [taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })],
+                1,
+                0,
+                1,
+                taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })
+            )
         );
         expect((await first.store.setAgentModels(doomed.id, { two: 'next/model' })).agentModels).toEqual({
             two: 'next/model'

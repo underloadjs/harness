@@ -3553,6 +3553,11 @@ export const installHarnessStream = (options: HarnessStreamOptions = {}): Stream
         // continued the old counter would read as a hundred dropped frames and force a resync.
         sequences.clear();
 
+        // T3b: whether THIS connection has completed its handshake. A subscribe that
+        // arrives before `onopen` is queued by the client and answered by the flush below;
+        // one that arrives after it is answered inside `send`.
+        let opened = false;
+
         const socket = {
             onopen: null as (() => void) | null,
             onmessage: null as ((event: { data: unknown }) => void) | null,
@@ -3562,7 +3567,32 @@ export const installHarnessStream = (options: HarnessStreamOptions = {}): Stream
                 const frame = JSON.parse(data) as Record<string, unknown>;
                 sent.push(frame);
 
-                if (frame.type === 'subscribe') subscriptions.push(frame);
+                if (frame.type === 'subscribe') {
+                    subscriptions.push(frame);
+
+                    // T3b: a real server answers EVERY subscribe with its
+                    // `subscription_state` baseline — including one that arrives after the
+                    // handshake, which is the ordinary case for a pane that mounts (or a
+                    // thread the reader expands) on an already-open connection. The
+                    // open-time flush below only covers the ones queued before `onopen`;
+                    // without this answer the client never records the registration as
+                    // ACKNOWLEDGED (`registered`, ./stream.ts:232) and a later collapse
+                    // has nothing to release, so the goodbye this fixture used to observe
+                    // silently disappeared.
+                    if (opened && !socket.closeFired)
+                        socket.onmessage?.({
+                            data: JSON.stringify({
+                                type: 'subscription_state',
+                                subscription_id: (frame as { subscription_id: string }).subscription_id,
+                                scope: (frame as { scope: string }).scope,
+                                epoch: 'test-epoch',
+                                sequence: 0,
+                                cursor: 'cursor-0',
+                                revisions: [],
+                                publishes: ['turn.upsert', 'display.ops', 'session.updated']
+                            })
+                        });
+                }
             },
             close: (code?: number) => {
                 socket.closeCode = code;
@@ -3586,6 +3616,13 @@ export const installHarnessStream = (options: HarnessStreamOptions = {}): Stream
         // Answer the handshake on the next microtask, so the caller's `subscribe`
         // has been registered before frames start arriving.
         queueMicrotask(() => {
+            // T3b: snapshot the queue BEFORE the handshake flush so a registration is
+            // answered exactly ONCE — the ones queued before `onopen` here, and every
+            // subscribe that arrives afterwards inside `send` (the client flushes its
+            // queue synchronously from `onopen`).
+            const preOpen = [...subscriptions];
+
+            opened = true;
             socket.onopen?.();
             socket.onmessage?.({
                 data: JSON.stringify({
@@ -3597,7 +3634,7 @@ export const installHarnessStream = (options: HarnessStreamOptions = {}): Stream
                 })
             });
 
-            for (const sub of subscriptions) {
+            for (const sub of preOpen) {
                 socket.onmessage?.({
                     data: JSON.stringify({
                         type: 'subscription_state',

@@ -541,12 +541,35 @@ export type TurnBoardOptions = {
     // the composer's routing line from it; nothing is sent to the server until a
     // submit targets the focused thread (ui/threads.ts `resolveSubmitTarget`).
     onFocusChange?: (threadId: string | undefined) => void;
+    // T3 (R2/R3): the set of persistent conversations the reader has OPENED — every
+    // expanded thread card joined to a roster row, plus the focused conversation (its tile
+    // or its roster-only panel is the surface being read). The shell follows exactly this
+    // set: it registers one `thread`-scope live subscription per id, loads that thread's
+    // transcript document on demand, and releases both when the id leaves the set. The
+    // board never opens a request itself (the renderer owns no network code, the rule
+    // `readFile`/`loadStepDetail` follow); it reports what is on screen.
+    //
+    // A card with no roster join is invocation detail: there is no server conversation to
+    // follow, so it contributes nothing. The session the ids belong to travels with the
+    // report, because thread ids are minted per conversation and a re-binding repaints the
+    // board asynchronously — the shell drops a report whose session it is no longer on.
+    //
+    // A session LOAD reports the EMPTY set — every card starts collapsed (T21 R22) — which
+    // is the whole of R1's "do not pull or stream a thread nobody opened".
+    onFollowedThreadsChange?: (threadIds: readonly string[], sessionId: string | undefined) => void;
     // R7 freshness: invoked ONCE on an explicit transcript open. The shell reads
     // `getSession` (never per streamed event), applies it through its normal
     // tombstone-guarded snapshot path, and returns the snapshot for that board. A
     // rejected/undefined answer keeps the last applied snapshot visible; a snapshot
     // for another session/thread is ignored by the transcript module.
-    refreshSessionSnapshot?: (sessionId: string) => Promise<SessionSnapshot | undefined>;
+    //
+    // T3 (R1): the opened `threadId` travels with the request so the shell composes THAT
+    // thread's document. It used to read one per roster thread — 2 identified reads each,
+    // 50 for a full roster page — to open one conversation.
+    refreshSessionSnapshot?: (
+        sessionId: string,
+        threadId?: string
+    ) => Promise<SessionSnapshot | undefined>;
     // R9 deletion transport. The board owns confirmation, dedupe, protection and
     // feedback; the shell owns the existing DELETE API plus tombstone/snapshot
     // reconciliation. Omitted in an embedding that does not expose thread delete:
@@ -651,6 +674,17 @@ export type TurnBoard = {
     // tiles with the SAME canonical name/sequence as the strip (S6), to resolve a
     // child's persistent identity, and to render a roster-only child transcript.
     setThreads: (threads: readonly SessionThreadEntry[]) => void;
+    // T3: the conversations the reader currently has OPEN (see
+    // `TurnBoardOptions.onFollowedThreadsChange`). Same value the change callback reports;
+    // the shell re-reads it after a roster update, because an id can only be followed once
+    // the roster makes it a real conversation.
+    followedThreads: () => readonly string[];
+    // T3 (R2): the transcript document the shell read for ONE thread. The surfaces that
+    // render a conversation's committed messages — the roster-only focus panel and an open
+    // transcript dialog — repaint from here, and the board keeps the document so a later
+    // roster frame (the compact wire carries transcript SIGNALS only) cannot wipe it.
+    // `undefined` means "the read failed": nothing is painted, nothing is forgotten.
+    setThreadTranscript: (threadId: string, payload: ThreadTranscriptPayload | undefined) => void;
     // Raw authoritative snapshot for THIS board (exact threads + turns + session
     // fields, tombstone-filtered by the shell). Observed by the R7 JSON transcript
     // and by delete protection; `setThreads` alone remains enough for every
@@ -2630,7 +2664,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         if (options.refreshSessionSnapshot === undefined || sessionId === undefined) return;
 
         void options
-            .refreshSessionSnapshot(sessionId)
+            .refreshSessionSnapshot(sessionId, threadId)
             .then((fresh) => {
                 // Guard the READER's state, not just the request: closed dialog,
                 // another transcript, another board, or a session switch all make
@@ -2943,9 +2977,147 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // C5: the projection can create or replace a conversation card, so the
         // unreadable-transcript mark is re-applied from the roster in the same pass.
         paintRosterInvalid();
+        // T3: this pass (re)creates cards, applies roster joins and restores the reader's
+        // remembered expansions, so it is where the followed set can MOVE without any
+        // click or focus change. Cheap to ask: the report is deduped by value.
+        notifyFollowedThreads();
     };
 
-    const notifyFocus = (): void => options.onFocusChange?.(focusedThreadId);
+    const notifyFocus = (): void => {
+        options.onFocusChange?.(focusedThreadId);
+        // T3: focus is viewing. Expanding a tile, focusing a child conversation, focusing
+        // a roster-only thread and collapsing (which clears the focus) all land here, so
+        // the followed set moves with the surface the reader is looking at.
+        notifyFollowedThreads();
+    };
+
+    // --- the followed set (T3: R2/R3) --------------------------------------
+    //
+    // "Which conversations is the reader actually looking at?" is ONE question, and its
+    // answer drives both per-thread paths the shell opens: the `thread`-scope live
+    // subscription and the per-thread transcript read. The set is RECOMPUTED from the
+    // board's own state rather than incremented by hand, so a projection rebuild, a roster
+    // join that makes a card persistent, an implicit open (`openEnclosingCards`) and a
+    // collapse cannot drift it. It holds:
+    //   - every EXPANDED `.thread-row` the roster has joined to a persistent conversation
+    //     (`data-persistent-thread`, painted by `paintPersistentMarkers`) — a child card the
+    //     reader opened, or one opened to reveal the focused exchange;
+    //   - the FOCUSED conversation (a tile's root thread, or a roster-only thread whose
+    //     panel IS its expanded surface).
+    // A card with no roster join is invocation detail: there is no server conversation to
+    // follow, so it contributes nothing. A loaded session contributes NOTHING at all —
+    // every card starts collapsed (T21 R22), which is the whole of R1's "do not pull every
+    // thread on load".
+    const followedIds = new Set<string>();
+
+    const computeFollowed = (): string[] => {
+        const ids = new Set<string>();
+
+        for (const row of element.querySelectorAll<HTMLElement>('.thread-row.is-expanded[data-persistent-thread]')) {
+            const id = row.dataset.persistentThread;
+            if (id !== undefined && id.length > 0) ids.add(id);
+        }
+
+        if (focusedThreadId !== undefined && focusedThreadId.length > 0) ids.add(focusedThreadId);
+
+        return [...ids].sort();
+    };
+
+    // Reports the set ONLY when it actually moved. A projection rebuild runs on every ops
+    // frame, and re-reporting an unchanged set would make the shell re-subscribe — or
+    // re-read a transcript — on every streamed token.
+    const notifyFollowedThreads = (): void => {
+        const ids = computeFollowed();
+
+        if (ids.length === followedIds.size && ids.every((id) => followedIds.has(id))) return;
+
+        followedIds.clear();
+        for (const id of ids) followedIds.add(id);
+
+        options.onFollowedThreadsChange?.(ids, boundSession);
+    };
+
+    // T3: the board's public read of the same set (./ui/turns.ts `TurnBoard.followedThreads`).
+    // The shell pulls it after installing a roster, which is the moment an id becomes a
+    // real conversation and can be followed.
+    const followedThreads = (): readonly string[] => computeFollowed();
+
+    // T3: the transcripts the shell read for this board, keyed by conversation. The
+    // compact roster carries transcript SIGNALS only (`messageCount`/`hasTranscript`/
+    // `preview`, ./threads.ts), so without this map every `setThreads` — one per streamed
+    // frame — would wipe the document the reader is looking at.
+    const threadTranscripts = new Map<string, ThreadTranscriptPayload>();
+
+    // Joins a stored transcript back onto a roster row that has no messages of its own.
+    const withStoredTranscript = (entry: SessionThreadEntry): SessionThreadEntry => {
+        if (entry.messages !== undefined) return entry;
+
+        const stored = threadTranscripts.get(entry.id);
+        if (stored === undefined) return entry;
+
+        return { ...entry, messages: Array.isArray(stored.messages) ? stored.messages : [] };
+    };
+
+    // Install the transcript the shell read for one conversation and repaint the surfaces
+    // that render committed messages: the roster row (labels, delete protection and the
+    // transcript dialog all read `entry.messages`), the roster-only focus panel, and an
+    // open dialog for that thread.
+    const setThreadTranscript = (threadId: string, payload: ThreadTranscriptPayload | undefined): void => {
+        if (payload === undefined) return;
+
+        threadTranscripts.set(threadId, payload);
+
+        let joined = false;
+        roster = roster.map((entry) => {
+            if (entry.id !== threadId) return entry;
+
+            joined = true;
+
+            return {
+                ...entry,
+                messages: Array.isArray(payload.messages) ? payload.messages : [],
+                // An unreadable document states itself on the row, which is what keeps the
+                // conversation focusable and fixable (C5) instead of merely empty.
+                ...(payload.invalid === undefined
+                    ? {}
+                    : {
+                          invalid: {
+                              id: threadId,
+                              agent: payload.agent,
+                              error: payload.invalid.error,
+                              // The stored value, PARSED back out of the document text — the
+                              // editor quotes the JSON the server kept, not a quoted string of
+                              // it. Same rule ./view-shell.ts `storedValueOf` applies to the raw
+                              // export; a document the server accepted as raw data (not JSON)
+                              // is quoted as its text.
+                              messages: (() => {
+                                  try {
+                                      return JSON.parse(payload.invalid.raw) as unknown;
+                                  } catch {
+                                      return payload.invalid.raw;
+                                  }
+                              })()
+                          }
+                      })
+            };
+        });
+
+        // A transcript can arrive for a conversation the roster has not published (yet);
+        // the document is still stored above so the next roster frame adopts it.
+        if (!joined) return;
+
+        if (focusPanel !== undefined && focusPanel.dataset.threadId === threadId) {
+            const entry = roster.find((candidate) => candidate.id === threadId);
+            if (entry !== undefined) showFocusPanel(entry);
+        }
+
+        refreshActionBars();
+
+        // A board with no authority at all (no raw read, no compiled view, no roster) has
+        // nothing to refresh the dialog with — same guard `setThreads` uses.
+        const source = transcriptSnapshotNow();
+        if (source !== undefined) notifyTranscriptRefresh(refreshOpenThreadTranscript(source, transcriptScope));
+    };
 
     // Cards THIS focus opened automatically, so ending the focus closes only them
     // (a card the reader opened by hand is their own state, not ours to collapse).
@@ -4068,6 +4240,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.tile?.classList.toggle('is-expanded', expanded);
             entry.select?.setAttribute('aria-expanded', String(expanded));
             syncThreadTranscriptAction(entry);
+            // T3 (R2/R3): a card opening is the reader starting to follow that conversation
+            // (or the board revealing it to show the focused exchange), and closing it is
+            // them stopping. This transition is the single place both happen, so the
+            // followed set is re-derived here — and the class toggles above are what the
+            // recomputation reads.
+            notifyFollowedThreads();
             // T7: nothing else to repaint. This is the ONLY transition of a nested card's
             // expansion (a header click, the footer chevron, and the board's implicit
             // open/close all route through here), and the card's own `is-expanded` class is
@@ -9044,6 +9222,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         closeThreadDeleteConfirmation();
         deletingRequests.clear();
         activeDeleteSuppressions.clear();
+
+        // T3 (R3): every card this board followed is gone with its rows.
+        threadTranscripts.clear();
+        followedIds.clear();
+        notifyFollowedThreads();
         // R1: a cleared board tears down the surface a Stop was pressed on; its in-flight
         // flag goes with it (the late answer only ever removes its own key).
         stoppingRequests.clear();
@@ -9544,6 +9727,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // else stays an invocation-only card instead of pointing at a foreign thread.
         if (boundSession !== undefined) learnedThreads.clear();
 
+        // T3 (R3): the followed set and the transcript documents belong to the conversation
+        // being LEFT — ids are minted per session, and the next session may mint the same
+        // one. Clearing the reported set here is also what forces a FRESH report for the
+        // next conversation even when its ids happen to read the same.
+        if (boundSession !== undefined) {
+            threadTranscripts.clear();
+            followedIds.clear();
+        }
+
         // A transcript/confirmation from the conversation being left cannot be
         // updated or acted on here. The raw snapshot belonged to the old session;
         // the shell will install the new one through `setSessionSnapshot`.
@@ -9585,6 +9777,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
 
         boundSession = sessionId;
+
+        // T3: the binding changed, so the shell needs the report again (the callback names
+        // the session these ids belong to, and `followedIds` was just reset above).
+        notifyFollowedThreads();
     };
 
     // Authoritative roster update (S2/S6). Repaints every roster-derived label and
@@ -9607,7 +9803,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     };
 
     const setThreads = (entries: readonly SessionThreadEntry[]): void => {
-        roster = [...entries];
+        // T3: the compact roster carries no transcript messages (./threads.ts:89-104), so a
+        // row that arrived without them keeps the document THIS board was given for that
+        // conversation. Before the per-thread loader, the only way a row ever had messages
+        // was the all-threads raw fan-out; now they arrive on demand and must survive every
+        // streamed roster update.
+        roster = [...entries].map(withStoredTranscript);
 
         // R7 snapshot semantics: an open transcript is a snapshot of the latest
         // applied authority. Every snapshot frame already calls this method, so
@@ -9701,6 +9902,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         focusedThread: () => focusedThreadId,
         focusThread,
         setThreads,
+        // T3: the followed set, on demand (the shell re-reads it after a roster update,
+        // which is when an id becomes a real conversation) and the per-thread transcript
+        // the shell read for it.
+        followedThreads,
+        setThreadTranscript,
         setSessionSnapshot,
         setSessionView,
         discard,

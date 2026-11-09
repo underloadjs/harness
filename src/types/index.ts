@@ -1466,6 +1466,17 @@ export type RecordsResult = {
     changesTruncated?: boolean;
     // `define`/`drop` only: the collection this call registered or removed.
     collection?: string;
+    // R6/T6.1 — `describe: true` only: the collection's OWN definition, verbatim from
+    // the stored spec (fields with `key`, `type`, `required`, `maxLength`, `maxItems`,
+    // `values`, `max`, `default`, `getOnly`, `sortable`, `count`, plus `maxRecords` and
+    // `responseBudgetBytes`). The read surface had no way to ask what a collection
+    // accepts, which cost a live session four failed `define` calls discovering the
+    // accepted `count` shapes.
+    definition?: RecordCollectionDefinition;
+    // R6/T6.2 — a `records` call with NO `collection` only: every registered collection
+    // name, sorted. The name list used to be reachable only by TRIGGERING the
+    // `unknown-collection` refusal.
+    collections?: string[];
 };
 
 // The generic model-facing arguments for `records`. `collection` is a STRING, not
@@ -1489,6 +1500,15 @@ export type RecordsParameters = {
     offset?: number;
     limit?: number;
     afterId?: string;
+    // R7/T7.1 — an equality filter for a LIST read: `{ field: value }`, AND across the
+    // keys, applied BEFORE ordering and paging so the page cursors and (when present)
+    // the counts describe the matching records. Values are scalars — `text`, `integer`,
+    // `enum` (one of its declared values) or `boolean` — and may name a `getOnly` field,
+    // which a page otherwise withholds. Mutually exclusive with `since`, because the
+    // change feed is the unfiltered log of the whole collection.
+    where?: Record<string, string | number | boolean>;
+    // R6/T6.1 — reads the collection's own definition back, on its own (no batch).
+    describe?: boolean;
     mergeDisjoint?: boolean;
     // Registers a NEW collection (Decision C/M). A name that already exists is an
     // ERROR, never a silent merge.
@@ -1586,6 +1606,11 @@ export type TaskParameters = {
     offset?: number;
     limit?: number;
     afterId?: string;
+    // R7/T7.1 — TYPE PARITY with the tool schema: `tasks.tool.ts:133` declares `where`, and
+    // `toWrapperInput` forwards it (`records.ts:3129`) exactly like `RecordsParameters.where`
+    // (`:1509`). Same engine control, same value type — an equality filter for a LIST read,
+    // AND across the keys, applied before ordering and paging.
+    where?: Record<string, string | number | boolean>;
     mergeDisjoint?: boolean;
 };
 
@@ -1604,9 +1629,22 @@ export type TaskPageInfo = RecordsPageInfo;
 // successful call returns exactly this shape — read, add, patch and removal alike
 // — which is what makes "mutate and instantly return the list" one round trip and
 // what removes the read-first dance `/task` used to pay for a rev token (F7).
-export type TaskResult = Omit<RecordsResult, 'entries' | 'counts'> & {
+//
+// R1 + its T1.1 extension are why `removed` is RE-declared here instead of inherited.
+// The ENGINE answers a removal with `removed?: RecordEntry[]` (`RecordsResult`, above),
+// but the `batch` wrapper's projection (`toWrapperResult`, src/core/records.ts:3222-3261)
+// mirrors `entry` and emits the deleted record SINGULAR, and only when exactly ONE
+// record was deleted (`result.removed?.length === 1`, src/core/records.ts:3261). A
+// multi-record removal through `tasks` therefore carries NO `removed` key at all, and a
+// single removal carries one record — never an array. Omitting the inherited key is what
+// makes the declared type match what the tool actually returns; the array stays on
+// `RecordsResult`, because the un-wrapped `records` surface answers with it verbatim.
+export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> & {
     tasks: TaskItem[];
     counts: TaskCounts;
+    // The one record this call deleted; absent on every other answer, including a
+    // removal of two or more records (the singular/conditional rule above).
+    removed?: TaskItem;
 };
 
 // The shared CRUD action set is declared above with the engine types.

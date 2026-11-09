@@ -396,13 +396,24 @@ describe('the live subscription plane', () => {
         ).toEqual(['session:s1', 'session:s1']);
 
         // And the new connection delivers again, with no gap: a sequence that continued
-        // the old counter would fire `resync_required` here, and the shell would answer
-        // with a window re-read — the very document that used to wipe the board.
+        // the old counter would read as a loss and re-register the subscription a THIRD
+        // time, so the two subscribes above are the whole of it.
         expect(live.push({ kind: 'turn.upsert', turn: rowDone })).toBe(true);
         await settle();
+        await settle();
 
-        expect(session.map((item) => item.type)).toEqual(['ops', 'ops']);
-        expect(session.filter((item) => item.type === 'view')).toHaveLength(0);
+        expect(live.sent.filter((frame) => frame.type === 'subscribe')).toHaveLength(2);
+
+        // T3 (R4): the DROP alone answers with no document — the client is already
+        // re-registering this subscription, and a re-read that races that answer can apply
+        // a document older than the frames already delivered (the N2/T44 hazard), so the
+        // loader-level repair runs at the drop and the window re-read waits for the
+        // baseline. THE RECONNECTION DOES reconcile: this fixture answers a fresh baseline
+        // with no `replayed_frames`, which is exactly the expired-replay-window case, and
+        // the pane converges on the current state without the reader pressing refresh.
+        expect(session.filter((item) => item.type === 'ops')).toHaveLength(2);
+        expect(session.filter((item) => item.type === 'view')).toHaveLength(1);
+        expect(session[session.length - 1]?.type).toBe('ops');
 
         controller.abort();
         live.close();

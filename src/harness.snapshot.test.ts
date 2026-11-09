@@ -531,7 +531,12 @@ describe('harness snapshot/restore', () => {
             ],
             counts: { total: 3, completed: 1, pending: 2 },
             page: { offset: 0, limit: 20, hasMore: false },
-            storeRev: 4
+            storeRev: 4,
+            // R1/T1.1 — this add affected exactly ONE record, so the restored store
+            // also answers with that record as `entry` beside the page. Reads and
+            // multi-record calls in this file keep the page-only shape, which is the
+            // assertion that the key is conditional rather than always present.
+            entry: taskItem('7', 'Next', { by: 'writer', at: EPOCH_ISO })
         });
 
         // Record bodies and trait arrays survived the copy.
@@ -854,7 +859,7 @@ describe('harness snapshot/restore', () => {
             {
                 role: 'tool',
                 content:
-                    '{"tasks":[{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1}',
+                    '{"tasks":[{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1,"entry":{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}}',
                 toolCallId: 'c1',
                 name: 'tasks'
             }
@@ -1725,7 +1730,10 @@ describe('harness restore validation', () => {
             ],
             counts: { total: 2, completed: 2, pending: 0 },
             page: { offset: 0, limit: 20, hasMore: false },
-            storeRev: 1
+            storeRev: 1,
+            // R1/T1.1 — the resumed write patched exactly ONE record, so it also
+            // answers with `entry`: a restored pre-T1 store behaves like any other.
+            entry: taskItem('1', 'Legacy open', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
         });
     });
 

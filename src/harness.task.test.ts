@@ -124,11 +124,31 @@ const empty = {
 };
 
 // One page of exactly these records with these counts.
-const taskPage = (tasks: TaskItem[], total: number, completed: number, storeRev: number) => ({
+//
+// R1/T1.1 — the engine answers a ONE-RECORD mutation with `entry` beside the page
+// (src/core/records.ts: `affected.length === 1`), and `toWrapperResult`'s batch branch
+// now carries it. `entry` is therefore passed ONLY at the sites whose call affected a
+// single record: a read, a multi-record batch and a removal all omit it, and each of
+// those pins stays the exact old shape — which is the assertion that the new key is
+// conditional rather than always present.
+//
+// T1.1 EXTENSION — the batch branch also carries `removed`, and with the same rule: one
+// deleted record answers as that record (singular, src/core/records.ts:3224), while a
+// multi-record call answers with the page only, exactly as `entry` behaves.
+const taskPage = (
+    tasks: TaskItem[],
+    total: number,
+    completed: number,
+    storeRev: number,
+    entry?: TaskItem,
+    removed?: TaskItem
+) => ({
     tasks,
     counts: { total, completed, pending: total - completed },
     page: page(),
-    storeRev
+    storeRev,
+    ...(entry === undefined ? {} : { entry }),
+    ...(removed === undefined ? {} : { removed })
 });
 
 type RecordShape = {
@@ -236,8 +256,12 @@ describe('tasks', () => {
         // The mutation answer IS the current list: no `{ todo, counts }` wrapper.
         // T1 adds the content revision, the attribution of THIS run (the primary
         // `writer` on its default conversation `agent:writer`), and `storeRev`.
+        // R1 adds `entry` for the one record this call created — the sentence at
+        // src/tools/runtime/tasks.tool.ts:70 ("One id answers with entry") that the
+        // batch reshape used to break, and which was left true rather than edited down
+        // to the bug.
         expect((entry.messages[2] as { content: string }).content).toBe(
-            `{"tasks":[{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1}`
+            `{"tasks":[{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1,"entry":{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"}}`
         );
     });
 
@@ -259,7 +283,14 @@ describe('tasks', () => {
 
         // First call: the add already returned the list.
         expect(JSON.parse((toolMessages[0] as { content: string }).content)).toEqual(
-            taskPage([task('1', 'Draft plan', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })], 1, 0, 1)
+            taskPage(
+                [task('1', 'Draft plan', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })],
+                1,
+                0,
+                1,
+                // R1: one record was created, so the same record also answers as `entry`.
+                task('1', 'Draft plan', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })
+            )
         );
 
         // Second call: an argument-less read of the same store, byte-identical. A
@@ -297,15 +328,32 @@ describe('tasks', () => {
                 ],
                 2,
                 1,
-                3
+                3,
+                // R1: exactly one record was patched, so it is also the `entry` — the
+                // projection a mutation result uses (no `updatedThreadId`: the host call
+                // that made this patch had no conversation).
+                task('1', 'One', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
             )
         );
 
         // Removals answer the same way, with the survivor list. A removal is a
         // guarded write too, so it needs the CURRENT token for the id it deletes.
+        //
+        // T1.1 EXTENSION — one record was deleted, so its full body (the state it was
+        // removed IN: completed, rev 2) answers as the singular `removed`. `entry` stays
+        // absent: a deletion affects no record, which is why the two keys never overlap.
         expect(
             await writer.executeTool('tasks', { remove: ['1'], expects: [{ id: '1', rev: 2 }] })
-        ).toEqual(taskPage([task('2', 'Two', { by: 'writer', at: EPOCH_ISO })], 1, 0, 4));
+        ).toEqual(
+            taskPage(
+                [task('2', 'Two', { by: 'writer', at: EPOCH_ISO })],
+                1,
+                0,
+                4,
+                undefined,
+                task('1', 'One', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
+            )
+        );
 
         // A rejected patch does not move the store — not the records, not the id
         // counter, and not `storeRev`.
@@ -415,7 +463,14 @@ describe('tasks', () => {
 
         expect(await writerA.executeTool('tasks', {})).toEqual(empty);
         expect(await writerA.executeTool('tasks', { tasks: [{ text: 'After reset' }] })).toEqual(
-            taskPage([task('1', 'After reset', { by: 'writer', at: EPOCH_ISO })], 1, 0, 1)
+            taskPage(
+                [task('1', 'After reset', { by: 'writer', at: EPOCH_ISO })],
+                1,
+                0,
+                1,
+                // R1: the single add answers with `entry` as well as the page.
+                task('1', 'After reset', { by: 'writer', at: EPOCH_ISO })
+            )
         );
     });
 
@@ -548,7 +603,15 @@ describe('tasks', () => {
                 ],
                 1,
                 1,
-                3
+                3,
+                // R1: the retried patch affected one record, so it also answers `entry`.
+                task('1', 'Renamed by the host', {
+                    completed: true,
+                    rev: 3,
+                    by: 'writer',
+                    threadId: 'agent:writer',
+                    at: EPOCH_ISO
+                })
             )
         );
 
@@ -728,7 +791,16 @@ describe('task concurrency across harness callers', () => {
                 ],
                 1,
                 1,
-                3
+                3,
+                // R1: one record patched → the winner's current values also ride as
+                // `entry`, so the retryer never re-reads to confirm its own write.
+                task('1', 'Rewritten by the researcher', {
+                    completed: true,
+                    rev: 3,
+                    by: 'writer',
+                    threadId: 'thread-author',
+                    at: EPOCH_ISO
+                })
             )
         );
     });
@@ -752,7 +824,7 @@ describe('task concurrency across harness callers', () => {
                     { id: '2', rev: 1 }
                 ]
             })
-        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1; the id is free again — re-read the list and add or retry.');
+        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1 — re-read the list and add or retry.');
 
         // THE SAME RACE, NAMED THE SAME WAY (T1 precedence fix). The token, not the
         // half of the call that spelled the id, is what proves which record is gone:
@@ -764,14 +836,14 @@ describe('task concurrency across harness callers', () => {
                 tasks: [{ id: '1', completed: true }],
                 expects: [{ id: '1', rev: 1 }]
             })
-        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1; the id is free again — re-read the list and add or retry.');
+        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1 — re-read the list and add or retry.');
 
         await expect(
             callAs(writer, author, 'thread-author', {
                 remove: ['1'],
                 expects: [{ id: '1', rev: 1 }]
             })
-        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1; the id is free again — re-read the list and add or retry.');
+        ).rejects.toThrow('stale-record: tasks "1" was removed since revision 1 — re-read the list and add or retry.');
 
         // Without the token the caller has proven nothing about id "1", so it is the
         // ordinary unknown-id rejection — and still not a guarded-write complaint.

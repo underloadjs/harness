@@ -392,4 +392,101 @@ describe('harness stream client', () => {
         expect(unknown).toEqual([{ type: 'some_future_frame' }]);
         expect(client.status()).toBe('open');
     });
+
+    // T3b (finding 5): the goodbye is a registration release, so it goes only when the
+    // server holds the registration. `registered` is populated by the `subscription_state`
+    // anchor — the same knowledge `reregister` uses — and an id the server never acked
+    // would buy one `unknown_subscription` error frame
+    // (../server/stream/broker.ts:810) for nothing.
+    it('releases a subscription the server acknowledged, and sends nothing for one it never saw', () => {
+        const probe = createProbe();
+        const client = createHarnessStream({ socketFactory: () => probe });
+
+        const acked = client.subscribe({ scope: 'session', sessionId: 's1' });
+        const queued = client.subscribe({ scope: 'global' });
+
+        probe.onopen?.();
+        probe.deliver(WELCOME());
+        // ONLY the first registration gets its baseline: the second stands for one the
+        // server never acknowledged (refused, or still queued when the pane closed).
+        probe.deliver({
+            type: 'subscription_state',
+            subscription_id: acked.id,
+            scope: 'session',
+            epoch: 'e1',
+            sequence: 1,
+            cursor: 'Y3Vyc29yLTE',
+            revisions: [],
+            publishes: ['turn.upsert']
+        });
+
+        acked.unsubscribe();
+        queued.unsubscribe();
+
+        expect(framesOf(probe)).toEqual([
+            { type: 'subscribe', subscription_id: acked.id, scope: 'session', session_id: 's1', pace: 'ordered' },
+            { type: 'subscribe', subscription_id: queued.id, scope: 'global', pace: 'ordered' },
+            { type: 'unsubscribe', subscription_id: acked.id }
+        ]);
+        expect(client.subscriptions()).toEqual([]);
+    });
+
+    // T3b (finding 3): the rate limit that keeps a live-data caller from defeating the
+    // backoff. The board's follow sync runs on every roster frame, and an unthrottled
+    // force there cancels the pending backoff and re-dials per frame — a schedule that is
+    // supposed to top out at one attempt per 10s becomes one per poll tick, against the
+    // 32 messages/second budget that closes 4429.
+    it('forceReconnectOnce spends one dial per outage, re-arms when the plane opens, and leaves refresh unthrottled', () => {
+        const probes: Probe[] = [];
+        const clock = createClock();
+        const client = createHarnessStream({
+            socketFactory: () => {
+                const probe = createProbe();
+                probes.push(probe);
+
+                return probe;
+            },
+            schedule: clock.schedule
+        });
+
+        client.connect();
+        probes[0]?.onopen?.();
+        probes[0]?.deliver(WELCOME());
+        expect(client.status()).toBe('open');
+
+        // The outage: a backoff is pending, and nothing dials until it fires or something
+        // forces it.
+        probes[0]?.onclose?.({ code: 1006 });
+        expect(client.status()).toBe('reconnecting');
+
+        // The FIRST forced attempt dials; every later one in the same down period is
+        // refused, so the pending backoff survives intact.
+        client.forceReconnectOnce();
+        client.forceReconnectOnce();
+        client.forceReconnectOnce();
+
+        expect(probes).toHaveLength(2);
+        expect(client.status()).toBe('reconnecting');
+
+        // The plane comes back. The allowance re-arms on `open`, and a subscribe that
+        // arrives in the `connecting` window is still queued, not dialled.
+        probes[1]?.onopen?.();
+        probes[1]?.deliver(WELCOME());
+        expect(client.status()).toBe('open');
+
+        client.forceReconnectOnce();
+        expect(probes).toHaveLength(2);
+
+        // A second outage forces again — the limit is per outage, not per page.
+        probes[1]?.onclose?.({ code: 1006 });
+        client.forceReconnectOnce();
+        expect(probes).toHaveLength(3);
+
+        // `refresh` stays the unthrottled human path (the Retry affordance, and the app's
+        // own "the browser is reachable again" signal): every call dials.
+        probes[2]?.onclose?.({ code: 1006 });
+        client.refresh();
+        client.refresh();
+        expect(probes).toHaveLength(5);
+    });
 });

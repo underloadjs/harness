@@ -455,6 +455,218 @@ describe('session record tools', () => {
 });
 
 // ---------------------------------------------------------------------------
+// R6 / R7 — the two additions to the read surface, exercised through the PUBLIC tool
+// surface rather than the engine. A wrapper's schema is `additionalProperties: false`,
+// so a schema that forgot a new engine control would strand it silently: `records` must
+// accept `describe` and `where`, the four list-capable wrappers must accept `where`, and
+// the answers must be the engine's, not a wrapper invention.
+// ---------------------------------------------------------------------------
+describe('record tools read surface: describe, the bare name list, and where', () => {
+    it('T7.1: a wrapper list accepts where and counts the filtered set', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        const planned = (await writer.executeTool('chapters', {
+            action: 'add',
+            title: 'Arrival',
+            summary: 'They land.'
+        })) as { chapter: { id: string } };
+        await writer.executeTool('chapters', {
+            action: 'add',
+            title: 'Middle',
+            summary: 'The turn.',
+            status: 'draft'
+        });
+
+        // Only the draft survives the filter, and the FACETS move with it: `planned: 0`
+        // while a planned chapter really exists, which is R7's whole point.
+        expect(
+            await writer.executeTool('chapters', { action: 'list', where: { status: 'draft' } })
+        ).toEqual({
+            chapters: [
+                {
+                    id: '2',
+                    title: 'Middle',
+                    summary: 'The turn.',
+                    status: 'draft',
+                    rev: 1,
+                    updatedBy: 'writer',
+                    updatedAt: EPOCH_ISO
+                }
+            ],
+            counts: { total: 1, planned: 0, draft: 1, complete: 0 },
+            page: page()
+        });
+
+        // An unfiltered list keeps the whole-collection counts (stop-condition 5).
+        expect(await writer.executeTool('chapters', { action: 'list' })).toEqual({
+            chapters: [
+                {
+                    id: '1',
+                    title: 'Arrival',
+                    summary: 'They land.',
+                    status: 'planned',
+                    rev: 1,
+                    updatedBy: 'writer',
+                    updatedAt: EPOCH_ISO
+                },
+                {
+                    id: '2',
+                    title: 'Middle',
+                    summary: 'The turn.',
+                    status: 'draft',
+                    rev: 1,
+                    updatedBy: 'writer',
+                    updatedAt: EPOCH_ISO
+                }
+            ],
+            counts: { total: 2, planned: 1, draft: 1, complete: 0 },
+            page: page()
+        });
+
+        // `tasks` forwards it too, and a field the wrapper schema names is filterable
+        // through the wrapper as well as through `records`.
+        const seeded = (await writer.executeTool('tasks', {
+            tasks: [{ text: 'Open' }, { text: 'Closed' }, { text: 'Also open' }]
+        })) as { tasks: Array<{ id: string }> };
+
+        const closedId = seeded.tasks[1].id;
+
+        await writer.executeTool('tasks', {
+            tasks: [{ id: closedId, completed: true }],
+            expects: [{ id: closedId, rev: 1 }]
+        });
+
+        const openOnly = (await writer.executeTool('tasks', {
+            where: { completed: false },
+            limit: 1
+        })) as { tasks: Array<{ text: string }>; counts: Record<string, number>; page: Record<string, unknown> };
+
+        expect(openOnly.tasks.map((task) => task.text)).toEqual(['Open']);
+        // The filtered set is two records, and the facet complement is computed over it.
+        expect(openOnly.counts).toEqual({ total: 2, completed: 0, pending: 2 });
+        // `tasks` declares no sortable field, so an offset page there still carries only
+        // `nextOffset` (R2's rule is conditional on the collection).
+        expect(openOnly.page).toEqual({ offset: 0, limit: 1, hasMore: true, nextOffset: 1 });
+
+        // A field the collection does not declare is refused by the ENGINE, through the
+        // wrapper, naming the key and the fields that do exist.
+        await expect(
+            writer.executeTool('chapters', { action: 'list', where: { body: 'x' } })
+        ).rejects.toThrow(
+            'chapters "where" has no field "body"; filterable fields: title, summary, content, status, order.'
+        );
+    });
+
+    it('T2.1: an offset page of the sortable built-in carries nextAfterId as the maximum id on it', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        // `order` is chapters' sortable field, so the page order and the id order differ
+        // on the very first built-in collection.
+        const orders = [30, 10, 40, 20];
+
+        for (const order of orders) {
+            await writer.executeTool('chapters', {
+                action: 'add',
+                title: `C${order}`,
+                summary: 's',
+                order
+            });
+        }
+
+        // Page order by `order`: ids 2 (10), 4 (20), 1 (30), 3 (40). Cut at 3, the page
+        // ENDS at id 1 while the largest id on it is 4 — the cursor must be 4.
+        const first = (await writer.executeTool('chapters', { action: 'list', limit: 3 })) as {
+            chapters: Array<{ id: string }>;
+            page: { nextAfterId?: string; nextOffset?: number };
+        };
+
+        expect(first.chapters.map((chapter) => chapter.id)).toEqual(['2', '4', '1']);
+        expect(first.page).toEqual({ offset: 0, limit: 3, hasMore: true, nextOffset: 3, nextAfterId: '4' });
+
+        // Resuming keyset from that cursor repeats nothing the page already showed — but
+        // the one record the page had NOT reached (id 3, which sorts last yet carries a
+        // smaller id) is behind the cursor and is therefore skipped. That asymmetry is
+        // exactly why T2.2's reworded `afterId` text forbids mixing the two modes inside
+        // one walk and calls the per-mode walk the complete one: `nextAfterId` on an
+        // offset page is the only cursor that cannot REPEAT a record, not a promise that a
+        // mid-walk switch is lossless.
+        const resumed = (await writer.executeTool('records', {
+            collection: 'chapters',
+            afterId: first.page.nextAfterId as string,
+            limit: 3
+        })) as { entries: Array<{ id: string }>; page: Record<string, unknown> };
+
+        expect(resumed.entries).toEqual([]);
+        expect(resumed.page).toEqual({ offset: 4, limit: 3, hasMore: false, afterId: '4' });
+
+        // The complete walk in ONE mode, by offset, still sees all four in page order.
+        const complete: string[] = [];
+        let offset = 0;
+
+        for (let guard = 0; guard < 8; guard += 1) {
+            const step = (await writer.executeTool('chapters', {
+                action: 'list',
+                offset,
+                limit: 2
+            })) as { chapters: Array<{ id: string }>; page: { hasMore: boolean; nextOffset?: number } };
+
+            complete.push(...step.chapters.map((chapter) => chapter.id));
+
+            if (!step.page.hasMore) break;
+
+            offset = step.page.nextOffset as number;
+        }
+
+        expect(complete).toEqual(['2', '4', '1', '3']);
+    });
+
+    it('T6.1/T6.2: records reads a defined spec back, and a bare call lists the collections', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        await writer.executeTool('records', {
+            define: {
+                name: 'probeg1',
+                maxRecords: 7,
+                fields: [
+                    { key: 'title', type: 'text', required: true, maxLength: 42 },
+                    { key: 'body', type: 'text', maxLength: 500, getOnly: true },
+                    { key: 'rank', type: 'integer', sortable: true, max: 999 },
+                    { key: 'kind', type: 'enum', values: ['note', 'task'], count: true }
+                ]
+            }
+        });
+
+        expect(await writer.executeTool('records', { collection: 'probeg1', describe: true })).toEqual({
+            entries: [],
+            counts: { total: 0, note: 0, task: 0 },
+            page: page(),
+            storeRev: 0,
+            collection: 'probeg1',
+            definition: {
+                name: 'probeg1',
+                fields: [
+                    { key: 'title', type: 'text', required: true, maxLength: 42 },
+                    { key: 'body', type: 'text', maxLength: 500, getOnly: true },
+                    { key: 'rank', type: 'integer', sortable: true, max: 999 },
+                    { key: 'kind', type: 'enum', values: ['note', 'task'], count: true }
+                ],
+                maxRecords: 7,
+                responseBudgetBytes: 64 * 1024
+            }
+        });
+
+        // A bare call answers with the name list instead of the unknown-collection error.
+        expect(await writer.executeTool('records', {})).toEqual({
+            entries: [],
+            counts: { total: 5 },
+            page: page(),
+            storeRev: 0,
+            collections: ['chapters', 'locations', 'probeg1', 'profiles', 'tasks']
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
 // F12 / T7 — one notification per logical write, by construction.
 //
 // The retired design risked TWO `tool_execute` notifications for one model action: if a

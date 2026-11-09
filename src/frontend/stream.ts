@@ -138,6 +138,14 @@ export type HarnessStreamClient = {
     close(reason?: string): void;
     // Forces an immediate reconnect (the "Retry" affordance), keeping resume state.
     refresh(): void;
+    // T3b: the RATE-LIMITED form of `refresh`, for callers that react to live data rather
+    // than to a human pressing Retry. The board calls it when a thread watch is NEWLY
+    // added while the plane is down (R2: expanding must promptly re-establish), and that
+    // sync runs on every roster frame — an unthrottled force would cancel the pending
+    // backoff and dial again per frame, which is the reconnect storm this client exists to
+    // avoid (`client_messages_per_second: 32`, close 4429). One forced dial per down
+    // period; the allowance returns when the plane reports `open` again.
+    forceReconnectOnce(): void;
     // The last epoch and cursor this client APPLIED, for diagnostics and for a host
     // that persists them across reloads.
     resumeState(): { epoch: string | null; cursor: string | null };
@@ -205,6 +213,12 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
     let reconnectCancel: (() => void) | undefined;
     let heartbeatCancel: (() => void) | undefined;
 
+    // T3b: whether the CURRENT down period has already spent its forced dial (see
+    // `forceReconnectOnce`). `setStatus` clears the allowance when the plane reaches
+    // `open` (the outage is over) or `closed` (a deliberate full stop); nothing here
+    // replaces the backoff schedule itself.
+    let forcedWhileDown = false;
+
     // Resume state for the NEXT `hello`: the epoch this client last spoke to, and
     // the highest cursor it APPLIED on any subscription. A cursor from a previous
     // epoch is refused with `epoch_mismatch`, which is the honest answer rather
@@ -222,9 +236,26 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
     // frame of a fresh subscription cannot "gap".
     const expected = new Map<string, number | null>();
 
+    // Registrations the server has ACKNOWLEDGED with a `subscription_state` frame (T3).
+    // This is what tells a re-registration from an initial one: a `resync_required` that
+    // ANSWERS a subscribe never registered the id at all
+    // (../server/stream/broker.ts:742-762 returns before `session.subscriptions.set`), and
+    // an `unsubscribe` naming an id the server does not hold is a protocol error
+    // (`unknown_subscription`, broker.ts:810). T3b precision on the cost: that error frame
+    // alone does NOT close the socket — only three consecutive frames that fail the CLIENT
+    // UNION parse do, with 1007 (../server/stream/connection.ts:283) — so a stray goodbye
+    // is harmless noise, and this set is what keeps the client from sending one.
+    const registered = new Set<string>();
+
     const setStatus = (next: StreamStatus): void => {
         if (current === next) return;
         current = next;
+
+        // T3b: reaching `open` ends the down period, and reaching `closed` is a deliberate
+        // full stop (both clear the forced-dial allowance, so the next drop or a later
+        // expand after a close may force again — see `forcedWhileDown`).
+        if (next === 'open' || next === 'closed') forcedWhileDown = false;
+
         handlers.onStatus?.(next);
     };
 
@@ -262,13 +293,25 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
         if (spec.scope === 'global') {
             frame = { type: 'subscribe', subscription_id: sub.id, scope: 'global', pace: spec.pace ?? 'ordered' };
         } else if (spec.scope === 'thread' && spec.sessionId !== undefined && spec.threadId !== undefined) {
+            // T3: the thread scope carries its OWN cursor, exactly like `session` and
+            // `turn`. The broker accepts one for every scope (../server/stream/broker.ts:720
+            // `const cursor = request.cursor ?? session.resumeCursor`) and parks a replay
+            // window when a thread subscription ends (:348-369), so a re-subscribe after a
+            // drop resumes inside that window instead of restarting the subscription from
+            // the server's current position — which is what lets `observeThread` tell a
+            // RESUMED baseline (replayed frames: nothing to reconcile) from a FRESH one
+            // (the window expired: the pane must re-read). Filters are deliberately absent:
+            // the thread scope publishes no filterable field (../shared/harness-stream.ts
+            // `HARNESS_WS_SCOPE_FILTERS`, and ../server/stream/protocol.ts:111-116 refuses
+            // any other with `unsupported_filter`).
             frame = {
                 type: 'subscribe',
                 subscription_id: sub.id,
                 scope: 'thread',
                 session_id: spec.sessionId,
                 thread_id: spec.threadId,
-                pace: spec.pace ?? 'ordered'
+                pace: spec.pace ?? 'ordered',
+                ...(sub.cursor === null || sub.cursor === '' ? {} : { cursor: sub.cursor })
             };
         } else if (spec.scope === 'turn' && spec.sessionId !== undefined && spec.turnId !== undefined) {
             frame = {
@@ -324,11 +367,26 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
         const timeoutMs = limits.heartbeatIntervalMs * limits.heartbeatTimeoutIntervals;
 
         heartbeatCancel = schedule(() => {
-            if (current !== 'open') return;
+            if (current === 'open') {
+                // Silent peer: close from THIS side with the contract's own code and let
+                // the reconnect path resume from the last cursor.
+                socket?.close(HEARTBEAT_LOSS_CODE, 'heartbeat timeout');
 
-            // Silent peer: close from THIS side with the contract's own code and let
-            // the reconnect path resume from the last cursor.
-            socket?.close(HEARTBEAT_LOSS_CODE, 'heartbeat timeout');
+                return;
+            }
+
+            // THE STUCK DIAL (T3). This watchdog used to no-op unless the state was
+            // `open`, while `open()` arms it BEFORE the upgrade completes — so a socket
+            // that is `connecting` forever (a proxy that holds the handshake, a server
+            // that accepts TCP and dies before the 101, a half-open resume) could never
+            // recover: nothing closes it, `open()` refuses to re-dial while connecting,
+            // and a pane that subscribes in that state now queues instead of dialing
+            // (see `subscribe` below). The deadline is the only clock this client has for
+            // "the attempt itself is dead", so it ends the attempt and re-dials with
+            // backoff instead of pretending the plane is alive.
+            if (current === 'connecting' || current === 'reconnecting') {
+                dropConnection(HEARTBEAT_LOSS_CODE, 'connect timeout');
+            }
         }, timeoutMs);
     };
 
@@ -345,6 +403,101 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
             reconnectCancel = undefined;
             open();
         }, backoff + jitter);
+    };
+
+    // The contract's recovery frame, minted CLIENT-SIDE for the one loss the server
+    // cannot report by itself: the connection carrying this subscription just ended.
+    // `reason: 'frames_dropped'` is the only value of that closed union
+    // (../shared/harness-stream.ts `WsResyncRequired`) that says "everything after your
+    // last cursor is missing", which is exactly what a drop means.
+    const droppedFrameFor = (sub: StreamSubscription): WsResyncRequired => ({
+        type: 'resync_required',
+        subscription_id: sub.id,
+        reason: 'frames_dropped',
+        epoch: epoch ?? '',
+        // The resume position THIS subscription holds; with none, the server starts it
+        // fresh at its own current position, which is the honest answer after an outage.
+        cursor: sub.cursor ?? '',
+        resources: []
+    });
+
+    // The whole drop path, in ONE place (T3). It used to be the body of `onclose`, which
+    // meant the ONLY thing that could reach a pane was an inbound frame — and a dropped
+    // socket sends none. Every live subscription is now told to reconcile, the sequence
+    // bookkeeping restarts for the fresh `subscription_state` baseline, and the reconnect
+    // loop resumes with backoff.
+    const handleDrop = (): void => {
+        clearHeartbeatWatch();
+        socket = undefined;
+
+        if (manualClose) {
+            setStatus('closed');
+
+            return;
+        }
+
+        // The bookkeeping starts over so a fresh baseline is not compared against the
+        // old sequence space (the next connection restarts its counters at 0), and no
+        // registration is considered acknowledged any more: the server dropped all of
+        // them with the connection.
+        for (const id of expected.keys()) expected.set(id, null);
+        registered.clear();
+
+        // A snapshot of the registrations: a pane's `onResync` may unsubscribe or
+        // subscribe from inside this callback, and mutating `subs` mid-iteration would
+        // otherwise decide which panes hear about the drop.
+        for (const sub of [...subs.values()]) sub.spec.onResync?.(droppedFrameFor(sub));
+
+        setStatus('reconnecting');
+        scheduleReconnect();
+    };
+
+    // Ends the connection from THIS side (a heartbeat loss, a stuck dial) and runs the
+    // drop path exactly once: the socket is detached BEFORE `close`, so the transport's
+    // own `onclose` is refused by the `socket !== created` guards and cannot double-run
+    // the reconnect or re-notify the panes.
+    const dropConnection = (code: number, reason: string): void => {
+        const dead = socket;
+
+        socket = undefined;
+
+        if (dead !== undefined) {
+            try {
+                dead.close(code, reason);
+            } catch {
+                // A socket that throws on close is by definition gone; the state below is
+                // what the caller observes either way.
+            }
+        }
+
+        handleDrop();
+    };
+
+    // Re-opens ONE registration from scratch (T3). Every recovery path (a client-detected
+    // sequence gap, a server `resync_required`, a drop) ends the same way: the id is
+    // released on the server when it is held there, the cursor is dropped when the caller
+    // says the position is dead, and the subscription is dialled again so its
+    // `subscription_state` baseline re-anchors the pane. `keepCursor` is the difference
+    // between "resume inside the replay window" (a gap: the frames after the last applied
+    // one are still retained) and "start at the server's current position" (a refused
+    // cursor: retaining it would just be refused again).
+    const reregister = (sub: StreamSubscription, keepCursor: boolean): void => {
+        expected.set(sub.id, null);
+
+        if (!keepCursor) sub.cursor = null;
+
+        // T3b: the goodbye is sent only when THIS client believes the server holds the
+        // id. An `unsubscribe` naming an id the server does not hold is answered with a
+        // single `unknown_subscription` error frame and no close
+        // (../server/stream/broker.ts:810-813) — harmless, but pointless traffic on a
+        // socket that is recovering, and the client's only knowledge of what the server
+        // holds is this set (`registered`, which `handleDrop` clears on every drop).
+        if (registered.has(sub.id)) {
+            registered.delete(sub.id);
+            send({ type: 'unsubscribe', subscription_id: sub.id });
+        }
+
+        sendSubscribe(sub);
     };
 
     const handleFrame = (raw: unknown): void => {
@@ -377,6 +530,8 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
 
             sub.cursor = raw.cursor;
             expected.set(raw.subscription_id, raw.sequence + 1);
+            // The server holds this registration from here on (see `registered` above).
+            registered.add(raw.subscription_id);
             sub.spec.onState?.(raw);
 
             return;
@@ -418,6 +573,18 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
             sub.cursor = raw.cursor;
             sub.spec.onResync?.(raw);
 
+            // THE RE-REGISTRATION (T3). The server answers a SUBSCRIBE with this frame
+            // when the cursor is dead (`cursor_expired`) or names another epoch, and in
+            // that branch it never registers the subscription at all
+            // (../server/stream/broker.ts:742-762 returns BEFORE `session.subscriptions
+            // .set`). The pane re-reads the resources the frame names — and then, without
+            // this, receives NOTHING EVER AGAIN, because the client still believes it is
+            // subscribed. A fresh registration (no cursor) is the contract's answer: the
+            // server starts that subscription at its own current position. A mid-life
+            // `frames_dropped` resync (an ack timeout, ../server/stream/broker.ts:427)
+            // DOES hold the id, so `reregister` releases it first.
+            reregister(sub, false);
+
             return;
         }
 
@@ -439,21 +606,8 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
     // `resync_required` with the resource links to re-read, so a gap converges to
     // REST reads and never to a history snapshot.
     const recover = (sub: StreamSubscription): void => {
-        expected.set(sub.id, null);
-
-        const synthetic: WsResyncRequired = {
-            type: 'resync_required',
-            subscription_id: sub.id,
-            reason: 'frames_dropped',
-            epoch: epoch ?? '',
-            cursor: sub.cursor ?? '',
-            resources: []
-        };
-
-        sub.spec.onResync?.(synthetic);
-
-        send({ type: 'unsubscribe', subscription_id: sub.id });
-        sendSubscribe(sub);
+        sub.spec.onResync?.(droppedFrameFor(sub));
+        reregister(sub, true);
     };
 
     const open = (): void => {
@@ -528,22 +682,28 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
         created.onclose = () => {
             if (socket !== created) return;
 
-            clearHeartbeatWatch();
-            socket = undefined;
-
-            if (manualClose) {
-                setStatus('closed');
-
-                return;
-            }
-
-            // Every subscription must be re-registered after a reconnect, and the
-            // bookkeeping starts over so the fresh `subscription_state` baseline is
-            // not compared against the old sequence space.
-            for (const id of expected.keys()) expected.set(id, null);
-            setStatus('reconnecting');
-            scheduleReconnect();
+            // THE DROP PATH, in one place (see `handleDrop`): notify every subscription,
+            // reset the sequence bookkeeping, and re-dial with backoff. A pane that used
+            // to keep its pre-drop document forever is now told to reconcile.
+            handleDrop();
         };
+    };
+
+    // The shared body of `refresh` and `forceReconnectOnce` (T3b): release the heartbeat
+    // watchdog, cancel any pending backoff, drop the socket with the resume state (epoch +
+    // cursor) intact so the next connection replays inside the retention window, and dial
+    // immediately.
+    const reconnectNow = (): void => {
+        clearHeartbeatWatch();
+
+        if (reconnectCancel !== undefined) {
+            reconnectCancel();
+            reconnectCancel = undefined;
+        }
+
+        if (socket !== undefined) socket.close(1011, 'client refresh');
+
+        open();
     };
 
     return {
@@ -567,7 +727,21 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
 
                     subs.delete(id);
                     expected.delete(id);
-                    send({ type: 'unsubscribe', subscription_id: id });
+
+                    // T3b: the goodbye goes only when the server actually holds this id,
+                    // mirroring `reregister` above. Two corrections to the previous
+                    // comment, which claimed this "stops the server queueing frames for
+                    // the pane even mid-drop":
+                    //   - mid-drop, `send` is a no-op on a non-open socket, so nothing
+                    //     reached the server anyway; on a drop this client discards the
+                    //     whole registration set (`handleDrop` clears `registered`) and
+                    //     re-registers from `subs` on the next `welcome`, and the SERVER
+                    //     drops every registration with the socket at itself
+                    //     (../server/stream/connection.ts:356).
+                    //   - an id the server never held (or no longer holds) would buy one
+                    //     `unknown_subscription` error frame per farewell
+                    //     (../server/stream/broker.ts:810-813) — tolerated, but pointless.
+                    if (registered.delete(id)) send({ type: 'unsubscribe', subscription_id: id });
                 }
             };
 
@@ -577,7 +751,18 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
             // Queued while not open: `onopen` flushes every subscription, so a pane
             // that mounted during a reconnect still gets its frames.
             if (current === 'open') sendSubscribe(sub);
-            else open();
+            else if (current === 'connecting' || current === 'reconnecting') {
+                // T3: a subscribe during an outage used to call `open()`, whose only
+                // guard is `connecting`/`open` — so in `reconnecting` it DIALED IMMEDI-
+                // ATELY, in front of the backoff timer that is already pending, and each
+                // pane that mounted (or re-expanded) during the outage started another
+                // connection attempt. That is the reconnect storm this client's own
+                // comment says it exists to avoid, and the burst the server prices at 32
+                // messages/second (`connection.ts:305`, close 4429). The registration is
+                // queued instead; `scheduleReconnect` is a no-op while the timer is
+                // pending and is the safety net when it is not.
+                scheduleReconnect();
+            } else open();
 
             return sub;
         },
@@ -603,24 +788,28 @@ export const createHarnessStream = (options: StreamClientOptions = {}): HarnessS
             socket = undefined;
             subs.clear();
             expected.clear();
+            registered.clear();
             setStatus('closed');
         },
 
-        refresh: () => {
-            clearHeartbeatWatch();
+        refresh: () => reconnectNow(),
 
-            if (reconnectCancel !== undefined) {
-                reconnectCancel();
-                reconnectCancel = undefined;
+        // T3b: the rate-limited form, for patch-driven callers (the board's follow sync
+        // runs on every `thread.upsert`). One forced dial per down period: the first
+        // expand while the plane is down re-dials immediately, later ones leave the
+        // backoff clock alone. `open` means there is nothing to force, and re-arms the
+        // allowance for the next drop.
+        forceReconnectOnce: () => {
+            if (current === 'open') {
+                forcedWhileDown = false;
+
+                return;
             }
 
-            if (socket !== undefined) {
-                // Keep resume state (epoch + cursor) so the reconnect replays inside
-                // the retention window instead of restarting the conversation.
-                socket.close(1011, 'client refresh');
-            }
+            if (forcedWhileDown) return;
 
-            open();
+            forcedWhileDown = true;
+            reconnectNow();
         },
 
         resumeState: () => ({ epoch, cursor }),

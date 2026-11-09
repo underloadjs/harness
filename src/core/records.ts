@@ -202,6 +202,13 @@ export const RECORD_ERROR_CODES = {
     collectionNotEmpty: 'collection-not-empty',
     // `drop` of a built-in collection, which is permanent by declaration.
     collectionPermanent: 'collection-permanent',
+    // R3/T3.2 — the caller's `since` predates the CURRENT change log of a collection
+    // that was dropped and re-`define`d under it. Distinct from `invalid-input` on
+    // purpose: the number the client sent was correct when it saved it, so the only
+    // honest answer is "the epoch moved — resync from scratch", not "you sent a bad
+    // number". Codes are enumerated from this object everywhere (`isRecordRejection`
+    // reads `Object.values`), so adding a key here is the whole registration.
+    revisionEpochReset: 'revision-epoch-reset',
     // A `define`d field spec that does not hold together (bad type, empty list,
     // duplicate or reserved key, cap out of range).
     definitionInvalid: 'definition-invalid',
@@ -329,11 +336,13 @@ const copyChange = (change: RecordChange): RecordChange => ({
     ...(change.itemRev === undefined ? {} : { itemRev: change.itemRev })
 });
 
-// Counts are always derived from the WHOLE collection, never from the page (F9): a
-// caller listing page 2 must still see how many records exist in total. The facets
-// come from the definition, which is the only way a generic engine can produce
-// `{ total, completed, pending }` for tasks and `{ total, planned, draft, complete }`
-// for chapters without inventing either.
+// Counts are always derived from the WHOLE selection, never from the page (F9): a
+// caller listing page 2 must still see how many records exist in total. The selection
+// is the whole collection for an unfiltered read, and the matching set for a read that
+// sent `where` (R7/T7.1 — see the note in `project`, which is the only caller that can
+// narrow it). The facets come from the definition, which is the only way a generic
+// engine can produce `{ total, completed, pending }` for tasks and `{ total, planned,
+// draft, complete }` for chapters without inventing either.
 const countsOf = (
     definition: RecordCollectionDefinition,
     items: readonly RecordEntry[]
@@ -364,6 +373,32 @@ const countsOf = (
 
     return counts;
 };
+
+// R6/T6.1 — a detached copy of a stored definition, for `describe`. The engine hands
+// results out by copy everywhere else (a caller must not be able to widen a cap or push
+// into `values` through an answer it was given), and the definition object is shared by
+// every collection built from a spec, so this is the same rule rather than a new one.
+// Key order follows the declared field order, i.e. the order a page emits fields in.
+const cloneDefinition = (
+    definition: RecordCollectionDefinition
+): RecordCollectionDefinition => ({
+    name: definition.name,
+    fields: definition.fields.map((field) => ({
+        ...field,
+        ...(field.values === undefined ? {} : { values: [...field.values] }),
+        ...(Array.isArray(field.default)
+            ? { default: [...(field.default as unknown[])] }
+            : {}),
+        ...(field.count !== undefined && field.count !== true
+            ? { count: { ...field.count } }
+            : {})
+    })),
+    maxRecords: definition.maxRecords,
+    responseBudgetBytes: definition.responseBudgetBytes,
+    // The wrapper half is part of the definition, and it is the answer to "which tool
+    // serves this collection", so it rides verbatim when the collection has one.
+    ...(definition.wrapper === undefined ? {} : { wrapper: { ...definition.wrapper } })
+});
 
 // ---------------------------------------------------------------------------
 // Argument readers (engine-wide — the wrappers no longer own copies of these)
@@ -455,6 +490,120 @@ const readMergeDisjoint = (label: string, value: unknown): boolean => {
     }
 
     return value;
+};
+
+// R6/T6.1 — the introspection flag. Same shape rule as `drop`: a boolean, and only
+// `true` means anything. A non-boolean is a caller error, not something to coerce.
+const readDescribe = (label: string, value: unknown): boolean => {
+    if (value === undefined) return false;
+
+    if (typeof value !== 'boolean') {
+        throw recordError(
+            RECORD_ERROR_CODES.invalidInput,
+            `${label} "describe" must be a boolean when provided.`
+        );
+    }
+
+    return value;
+};
+
+// R7/T7.1 — the equality filter, validated against the collection's DECLARED fields.
+// A `define`d collection's field set is invisible to the JSON Schema, so an unknown key
+// here would otherwise read as "nothing matches": Decision C's stance for parameter
+// values is that a typo must be a refusal naming the typo, never an empty page.
+//
+// The value must match the field's declared type — and, unlike a WRITE, an enum value
+// only has to be one the field declares (there is nothing to store) while a text value
+// is trimmed to meet the stored form. A `strings` field is refused outright: an entry
+// cannot name an array term in a `Record<string, string | number | boolean>`.
+const readWhere = (
+    label: string,
+    definition: RecordCollectionDefinition,
+    value: unknown
+): Record<string, unknown> | undefined => {
+    if (value === undefined) return undefined;
+
+    if (!isRecord(value)) {
+        throw recordError(
+            RECORD_ERROR_CODES.invalidInput,
+            `${label} "where" must be an object of { field: value } equality terms when provided.`
+        );
+    }
+
+    const declared = definition.fields.map((field) => field.key);
+    const where: Record<string, unknown> = {};
+
+    for (const key of Object.keys(value)) {
+        const field = definition.fields.find((candidate) => candidate.key === key);
+
+        if (field === undefined) {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where" has no field "${key}"; filterable fields: ${declared.join(', ')}.`
+            );
+        }
+
+        const term = value[key];
+        const sent = JSON.stringify(term);
+
+        if (field.type === 'strings') {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where" cannot filter the strings field "${key}"; an equality term is a text, integer, enum or boolean value.`
+            );
+        }
+
+        if (field.type === 'boolean' && typeof term !== 'boolean') {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where.${key}" must be a boolean to filter a boolean field; got ${sent}.`
+            );
+        }
+
+        if (field.type === 'integer' && !Number.isSafeInteger(term)) {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where.${key}" must be an integer to filter an integer field; got ${sent}.`
+            );
+        }
+
+        if (field.type === 'text' && typeof term !== 'string') {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where.${key}" must be a string to filter a text field; got ${sent}.`
+            );
+        }
+
+        if (field.type === 'enum') {
+            const allowed = field.values ?? [];
+
+            if (typeof term !== 'string' || !allowed.includes(term)) {
+                throw recordError(
+                    RECORD_ERROR_CODES.invalidInput,
+                    `${label} "where.${key}" must be one of: ${allowed.join(', ')}; got ${sent}.`
+                );
+            }
+        }
+
+        // A stored text is trimmed on the way IN, so the term is trimmed to meet it —
+        // otherwise `where: { text: "done " }` would find nothing for a record stored as
+        // "done".
+        where[key] = field.type === 'text' ? (term as string).trim() : term;
+    }
+
+    return where;
+};
+
+// One record against the validated filter map: exact equality on every key (AND). The
+// values are already in stored form (trimmed text), so a plain `===` is the whole rule;
+// a record that has no value for a filtered field never matches it, which is the
+// honest answer for an optional field the writer left out.
+const matchesWhere = (entry: RecordEntry, where: Record<string, unknown>): boolean => {
+    for (const key of Object.keys(where)) {
+        if (entry[key] !== where[key]) return false;
+    }
+
+    return true;
 };
 
 // One trimmed, non-empty id. A missing, non-string, or blank id is reported BEFORE
@@ -1072,6 +1221,19 @@ const stalePayloadOf = (
     };
 };
 
+// R4 — what the caller could ACTUALLY do about the conflict. `staleRecordError` used to
+// append `or pass "mergeDisjoint": true` unconditionally, which twice sent a live agent
+// after a knob that cannot help: a REMOVAL is never merged (the tool schemas say so),
+// and a patch that already sent the flag has already used it. The one call site below
+// knows both facts, so it passes them here; the sentence is then composed from them.
+type StaleAdvice = {
+    // The field patch this call sends for the record, or ABSENT when the call removes
+    // it (a removal has no patch, and `mergeDisjoint` never merges one).
+    patch?: FieldPatch;
+    // True when the call already passed `mergeDisjoint: true`.
+    mergeDisjoint: boolean;
+};
+
 // The one message every rejected CAS write shows. Sentence shape preserved from the
 // old task store (current rev, last editor, the fields the log can attribute) with
 // two additions: `updatedAt` beside the editor, and the CURRENT RECORD appended as
@@ -1083,7 +1245,8 @@ const staleRecordError = (
     definition: RecordCollectionDefinition,
     entry: RecordEntry,
     expected: number,
-    changes: readonly RecordChange[]
+    changes: readonly RecordChange[],
+    advice: StaleAdvice
 ): HarnessError => {
     const fields = changedFieldsSince(definition, changes, entry.id, expected);
     const hint = fields === undefined || fields.length === 0 ? '' : `; changed fields: ${fields.join(', ')}`;
@@ -1093,12 +1256,46 @@ const staleRecordError = (
             ? ''
             : ` (projection: ${'note' in payload && payload.note !== undefined ? `${payload.note} omitted` : 'large fields omitted'})`;
 
+    // The clashing fields, in canonical declaration order — the same intersection the
+    // provable-merge refusal composes above (`cannot merge "<field>" because this patch
+    // sets it too`), computed from what the log CAN attribute. `fields === undefined`
+    // means the window shows no update for this record at all, so nothing clashes and
+    // nothing more is claimed.
+    //
+    // The patch is copied into a const first: a property access is not narrowed inside a
+    // closure (the same trap `project` documents for `since`), and the filter below reads
+    // it from inside one.
+    const patched = advice.patch;
+    const clash =
+        patched === undefined || fields === undefined
+            ? []
+            : definition.fields
+                  .map((field) => field.key)
+                  .filter((key) => patched[key] !== undefined && fields.includes(key));
+
+    const token = `retry with "expects" [{ id: "${entry.id}", rev: ${entry.rev} }]`;
+    const adviceText =
+        // A removal: the flag is not an option this caller has, so it is not mentioned.
+        advice.patch === undefined
+            ? `${token}.`
+            : advice.mergeDisjoint
+                ? // The flag is already set, so re-recommending it is noise. When the
+                  // window still names a field this patch also sets, say which one;
+                  // when it cannot (its coverage of this record has aged out), the
+                  // honest sentence is that the flag is spent — no invented advice.
+                    clash.length === 0
+                        ? `${token}; "mergeDisjoint" is already set, and the change window no longer covers every revision since ${expected}, so it cannot prove this patch disjoint.`
+                        : `${token}; "mergeDisjoint" is already set and cannot merge ${clash
+                              .map((field) => `"${field}"`)
+                              .join(' and ')} because this patch sets it too.`
+                : `${token} or pass "mergeDisjoint": true.`;
+
     return recordError(
         RECORD_ERROR_CODES.staleRecord,
         `${label} "${entry.id}" changed since revision ${expected} ` +
             `(now ${entry.rev}, last edited by "${entry.updatedBy ?? 'unknown'}"` +
             `${entry.updatedAt === undefined ? '' : ` at ${entry.updatedAt}`})${hint}; ` +
-            `retry with "expects" [{ id: "${entry.id}", rev: ${entry.rev} }] or pass "mergeDisjoint": true. ` +
+            `${adviceText} ` +
             `current: ${payload.json}${projection}`,
         {
             id: entry.id,
@@ -1107,6 +1304,9 @@ const staleRecordError = (
             updatedBy: entry.updatedBy ?? 'unknown',
             ...(entry.updatedAt === undefined ? {} : { updatedAt: entry.updatedAt }),
             ...(fields === undefined ? {} : { changedFields: fields }),
+            // R4: the machine-readable twin of the clash sentence, mirroring the
+            // provable-merge refusal's `details.clash`. Only for a patch that opted in.
+            ...(advice.mergeDisjoint && clash.length > 0 ? { clash } : {}),
             projected: payload.projected,
             entry: copyEntry(definition, entry, payload.projected === false)
         }
@@ -1203,8 +1403,31 @@ type StoreView = {
     find: (id: string) => RecordEntry | undefined;
     length: () => number;
     changes: () => readonly RecordChange[];
+    // R5/T5.1 — which OTHER collection holds this id, if any. The id counter is global
+    // (F3, Decision F3), so an id lives in at most one collection and the answer is
+    // unambiguous. The view itself stays per-collection — `find` must keep meaning
+    // "in THIS collection", which is exactly what the first draft of this finding got
+    // wrong — and this is the one cross-collection question the pre-check may ask to
+    // phrase its answer truthfully. Optional so a caller that cannot see the rest of
+    // the store degrades to the "absent everywhere" wording rather than lying.
+    ownerOf?: (id: string) => string | undefined;
     by?: string;
     threadId?: string;
+};
+
+// R5/T5.2/T5.3 — the newest `remove` event the window still holds for an id. The
+// phrase "was removed" is only allowed when this returns a revision: the log is the
+// engine's own evidence, and an absent entry means either "this collection never had
+// the id" or "the removal aged out of the FIFO window" — neither of which may be
+// reported as a removal the caller missed.
+const removalRevOf = (changes: readonly RecordChange[], id: string): number | undefined => {
+    let rev: number | undefined;
+
+    for (const change of changes) {
+        if (change.id === id && change.op === 'remove') rev = change.rev;
+    }
+
+    return rev;
 };
 
 // Registers one id against the list that named it and rejects a duplicate or a
@@ -1438,16 +1661,54 @@ const readPlan = (
 
     // STEP 3 — removed-since. Every token is compared against the live store BEFORE
     // any id is looked up for the caller's own sake.
+    //
+    // R5 — this used to answer the SAME sentence for every miss, and the sentence was
+    // wrong twice over: it claimed "was removed" for an id this collection never held
+    // (id "4" belonged to `profiles` all along, live at rev 4), and it claimed "the id
+    // is free again", which is never true inside a session because the id counter only
+    // moves forward. The three facts are now told apart: live elsewhere, removed from
+    // here with the log as evidence, and simply not here.
     for (const [id, rev] of expects) {
-        if (store.find(id) === undefined) {
-            // R9 on the axis where there IS no current entry: the record is gone, and
-            // that is the fact the caller needs beside its expected rev.
+        if (store.find(id) !== undefined) continue;
+
+        const owner = store.ownerOf === undefined ? undefined : store.ownerOf(id);
+
+        if (owner !== undefined) {
+            // Live in another collection: the caller named the wrong door, and there is
+            // nothing removed about it.
             throw recordError(
                 RECORD_ERROR_CODES.staleRecord,
-                `${label} "${id}" was removed since revision ${rev}; the id is free again — re-read the list and add or retry.`,
+                `${label} id "${id}" belongs to "${owner}" — re-read that collection.`,
+                {
+                    id,
+                    expectedRev: rev,
+                    currentRev: 0,
+                    updatedBy: 'unknown',
+                    collection: owner
+                }
+            );
+        }
+
+        if (removalRevOf(store.changes(), id) !== undefined) {
+            // The one case allowed to say "was removed". The "the id is free again"
+            // clause is gone (T5.2): ids are never re-claimed, and the sentence invited
+            // the caller to try.
+            throw recordError(
+                RECORD_ERROR_CODES.staleRecord,
+                `${label} "${id}" was removed since revision ${rev} — re-read the list and add or retry.`,
                 { id, expectedRev: rev, currentRev: 0, updatedBy: 'unknown', removed: true }
             );
         }
+
+        // Absent here with nothing in the log: never in this collection, or a removal
+        // the 200-event window has already dropped. Both are stated, neither claims a
+        // removal, and `removed` stays out of the details (T5.3).
+        throw recordError(
+            RECORD_ERROR_CODES.staleRecord,
+            `${label} has no ${recordLabel(definition)} with id "${id}" and this collection's change log holds no removal for it — ` +
+                `it was never in "${definition.name}", or its removal aged out of the ${RECORD_MAX_CHANGES}-event window. Re-read the list.`,
+            { id, expectedRev: rev, currentRev: 0, updatedBy: 'unknown' }
+        );
     }
 
     // STEP 4 — existence, reported in the order the lists named it.
@@ -1541,7 +1802,20 @@ const readPlan = (
             }
         }
 
-        throw staleRecordError(label, definition, entry, expected, store.changes());
+        // R4: the advice must match the operation the caller actually sent, and whether
+        // it has already used its one escape hatch. Reachability, from the branch above:
+        //   - a REMOVAL never has a patch, so the flag is unreachable for it by contract
+        //     ("Never merges a removal") and must not be recommended;
+        //   - a stale patch WITH the flag and provable coverage never reaches this line:
+        //     it either applies (disjoint) or is refused by the merge-clash message above
+        //     naming the field;
+        //   - a stale patch WITH the flag reaching this line therefore means the window
+        //     can no longer prove coverage, which is exactly the case the caller needs
+        //     told — the flag is spent, not recommended.
+        throw staleRecordError(label, definition, entry, expected, store.changes(), {
+            ...(patch === undefined ? {} : { patch: patch.patch }),
+            mergeDisjoint
+        });
     }
 
     // CAPACITY, checked after field validation and before any id is consumed: an
@@ -2001,15 +2275,56 @@ export const createRecordEngine = (): RecordEngine => {
     // and every id referring to it are gone too.
     let nextId = 1;
 
-    const freshState = (definition: RecordCollectionDefinition): CollectionState => ({
+    // R3/T3.1 — the per-NAME storeRev high-water mark, and the epoch floor that goes
+    // with a re-`define`.
+    //
+    // The defect: `drop` deleted the collection outright and a re-`define` built it
+    // with `freshState`, i.e. storeRev 0 and an empty change log. Every client holding
+    // a watermark from the dropped epoch then hit `since > storeRev` and was told its
+    // own saved revision was a caller error — a token that could never be accepted
+    // again, with no code that says "the epoch moved, resync".
+    //
+    // The fix is RUNTIME state, held beside `collections` and deliberately NOT part of
+    // the snapshot: `readRecordsStoreState` validates the persisted root with an exact
+    // key set (`nextId`, `collections`) and each collection with an exact key set
+    // (`definition`, `items`, `storeRev`, `changes`), so a new persisted key would
+    // break every restore, and persistence itself is out of R3's scope. `restore()`
+    // therefore SEEDS this map from each restored collection's storeRev, which covers
+    // the restart path that keeps the same name.
+    //
+    // Residual gap, stated rather than hidden: drop → process restart → re-`define`
+    // loses the mark, because nothing persisted ever held it and the dropped name is
+    // absent from the snapshot. That restart already loses the client's change log too.
+    const storeRevHighWater = new Map<string, number>();
+
+    // The lowest `since` the CURRENT epoch of a name accepts. Absent means "this name
+    // has never been re-defined", i.e. every since >= 0 is meaningful and today's
+    // behaviour is unchanged. Never persisted, for the same reason as the map above.
+    const epochFloors = new Map<string, number>();
+
+    // Records that a name has been seen at least this high. Monotonic by construction:
+    // a registration, a drop and a restore all flow through here and none may lower it.
+    const seedHighWater = (name: string, storeRev: number): void => {
+        const prior = storeRevHighWater.get(name);
+
+        storeRevHighWater.set(name, prior === undefined || storeRev > prior ? storeRev : prior);
+    };
+
+    const freshState = (
+        definition: RecordCollectionDefinition,
+        // R3: a re-`define` of a dropped name inherits the epoch, so its starting
+        // revision is passed in; a first-time name (and every built-in) starts at 0.
+        storeRev: number = 0
+    ): CollectionState => ({
         definition,
         items: [],
-        storeRev: 0,
+        storeRev,
         changes: []
     });
 
     for (const definition of BUILTIN_RECORD_COLLECTIONS) {
         collections.set(definition.name, freshState(definition));
+        seedHighWater(definition.name, 0);
     }
 
     // The names the engine currently accepts — the set `records` validates a
@@ -2073,13 +2388,36 @@ export const createRecordEngine = (): RecordEngine => {
     // result shape a property of the code rather than of discipline.
     const project = (
         state: CollectionState,
-        request: { offset: number; limit: number; afterId?: string; since?: number }
+        request: {
+            offset: number;
+            limit: number;
+            afterId?: string;
+            since?: number;
+            // R7/T7.1 — the validated equality filter. ABSENT means "no filter", and
+            // every path below then reads the live `state.items` exactly as it always
+            // did, which is what makes an unfiltered page byte-identical (stop-condition
+            // 5). `readWhere` has already normalized it, so `project` never re-validates.
+            where?: Record<string, unknown>;
+        }
     ): RecordsResult => {
         const definition = state.definition;
+        // The collection's sort key, when it declares one. `orderedFor` uses the first
+        // `sortable` field; R2's cursor rule below asks the same question, so the two
+        // stay in agreement about what "a sortable collection" means.
+        const sortable = definition.fields.find((field) => field.sortable === true);
         const keyset = request.afterId !== undefined;
+        // R7/T7.1 — the filter is applied to the ITEM SET, before the order is chosen and
+        // before the slice is cut, so `offset`, `limit`, `hasMore`, `nextOffset` and
+        // `nextAfterId` all describe the matching records (the doc's check: a filtered
+        // page must report `hasMore` against the filtered set). Filtering after the slice
+        // would return short pages that claim there is no more.
+        const selected: readonly RecordEntry[] =
+            request.where === undefined
+                ? state.items
+                : state.items.filter((item) => matchesWhere(item, request.where as Record<string, unknown>));
         const ordered: readonly RecordEntry[] = keyset
-            ? [...state.items].sort((left, right) => Number(left.id) - Number(right.id))
-            : orderedFor(definition, state.items);
+            ? [...selected].sort((left, right) => Number(left.id) - Number(right.id))
+            : orderedFor(definition, selected);
         const start = keyset
             ? firstIndexAfter(ordered, Number(request.afterId))
             : request.offset;
@@ -2111,12 +2449,56 @@ export const createRecordEngine = (): RecordEngine => {
 
         if (page.hasMore) {
             if (keyset) page.nextAfterId = entries[entries.length - 1].id;
-            else page.nextOffset = consumed;
+            else {
+                page.nextOffset = consumed;
+
+                // R2/T2.1 — the seam between the two page orders. An OFFSET page on a
+                // collection that declares a `sortable` field is in PAGE order, while
+                // every `afterId` cursor walks ID order, and those two orders differ on
+                // exactly such a collection (the decision recorded above
+                // `firstIndexAfter`). Emitting only `nextOffset` left a caller that
+                // switches modes to invent a cursor from the last id it SAW, which on a
+                // sortable page is not the largest id on it — so the switch silently
+                // skipped every record that sorted into this page while carrying a
+                // smaller id (the doc's {82,84} → 85 walk that lost 81 and 83). Handing
+                // back the MAXIMUM id of the page makes the switch lossless.
+                //
+                // Deliberately narrow, so nothing else moves:
+                //   - a keyset page already reports the maximum id of its own page,
+                //     because `ordered` is id-sorted in that mode;
+                //   - an offset page on a NON-sortable collection is already in id
+                //     order, so its last element IS the maximum and `nextOffset` alone
+                //     stays sufficient;
+                //   - `hasMore` implies a non-empty page in offset mode (`limit` >= 1 and
+                //     the first record always fits the budget), hence the length guard is
+                //     belt-and-braces for a hand-built request.
+                if (sortable !== undefined && entries.length > 0) {
+                    // MAX numeric id, NOT the last element — pinned by a limit-3 test on
+                    // the doc's fixture, where the page ends at the prio-5 record while
+                    // the prio-3 record carries the larger id.
+                    let maxId = Number(entries[0].id);
+
+                    for (const entry of entries) {
+                        const id = Number(entry.id);
+
+                        if (id > maxId) maxId = id;
+                    }
+
+                    page.nextAfterId = String(maxId);
+                }
+            }
         }
 
         const result: RecordsResult = {
             entries,
-            counts: countsOf(definition, state.items),
+            // R7/T7.1 — the counts rule, stated exactly because it is what a caller
+            // reconciles the page against: an UNFILTERED read still counts the WHOLE
+            // collection (`selected` IS `state.items` there, so this line is byte-identical
+            // to before), while a read that sends `where` counts the FILTERED set — the
+            // only way a facet count and a filtered page can ever agree. `selected` is the
+            // same array the page and its cursors were computed from, so the two cannot
+            // disagree in either mode.
+            counts: countsOf(definition, selected),
             page,
             storeRev: state.storeRev
         };
@@ -2205,10 +2587,53 @@ export const createRecordEngine = (): RecordEngine => {
             return dropCollection(state);
         }
 
+        // R6/T6.1 — `describe` reads the collection's SPEC, so it is answered before the
+        // paging, cursor, `since` and plan rules run at all: nothing about a page can
+        // disturb it, and it cannot be combined with a write (a call that both asked for
+        // the definition and sent `entries` would otherwise silently drop the write).
+        // `drop` is checked above and still wins, because it was here first and its
+        // error wording is pinned.
+        if (raw.describe !== undefined) {
+            // Read the flag even when it is `false`, so a non-boolean is still refused.
+            const described = readDescribe(label, raw.describe);
+
+            if (described) {
+                // Review F5 — the guard used to refuse only the three batch keys, so every
+                // READ control beside `describe: true` rode along unvalidated and was
+                // silently ignored: `describe: true, since: 999` answered with a definition
+                // and no `changes`, and a `where`/`offset`/`limit`/`afterId` beside it could
+                // move nothing, because this branch short-circuits ahead of the readers
+                // below. A `describe` answer is the SPEC plus an empty page, so "on its own"
+                // now means exactly that: none of the eight controls may accompany it.
+                const crowded =
+                    raw.entries !== undefined ||
+                    raw.remove !== undefined ||
+                    raw.ids !== undefined ||
+                    raw.since !== undefined ||
+                    raw.offset !== undefined ||
+                    raw.limit !== undefined ||
+                    raw.afterId !== undefined ||
+                    raw.where !== undefined;
+
+                if (crowded) {
+                    throw recordError(
+                        RECORD_ERROR_CODES.invalidInput,
+                        `${label} "describe" reads a collection's definition on its own; send it without "entries", "remove", "ids", "since", "offset", "limit", "afterId" or "where".`
+                    );
+                }
+
+                return describeCollection(state);
+            }
+        }
+
         const offset = readOffset(label, raw.offset);
         const limit = readLimit(label, raw.limit);
         const afterId = readAfterId(label, raw.afterId);
         const since = readSince(label, raw.since);
+        // R7/T7.1 — validated against the declared fields, so a typo is a refusal naming
+        // the key rather than an empty page. It is read HERE rather than in `readPlan`
+        // because it belongs to the READ half of a call: it never touches the store.
+        const where = readWhere(label, definition, raw.where);
 
         // The two cursors mean different things (an index vs. an id) and a caller that
         // sends both has not decided which page it wants.
@@ -2219,8 +2644,48 @@ export const createRecordEngine = (): RecordEngine => {
             );
         }
 
+        // R7/T7.1 — `where` narrows the set the page cursors move over, while `since`
+        // asks for the collection's event LOG, which is a different axis entirely: a
+        // change entry has no field values to filter on, so a filtered feed would be a
+        // fabrication. Refused rather than silently ignoring one of the two.
+        if (where !== undefined && since !== undefined) {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where" and "since" cannot be combined: the change feed is the unfiltered log of the whole collection.`
+            );
+        }
+
+        // Review F3 — `ids` is the OTHER axis `where` cannot meet: it is the one lookup
+        // mode that does not answer with the page at all. `readIds` (`records.ts:2547`)
+        // fetches exactly the ids the caller named and REPLACES the projected entries with
+        // them (`records.ts:2749-2756`), while `project` has already filtered the SET the
+        // page and `counts` were computed from. The answer was therefore two different
+        // sets in one envelope: unfiltered records beside filtered counts, with nothing
+        // refusing the pair and nothing documenting it.
+        //
+        // `ids` is the only non-page lookup mode in the request parser. `readPlan`
+        // (`records.ts:1568`) sorts the rest into writes — `entries` are patches and
+        // additions, `remove` is a removal list — and a mutating call still answers with a
+        // PAGE (`records.ts:2880-2888`), which `where` bounds honestly. So the refusal
+        // covers every mode where the filter would be bypassed and only that mode.
+        //
+        // Through a wrapper this is the same rule, not a new one: an `action`-style
+        // `get` maps to `ids: [id]` (`records.ts:3185`), and its schema already says
+        // `where` is "For 'list' only", so `get` + `where` was a silently ignored filter.
+        if (where !== undefined && raw.ids !== undefined) {
+            throw recordError(
+                RECORD_ERROR_CODES.invalidInput,
+                `${label} "where" and "ids" cannot be combined: "ids" answers with the records it names, so a filter would narrow only the page and the counts beside them.`
+            );
+        }
+
         // Asking for events the collection has not produced yet is a bug, not an empty
         // answer: it usually means the caller sent a page revision.
+        //
+        // R3: this stays the FIRST check, and stays `invalid-input`, so the code keeps
+        // its meaning — "you asked for a revision the store has not reached". A token
+        // that was fine when it was saved and is now behind the log gets its own code
+        // below.
         if (since !== undefined && since > state.storeRev) {
             throw recordError(
                 RECORD_ERROR_CODES.invalidInput,
@@ -2228,17 +2693,47 @@ export const createRecordEngine = (): RecordEngine => {
             );
         }
 
+        // R3/T3.2 — the other side of the epoch: the watermark is real, but the change
+        // log it indexes was deleted and rebuilt under the caller (drop + re-`define`).
+        // `revision-epoch-reset` tells a client to resync from scratch instead of
+        // blaming its arithmetic, and it can only fire for a name that was re-`define`d,
+        // because only then does a floor exist.
+        const epochFloor = epochFloors.get(definition.name);
+
+        if (since !== undefined && epochFloor !== undefined && since < epochFloor) {
+            throw recordError(
+                RECORD_ERROR_CODES.revisionEpochReset,
+                `${label} "since" ${since} predates the current change log (the collection was dropped and re-defined; storeRev is now ${state.storeRev}) — resync from scratch.`,
+                { collection: definition.name, since, epochFloor, storeRev: state.storeRev }
+            );
+        }
+
         // Validate everything, then mutate. Nothing between this line and the apply
         // loops below can throw, so the store is never half-patched — including a
         // rejected CAS, which leaves items, the id counter, storeRev and the log
         // exactly as they were.
-        const plan = readPlan(definition, raw, {
-            find: (id) => state.items.find((candidate) => candidate.id === id),
-            length: () => state.items.length,
-            changes: () => state.changes,
-            ...(identity.by === undefined ? {} : { by: identity.by }),
-            ...(identity.threadId === undefined ? {} : { threadId: identity.threadId })
-        }, callerBatchKey);
+        const plan = readPlan(
+            definition,
+            raw,
+            {
+                find: (id) => state.items.find((candidate) => candidate.id === id),
+                length: () => state.items.length,
+                changes: () => state.changes,
+                // R5/T5.1: the whole-store id sweep, from the one place that can do it
+                // — the engine closure, which owns every collection. First match wins
+                // because ids are unique across collections (F3).
+                ownerOf: (id: string): string | undefined => {
+                    for (const [name, candidate] of collections) {
+                        if (candidate.items.some((item) => item.id === id)) return name;
+                    }
+
+                    return undefined;
+                },
+                ...(identity.by === undefined ? {} : { by: identity.by }),
+                ...(identity.threadId === undefined ? {} : { threadId: identity.threadId })
+            },
+            callerBatchKey
+        );
 
         // A pure read: `ids` (one → `entry`) or the current page.
         if (!plan.mutates) {
@@ -2246,7 +2741,9 @@ export const createRecordEngine = (): RecordEngine => {
                 offset,
                 limit,
                 ...(afterId === undefined ? {} : { afterId }),
-                ...(since === undefined ? {} : { since })
+                ...(since === undefined ? {} : { since }),
+                // R7: the filter decides the ordered set the page is cut from.
+                ...(where === undefined ? {} : { where })
             });
 
             if (plan.lookups.length === 1) {
@@ -2384,7 +2881,10 @@ export const createRecordEngine = (): RecordEngine => {
             offset,
             limit,
             ...(afterId === undefined ? {} : { afterId }),
-            ...(since === undefined ? {} : { since })
+            ...(since === undefined ? {} : { since }),
+            // R7: a mutation still answers with a page, and `where` bounds that page the
+            // same way it bounds a read. The write itself is unaffected by the filter.
+            ...(where === undefined ? {} : { where })
         });
 
         if (removed.length > 0) result.removed = removed;
@@ -2425,14 +2925,65 @@ export const createRecordEngine = (): RecordEngine => {
             registeredNames()
         );
 
-        collections.set(definition.name, freshState(definition));
+        // R3/T3.1 — a name whose high-water mark survives a drop continues the count
+        // instead of restarting at 0, so a `storeRev` a client saved before the drop can
+        // never be "ahead of the store" again, and never silently re-uses a revision
+        // number from the previous epoch. A name the engine has never seen keeps exactly
+        // today's behaviour (storeRev 0, no floor).
+        const priorHighWater = storeRevHighWater.get(definition.name);
+        const startRev = priorHighWater === undefined ? 0 : priorHighWater + 1;
+        const state = freshState(definition, startRev);
+
+        collections.set(definition.name, state);
+        seedHighWater(definition.name, startRev);
+
+        // The floor exists only for a re-`define`: it is the first revision of the NEW
+        // change log, so anything below it belongs to the dropped epoch.
+        if (startRev > 0) epochFloors.set(definition.name, startRev);
 
         return {
             entries: [],
             counts: { total: 0 },
             page: { offset: 0, limit: RECORD_LIST_DEFAULT_LIMIT, hasMore: false },
-            storeRev: 0,
+            // R3: echo the state's real revision — this literal was `storeRev: 0`, which
+            // after a drop + re-`define` would report a revision the store does not have.
+            storeRev: state.storeRev,
             collection: definition.name
+        };
+    };
+
+    // R6/T6.1 — reads a collection's OWN spec back. There was no introspection verb:
+    // the engine held the answer (the same map that powers the `unknown-collection`
+    // name list) and exposed only the names, which is what made discovering the accepted
+    // `count` shapes cost a live session four failed `define` calls.
+    //
+    // Short-circuited ahead of `readPlan` and ahead of the paging/cursor/`since` rules,
+    // so it can never disturb them: a describe call mints nothing, moves nothing and
+    // reports the collection's real `counts` and `storeRev` alongside the spec.
+    const describeCollection = (state: CollectionState): RecordsResult => ({
+        entries: [],
+        counts: countsOf(state.definition, state.items),
+        page: { offset: 0, limit: RECORD_LIST_DEFAULT_LIMIT, hasMore: false },
+        storeRev: state.storeRev,
+        collection: state.definition.name,
+        definition: cloneDefinition(state.definition)
+    });
+
+    // R6/T6.2 — the registered collection names, sorted. `collections()` on the engine
+    // surface returns declaration order (the order `unknown-collection` quotes); this is
+    // the answer to "what can I ask for?" and must be stable across hosts, hence the
+    // sort.
+    const listCollections = (): RecordsResult => {
+        const names = [...collections.keys()].sort();
+
+        return {
+            entries: [],
+            counts: { total: names.length },
+            page: { offset: 0, limit: RECORD_LIST_DEFAULT_LIMIT, hasMore: false },
+            // No single collection is addressed by a bare call, so there is no store
+            // revision to report — `0` says "none", and `collections` is the answer.
+            storeRev: 0,
+            collections: names
         };
     };
 
@@ -2455,6 +3006,12 @@ export const createRecordEngine = (): RecordEngine => {
                 { collection: state.definition.name, count: state.items.length }
             );
         }
+
+        // R3/T3.1: keep the high-water mark (raised, never lowered) across the delete,
+        // because the point of the mark is exactly what the client still holds after the
+        // collection is gone. `drop` only accepts an EMPTY collection, so the surviving
+        // number is the last revision that collection reached.
+        seedHighWater(state.definition.name, state.storeRev);
 
         collections.delete(state.definition.name);
 
@@ -2603,6 +3160,10 @@ export const createRecordEngine = (): RecordEngine => {
         if (raw.limit !== undefined) input.limit = raw.limit as number;
         if (raw.afterId !== undefined) input.afterId = raw.afterId as string;
         if (raw.since !== undefined) input.since = raw.since as number;
+        // R7/T7.1 — `where` is one of the engine's list-read controls, so every wrapper
+        // that can page must forward it. A `list` call returns right below, which is why
+        // this sits with the other read controls rather than with the patch fields.
+        if (raw.where !== undefined) input.where = raw.where as Record<string, string | number | boolean>;
         if (raw.expects !== undefined) input.expects = raw.expects as RecordExpect[];
         if (raw.mergeDisjoint !== undefined) {
             input.mergeDisjoint = raw.mergeDisjoint as boolean;
@@ -2661,11 +3222,43 @@ export const createRecordEngine = (): RecordEngine => {
         if (wrapper.style === 'batch') {
             // `tasks` keeps its own contract exactly: the page under the collection's
             // plural key, plus the counts, cursor, revision and (on `since`) the feed.
+            //
+            // R1/T1.1 — the engine answers a single-id read (`records.ts:2252-2259`) and
+            // a single-record mutation (`records.ts:2392-2402`) with `entry`, having
+            // DELETED `entries`. This branch used to read only `entries`, so `?? []`
+            // turned a found record into an empty list and the record itself was
+            // dropped: `tasks {"ids":[<id>]}` answered `{"tasks":[]}` while promising
+            // "entry" (tasks.tool.ts:70). Carrying `entry` through closes the contract
+            // without touching anything else in the shape — the empty plural stays for
+            // an actually-empty page, because the engine deletes `entries` ONLY for a
+            // one-id answer.
+            //
+            // T1.1 EXTENSION — `removed`, the same defect class as `entry` above. The
+            // engine answers ANY call that deleted at least one record with
+            // `result.removed`, an ARRAY of full copies of the records it deleted
+            // (`records.ts:2804-2813` + `:2853`), and this branch used to drop it the
+            // way it dropped `entry`: `tasks {"remove":["1"]}` answered only the
+            // survivor page, so the caller could not see WHICH record body it had just
+            // deleted (rev, attribution and text included).
+            //
+            // It is surfaced SINGULAR, mirroring `entry`, and only when exactly ONE
+            // record was removed:
+            //   - `entry` follows the same one-record rule (`affected.length === 1` at
+            //     `records.ts:2857`), so a multi-record batch keeps the historical
+            //     page-only shape and every existing pin stays exact;
+            //   - the sibling action-wrapper branch already answers `removed` as ONE
+            //     record — `removed: (result.removed ?? [])[0]` below at `:3253` — so
+            //     the two wrapper styles now agree about what `removed` MEANS;
+            //   - a caller that removes several records still gets the full array from
+            //     the engine surface (`records` with no wrapper returns `result`
+            //     verbatim, `:3183`), where `removed?: RecordEntry[]` is declared.
             const shaped: Record<string, unknown> = {
                 [wrapper.plural]: result.entries ?? [],
                 counts: result.counts,
                 page: result.page,
-                storeRev: result.storeRev
+                storeRev: result.storeRev,
+                ...(result.entry === undefined ? {} : { entry: result.entry }),
+                ...(result.removed?.length === 1 ? { removed: result.removed[0] } : {})
             };
 
             if (result.changes !== undefined) shaped.changes = result.changes;
@@ -2755,6 +3348,18 @@ export const createRecordEngine = (): RecordEngine => {
             // read as an unknown-collection typo.
             if (raw.define !== undefined) {
                 return defineCollection(readDefineInput('records', raw.define));
+            }
+
+            // R6/T6.2 — a `records` call that names NO collection lists the defined
+            // names instead of erroring, so discovery no longer has to trip
+            // `unknown-collection` to find out what exists. Deliberately narrow:
+            //   - `define` is handled above, so `records({ define })` is unchanged;
+            //   - `{ drop: true }` with no collection still falls through to
+            //     `findCollection`, keeping that refusal's exact wording;
+            //   - an empty or whitespace `collection` is NOT absent, and still gets the
+            //     exact `records requires a non-empty "collection" string` message.
+            if (raw.collection === undefined && raw.drop === undefined) {
+                return listCollections();
             }
 
             const state = findCollection(raw.collection);
@@ -2854,8 +3459,17 @@ export const createRecordEngine = (): RecordEngine => {
         reset: () => {
             collections.clear();
 
+            // R3: a reset rewinds EVERYTHING, by design — including the epoch bookkeeping
+            // this defect added. Stop-condition 4: `reset()` is not a drop + re-`define`,
+            // it is the declared clean start, so the old rewinds-to-0 behaviour stays and
+            // the high-water marks must go with it (otherwise a reset would refuse a
+            // `since: 0` that is genuinely correct again).
+            storeRevHighWater.clear();
+            epochFloors.clear();
+
             for (const definition of BUILTIN_RECORD_COLLECTIONS) {
                 collections.set(definition.name, freshState(definition));
+                seedHighWater(definition.name, 0);
             }
 
             nextId = 1;
@@ -2890,8 +3504,18 @@ export const createRecordEngine = (): RecordEngine => {
 
             collections.clear();
 
+            // R3: the high-water marks are runtime-only, so a restore REBUILDS what it
+            // can from the restored revisions (keep-or-raise, never lower) rather than
+            // trusting that the live map happens to agree. The epoch FLOORS do go: a
+            // restored change log is the persisted one, so every `since` at or below its
+            // own revisions is answerable and nothing should be refused as
+            // pre-epoch. A name that is re-`define`d after a restore still gets the
+            // monotonic start, because the marks above survived.
+            epochFloors.clear();
+
             for (const [name, restoredState] of Object.entries(restored.collections)) {
                 collections.set(name, restoredState);
+                seedHighWater(name, restoredState.storeRev);
             }
 
             nextId = restored.nextId;

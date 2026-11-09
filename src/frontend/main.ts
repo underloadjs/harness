@@ -142,13 +142,18 @@ import {
     listViews,
     observeTurn,
     observeView,
+    // T3: the per-thread live plane — one `thread`-scope subscription per conversation the
+    // reader opened (./view-shell.ts `observeThread`) and the bounded queue that reads THAT
+    // thread's transcript (./view-api.ts `createThreadTranscriptLoader`).
+    observeThread,
+    createThreadTranscriptLoader,
     resetView,
     resumeViewThread,
     submitViewTask,
     updateThreadTranscript as updateViewThreadTranscript,
     updateView
 } from './view-shell';
-import type { DisplayPlane, ViewStreamItem } from './view-shell';
+import type { DisplayPlane, ThreadTranscriptLoader, ViewStreamItem } from './view-shell';
 // The connection the observation rides. The shell asks it ONE question, when an observation
 // ends: is there a transport at all? `closed` means nothing will ever arrive on a
 // subscription (no factory and no `WebSocket`, stream.ts:193-199 and :459-467), which is the
@@ -174,7 +179,12 @@ import {
     readTurnRow,
     // T38: the details dialog's lazy per-conversation usage fold (./view-api.ts:850).
     readUsage,
-    sessionRowOf
+    sessionRowOf,
+    // T3: the invalid-transcript roster is DERIVED from the roster rows (an unreadable
+    // transcript is a property of the row), so a single-row patch re-derives it exactly the
+    // way `openSession` does.
+    invalidThreadsOf,
+    type ThreadRow
 } from './view-api';
 import {
     activeAgentsOf,
@@ -772,6 +782,12 @@ type View = {
     // presented as several independent threads. (The former strip also rendered
     // these rows; it is gone, and this is the only consumer.)
     setThreads: (threads: readonly SessionThreadEntry[]) => void;
+    // T3: the conversations this view is SHOWING (expanded cards + the focused one), and
+    // the transcript document the shell read for one of them. Same pair the board exposes
+    // (./ui/turns.ts `TurnBoard`); the shell pulls after a roster lands, because that is
+    // when an id becomes a real conversation it may follow.
+    followedThreads: () => readonly string[];
+    setThreadTranscript: (threadId: string, payload: ThreadTranscriptPayload | undefined) => void;
     // R7: the tombstone-filtered raw snapshot the JSON transcript copies. Reached by
     // an EXPLICIT export read only (T5 R3); `undefined` until the reader opens a
     // transcript, and on session teardown.
@@ -869,6 +885,10 @@ type LazyDisplayBinding = {
     // The tile the reader expanded, so the shell can move its `turn`-scope flow
     // subscription to the conversation whose streamed text matters.
     focusTurn?: (turnId: string | undefined) => void;
+    // T3 (R2/R3): the conversations the reader has OPEN. The shell follows exactly this
+    // set with one `thread`-scope subscription and one transcript document each, and stops
+    // following an id the moment it leaves the set.
+    followThreads?: (threadIds: readonly string[], sessionId: string | undefined) => void;
     // An owner question as the COMPACT wire sees it: answered synchronously from the
     // session's live pending actions, so a card carries the REAL recorded options
     // (./ui/turns.ts:513). Undefined = not pending, which the lazy read below settles.
@@ -890,7 +910,9 @@ const createView = (
     answer?: (input: AnswerActionInput) => Promise<void>,
     // R7: one explicit-open `getSession` read, guarded by the shell before it is
     // applied. R9: the board's Delete confirmation delegates the actual DELETE here.
-    refreshTranscript?: (sessionId: string) => Promise<SessionSnapshot | undefined>,
+    // T3 (R1): the thread the reader opened travels with the request, so the shell composes
+    // THAT conversation's document instead of one per roster row.
+    refreshTranscript?: (sessionId: string, threadId?: string) => Promise<SessionSnapshot | undefined>,
     removeThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>,
     // C5: the board's transcript editor delegates the PUT here. The shell owns the
     // API and applies the returned snapshot through `applySnapshot`, so the roster,
@@ -1005,6 +1027,14 @@ const createView = (
             // Identity is the view's own pane, the one thing available before the
             // View object exists.
             if (current?.view.pane === pane) paintComposerTarget();
+        },
+        // T3 (R2/R3): the board reports the set of conversations it is SHOWING — expanded
+        // thread cards plus the focused conversation — and the shell turns that into live
+        // following: a `thread`-scope subscription and a transcript document per id, and
+        // neither for anything collapsed. A load reports the empty set, which is R1: the
+        // collapsed screen stays driven by the roster page alone.
+        onFollowedThreadsChange: (threadIds, sessionId) => {
+            lazy?.followThreads?.(threadIds, sessionId);
         }
     });
 
@@ -1180,6 +1210,12 @@ const createView = (
             // path draws and protects. The raw transcript source stays untouched until
             // an explicit export read replaces it.
             board.setSessionView(view);
+        },
+        followedThreads: () => board.followedThreads(),
+        setThreadTranscript: (threadId, payload) => {
+            // T3: the shell owns the read; the board owns the surfaces that render it (the
+            // roster row, the roster-only focus panel, an open transcript dialog).
+            board.setThreadTranscript(threadId, payload);
         },
         hydrateView: (view, model, keep) => {
             const follow = pinned();
@@ -5218,6 +5254,34 @@ type Instance = {
     // subscription cannot deliver streamed text; this is the connection that does.
     // Aborting it unsubscribes and never cancels a task.
     turnWatch?: { turnId: string; sessionId: string; controller: AbortController };
+    // T3 (R2/R3): the conversations this card's reader has OPEN, one live `thread`-scope
+    // subscription each. Keyed by thread id; each entry owns its AbortController, so a
+    // collapse releases exactly one registration and a session switch releases all of
+    // them. This is the lazy counterpart of the session subscription: before it, the only
+    // way a thread's own state reached the page was the whole-roster read every frame
+    // triggered, and the only way its transcript arrived was the per-open fan-out.
+    threadWatches?: Map<string, { sessionId: string; controller: AbortController }>;
+    // T3b: the newest `thread.upsert` stamp this page has APPLIED for each roster row,
+    // keyed by thread id (the value is the frame's server-clock `at`). A resumed stream
+    // replays from its retained window, and a document re-read (a poll, a resync, a
+    // reopen) can install a NEWER row in between — so a frame that arrives afterwards can
+    // be OLDER than the row on screen. `applyThreadRowPatch` refuses it with this mark,
+    // exactly as `applyView` refuses a stale document with `snapshotMark`. The frame's
+    // `cursor` is used for the resume position only (the client tracks those itself), so
+    // only `at` is retained here.
+    threadRowMarks?: Map<string, number>;
+    // T3: the bounded transcript queue for THIS conversation (2 concurrent, deduped,
+    // generation-guarded, ./view-api.ts). Rebuilt when the instance points at another
+    // session, and invalidated whenever the realtime plane loses its position, so a
+    // document read before an outage is never painted after it.
+    transcripts?: { sessionId: string; loader: ThreadTranscriptLoader };
+    // T3 (R1): set while a LOAD is being applied. A loaded conversation starts with every
+    // card collapsed (`collapseForLoad`, T21 R22), but the board's own first-content rule
+    // opens the newest surface inside `applyView` — following it during that window would
+    // pull a transcript for a conversation the reader never opened. The shell clears this
+    // flag right after the collapse and syncs the followed set once, from the state that
+    // the reader actually sees.
+    deferFollow?: boolean;
     // T44: the turns whose STALE display tree this instance has already re-read because a
     // settling row arrived without a flow frame (see `refreshUnopenedTree`). Scoped to the
     // session id so a conversation switch starts the budget over; one bounded tree read per
@@ -5639,6 +5703,8 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
         hasOlder: () => instance.plane?.hasOlder() ?? false,
         loadingOlder: () => instance.plane?.loadingOlder() ?? false,
         focusTurn: (turnId) => followTurnFlow(instance, turnId),
+        // T3 (R2/R3): the board's "what am I showing" report, turned into following.
+        followThreads: (threadIds, sessionId) => syncThreadFollow(instance, threadIds, sessionId),
         requestFor: (step) => actionRequestForStep(instance, step),
         loadRequest: (step) => loadActionRequestFor(instance, step),
         actionHydrated: (turnId) => repaintActionCard(instance, turnId)
@@ -9891,6 +9957,317 @@ const stopTurnFlow = (instance: Instance): void => {
     instance.turnWatch = undefined;
 };
 
+// ---------------------------------------------------------------------------
+// T3: following threads (lazy live observation + on-demand transcripts)
+// ---------------------------------------------------------------------------
+
+// The transcript queue for the conversation this card points at: rebuilt when the
+// instance moves to another session (thread ids and documents are minted inside ONE
+// conversation), reused otherwise, so a repaint never re-creates the cache and a switch
+// never paints another conversation's document.
+const transcriptLoaderFor = (instance: Instance, sessionId: string): ThreadTranscriptLoader => {
+    const held = instance.transcripts;
+
+    if (held !== undefined && held.sessionId === sessionId) return held.loader;
+
+    const loader = createThreadTranscriptLoader(sessionId, {
+        // Every document this queue reads — awaited or not — lands on the two surfaces
+        // that render a conversation's committed messages: the board (its roster rows and
+        // the roster-only focus panel) and the raw authority the transcript dialog quotes.
+        // Painting from here rather than from each caller is what keeps a re-read that the
+        // original waiter had already finished from being thrown away.
+        onResolved: (threadId, payload) => {
+            if (instance.sessionId !== sessionId) return;
+
+            instance.snapshot = withThreadTranscript(instance.snapshot, threadId, payload);
+            instance.view.setThreadTranscript(threadId, payload);
+            instance.view.setSessionSnapshot(instance.snapshot);
+        }
+    });
+
+    instance.transcripts = { sessionId, loader };
+
+    return loader;
+};
+
+// Stamps one thread's transcript onto the RAW authority without disturbing the rest of
+// the document. The compact wire never carries messages (./ui/threads.ts:89-104), so a
+// per-thread read would otherwise be the only row with content and every thread the
+// reader opened EARLIER would lose its bytes from the lossless JSON.
+const withThreadTranscript = (
+    previous: SessionSnapshot | undefined,
+    threadId: string | undefined,
+    payload: ThreadTranscriptPayload | undefined
+): SessionSnapshot | undefined => {
+    // No explicit read has happened yet, or the read failed: the raw authority stays as it
+    // was (T5 R3 — a transcript/export document exists only after the reader asked for one),
+    // and the board renders the conversation from the transcript payload above.
+    if (threadId === undefined || payload === undefined) return previous;
+    if (previous === undefined || !Array.isArray(previous.threads)) return previous;
+
+    return {
+        ...previous,
+        threads: previous.threads.map((row) =>
+            row.id === threadId
+                ? ({ ...row, messages: payload.messages } as unknown as SessionThread)
+                : row
+        )
+    } as SessionSnapshot;
+};
+
+// Releases EVERY thread subscription this card holds (a session switch, a delete, a
+// teardown). Aborting is an unsubscribe only — execution is server-owned (rule 7 of
+// ./stream.ts), so leaving a conversation never cancels a task running inside it.
+const stopThreadFollow = (instance: Instance): void => {
+    const watches = instance.threadWatches;
+
+    if (watches === undefined) return;
+
+    for (const [, entry] of watches) entry.controller.abort();
+    watches.clear();
+};
+
+// R2/R3: make this card's live following match exactly what the board is showing.
+//
+// The board reports the set it can see (./ui/turns.ts `followedThreads`); the shell owns
+// the diff, because the shell owns the socket. One entry per conversation: a `thread`
+// subscription (the roster row and the transcript signal) plus the transcript document
+// itself. Expanding re-dials when the plane is down, so "whenever expanding a thread, the
+// socket needs to be re-established" is literally true; collapsing aborts the controller,
+// which unsubscribes, and the thread's document is dropped from the cache so the next
+// expand reads the CURRENT state again rather than whatever was on screen before.
+const syncThreadFollow = (
+    instance: Instance,
+    reported: readonly string[],
+    sessionOfReport?: string
+): void => {
+    const sessionId = instance.sessionId;
+
+    if (sessionId === undefined) return;
+
+    // T3 (R1): during a LOAD, defer. The board opens its newest surface while the document
+    // is reconciled and the shell collapses it immediately after; following the
+    // conversation in between would read a transcript for a thread nobody opened. The
+    // shell calls back into this function when the flag clears, so nothing is lost — the
+    // set is simply applied from the state the reader actually sees.
+    if (instance.deferFollow === true) return;
+
+    // A report from another conversation is stale by construction: `bindSession` runs
+    // before the rows are replaced, and the previous session's expanded cards are still in
+    // the DOM at that moment. Following THOSE ids under the NEW session would subscribe to
+    // conversations that do not exist here (and the server refuses them).
+    if (sessionOfReport !== undefined && sessionOfReport !== sessionId) return;
+
+    // Only a conversation the ROSTER describes is followable. `focusedThreadId` can name a
+    // thread the roster has not published yet (an optimistic row, a legacy turn), and a
+    // `thread` subscription for an unknown id is a protocol error, not a wait — the roster
+    // frame that finally names it re-syncs this set (see `applyView`/`applyThreadRowPatch`).
+    const wanted = new Set(
+        reported.filter((threadId) => instance.threads.some((entry) => entry.id === threadId))
+    );
+
+    const watches = instance.threadWatches ?? new Map<string, { sessionId: string; controller: AbortController }>();
+
+    instance.threadWatches = watches;
+
+    // R3: collapsing stops the following — unsubscribe, and stop holding its document.
+    for (const [threadId, entry] of [...watches]) {
+        if (wanted.has(threadId) && entry.sessionId === sessionId) continue;
+
+        entry.controller.abort();
+        watches.delete(threadId);
+        instance.transcripts?.loader.forget(threadId);
+    }
+
+    if (wanted.size === 0) return;
+
+    const stream = harnessStream();
+
+    // The threads this sync actually STARTS watching. Everything else in `wanted` is
+    // already carried by a live watch and needs no action at all — a distinction T3b had
+    // to make explicit, because this function also runs from `applyThreadRowPatch` on
+    // every roster frame and an unconditional force there re-dialled per frame.
+    const fresh = [...wanted].filter((id) => watches.get(id)?.sessionId !== sessionId);
+
+    // R2: expanding while the plane is DOWN must re-establish the connection, not wait for
+    // the next frame or the next reader gesture — `reconnecting` means a backoff timer is
+    // pending, up to 10s of it, and a reader who just clicked to READ a conversation
+    // should not watch a stale card for that long. T3b: that force belongs to a NEW watch
+    // only, and ./stream.ts `forceReconnectOnce` spends it at most once per outage (the
+    // resume state survives either way, so the reconnect still replays). `open` already
+    // carries the subscribe and `connecting` already has a dial in flight that flushes the
+    // queued registration on its `welcome`, so neither is forced.
+    if (fresh.length > 0) {
+        const status = stream.status();
+
+        if (status === 'reconnecting' || status === 'idle' || status === 'closed')
+            stream.forceReconnectOnce();
+    }
+
+    const loader = transcriptLoaderFor(instance, sessionId);
+
+    for (const threadId of fresh) {
+        const controller = new AbortController();
+
+        watches.set(threadId, { sessionId, controller });
+
+        void observeThread(sessionId, threadId, controller.signal, {
+            // The thread's own roster row moved: patch it (the frame carries the whole
+            // row, so this is a patch, never a read).
+            onThread: (id, row, stamp) => applyThreadRowPatch(instance, id, row, stamp),
+            // `transcript.updated`: the committed document moved. One bounded re-read of
+            // THIS thread — that is the whole payload class the session fan-out used to
+            // pay for on every open.
+            onTranscript: (id) => void loader.refresh(id),
+            // Lost position (a drop, a gap, a refused cursor, or a re-registered baseline
+            // whose replay window expired): the document this surface shows is re-read, so
+            // the pane converges without a page refresh (R4).
+            onResync: (id) => void loader.refresh(id),
+            onError: () => {
+                if (watches.get(threadId)?.controller === controller) watches.delete(threadId);
+            }
+        }).catch(() => {
+            // A refused or aborted observation costs this card its live thread flow; the
+            // session subscription still carries the roster and the board keeps rendering
+            // the document below.
+            if (watches.get(threadId)?.controller === controller) watches.delete(threadId);
+        });
+
+        // R2: the FRESH per-thread load, every time. `refresh` bypasses the cache on
+        // purpose — an expand is the reader asking for the conversation as it is NOW, and a
+        // document held from before a collapse (or before an outage) cannot prove that.
+        void loader.refresh(threadId);
+    }
+};
+
+// T3 (R4): the plane lost its position — a dropped connection, a detected gap, a server
+// `resync_required`, or a re-registration whose replay window had expired (the quiet one:
+// the broker answers a fresh baseline and the client cannot see the loss in any frame).
+// The observer's own re-read restores the ROWS; this restores what a document cannot:
+//   - the cached display trees: a turn that was mid-flight across the outage settled
+//     without a frame, and `createDisplayLoader` marks an answer 'done' for its
+//     generation forever, so its stale tree would be painted until the reader switched
+//     conversations;
+//   - the cached per-thread transcripts, for the same reason;
+//   - every followed thread's document, re-read now.
+const recoverAfterDrop = (instance: Instance, sessionId: string): void => {
+    if (instance.sessionId !== sessionId) return;
+
+    instance.plane?.invalidate();
+
+    const held = instance.transcripts;
+
+    if (held !== undefined && held.sessionId === sessionId) held.loader.invalidate();
+
+    for (const threadId of instance.view.followedThreads()) {
+        void transcriptLoaderFor(instance, sessionId).refresh(threadId);
+    }
+};
+
+// T3: one roster row moves — the reducer BOTH paths share: the session subscription's
+// `thread.upsert` (./view-shell.ts `applyUpdate`) and the followed thread's own
+// subscription. The frame carries the whole row (../shared/harness-stream.ts:619-627), so
+// the compact document's `threadViews` is patched in place and every roster-derived
+// surface repaints from it. This replaced a full `openSession` re-read (rows page + roster
+// page + actions + a board rebuild) per frame, on the hot path of every running
+// conversation.
+const applyThreadRowPatch = (
+    instance: Instance,
+    threadId: string,
+    row: ThreadRow,
+    // The frame's OWN stamp, carried by `observeView`/`observeThread` (T3b). Absent only
+    // from a caller that has no frame to speak of (a hand-built patch in a test).
+    stamp?: { at: number; cursor: string }
+): void => {
+    if (instance.sessionId === undefined) return;
+
+    // S3: a conversation this client deleted never comes back, whatever frame arrives last.
+    if (instance.threadTombstones.has(threadId)) return;
+
+    // T3b (R4 of the review): the freshness guard, the row-level twin of `applyView`'s
+    // document watermark below. The danger is ordering, not content: a `thread.upsert`
+    // replayed out of the stream's retention window can describe a moment EARLIER than
+    // the document a mid-outage `pollSession`/`resyncSession` already installed, and the
+    // patch would then regress one settled row's `status`/`messageCount`/`preview` while
+    // every other row kept the newer state (the frame carries ONE row — the only
+    // information about it is the frame itself).
+    //
+    // The floor is the newest of:
+    //   - this row's own applied mark, and
+    //   - this document's `snapshotMark.at`, because a document re-read settled EVERY row
+    //     at that instant (a thread that has never had a frame of its own still must not
+    //     accept an older one);
+    // and, like `applyView`, only a STRICTLY older frame is refused — an equal stamp
+    // describes the same instant and re-applying it cannot lose anything. A frame with no
+    // usable stamp is applied: refusing it would silently drop a live patch, which is the
+    // worse failure.
+    const document =
+        instance.snapshotMark !== undefined && instance.snapshotMark.sessionId === instance.sessionId
+            ? instance.snapshotMark.at
+            : undefined;
+    const applied = instance.threadRowMarks?.get(threadId);
+    const floor =
+        typeof applied === 'number'
+            ? Math.max(applied, document ?? applied)
+            : document;
+
+    if (
+        stamp !== undefined &&
+        floor !== undefined &&
+        Number.isFinite(stamp.at) &&
+        stamp.at < floor
+    )
+        return;
+
+    const view = instance.compiled;
+
+    // The shell holds the compiled document under the protocol's nominal `SessionView`
+    // (../server/protocol.ts) while a roster row is the display wire's `ThreadRow`
+    // (./view-model.ts): the same record in two spellings, and the same nominal cast the
+    // delete path already applies (see `reconcileDeletedThread`).
+    const rows: ThreadRow[] =
+        view === undefined || !Array.isArray(view.threadViews)
+            ? []
+            : [...(view.threadViews as unknown as ThreadRow[])];
+
+    const index = rows.findIndex((entry) => entry.id === threadId);
+
+    if (index >= 0) rows[index] = row;
+    else rows.push(row);
+
+    if (view !== undefined) {
+        view.threadViews = rows as unknown as SessionView['threadViews'];
+        // An unreadable transcript is a PROPERTY OF THE ROW (./view-api.ts
+        // `invalidThreadsOf`), so the invalid roster is re-derived from the patched rows —
+        // the same rule `openSession` follows, never a second source of truth.
+        view.invalidThreads = invalidThreadsOf(rows) as unknown as SessionView['invalidThreads'];
+        instance.store.setView(view);
+    }
+
+    const entries = sessionThreadsOf(view ?? ({ threadViews: rows } as unknown as SessionView)).filter(
+        (entry) => !instance.threadTombstones.has(entry.id)
+    );
+
+    instance.threads = entries;
+    instance.view.setThreads(entries);
+    if (view !== undefined) instance.view.setSessionView(view);
+
+    // The applied mark moves with an APPLIED patch only — a refused (older) frame leaves
+    // the newer mark in place, which is the whole point of the guard above.
+    if (stamp !== undefined && Number.isFinite(stamp.at)) {
+        const marks = instance.threadRowMarks ?? new Map<string, number>();
+
+        instance.threadRowMarks = marks;
+
+        if ((marks.get(threadId) ?? Number.NEGATIVE_INFINITY) < stamp.at) marks.set(threadId, stamp.at);
+    }
+
+    // A row that appears in the roster can make a conversation the reader is ALREADY
+    // looking at followable for the first time. The board's report does not change (its
+    // set is the same ids), so the re-sync has to be asked for here.
+    syncThreadFollow(instance, instance.view.followedThreads());
+};
+
 const applyView = (instance: Instance, session: SessionView): void => {
     // R8: a snapshot for a session this page deleted must never re-point the card
     // at it. The tombstone covers the observer/poll/resync/openSession/enqueue
@@ -10066,6 +10443,13 @@ const applyView = (instance: Instance, session: SessionView): void => {
     // (the stale guard above returns first).
     instance.threads = incomingThreads;
     instance.view.setThreads(instance.threads);
+
+    // T3: a roster is what makes an id a followable conversation. The reader may already be
+    // looking at a thread the previous roster did not name (a submit that minted one, a
+    // child the server just joined), and the board's reported set did not change when the
+    // roster did — so the follow set is re-derived here, not only from the board.
+    syncThreadFollow(instance, instance.view.followedThreads());
+
     instance.view.setSessionView(session);
     // The transcript dialog repaints from the newest authority the board holds: the
     // raw document after an explicit export read, the compiled rows otherwise.
@@ -10133,7 +10517,8 @@ const applyView = (instance: Instance, session: SessionView): void => {
 // switch or an already-deleted session makes the read stale: return undefined and let
 // the board keep its last applied authority instead of retargeting another conversation.
 const refreshTranscriptSnapshot = async (
-    sessionId: string
+    sessionId: string,
+    threadId?: string
 ): Promise<SessionSnapshot | undefined> => {
     if (deletedSessions.has(sessionId)) return undefined;
 
@@ -10160,11 +10545,27 @@ const refreshTranscriptSnapshot = async (
             for (const id of transcriptTurnIdsOf(view, entry.id, roster)) ids.add(id);
         }
 
+        // T3b (R1 + the export-fidelity contract): the transcript documents are read HERE,
+        // at the explicit export/transcript action, for EVERY roster thread — the lossless
+        // JSON document (`ui/thread-transcript.ts`, and `ui/thread-transcript.test.ts` which
+        // pins a thread row's committed `messages`) must describe the conversations this
+        // page never opened exactly as it did before the lazy-thread work. What stayed
+        // lazy is everything that is NOT an explicit export: a load reads no transcript at
+        // all (R1), and an expanded card reads only its own conversation (R2).
+        const payload = threadId === undefined
+            ? undefined
+            : await transcriptLoaderFor(instance, sessionId).refresh(threadId);
+
         const session = await getRawSession(sessionId, [...ids]);
         if (deletedSessions.has(sessionId) || instance.sessionId !== sessionId) return undefined;
 
         instance.snapshot = session;
         instance.view.setSessionSnapshot(session);
+
+        // The opened conversation also lands on the surfaces that render committed messages
+        // from the ROSTER row (the roster-only focus panel), which the compact document
+        // never carries.
+        if (threadId !== undefined) instance.view.setThreadTranscript(threadId, payload);
 
         return session;
     } catch {
@@ -10687,6 +11088,17 @@ const onViewItem = (
         return;
     }
 
+    // T3: one roster row moved. The frame carries the whole row, so this is the patch path
+    // — the rows page, the roster page and the pending-action list are NOT re-read to learn
+    // what the frame already states.
+    if (item.type === 'thread') {
+        // T3b: the frame's stamp travels with the row so a replayed older patch is refused
+        // (./main.ts `applyThreadRowPatch`).
+        applyThreadRowPatch(instance, item.threadId, item.row, { at: item.at, cursor: item.cursor });
+
+        return;
+    }
+
     // `view` (the open frame and every drain frame) and `failed` (the error terminal)
     // both carry a complete document. Applying it reconciles everything the frames may
     // have missed — and `lastError` populates the pane's session note. The pill is NOT
@@ -10800,7 +11212,16 @@ const startWatching = (instance: Instance, sessionId: string): void => {
     void observeView(
         sessionId,
         (item) => onViewItem(instance, sessionId, item, controller),
-        controller.signal
+        controller.signal,
+        {
+            // T3 (R4): the plane lost its position — a dropped socket (./stream.ts now
+            // reports a drop to every subscription instead of re-dialling in silence), a
+            // sequence gap, or a re-registered baseline whose replay window had expired.
+            // The observer re-reads the rows; this drops the render state a document
+            // cannot repair and re-reads what the reader is looking at, so the panes
+            // converge on the CURRENT state without a page refresh.
+            onRecover: () => recoverAfterDrop(instance, sessionId)
+        }
     )
         .then(() => {
             if (watch?.controller !== controller) return;
@@ -10816,7 +11237,17 @@ const startWatching = (instance: Instance, sessionId: string): void => {
             // promise ends (the server ended the subscription, a protocol error, an unsubscribe)
             // keeps the single authoritative re-read, because there the socket may come back and
             // the document in hand may already be stale.
-            if (harnessStream().status() === 'closed') {
+            //
+            // T3 (R4): `reconnecting` joins `closed` here. An observation that ENDED while the
+            // plane was still trying to come back used to take the `resyncSession` branch, which
+            // re-read once and then only restarted the observer if `instance.pending` happened to
+            // be true at that instant — so an outage that outlived the run left the card
+            // displaying a document nothing was updating any more, with no fallback ticking. The
+            // bounded poll re-reads on every tick and stops by itself when the work settles,
+            // which is the honest shape of "the socket is not carrying you right now".
+            const plane = harnessStream().status();
+
+            if (plane === 'closed' || plane === 'reconnecting') {
                 pollSession(instance, sessionId);
 
                 return;
@@ -10930,6 +11361,19 @@ const releaseSessionState = (instance: Instance): void => {
     // subscription dies with it, because a `turn` id is minted inside one session.
     instance.plane?.invalidate();
     stopTurnFlow(instance);
+
+    // T3 (R3): the thread subscriptions and the transcript queue belong to the
+    // conversation being released. Thread ids are minted per session, so the next
+    // conversation may mint the same id — holding a stale document (or a subscription)
+    // under it would paint another conversation's transcript.
+    stopThreadFollow(instance);
+    instance.threadWatches = undefined;
+    // T3b: the row marks are keyed by thread id, which is minted per session — the next
+    // conversation may reuse an id, and a mark left from the conversation being released
+    // would refuse its first live patch.
+    instance.threadRowMarks = undefined;
+    instance.transcripts = undefined;
+
     instance.view.paintOlder();
 };
 
@@ -11099,19 +11543,43 @@ const openSession = async (
         // status line the action before it painted.
         options?.automatic === true ? { keepStatus: true } : undefined
     );
-    applyView(target, session);
-    // T50: the conversation's OWN team (see `hydrateFrozenTeam`). A registered harness with a
-    // document that carries no frozen team would otherwise paint the live preset's roster.
-    hydrateFrozenTeam(target);
-    // T21 R22: a loaded conversation starts with EVERY thread collapsed. `applyView`
-    // just reconciled the document, and the board's first-content rule opened the
-    // newest surface while doing so (`reconcileView`'s `!hadTurns` branch, and its
-    // `pendingFirstFocus` branch after a session switch — ui/turns.ts). Reading that as
-    // an expansion request is wrong — only a click is — so the shell drops it here,
-    // before the observer below or any composer paint can see a focus the reader never
-    // chose. `collapse` also marks the unfocus deliberate (`explicitUnfocus`), which is
-    // what stops every later stream/snapshot/poll frame from re-opening anything.
-    if (loadsFresh) target.view.collapseForLoad();
+
+    // T3 (R1): the whole apply/collapse pass below runs with the thread following deferred
+    // (see `Instance.deferFollow`).
+    target.deferFollow = true;
+
+    // T3b: the release belongs in a `finally`, and the deferred sync travels with it — the
+    // flag and the sync are one critical section. A throw anywhere below (a malformed
+    // document reaching `applyView`, anything in the hydrate/collapse pass) used to leave
+    // `deferFollow` set for the life of this card, and every later board report was then
+    // dropped at the top of `syncThreadFollow` in silence: expanding a thread would simply
+    // never follow again. Releasing the flag without re-syncing would leave the same hole
+    // until the reader's next expand, so both happen together.
+    try {
+        applyView(target, session);
+        // T50: the conversation's OWN team (see `hydrateFrozenTeam`). A registered harness
+        // with a document that carries no frozen team would otherwise paint the live
+        // preset's roster.
+        hydrateFrozenTeam(target);
+        // T21 R22: a loaded conversation starts with EVERY thread collapsed. `applyView`
+        // just reconciled the document, and the board's first-content rule opened the
+        // newest surface while doing so (`reconcileView`'s `!hadTurns` branch, and its
+        // `pendingFirstFocus` branch after a session switch — ui/turns.ts). Reading that as
+        // an expansion request is wrong — only a click is — so the shell drops it here,
+        // before the observer below or any composer paint can see a focus the reader never
+        // chose. `collapse` also marks the unfocus deliberate (`explicitUnfocus`), which is
+        // what stops every later stream/snapshot/poll frame from re-opening anything.
+        if (loadsFresh) target.view.collapseForLoad();
+    } finally {
+        // T3 (R1/R5): the load is over, so the deferred following is applied — from the set
+        // the reader ACTUALLY sees, which after a fresh load is empty (every card
+        // collapsed). Nothing per-thread has been fetched or streamed for the conversations
+        // still showing their roster row; the roster page above is the collapsed screen's
+        // source.
+        target.deferFollow = false;
+        syncThreadFollow(target, target.view.followedThreads());
+    }
+
     rememberSession(id);
 
     if (pendingOf(session)) {
@@ -11969,8 +12437,21 @@ window.addEventListener('pagehide', () => {
         // T24: every focused-turn flow subscription dies with the page. Aborting is
         // an unsubscribe only — the server keeps running whatever is pending (R4).
         stopTurnFlow(instance);
+        // T3: same for every followed thread (R3) — the registrations are released, the
+        // transcripts go with the conversation, and the plane itself says goodbye below.
+        stopThreadFollow(instance);
+        instance.threadWatches = undefined;
+        instance.transcripts = undefined;
         instance.view.dispose();
     }
+
+    // T3 (R4): the page is going away, so the ONE shared socket goes with it — a `bye`
+    // plus close 1000, which is how this connection does not look like a DROP in the
+    // server's diagnostics (and how the next page load starts from a fresh registration
+    // instead of resuming a cursor the server may have parked for this one). Until now
+    // `close()` was never called in production at all: the socket of a reloaded page was
+    // left to the browser, and the reconnect path treated it as an outage.
+    harnessStream().close('page unload');
 });
 
 // ---------------------------------------------------------------------------

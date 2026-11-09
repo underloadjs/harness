@@ -99,17 +99,29 @@ const EPOCH_MS = Date.parse(EPOCH_ISO);
 // a read, an add, a patch, a removal and an ownership action alike, now plus
 // `storeRev` — one increment per RECORDED event (a claim renewal, a no-op release
 // and a read record nothing, so they leave it where it was).
+//
+// R1/T1.1 (+ its `removed` extension) — the engine answers a call that affected
+// exactly ONE record with that record beside the page: `entry` for a read/patch/add
+// (src/core/records.ts:2857) and `removed` for a one-record deletion (:2853, carried
+// through the batch reshape at :3224). BOTH keys are therefore optional here and are
+// passed ONLY at the call sites whose command touched a single record; a plain read,
+// a multi-record call and a multi-record removal all omit them, which is what keeps
+// those pins the exact historical shape.
 const taskPage = (
     tasks: unknown[],
     total: number,
     completed: number,
     pending: number,
-    storeRev: number
+    storeRev: number,
+    entry?: unknown,
+    removed?: unknown
 ) => ({
     tasks,
     counts: { total, completed, pending },
     page: { offset: 0, limit: 20, hasMore: false },
-    storeRev
+    storeRev,
+    ...(entry === undefined ? {} : { entry }),
+    ...(removed === undefined ? {} : { removed })
 });
 
 // One stored record as the COMMAND door writes it. Attribution comes from the
@@ -467,9 +479,12 @@ describe('/task', () => {
         // `/task add "testing"` — the quoted phrase is ONE task text. An ADD is not
         // a guarded write (there is no prior record), so it needs no token; `rev`
         // starts at 1 and the primary is credited because executeTool has one.
+        //
+        // R1: exactly one record was created, so the same record also answers as
+        // `entry` beside the page.
         expect(await writer.executeCommand('/task add "testing"')).toEqual({
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
-            data: taskPage([record('1', 'testing', false, 1)], 1, 0, 1, 1)
+            data: taskPage([record('1', 'testing', false, 1)], 1, 0, 1, 1, record('1', 'testing', false, 1))
         });
 
         // A later add joins the remaining tokens, and `/task` re-reads the list.
@@ -483,27 +498,43 @@ describe('/task', () => {
             content: '#1 [x] testing\n#2 [ ] fix the build\n2 total, 1 completed, 1 pending\npage: offset 0, limit 20, showing 2',
             // One RECORDED event for the flip (storeRev 3), and `rev` moves by
             // exactly one because one content field changed.
+            //
+            // R1: the flip affected exactly one record, so it is also `entry`.
             data: taskPage(
                 [record('1', 'testing', true, 2), record('2', 'fix the build', false, 1)],
                 2,
                 1,
                 1,
-                3
+                3,
+                record('1', 'testing', true, 2)
             )
         });
         expect(await writer.executeCommand('/task reopen 1')).toEqual({
             content: '#1 [ ] testing\n#2 [ ] fix the build\n2 total, 0 completed, 2 pending\npage: offset 0, limit 20, showing 2',
+            // R1: the reopen affected exactly one record, so it is also `entry`.
             data: taskPage(
                 [record('1', 'testing', false, 3), record('2', 'fix the build', false, 1)],
                 2,
                 0,
                 2,
-                4
+                4,
+                record('1', 'testing', false, 3)
             )
         });
         expect(await writer.executeCommand('/task remove 2')).toEqual({
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
-            data: taskPage([record('1', 'testing', false, 3)], 1, 0, 1, 5)
+            // T1.1 extension: the removal deleted exactly ONE record, so the deleted
+            // body answers as `removed` (`entry` stays absent — a deletion affects no
+            // record in `affected`).
+            data: taskPage(
+                [record('1', 'testing', false, 3)],
+                1,
+                0,
+                1,
+                5,
+                undefined,
+                record('2', 'fix the build', false, 1)
+            )
         });
 
         // The store is THIS harness's: the host tool path and a snapshot both see

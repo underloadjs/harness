@@ -420,6 +420,8 @@ describe('worker mode: shared state is central, not local', () => {
         counts?: { total: number; completed: number; pending: number };
         page?: { offset: number; limit: number; hasMore: boolean };
         storeRev?: number;
+        // R1/T1.1 — the one record a single-record call affected, when there is one.
+        entry?: Record<string, unknown>;
     };
 
     // `updatedAt` (and the change-feed `at`) is the coordinator's wall-clock instant,
@@ -461,7 +463,17 @@ describe('worker mode: shared state is central, not local', () => {
             ],
             counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false },
-            storeRev: 1
+            storeRev: 1,
+            // R1/T1.1 — the lane's add affected exactly ONE record, so the coordinator
+            // answers through the lane with that record as `entry` too.
+            entry: {
+                id: '1',
+                text: 'written from a lane',
+                completed: false,
+                rev: 1,
+                updatedBy: 'demo',
+                updatedAt: stampOf(added?.tasks?.[0])
+            }
         });
 
         const stamp = stampOf(added?.tasks?.[0]);
@@ -476,7 +488,15 @@ describe('worker mode: shared state is central, not local', () => {
 
         // Byte-identical to the first answer, stamp included: the rebuilt replica re-read
         // the canonical store rather than restamping or re-adding anything.
-        expect(reread).toEqual(added);
+        //
+        // R1/T1.1 adds the ONE per-CALL key: `entry` names the record the ADD affected,
+        // and a plain read affects none, so the re-read carries no `entry`. Dropping that
+        // one key from the first answer keeps this an exact comparison of everything the
+        // STORE holds — record, counts, page and stamp — without hiding a difference.
+        const addedPage: TaskPageShape = { ...added };
+
+        delete addedPage.entry;
+        expect(reread).toEqual(addedPage);
 
         // A new worker really was created for the read (nothing survived the reclaim).
         expect((await hostReady(store)).lanes().filter((lane) => lane.sessionKey === session.id)).toHaveLength(1);

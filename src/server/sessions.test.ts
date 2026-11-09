@@ -1673,9 +1673,13 @@ describe('SessionStore manual tool calls', () => {
             storeRev: 1
         };
 
-        expect(await store.callTool(mine.id, 'tasks', { tasks: [{ text: '  only mine ' }] })).toEqual(
-            onlyMine
-        );
+        // R1/T1.1 — this add affected exactly ONE record, so that record also answers
+        // as `entry`. `onlyMine` itself stays the page-only shape, because the plain
+        // re-reads below (which touch no record) must NOT carry it.
+        expect(await store.callTool(mine.id, 'tasks', { tasks: [{ text: '  only mine ' }] })).toEqual({
+            ...onlyMine,
+            entry: onlyMine.tasks[0]
+        });
 
         // The state lives in the session's harness: the same session sees the item —
         // an unchanged read reports the same rev, attribution and storeRev — a

@@ -517,6 +517,27 @@ describe('an owner question answers with its recorded choices', () => {
 });
 
 describe('the opened tile is the streamed tile', () => {
+    // T3: the socket double records SUBSCRIBE frames by id, and an `unsubscribe` frame
+    // names only its `subscription_id` — so "which scope was released" is answered by
+    // joining the two. Sorted, because the order the shell releases the turn flow and the
+    // thread following in is not part of the contract.
+    const threadSubscriptions = (stream: { subscriptions: Record<string, unknown>[] }): Record<string, unknown>[] =>
+        stream.subscriptions.filter((sub) => sub.scope === 'thread');
+
+    const unsubscribedScopes = (stream: {
+        subscriptions: Record<string, unknown>[];
+        sent: Record<string, unknown>[];
+    }): string[] => {
+        const scopeOf = new Map<string, string>(
+            stream.subscriptions.map((sub) => [String(sub.subscription_id), String(sub.scope)])
+        );
+
+        return stream.sent
+            .filter((frame) => frame.type === 'unsubscribe')
+            .map((frame) => scopeOf.get(String(frame.subscription_id)) ?? 'unknown')
+            .sort();
+    };
+
     it('subscribes to the expanded turn on the turn scope and leaves it on the next expansion', async () => {
         // The socket double and the shell must resolve the SAME `./stream` module
         // instance: `vi.resetModules()` cleared the registry, so a static import would
@@ -551,14 +572,24 @@ describe('the opened tile is the streamed tile', () => {
         // Closing THAT tile closes its flow: an unsubscribe frame on the same socket,
         // and no second subscription while nothing is expanded. The reader is not
         // watching a collapsed row, so its streamed text is not worth a connection.
+        //
+        // T3 (R3): collapsing also stops FOLLOWING the conversation itself, so the
+        // `thread`-scope registration the expand created is released in the same gesture.
+        // Unsubscribe frames name only a `subscription_id`, so the scope is resolved from
+        // the subscribe that opened it.
         tiles()[0]?.querySelector<HTMLButtonElement>('.tile-select')?.click();
         await flush();
 
         expect(stream.subscriptions.filter((sub) => sub.scope === 'turn')).toHaveLength(1);
-        expect(stream.sent.filter((frame) => frame.type === 'unsubscribe')).toHaveLength(1);
+        expect(unsubscribedScopes(stream)).toEqual(['thread', 'turn']);
+
+        // T3 (R2): the expanded conversation was followed while it was open, and the
+        // collapse released it — the pair below is the whole of that statement.
+        expect(threadSubscriptions(stream).map((sub) => sub.thread_id)).toEqual(['th-a']);
 
         // Opening a different tile moves the subscription to it — exactly one more
-        // `turn` subscription, addressed to the row the reader chose.
+        // `turn` subscription, addressed to the row the reader chose. The CONVERSATION is
+        // the same one (`th-a`), so following it is re-established once, not duplicated.
         tiles()[tiles().length - 1]?.querySelector<HTMLButtonElement>('.tile-select')?.click();
         await flush();
 
@@ -566,6 +597,10 @@ describe('the opened tile is the streamed tile', () => {
             openedId,
             otherId
         ]);
-        expect(stream.sent.filter((frame) => frame.type === 'unsubscribe')).toHaveLength(1);
+        expect(threadSubscriptions(stream).map((sub) => sub.thread_id)).toEqual(['th-a', 'th-a']);
+
+        // Nothing is released by this gesture: the conversation was collapsed first, so
+        // the reader is OPENING, not moving. The two releases above are the whole of it.
+        expect(unsubscribedScopes(stream)).toEqual(['thread', 'turn']);
     }, 20_000);
 });
