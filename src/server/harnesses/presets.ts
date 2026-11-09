@@ -336,7 +336,21 @@ const demo: HarnessPreset = {
             // scripted transport never calls actionRequest, but forwarding it keeps
             // "a preset choice changes agents, not host capabilities". It must be a
             // TOP-LEVEL configuration field: presence registers the tool.
-            ...(report?.interaction === undefined ? {} : { interaction: report.interaction })
+            ...(report?.interaction === undefined ? {} : { interaction: report.interaction }),
+            // R2/R3: the two DEPLOYMENT-WIDE switches, forwarded on the same top-level rule
+            // the live toolbox already honours (../harnesses/toolbox.ts). Before this line the
+            // scripted fixture was the one preset that IGNORED them: `PATCH
+            // /v1/harness/tools/{tool_id}` left `timeNow` declared, callable and "enabled" to a
+            // demo model, and `PATCH /v1/harness/plugins/{plugin_id}` left the built-in plugins'
+            // hooks running with their shipped knobs - inline AND on a lane, because the lane
+            // hands this same report to the same factory (../workers/lane-worker-loop.ts
+            // `sayHello`). The scripted transport changes nothing about that: the switches gate
+            // the runtime's tool decisions and the framework's hook delivery, not the stream.
+            //
+            // Absence keeps the historical behaviour byte for byte: no provider means nothing
+            // disabled and the library's declared-default plugin settings (src/harness.ts:1395).
+            ...(report?.pluginSettings === undefined ? {} : { pluginSettings: report.pluginSettings }),
+            ...(report?.toolSettings === undefined ? {} : { toolSettings: report.toolSettings })
         })
 };
 

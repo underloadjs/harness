@@ -75,15 +75,24 @@
 //     ignored forever - the contract's "a client is never left believing it changed
 //     something" rule (src/server/harness.swagger.yaml `components.responses.BadRequest`).
 //
-// WORKER MODE (documented limit)
-// ------------------------------
+// WORKER MODE (the provider cannot cross; the VALUES can)
+// -------------------------------------------------------
 // A lane worker rebuilds its replica from the preset RECORD in the `hello` blueprint
-// (src/server/workers/lane-worker-loop.ts:968-984) and passes `{ stateChange, interaction }`
-// as the report. `HarnessPresetReport.pluginSettings` is OPTIONAL, so a worker keeps
-// compiling: it gets the library's declared-default provider, because a live closure cannot
-// cross a `worker_threads` boundary and the blueprint carries no settings field. Inline
-// sessions (the default, `threadExecution: 'inline'`) get the live store, which is what the
-// acceptance criteria are about.
+// (src/server/workers/lane-worker-loop.ts `sayHello`) and passes `{ stateChange, interaction,
+// toolSettings, pluginSettings }` as the report. The LIVE provider is a closure, so it can
+// never cross a `worker_threads` boundary; what crosses instead is this store's `snapshot()`
+// - the override map in exactly the shape `state.json` holds it - carried as
+// `LaneBlueprint.pluginSettings` (src/server/workers/protocol.ts), read at lane creation by
+// src/server/sessions.ts `blueprintFor`, and turned back into a read-only provider by
+// `lanePluginSettingsProvider`. A replica therefore resolves the operator's `enabled` switch
+// (the framework's hook gate, src/plugin/host.ts + src/plugin/hooks.ts) and every other knob
+// exactly like an inline session, and a value changed while a lane was running reaches that
+// lane when the lane is next created - the semantics the plugin PATCH documents.
+//
+// The one deliberate difference: a lane's provider has no `set`, so a plugin calling
+// `api.settings.setOwn` on a replica gets the library's stated "read-only (no writer)"
+// refusal instead of writing into a private copy that dies with the lane. No built-in writes
+// settings (src/plugins/** reads only), so this is a honesty change, not a behaviour change.
 //
 // Cross-references:
 //   - ../plugin/manifest.ts       — BUILTIN_PLUGIN_DESCRIPTORS: the seeded catalogue + defaults

@@ -1320,7 +1320,14 @@ describe('harness', () => {
 
         // R2/R3/R4: the auto-discovered built-ins are applied FIRST, so `plugins`
         // reports them as well — a host plugin list is additive, never the whole set.
-        expect(writer.plugins).toEqual(['async-ping', 'context-compaction', 'extras']);
+        // R5 added the third built-in (`context-trimmer`), so the auto-discovered set is
+        // async-ping + context-compaction + context-trimmer, in manifest order.
+        expect(writer.plugins).toEqual([
+            'async-ping',
+            'context-compaction',
+            'context-trimmer',
+            'extras'
+        ]);
         expect(writer.agents.researcher.name).toBe('researcher');
         expect(writer.tools.now.description).toBe('Time.');
         // A plugin-contributed tool is searchable too: it does not bypass discovery.

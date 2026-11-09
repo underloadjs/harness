@@ -47,17 +47,32 @@
 // (../api-reads.ts `isProtectedToolName`, which imports it from here) and the same rule
 // the runtime enforces through `requireSwitchableTool` (../harness.ts).
 //
-// WORKER MODE (same documented limit as ./plugins.ts)
+// WORKER MODE (the provider cannot cross; the SET can)
 // ---------------------------------------------------
 // A lane worker rebuilds its replica from the preset RECORD in the `hello` blueprint, and
-// a live provider closure cannot cross a `worker_threads` boundary, so a replica harness
-// runs with no global provider until its lane is re-created. Every inline session — the
-// default deployment shape — reads the switch live.
+// `provider` is a closure, so a replica can never hold the store's LIVE object. It does not
+// have to: the store's SNAPSHOT travels as data. `../sessions.ts` `blueprintFor` reads
+// `disabled()` at lane creation into `LaneBlueprint.disabledTools`
+// (../workers/protocol.ts), and `../workers/lane-worker-loop.ts` `laneToolSettingsProvider`
+// turns that list back into a provider the replica is BUILT with. So a lane honours every
+// name that was switched off when its lane was created, and a name switched off while the
+// lane was already running reaches it when the lane is next created (an idle reclaim, a new
+// conversation, an authority rebuild) - the documented lane semantics, the same ones
+// `PATCH /v1/harness/plugins/{plugin_id}` states (../harness.swagger.yaml, that PATCH).
+// Discovery is NOT delayed even in that window: a lane's `toolRequest` is routed to the
+// authority (../workers/lane-authority.ts), which answers against the canonical harness and
+// therefore against this live provider.
+//
+// Every inline session - the default deployment shape - reads the switch live, on the turn
+// it is made.
 //
 // Cross-references:
 //   - ./plugins.ts            — the sibling store this one mirrors (live provider, revision, snapshot)
 //   - ./persistence.ts        — `HarnessToolSettingsRecord`, the durable deny list
 //   - ./sessions.ts           — owns one store per runtime, passes `provider` to buildHarness
+//                               and `disabled()` to every lane blueprint (`blueprintFor`)
+//   - ./workers/protocol.ts   — `LaneBlueprint.disabledTools`, the lane-creation snapshot on the wire
+//   - ./workers/lane-worker-loop.ts — `laneToolSettingsProvider`, the snapshot turned back into a provider
 //   - ./api.ts                — `GET /tools` rows and `PATCH /tools/{tool_id}`
 //   - ../harness.ts           — the three consumers of the provider
 //   - ../types/index.ts       — `HarnessToolSettingsProvider`, `HarnessConfiguration.toolSettings`

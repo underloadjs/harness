@@ -55,8 +55,11 @@ import type {
     HarnessEvent,
     HarnessIdentityReservation,
     HarnessMessage,
+    HarnessPluginSettingsProvider,
+    HarnessToolSettingsProvider,
     ToolContext
 } from '../../types';
+import type { HarnessPluginSettingsRecord } from '../persistence';
 import type { HarnessPreset } from '../harnesses/types';
 import { presetFromRecord } from '../harnesses';
 import type { LaneAuthorityRequest } from './lane-authority';
@@ -1115,6 +1118,105 @@ export const nestedRunHandshakeLimitations = (refusedTools: readonly string[]): 
     ...NESTED_RUN_ARMED_DOORS.map((door) => ({ code: NESTED_RUN_LIMITATION_CODE, message: nestedRunRefusalMessage(door) }))
 ];
 
+// R3 (the GLOBAL tool switch): turn the blueprint's LANE-CREATION deny-list into the
+// provider this replica's harness is built with. It lives here, next to its only caller,
+// and is EXPORTED for the same reason `requestToolsRoutePayload` is: it is the one piece of
+// the lane's tool-settings path that can be pinned without spawning a thread.
+//
+// WHY A SNAPSHOT IS THE HONEST SHAPE HERE: the coordinator's provider is a closure over the
+// live store (../tool-settings.ts `provider`), and a closure cannot cross `worker_threads`.
+// The alternative - shipping nothing - is what the "WORKER MODE" headers used to document as
+// a limit: a lane kept declaring and launching tools the operator had switched off. Carrying
+// the SET at lane creation gives a new lane the CURRENT value (an idle reclaim, a new
+// conversation, an authority rebuild) while a live lane keeps the value it was built with,
+// which is exactly the documented lane semantics (../harness.swagger.yaml, the
+// plugin-settings PATCH: a lane "picks the new value up the next time its lane is created").
+//
+// WHY `undefined` FOR AN EMPTY LIST: `harness()` keeps a fast path for "no provider wired"
+// (src/harness.ts `declared()` returns the list as built when `toolSettings` is absent), and
+// an empty deny list answers identically to an absent provider. Returning the provider only
+// when it can actually refuse something keeps a lane with nothing switched off byte-identical
+// to the pre-R3 replica, and makes `blueprint.disabledTools: []` and an absent field mean the
+// same thing rather than two shapes.
+//
+// EDGE CASES, all deliberate:
+//   - a protected (harness-owned) name can never appear in the list: the store refuses the
+//     write with 403 and drops one at restore (../tool-settings.ts), so the replica never
+//     sees `toolRequest` switched off;
+//   - the list is COPIED into a Set, so a caller mutating the array afterwards cannot move
+//     this lane's answer mid-turn (a snapshot that changes under a run is not a snapshot).
+// The worker's OWN read of the two deployment-wide switches, built from the blueprint's
+// lane-creation snapshots. Both exist because the coordinator's providers are CLOSURES over
+// live stores - `../tool-settings.ts` and `../plugins.ts` hand every harness the same object
+// and re-read it per decision - and a closure cannot cross `worker_threads`. Serialising the
+// VALUES at lane creation (../sessions.ts `blueprintFor`) and rebuilding the provider here is
+// what makes a replica answer the operator's switches instead of the library's declared
+// defaults; a live lane keeps the state it was created with and the next lane sees the edit,
+// the documented semantics (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}).
+//
+// `undefined` for an absent/empty snapshot is the deliberate fast path: the preset factories
+// spread these members only when present (../harnesses/toolbox.ts), so a deployment that never
+// touched either switch builds exactly the harness it built before the switches existed -
+// including the library's declared-default plugin-settings provider, which is what an absent
+// `HarnessConfiguration.pluginSettings` means (src/harness.ts:1395).
+export const laneToolSettingsProvider = (disabledTools?: readonly string[]): HarnessToolSettingsProvider | undefined => {
+    if (disabledTools === undefined || disabledTools.length === 0) return undefined;
+
+    const disabled = new Set(disabledTools);
+
+    return {
+        // `harness()` treats any non-`true` answer as enabled (src/harness.ts
+        // `isToolGloballyDisabled`), and a Set lookup is exactly that answer.
+        isToolDisabled: (name: string) => disabled.has(name)
+    };
+};
+
+// R3 (the PLUGIN switches): the blueprint's plugin-settings snapshot turned back into the
+// `HarnessPluginSettingsProvider` the replica's harness is built with - the twin of
+// `laneToolSettingsProvider` above, for the other deployment-wide setting.
+//
+// WHY A `get`-ONLY PROVIDER IS THE RIGHT SHAPE HERE: the settings view a plugin holds
+// resolves `stored override -> declared default -> call fallback` (src/plugin/settings.ts
+// `resolve`), so a provider that answers ONLY the operator's overrides is complete - every
+// key nobody touched keeps its declared default, exactly like the host's own provider, which
+// is also an override map (../plugins.ts `provider`). No plugin metadata has to cross, and
+// the library's `wakeIntervalMs` legacy seed is unaffected: the server never sets that field,
+// and `DEFAULT_WAKE_INTERVAL_MS` equals the `async-ping` plugin's declared default, so an
+// override-less read answers the same 600000 either way.
+//
+// NO `set` MEMBER, deliberately: the provider contract treats a writer-less provider as a
+// read model, and `api.settings.setOwn` refuses it with the stated "this harness's
+// plugin-settings provider is read-only (no writer)" answer (src/plugin/settings.ts:324-331).
+// That is the honest lane answer. The provider a replica used to get instead (the library's
+// in-memory one, absent configuration) ACCEPTS a write into a copy that dies with the lane,
+// so a plugin that stored a value believed the host had it. Nothing shipped calls `setOwn`
+// (src/plugins/** reads only), so this changes no built-in's behaviour - it makes a
+// hypothetical host plugin's write refuse loudly instead of lying quietly.
+//
+// `undefined` for an absent/empty snapshot: no plugin setting has ever been changed (the
+// pre-R3 document shape), so the worker installs no provider and the library's
+// declared-default provider answers, byte for byte as before.
+//
+// EDGE CASES:
+//   - the map is COPIED (per plugin), so a caller mutating the blueprint afterwards cannot
+//     move a live lane's answer mid-turn - the same snapshot rule as the tool deny list;
+//   - an OWN-KEY lookup only: a plugin named `constructor` or `toString` must not resolve
+//     through the prototype and report a value nobody stored.
+export const lanePluginSettingsProvider = (
+    pluginSettings?: HarnessPluginSettingsRecord
+): HarnessPluginSettingsProvider | undefined => {
+    if (pluginSettings === undefined || Object.keys(pluginSettings).length === 0) return undefined;
+
+    const snapshot: HarnessPluginSettingsRecord = {};
+
+    for (const [plugin, values] of Object.entries(pluginSettings)) snapshot[plugin] = { ...values };
+
+    return {
+        get: (plugin: string, key: string) =>
+            Object.prototype.hasOwnProperty.call(snapshot, plugin) ? snapshot[plugin]?.[key] : undefined
+    };
+};
+
 const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise<void> => {
     const blueprint: LaneBlueprint = frame.blueprint;
 
@@ -1125,6 +1227,14 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
     // the coordinator's process cannot cross (./capability.ts refuses such a preset).
     const preset = presetFromRecord(blueprint.record);
 
+    // R3: the replica's global tool provider, built ONCE here so the presence test below and
+    // the value it installs can never disagree.
+    const toolSettings = laneToolSettingsProvider(blueprint.disabledTools);
+    // R3: and the replica's plugin-settings provider, same one-build rule. This is the value
+    // every plugin's `api.settings` - and therefore the framework's `enabled` HOOK gate -
+    // resolves through on this thread (src/plugin/host.ts, src/plugin/hooks.ts).
+    const pluginSettings = lanePluginSettingsProvider(blueprint.pluginSettings);
+
     const replica = preset.create(
         { ...blueprint.settings, ...(blueprint.apiKey === undefined ? {} : { apiKey: blueprint.apiKey }) },
         (event: HarnessEvent) => emitProgress(event),
@@ -1133,6 +1243,27 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
             // boundary, and boundaries are driven by the commit calls below. This callback
             // must never throw: the core swallows observer errors (T3 finding F4's invisibility).
             stateChange: () => undefined,
+            // R3: the GLOBAL tool switch, as THIS lane was created. The blueprint carries the
+            // deny list itself (the coordinator's provider is a closure and cannot cross
+            // `worker_threads`), and `laneToolSettingsProvider` above turns it back into the
+            // provider the factory below forwards into `HarnessConfiguration.toolSettings`
+            // (../harnesses/toolbox.ts). A lane therefore honours every name switched off when
+            // the lane was created, and picks up a later edit when it is next created - the
+            // documented lane semantics, the same ones the plugin-settings PATCH states
+            // (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}). Discovery is not even delayed by that window:
+            // a lane's `toolRequest` is routed to the authority (../lane-authority.ts), which
+            // answers against the canonical harness and so against the LIVE provider.
+            ...(toolSettings === undefined ? {} : { toolSettings }),
+            // R3: the plugin switches, on the identical rule. The framework gates every
+            // built-in plugin's HOOKS on `settings.boolean('enabled', true)`
+            // (src/plugin/host.ts:183-197, src/plugin/hooks.ts `isDeliverable`), and the view
+            // resolves `stored override -> declared default` (src/plugin/settings.ts
+            // `resolve`). Without the blueprint's override map a replica therefore answered
+            // the DECLARED default, so a plugin the operator switched off kept running its
+            // hooks on every lane - and every knob (`contextLimit`, `minTokens`, `intervalMs`)
+            // kept its shipped value. With it, the replica's gate reads the operator's value,
+            // and an override-less key still falls through to its declared default.
+            ...(pluginSettings === undefined ? {} : { pluginSettings }),
             // T1.5's last mile, stated rather than left implied: the HOST has a diagnostic sink
             // now (../sessions.ts `notePluginDiagnostic`), and this replica does not forward one,
             // because a report fired inside a hook has no frame to travel on — a closure cannot

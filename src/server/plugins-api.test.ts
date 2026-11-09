@@ -1,9 +1,10 @@
 // T5 (R2/R3) — the plugin settings REST contract, the live-provider wiring, and durability.
 //
 // WHAT THIS FILE PROVES (one block per acceptance criterion):
-//   1. LIST      - `GET /v1/harness/plugins` answers BOTH built-ins, in manifest order, with
-//                  their declared settings + defaults, effective `values`, and `builtin: true`.
-//                  Paging and `q` behave like every other collection in this contract.
+//   1. LIST      - `GET /v1/harness/plugins` answers EVERY built-in the manifest ships, in
+//                  manifest order, with their declared settings + defaults, effective
+//                  `values`, and `builtin: true`. Paging and `q` behave like every other
+//                  collection in this contract.
 //   2. WRITE     - `PATCH /v1/harness/plugins/{plugin_id}` validates against the plugin's own
 //                  descriptor, answers the updated row, bumps the collection revision, and is
 //                  durable BEFORE the response.
@@ -57,7 +58,7 @@ const SETTINGS: RunnerSettings = {
 
 const DEFAULTS = { baseURL: 'http://provider.test/v1', model: 'demo-model', hasApiKey: true };
 
-// The two shipped descriptors, read from the generated manifest rather than retyped: the plugin
+// The shipped descriptors, read from the generated manifest rather than retyped: the plugin
 // file is the single owner of its own metadata, so a row that echoed prose typed here would
 // drift the moment the plugin changed. Every NUMBER (default/min/step) and every identity field
 // IS hardcoded below, because those are the contract this route exposes.
@@ -65,6 +66,17 @@ const ASYNC_PING = BUILTIN_PLUGIN_DESCRIPTORS.find((entry) => entry.name === 'as
 const COMPACTION = BUILTIN_PLUGIN_DESCRIPTORS.find(
     (entry) => entry.name === 'context-compaction'
 ) as HarnessPluginMetadata;
+// The third built-in (R5, `src/plugins/context-trimmer.plugin.ts`). Its metadata is owned by
+// the plugin file and mirrored here through the manifest, exactly like the two above, so a
+// wording change in the plugin cannot silently break this contract test.
+const TRIMMER = BUILTIN_PLUGIN_DESCRIPTORS.find(
+    (entry) => entry.name === 'context-trimmer'
+) as HarnessPluginMetadata;
+// The manifest scan order (path ascending), written ONCE here as a literal and asserted
+// against the route, the toolbox factory and the row list alike. It is an exact pin, not a
+// derivation: a re-ordered or renamed built-in fails these assertions, and the pane renders
+// this order as-is.
+const CATALOGUE = ['async-ping', 'context-compaction', 'context-trimmer'];
 
 // ---------------------------------------------------------------------------
 // Scratch root: the workspace `Temp/` (repo policy: throwaway work lives in the repo-root
@@ -305,15 +317,15 @@ afterEach(() => {
 });
 
 describe('GET /v1/harness/plugins', () => {
-    it('lists both built-ins with their declared settings, defaults, and effective values', async () => {
+    it('lists every built-in with their declared settings, defaults, and effective values', async () => {
         const runtime = createRuntime();
         const page = await call(runtime, 'GET', `${MOUNT}/plugins`);
 
         expect(page.status).toBe(200);
         expect(Object.keys(page.body).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
 
-        // A two-entry catalogue fits one default page, so the cursor ends the collection.
-        expect(page.body.limit).toBe(2);
+        // A three-entry catalogue fits one default page, so the cursor ends the collection.
+        expect(page.body.limit).toBe(3);
         expect(page.body.next_cursor).toBeNull();
 
         // An untouched runtime has a collection revision of 0 ("never changed"), exactly like
@@ -325,11 +337,11 @@ describe('GET /v1/harness/plugins', () => {
         expect(page.headers).toEqual({ [HARNESS_EPOCH_HEADER]: runtime.events.epoch });
 
         // Manifest order (scan order, path ascending), pinned because the pane renders it as-is.
-        expect(page.body.items.map((row: { name: string }) => row.name)).toEqual(['async-ping', 'context-compaction']);
+        expect(page.body.items.map((row: { name: string }) => row.name)).toEqual(CATALOGUE);
 
         // The full row key set (the closed `PluginSummary` object). A plugin that declares no
-        // description/version/tags/hooks would omit those keys, and both shipped plugins declare
-        // all four, so the set below IS what the shipped catalogue answers.
+        // description/version/tags/hooks would omit those keys, and all three shipped plugins
+        // declare all four, so the set below IS what the shipped catalogue answers.
         expect(Object.keys(page.body.items[0]).sort()).toEqual([
             'builtin',
             'description',
@@ -394,46 +406,93 @@ describe('GET /v1/harness/plugins', () => {
                     step: 1000,
                     description: COMPACTION.settings?.[0].description
                 },
-{
-                    key: "enabled",
-                    label: "Compact conversations",
-                    type: "boolean",
+                // R4 added these two BEFORE `enabled` (declared order is the row order the pane
+                // renders, so both position and value are pinned): the headroom that moves the
+                // firing point off the ceiling, and the per-model JSON override map.
+                {
+                    key: 'gapTokens',
+                    label: 'Headroom before the limit (tokens)',
+                    type: 'number',
+                    default: 65536,
+                    min: 0,
+                    step: 1024,
+                    description: COMPACTION.settings?.find((setting) => setting.key === 'gapTokens')?.description
+                },
+                {
+                    key: 'modelLimits',
+                    label: 'Per-model limits (JSON)',
+                    type: 'string',
+                    default: '{}',
+                    description: COMPACTION.settings?.find((setting) => setting.key === 'modelLimits')?.description
+                },
+                {
+                    key: 'enabled',
+                    label: 'Compact conversations',
+                    type: 'boolean',
                     default: true,
-                    description: COMPACTION.settings?.find((setting) => setting.key === "enabled")?.description
-                    },
-{
-                    key: "minTokens",
-                    label: "Minimum saving per pass (tokens)",
-                    type: "number",
+                    description: COMPACTION.settings?.find((setting) => setting.key === 'enabled')?.description
+                },
+                {
+                    key: 'minTokens',
+                    label: 'Minimum saving per pass (tokens)',
+                    type: 'number',
                     default: 200,
                     min: 0,
                     step: 50,
-                    description: COMPACTION.settings?.find((setting) => setting.key === "minTokens")?.description
-                    },
-{
-                    key: "safetyTurns",
-                    label: "Recent units to protect",
-                    type: "number",
+                    description: COMPACTION.settings?.find((setting) => setting.key === 'minTokens')?.description
+                },
+                {
+                    key: 'safetyTurns',
+                    label: 'Recent units to protect',
+                    type: 'number',
                     default: 6,
                     min: 0,
                     step: 1,
-                    description: COMPACTION.settings?.find((setting) => setting.key === "safetyTurns")?.description
-                    },
-{
-                    key: "mode",
-                    label: "Compaction mode",
-                    type: "string",
-                    default: "exclude",
-                    description: COMPACTION.settings?.find((setting) => setting.key === "mode")?.description
-                    }
+                    description: COMPACTION.settings?.find((setting) => setting.key === 'safetyTurns')?.description
+                },
+                {
+                    key: 'mode',
+                    label: 'Compaction mode',
+                    type: 'string',
+                    default: 'exclude',
+                    description: COMPACTION.settings?.find((setting) => setting.key === 'mode')?.description
+                }
             ],
             values: {
                 contextLimit: 100000,
+                gapTokens: 65536,
+                modelLimits: '{}',
                 enabled: true,
                 minTokens: 200,
                 safetyTurns: 6,
                 mode: 'exclude'
             }
+        });
+
+        // The third row: `context-trimmer` (R5). Same closed key set, and `values` is the
+        // projection of ITS declared keys only — one boolean — which is the proof the route does
+        // not leak another plugin's settings onto a row.
+        expect(page.body.items[2]).toEqual({
+            name: 'context-trimmer',
+            title: 'Context Trimmer',
+            description: TRIMMER.description,
+            version: '1.0.0',
+            tags: ['context', 'trimming', 'lifecycle'],
+            hooks: TRIMMER.hooks,
+            builtin: true,
+            // Same reserved-switch rule as compaction: the plugin DECLARES `enabled`, so the row
+            // field and `values.enabled` are one stored value read two ways.
+            enabled: true,
+            settings: [
+                {
+                    key: 'enabled',
+                    label: 'Trim superseded tool calls',
+                    type: 'boolean',
+                    default: true,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'enabled')?.description
+                }
+            ],
+            values: { enabled: true }
         });
     });
 
@@ -461,10 +520,17 @@ describe('GET /v1/harness/plugins', () => {
         expect(first.body.limit).toBe(1);
         expect(typeof first.body.next_cursor).toBe('string');
 
+        // One entry per page over a THREE-entry catalogue: pages 1 and 2 are full, so each
+        // advertises a cursor, and only the last page ends the collection.
         const second = await call(runtime, 'GET', `${MOUNT}/plugins`, {}, `limit=1&cursor=${first.body.next_cursor}`);
 
         expect(second.body.items.map((row: { name: string }) => row.name)).toEqual(['context-compaction']);
-        expect(second.body.next_cursor).toBeNull();
+        expect(typeof second.body.next_cursor).toBe('string');
+
+        const third = await call(runtime, 'GET', `${MOUNT}/plugins`, {}, `limit=1&cursor=${second.body.next_cursor}`);
+
+        expect(third.body.items.map((row: { name: string }) => row.name)).toEqual(['context-trimmer']);
+        expect(third.body.next_cursor).toBeNull();
 
         // A limit outside the contract bounds is a 400 naming the parameter.
         expect((await call(runtime, 'GET', `${MOUNT}/plugins`, {}, 'limit=0')).status).toBe(400);
@@ -496,8 +562,15 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(patched.status).toBe(200);
         expect(Object.keys(patched.body)).toEqual(['plugin']);
         expect(patched.body.plugin.name).toBe('context-compaction');
+        // `values` is the projection of EVERY declared key (seven as of R4: the limit, the two
+        // new trigger knobs, and the four policy knobs), not just the one that was written. The
+        // same seven-key map is what every later read below re-asserts, because the store answers
+        // stored value -> declared default per key and a partial projection would let a new
+        // setting ship without ever being exposed on the contract.
         expect(patched.body.plugin.values).toEqual({
             contextLimit: 200000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -519,13 +592,15 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(reload.body.revision).toBe(1);
         expect(reload.body.items[1].values).toEqual({
             contextLimit: 200000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
             mode: 'exclude'
         });
 
-        // The other plugin is untouched, and only the changed plugin is stored.
+        // The other plugins are untouched, and only the changed plugin is stored.
         expect(reload.body.items[0].values).toEqual({ intervalMs: 600000 });
         expect(pluginsOf(runtime).snapshot()).toEqual({ 'context-compaction': { contextLimit: 200000 } });
     });
@@ -550,6 +625,8 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         // `values` carries a NUMBER, not the text that arrived, so a client round-trips types.
         expect(patched.body.plugin.values).toEqual({
             contextLimit: 150000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -567,6 +644,8 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(reset.status).toBe(200);
         expect(reset.body.plugin.values).toEqual({
             contextLimit: 100000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -584,7 +663,12 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
 
         expect(await patchSettings(runtime, 'nope', { contextLimit: 5000 })).toEqual({
             status: 404,
-            body: { error: { message: 'Unknown plugin "nope". This build ships: async-ping, context-compaction.' } },
+            body: {
+                error: {
+                    message:
+                        'Unknown plugin "nope". This build ships: async-ping, context-compaction, context-trimmer.'
+                }
+            },
             headers: {}
         });
     });
@@ -597,7 +681,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, gapTokens, modelLimits, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -667,7 +751,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, gapTokens, modelLimits, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -761,10 +845,12 @@ describe('the live settings provider reaches an existing session', () => {
             { pluginSettings: pluginsOf(runtime).provider }
         );
 
-        // `harness()` applied the auto-scanned catalogue on top of the host provider: both
-        // built-ins are present, which is the shape the Plugins pane lists.
-        expect(built.plugins).toEqual(['async-ping', 'context-compaction']);
-        expect(built.pluginMetadata.map((entry) => entry.name)).toEqual(['async-ping', 'context-compaction']);
+        // `harness()` applied the auto-scanned catalogue on top of the host provider: all three
+        // built-ins are present, which is the shape the Plugins pane lists. `CATALOGUE` is the
+        // manifest's own scan order, so this also proves the catalogue is not re-sorted on the
+        // way through the toolbox factory.
+        expect(built.plugins).toEqual(CATALOGUE);
+        expect(built.pluginMetadata.map((entry) => entry.name)).toEqual(CATALOGUE);
 
         // And the provider it was built with is still live: an edit lands on the same map.
         pluginsOf(runtime).update('context-compaction', { contextLimit: 12000 });
@@ -979,6 +1065,8 @@ describe('plugin settings survive a restart', () => {
         expect(second.store.pluginSettings.provider.get('context-compaction', 'contextLimit')).toBe(200000);
         expect(second.store.pluginSettings.values('context-compaction')).toEqual({
             contextLimit: 200000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -991,6 +1079,8 @@ describe('plugin settings survive a restart', () => {
         expect(page.body.revision).toBe(0);
         expect(page.body.items[1].values).toEqual({
             contextLimit: 200000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -1036,6 +1126,8 @@ describe('plugin settings survive a restart', () => {
         expect(page.body.items[0].values).toEqual({ intervalMs: 9000 });
         expect(page.body.items[1].values).toEqual({
             contextLimit: 4000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -1079,15 +1171,20 @@ describe('plugin settings survive a restart', () => {
         expect(fourth.store.pluginSettings.get('context-compaction', 'contextLimit')).toBeUndefined();
         expect(fourth.store.pluginSettings.values('context-compaction')).toEqual({
             contextLimit: 100000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
             mode: 'exclude'
         });
         expect((await call(fourth, 'GET', `${MOUNT}/plugins`)).body.items[1].values).toEqual({
-            // Back on every declared default — and "declared" now means all five settings
-            // (compaction T4.6), not just the limit.
+            // Back on every declared default — and "declared" now means all seven settings
+            // (five as of compaction T4.6, plus R4's `gapTokens` and `modelLimits`), not just
+            // the limit.
             contextLimit: 100000,
+            gapTokens: 65536,
+            modelLimits: '{}',
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,

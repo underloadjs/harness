@@ -75,7 +75,20 @@ export type LaneTarget = { kind: 'thread'; threadId: string } | { kind: 'root'; 
 // The per-session data a lane needs to rebuild its replica. The store already owns both
 // records, so the host never keeps session state of its own: a reclaimed lane costs nothing
 // but a rebuild from committed state.
-export type LaneBlueprintSource = Pick<LaneBlueprint, 'record' | 'settings' | 'apiKey' | 'memoryKeys'>;
+//
+// `disabledTools` and `pluginSettings` (both R3) join the same list because they are the
+// same KIND of value: durable, deployment-wide settings the coordinator can only hand over as
+// data. The store reads both at THIS moment (../sessions.ts `blueprintFor`, from
+// ../tool-settings.ts `disabled()` and ../plugins.ts `snapshot()`), the host merges them into
+// the `hello` blueprint verbatim below, and the worker turns each back into the provider its
+// harness is built with (./lane-worker-loop.ts `laneToolSettingsProvider` /
+// `lanePluginSettingsProvider`). They are therefore LANE-CREATION snapshots, not live reads -
+// the documented lane semantics for every value that crosses here
+// (../harness.swagger.yaml, the plugin-settings PATCH).
+export type LaneBlueprintSource = Pick<
+    LaneBlueprint,
+    'record' | 'settings' | 'apiKey' | 'memoryKeys' | 'disabledTools' | 'pluginSettings'
+>;
 
 export type LaneTurnRequest = {
     sessionKey: string;

@@ -2471,7 +2471,10 @@ describe('durable steered-submit text archive (T14)', () => {
 //
 // Both are measured as a DIFFERENCE against the same fixture with the built-in replaced by a
 // no-op plugin of the same name (a programmatic plugin naming a built-in replaces it —
-// ./plugin/host.ts), so the counts cannot be inflated by the run's own writes.
+// ./plugin/host.ts), so the counts cannot be inflated by the run's own writes. The R5
+// `context-trimmer` built-in is switched off through the fixture's settings provider for the
+// SAME reason: it is a second `turn.before` context pass, and the control arm must contain no
+// pass at all (see the provider comment below for the measurements).
 //
 // The seeded conversation is deliberately a REAL tool exchange rather than a hand-written
 // transcript: the units carry a persisted `outcome: 'failed'` (T1) produced by a throwing
@@ -2491,6 +2494,11 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
     // turn, `minTokens: 10` clears the withheld failures, and `safetyTurns: 0` removes the
     // horizon so the whole transcript is eligible (the horizon has its own cases in
     // src/plugin/context-compaction.test.ts).
+    //
+    // R4's two new knobs are deliberately NOT listed, i.e. they take their declared defaults:
+    // `modelLimits` stays `{}` (no per-model ceiling) and `gapTokens` stays 65536, which
+    // clamps the trigger to `max(1, 100 - 65536) = 1` token — so this fixture still crosses it
+    // on the very first turn, exactly as it did before the headroom existed.
     const OPERATOR_SETTINGS: Record<string, number> = {
         contextLimit: 100,
         minTokens: 10,
@@ -2553,8 +2561,29 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
                 primary: 'writer',
                 presets: false,
                 pluginSettings: {
-                    get: (plugin, key) =>
-                        plugin === 'context-compaction' ? OPERATOR_SETTINGS[key] : undefined
+                    // The operator's compaction numbers, plus ONE deliberate host-side override:
+                    // `context-trimmer` — the other shipped `turn.before` context pass, added by
+                    // R5 — is seeded OFF for this whole fixture.
+                    //
+                    // WHY: on this seeded transcript the trimmer's rule (a `failed`/`rejected`
+                    // unit that ANY later unit answers the same TOOL NAME on) is a superset of
+                    // compaction's, so left on its declared default it runs its OWN three-unit
+                    // pass in the `compact: false` control. Measured directly (same seed, same
+                    // provider, plain `harness()`): control ON -> 3 `agent_message` notifications
+                    // + a `policy:context-trimmer withheld 3 superseded tool unit(s)` diagnostic
+                    // + six flags on the "untouched" transcript; control OFF -> 2 + none + none.
+                    // In the `compact: true` run the trimmer writes NOTHING either way, because
+                    // compaction runs first (manifest order) and withholds the same three units,
+                    // and the trimmer's idempotence guard skips a unit that is no longer included
+                    // — compacted is identical with the trimmer on and off. So disabling it moves
+                    // only the control, which is precisely the arm that has to stay a run with NO
+                    // pass for the coalescing delta below to mean what it claims.
+                    get: (plugin, key) => {
+                        if (plugin === 'context-compaction') return OPERATOR_SETTINGS[key];
+                        if (plugin === 'context-trimmer' && key === 'enabled') return false;
+
+                        return undefined;
+                    }
                 },
                 // `compact: false` contributes a no-op host plugin that NAMES the built-in,
                 // which is how this file measures the pass instead of guessing at it.
@@ -2626,7 +2655,9 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
         // writes TWO transcript changes (the prompt the session appended and the answer it
         // committed); with a THREE-unit pass it writes THREE. One notification for three
         // flags, i.e. one whole-document rewrite instead of three — and 40 units would also
-        // be one (compaction T4.4, context-inclusion T4.1).
+        // be one (compaction T4.4, context-inclusion T4.1). "No pass" is exact: the fixture's
+        // provider switches the R5 `context-trimmer` off as well as replacing compaction, so
+        // the delta is one coalesced pass and nothing else.
         expect(control.transcriptWrites).toEqual(['agent_message', 'agent_message']);
         expect(compacted.transcriptWrites).toEqual([
             'agent_message',

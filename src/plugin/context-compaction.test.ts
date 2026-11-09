@@ -446,10 +446,24 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // of 65536 dwarfs the toy limits these fixtures use — a limit of 100 with the default gap
 // triggers at 1 token, so every conversation here would compact on its first turn — and the
 // headroom itself is pinned at its own scale in the trigger tables below.
+//
+// `context-trimmer` (R5, the other shipped `turn.before` context pass) is seeded OFF here,
+// exactly as src/server/persistence.test.ts does for its compaction fixture. Its rule is a
+// superset of compaction's (tool NAME match, no token floor, no cooldown), so left at its
+// declared default it runs its own pass on these transcripts — in the `withoutCompaction`
+// control arm, and even in an arm where compaction's `minTokens` floor refuses the pass.
+// Turning it off keeps every case below a measurement of ONE plugin, which is what this
+// file's header claims; no expectation changes as a result.
 const settingsOf = (values: Record<string, number | string | boolean>): HarnessPluginSettingsProvider => {
     const stored: Record<string, number | string | boolean> = { gapTokens: 0, ...values };
 
-    return { get: (plugin, key) => (plugin === 'context-compaction' ? stored[key] : undefined) };
+    return {
+        get: (plugin, key) => {
+            if (plugin === 'context-trimmer' && key === 'enabled') return false;
+
+            return plugin === 'context-compaction' ? stored[key] : undefined;
+        }
+    };
 };
 
 // The one-key spelling: just the limit.
@@ -1860,7 +1874,9 @@ describe('context-compaction action (executeCompaction)', () => {
 
     // A host plugin that NAMES the built-in replaces it (src/plugin/host.ts precedence),
     // which is how these tests compare "with compaction" against "without" in one harness
-    // configuration instead of reasoning about the difference.
+    // configuration instead of reasoning about the difference. The control arm has NO other
+    // context pass available either: `settingsOf` seeds `context-trimmer` off, so "without"
+    // means without any pruning, which is what the coalescing delta below claims to measure.
     const withoutCompaction: HarnessPlugin = { name: 'context-compaction', setup: () => undefined };
 
     const compactRun = async (input: {

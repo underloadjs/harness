@@ -2374,12 +2374,32 @@ export class SessionStore {
     // The per-lane rebuild data: the durable preset record, the session's provider settings,
     // and the bounded memory window. The authority's snapshot is taken by the host at hello,
     // because that is the one moment a full document may cross.
+    //
+    // R3: `disabledTools` joins it for the same reason the other fields are here rather than
+    // resolved inside the worker — the value lives in a process-wide store behind a CLOSURE
+    // (`this.tools.provider`, ../tool-settings.ts), and a closure cannot cross
+    // `worker_threads`. Reading it at THIS moment is what makes the deny list a lane-creation
+    // snapshot: a lane that is already running keeps the set it was built with, and a newly
+    // created one states the operator's current value, exactly the documented semantics of
+    // `PATCH /v1/harness/plugins/{plugin_id}` (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}) and of every
+    // other field below. `disabled()` is the store's sorted snapshot of the SAME names the
+    // durable document carries (its `snapshot()`), just unwrapped for the wire.
+    //
+    // R3 (plugins): `pluginSettings` is the twin read — `this.plugins.snapshot()` is the
+    // operator's override map in exactly the shape `state.json` stores it, so a lane replica's
+    // plugin-settings view resolves the SAME `enabled` switch and the SAME numeric/string knobs
+    // the host's live provider answers, and the framework's hook gate
+    // (src/plugin/host.ts `settings.boolean('enabled', true)`) decides identically on both
+    // sides of the thread boundary. Empty means "nothing has ever been changed", and the
+    // worker then installs no provider at all.
     private blueprintFor(session: Session): LaneBlueprintSource {
         return {
             record: presetToRecord(session.preset),
             settings: session.settings,
             apiKey: session.settings.apiKey,
-            memoryKeys: this.memoryKeysFor(session)
+            memoryKeys: this.memoryKeysFor(session),
+            disabledTools: this.tools.disabled(),
+            pluginSettings: this.plugins.snapshot()
         };
     }
 

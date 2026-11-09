@@ -55,7 +55,7 @@
 //   - ./lane-worker-loop.ts - the worker side: the message loop and its commit boundaries
 
 import type { HarnessActionRequest, HarnessAttachment, HarnessEvent, HarnessStateChangeEvent } from '../../types';
-import type { HarnessPresetRecord } from '../persistence';
+import type { HarnessPluginSettingsRecord, HarnessPresetRecord } from '../persistence';
 import type { RunnerSettings } from '../harnesses/types';
 import type { IdentityLease, IdSpace } from './lane-identity';
 import type { MemoryWindow } from './lane-memory';
@@ -123,6 +123,54 @@ export type LaneBlueprint = {
     identities: Partial<Record<IdSpace, number>>;
     // The keys this lane's tools may reach into shared memory for (./lane-memory.ts).
     memoryKeys: string[];
+    // R3 (the GLOBAL tool switch): the deployment's deny list AS THIS LANE WAS CREATED -
+    // the sorted tool names ../tool-settings.ts has switched off for every session.
+    //
+    // WHY A SNAPSHOT AND NOT A LIVE ANSWER: the coordinator's provider is a closure over
+    // the live store, and a closure cannot cross `worker_threads`, so the replica would
+    // otherwise declare and launch tools the operator has already switched off (the gap
+    // the `plugins.ts` / `tool-settings.ts` "WORKER MODE" headers used to document as a
+    // limit). Serialising the SET at lane creation is the same mechanism every other
+    // lane-creation value uses (`record`, `settings`, `apiKey`, `memoryKeys` above), and
+    // it matches the documented lane semantics: an already-running lane keeps the state it
+    // was built with and "picks the new value up the next time its lane is created"
+    // (../harness.swagger.yaml, `PATCH /v1/harness/plugins/{plugin_id}`), while a NEW lane
+    // - an idle reclaim, a new conversation, an authority rebuild - states the CURRENT set.
+    //
+    // A disabled name is never UNREGISTERED here: the provider only hides it from a
+    // request's tool list, refuses it at the launch gate, and answers discovery with
+    // `forbidden` (../harness.ts), exactly as it does inline.
+    //
+    // ADDITIVE and OPTIONAL: `undefined` means "the coordinator shipped no deny list" (an
+    // older blueprint, or a host that never built one), which the worker reads as nothing
+    // disabled - the pre-R3 behaviour, byte for byte. That tolerance is why
+    // `LANE_PROTOCOL_VERSION` stays where it is: a v3 worker that predates this field simply
+    // ignores it, and a v3 coordinator talking to an older bundle gets the older behaviour.
+    // Neither side can mis-parse a frame, which is what the version bump exists to catch.
+    disabledTools?: string[];
+    // R3 (the PLUGIN switches): the operator's per-plugin setting OVERRIDES as of lane
+    // creation, in the SAME shape `state.json` stores them (`HarnessPluginSettingsRecord`,
+    // plugin name -> key -> JSON scalar; ../persistence.ts). It joins the blueprint for the
+    // one reason every other field is here: the store's provider is a closure over a live
+    // Map, and a closure cannot cross `worker_threads`.
+    //
+    // WHAT IT CHANGES: the framework gates every plugin's HOOKS on
+    // `settings.boolean('enabled', true)` (src/plugin/host.ts, src/plugin/hooks.ts), and the
+    // settings view resolves stored override -> declared default (src/plugin/settings.ts
+    // `resolve`). Without the override a replica answers the DECLARED default, so a plugin an
+    // operator switched OFF kept running its hooks on every lane - and every numeric/string
+    // knob (`contextLimit`, `minTokens`, `intervalMs`, ...) kept its declared default rather
+    // than the operator's value. With it, a lane replica sees exactly what the host sees.
+    //
+    // A SNAPSHOT, with the same documented consequence as `disabledTools`: a lane that is
+    // already running keeps the values it was built with, and "picks the new value up the
+    // next time its lane is created" (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id} - the wording this
+    // field is what makes true for worker lanes).
+    //
+    // ADDITIVE and OPTIONAL, same tolerance rule as above: `undefined` or `{}` ("no plugin
+    // setting has ever been changed", the pre-R3 document) means the worker installs no
+    // provider and the library's declared-default provider answers, byte for byte as before.
+    pluginSettings?: HarnessPluginSettingsRecord;
 };
 
 // What the worker could actually do once built. A non-empty `unsupported` list makes

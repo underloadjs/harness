@@ -399,6 +399,41 @@ A policy that must not prune a transcript that is about to be incorporated
 into its owner checks `branchId` — which is exactly what the shipped
 compactor now does (it declines to act on a branch round at all).
 
+### The two shipped context passes — who owns what
+
+Both built-ins subscribe `turn.before`, and compaction is dispatched first
+(manifest order, `src/plugin/manifest.ts`). With **both** enabled the
+trimmer's rule is a superset of compaction's failure-retry pruning: it
+matches on the tool **name** alone (no argument fingerprint), declares no
+`minTokens` floor and no cooldown, and runs on every turn — so every unit
+compaction would prune for being superseded, the trimmer prunes as well,
+and normally well before compaction's trigger and floor gates let it act.
+Compaction's per-model trigger then mainly governs its OWN additional
+pressure behaviour — the floor, the tail horizon and the cooldown that
+shape a pass at scale — rather than the failure-retry pruning. Seeding
+`context-trimmer` off (`PATCH /v1/harness/plugins/context-trimmer` with
+`{ "settings": { "enabled": false } }`) restores compaction-only pruning,
+which is why the compaction fixtures disable it
+(`src/plugin/context-compaction.test.ts`, `src/server/persistence.test.ts`)
+instead of reasoning about the overlap.
+
+The trigger reads two settings beyond `contextLimit`
+(`src/plugins/context-compaction.plugin.ts`):
+
+- `gapTokens` (default 65536) — how far BEFORE the effective limit a pass
+  fires: the trigger is `max(1, effective limit − gapTokens)`. The estimate
+  measures the request that is about to go out, and the answer plus the next
+  tool block land in that same context, so firing exactly at the limit fires
+  too late; `0` is the historical act-exactly-at-the-limit behaviour. A gap
+  larger than the limit just compacts as early as it possibly can.
+- `modelLimits` (a JSON string map, model id → `{ limit?, window? }`) —
+  `limit` replaces `contextLimit` for that one model; `window` states the
+  model's HARD context window and CAPS whichever limit is in force. The model
+  id is read live from the agent, so switching models changes the ceiling on
+  the next turn. Anything malformed — broken JSON, a value that is not an
+  object, a non-positive limit — is ignored rather than an error, and a model
+  that is not in the map takes the global settings.
+
 ---
 
 ## What a decision does to the run
@@ -607,5 +642,8 @@ decisions), `docs/tasks/2026-11-09-context-inclusion-followups.md` (now only
 the missing UI marker for an excluded turn),
 `docs/tasks/2026-11-09-progressive-compaction.md`
 (the policy that consumes all of this), and the shipped built-ins
-`src/plugins/context-compaction.plugin.ts` and
+`src/plugins/context-compaction.plugin.ts`,
+`src/plugins/context-trimmer.plugin.ts` (the same `turn.before` boundary with
+no limit, no floor and no cooldown — the smallest policy that still writes
+canonical state and reports it), and
 `src/plugins/async-ping.plugin.ts` as worked examples.

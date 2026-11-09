@@ -781,10 +781,19 @@ paths:
         REGISTERED, only its availability changes, and the change is read live when the next request's
         tool list is built - so a run in flight is never invalidated and the Tools page is reachable
         whether or not a thread is running. The write is durable before the response.
+        (A CPU-isolated lane worker cannot hold this route's live provider - a closure cannot cross a
+        `worker_threads` boundary - so the lane blueprint carries the deny list as it stood WHEN THE LANE
+        WAS CREATED: a worker lane that is already running keeps the set it was built with and picks the
+        new value up the next time its lane is created (an idle reclaim, a new conversation, an authority
+        rebuild), exactly like the plugin-settings route below; every in-process session sees it at once.
+        Discovery is not delayed even inside that window, because a lane's `toolRequest` is answered by
+        the coordinator against the live switch, and a name disabled here is therefore reported
+        `forbidden` and never written into the session's enabled set.)
         A `protected` entry - a harness-owned control tool the runtime is built on (`toolRegistry`,
-        `toolRequest`, `task`, ...) - is refused with 403, because switching the control plane off would
-        strand every conversation. An unknown tool is 404, and a body that is not exactly one boolean
-        `enabled` is 400. The response is the whole identified read, so a client sees the row it changed
+        `toolRequest`, `task`, ...) - is refused with 403 WHEN DISABLED, because switching the control plane
+        off would strand every conversation; `{ "enabled": true }` on the same name is accepted as the
+        idempotent no-op it is and answers 200 with `enabled: true`. An unknown tool is 404, and a body
+        that is not exactly one boolean `enabled` is 400. The response is the whole identified read, so a client sees the row it changed
         (including `protected`, which is the honest reason a refused row never changes).
       requestBody:
         required: true

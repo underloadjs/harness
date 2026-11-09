@@ -596,8 +596,12 @@ export const createToolboxHarness = (
         // HarnessConfiguration field, src/types/index.ts `HarnessConfiguration.toolSettings`).
         // Presence means the harness honours the operator's disabled set at the three tool
         // decisions (declarations, the launch gate, discovery); absence means nothing is
-        // disabled globally, which is what a lane worker still gets, because a closure cannot
-        // cross a `worker_threads` boundary (see ../tool-settings.ts "WORKER MODE").
+        // disabled globally. A lane worker reaches this same line with a provider of its OWN:
+        // the coordinator's closure cannot cross `worker_threads`, so the blueprint ships the
+        // NAME LIST and the worker builds the provider from it (../workers/lane-worker-loop.ts
+        // `laneToolSettingsProvider`, ../workers/protocol.ts `LaneBlueprint.disabledTools`).
+        // Only the reference is live; a lane is live for the set it was created with
+        // (../tool-settings.ts "WORKER MODE").
         ...(observer?.toolSettings === undefined ? {} : { toolSettings: observer.toolSettings })
     };
 
