@@ -12,7 +12,7 @@
 //
 // There is NO read-only harness concept. `editable` survives on the wire as a
 // compatibility field and is always true; the registry never gates on it, and a
-// non-live template (demo's script, flaky's extra tool) is editable too.
+// non-live template (an injected scripted or extra-tool preset) is editable too.
 //
 // INVARIANTS
 // ----------
@@ -31,16 +31,24 @@
 // ---------------------
 // A PATCH is split into two kinds:
 //   - metadata only (title/description) — keep the captured factory and every
-//     executable field, so demo stays the scripted fixture, flaky keeps testFlaky,
-//     and a live harness keeps the exact closure a session captured;
+//     executable field, so a scripted fixture stays scripted and a live harness
+//     keeps the exact closure a session captured;
 //   - executable (primary/subagents and the per-agent maps: agentModels,
 //     agentInstructions, agentColors) — rebuild from the template:
 //       'live'     → createProfiledHarness (unchanged behaviour);
 //       'scripted' → upgrade to a LIVE profiled harness and correct the descriptor
 //                    (requiresEndpoint, shared toolbox, environmentTools) so the
 //                    card stops claiming scripted behaviour it no longer runs;
-//       'flaky'    → rebuild the live toolbox with the testFlaky extra retained.
+//       'flaky'    → rebuild the live toolbox with the example extra retained.
 // A hand-built/injected preset without a `template` defaults to 'live'.
+//
+// EVERY SHIPPED TEMPLATE IS 'live' NOW. 'scripted' and 'flaky' were the markers of the
+// `demo` and `flaky` example presets, which are deleted; the branches below stay because
+// the value is DURABLE — an installation may hold a saved row or a frozen session that
+// names one — and because an injected preset may declare either. What changed is the
+// 'scripted' REBUILD: it used to find its factory by name in a shipped superset that no
+// longer exists, so a scripted record this build cannot supply is now an explicit error
+// (see `presetFromRecord`).
 //
 // DELETION (T5)
 // -------------
@@ -89,10 +97,9 @@ import type { HarnessPreset } from './types';
 import type { HarnessAgentRecord, HarnessPresetRecord } from '../persistence';
 import { attachDefaultAgentState, createAgentState } from './agent-state';
 import type { AgentProfilePatch, AgentState } from './agent-state';
-import { ALL_PRESET_TEMPLATES, LEGACY_PRESET_DEFINITIONS, presets } from './presets';
+import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
 import {
-    EXAMPLE_APP_TOOL_SOURCES,
     SHARED_TOOL_NAMES,
     agentsFromProfiles,
     createProfiledHarness,
@@ -669,8 +676,8 @@ const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
     editable: true
 });
 
-// Build the factory for a template's LIVE form. 'flaky' keeps its example-only
-// extra tool; everything else is the shared profiled harness. The model, instruction,
+// Build the factory for a template's LIVE form. 'flaky' keeps the example-only
+// extra tools; everything else is the shared profiled harness. The model, instruction,
 // and color maps are captured by the closure (via createProfiledHarness /
 // agentsFromProfiles), which is what makes a later PATCH invisible to an existing
 // session. `customAgents` (R7) is captured the same way, and it is the map that tells
@@ -711,12 +718,16 @@ const liveFactory = (
                 ),
                 primary,
                 subagents: [...subagents],
-                // T19/F1: a rebuilt flaky example keeps its extra TOOL SET, but
-                // the extra is supplied as an editable source path so startup uses
-                // the same compiler as every other shipped/app tool.
-                // T25: the paths are DISCOVERED from server/tools/examples, so the
-                // example set cannot drift from the files.
-                extraToolSources: { ...EXAMPLE_APP_TOOL_SOURCES }
+                // The 'flaky' template used to mean "the live toolbox PLUS the example
+                // tool, compiled from its editable source entry". The example preset and
+                // its folder are deleted, so there is no shipped extra left to attach and
+                // this rebuilds as a plain live toolbox. The branch stays for two reasons:
+                // a durable record still names the template, and a host that injects its
+                // own extra-tool preset declares the template and expects the
+                // createToolboxHarness path rather than createProfiledHarness. A saved
+                // 'flaky' session therefore restores and runs, minus a tool this build no
+                // longer ships — which is the same outcome as any other deleted tool.
+                extraToolSources: {}
             },
             settings,
             progress,
@@ -825,9 +836,18 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
 //   - 'flaky'    → live toolbox with testFlaky retained;
 //   - 'scripted' → the shipped scripted factory for that name, looked up in
 //                  ALL_PRESET_TEMPLATES so a fixture that left the shipped
-//                  catalogue (T5: demo) still rebuilds for an old session (a
-//                  scripted entry's executable fields can never have changed: an
-//                  executable PATCH promotes it to 'live');
+//                  catalogue still rebuilds for an old session;
+//
+// THE 'scripted' BRANCH NO LONGER HAS A SHIPPED FACTORY TO FIND. It used to resolve the
+// name against a shipped superset, because `demo` was the only scripted template and a
+// frozen session recorded only its name. That preset is deleted, so a scripted record can
+// now mean exactly one of two things: the host INJECTED a scripted preset this build still
+// has (the `fallback` argument, which is the registry's current entry for that name), or
+// the record names the deleted `demo` and nothing in this build can run it. The second is
+// an explicit error rather than a silent substitution: rebuilding a scripted session on a
+// live factory would send turns to a provider the user never configured, and the session's
+// own transcript would then disagree with the card that produced it. ./sessions.ts catches
+// per record and reports it, so one unresolvable session does not abort startup.
 //   - absent     → an injected/custom preset. Its factory is not serializable, so
 //                  a caller must pass the still-available entry as `fallback`; a
 //                  mismatch is an error instead of a silently different harness.
@@ -838,22 +858,18 @@ export const presetFromRecord = (
     let create: HarnessPreset['create'];
 
     if (record.template === 'scripted') {
-        // T5: the lookup is the SUPERSET (catalogue + fixtures), not `presets`. A
-        // session frozen on an older build recorded only the NAME of a scripted
-        // harness, and its factory lives in exactly one place; if that place is no
-        // longer in the shipped catalogue, the session still has to rebuild. Same
-        // reason the fixture presets stay exported.
-        const shipped = ALL_PRESET_TEMPLATES.find(
-            (preset) => preset.name === record.name && preset.template === 'scripted'
-        );
-
-        if (shipped === undefined) {
+        // An injected scripted preset is the only way this build can still hold the
+        // factory, and the registry hands it over as `fallback`. The name and the
+        // template must both match: a same-named entry that is no longer scripted is a
+        // different harness, and running a saved transcript through it would be the
+        // silent substitution the error below exists to prevent.
+        if (fallback !== undefined && fallback.name === record.name && fallback.template === 'scripted') {
+            create = fallback.create;
+        } else {
             throw new Error(
                 `Scripted harness "${record.name}" is not shipped in this build; the session cannot be restored.`
             );
         }
-
-        create = shipped.create;
     } else if (record.template === 'flaky') {
         create = liveFactory(
             'flaky',
@@ -1454,6 +1470,14 @@ export const createHarnessRegistry = (
               )
             : current.create;
 
+        // Honest tools on a 'flaky' rebuild. That template's factory used to re-attach the
+        // example-only tools from `src/server/tools/examples`; the folder and its one tool
+        // are deleted, so the rebuilt harness registers the plain shared toolbox. A card
+        // that still advertised `testFlaky` would promise a tool its next session cannot
+        // call, so the declaration follows the factory — exactly the reasoning that already
+        // rewrites `requiresEndpoint`/`tools` when a scripted entry goes live.
+        const downgradedFlaky = executable && template === 'flaky';
+
         // A new object: an existing session keeps the preset it captured, so it
         // continues to run (and report) the old configuration — including the old
         // per-agent models. This is the frozen-session guarantee.
@@ -1475,6 +1499,12 @@ export const createHarnessRegistry = (
             // R2: same explicit statement — `{}` from a patch means "no colors", which
             // `...current` would not produce on its own.
             agentColors,
+            ...(downgradedFlaky
+                ? {
+                      tools: [...SHARED_TOOL_NAMES],
+                      environmentTools: ['search', 'fetch']
+                  }
+                : {}),
             ...(upgradedScripted
                 ? {
                       // The upgrade replaces the script with the live toolbox, which

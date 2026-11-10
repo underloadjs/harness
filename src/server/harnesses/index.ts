@@ -28,7 +28,7 @@
 import { presetTools } from '../../harness';
 import type { Tool } from '../../harness';
 import { harnessTools } from './tools';
-import { ALL_PRESET_TEMPLATES, presets, PRESET_MAX_ITERATIONS } from './presets';
+import { presets, PRESET_MAX_ITERATIONS } from './presets';
 // Value import for the local findPreset() below. The barrel also re-exports the
 // constant so callers keep importing it from here.
 import { PRESET_ALIASES } from './registry';
@@ -39,12 +39,10 @@ import type { WebFetchCatalogueEntry } from './webfetch';
 import type { CatalogueEntry, HarnessPreset, ToolGroup } from './types';
 
 export { presets, harnessTools, PRESET_MAX_ITERATIONS };
-// T5: the offline/failure fixtures are no longer part of `presets` (the shipped
-// catalogue must be real, usable configurations), but they stay reachable so a
-// host or a test injects them EXPLICITLY, and so `presetFromRecord` can still
-// rebuild a scripted session frozen on an older build. `ALL_PRESET_TEMPLATES` is
-// that superset in one call.
-export { ALL_PRESET_TEMPLATES, FIXTURE_PRESETS } from './presets';
+// The fixture presets are DELETED, so `presets` is the whole catalogue and there is no
+// superset to export. A host or a test that wants an offline or extra-tool harness
+// declares its own `HarnessPreset` and passes it to
+// `createHarnessRegistry([...presets, mine])`.
 // The derived roster (T3): one specialist list, one `teamOf()` helper, and the
 // previous shipped definitions the restore policy compares against. Exported so
 // tests and any caller can reason about the same data the registry uses.
@@ -54,7 +52,6 @@ export {
     CORE_ENVIRONMENT_TOOL_NAMES,
     CORE_PRESET_TOOL_NAMES,
     CORE_TOOL_NAMES,
-    EXAMPLE_APP_TOOL_SOURCES,
     SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,
     SHARED_APP_TOOL_SOURCES,
@@ -73,7 +70,8 @@ export {
 export type { ToolboxHarnessConfiguration } from './toolbox';
 // The discovered app catalogue (T25). Exported so a host/test can see the exact
 // folder-derived entries and source paths without importing a tool module.
-export { EXAMPLE_APP_TOOL_FOLDER, SERVER_TOOLS_DIRECTORY, SHARED_APP_TOOLS as HARNESS_APP_TOOLS } from './tools';
+// `EXAMPLE_APP_TOOL_FOLDER` is gone with the examples folder it named.
+export { SERVER_TOOLS_DIRECTORY, SHARED_APP_TOOLS as HARNESS_APP_TOOLS } from './tools';
 export {
     createHarnessRegistry,
     HarnessRegistryError,
@@ -104,7 +102,6 @@ export {
     CORE_TOOL_SESSION_HINT,
     createCoreToolEntries
 } from './core';
-export { scriptedDemo } from './demo';
 export { createWebSearchCatalogueEntry, WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './websearch';
 export type { WebSearchCatalogueEntry, WebSearchCatalogueOptions } from './websearch';
 // R9-R11: the fetch half of the environment-backed core pair. A host swaps its own
@@ -224,17 +221,14 @@ export const createToolCatalogue = (options: ToolCatalogueOptions = {}): ToolCat
     };
 };
 
-// Resolve a preset name, including an alias, against any static catalogue. The
-// default is `ALL_PRESET_TEMPLATES` (the shipped catalogue PLUS the offline
-// fixtures, T5): this is a LOOKUP surface, and the CLI documents `--preset demo` as
-// its endpoint-free escape hatch, so a fixture must stay resolvable by name even
-// though it is no longer something the product lists or offers. A caller that wants
-// production-only resolution passes `presets` explicitly (that is what a listing
-// does, e.g. the CLI's `--list`). Aliases themselves are re-exported from
-// ./registry.ts above.
+// Resolve a preset name, including an alias, against any static catalogue. The default
+// is `presets`, the shipped production catalogue: with the fixtures deleted there is
+// nothing behind it to resolve to, so a listing and a lookup agree by construction. A
+// host that injected its own presets passes its own list. Aliases themselves are
+// re-exported from ./registry.ts above.
 export const findPreset = (
     name: string,
-    catalogue: readonly HarnessPreset[] = ALL_PRESET_TEMPLATES
+    catalogue: readonly HarnessPreset[] = presets
 ): HarnessPreset | undefined => {
     const direct = catalogue.find((preset) => preset.name === name);
     if (direct !== undefined) return direct;

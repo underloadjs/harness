@@ -70,11 +70,13 @@
 // because it IS `planner`). So every live session is pairwise-distinct inside 8 slots, with
 // ZERO headroom: an eighth live role would put 9 members on the Manager card and two of
 // them would share a tone. That is a deliberate trade, not an oversight — see the next
-// paragraph. The 10-id CATALOGUE (`AGENT_PROFILE_NAMES`, fixtures included) is deliberately
-// NOT the constraint: growing the palette to cover it would re-derive the hash modulus
-// (`PALETTE_SIZE`) and repaint EVERY agent for two cards a session can never contain
-// (`demo`, `flaky`), so the documented repeat rule (a beyond-palette identity reuses its
-// OWN hashed slot, stably) covers the surplus instead.
+// paragraph. The CATALOGUE (`AGENT_PROFILE_NAMES`) is now exactly this long — eight ids,
+// the seven real roles plus the summarizer — because the `demo`/`flaky` fixture profiles
+// that used to make it ten are deleted, so the shipped roster fills the palette with no
+// repeat at all. The palette is still NOT sized to the roster as a rule: adding a ninth
+// role would re-derive the hash modulus (`PALETTE_SIZE`) and repaint every agent if the
+// array grew with it, so the documented repeat rule (a beyond-palette identity reuses its
+// OWN hashed slot, stably) covers that surplus instead.
 //
 // Cross-references:
 //   - src/agents/index.ts `AGENT_PROFILE_NAMES` — the catalogue; ui/agent-color.test.ts

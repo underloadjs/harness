@@ -19,11 +19,12 @@
 //     reader SEES is one view's roster (the active harness's members), never the whole
 //     catalogue. The largest live team — the Manager's — is its primary plus its
 //     `teamOf()` allowlist = 8 members, exactly the palette, and every other live team is
-//     7, so no live session ever has two members in one tone. The 10-id CATALOGUE
-//     (src/agents/index.ts `AGENT_PROFILE_NAMES`, the `demo`/`flaky` fixtures included) is
-//     deliberately NOT the constraint: widening the palette would re-derive the hash
-//     modulus (`PALETTE_SIZE`) and repaint EVERY agent to make room for two cards a live
-//     session can never contain, so the repeat rule above is what covers the surplus
+//     7, so no live session ever has two members in one tone. The CATALOGUE
+//     (src/agents/index.ts `AGENT_PROFILE_NAMES`) is now ALSO exactly eight ids: the
+//     `demo`/`flaky` fixture profiles were deleted, so the roster and the palette are the
+//     same size and the catalogue fills the palette with no repeat at all. The repeat rule
+//     is still pinned below because it is what protects a FUTURE ninth role — widening the
+//     palette would re-derive the hash modulus (`PALETTE_SIZE`) and repaint every agent
 //     (see ui/agent-color.ts, the `EIGHT TONES IS ENOUGH` block);
 //   - ONE IDENTITY, ONE SLOT: `Writer` / `writer` / ` writer ` are one agent and must not
 //     mint a second colour or burn a second slot;
@@ -82,8 +83,9 @@ const PALETTE = [
 
 // The catalogue the harness ships (src/agents/index.ts `AGENT_PROFILE_NAMES`), in
 // catalogue order — the order `configureAgentColors` resolves collisions in when a caller
-// seeds the whole catalogue. TEN ids for EIGHT tones: the seven real roles, the
-// summarizer, and the two fixtures.
+// seeds the whole catalogue. EIGHT ids for EIGHT tones: the seven real roles plus the
+// summarizer. The `demo`/`flaky` fixture profiles used to make this ten, which forced the
+// documented repeat; they are deleted, so the roster and the palette are the same size.
 const CATALOGUE = [
     'general',
     'instruct',
@@ -92,18 +94,15 @@ const CATALOGUE = [
     'reviewer',
     'planner',
     'debugger',
-    'summarizer',
-    'demo',
-    'flaky'
+    'summarizer'
 ];
 
 // The slots that catalogue lands on. Four of its keys hash onto an already-owned slot
 // (`instruct` 3, `planner` 3, `debugger` 6, `summarizer` 0 collide) and walk forward,
-// which is why the vector is not simply the raw residues
-// [3, 3, 4, 6, 2, 3, 6, 0, 6, 6]. The first eight ids take all eight slots, one each; the
-// two fixtures then find nothing free and keep their own residue (6), sharing
-// `workspace`'s violet — the documented repeat, not a drift.
-const CATALOGUE_SLOTS = [3, 4, 5, 6, 2, 7, 0, 1, 6, 6];
+// which is why the vector is not simply the raw residues [3, 3, 4, 6, 2, 3, 6, 0]. With
+// the two fixtures deleted the eight ids take all eight slots, one each, so the shipped
+// roster has NO repeated tone — the probe still runs, it just never runs out of room.
+const CATALOGUE_SLOTS = [3, 4, 5, 6, 2, 7, 0, 1];
 
 // Eight throwaway identities `a`..`h`: none of them collides, so their slots are exactly
 // their hash residues — the smallest vector that pins the hash itself.
@@ -532,17 +531,17 @@ describe('palette shape (the largest live team fits; the catalogue may exceed it
 
         // Eight slots is the modulus the probe walks (ui/agent-color.ts `PALETTE_SIZE`).
         // Widening the array re-derives every automatic mapping, so the size is pinned:
-        // the decision to keep eight must be a deliberate edit here.
-        expect(CATALOGUE.length - AGENT_PALETTE.length).toBe(2);
+        // the decision to keep eight must be a deliberate edit here. The shipped roster is
+        // now exactly this long — the deleted `demo`/`flaky` profiles were the surplus — so
+        // a ninth role is the edit that makes the repeat rule matter again, and it will
+        // repaint nothing but itself.
+        expect(CATALOGUE.length - AGENT_PALETTE.length).toBe(0);
     });
 
-    it('pins the ten-id catalogue slot for slot, and the two surplus ids on their own residues', () => {
-        // The catalogue the harness ships, in catalogue order: ten ids for eight tones.
-        // Exceeding the palette is ALLOWED (the surplus is `demo`/`flaky`, fixtures a live
-        // session can never contain), so this asserts the exact repeat rather than demanding
-        // a tone per id.
+    it('pins the eight-id catalogue slot for slot, with no repeat', () => {
+        // The catalogue the harness ships, in catalogue order: eight ids, eight tones.
         expect(AGENT_PROFILE_NAMES).toEqual(CATALOGUE);
-        expect(AGENT_PROFILE_NAMES.length).toBe(10);
+        expect(AGENT_PROFILE_NAMES.length).toBe(8);
 
         configureAgentColors({ roster: AGENT_PROFILE_NAMES });
 
@@ -550,46 +549,46 @@ describe('palette shape (the largest live team fits; the catalogue may exceed it
         expect(slotsOf(AGENT_PROFILE_NAMES)).toEqual(CATALOGUE_SLOTS);
         expect(tonesOf(AGENT_PROFILE_NAMES)).toEqual(CATALOGUE_SLOTS.map(toneAt));
 
-        // The first eight ids fill the palette exactly once each, so a live view that
-        // offers the real roles has no shared tone.
-        expect([...new Set(CATALOGUE_SLOTS.slice(0, 8))].sort()).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+        // The catalogue fills the palette exactly once each, so no two shipped agents share
+        // a tone and the repeat rule is not exercised by anything this build ships.
+        expect([...new Set(CATALOGUE_SLOTS)].sort()).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
 
-        // The surplus: both fixtures hash to residue 6 and every slot is already owned,
-        // so each keeps its OWN residue instead of walking — the repeat rule, spelled out
-        // as the tone the reader sees (the same violet as `workspace`).
-        expect(slotsOf(CATALOGUE.slice(8))).toEqual([6, 6]);
-        expect(agentColorOf('demo')).toEqual(toneAt(6));
-        expect(agentColorOf('flaky')).toEqual(toneAt(6));
-        expect(agentColorOf('demo')).toEqual(agentColorOf('workspace'));
+        // The rule that WOULD cover a surplus is still pinned, on throwaway identities
+        // rather than on deleted fixtures: once every slot is owned, an extra id keeps its
+        // own hash residue instead of walking (see `EXHAUSTED_SLOTS` above).
+        expect(slotsOf(['i', 'j'])).toEqual(EXHAUSTED_SLOTS);
 
-        // Ten ids, eight tones: exactly eight distinct colours, and none of them is the
-        // neutral fallback — every real id gets a real tone.
+        // Eight ids, eight tones: eight distinct colours, and none of them is the neutral
+        // fallback — every real id gets a real tone.
         expect(new Set(tonesOf(AGENT_PROFILE_NAMES).map((tone) => tone.color)).size).toBe(8);
         expect(CATALOGUE_SLOTS.filter((slot) => slot === UNKNOWN_AGENT_COLOR.slot).length).toBe(0);
     });
 
-    it('repeats the surplus stably instead of drifting a tone a reader is already using', () => {
-        // The eight real roles join first and take all eight slots, one each — `planner`
-        // (residue 3) and `debugger` (residue 6) only reach 7 and 0 because the probe
-        // walked forward.
-        configureAgentColors({ roster: CATALOGUE.slice(0, 8) });
-        expect(slotsOf(CATALOGUE.slice(0, 8))).toEqual([3, 4, 5, 6, 2, 7, 0, 1]);
-        expect(new Set(slotsOf(CATALOGUE.slice(0, 8))).size).toBe(8);
+    it('repeats a surplus stably instead of drifting a tone a reader is already using', () => {
+        // The shipped roster is exactly eight ids, so it fills the palette with no repeat.
+        // The repeat rule is still what protects a NINTH role (or a session-defined agent),
+        // so it is pinned here on throwaway identities rather than on the deleted
+        // `demo`/`flaky` fixtures — the rule is about the palette being full, not about
+        // those two keys.
+        configureAgentColors({ roster: CATALOGUE });
+        expect(slotsOf(CATALOGUE)).toEqual([3, 4, 5, 6, 2, 7, 0, 1]);
+        expect(new Set(slotsOf(CATALOGUE)).size).toBe(8);
 
         // The surplus joins on a later, incremental configure (the way a live roster
-        // grows): nothing free, so both fixtures land on their own residue 6.
-        configureAgentColors({ roster: CATALOGUE.slice(8) });
-        expect(slotsOf(CATALOGUE.slice(8))).toEqual([6, 6]);
-        expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
+        // grows): every slot is owned, so each extra id keeps its OWN residue instead of
+        // walking — `i`→4 (`research`'s tone) and `j`→5 (`reviewer`'s).
+        configureAgentColors({ roster: ['i', 'j'] });
+        expect(slotsOf(['i', 'j'])).toEqual(EXHAUSTED_SLOTS);
 
         // No drift: identities discovered AFTER the surplus cannot move the surplus, the
-        // first eight, or each other — the repeat is a fact about the key, never a slot
+        // catalogue, or each other — the repeat is a fact about the key, never a slot
         // handed out round-robin.
-        configureAgentColors({ roster: ['i', 'j', 'k', 'l', 'm', ...COLLIDERS] });
+        configureAgentColors({ roster: ['k', 'l', 'm', ...COLLIDERS] });
         expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
+        expect(slotsOf(['i', 'j'])).toEqual(EXHAUSTED_SLOTS);
 
         // And the identical map again from an empty page (a reload, or the ACTIVE view
-        // being re-selected): id by id, the same ten tones.
+        // being re-selected): id by id, the same eight tones.
         resetAgentColors();
         configureAgentColors({ roster: CATALOGUE });
         expect(tonesOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS.map(toneAt));

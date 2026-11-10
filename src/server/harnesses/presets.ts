@@ -4,28 +4,33 @@
 // progress sink. The CLI calls one directly; the HTTP server keeps one harness per
 // session and routes that session's events to its own stream.
 //
-// TWO KINDS OF PRESET (T5: only the first kind SHIPS)
-// ---------------------------------------------------
-//   live  — general, instruct, research, workspace, reviewer, planner, debugger. All
-//           built from TRUSTED agent profiles in src/agents through `createProfiledHarness`
-//           (./toolbox.ts), so they register the SAME toolbox: package coding
-//           tools, the app tools, environment-backed search, and the harness core
-//           tools. Only the agents differ: names, instructions, guidelines,
-//           primary, and subagents. These seven are `presets`, the default
-//           catalogue every registry and every `GET /harnesses` listing starts from.
-//   fixture — demo (a scripted offline run with timeNow only) and flaky (the
-//           recoverable-failure example with `testFlaky`). They are NOT in
-//           `presets`: a user opening the product must not be offered a scripted
-//           card or a card whose tool throws two calls in three. They stay exported
-//           as `FIXTURE_PRESETS` because they are still load-bearing:
-//             - a host or a test that wants an offline loop injects them explicitly
-//               (`createHarnessRegistry(ALL_PRESET_TEMPLATES)`);
-//             - a session saved on an older build when demo/flaky WERE shipped must
-//               still restore, and a 'scripted' record rebuilds its factory by name
-//               from `ALL_PRESET_TEMPLATES` (see ./registry.ts presetFromRecord).
-//           Deleting a shipped harness is therefore not the same as un-shipping a
-//           fixture: a deletion is a durable operator decision (a tombstone in the
-//           database), while un-shipping is this module no longer listing a row.
+// EVERY PRESET HERE IS A PRODUCTION CONFIGURATION
+// ------------------------------------------------
+//   general, instruct, research, workspace, reviewer, planner, debugger. All seven
+//   are built from TRUSTED agent profiles in src/agents through `createProfiledHarness`
+//   (./toolbox.ts), so they register the SAME toolbox: package coding tools, the app
+//   tools, environment-backed search, and the harness core tools. Only the agents
+//   differ: names, instructions, guidelines, primary, and subagents. These seven are
+//   `presets`, the default catalogue every registry and every `GET /harnesses` listing
+//   starts from — and they are the WHOLE catalogue. There is no second tier.
+//
+//   THE FIXTURES ARE GONE. `demo` (a scripted offline run with timeNow only) and
+//   `flaky` (the recoverable-failure example with `testFlaky`) used to ship as
+//   `FIXTURE_PRESETS` behind a `ALL_PRESET_TEMPLATES` superset. They are deleted, along
+//   with the scripted transport (./demo.ts), the `testFlaky` example tool, and the two
+//   agent profiles. A card a user can pick has to be a configuration that actually runs
+//   a model on the shared toolbox; a scripted transcript and a tool that throws on
+//   purpose are not that. Anything that needs one — a test that wants an offline loop, a
+//   host that wants an extra-tool harness — declares its own `HarnessPreset` next to
+//   itself and injects it (`createHarnessRegistry([myFixture])`). Nothing in the shipped
+//   product depends on the deleted pair.
+//
+//   DELETION IS NOT A TOMBSTONE. Removing a preset from this module is not the same as
+//   an operator deleting a card: a deletion is a durable row in the database, while this
+//   is simply a catalogue that no longer has the row. The consequence is restore, and it
+//   is handled in ./registry.ts: a saved row or a frozen session naming `demo` or
+//   `flaky` no longer has a template to rebuild from, so it is reported rather than
+//   silently resurrected (see the note above `presetFromRecord`).
 //
 // THE SEVEN REAL ROLES
 // --------------------
@@ -60,13 +65,12 @@
 // keeps the factory it captured). `editable: true` is a compatibility wire field
 // only; there is no read-only category, no categorization UI, and the registry
 // does not gate a PATCH on it. `template` (not on the wire) tells the registry
-// what a metadata-only patch must preserve:
-//   - 'scripted' — demo keeps its offline script and timeNow registry;
-//   - 'flaky'    — the example keeps testFlaky and its shared toolbox;
-//   - 'live'     — rebuilt from the selected agents/models.
-// An executable change (primary/subagents/agentModels) on demo upgrades it to a
-// live profiled harness; on flaky it rebuilds the live toolbox and retains
-// testFlaky. See ./registry.ts update().
+// what a metadata-only patch must preserve. Every shipped entry is 'live' —
+// rebuilt from the selected agents/models — and the two non-live template kinds
+// ('scripted', 'flaky') survive ONLY as durable-record vocabulary: an
+// installation that saved a row or froze a session while the fixtures shipped
+// still names one, and ./registry.ts has to answer it honestly rather than crash.
+// An injected preset may still declare either.
 //
 // Instructions live in src/agents, not here
 // -----------------------------------------
@@ -102,30 +106,12 @@
 //   - ./registry.ts     — restore policy, aliases, validation
 //   - ../api.ts  — descriptors resolved from this metadata
 
-import { agent, harness } from '../../harness';
-import { agentInstruction, AGENT_PROFILES } from '../../agents';
-import type { HarnessPreset, RunnerSettings } from './types';
-import { scriptedDemo } from './demo';
-import {
-    EXAMPLE_APP_TOOL_SOURCES,
-    PRESET_MAX_ITERATIONS,
-    SHARED_APP_TOOL_SOURCES,
-    SHARED_TOOL_NAMES,
-    agentsFromProfiles,
-    createProfiledHarness,
-    createToolboxHarness,
-    providerOf
-} from './toolbox';
+import type { HarnessPreset } from './types';
+import { PRESET_MAX_ITERATIONS, SHARED_TOOL_NAMES, createProfiledHarness } from './toolbox';
 
 // Re-exported for callers that imported the app-wide tool-loop budget from here
 // (the CLI and server tests did); the value now lives with the shared factory.
 export { PRESET_MAX_ITERATIONS };
-
-// The example-only app tools, in registration order. T25: derived from the discovered
-// `server/tools/examples` folder instead of the literal 'testFlaky', so a second
-// example entry joins this preset with no edit here (and still no name filter in the
-// shared toolbox).
-const EXAMPLE_TOOL_NAMES: readonly string[] = Object.keys(EXAMPLE_APP_TOOL_SOURCES);
 
 // The real roles, in catalogue/descriptor order, DEFAULT FIRST. This is the ONE list
 // the teams and the delegate enums are derived from: adding a role here adds it to every
@@ -333,152 +319,15 @@ const debuggerPreset: HarnessPreset = {
 };
 
 // ---------------------------------------------------------------------------
-// Examples and fixtures
-// ---------------------------------------------------------------------------
-
-// The offline demo is a scripted transport, not a live harness: it demonstrates
-// the loop (reasoning, toolRequest discovery, one tool call, answer) with no
-// endpoint. Its timeNow-only registry is intentional and pinned by its script, so
-// it is exempt from the shared-toolbox rule. It is still an EDITABLE template
-// (R20.1): a metadata-only PATCH (title/description) keeps the script; an
-// executable PATCH (primary/subagents/agentModels) upgrades it to an honest live
-// profiled harness (shared toolbox, requiresEndpoint, no script). `template` is
-// the registry's signal for that distinction — see ./registry.ts.
-const demo: HarnessPreset = {
-    name: 'demo',
-    title: 'Scripted demo',
-    description:
-        'Runs a scripted transport: a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to the real presets.',
-    requiresEndpoint: false,
-    primary: 'demo',
-    subagents: [],
-    agents: ['demo'],
-    tools: ['timeNow'],
-    builtin: true,
-    editable: true,
-    template: 'scripted',
-    // Adopted by the registry only when an executable PATCH upgrades this template
-    // and the operator has not edited the shipped title/description (R20.1): the
-    // card must stop claiming "scripted, no endpoint" once it runs live turns.
-    live: {
-        title: 'Live demo',
-        description:
-            'A live harness built from the selected agents with the shared toolbox, running against the session provider. This entry started as the scripted demo and no longer uses the offline script.'
-    },
-    create: (settings, progress, report) =>
-        harness({
-            agents: {
-                demo: agent({
-                    model: settings.model.trim().length > 0 ? settings.model : 'scripted/demo',
-                    // The trusted profile's instruction + guidelines, same
-                    // composition every live agent uses. The scripted transport
-                    // ignores them; keeping the path identical proves the profile
-                    // is the single source of the prompt.
-                    instruction: agentInstruction(AGENT_PROFILES.demo),
-                    stream: scriptedDemo()
-                })
-            },
-            // T19/F1: the scripted fixture is still a shipped exception in its
-            // TOOL SET, but not in how that tool is registered. Compile its one
-            // editable source entry through the same startup kernel instead of
-            // passing a prebuilt definition through `tools`.
-            // T25: the path is the DISCOVERED one (server/tools/shared/timeNow.tool.ts),
-            // so moving/renaming the entry cannot leave a stale literal behind.
-            toolSources: { timeNow: SHARED_APP_TOOL_SOURCES.timeNow },
-            presets: false,
-            // Explicit entry point, even with one agent: the documented style,
-            // and it keeps the harness name independent of key order.
-            primary: 'demo',
-            // The optional third argument is the server's persistence observer
-            // (R3b). A scripted harness mutates the todo/record stores too, so its
-            // notifications matter exactly like a live harness's.
-            report: {
-                progress,
-                ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange }),
-                // T1.5 last mile: the host's plugin-diagnostic sink, forwarded exactly like the
-                // observer above. The scripted transport still runs the SAME built-in plugins a
-                // live harness does (src/plugin/manifest.ts), so a hook failure here is a real
-                // failure the host has to be able to see; ignoring this member would leave the
-                // shipped fixture blind while every live preset reported.
-                ...(report?.diagnostic === undefined ? {} : { diagnostic: report.diagnostic })
-            },
-            // N4: the same owner-interaction hook every live factory gets. The
-            // scripted transport never calls actionRequest, but forwarding it keeps
-            // "a preset choice changes agents, not host capabilities". It must be a
-            // TOP-LEVEL configuration field: presence registers the tool.
-            ...(report?.interaction === undefined ? {} : { interaction: report.interaction }),
-            // R2/R3: the two DEPLOYMENT-WIDE switches, forwarded on the same top-level rule
-            // the live toolbox already honours (../harnesses/toolbox.ts). Before this line the
-            // scripted fixture was the one preset that IGNORED them: `PATCH
-            // /v1/harness/tools/{tool_id}` left `timeNow` declared, callable and "enabled" to a
-            // demo model, and `PATCH /v1/harness/plugins/{plugin_id}` left the built-in plugins'
-            // hooks running with their shipped knobs - inline AND on a lane, because the lane
-            // hands this same report to the same factory (../workers/lane-worker-loop.ts
-            // `sayHello`). The scripted transport changes nothing about that: the switches gate
-            // the runtime's tool decisions and the framework's hook delivery, not the stream.
-            //
-            // Absence keeps the historical behaviour byte for byte: no provider means nothing
-            // disabled and the library's declared-default plugin settings (src/harness.ts:1395).
-            ...(report?.pluginSettings === undefined ? {} : { pluginSettings: report.pluginSettings }),
-            ...(report?.toolSettings === undefined ? {} : { toolSettings: report.toolSettings })
-        })
-};
-
-// Recoverable failures is a live example, so it gets the shared toolbox too and
-// adds the example tools. Those stay out of the shared table on purpose: `testFlaky`
-// throws two calls out of three and keeps its attempt count per AGENT (a WeakMap
-// keyed by the requesting agent, so two sessions never share a count), which must
-// never be part of what the real presets can call. The example's failure behaviour is
-// its point, so its template is `flaky`: a metadata-only PATCH keeps this factory and
-// its extra tools, while an executable PATCH rebuilds the live toolbox with them
-// retained. The harness id stays `flaky`.
-//
-// T25: the tool SET is `[...SHARED_TOOL_NAMES, ...EXAMPLE_TOOL_NAMES]` and the
-// sources are the discovered example map — both derived from the folders, so no name
-// is hardcoded here.
-const failure: HarnessPreset = {
-    name: 'flaky',
-    title: 'Recoverable failures (example)',
-    description:
-        'The shared toolbox plus a tool that throws on two out of every three calls. The harness turns each error into a tool result, so the model can retry instead of the run dying. An example of the failure path, not a general-purpose agent.',
-    requiresEndpoint: true,
-    primary: 'flaky',
-    subagents: [],
-    agents: ['flaky'],
-    tools: [...SHARED_TOOL_NAMES, ...EXAMPLE_TOOL_NAMES],
-    // R18: the factory below uses createToolboxHarness, which opts into search
-    // exactly like the live presets. Declaring it here keeps descriptor.tools and
-    // descriptor.coreTools equal to what the session actually registers.
-    environmentTools: ['search', 'fetch'],
-    builtin: true,
-    editable: true,
-    template: 'flaky',
-    create: (settings: RunnerSettings, progress, report) =>
-        createToolboxHarness(
-            {
-                agents: agentsFromProfiles(['flaky'], settings),
-                primary: 'flaky',
-                subagents: [],
-                // The example tools; excluded from the shared set but still compiled
-                // from their editable source entries (T19/F1, T25).
-                extraToolSources: { ...EXAMPLE_APP_TOOL_SOURCES }
-            },
-            settings,
-            progress,
-            report
-        )
-};
-
-// ---------------------------------------------------------------------------
 // Catalogue exports (T5)
 // ---------------------------------------------------------------------------
 
-// The PRODUCTION catalogue, in UI/CLI order (general is the default/first card, which is
+// THE catalogue, in UI/CLI order (general is the default/first card, which is
 // also what `DEFAULT_CLI_PRESET` in ../cli/options.ts selects). Every entry is a real,
 // usable configuration: a live agent team on the shared toolbox that runs against the
-// configured provider. The scripted demo and the failure example are deliberately absent —
-// a catalogue a user picks from should not contain a card that never calls a model, or one
-// whose tool throws on purpose.
+// configured provider. This array IS the product — there is no fixture tier behind it
+// any more, so `presets` is both the shipped catalogue and the complete set of
+// templates this build can rebuild a factory from.
 //
 // ORDER IS A CONTRACT, NOT A PREFERENCE: it is the order `GET /harnesses` returns, the order
 // a picker renders, and the order the frontend palette assigns tones by. A new role is added
@@ -493,24 +342,12 @@ export const presets: readonly HarnessPreset[] = [
     debuggerPreset
 ];
 
-// The offline/example fixtures, kept as first-class presets so a host or a test
-// can inject them explicitly (`createHarnessRegistry(FIXTURE_PRESETS)` or
-// `[...presets, ...FIXTURE_PRESETS]`). They are no longer part of `presets`, so
-// `GET /harnesses` and a new session cannot reach them by accident, but their
-// factories are unchanged: demo still scripts a full loop with no endpoint, and
-// flaky still registers `testFlaky`.
-export const FIXTURE_PRESETS: readonly HarnessPreset[] = [demo, failure];
-
-// Every template this build can rebuild a factory from: the shipped catalogue
-// PLUS the fixtures. Two consumers need the superset:
-//   - ./registry.ts `presetFromRecord`, whose 'scripted' branch resolves a frozen
-//     session's factory BY NAME, so a session created on an older build when demo
-//     shipped still restores (a legacy flaky record rebuilds from its `flaky`
-//     template and never needs this list);
-//   - a test/host that wants the old offline-capable registry in one call.
-// Order is catalogue-first, so an injected registry lists the real presets before
-// the fixtures, exactly as the UI used to.
-export const ALL_PRESET_TEMPLATES: readonly HarnessPreset[] = [...presets, ...FIXTURE_PRESETS];
+// There is no `FIXTURE_PRESETS` and no `ALL_PRESET_TEMPLATES` any more. Both existed to
+// keep the scripted `demo` and the `flaky` example reachable behind the production
+// catalogue; with those presets deleted there is no second tier to name. `presets` is the
+// whole set, and a host or a test that wants its own fixture passes it straight to
+// `createHarnessRegistry([...presets, myFixture])` — the registry already accepts any
+// `HarnessPreset[]`, so nothing was ever needed from this module to make that work.
 
 // Previous shipped EXECUTABLE definitions, keyed by preset id, for the restore
 // policy in ./registry.ts.

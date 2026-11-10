@@ -12,7 +12,8 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
-import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from '../harnesses';
+import { createHarnessRegistry } from '../harnesses';
+import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { STANDALONE_MOUNT } from '../api';
 // The shared epoch/revision hub (REST owner): the stream must report THIS epoch, not its own.
 import { HARNESS_RUNTIME_EPOCH } from '../api-events';
@@ -28,7 +29,7 @@ beforeAll(async () => {
     server = await startHarnessServer({
         port: 0,
         staticRoot: null,
-        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES)
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES)
     });
 
     streamPath = server.stream.path;

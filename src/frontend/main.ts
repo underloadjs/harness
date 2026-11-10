@@ -774,7 +774,9 @@ type View = {
     // what routes the next submit: continuing an idle/stopped thread or steering a
     // running one. `undefined` means "no focus": the next message opens a NEW thread.
     focusedThread: () => string | undefined;
-    focusThread: (threadId: string) => boolean;
+    // R3c: `scroll` (default false) is this view saying "the reader asked for it" — the
+    // board then moves that conversation into view. A background path leaves it off.
+    focusThread: (threadId: string, scroll?: boolean) => boolean;
     // Explicitly drop the steering target (deleted thread, session teardown). Unlike
     // a tile toggle this is never a user intent to open a new thread, but it must
     // still stop the next submit from targeting the removed id (S3).
@@ -1199,7 +1201,7 @@ const createView = (
         },
         discard: (turn) => board.discard(turn),
         focusedThread: () => board.focusedThread(),
-        focusThread: (threadId) => board.focusThread(threadId),
+        focusThread: (threadId, scroll) => board.focusThread(threadId, scroll === true),
         clearFocus: () => board.collapse(),
         // T21 R22: same transition as the reader's own collapse press, used by the
         // shell when a conversation is LOADED (see the `View.collapseForLoad` note).
@@ -1265,7 +1267,12 @@ const createView = (
         },
         notice: (text, tone) => {
             board.notice(text, tone);
-            stick(true);
+            // R3: a notice is the board's own line (it already lives at the end of the
+            // transcript), not a user gesture. Jumping to the bottom here pulled a reader
+            // out of whatever they were reading every time anything was reported; the same
+            // follow-the-bottom rule the rest of this view uses applies — follow ONLY when
+            // the reader was already at the bottom (see `pinned`).
+            stick(pinned());
         },
         setNotice,
         hydrate: (turns, model, keep, labelSeeds) => {
@@ -5303,6 +5310,15 @@ type Instance = {
     // `refreshReceiptRow`). Same scoping rule as `reloadedTrees`: one bounded row-page read per
     // turn per open conversation, never one per frame.
     reloadedRows?: { sessionId: string; ids: Set<string> };
+    // R2: the turns whose tree read is IN FLIGHT right now (see `reloadTurnTree`). Unlike
+    // `reloadedTrees`, this is not a budget — it is released as soon as the answer lands,
+    // so it dedupes only CONCURRENT identical reads (the three recovery paths that fire on
+    // one drop) and never blocks a later freshness re-read after a real reconnect.
+    treeReads?: { sessionId: string; ids: Set<string> };
+    // R2/R4: the display loader's generation at the moment the current document's trees were
+    // adopted (see `carryDisplays`). A mismatch means the cache was invalidated since, so the
+    // trees the last document painted must not survive into the next one.
+    treeGeneration?: number;
 };
 
 const instances = new Map<string, Instance>();
@@ -9716,44 +9732,30 @@ const deleteSessionRow = async (id: string): Promise<void> => {
 // R1: only the first eight characters are VISIBLE. The full uuid, the harness and the
 // status live in the `title` tooltip, so a dozen conversations still fit one wrapped row
 // under the title.
-const renderSessionPill = (
-    session: SessionRecord,
-    activeId: string | undefined,
-    archived: boolean
-): HTMLElement => {
+// One pill per conversation, REUSED across paints (R4b). `renderSessions()` is the single
+// directory painter and it runs from EVERY mutation path AND from `applyView`/`upsertSession`
+// — i.e. once per poll tick while a run is live. It used to `replaceChildren` the whole
+// strip, so every pill was destroyed and rebuilt on every paint: the entry animation
+// restarted, the hover state died mid-click, and a list the reader was already looking at
+// re-appeared as fresh content. The node is now created once per session id and updated in
+// place; only added/removed/moved conversations touch the DOM.
+//
+// R1: only the first eight characters are VISIBLE. The full uuid, the harness and the
+// status live in the `title` tooltip, so a dozen conversations still fit one wrapped row
+// under the title.
+const createSessionPill = (session: SessionRecord, archived: boolean): HTMLElement => {
     const pill = el('span', 'session-pill');
     pill.setAttribute('role', 'listitem');
     pill.dataset.sessionId = session.id;
-    pill.dataset.status = session.status;
-    // R6: an archived pill is the conversation of a harness the registry no longer has.
-    // The flag is styling only (muted/dashed) — opening and deleting are the same paths.
-    pill.dataset.archived = archived ? 'true' : 'false';
-    if (session.id === activeId) pill.dataset.active = 'true';
 
     const select = el('button', 'session-pill-select');
     select.type = 'button';
     select.dataset.sessionId = session.id;
-    select.dataset.status = session.status;
-    if (session.id === activeId) {
-        select.dataset.active = 'true';
-        // `aria-current` is ARIA for "this is the current item of a set"; it is written under
-        // the SAME condition as `data-active`, from the SAME painter, so what a reader sees
-        // and what a screen reader hears can never disagree — the dashboard's pills are
-        // rebuilt from `activeId` on every paint, exactly like the header cycler.
-        select.setAttribute('aria-current', 'true');
-    }
-    // Switching conversations is refused while a run is in flight OR while a submit is in its
-    // enqueue window (the same lock the old row carried, and the reason New session is
-    // disabled too). `submitting` is here because the dashboard is built the moment the
-    // reader opens it — a strip created inside the enqueue window has to be born locked, or
-    // the freshly painted pill would offer a switch the header cycler refuses. `paintControls`
-    // re-applies the same expression on every later repaint.
-    select.disabled = submitting || running;
-    select.append(el('span', 'session-pill-id', shortId(session.id)));
-    select.title = `${session.harness} · ${session.status} · ${session.id}`;
     // The visible text is a truncated id, so the accessible name spells the action out
-    // instead of announcing eight hex characters.
+    // instead of announcing eight hex characters. The id never changes for a reused pill,
+    // so this is a create-time fact, not a per-paint one.
     select.setAttribute('aria-label', `Open session ${shortId(session.id)}`);
+    select.append(el('span', 'session-pill-id', shortId(session.id)));
     select.addEventListener('click', () => {
         // R2: a pill pressed inside the open Instruct dialog must not leave that dialog
         // describing the conversation the reader just left. No-op when it is closed.
@@ -9770,11 +9772,82 @@ const renderSessionPill = (
     // whole permanence warning now that no confirmation surface exists.
     remove.setAttribute('aria-label', `Delete session ${shortId(session.id)}`);
     remove.title = 'Delete this session permanently. Running or queued work in it stops.';
-    remove.disabled = deletionBlocked() || removingSessions.has(session.id);
     remove.addEventListener('click', () => void deleteSessionRow(session.id));
 
     pill.append(select, remove);
+
+    // Every state attribute (and both busy locks) is painted by ONE function, so a created
+    // pill and a reused one can never disagree.
+    paintSessionPill(pill, session, undefined, archived);
+
     return pill;
+};
+
+// The in-place update of a reused pill. Written under the SAME conditions the old wholesale
+// painter used, plus the removals that a rebuild got for free by starting from nothing:
+// `data-active`/`aria-current` are DELETED when this conversation is no longer the one on
+// screen, or the strip would show two selected pills after a selection change.
+const paintSessionPill = (
+    pill: HTMLElement,
+    session: SessionRecord,
+    activeId: string | undefined,
+    archived: boolean
+): void => {
+    const select = pill.querySelector<HTMLButtonElement>('.session-pill-select');
+    const remove = pill.querySelector<HTMLButtonElement>('.session-pill-delete');
+    const active = session.id === activeId;
+
+    pill.dataset.status = session.status;
+    // R6: an archived pill is the conversation of a harness the registry no longer has.
+    // The flag is styling only (muted/dashed) — opening and deleting are the same paths.
+    pill.dataset.archived = archived ? 'true' : 'false';
+
+    if (active) pill.dataset.active = 'true';
+    else delete pill.dataset.active;
+
+    if (select !== null) {
+        select.dataset.status = session.status;
+
+        if (active) {
+            select.dataset.active = 'true';
+            // `aria-current` is ARIA for "this is the current item of a set"; it is written
+            // under the SAME condition as `data-active`, from the SAME painter, so what a
+            // reader sees and what a screen reader hears can never disagree.
+            select.setAttribute('aria-current', 'true');
+        } else {
+            delete select.dataset.active;
+            select.removeAttribute('aria-current');
+        }
+
+        // Switching conversations is refused while a run is in flight OR while a submit is in
+        // its enqueue window (the same lock the old row carried, and the reason New session
+        // is disabled too). `paintControls` re-applies the same expression on every later
+        // repaint; painting it here as well is what keeps a pill that was just created (or
+        // reused after a directory change) honest without a second pass over the strip.
+        select.disabled = submitting || running;
+        select.title = `${session.harness} · ${session.status} · ${session.id}`;
+    }
+
+    if (remove !== null) {
+        // R8: deletion is a write, so it is disabled for the same conflicting windows that
+        // lock submits/saves, and for a pill whose own DELETE is in flight.
+        remove.disabled = deletionBlocked() || removingSessions.has(session.id);
+    }
+};
+
+// The reused nodes of one strip, keyed by session id. A WeakMap on the list element keeps
+// this entirely local to the painter: `SessionPillBar` (the exported bar record) is unchanged.
+const pillNodes = new WeakMap<HTMLElement, Map<string, HTMLElement>>();
+
+const pillNodesFor = (list: HTMLElement): Map<string, HTMLElement> => {
+    const held = pillNodes.get(list);
+
+    if (held !== undefined) return held;
+
+    const created = new Map<string, HTMLElement>();
+    pillNodes.set(list, created);
+
+    return created;
 };
 
 // T7/T9: paint the session cycling pill next to the Instruct title (the node and the click
@@ -9874,6 +9947,9 @@ const renderSessions = (): void => {
     const entries = sessionDirectory();
 
     for (const bar of bars) {
+        // R4b: the reused nodes of THIS strip, keyed by session id.
+        const pills = pillNodesFor(bar.list);
+
         if (entries.length === 0) {
             // `role="list"` promises list items; an empty strip announces a list of
             // nothing, so the hint replaces the semantics instead of riding inside it.
@@ -9889,13 +9965,42 @@ const renderSessions = (): void => {
                         : 'No sessions yet.'
                 )
             );
+            // The nodes this strip owned are detached; the map must not hand a dead node
+            // back to the next paint that names the same conversation.
+            pills.clear();
             continue;
         }
 
         bar.list.setAttribute('role', 'list');
-        bar.list.replaceChildren(
-            ...entries.map((entry) => renderSessionPill(entry.session, activeId, entry.archived))
-        );
+
+        // 1. retire the pills of conversations that are gone, and the empty-state hint a
+        //    previously-empty strip left behind.
+        for (const [id, pill] of [...pills]) {
+            if (entries.some((entry) => entry.session.id === id)) continue;
+
+            pill.remove();
+            pills.delete(id);
+        }
+
+        bar.list.querySelector(':scope > .session-pills-empty')?.remove();
+
+        // 2. update or create one pill per entry, then move it only when it is not already
+        //    the child at this position. A directory that only changed STATUS — the common
+        //    poll tick — therefore costs zero DOM moves.
+        let position = 0;
+
+        for (const entry of entries) {
+            const existing = pills.get(entry.session.id);
+            const pill = existing ?? createSessionPill(entry.session, entry.archived);
+
+            pills.set(entry.session.id, pill);
+            paintSessionPill(pill, entry.session, activeId, entry.archived);
+
+            const at = bar.list.children[position] ?? null;
+
+            if (at !== pill) bar.list.insertBefore(pill, at);
+            position += 1;
+        }
     }
 };
 
@@ -10299,9 +10404,36 @@ const repaintActionCard = (instance: Instance, turnId: string): void => {
 
 // Recovery for a gap on the focused turn's own subscription: one bounded re-read of
 // THAT turn's tree (the turn scope's full state), never a history snapshot.
+//
+// R2: deduped per turn while a read is in flight. A recovery can be asked for the SAME
+// turn by three independent paths at once (the drop's tree-cache invalidation, the window
+// reconcile that follows it, and the re-registered `turn` subscription's fresh baseline),
+// and they used to stack three identical GETs of one tree. Sequential re-reads after a
+// real reconnect are still allowed — the guard is scoped to the in-flight window and to
+// one session id, so it never suppresses the NEXT re-read, only a concurrent duplicate.
 const reloadTurnTree = (instance: Instance, sessionId: string, turnId: string): void => {
+    let scoped = instance.treeReads;
+
+    if (scoped === undefined || scoped.sessionId !== sessionId) {
+        scoped = { sessionId, ids: new Set<string>() };
+        instance.treeReads = scoped;
+    }
+
+    if (scoped.ids.has(turnId)) return;
+    scoped.ids.add(turnId);
+
+    // Stable binding for the callbacks below (a `let` captured in a closure loses the
+    // narrowing above). The id is released on BOTH outcomes so the next genuine re-read
+    // still runs; the mark only lives while this one request is open.
+    const pending = scoped;
+    const release = (): void => {
+        if (instance.treeReads === pending) pending.ids.delete(turnId);
+    };
+
     void readTurnDisplay(sessionId, turnId)
         .then((tree) => {
+            release();
+
             const view = instance.compiled;
 
             // Stale guard: the reader left this conversation while the read ran.
@@ -10310,7 +10442,9 @@ const reloadTurnTree = (instance: Instance, sessionId: string, turnId: string): 
             view.displays[turnId] = tree;
             repaintPlane(instance);
         })
-        .catch(() => undefined);
+        .catch(() => {
+            release();
+        });
 };
 
 // T44: recovery for a turn that settles WITHOUT a flow frame (see the call in
@@ -10758,6 +10892,94 @@ const applyThreadRowPatch = (
     syncThreadFollow(instance, instance.view.followedThreads());
 };
 
+// R2/R4: moves the trees this instance already painted onto a rows-only document before
+// that document becomes the instance's authority. Two rules, stated once:
+//
+//   1. the loader's GENERATION decides whether any tree may survive at all. `invalidate()`
+//      (a dropped socket in `recoverAfterDrop`, a released session) is the signal that the
+//      cached trees are untrustworthy, so nothing carries and the next reveal() re-reads the
+//      rows on screen — the freshness recovery `recoverAfterDrop` documents stays intact;
+//   2. a ROW that moved since its tree was painted (a running turn advancing, a settle, a
+//      cancel) is a tree that is known to be behind, so it is unloaded from the cache
+//      (`plane.forget`) and read again by the plane. That is the poll fallback's display
+//      update channel: it used to arrive as a fresh tree inside the polled document.
+//
+// A steady-state tick — an idle conversation, or a live one whose rows did not move — then
+// carries every tree and costs ZERO display reads and ZERO tile rebuilds, which is the flood
+// and the flicker this fix removes.
+const carryDisplays = (instance: Instance, session: SessionView): void => {
+    const plane = instance.plane;
+    const previous = instance.compiled;
+
+    // The first document of this card, or a document of ANOTHER conversation: nothing to
+    // carry (turn ids are unique per session only), and the stamp is re-based onto the plane
+    // this conversation's trees belong to.
+    if (previous === undefined || previous.id !== session.id) {
+        instance.treeGeneration = plane?.generation();
+
+        return;
+    }
+
+    const generation = plane?.generation();
+    const stamp = instance.treeGeneration;
+
+    instance.treeGeneration = generation;
+
+    const held = previous.displays;
+    const incoming = session.displays;
+
+    if (held === undefined || incoming === undefined) return;
+
+    // A generation bump happened between the two documents: every tree the last document
+    // painted is stale by the loader's own rule, so the rows simply become unloaded again.
+    if (generation !== undefined && stamp !== undefined && stamp !== generation) {
+        for (const row of session.turns) plane?.forget(row.id);
+
+        return;
+    }
+
+    const before = new Map<string, TurnSummary>();
+    for (const row of previous.turns) before.set(row.id, row);
+
+    for (const row of session.turns) {
+        // A document that DOES carry this row's tree (an open that fetched a tail, an ops
+        // frame's adopted tree) is the newer authority and wins untouched.
+        if (incoming[row.id] !== undefined) continue;
+        if (held[row.id] === undefined) continue;
+
+        if (rowMoved(before.get(row.id), row)) {
+            plane?.forget(row.id);
+            continue;
+        }
+
+        incoming[row.id] = held[row.id];
+    }
+};
+
+// R2/R4 rule 2: has this row's RECORD moved since the tree above it was painted? The
+// comparison is the row's OWN published tree-shaped figures (the server folds them from the
+// same flow the tree carries): the stamps, the folded state, the section/step counts, the
+// live agents and the block previews. Identical figures mean the painted tree is still
+// current; anything else means the flow advanced and the tree is behind, so the plane reads
+// it again — one bounded read for the row that moved, instead of the old document that
+// shipped a fresh tree for EVERY painted turn on EVERY tick.
+const treeSignatureOf = (row: TurnSummary): string =>
+    [
+        row.updatedAt,
+        row.status,
+        row.state,
+        row.sectionCount,
+        row.stepCount,
+        (row.activeAgents ?? []).join(','),
+        row.detail ?? '',
+        (row.blocks ?? [])
+            .map((block) => `${block.agent}:${block.label}:${block.status}:${block.preview?.length ?? 0}`)
+            .join('|')
+    ].join('');
+
+const rowMoved = (previous: TurnSummary | undefined, next: TurnSummary): boolean =>
+    previous === undefined || treeSignatureOf(previous) !== treeSignatureOf(next);
+
 const applyView = (instance: Instance, session: SessionView): void => {
     // R8: a snapshot for a session this page deleted must never re-point the card
     // at it. The tombstone covers the observer/poll/resync/openSession/enqueue
@@ -10871,6 +11093,15 @@ const applyView = (instance: Instance, session: SessionView): void => {
         );
     }
     instance.records = records;
+
+    // R2/R4 (the display-read flood): a document read is now ROWS ONLY (./view-shell.ts
+    // `getView` passes `visibleTurns: 0`), so the trees this instance had already painted
+    // are not in the document that replaces it. `carryDisplays` moves them across (with its
+    // own generation and row-level rules) BEFORE the document becomes the instance's
+    // authority, so the tiles, the tool panels, `stepIndex` and any later ops frame all keep
+    // reading the trees that are on screen — and a steady-state poll tick costs zero display
+    // reads and zero tile rebuilds.
+    carryDisplays(instance, session);
 
     // R1/R3 authority: the compiled document this instance renders, kept in the
     // per-instance store so an ops frame and this document mutate ONE state object.
@@ -12554,7 +12785,8 @@ const run = async (): Promise<void> => {
 
         // Keep the steering target visible on the conversation that received the
         // message: continuing/steering must not silently move focus elsewhere.
-        if (target.threadId !== undefined) instance.view.focusThread(target.threadId);
+        // R3c: the reader pressed send, so keeping that conversation in view is their call.
+        if (target.threadId !== undefined) instance.view.focusThread(target.threadId, true);
 
         // The receipt's own merge: rows, pending flag, session figures, directory row.
         applyReceiptRow(instance, record, receipt);

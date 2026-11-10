@@ -953,7 +953,7 @@ share one.
 | `roll` | `diceRoll` | app tool |
 | `searchNotes` | `noteSearch` | app tool |
 | `summarize` | `textSummarize` | app tool |
-| `flaky` (tool) | `testFlaky` | the `flaky` **harness/preset id** is unchanged |
+| `flaky` (tool) | `testFlaky` | both are gone: the tool and the `flaky` **harness/preset id** were deleted with the example tier |
 
 `profiles`, `chapters`, and `locations` were added under their final
 names, so they have no removed-name row. All three are core session tools with the
@@ -977,9 +977,10 @@ preset. See [Web search](#web-search-search), [Page fetch](#page-fetch-fetch), a
 There are **no aliases**: the old names are gone from the wire surface, the
 exports, the catalogue, and the reserved-name list. This is a deliberate breaking
 change — a catalogue with two names for one tool makes discovery ambiguous. Harness
-ids (`instruct`, `research`, `workspace`, `reviewer`, `planner`, `demo`, `flaky`),
-agent ids, and the `websearch` and `webfetch` configuration fields are *not* tool
-names and are unchanged.
+ids (`general`, `instruct`, `research`, `workspace`, `reviewer`, `planner`,
+`debugger`), agent ids, and the `websearch` and `webfetch` configuration fields are
+*not* tool names and are unchanged. (`demo` and `flaky` are no longer among them: the
+example presets were deleted, so those two names resolve to nothing.)
 
 ### Preset tools
 
@@ -1238,12 +1239,12 @@ library never imports a dotenv parser and never reads a file: when you embed
 (CLI, `yarn dev:server`, and the service runtime) load the package-root `.env` once at startup before any
 harness is constructed — see [Environment file](#environment-file). The
 CLI/server presets pass `websearch: true`, so a key in the shell or in `.env` is
-enough for any of those entry points; the offline `demo` stays offline, and no UI
-field or `RunnerSettings` value carries a search key. The real harnesses
-(`instruct`, `research`, `workspace`, `reviewer`, `planner`) share one toolbox, so a
-key makes web search available to all of them or to none. The `flaky` example is
-built by the same shared factory, so it opts in too; only the scripted `demo` stays
-offline.
+enough for any of those entry points, and no UI field or `RunnerSettings` value
+carries a search key. Every shipped harness (`general`, `instruct`, `research`,
+`workspace`, `reviewer`, `planner`, `debugger`) is built from one shared factory and
+shares one toolbox, so a key makes web search available to all of them or to none.
+There is no endpoint-free preset left to exempt: the scripted `demo` and the `flaky`
+example are deleted, so every card requires a provider.
 
 **Catalogue visibility (server and UI).** The harness app always lists
 `search` in its direct-call catalogue, configured or not. With a key it is a
@@ -1257,8 +1258,8 @@ descriptor, hint, CLI listing, or UI.
 
 The same rule applies to preset descriptors (`GET /harnesses`, the `/presets`
 alias, and the canonical bootstrap document). Every shared-toolbox preset
-(`instruct`, `research`, `workspace`, `reviewer`, `planner`, and the `flaky`
-example) declares `environmentTools: ['search', 'fetch']`, which the
+(`general`, `instruct`, `research`, `workspace`, `reviewer`, `planner`, `debugger`)
+declares `environmentTools: ['search', 'fetch']`, which the
 server appends to its `tools` list **and** to `coreTools` **only** when the runtime
 catalogue has an executable definition for that name: a resolved key for `search`
 (`src/server/harnesses/websearch.ts`), the `webfetch` opt-in for `fetch`
@@ -2124,7 +2125,7 @@ workspace root still finds it. In this workspace the file is
 | `HARNESS_BASE_URL` | Provider base URL default; CLI `-b` overrides |
 | `HARNESS_API_KEY` | Provider key; CLI `-k` overrides. Falls back to `OPENAI_API_KEY` |
 | `HARNESS_MODEL` | Model default; CLI `-m` overrides |
-| `EXA_API_KEY` | Opt-in `search` provider (the preferred default) for the real presets (`instruct`, `research`, `workspace`, `reviewer`, `planner`, and the `flaky` example), **and** the optional hosted `fetch` provider |
+| `EXA_API_KEY` | Opt-in `search` provider (the preferred default) for every shipped preset (`general`, `instruct`, `research`, `workspace`, `reviewer`, `planner`, `debugger`), **and** the optional hosted `fetch` provider |
 | `TAVILY_API_KEY` | Second opt-in `search` provider (search only — Tavily has no `fetch` provider) |
 | `LINKUP_API_KEY` | Third opt-in `search` provider, and the second optional hosted `fetch` provider |
 | `HARNESS_THREAD_EXECUTION` | Server only: `inline` (default) or `worker` — runs each conversation's turn on its own OS worker thread. See [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker) |
@@ -2400,9 +2401,8 @@ this package's source through the workspace script; the published package remain
 the library.
 
 ```bash
-yarn cli --list                                     # seven real presets, then the examples
+yarn cli --list                                     # the seven shipped presets
 yarn cli "Write an opening."                        # default preset: general (live)
-yarn cli --preset demo "What time is it?"           # explicit offline scripted fixture
 yarn cli --preset planner "Plan the release."       # plans, then delegates to its specialists
 yarn cli --preset workspace --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
 yarn cli --preset research --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
@@ -2414,8 +2414,9 @@ The Analyst card is the `workspace` preset and the Explore card is `research` (t
 ids are kept for saved sessions and bookmarks; `--list` shows each id with its
 title). The default is the real `general` role, not the demo: a scripted answer is
 not a useful general harness, and `general` is the one card the catalogue lists
-first. `demo` remains the explicit endpoint-free fixture (`--preset demo`), and
-there is no silent fallback to it when a provider is unreachable. A live role uses
+first. There is no endpoint-free preset to fall back to: the scripted `demo`
+fixture is deleted, so `--preset demo` is an unknown name and the CLI says so and
+prints the real list. Every preset is live, and a live role uses
 `--base-url` / `HARNESS_BASE_URL` (plus `--api-key` / `HARNESS_API_KEY` when the
 provider needs one); if the run cannot reach the provider, it reports the failure
 rather than
@@ -2423,7 +2424,7 @@ inventing a demo transcript.
 
 | Flag | Meaning |
 |---|---|
-| `-p, --preset <name>` | Preset to run (default `instruct`; `demo` is the offline fixture) |
+| `-p, --preset <name>` | Preset to run (default `general`; every preset needs a provider) |
 | `-m, --model <model>` | Model for live presets |
 | `-b, --base-url <url>` | OpenAI-compatible base URL |
 | `-k, --api-key <key>` | Provider key; defaults to `HARNESS_API_KEY` |
@@ -2640,20 +2641,20 @@ to run as a delegate. `general`'s own team is empty on purpose, which is what ma
 Delegation is **one level deep** and a subagent never receives `delegate`; the
 profiles say so, and none of them asks a subagent to delegate again.
 
-The two remaining presets are examples, and T5 un-shipped them: they are NOT in the
-catalogue a server lists (`GET /api/harnesses` returns only the seven real roles). A
-host or a test injects them explicitly (`createHarnessRegistry(ALL_PRESET_TEMPLATES)`
-or `FIXTURE_PRESETS`), and an older session recorded while they shipped still restores
-because the scripted factory is looked up in that superset:
+There is no example tier left. The two presets that used to sit beside these seven —
+`demo` (a scripted offline transport) and `flaky` (the shared toolbox plus a tool that
+throws two calls out of three) — are deleted, along with the `demo`/`flaky` agent
+profiles and the `testFlaky` tool and its scanned `src/server/tools/examples` folder.
+A card a user could pick that did not do what a card promises was the bug; the offline
+loop and the failure tool that suites still need are TEST fixtures a test injects
+itself (`src/server/harnesses/fixture-presets.test-support.ts`), never a catalogue row.
+Because nothing ships a scripted factory any more, a saved session whose frozen record
+names the `scripted` template is DROPPED at restore with a readable reason
+(`Scripted harness "demo" is not shipped in this build`) unless the host injected a
+scripted preset of that name — never silently rebuilt on some other harness.
 
-| Preset | Shape |
-|---|---|
-| `demo` | Scripted offline template — no endpoint needed; discovers `timeNow` with `toolRequest`, calls it, then answers. Deliberately not a live harness, so it uses timeNow only. Editable: metadata edits keep the script; an executable edit upgrades it to a live profiled harness. |
-| `flaky` | The shared toolbox plus a tool that throws two calls out of three, to show recoverable failures. Editable: metadata edits keep `testFlaky`; an executable edit rebuilds the live toolbox with it retained. |
-
-`flaky` is the only preset-specific extra tool: it is excluded from the shared
-toolbox because it fails on purpose and keeps attempt state. Every entry - shipped or
-fixture - is a template the registry copies; there is no read-only category (R20.1). Legacy
+Every shipped entry is a template the registry copies; there is no read-only category
+(R20.1). Legacy
 identifiers still resolve: `writer` and `assistant` → `instruct`, `researcher` →
 `research`. They are aliases, not extra cards, and a session created through one
 reports the canonical name. Titles are never names: the visible titles `Explore`,
@@ -2778,16 +2779,14 @@ only a `list` entry may omit `path`, and that one means the working directory.
 
 **Harness creation and overrides.** `POST /api/harnesses` adds a live harness
 built from trusted agents and the shared toolbox; `PATCH` changes any harness,
-including the shipped templates (`instruct`, `research`, `workspace`, `reviewer`,
-`planner`, `demo`, `flaky`). Every entry is an editable template copy;
+including the shipped templates (`general`, `instruct`, `research`, `workspace`,
+`reviewer`, `planner`, `debugger`). Every entry is an editable template copy;
 `editable` remains on the wire for compatibility and is always `true`. A
 metadata-only `PATCH` (`title`/`description`) preserves the template's captured
-factory — the scripted `demo` keeps its offline script and `timeNow`-only registry,
-and `flaky` keeps its `testFlaky` extra. An executable `PATCH`
-(`primary`/`subagents`/`agentModels`/`agentInstructions`) rebuilds the harness: `demo`
-becomes an
-honest live profiled harness (shared toolbox, requires an endpoint), and `flaky`
-rebuilds the live toolbox while retaining `testFlaky`.
+factory, so a harness that does not use the live profiled factory keeps whatever it
+was built with. An executable `PATCH`
+(`primary`/`subagents`/`agentModels`/`agentInstructions`) rebuilds the harness as a
+live profiled harness from the shared toolbox.
 `builtin: true` still marks provenance. There is no delete; with a database root
 the registry is restored from `<root>/harness/state.json` (see Persistence), and
 without one it is in memory only. Registry edits affect FUTURE sessions only,
@@ -3532,7 +3531,7 @@ create sessions and drive tools, so use this only on a trusted network.
 ```json
 {
     "rootPath": "/v1/harness",
-    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "task", "profiles", "chapters", "locations", "agentManage", "agentResult", "threadFork"], "builtin": true, "editable": true }],
+    "presets": [{ "name": "general", "title": "General", "requiresEndpoint": true, "primary": "general", "subagents": [], "agents": ["general"], "tools": ["…the shared toolbox…"], "coreTools": ["toolRequest", "tasks"], "builtin": true, "editable": true }],
     "agents": [{ "name": "instruct", "title": "Instruct", "description": "…", "instruction": "…", "guidelines": ["…"] }],
     "tools": [{ "name": "toolRequest", "group": "Core tools", "tags": ["discovery"], "visibility": "core", "sessionBound": true, "parameters": {}, "availability": { "state": "available", "hint": "Runs inside a session harness: send a sessionId with the call." } }, { "name": "read", "group": "Package presets", "tags": ["files"], "visibility": "core", "parameters": {} }],
     "defaults": { "baseURL": "…", "model": "…", "hasApiKey": true },

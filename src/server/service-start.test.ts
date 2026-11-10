@@ -72,7 +72,8 @@ const DRIVER = `// Scratch integration driver written by src/server/service-star
 // Scans the harness package for endpoint modules and serves them on port 0.
 import http from 'node:http';
 import { startServer } from '../../packages/underload/service/src/server/start';
-import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from '../../packages/underload/harness/src/server/harnesses';
+import { createHarnessRegistry } from '../../packages/underload/harness/src/server/harnesses';
+import { PRODUCTION_WITH_FIXTURES } from '../../packages/underload/harness/src/server/harnesses/fixture-presets.test-support';
 import { createHarnessRuntime, setHarnessRuntime } from '../../packages/underload/harness/src/server/runtime';
 
 const target = http.Server.prototype as unknown as { listen: (...args: unknown[]) => unknown };
@@ -107,7 +108,7 @@ const serviceRoot = process.env.HARNESS_SERVICE_DATABASE_ROOT;
 setHarnessRuntime(
     createHarnessRuntime({
         ...(serviceRoot === undefined ? {} : { root: serviceRoot }),
-        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES)
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES)
     }),
     serviceRoot
 );
@@ -139,7 +140,7 @@ process.on('SIGINT', shutdown);
 // pass): the SEVEN shipped production presets plus the two fixtures the driver
 // registers so this suite can run a real turn offline. An un-injected runtime lists
 // only the first seven. Order is the shipped catalogue order, fixtures last
-// (../harnesses/presets.ts:486-494 + ALL_PRESET_TEMPLATES at :513).
+// (../harnesses/presets.ts:486-494 + PRODUCTION_WITH_FIXTURES at :513).
 const PRESET_NAMES = [
     'general',
     'instruct',
@@ -189,7 +190,6 @@ const TOOL_NAMES = [
     'diceRoll',
     'noteSearch',
     'textSummarize',
-    'testFlaky',
     'search',
     // R9-R11: the web core pair is listed together (src/server/harnesses/webfetch.ts).
     'fetch'

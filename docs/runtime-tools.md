@@ -443,8 +443,9 @@ against an incompatible replacement. Later requests see the published replacemen
 
 ## Server integration
 
-All shipped preset, demo, and flaky tool source routes are compiled through the
-shared source operation. The `toolRegistry` catalogue entry is session-bound: a
+Every shipped preset's tool source routes are compiled through the
+shared source operation (a test fixture that opts into extra source tools goes through
+the same operation). The `toolRegistry` catalogue entry is session-bound: a
 call with a `sessionId` runs against that session's live harness registry and
 accepts any registered name, including a source revision just published there.
 

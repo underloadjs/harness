@@ -8,14 +8,13 @@
 //   harness                           interactive Instruct session (TTY)
 //   echo "a task" | harness           one task from stdin
 //   harness --preset planner          a different real role
-//   harness --preset demo             offline scripted fixture (no endpoint)
 //   harness --preset instruct --json  newline-delimited events
 //   harness --serve                   API + built UI on http://127.0.0.1:5181
 //
-// With no `--preset`, the default is the real Instruct role, not the demo: a
-// scripted answer is useful only as an explicit offline demonstration. There is
-// no silent demo fallback when a provider is unreachable; a live role reports
-// the run failure instead.
+// With no `--preset`, the default is the real General role. Every preset this CLI can
+// select is a live role that needs a provider: the offline scripted `demo` fixture is
+// deleted, so there is no endpoint-free preset and no silent fallback to one — a run
+// with no base URL reports the missing configuration instead.
 
 import { createInterface } from 'node:readline';
 import { createToolCatalogue, findPreset, presets } from '../harnesses';
@@ -59,7 +58,7 @@ session. With no task and piped stdin, reads the task from stdin.
 
 Options:
   -p, --preset <name>    Harness preset to run (default: ${DEFAULT_CLI_PRESET})
-                         Use --preset demo for the offline scripted fixture.
+                         Every preset is live and needs a provider base URL.
   -m, --model <model>    Model for live presets
   -b, --base-url <url>   OpenAI-compatible base URL
   -k, --api-key <key>    Provider key (default: HARNESS_API_KEY)
@@ -417,7 +416,7 @@ const main = async (): Promise<void> => {
 
     if (preset.requiresEndpoint && settings.baseURL.trim().length === 0) {
         process.stderr.write(`harness "${preset.name}" needs a provider base URL.\n`);
-        process.stderr.write('Set --base-url or HARNESS_BASE_URL, or run the offline fixture with --preset demo.\n');
+        process.stderr.write('Set --base-url or HARNESS_BASE_URL.\n');
         process.exitCode = 1;
         return;
     }

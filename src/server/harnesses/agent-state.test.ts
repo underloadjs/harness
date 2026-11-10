@@ -119,15 +119,15 @@ describe('createAgentState overlay resolution', () => {
     it('keeps record order stable in first-decision order', () => {
         const state = createAgentState();
 
-        state.retire('flaky');
+        state.retire('debugger');
         state.patch('instruct', { title: 'First prose' });
-        state.retire('demo');
+        state.retire('research');
         state.patch('instruct', { description: 'More prose' });
 
         expect(state.records()).toEqual([
-            { name: 'flaky', retired: true },
+            { name: 'debugger', retired: true },
             { name: 'instruct', title: 'First prose', description: 'More prose' },
-            { name: 'demo', retired: true }
+            { name: 'research', retired: true }
         ]);
     });
 
@@ -199,16 +199,16 @@ describe('createAgentState validation', () => {
             message: 'Unknown agent "nope".'
         });
 
-        state.retire('demo');
+        state.retire('workspace');
 
-        expect(refused(() => state.patch('demo', { title: 'X' }))).toEqual({
+        expect(refused(() => state.patch('workspace', { title: 'X' }))).toEqual({
             status: 404,
-            message: 'Agent "demo" is retired; it is no longer part of the selectable catalogue.'
+            message: 'Agent "workspace" is retired; it is no longer part of the selectable catalogue.'
         });
 
-        expect(refused(() => state.retire('demo'))).toEqual({
+        expect(refused(() => state.retire('workspace'))).toEqual({
             status: 404,
-            message: 'Agent "demo" is already retired.'
+            message: 'Agent "workspace" is already retired.'
         });
     });
 
@@ -297,7 +297,7 @@ describe('the durable overlay file', () => {
         const state = createAgentState();
 
         state.patch('research', { title: 'Investigator', guidelines: ['One bullet.'] });
-        state.retire('flaky');
+        state.retire('debugger');
 
         writeHarnessAgentRecords(root, state.records());
 

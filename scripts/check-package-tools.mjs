@@ -116,11 +116,14 @@ const RUNTIME_SOURCE_ENTRIES = [
 ];
 const WEB_SOURCE_ENTRIES = ['fetch.tool.ts', 'search.tool.ts'];
 // App tool entries (T25): DERIVED from the server tools folders, never a hand list.
-// The layout is the contract: `src/server/tools/shared` is the shared toolbox and
-// `src/server/tools/examples` is opt-in per harness. A new `*.tool.ts` in either
-// folder is counted here without this script knowing its name.
+// The layout is the contract: `src/server/tools/shared` IS the shared toolbox. There used
+// to be a second, opt-in folder — `src/server/tools/examples`, which held the one file the
+// deleted `flaky` example preset advertised (`testFlaky.tool.ts`). A scanned folder is
+// load-bearing (`resolveToolFolders` rejects one that is missing), so the folder went with
+// its only entry rather than being left empty. A new `*.tool.ts` under `shared` is counted
+// here without this script knowing its name.
 const APP_TOOLS_ROOT = ['server', 'tools'];
-const APP_TOOL_FOLDERS = ['shared', 'examples'];
+const APP_TOOL_FOLDERS = ['shared'];
 // Preset implementation entries. These are shipped and independently loadable, but
 // the default harness registers the lazy catalogue proxies rather than source
 // revisions, so this check inventories their files without claiming a startup
@@ -659,9 +662,9 @@ await check('shipped source entry inventory is present in the copied package', (
         assert.ok(runtimeEntries.includes(name), `runtime source entry is missing: ${name}`);
     }
 
-    // The two app folders are the whole exclusion contract: `shared` is the shared
-    // toolbox, `examples` is opt-in. Both must exist and both must ship at least the
-    // entries the presets advertise, or the toolbox silently loses a tool.
+    // The app folder is the whole exclusion contract: `shared` IS the shared toolbox. It
+    // must exist and must ship at least one `*.tool.ts`, or the toolbox silently loses a
+    // tool — the same failure an empty scanned folder would cause.
     for (const folder of APP_TOOL_FOLDERS) {
         const directory = path.join(copiedSourceRoot, ...APP_TOOLS_ROOT, folder);
         assert.ok(existsSync(directory), `app tools folder is missing: ${folder}`);

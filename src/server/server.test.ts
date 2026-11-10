@@ -7,7 +7,8 @@
 // beforeAll); the un-injected production catalogue is pinned elsewhere.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from './harnesses';
+import { createHarnessRegistry } from './harnesses';
+import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 // The mount is the REST owner's constant, imported rather than spelled: the standalone listener now
 // serves the canonical `/v1/harness` root (there is no `/api` any more), and a test that hard-coded
 // the old root would fail the moment the contract root moved — which is exactly what happened.
@@ -51,16 +52,16 @@ let base: string;
 const CLIENT = { 'X-Harness-Client': 'ui' };
 
 beforeAll(async () => {
-    // T5: the shipped catalogue is the five real roles, none of which run without a
+    // T5: the shipped catalogue is the production roles, none of which run without a
     // provider. This file exercises the whole HTTP path offline (streams, resets,
     // tool calls), so the server is started over the shipped catalogue PLUS the
     // explicit fixtures — exactly the injection a host that wants the offline card
-    // performs. The production default (five presets, no fixtures) is pinned by
+    // performs. The production default (seven presets, no fixtures) is pinned by
     // src/server/api.test.ts and by the catalogue assertions in src/structure.test.ts.
     server = await startHarnessServer({
         port: 0,
         staticRoot: null,
-        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES)
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES)
     });
     base = server.url;
 });

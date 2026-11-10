@@ -45,12 +45,8 @@ import {
     restoreHarnessRegistry
 } from './registry';
 import { describeHarness } from './descriptor';
-import {
-    ALL_PRESET_TEMPLATES,
-    FIXTURE_PRESETS,
-    LEGACY_PRESET_DEFINITIONS,
-    presets
-} from './presets';
+import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
+import { FIXTURE_PRESETS, PRODUCTION_WITH_FIXTURES } from './fixture-presets.test-support';
 import { SHARED_TOOL_NAMES } from './toolbox';
 // `AGENT_PROFILE_NAMES` is deliberately NOT imported: the roster assertions below are written
 // as literal id lists, so renaming/adding a profile is a visible test edit rather than a
@@ -99,7 +95,7 @@ const registryError = (run: () => unknown): { status: number; message: string } 
 // patch keeps the script; an executable patch upgrades it) has to ask for them by
 // name. That is exactly what a host or a test does now: an explicit fixture
 // injection, not a default that ships them.
-const fixtureRegistry = (): HarnessRegistry => createHarnessRegistry(ALL_PRESET_TEMPLATES);
+const fixtureRegistry = (): HarnessRegistry => createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
 
 describe('the shipped registry', () => {
     it('lists every template as an independent, editable copy', () => {
@@ -202,7 +198,7 @@ describe('the shipped registry', () => {
             ['flaky', 'flaky', true]
         ]);
 
-        const injected = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+        const injected = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
 
         expect(injected.list().map((preset) => preset.name)).toEqual([
             'general',
@@ -216,10 +212,10 @@ describe('the shipped registry', () => {
             'flaky'
         ]);
 
-        // `ALL_PRESET_TEMPLATES` is the lookup superset restore depends on: a
+        // `PRODUCTION_WITH_FIXTURES` is the lookup superset restore depends on: a
         // session frozen on the scripted demo rebuilds even though demo left the
         // catalogue (see ./restore.test.ts and ./registry.ts presetFromRecord).
-        expect(ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
+        expect(PRODUCTION_WITH_FIXTURES.map((preset) => preset.name)).toEqual([
             'general',
             'instruct',
             'research',
@@ -247,9 +243,7 @@ describe('the shipped registry', () => {
             'reviewer',
             'planner',
             'debugger',
-            'summarizer',
-            'demo',
-            'flaky'
+            'summarizer'
         ]);
         // Titles are catalogue data too, and they are the pair the card/picker renders.
         expect(registry.agents().map((profile) => profile.title)).toEqual([
@@ -260,9 +254,7 @@ describe('the shipped registry', () => {
             'Reviewer',
             'Manager',
             'Debugger',
-            'Summarizer',
-            'Demo',
-            'Flaky'
+            'Summarizer'
         ]);
     });
 
@@ -433,7 +425,7 @@ describe('creating a harness', () => {
             // (src/agents/index.ts:78-89) — pinned as literal prose so a renamed or added
             // profile is a deliberate test edit rather than a silent message change.
             message:
-                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky.'
+                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
         });
     });
 
@@ -466,7 +458,7 @@ describe('creating a harness', () => {
             status: 400,
             // Same roster prose as the `primary` refusal above (registry.ts:362).
             message:
-                '`subagents` names unknown agent "critic". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky.'
+                '`subagents` names unknown agent "critic". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
         });
 
         expect(
@@ -605,7 +597,7 @@ describe('updating a harness', () => {
         ).toEqual({
             status: 400,
             message:
-                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky.'
+                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
         });
     });
 
@@ -671,9 +663,9 @@ describe('updating a harness', () => {
         expect(Object.keys(flakyAfter.create(SETTINGS, progress).tools)).toContain('testFlaky');
 
         // The old objects are untouched; a session that captured them keeps the
-        // shipped metadata too.
-        expect(demoBefore.title).toBe('Scripted demo');
-        expect(flakyBefore.title).toBe('Recoverable failures (example)');
+        // injected metadata too.
+        expect(demoBefore.title).toBe('Scripted fixture');
+        expect(flakyBefore.title).toBe('Recoverable failures (fixture)');
     });
 
     it('upgrades the demo to an honest live profiled harness on an executable patch', () => {
@@ -687,7 +679,7 @@ describe('updating a harness', () => {
         // provider, advertises the shared toolbox the live factory registers, and
         // adopts the template's live prose because the shipped text was untouched.
         expect(after.template).toBe('live');
-        expect(after.title).toBe('Live demo');
+        expect(after.title).toBe('Live fixture');
         expect(after.description).toContain('no longer uses the offline script');
         expect(after.requiresEndpoint).toBe(true);
         expect(after.tools).toEqual(SHARED_TOOL_NAMES);
@@ -702,7 +694,7 @@ describe('updating a harness', () => {
         );
     });
 
-    it('rebuilds flaky live and retains testFlaky on an executable patch', () => {
+    it('rebuilds flaky live on an executable patch and drops the example tool this build no longer ships', () => {
         const registry = fixtureRegistry();
 
         const after = registry.update('flaky', {
@@ -710,15 +702,24 @@ describe('updating a harness', () => {
             agentModels: { workspace: 'big/model' }
         });
 
+        // The template survives the patch — that is what keeps the entry on the
+        // createToolboxHarness path rather than the plain profiled factory — but the
+        // example-only tool it used to re-attach came from `src/server/tools/examples`,
+        // which is deleted. The DECLARATION follows the FACTORY: a card may not advertise
+        // a tool its next session cannot call, the same rule that rewrites requiresEndpoint
+        // when a scripted entry goes live.
         expect(after.template).toBe('flaky');
-        expect(after.tools).toEqual([...SHARED_TOOL_NAMES, 'testFlaky']);
+        expect(after.tools).toEqual([...SHARED_TOOL_NAMES]);
         expect(after.requiresEndpoint).toBe(true);
         expect(after.agents).toEqual(['workspace']);
 
         const live = after.create(SETTINGS, progress);
-        expect(live.tools.testFlaky).toBeDefined();
+        expect(live.tools.testFlaky).toBeUndefined();
         expect(Object.keys(live.agents)).toEqual(['workspace']);
         expect(live.agents.workspace.model()).toBe('big/model');
+
+        // A metadata-only patch is different: it keeps the captured factory, and the
+        // injected fixture's factory really does register testFlaky. Pinned above.
     });
 });
 
@@ -885,7 +886,7 @@ describe('deleting a harness', () => {
     });
 
     it('replays deletions idempotently and removes an entry the build still ships', () => {
-        const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+        const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
 
         // Startup replay: duplicates and blank names are noise, not errors, and a
         // name this build does not ship is still recorded.
@@ -1428,14 +1429,16 @@ describe('per-agent instruction overrides', () => {
     it('upgrades the scripted demo on an instruction edit, exactly like a model edit', () => {
         const registry = fixtureRegistry();
 
-        // The demo's shipped factory is the offline script, which ignores prompts. An
+        // The fixture's factory is the offline script, which ignores prompts. An
         // instruction edit is executable, so it must not be stored against a factory
-        // that would silently ignore it: the entry becomes a live profiled harness.
-        const patched = registry.update('demo', { agentInstructions: { demo: 'Be brief.' } });
+        // that would silently ignore it: the entry becomes a live profiled harness. The
+        // member is the real `general` role — the fixture PRESET is named `demo`, but no
+        // `demo` agent profile ships any more.
+        const patched = registry.update('demo', { agentInstructions: { general: 'Be brief.' } });
 
         expect(patched.template).toBe('live');
         expect(patched.requiresEndpoint).toBe(true);
-        expect(patched.agentInstructions).toEqual({ demo: 'Be brief.' });
+        expect(patched.agentInstructions).toEqual({ general: 'Be brief.' });
     });
 
     it('describes the override map only when it is non-empty', () => {
@@ -1531,8 +1534,11 @@ describe('an injected registry', () => {
         expect(registry.find('scripted')).not.toBe(scripted);
         expect(registry.find('scripted')).toEqual(scripted);
         expect(registry.find('instruct')).toBeUndefined();
-        // The trusted roster is independent of the injected catalogue: the same 10 ids,
-        // in `AGENT_PROFILE_NAMES` order (src/agents/index.ts:78-89).
+        // The trusted roster is independent of the injected catalogue: the same eight ids,
+        // in `AGENT_PROFILE_NAMES` order (src/agents/index.ts). Note that the injected
+        // preset's own agent id (`scripted`) is NOT among them — an agent key a harness
+        // invents is not a catalogue profile, which is exactly why the deleted `demo`
+        // fixture builds its scripted agent inline instead of shipping a profile.
         expect(registry.agents().map((profile) => profile.name)).toEqual([
             'general',
             'instruct',
@@ -1541,9 +1547,7 @@ describe('an injected registry', () => {
             'reviewer',
             'planner',
             'debugger',
-            'summarizer',
-            'demo',
-            'flaky'
+            'summarizer'
         ]);
 
         // Creating into an injected registry is still validated and works.
@@ -1773,14 +1777,24 @@ describe('per-agent identity colors', () => {
 
     it('upgrades a scripted template the same way an instruction edit does', () => {
         const registry = fixtureRegistry();
-        const recolored = registry.update('demo', { agentColors: { demo: '#4ade80' } });
 
         // The rule is the T3 instruction rule, restated for colors: a patch that changes
         // what the factory captures cannot keep the offline script.
+        //
+        // The patch also re-targets the primary, and it has to. Going live replaces the
+        // scripted agent with one built from the TRUSTED profiles, and the fixture's own
+        // id (`demo`) is no longer a profile — it was deleted with the preset. An injected
+        // scripted entry whose primary is not a catalogue profile can therefore only go
+        // live by naming one.
+        const recolored = registry.update('demo', {
+            primary: 'instruct',
+            agentColors: { instruct: '#4ade80' }
+        });
+
         expect(recolored.template).toBe('live');
         expect(recolored.requiresEndpoint).toBe(true);
         expect(recolored.tools).toEqual([...SHARED_TOOL_NAMES]);
-        expect(recolored.create(SETTINGS, progress).agents.demo.color).toBe('#4ade80');
+        expect(recolored.create(SETTINGS, progress).agents.instruct.color).toBe('#4ade80');
     });
 
     it('projects the map onto the descriptor only when the harness colors something', () => {

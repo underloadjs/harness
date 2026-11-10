@@ -87,7 +87,6 @@ import { agentInstruction, agentProfile, isAgentProfileName } from '../../agents
 import { AgentStateError, effectiveAgentProfile } from './agent-state';
 import { PRESET_DESCRIPTORS, RUNTIME_DESCRIPTORS, isCoreRegistered } from '../../tools/descriptors';
 import {
-    EXAMPLE_APP_TOOL_SOURCES,
     SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,
     SHARED_APP_TOOL_SOURCES,
@@ -106,7 +105,6 @@ export const PRESET_MAX_ITERATIONS = 1000;
 // import path for the shared app set (T25). Both are derived in ./tools.ts from the
 // files in src/server/tools/shared; nothing here names a tool.
 export {
-    EXAMPLE_APP_TOOL_SOURCES,
     SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,
     SHARED_APP_TOOL_SOURCES,
@@ -486,10 +484,11 @@ export type ToolboxHarnessConfiguration = {
     primary: string;
     // Omitted/empty means a single-agent harness (no delegate tool).
     subagents?: readonly string[];
-    // Example-only SOURCE extras (the recoverable-failure preset adds `testFlaky`).
-    // Merged after the shared source map and before host `extraTools`, so a shipped
-    // exception is still compiled from its editable entry instead of a prebuilt
-    // definition, while a host definition can still override it.
+    // Extra SOURCE entries, by package-relative path. Merged after the shared source
+    // map and before host `extraTools`, so an extra is still compiled from its editable
+    // entry instead of a prebuilt definition, while a host definition can still override
+    // it. No shipped preset uses this any more — it was how the `flaky` example pulled in
+    // `testFlaky` — so it is now purely a host/test extension point.
     extraToolSources?: Readonly<Record<string, string>>;
     // Host/example constructed DEFINITION overrides, registered last so they win
     // over both the shared and extra source maps.
@@ -508,17 +507,17 @@ export type ToolboxHarnessConfiguration = {
 // precisely the shared set a descriptor advertises.
 //
 // `configuration.extraToolSources` is merged AFTER the shared source map and
-// BEFORE `configuration.extraTools`: shipped exceptions (the flaky example's
-// `testFlaky`) are compiled from their editable entries, while a host definition
-// still wins on a name collision exactly as before. Environment tools
+// BEFORE `configuration.extraTools`: an extra is compiled from its editable entry, while
+// a host definition still wins on a name collision exactly as before. Environment tools
 // (search/fetch) follow the host configuration as usual.
 //
 // FOLDER PRECEDENCE (T25): every app entry is a `toolSources` entry discovered from
 // `src/server/tools/shared`, so the kernel commits it after the package baseline and
-// after the package source map, and before `tools` definitions. The example extra
-// (`testFlaky`) is committed the same way from `src/server/tools/examples`, so it is
-// never part of the shared set. No name is registered twice, because the two folders
-// are disjoint.
+// after the package source map, and before `tools` definitions. There used to be a second,
+// opt-in folder (`src/server/tools/examples`, holding `testFlaky`) committed the same way,
+// which is how an example stayed out of the shared set without a name filter. That folder
+// is gone with the example preset that owned it, so the shared folder is the only app
+// source and `extraToolSources` is a host/test extension point.
 export const createToolboxHarness = (
     configuration: ToolboxHarnessConfiguration,
     settings: RunnerSettings,

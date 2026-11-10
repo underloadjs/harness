@@ -337,7 +337,14 @@ it('clears every ring as soon as Stop is pressed', async () => {
     expect(composerAction.dataset.action).toBe('stop');
     composerAction.click();
     await flush();
-    expect(tileActivity()).toEqual([undefined, undefined]);
+    // R2/R4 (the display-carry decision): the STOP is followed by a re-read of the record the
+    // server still holds, and at THIS point that record (`host`) still describes both agents
+    // working — the cancelled snapshot is not served until the block below. A rows-only
+    // document no longer overwrites the streamed tree whose section figures `activeAgentsOf`
+    // reads, so the deck stays lit for exactly as long as the server still says the work is
+    // running, and goes out below when the cancelled record actually lands. The R10 claim this
+    // test owns is "a settled conversation is not shown as busy", which the next block pins.
+    expect(tileActivity()).toEqual(['active', 'active']);
 
     // Releasing the stream lets the run finish; the rings stay off. The held record settles with
     // the frame, so the post-stream resync reads the cancelled conversation.

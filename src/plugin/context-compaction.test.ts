@@ -1047,7 +1047,7 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
 
         // Real conversations are untouched, including the shipped profile names.
         expect(
-            ['writer', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky', ''].map(
+            ['writer', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'general', 'debugger', ''].map(
                 isInternalAgent
             )
         ).toEqual([false, false, false, false, false, false, false, false, false]);

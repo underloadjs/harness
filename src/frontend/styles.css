@@ -7808,9 +7808,10 @@ body.is-resizing-rail {
    recorded call, because both kinds size the same block. `min-height: 0` + `flex-shrink` are what
    let the mobile `50dvh` cap (and a short desktop viewport) shrink THIS box instead of the block
    overflowing it.
-   R1b: the whole thinking body is in the DOM, so the box has to be able to scroll it;
-   `data-follow='latest'` (ui/turns.ts `followLatest`) still aims the scroll at the newest byte,
-   which is the T26 (R26) half that survives. */
+   R1b: the whole thinking body is in the DOM, so the box has to be able to scroll it. The scroll
+   follows the newest byte ONLY while the reader is at the live edge (12px); scroll away and the
+   box pauses and keeps their position, scroll back to the bottom and it resumes by itself — the
+   contract lives in ui/turns.ts (`followLatest` / `aimTailBox`, R5). */
 .context-bar-tail-body {
     margin: 0;
     flex: 1 1 auto;
@@ -7848,10 +7849,13 @@ body.is-resizing-rail {
 
    T26 (R26): a recorded payload is NOT windowed the way a prose preview is — capping the
    bytes T25 made whole would be the gratuitous cap the requirement warns off. What the pane
-   does instead is follow the newest byte: `ui/turns.ts` marks it `data-follow='latest'` and
-   scrolls it to the bottom when its CONTENT changes, so a long running result shows its end
-   rather than a frozen beginning. The full bytes remain one scroll up, and the exact
-   recorded length stays printed in the caption line above. */
+   does instead is aim its scroll at the newest byte, and R5 makes that aim conditional: the pane
+   follows while the reader is at the live edge (12px), pauses and keeps their position the moment
+   they scroll away, and resumes on its own when they come back to the bottom — `data-follow`
+   states which of the two the pane is doing (`'latest'` / `'paused'`), and the contract lives in
+   `ui/turns.ts` (`followLatest` / `aimTailBox`). A long running result therefore still shows its
+   end rather than a frozen beginning, without dragging anyone back down. The full bytes remain one
+   scroll up, and the exact recorded length stays printed in the caption line above. */
 .context-bar-tail-pane-body {
     margin: 0;
     max-height: 14rem;

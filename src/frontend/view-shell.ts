@@ -109,9 +109,21 @@ export const listViews = async (): Promise<SessionView[]> => {
 // ---------------------------------------------------------------------------
 
 // Opening a conversation is the windowed composition in `openSession`: metadata +
-// the newest 25 rows + one roster page + the pending questions, and display trees
-// only for the tail that paints.
-export const getView = (sessionId: string): Promise<SessionView> => openSession(sessionId);
+// the newest 25 rows + one roster page + the pending questions.
+//
+// R2 (the display-read flood): `visibleTurns: 0`, so a document read fetches ROWS ONLY
+// and NO display tree. This function is the document read of EVERY re-read path — the
+// 1 s bounded poll (`main.ts` `pollSession`), `resyncSession`, the shell's session open,
+// the transcript/save freshness reads — and it used to re-download the newest
+// `MAX_VISIBLE_DISPLAYS_PER_OPEN` trees on each call: a steady-state poll therefore
+// issued one identical `GET .../turns/:id/display` per painted turn per second, which is
+// the log flood this fix removes. The per-instance display loader
+// (`createDisplayPlane` below, driven by the pane's `reveal()` → `ensureVisible`) is now
+// the SOLE display fetcher: it is capped at 4 concurrent reads, deduped per turn id,
+// generation-guarded and never retried, and it only asks for rows the reader can SEE.
+// Same `visibleTurns: 0` the stream's own window re-read already passes (:582).
+export const getView = (sessionId: string): Promise<SessionView> =>
+    openSession(sessionId, { visibleTurns: 0 });
 
 // Total camelCase → snake_case mapping of the provider settings block. Every field is
 // sent even when blank: `api_key: ''` is what the server already accepts as "no key"
@@ -331,6 +343,16 @@ export type DisplayPlane = {
     invalidate(): void;
     // A reset or delete emptied the rows: forget the cache, keep the generation.
     reset(): void;
+    // R2/R4: the loader's cache stamp. The document install (`main.ts` `applyView`) records
+    // it next to the trees it carries across, and refuses to carry anything once it moved:
+    // `invalidate()` is exactly the signal that the cached trees are untrustworthy (a dropped
+    // socket), and the next reveal() must re-read them instead of trusting a stale tree.
+    generation(): number;
+    // R2/R4: un-marks ONE turn so the next `ensureVisible` reads its tree again. The document
+    // install calls this for a row whose record moved since the tree was painted (a running
+    // turn advancing, a settle, a cancel) — that is the poll path's display update channel,
+    // and without it a rows-only document would leave a live tile frozen on its old text.
+    forget(turnId: string): void;
     // The turn the reader is looking at (expanded tile), for a focused subscription.
     focusedTurn(): string | undefined;
     setFocusedTurn(turnId: string | undefined): void;
@@ -465,6 +487,17 @@ export const createDisplayPlane = (options: DisplayPlaneOptions): DisplayPlane =
 
         reset: () => {
             loader.reset();
+        },
+
+        // R2/R4: the cache stamp of the loader that currently owns this conversation. Read
+        // WITHOUT the session-sync side effect (`loader`, not `syncLoader()`): the stamp is
+        // refreshed on every document install, and the swap itself stays where it always was
+        // (the first `ensureVisible` of the new conversation), so asking a question can never
+        // drop an in-flight tree.
+        generation: () => loader.generation(),
+
+        forget: (turnId) => {
+            syncLoader().forget(turnId);
         },
 
         focusedTurn: () => focused,

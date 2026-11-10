@@ -21,24 +21,25 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { prepareToolCandidate } from '../../core';
 import { harnessTools } from './tools';
-import { EXAMPLE_APP_TOOL_SOURCES, SHARED_APP_TOOL_SOURCES } from './toolbox';
+import { SHARED_APP_TOOL_SOURCES } from './toolbox';
 import timeNow from '../tools/shared/timeNow.tool';
 import textCount from '../tools/shared/textCount.tool';
 import diceRoll from '../tools/shared/diceRoll.tool';
 import noteSearch from '../tools/shared/noteSearch.tool';
 import textSummarize from '../tools/shared/textSummarize.tool';
-import testFlaky from '../tools/examples/testFlaky.tool';
 
 // The concrete source-entry list the app ships, in catalogue (registration) order.
-// `folder` is the subfolder of `src/server/tools` the entry lives in; that folder IS
-// the shared/example policy (T25), so it is part of the contract.
+// `folder` is the subfolder of `src/server/tools` the entry lives in. There is exactly
+// ONE such folder now: `examples` held `testFlaky`, the tool the deleted `flaky` example
+// preset registered, and the folder is the shared/example policy (T25) — with no example
+// left, the second folder had no consumer and is gone. The field stays because the
+// package-relative source path the harness records is built from it.
 const SOURCES = {
     timeNow: { folder: 'shared', file: 'timeNow.tool.ts', definition: timeNow },
     textCount: { folder: 'shared', file: 'textCount.tool.ts', definition: textCount },
     diceRoll: { folder: 'shared', file: 'diceRoll.tool.ts', definition: diceRoll },
     noteSearch: { folder: 'shared', file: 'noteSearch.tool.ts', definition: noteSearch },
-    textSummarize: { folder: 'shared', file: 'textSummarize.tool.ts', definition: textSummarize },
-    testFlaky: { folder: 'examples', file: 'testFlaky.tool.ts', definition: testFlaky }
+    textSummarize: { folder: 'shared', file: 'textSummarize.tool.ts', definition: textSummarize }
 } as const;
 
 // The shared runtime helpers are the only permitted VALUE imports. Every source
@@ -79,9 +80,7 @@ describe('app tool source entries', () => {
 
             // The catalogue's lazily compiled implementation is the SAME file the
             // harness registers, so a direct call runs the shipped code.
-            expect(SHARED_APP_TOOL_SOURCES[name] ?? EXAMPLE_APP_TOOL_SOURCES[name]).toBe(
-                packagePath(source.folder, source.file)
-            );
+            expect(SHARED_APP_TOOL_SOURCES[name]).toBe(packagePath(source.folder, source.file));
         }
 
         for (const [name, source] of Object.entries(SOURCES)) {

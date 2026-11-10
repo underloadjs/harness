@@ -39,6 +39,7 @@
 
 import type {
     ContextBlock,
+    DisplayStep,
     TurnBlockDetail,
     TurnDisplay,
     TurnDisplayOp,
@@ -1491,5 +1492,545 @@ describe('a legacy section with no context', () => {
         // One chip for the round (the pre-bar surface), and the answer prints.
         expect(tile().querySelectorAll('.tool.think')).toHaveLength(1);
         expect(proseState(tile())).toEqual([{ nodeId: '5', hidden: false }]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R5 — the streaming preview box never moves the reader's scroll against their will.
+// ---------------------------------------------------------------------------
+//
+// The user report these tests pin: "the thinking block constantly dragged the scrolling bar to
+// the bottom of the page, which prevented reading the thought as it output". The thinking body
+// is the WHOLE thought inside a clipped box (T27 R1b, styles.css `.context-bar-tail-body` =
+// `overflow: auto`), and every frame of the round wrote `scrollTop = scrollHeight`
+// (`followLatest`), so a reader who scrolled up inside that box to read the thought as it
+// streamed was yanked back to its end within one frame — and with the box pinned at its end,
+// scroll chaining handed their wheel to the page.
+//
+// jsdom has no layout, so these tests GIVE the box fake layout. Two properties make the fake
+// honest rather than convenient:
+//   - the height DERIVES from the element's own text, so the box grows at the moment the code
+//     under test writes the bytes — exactly when a browser's layout grows. A pre-arranged
+//     height would instead claim the box was already tall before the paint, which is a state no
+//     real frame ever passes through, and it would test the wrong pre-paint reading;
+//   - a scroll write is CLAMPED to `scrollHeight - clientHeight`, as a browser clamps it, so
+//     "at the live edge" and "followed to the bottom" are measured figures here;
+//   - metrics only exist for an element that is IN the document, and a move throws the scroll
+//     position away — both are what CSSOM View does and what the fakes below model, because
+//     jsdom does neither. Without the connection rule a pane minted DETACHED (the args/result
+//     panes) would report a scroll box it cannot have in a browser, which is exactly how the
+//     pre-fix aim hid behind these tests.
+// The `data-follow` attribute is asserted beside every figure: it is the half of the policy a
+// host with no layout at all can still report (./turns.ts `followLatest` docs).
+
+describe('the streaming preview box follows only at the live edge (R5)', () => {
+    // A box whose height grows with its bytes: 8px per character inside a fixed viewport.
+    const PX_PER_CHAR = 8;
+
+    /**
+     * Fake layout on ONE box (a stable element, e.g. a thinking body). `top()` reads back what
+     * the code under test actually left there — clamped the way a browser clamps it — and takes
+     * an argument when the test wants to BE the reader scrolling.
+     */
+    const fakeLayout = (
+        box: HTMLElement,
+        view: number
+    ): { top: (next?: number) => number; zero: () => void } => {
+        let top = 0;
+
+        const heightOf = (): number => view + (box.textContent ?? '').length * PX_PER_CHAR;
+
+        Object.defineProperty(box, 'scrollHeight', {
+            configurable: true,
+            get: () => (box.isConnected ? heightOf() : 0)
+        });
+        Object.defineProperty(box, 'clientHeight', {
+            configurable: true,
+            get: () => (box.isConnected ? view : 0)
+        });
+        Object.defineProperty(box, 'scrollTop', {
+            configurable: true,
+            // A detached element has no scroll box: the read is 0 and the write is a no-op
+            // (CSSOM View; ../extensions/records-dom.ts:367-371 states it for this repo). Without
+            // this the fake gives metrics to an element the browser would not, which is exactly
+            // how the D1 detached-aim defect hid behind these tests.
+            get: () => (box.isConnected ? top : 0),
+            set: (next: number) => {
+                if (!box.isConnected) return;
+
+                top = Math.max(0, Math.min(next, heightOf() - view));
+            }
+        });
+
+        return {
+            top: (next?: number) => {
+                if (next !== undefined) box.scrollTop = next;
+
+                return top;
+            },
+            // A browser throws a scroll position away when the element is removed and put back
+            // (the moved subtree has no layout in between); jsdom keeps it. A test that wants the
+            // honest pre-state of a MOVE calls this where the re-insertion happens.
+            zero: (): void => {
+                top = 0;
+            }
+        };
+    };
+
+    /**
+     * Model the browser's scroll reset on a MOVE: every mutation of `parent` that (re-)inserts a
+     * subtree containing `box` throws that subtree's scroll position away. Returns the restore —
+     * these are instance patches, and a leaked one outlives the assertion.
+     */
+    const fakeScrollResetOnMove = (
+        parent: HTMLElement,
+        box: HTMLElement,
+        zero: () => void
+    ): (() => void) => {
+        const names = ['insertBefore', 'appendChild', 'append', 'prepend', 'replaceChildren'] as const;
+        const held = new Map<string, (...args: unknown[]) => unknown>();
+
+        for (const name of names) {
+            const original = (parent as unknown as Record<string, (...args: unknown[]) => unknown>)[name];
+
+            held.set(name, original);
+
+            (parent as unknown as Record<string, (...args: unknown[]) => unknown>)[name] = (
+                ...args: unknown[]
+            ): unknown => {
+                const moved = args.find((arg) => arg instanceof Node && (arg === box || arg.contains(box)));
+
+                // BEFORE the insertion: the reset is the first thing a frame does to a moved
+                // subtree, and the code under test is expected to re-aim after it.
+                if (moved !== undefined) zero();
+
+                return original.apply(parent, args);
+            };
+        }
+
+        return () => {
+            for (const [name, original] of held) {
+                (parent as unknown as Record<string, (...args: unknown[]) => unknown>)[name] = original;
+            }
+        };
+    };
+
+    /**
+     * Fake layout on EVERY element. The tool-call tail needs this: `paintTail` MINTS the
+     * args/result panes again on every content pass (`replaceChildren(createTailPane(...))`), so
+     * a stub attached to one pane would be thrown away with the element it described. The payload
+     * of a recorded call is written once per event, so a fixed height states the truth here.
+     *
+     * `isConnected` decides everything, exactly as it does in a browser (D1's whole point): a
+     * pane that has not been put in the document yet reports no metrics and takes no write, so a
+     * test can only pass when the code aims at a box that EXISTS. Returns the restore: a
+     * prototype patch outlives an assertion.
+     */
+    const fakeDocumentLayout = (metrics: { height: number; view: number }): (() => void) => {
+        const held = {
+            scrollTop: Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop'),
+            scrollHeight: Object.getOwnPropertyDescriptor(Element.prototype, 'scrollHeight'),
+            clientHeight: Object.getOwnPropertyDescriptor(Element.prototype, 'clientHeight')
+        };
+        const tops = new WeakMap<Element, number>();
+
+        Object.defineProperty(Element.prototype, 'scrollHeight', {
+            configurable: true,
+            get(this: Element) {
+                return this.isConnected ? metrics.height : 0;
+            }
+        });
+        Object.defineProperty(Element.prototype, 'clientHeight', {
+            configurable: true,
+            get(this: Element) {
+                return this.isConnected ? metrics.view : 0;
+            }
+        });
+        Object.defineProperty(Element.prototype, 'scrollTop', {
+            configurable: true,
+            get(this: Element) {
+                return this.isConnected ? tops.get(this) ?? 0 : 0;
+            },
+            set(this: Element, next: number) {
+                if (!this.isConnected) return;
+
+                tops.set(this, Math.max(0, Math.min(next, metrics.height - metrics.view)));
+            }
+        });
+
+        return () => {
+            const proto = Element.prototype as unknown as Record<string, PropertyDescriptor | undefined>;
+
+            for (const [name, descriptor] of Object.entries(held)) {
+                if (descriptor === undefined) delete proto[name];
+                else Object.defineProperty(Element.prototype, name, descriptor);
+            }
+        };
+    };
+
+    // One streaming thinking round, in the frame order the projector really sends: a designated
+    // block, its first bytes, then an appended delta with the segment's new exact count.
+    const streaming = (): {
+        box: HTMLElement;
+        layout: { top: (next?: number) => number; zero: () => void };
+        tile: () => HTMLElement;
+        grow: (delta: string, chars: number) => void;
+        clear: () => void;
+    } => {
+        const view = documentOf([summary()], { t1: [rootSection()] });
+        const { board, tile } = mount();
+
+        board.upsertView(summary(), view).renderDisplay(displayOf(view));
+
+        frame(board, view, 't1', [
+            { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: thinkBlock('0-reasoning-3', 13) },
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: thinkNode('3', 'first thought') }
+        ]);
+
+        // `?? null` on purpose: the optional chain can also give `undefined` (no tail mounted),
+        // and `=== undefined` would not narrow the `HTMLElement | null` that `querySelector`
+        // returns, which is how this line failed a strict typecheck of the test block (D5).
+        const box = tails(tile())[0]?.querySelector<HTMLElement>('.context-bar-tail-body') ?? null;
+
+        if (box === null) throw new Error('the thinking body was never printed');
+
+        // 400px of visible thought: enough scroll range that "at the edge" and "scrolled up"
+        // are far apart, and one appended sentence is a third of the box.
+        const layout = fakeLayout(box, 400);
+
+        return {
+            box,
+            layout,
+            tile,
+            grow: (delta: string, chars: number): void => {
+                frame(board, view, 't1', [
+                    { op: 'node:append', turnId: 't1', sectionId: 't1:0', nodeId: '3', delta },
+                    { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-reasoning-3', patch: { chars } }
+                ]);
+            },
+            // The block leaves the section: its node is withdrawn, so nothing is eligible to
+            // print and the tile has to blank the box. (`tail:clear` alone does NOT blank it —
+            // ../frontend/view-context.ts:975 falls back to `legacyTailOf` whenever the
+            // designation is absent, so a cleared designation re-derives the same block from
+            // `section.nodes`. Reported as a finding; not this task's scope to change.)
+            clear: (): void => {
+                frame(board, view, 't1', [{ op: 'node:remove', turnId: 't1', sectionId: 't1:0', nodeId: '3' }]);
+            }
+        };
+    };
+
+    it('follows the newest byte while the reader is at the live edge (R5.1)', () => {
+        const { box, layout, tile, grow } = streaming();
+
+        // Where a first paint leaves the reader: the bottom of 13 characters (13 * 8 = 104).
+        layout.top(104);
+
+        grow(' and more thought', 30);
+
+        // Followed to the new bottom (30 * 8 = 240), so the bytes that just arrived are ON
+        // SCREEN — the "static text" half of the complaint stays fixed.
+        expect(layout.top()).toBe(240);
+        expect(box.textContent).toBe('first thought and more thought');
+        expect(box.dataset.follow).toBe('latest');
+        expect(tailState(tile())?.body).toBe('first thought and more thought');
+
+        // And still followed for the next frame of the same round (52 * 8 = 416).
+        grow(' and even more thought', 52);
+
+        expect(layout.top()).toBe(416);
+        expect(box.textContent).toBe('first thought and more thought and even more thought');
+        expect(box.dataset.follow).toBe('latest');
+    });
+
+    it('leaves a scrolled-up reader exactly where they are while the bytes keep arriving (R5.2)', () => {
+        const { box, layout, tile, grow } = streaming();
+
+        // The reader drags the box up to re-read the opening of the thought.
+        layout.top(20);
+
+        grow(' and more thought', 30);
+
+        // Their offset is exactly where they left it — the box was never re-aimed — while the
+        // growth still appended at the END of the body, below what they are looking at. The
+        // thinking body prints the whole text (T27 R1b), so nothing they can see is rewritten or
+        // evicted under them while they are away from the edge.
+        expect(layout.top()).toBe(20);
+        expect(box.textContent).toBe('first thought and more thought');
+        expect(tailState(tile())?.body).toBe('first thought and more thought');
+        // The stated policy matches what happened: paused, not silently 'latest'.
+        expect(box.dataset.follow).toBe('paused');
+
+        // It holds for every later frame of the same block, however far the body grows.
+        grow(' and even more thought', 52);
+
+        expect(layout.top()).toBe(20);
+        expect(box.textContent).toBe('first thought and more thought and even more thought');
+        expect(box.dataset.follow).toBe('paused');
+    });
+
+    it('resumes following on the next frame once the reader scrolls back to the bottom (R5.3)', () => {
+        const { box, layout, grow } = streaming();
+
+        layout.top(20);
+        grow(' and more thought', 30);
+
+        expect(layout.top()).toBe(20);
+        expect(box.dataset.follow).toBe('paused');
+
+        // The reader drags back to the live edge. A real `scroll` event is what a user drag
+        // fires, and it is the only thing that ever changes the policy — no button, no reload.
+        // (The write clamps to the bottom of the 30 characters now on screen: 240.)
+        layout.top(1_000);
+        box.dispatchEvent(new Event('scroll'));
+
+        expect(layout.top()).toBe(240);
+        expect(box.dataset.follow).toBe('latest');
+
+        grow(' and even more thought', 52);
+
+        expect(layout.top()).toBe(416);
+        expect(box.dataset.follow).toBe('latest');
+    });
+
+    it('re-aims the box after a frame that only MOVES the block (D2)', () => {
+        // The one frame that paints NOTHING: the printed block is unchanged (`paintTail`
+        // early-returns on the same `tailKey`), yet `placeTail` moves the block because a newer
+        // response took the prose seat above it (see the move test above). Re-insertion resets
+        // `scrollTop` to 0 in a browser, so without a re-assert the reader spends that frame at
+        // the top of the bytes they were reading. The fake MODELS that reset, because jsdom does
+        // not (see `fakeScrollResetOnMove`).
+        const view = documentOf([summary()], { t1: [rootSection()] });
+        const { board, tile } = mount();
+
+        board.upsertView(summary(), view).renderDisplay(displayOf(view));
+
+        frame(board, view, 't1', [
+            { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: thinkBlock('0-reasoning-3', 13) },
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: thinkNode('3', 'first thought') },
+            // The designation is EXPLICIT: without it the legacy fallback would hand the tail to
+            // the newer answer below and the body would disappear — a CONTENT change, not the
+            // pure move this test is about.
+            {
+                op: 'tail:set',
+                turnId: 't1',
+                sectionId: 't1:0',
+                tail: { kind: 'reasoning', nodeId: '3', blockId: '0-reasoning-3', chars: 13, truncated: false } as never
+            }
+        ]);
+
+        const box = tails(tile())[0]?.querySelector<HTMLElement>('.context-bar-tail-body') ?? null;
+
+        if (box === null) throw new Error('the thinking body was never printed');
+
+        const flow = tile().querySelector<HTMLElement>('.agent-flow') ?? null;
+
+        if (flow === null) throw new Error('the section flow was never mounted');
+
+        const layout = fakeLayout(box, 400);
+        const restoreMove = fakeScrollResetOnMove(flow, box, layout.zero);
+
+        // The response frames used for the move: a newer answer is recorded and the projector has
+        // NOT re-designated the tail (no `tail:set`), so the block prints the same bytes and only
+        // its seat moves.
+        const reply = (id: string, text: string): void => {
+            frame(board, view, 't1', [
+                { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: answerBlock(`0-assistant-${id}`, text.length) },
+                { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: answerNode(id, text) },
+                { op: 'node:set', turnId: 't1', sectionId: 't1:0', nodeId: id, patch: { committed: true } },
+                { op: 'section:set', turnId: 't1', sectionId: 't1:0', patch: { answerNodeId: id } }
+            ]);
+        };
+
+        try {
+            // Where a pinned first paint leaves the reader: the bottom of the 13 recorded
+            // characters (13 * 8 = 104). The fake went on after that paint, exactly as in the
+            // R5.1 test, so the starting offset is stated rather than measured.
+            layout.top(104);
+
+            // The reader scrolls up and keeps reading — a real scroll event, which is also what
+            // records the offset the re-assert has to restore.
+            layout.top(20);
+            box.dispatchEvent(new Event('scroll'));
+
+            expect(layout.top()).toBe(20);
+            expect(box.dataset.follow).toBe('paused');
+
+            reply('9', 'second');
+
+            // The block moved below the new response (the seat proves it), the move threw the
+            // offset away, and the policy put the reader BACK on the byte they held. NOT the
+            // bottom: they are away from the edge, so nothing may drag them there.
+            expect(flowChildren(tile())).toEqual([
+                { kind: 'prose', nodeId: '9' },
+                { kind: 'tail', nodeId: '3' }
+            ]);
+            expect(layout.top()).toBe(20);
+            expect(box.dataset.follow).toBe('paused');
+            // The bytes themselves are untouched by the move.
+            expect(box.textContent).toBe('first thought');
+
+            // The same reader back at the live edge: the next move lands on the newest byte,
+            // which is the follower's half of the same re-assert.
+            layout.top(1_000);
+            box.dispatchEvent(new Event('scroll'));
+
+            expect(box.dataset.follow).toBe('latest');
+
+            reply('11', 'third');
+
+            expect(layout.top()).toBe(104);   // 400 + 13 * 8, clamped to the bottom
+            expect(box.dataset.follow).toBe('latest');
+        } finally {
+            restoreMove();
+        }
+    });
+
+    it('leaves NO follow state on a cleared seat', () => {
+        // The other half of the attribute contract (./turns.ts `clearTail`): a body that prints
+        // nothing describes NOTHING, the policy included. Leaving `data-follow` behind would make
+        // a cold-rendered section and a live-cleared one report different state for the same "no
+        // body" answer, and a stale 'paused' would claim a reader is holding a box that is empty.
+        const { box, layout, tile, grow, clear } = streaming();
+
+        layout.top(20);
+        grow(' and more thought', 30);
+
+        // Paused FIRST, so this proves the policy is withdrawn rather than merely never written.
+        expect(box.dataset.follow).toBe('paused');
+
+        clear();
+
+        expect(box.textContent).toBe('');
+        // The element is reused, not recreated, so this is a real leftover check on the very node
+        // that carried the policy.
+        expect(box.dataset.follow).toBeUndefined();
+        expect(
+            Array.from(box.querySelectorAll('[data-follow]')).map((node) => node.getAttribute('data-follow'))
+        ).toEqual([]);
+        // And the aggregate the suite reads agrees with it: `tailState().follow` is undefined, not
+        // a stale 'latest'/'paused'.
+        expect(tailState(tile())).toMatchObject({ hidden: true, follow: undefined, body: '' });
+    });
+
+    it('carries a scrolled-up reader across the result pane being minted again, and still follows at the edge', () => {
+        // The current call is the same mechanism in its harder shape: the pane the reader
+        // scrolled inside does NOT survive the frame, so the policy is keyed per pane and the
+        // offset is carried onto the replacement element.
+        const args = '{"path":"notes.md","query":"what changed"}';
+        const result = 'the whole recorded file body, every line of it';
+
+        const callBlock = (overrides: Record<string, unknown> = {}): ContextBlock =>
+            block({
+                chars: args.length + result.length,
+                argsChars: args.length,
+                resultChars: result.length,
+                ...overrides,
+                id: '0-tool-7'
+            });
+
+        // Typed as the exact node type it builds (D5): a bare `TurnSection['nodes'][number]`
+        // annotation erases the union into `DisplayNode`, and the `step:set` op below takes a
+        // `DisplayStep`, so the union had to be narrowed by hand. `satisfies` checks the fixture
+        // against the real shape and keeps the narrow type, so a wrong field fails here instead
+        // of at the call site.
+        const callStep = (overrides: Partial<DisplayStep> = {}): DisplayStep =>
+            ({
+                kind: 'tool',
+                id: '7',
+                turnId: 't1',
+                sectionId: 't1:0',
+                callId: 'call-1',
+                name: 'read',
+                argsPreview: `${args.slice(0, 20)}…`,
+                state: 'running',
+                startedAt: T,
+                detail: { stepId: '7', hasResult: false, truncated: false },
+                ...overrides
+            }) satisfies DisplayStep;
+
+        const callTail = (overrides: Record<string, unknown> = {}) =>
+            ({
+                kind: 'tool',
+                nodeId: '7',
+                blockId: '0-tool-7',
+                chars: args.length + result.length,
+                truncated: false,
+                args,
+                result,
+                ...overrides
+            }) as never;
+
+        // 200px of a 900px payload: the edge is at 700.
+        const restore = fakeDocumentLayout({ height: 900, view: 200 });
+
+        try {
+            const view = documentOf([summary()], { t1: [rootSection()] });
+            const { board, tile } = mount();
+
+            board.upsertView(summary(), view).renderDisplay(displayOf(view));
+
+            frame(board, view, 't1', [
+                { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: callBlock({ state: 'running', chars: args.length, argsChars: args.length, resultChars: undefined, endedAt: undefined }) },
+                { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: callStep() },
+                { op: 'tail:set', turnId: 't1', sectionId: 't1:0', tail: callTail({ result: undefined, chars: args.length }) }
+            ]);
+
+            const argsPane = (): HTMLElement | null =>
+                tile().querySelector<HTMLElement>('.context-bar-tail-pane-body[data-field="args"]');
+
+            const first = argsPane();
+
+            if (first === null) throw new Error('the arguments pane was never printed');
+
+            // A pane nobody has scrolled follows: the bottom of the recorded request.
+            expect(first.scrollTop).toBe(700);
+            expect(first.dataset.follow).toBe('latest');
+            expect(first.textContent).toBe(args);
+
+            // The reader scrolls up inside the request and keeps reading it.
+            first.scrollTop = 240;
+            first.dispatchEvent(new Event('scroll'));
+
+            expect(first.dataset.follow).toBe('paused');
+
+            // The call SETTLES: the result bytes arrive and both panes are minted again.
+            frame(board, view, 't1', [
+                { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { state: 'ok', chars: args.length + result.length, resultChars: result.length, endedAt: T + 800, durationMs: 800, eventTo: 9 } },
+                { op: 'step:set', turnId: 't1', sectionId: 't1:0', step: callStep({ state: 'ok', outcome: 'completed', endedAt: T + 800, durationMs: 800, detail: { stepId: '7', resultStepId: '9', hasResult: true, truncated: true } }) },
+                { op: 'tail:set', turnId: 't1', sectionId: 't1:0', tail: callTail() }
+            ]);
+
+            const second = argsPane();
+
+            if (second === null) throw new Error('the arguments pane vanished on the settle frame');
+
+            // The element really was replaced — and the reader still holds the byte of the SAME
+            // recorded request they were reading, with the payload itself intact.
+            expect(second).not.toBe(first);
+            expect(second.textContent).toBe(args);
+            expect(second.scrollTop).toBe(240);
+            expect(second.dataset.follow).toBe('paused');
+
+            // The same reader now drags that pane to the bottom: following resumes, and the next
+            // rebuilt pane is aimed at the newest byte again — the gate is per reader position,
+            // never a blanket freeze.
+            second.scrollTop = 900;
+            second.dispatchEvent(new Event('scroll'));
+
+            expect(second.dataset.follow).toBe('latest');
+
+            frame(board, view, 't1', [
+                { op: 'tail:set', turnId: 't1', sectionId: 't1:0', tail: callTail({ result: `${result}, plus a longer ending` }) }
+            ]);
+
+            const third = argsPane();
+
+            if (third === null) throw new Error('the arguments pane vanished on the follow-up frame');
+
+            expect(third.scrollTop).toBe(700);   // clamped to the bottom, exactly as before R5
+            expect(third.dataset.follow).toBe('latest');
+        } finally {
+            restore();
+        }
     });
 });

@@ -113,7 +113,8 @@ src/
                         Manager (id `planner`, orchestrates + independent review), and
                         Debugger (stress-tests everything)
     summarizer.ts       the delegated condenser (subagent in every teamed preset)
-    demo.ts / flaky.ts  fixture profiles (scripted demo; recoverable-failures example)
+                        (there is no `demo`/`flaky` profile: those fixture agents were
+                        deleted, so the roster is exactly the eight names above)
     agents.test.ts      pinned ids/instructions + guideline composition + the
                         policy-not-inventory and prompt-budget guards
   transport/
@@ -222,16 +223,19 @@ src/server/
   harnesses/
     index.ts            createToolCatalogue: runtime catalogue for CLI and server
     core.ts             core-tool catalogue entries (sessionBound) for the server (R8)
-    presets.ts          the 5 shipped presets + 2 explicit fixtures (T5: demo/flaky are
-                    presets but not catalogue entries), legacy defaults,
+    presets.ts          the 7 shipped presets and nothing else (the `demo`/`flaky`
+                    example tier is deleted), legacy defaults,
                         and teamOf() — assembled from src/agents profiles
     registry.ts         in-memory registry: create/patch, aliases, validation, agentModels (R9),
                         restore policy (refresh unmodified shipped defaults, T3)
     descriptor.ts       describeHarness/describeAgent: the single wire projection
     toolbox.ts          shared toolbox + createProfiledHarness/createToolboxHarness
-    tools.ts            timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky
+    tools.ts            timeNow, textCount, diceRoll, noteSearch, textSummarize
+                    (one scanned folder, `src/server/tools/shared`; the opt-in
+                    `examples` folder and its `testFlaky` are deleted)
     websearch.ts        always-listed search entry (configured or not)
-    demo.ts             scripted offline transport
+    fixture-presets.test-support.ts  TEST-ONLY `demo` (scripted) + `flaky`
+                    (toolbox + `testFlaky`) presets a suite injects; not production
     types.ts            RunnerSettings, HarnessPreset, CatalogueEntry, availability
 src/frontend/
   index.ts              client barrel -> @underload/harness/frontend (no CSS, no shell)
@@ -542,8 +546,8 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 | `time*` | `timeNow` |
 | `dice*` | `diceRoll` |
 | `note*` | `noteSearch` |
-| `test*` | `testFlaky` |
 | (already conformant) | `gitDiff` |
+(`testFlaky` is gone: the tool and the `flaky` preset that registered it were deleted.)
 
 There are **no aliases**. The T14 spellings (`fileRead`, `fileEdit`, `commandRun`,
 `webSearch`, `webFetch`, `agentDelegate`, plus the older `readFile`, `writeFile`,
@@ -566,9 +570,9 @@ a payload shape, a limit, or a factory, not the tool the model calls.
 
 What is deliberately **not** renamed:
 
-- **harness / preset ids** — `instruct`, `research`, `workspace`, `reviewer`,
-  `planner`, `demo`, `flaky` are identities, not tool names, and sessions/aliases
-  reference them. `workspace` keeps its id while its visible title is "Coder", so
+- **harness / preset ids** — `general`, `instruct`, `research`, `workspace`,
+  `reviewer`, `planner`, `debugger` are identities, not tool names, and sessions/aliases
+  reference them (`demo`/`flaky` are deleted, so those two names resolve to nothing). `workspace` keeps its id while its visible title is "Coder", so
   every saved session and bookmark still resolves;
 - **agent ids** — `summarize`'s delegated half still targets the `summarizer` agent;
 - **the `websearch` harness configuration field** — it names the *feature*, not the
@@ -1454,14 +1458,13 @@ provider fails loudly there instead of silently running Linkup's adapter). No
 SDK: all three adapters use `fetch`. A failed import is a plain tool error
 and is not cached, so a later call can retry.
 
-**Application wiring:** the real presets (`instruct`, `research`, `workspace`,
-`reviewer`, `planner`) pass `websearch: true` AND `webfetch: true` through the
-shared toolbox (`src/server/harnesses/toolbox.ts`), so the CLI and server read
-search keys from their own process environment; the shared-factory `flaky` example
-opts in
-too, while `demo` stays offline. `flaky`'s preset metadata declares
-`environmentTools: ['search', 'fetch']` so its descriptor matches what the
-factory registers.
+**Application wiring:** EVERY shipped preset (`general`, `instruct`, `research`,
+`workspace`, `reviewer`, `planner`, `debugger`) passes `websearch: true` AND
+`webfetch: true` through the shared toolbox (`src/server/harnesses/toolbox.ts`), so
+the CLI and server read search keys from their own process environment. There is no
+endpoint-free preset left to exempt — the scripted `demo` and the `flaky` example are
+deleted — so every card declares `environmentTools: ['search', 'fetch']` to match what
+the factory registers.
 This is why no search key was added to `RunnerSettings` or the Endpoint panel. The
 app entry points preload the package-root `.env` into `process.env` (see “CLI,
 server, and UI”); the library still has no autoload and importing it never reads a
@@ -1478,7 +1481,7 @@ never advertise the declaration its harness really makes. A keyless host therefo
 advertises no search at all (the global catalogue still shows the tool as unconfigured
 with its hint) but does advertise `fetch`, because the `native` provider needs no
 credential. Core file tools in `coreTools` are likewise filtered by the preset's
-registered names, so the demo fixture (timeNow only) does not claim them. Both web
+registered names. Both web
 names are declared CORE when registered (R9-R11): a configured search and any enabled
 fetch are in the first request's schema, while the eleven demoted runtime rows and
 `download` wait for `toolRequest`.
@@ -1748,12 +1751,15 @@ then `summarizer`. The five primaries are `instruct`, `research` (title
 - a subagent never re-delegates, so every profile's delegation guideline is
   conditional on BOTH running as the primary AND this harness declaring
   `delegate` to it, and tells a subagent/lone agent to do the work itself;
-- `demo` (scripted) and `flaky` (failure example) stay fixtures with no subagents,
-  and T5 un-shipped them: the server catalogue lists only the five real roles, while
-  the fixtures remain presets a host or a test injects explicitly
-  (`FIXTURE_PRESETS` / `ALL_PRESET_TEMPLATES`). The CLI and UI both select `instruct`
-  first (the CLI default is the live role, and `--preset demo` still resolves through
-  the lookup superset).
+- `general` is the only preset with no team, so it is the only one that never registers
+  `delegate`; the other six delegate to each other plus `summarizer`.
+- There are no fixtures in the catalogue. The `demo` (scripted) and `flaky`
+  (failure-example) presets, their agent profiles, the `testFlaky` tool and the scanned
+  `src/server/tools/examples` folder are DELETED; the server lists exactly the seven
+  real roles. A suite that needs the offline loop or the failing tool builds its own
+  preset in `src/server/harnesses/fixture-presets.test-support.ts` and injects it.
+  The CLI and UI both select `general` first (`DEFAULT_CLI_PRESET`), and `--preset demo`
+  is an unknown name that prints the real list.
 
 ### Persistence restore policy (T3)
 
@@ -2155,8 +2161,8 @@ throw:
   counts, including an immediate tool continuation, a pause turn, and every
   completion or timed wake. Defaults to **16** (the library guard);
   `harness({ maxIterations })` raises or lowers it and is validated at construction
-  as a positive safe integer. The application presets pass 1000 for real sessions;
-  the offline `demo` keeps the library default of 16. The bound is per agent run,
+  as a positive safe integer. The application presets pass 1000 for real sessions.
+  The bound is per agent run,
   so a delegated subagent gets its own budget.
 
 Multi-tool turns are **scheduled concurrently**, and every call gets a matching
@@ -2872,18 +2878,17 @@ as their own entries.
 - **Catalogue (`src/server/harnesses/`)** holds the presets and harness-level tools shared by
   the CLI and server. Presets are factories because a harness bakes its transport
   at construction. `toolbox.ts` owns the one shared toolbox and the factory every
-  live preset uses, so `instruct`, `research`, `workspace`, `reviewer` and `planner`
-  register the same tools and differ only in agents/instructions/routing. `demo`
-  uses the scripted
-  transport, needs no endpoint, and keeps a timeNow-only registry as a documented
-  template exception; `flaky` is the shared toolbox plus the intentional failure
-  tool (excluded from the shared set because it fails on purpose). Every template is
+  live preset uses, so all seven shipped presets
+  register the same tools and differ only in agents/instructions/routing. There is no
+  scripted template and no preset-specific extra tool any more: the `demo` and `flaky`
+  example tier, the `testFlaky` tool and the scanned `examples` folder are deleted, so
+  every shipped card is a live profiled harness that requires an endpoint. Every template is
   editable (R20.1): the registry copies it, metadata-only patches preserve the
-  captured factory, and an executable patch upgrades demo to a live profiled
-  harness / rebuilds flaky with `testFlaky` retained. Every preset
-  names its `primary` explicitly; the five real presets declare the same symmetric
+  captured factory, and an executable patch rebuilds the harness as a live profiled
+  harness. Every preset
+  names its `primary` explicitly; the six teamed presets declare the same symmetric
   team (every other real role plus `summarizer`, via `teamOf()`), so each registers
-  `delegate`, while the two fixtures have no subagents and no delegate. Every
+  `delegate`, while `general` has no subagents and no delegate. Every
   agent keeps its own instruction. `src/server/harnesses/index.ts` exports
   `createToolCatalogue`, which snapshots the lazy `presetTools` metadata plus the
   harness tools plus the runtime `search` entry; it never executes or imports an
@@ -3726,12 +3731,16 @@ the dispatcher:
   `agentInstructions` for
   **every** entry (there is no 403/read-only branch; `editable` is a compatibility
   wire field, always true). It **replaces** the preset object instead of mutating
-  it. A metadata-only patch keeps the captured factory (demo's script, flaky's
-  `testFlaky`); an executable patch (primary/subagents/agentModels/agentInstructions)
-  rebuilds from
-  the `template`: `scripted` upgrades to a live profiled harness and corrects
-  `requiresEndpoint`/`tools`/`environmentTools`, `flaky` rebuilds the live toolbox
-  with the extra retained, and `live` uses `createProfiledHarness`. Changing
+  it. A metadata-only patch keeps the captured factory. An executable patch
+  (primary/subagents/agentModels/agentInstructions) rebuilds from the `template`:
+  `live` uses `createProfiledHarness`, and `flaky` — the marker the deleted example
+  preset carried, still rebuildable for a saved row or an injected preset — goes
+  through `createToolboxHarness` with `extraToolSources: {}`, since no shipped preset
+  contributes an extra tool any more. A `scripted` record has no shipped factory any more:
+  `presetFromRecord` rebuilds it only from a matching injected `fallback`, and otherwise
+  throws `Scripted harness "<name>" is not shipped in this build`, which the session store
+  turns into a per-session restore DROP with a readable reason rather than a silent
+  substitution. Changing
   `primary` without restating `subagents` removes the new primary from the old
   allowlist;
 - `remove(name)` (T5) deletes any entry by its DIRECT name (an alias is a read redirect,
@@ -3765,8 +3774,8 @@ the dispatcher:
   non-empty, ≤8000 characters, and free of control characters except tab/newline/CR,
   so multi-line prose is legal) and the same REPLACE semantics (`{}` clears every
   override). It is EXECUTABLE state: `update()` rebuilds the factory (an instruction
-  patch on the scripted demo therefore upgrades it to a live harness, exactly like a
-  model patch), it is persisted in the registry record, and `agentInstruction(profile,
+  patch on an injected scripted fixture therefore upgrades it to a live harness,
+  exactly like a model patch), it is persisted in the registry record, and `agentInstruction(profile,
   override)` returns the stored text VERBATIM as the COMPLETE prompt (T6) — the profile's
   `guidelines` are the default an UN-overridden member runs on and are never appended
   underneath an override, and the trusted profile in `src/agents` is never rewritten. A
@@ -3899,7 +3908,7 @@ the exception a saved chat exposes directly.
 
 ```bash
 yarn cli "task"           # one-shot as the live default preset (instruct)
-yarn cli --preset demo    # explicit offline scripted fixture
+yarn cli --preset planner # any of the seven shipped presets (all need a provider)
 yarn cli                  # interactive Instruct session
 yarn cli --serve          # explicit standalone API + built UI on :5181 (CLI opt-in)
 yarn dev:frontend         # Vite UI on :5180, dual-stack wildcard (localhost + LAN); /api proxies to the service on :5000
@@ -3924,8 +3933,9 @@ API-only without that opt-in, so `yarn workspace @underload/service start` needs
 no UI build. The opted-in gateway serves the page at `/harness/` as well as
 `/v1/harness`, so a device on the same LAN can open `http://<LAN-IP>:5000/harness/`
 (no auth, trusted LAN only). `src/server/server.test.ts` drives the real HTTP server with the
-scripted demo: create a session, stream a task, continue it, reset it, call a tool
-directly, and check the error statuses. `src/server/service-start.test.ts` runs an
+inline scripted `demo` FIXTURE (injected through `PRODUCTION_WITH_FIXTURES`, since no
+example card ships any more): create a session, stream a task, continue it, reset it,
+call a tool directly, and check the error statuses. `src/server/service-start.test.ts` runs an
 actual `vite-node` service gateway that discovers
 `src/server/endpoint/harness/service-route*.ts` and answers `/v1/harness`. The UI
 build no longer needs a package alias, so `src/frontend/dist` is a plain client

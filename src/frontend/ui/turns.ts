@@ -401,7 +401,9 @@ export type TurnHandle = {
     // child conversation, collapses every other PERSISTENT child conversation on the
     // tile (ephemeral invocation details stay independent) and the tile body, and
     // marks the row as the focused conversation. False when this tile has no match.
-    focusChildThread: (threadId: string) => boolean;
+    // R3c: `scroll` (default false) moves the row into view — pass it only from a caller
+    // acting on a user gesture, never from a reconcile that is merely re-asserting a focus.
+    focusChildThread: (threadId: string, scroll?: boolean) => boolean;
     // Collapse persistent child conversations and clear their focus markers. Called
     // when focus moves to a tile / panel, or when the focused child is deleted.
     clearThreadFocus: () => void;
@@ -669,7 +671,9 @@ export type TurnBoard = {
     //   3. roster-only (a runtime child with no turn yet) -> show its recorded
     //      transcript from `SessionThread.messages`.
     // Returns false only when the id is unknown to both the turns and the roster.
-    focusThread: (threadId: string) => boolean;
+    // R3c: `scroll` (default false) is the caller saying "this focus IS a user gesture";
+    // a background reconcile re-asserts the focus WITHOUT moving the reader's viewport.
+    focusThread: (threadId: string, scroll?: boolean) => boolean;
     // Authoritative roster (`SessionSnapshot.threads`). The board uses it to label
     // tiles with the SAME canonical name/sequence as the strip (S6), to resolve a
     // child's persistent identity, and to render a roster-only child transcript.
@@ -771,6 +775,35 @@ const el = <K extends keyof HTMLElementTagNameMap>(
     if (text !== undefined) node.textContent = text;
     return node;
 };
+
+// V1: the "this tile is already painted from EXACTLY this content" fingerprint of one
+// compiled tree, used by `syncCompiledDisplay` to skip a whole node-level pass.
+//
+// WHY IT IS NEEDED: every applied document hands each loaded tile its display tree again
+// (`reconcileView` → `syncDisplay`, :9739), and the poll carry (`./main.ts carryDisplays`)
+// re-applies an unchanged tree once a second while work is pending. The pass is idempotent
+// but not free: a COMMITTED text node takes the ungated branch of `syncCompiledNode`
+// (:7939-7948) and calls `renderText` → `paintProse` (:5472-5478) → `replaceChildren(
+// markdownFragment(text))`. A polling session therefore re-parsed every loaded tile's
+// Markdown every second and threw away the reader's live text selection with each replaced
+// fragment.
+//
+// WHY A STRUCTURAL FINGERPRINT AND NOT A REFERENCE CHECK: display trees are NOT immutable.
+// The stream ops fold mutates the very object a tile was painted from, IN PLACE —
+// `../view-state.ts` `applyViewOps` does `display.sections.push` (:396), `node.text +=
+// op.delta` (:443) and `display.sections.splice` (:509) — so "same object" does not imply
+// "same content", and a bare `display === painted` skip would freeze an actively streaming
+// tile. The server's own change counter for the tree (`revision`, src/server/api.ts:4352)
+// never reaches this layer: `projectDisplay` (./display-project.ts:432) keeps only
+// `turnId`/`sections`/`lastSectionOrdinal`. So the only safe signal is the tree's content.
+//
+// WHY `JSON.stringify` IS THE SAFE CHOICE: it is EXACT — equal strings mean byte-equal
+// content, so a skip can never hide a change. Anything that alters the tree (an in-place op
+// mutation, or a fresh object from a re-read) yields a different string and the tile
+// re-renders; a key-ORDER difference between two equal-content objects only ever costs one
+// redundant repaint, never a stale tile. The cost is one stringify per tile per applied
+// document; the work it buys is a Markdown parse plus a fragment swap per text node.
+const displaySignatureOf = (display: TurnDisplay): string => JSON.stringify(display);
 
 // Incremental Markdown: coalesce every delta that arrives in one frame into a
 // single parse. `flushPending` cancels the queued frame and renders now.
@@ -2805,6 +2838,41 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return undefined;
     };
 
+    // R4c: the shared "put these nodes in this order" primitive, WITHOUT the unconditional
+    // move. `append` on an already-attached node is a DOM MOVE: it restarts every CSS
+    // animation/transition the node matches (a freshly-attached row animates as a new
+    // arrival — see `extensions/records-panels.ts:435` for the same rule) and it fights the
+    // browser's scroll anchoring. Every ordering pass below runs on every reconcile, so the
+    // steady state used to re-append every row, container and thread row once per poll tick.
+    // When the requested nodes are already in the requested relative order the pass is a
+    // pure no-op; when they are not, the whole sequence is re-appended exactly as before.
+    const sequenceInPlace = (host: HTMLElement, nodes: readonly HTMLElement[]): boolean => {
+        if (nodes.length === 0) return true;
+
+        const wanted = new Set<Node>(nodes);
+        const present = [...host.children].filter((node) => wanted.has(node));
+
+        return present.length === nodes.length && nodes.every((node, index) => node === present[index]);
+    };
+
+    const appendInOrder = (host: HTMLElement, nodes: readonly HTMLElement[]): void => {
+        if (sequenceInPlace(host, nodes)) return;
+
+        for (const node of nodes) host.append(node);
+    };
+
+    // Same rule for the nodes that must end up at the END of the host (the board's notices):
+    // correct relative order is not enough, they also have to be the trailing children.
+    const appendTailInOrder = (host: HTMLElement, nodes: readonly HTMLElement[]): void => {
+        if (nodes.length === 0) return;
+
+        const tail = [...host.children].slice(-nodes.length);
+
+        if (tail.length === nodes.length && nodes.every((node, index) => node === tail[index])) return;
+
+        for (const node of nodes) host.append(node);
+    };
+
     // Chronological order INSIDE one card (a conversation host or a nested child
     // card's flow). `placeTurn` re-appends a row on every reconcile, and a live
     // snapshot can list a continuation BEFORE its owner (or re-place an earlier
@@ -2817,8 +2885,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const positionOf = (node: HTMLElement): number =>
             turns.findIndex((turn) => turn.element.parentElement === node);
 
-        rows.sort((left, right) => positionOf(left) - positionOf(right));
-        for (const node of rows) flow.append(node);
+        // R4c: sort a COPY so the on-screen order stays comparable with the requested one.
+        const ordered = rows.slice().sort((left, right) => positionOf(left) - positionOf(right));
+
+        appendInOrder(flow, ordered);
     };
 
     // The conversation CARD a tile currently lives in (undefined for a legacy
@@ -2965,6 +3035,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // panel stays first because it is prepended and never moved by this pass.
     const reorderBoard = (): void => {
         const seen = new Set<HTMLElement>();
+        const containers: HTMLElement[] = [];
 
         for (const turn of turns) {
             const row = turn.element.parentElement;
@@ -2977,8 +3048,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (seen.has(container)) continue;
 
             seen.add(container);
-            element.append(container);
+            containers.push(container);
         }
+
+        // R4c: the board's top-level units are re-appended ONLY when their order on screen
+        // is not already the recorded one (see `appendInOrder`).
+        appendInOrder(element, containers);
 
         // Empty conversation shells (all turns removed) must not leave a blank row;
         // surviving groups mark their first exchange as the header so removing the
@@ -3004,9 +3079,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             paintConversationAgent(host);
         }
 
-        for (const node of [...element.querySelectorAll<HTMLElement>(':scope > .notice')]) {
-            element.append(node);
-        }
+        // R4c: the notices keep their documented position (last), but they are re-appended
+        // only when they are not already the trailing children in the same order.
+        appendTailInOrder(
+            element,
+            [...element.querySelectorAll<HTMLElement>(':scope > .notice')]
+        );
     };
 
     // Re-run the projection for EVERY turn. A nested child card only becomes
@@ -3519,7 +3597,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Focus one persistent thread (S2). Tile first (a continuation turn lives
     // there), then the nested invocation whose runtime identity matches, then a
     // roster-only transcript. Returns false only for an id nobody knows.
-    const focusThread = (threadId: string): boolean => {
+    //
+    // R3c: `scroll` defaults to FALSE — every reconcile/resync path calls this to
+    // re-assert a focus the reader already has, and that must not move their viewport.
+    // Only a caller acting on a click or a submit passes `true`.
+    const focusThread = (threadId: string, scroll = false): boolean => {
         // 1. A turn of this conversation: the normal case, including a child thread
         //    that was continued (the continuation creates a host turn with its id).
         for (let position = turns.length - 1; position >= 0; position -= 1) {
@@ -3541,7 +3623,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             hideFocusPanel();
             detachTileExpansion();
             for (const other of turns) other.clearThreadFocus();
-            if (!candidate.focusChildThread(threadId)) continue;
+            if (!candidate.focusChildThread(threadId, scroll)) continue;
 
             focusedThreadId = threadId;
             explicitUnfocus = false;
@@ -4508,7 +4590,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // Focus the child conversation. The tile body is collapsed so only ONE
         // persistent conversation (this child) is open; other PERSISTENT child
         // entries are collapsed, while pure invocation details are left alone.
-        const focusChildThread = (threadId: string): boolean => {
+        //
+        // R3c: `scroll` is the caller's statement that THIS focus is a user gesture. A
+        // background reconcile re-asserts the reader's focus on every poll, and scrolling
+        // the row into view there moved the viewport underneath the reader (the "forced to
+        // the latest item" complaint); a programmatic caller therefore never scrolls.
+        const focusChildThread = (threadId: string, scroll = false): boolean => {
             for (const entry of threads.values()) {
                 if (entry.row === undefined) continue;
                 if (persistentIdOf(entry) !== threadId) continue;
@@ -4522,7 +4609,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 setThreadExpanded(entry, true);
                 entry.row.classList.add('is-persistent-focused');
                 focusedChildKey = entry.key;
-                entry.row.scrollIntoView?.({ block: 'nearest' });
+                if (scroll) entry.row.scrollIntoView?.({ block: 'nearest' });
                 return true;
             }
 
@@ -4586,6 +4673,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // A corrupt/cyclic parent chain terminates: the second visit is a no-op rather than
             // infinite recursion, and the row keeps the position it already had.
             const seen = new Set<string>();
+            // The rows in the depth-first order the host must end up holding (R4c).
+            const orderedRows: HTMLElement[] = [];
 
             const visit = (entry: ThreadEntry, depth: number, parentKey: string | undefined): void => {
                 if (seen.has(entry.key)) return;
@@ -4606,7 +4695,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 }
                 // The host's own `padding-left` is the FIRST step, so a row adds `depth - 1`.
                 entry.row?.style.setProperty('--thread-depth', String(Math.max(0, depth - 1)));
-                if (entry.row !== undefined) threadHost.append(entry.row);
+                // R4c: the row is COLLECTED in the recorded pre-order and moved by one
+                // `appendInOrder` pass below, instead of an unconditional `append` per row —
+                // that per-row move re-mounted every thread card on every repaint, which is
+                // what restarted the row's animations and fought the reader's scroll.
+                if (entry.row !== undefined) orderedRows.push(entry.row);
 
                 for (const child of children.get(entry.key) ?? []) visit(child, depth + 1, entry.key);
             };
@@ -4615,6 +4708,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // 'root' for the raw path's root flow), so the attribute is decided from the entry,
             // not from the walk.
             for (const root of roots) visit(root, 1, root.parentKey);
+
+            appendInOrder(threadHost, orderedRows);
         };
 
         // Would making `parentKey` this entry's parent create a cycle? A recorded
@@ -5030,7 +5125,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         return;
                     }
 
-                    focusThread(persistent);
+                    // R3c: this press IS the gesture — scrolling the focused card into
+                    // view is what the reader asked for.
+                    focusThread(persistent, true);
                     return;
                 }
 
@@ -6359,6 +6456,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // True once anything was painted from the display wire. The raw event fold
         // and this renderer never share a tile: a view-driven tile has no events.
         let compiledMode = false;
+        // V1: the fingerprint of the tree this tile's compiled DOM was last painted from
+        // (`displaySignatureOf`, :779). Written by BOTH paint passes, read only by the skip
+        // in `syncCompiledDisplay`. `resetCompiled()` runs inside `renderCompiledDisplay`,
+        // which re-records the value at the same call, so a teardown never leaves a stale
+        // fingerprint behind; and the raw event fold never shares a tile with this renderer
+        // (see `compiledMode`), so nothing else can invalidate it.
+        let compiledPaintedSignature: string | undefined;
 
         // --- one context bar per SECTION (T11 R7/R8, per-section since T19 R17) ---------
         //
@@ -6493,8 +6597,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 tailBody.replaceChildren();
                 // A cleared body describes NOTHING, the follow policy included: leaving
                 // `data-follow` on an empty box would make a cold-rendered section and a
-                // live-cleared one report different state for the same "no body" answer.
+                // live-cleared one report different state for the same "no body" answer. The
+                // per-pane policies (R5) go with it, listeners unbound, so the next block that
+                // takes this seat starts following and no watcher outlives its element.
                 delete tailBody.dataset.follow;
+                resetTailFollow();
                 // T27 (R2): a body that prints nothing goes back to the strip's host, where the
                 // surface's teardown can remove it. This is also what keeps "a section the bar
                 // never described has NO tail element mounted" true after a mode flip.
@@ -6502,22 +6609,199 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             };
 
             /**
-             * Keep the NEWEST byte visible in a clipped box (T26, R26).
+             * R5 — the follow POLICY of one clipped preview box in this strip.
              *
-             * Every preview box in this surface is height-bounded with its own scrollbar, so a
-             * body that grows stays pinned at the top and the reader watches a block of text
-             * that never changes — the "static text" the requirement names. Scrolling to the
-             * bottom is the cheap, layout-honest answer, and it touches no recorded byte.
+             * The reader, not the frame, decides: a box follows the newest byte ONLY while the
+             * reader is at its live edge. That is the standard follow-tail rule this surface
+             * already applies at the transcript level (./main.ts `pinned()` + `stick(pinned())`)
+             * and in ../extensions/records-dom.ts `createRecordsFollow()`; what it never applied
+             * to is the thinking/tool preview boxes, and that is the user-reported bug: the
+             * thinking body is the WHOLE thought inside a fixed-height box (T27 R1b, styles.css
+             * `.context-bar-tail-body` = `overflow: auto`), and every frame of the round wrote
+             * `scrollTop = scrollHeight`, so a reader who scrolled up inside the box to read the
+             * thought as it streamed was dragged back to the bottom within one frame — and, with
+             * the box pinned at its end, scroll chaining handed their wheel to the page, which
+             * is what "constantly dragged the scrolling bar to the bottom of the page" describes.
              *
-             * `data-follow` states the policy ON the element: a host with no layout (jsdom, a
-             * stripped webview) cannot report `scrollTop`, but it can report the intent, and the
-             * attribute is the assertion surface. A pane is only re-aimed when its CONTENT
-             * changed, because every caller here is behind the `tailKey` guard — a reader who
-             * scrolled up to re-read is never yanked by an unrelated repaint.
+             * The policy is keyed by a STABLE string, not by the element, because a tool call's
+             * args/result pane is MINTED on every content pass (`paintTail` → `replaceChildren(
+             * createTailPane(...))`): the policy — and the offset it protects — has to outlive
+             * the element it was read from and be restored on its replacement, or "scrolled up
+             * in a long result" is lost one frame later regardless of the gate.
+             *
+             * `data-follow` keeps its documented meaning (the policy stated ON the element, the
+             * assertion surface for a layout-free host): `'latest'` while actually following,
+             * `'paused'` while the reader holds the box away from the edge, and absent on a
+             * cleared body (see `clearTail`). Nothing in CSS selects it (verified), and the two
+             * tests that read it pin exactly these two spellings.
              */
-            const followLatest = (box: HTMLElement): void => {
-                box.dataset.follow = 'latest';
-                box.scrollTop = box.scrollHeight;
+            type TailFollow = {
+                following: boolean;
+                // The element this policy was last bound to, and the offset its reader held.
+                box: HTMLElement | undefined;
+                offset: number;
+                onScroll: (() => void) | undefined;
+            };
+
+            const tailFollows = new Map<string, TailFollow>();
+
+            // How close to the bottom counts as "at the live edge". 12px is the repo's own
+            // figure (../extensions/records-dom.ts `createRecordsFollow`, threshold 12); 48px
+            // (./main.ts `pinned`) is far too coarse here — these boxes are ~12 line boxes
+            // tall, so 48px would silently follow across a fifth of the visible text. A
+            // layout-free host reports 0 for all three metrics, which reads as "at the edge",
+            // keeping the pre-R5 hard-pin behaviour in exactly the hosts that cannot tell.
+            const TAIL_FOLLOW_EPSILON = 12;
+
+            const tailAtEdge = (box: HTMLElement): boolean =>
+                box.scrollHeight - box.clientHeight - box.scrollTop <= TAIL_FOLLOW_EPSILON;
+
+            const tailFollowOf = (key: string): TailFollow => {
+                const known = tailFollows.get(key);
+
+                if (known !== undefined) return known;
+
+                // A box that has never been scrolled starts AT the edge: the newest byte is
+                // what the reader of a streaming block came for, and that is what this path
+                // did unconditionally before R5.
+                const state: TailFollow = { following: true, box: undefined, offset: 0, onScroll: undefined };
+
+                tailFollows.set(key, state);
+
+                return state;
+            };
+
+            /**
+             * The pre-paint read, and the ONLY place the reader's position is measured.
+             *
+             * It has to happen BEFORE the caller writes the content: an append-only growth moves
+             * the live edge away from a reader who was AT it (their `scrollTop` is unchanged while
+             * `scrollHeight` grew), so measuring afterwards would stop the follow on the very
+             * first appended chunk. A rebuilt pane has no position of its own yet, so its answer
+             * is the policy the last scroll established, and its offset is the one the discarded
+             * element held.
+             */
+            const tailEdgeOf = (key: string, box: HTMLElement): boolean => {
+                const state = tailFollowOf(key);
+
+                // The offset to protect is the one the CURRENT occupant of this seat holds — the
+                // same element for a thinking body, the pane being discarded for a rebuilt one.
+                state.offset = (state.box ?? box).scrollTop;
+
+                // Only a box that is actually on screen can be measured. A policy with no element
+                // bound (a first paint, or the reset when a new block takes the seat) IS the
+                // answer, and so is the policy of a pane whose element was just replaced.
+                if (state.box === undefined || state.box !== box) return state.following;
+
+                return tailAtEdge(box);
+            };
+
+            /**
+             * Forget every policy: the block in this seat is a DIFFERENT block now (the next
+             * thinking window, the next recorded call), and the position the reader held belongs
+             * to the bytes that were here, not to these. Following starts on again, exactly as
+             * it did by construction when every frame hard-pinned the box.
+             */
+            const resetTailFollow = (): void => {
+                for (const state of tailFollows.values()) {
+                    if (state.box !== undefined && state.onScroll !== undefined) {
+                        state.box.removeEventListener('scroll', state.onScroll);
+                    }
+
+                    state.box = undefined;
+                    state.onScroll = undefined;
+                    state.following = true;
+                    state.offset = 0;
+                }
+            };
+
+            /** Point this seat's watcher at the element that is live for it (and off the old one). */
+            const bindTailBox = (state: TailFollow, box: HTMLElement): void => {
+                if (state.box === box) return;
+
+                if (state.box !== undefined && state.onScroll !== undefined) {
+                    state.box.removeEventListener('scroll', state.onScroll);
+                }
+
+                // A scroll is the reader speaking: away from the edge the box hands off, back to
+                // the edge it follows again — no button, per R5.3. Their live offset is recorded on
+                // the way past, so a repaint restores where they ACTUALLY hold the box, not where
+                // the last frame happened to leave it.
+                state.onScroll = (): void => {
+                    state.following = tailAtEdge(box);
+                    state.offset = box.scrollTop;
+                    box.dataset.follow = state.following ? 'latest' : 'paused';
+                };
+
+                box.addEventListener('scroll', state.onScroll);
+                state.box = box;
+            };
+
+            /**
+             * Write one box's aim — the newest byte, or the offset its reader is holding.
+             *
+             * D1: the WRITE is skipped while the element is out of the document. A detached element
+             * has no scroll box at all — `scrollHeight` is 0 and a `scrollTop` write is a no-op
+             * (CSSOM View; the repo states the same fact for its own markers in
+             * ../extensions/records-dom.ts:367-371) — and the args/result panes are minted DETACHED
+             * inside `createTailPane` (`section.append` follows, and `tailBody.replaceChildren` puts
+             * them in the document later). Aiming there would silently drop both the edge pin and
+             * the carried offset, leaving the rebuilt pane at the TOP of the payload — a forced jump
+             * of the same class as the one R5 removed, only toward the top. The POLICY is still
+             * recorded (it is the pre-paint read of the element that is still attached, so it is the
+             * real one); the write lands in `aimTailBoxes`, which runs once the panes are attached
+             * and again once the block has been seated.
+             */
+            const aimTailBox = (key: string, box: HTMLElement, edge: boolean): void => {
+                const state = tailFollowOf(key);
+
+                bindTailBox(state, box);
+
+                state.following = edge;
+                box.dataset.follow = edge ? 'latest' : 'paused';
+
+                if (!box.isConnected) return;   // D1: the aim is owed; `aimTailBoxes` lands it
+
+                if (edge) box.scrollTop = box.scrollHeight;
+                // D4: a content SHRINK under the same nodeId (a re-hydration carrying fewer bytes
+                // than the live stream did) clamps `scrollTop` during the text write above, so this
+                // restore can overshoot to the new bottom exactly once. Self-healing: the write
+                // lands on the clamp, the watcher then reads the edge and following resumes.
+                else box.scrollTop = state.offset;
+            };
+
+            /**
+             * Land every aim this strip owes, for the boxes that are IN the document right now
+             * (D1) — and re-land it after `placeTail` MOVES the block, because re-inserting an
+             * element resets its `scrollTop` to 0 (D2). This never makes a new decision: each box
+             * keeps the policy its reader established, so a reader away from the edge gets their
+             * own offset written back and nothing else, and a following reader is re-aimed at the
+             * newest byte.
+             */
+            const aimTailBoxes = (): void => {
+                for (const state of tailFollows.values()) {
+                    const box = state.box;
+
+                    if (box === undefined || !box.isConnected) continue;
+
+                    if (state.following) box.scrollTop = box.scrollHeight;
+                    else box.scrollTop = state.offset;
+
+                    box.dataset.follow = state.following ? 'latest' : 'paused';
+                }
+            };
+
+            /**
+             * Keep the NEWEST byte visible in a clipped box (T26, R26) — while the reader is at
+             * its live edge (R5). Both halves in one call for the callers that paint nothing:
+             * `followLatest` reads the edge, paints `text`, then aims.
+             */
+            const followLatest = (key: string, box: HTMLElement, text?: string): void => {
+                const edge = tailEdgeOf(key, box);
+
+                if (text !== undefined) box.textContent = text;
+
+                aimTailBox(key, box, edge);
             };
 
             // One labelled pane of the current call's body, and its stated absence. The
@@ -6555,11 +6839,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 const body = document.createElement('pre');
                 body.className = 'context-bar-tail-pane-body';
                 body.dataset.field = pane;
-                body.textContent = value;
-                // The bytes stay WHOLE (T25: a designated payload is never capped away), so
-                // this pane adds no text bound of its own — it only aims the scroll at the
-                // newest byte, which is the R26 rule for every clipped preview here.
-                followLatest(body);
+                // The bytes stay WHOLE (T25: a designated payload is never capped away), so this
+                // pane adds no text bound of its own — it only aims the scroll at the newest byte
+                // (R26), and R5 gates that aim.
+                //
+                // R5/D1: one key per pane, and the ORDER matters. The read happens while the
+                // PREVIOUS pane for this seat is still attached (the replace is further down
+                // `paintTail`), which is what makes the carried offset a real number; the WRITE is
+                // skipped here because this element is detached until `section.append` runs and the
+                // panes enter the document with `tailBody.replaceChildren`, where `aimTailBoxes`
+                // lands it.
+                followLatest(pane, body, value);
                 section.append(body);
 
                 return section;
@@ -6617,6 +6907,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                 if (key === tailKey) return;
 
+                // R5: a different designated block in this same box (the next thinking window,
+                // the next recorded call) is new content, so every pane's follow policy starts
+                // fresh — see `resetTailFollow`. `tail.dataset.nodeId` is still the PREVIOUS
+                // block here; `clearTail` deletes it, which is also what resets a cleared seat.
+                if (tail.dataset.nodeId !== next.nodeId) resetTailFollow();
+
                 tailKey = key;
                 tail.hidden = false;
                 tail.dataset.kind = next.kind;
@@ -6647,11 +6943,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // space can contain anything the model wrote, and this path parses no HTML.
                     // T27 (R1b): the painted string is the WHOLE body (`renderText` is
                     // `ContextTail.text` for a thinking tail, windowed by nothing), inside the
-                    // fixed-height scroll box styles.css gives it. `followLatest` still aims the
-                    // box at the newest byte, which is the T26 (R26) half that survives: a round
-                    // that is streaming reads as text that MOVES, not an opening sentence.
-                    tailBody.textContent = next.renderText;
-                    followLatest(tailBody);
+                    // fixed-height scroll box styles.css gives it. R26's aim at the newest byte
+                    // still runs, but R5 gates it: this is the box the user reported being
+                    // dragged to the bottom every frame, so it follows only while the reader is
+                    // at its live edge and leaves their offset alone the moment they scroll up.
+                    followLatest('body', tailBody, next.renderText);
 
                     return;
                 }
@@ -6676,6 +6972,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         kind?.hasResult === true ? 'empty-result' : 'no-result'
                     )
                 );
+                // D1: THIS is the moment the two panes gain a scroll box — they were minted
+                // detached, so `createTailPane` only recorded their policy. Their aim (the newest
+                // byte for a follower, the offset the reader discarded with the old element for a
+                // reader who is holding the box away from the edge) is written here.
+                aimTailBoxes();
             };
 
             /**
@@ -6721,6 +7022,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     if (tail.parentElement === flow && tail.nextElementSibling === anchor) return;
 
                     flow.insertBefore(tail, anchor);
+                    // D2: moving an element resets its `scrollTop` to 0, and a frame that only
+                    // moved the block paints NOTHING (`paintTail` returned on the same `tailKey`),
+                    // so the aim has to be re-asserted here or the reader spends one frame at the
+                    // top of the bytes they were reading. Per policy only: a follower goes back to
+                    // the newest byte, a reader away from the edge gets their OWN offset back —
+                    // this call can never move a reader who is holding the box away from the edge.
+                    aimTailBoxes();
 
                     return;
                 }
@@ -6728,6 +7036,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 if (tail.parentElement === flow && flow.lastElementChild === tail) return;
 
                 flow.append(tail);
+                // D2: the same re-assert for the no-anchor seat (see the `insertBefore` branch).
+                aimTailBoxes();
             };
 
             /** True when the bar, not the chip wall, is this section's tool surface. */
@@ -7732,6 +8042,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // says "the document IS the state", so anything left over from a previous
         // projection (including sections the document no longer names) is dropped.
         const renderCompiledDisplay = (display: TurnDisplay): void => {
+            // V1: a full paint replaces the DOM wholesale, so THIS tree is what the tile now
+            // shows — the previous fingerprint is meaningless and is re-recorded here (the
+            // action-card repaint path, `./main.ts` `repaintActionCard`, goes through this
+            // function with the same tree it just painted).
+            compiledPaintedSignature = displaySignatureOf(display);
             resetCompiled();
             compiledMode = true;
 
@@ -7781,6 +8096,33 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // are detached. Text can never duplicate, because a node's content is painted
         // FROM the node (the raw path needs prefix matching for that guarantee).
         const syncCompiledDisplay = (display: TurnDisplay): void => {
+            // V1 — the unchanged-tree skip. A document apply that carries the SAME content the
+            // tile is already painted from must not run the node-level pass at all: every
+            // committed text node in that pass re-parses its Markdown and replaces its DOM
+            // fragment (`syncCompiledNode` :7966 → `paintProse` :5472), which on a polling
+            // session meant one re-parse per loaded tile per second and a lost text selection.
+            //
+            // The gate is the tree's content (`displaySignatureOf`, :779), NOT its identity,
+            // because the ops fold mutates this object in place (../view-state.ts:396/:443/:509)
+            // — a mutated tree always fingerprints differently, so a streaming tile can never
+            // be frozen by this skip.
+            const signature = displaySignatureOf(display);
+
+            if (compiledMode && compiledPaintedSignature === signature) {
+                // Everything this pass derives from ANYTHING BUT the tree still runs, because a
+                // poll tick can legitimately move those without moving the tree: the row's header
+                // figures (a rows-only document changes the ROW and carries the tree untouched),
+                // the persistent-conversation join (a roster claim `setCompiledSummary` may have
+                // just recorded) and the meta line. All three are the same calls both paint passes
+                // already end with, so the skip cannot depend on a caller having set the row first.
+                if (compiledSummary !== undefined) applyRowFigures(compiledSummary);
+                paintPersistentMarkers();
+                updateMeta();
+
+                return;
+            }
+
+            compiledPaintedSignature = signature;
             compiledMode = true;
 
             // T11: an authoritative frame can be the one that FINALLY carries context (or a
@@ -9535,6 +9877,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // incoming conversation is then opened like first content.
                 dropFocusState();
                 notifyFocus();
+                // R3b: the thread focus IS dropped above — `dropFocusState` clears every
+                // tile's child-conversation focus and the focused id — so the composer stops
+                // steering into a conversation the server deleted. The newest surface is then
+                // opened ONLY on entry: `pendingFirstFocus` is set by `bindSession` for a real
+                // session switch and cleared by the first reconcile, so while the reader is
+                // inside one conversation this branch cannot fire at all. That is the
+                // entry-time default the design keeps (a switch opens the conversation the
+                // reader just entered); the mid-session forces live in
+                // `hydrate`/`hydrateView` (R3a) and in the follow/scroll paths (R3c/R3d).
                 if (!explicitUnfocus && pendingFirstFocus) {
                     const newest = next[next.length - 1];
                     if (newest !== undefined) expand(newest);
@@ -9573,10 +9924,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         renderCrossSteers();
 
         const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
-        const target = kept ?? handles[handles.length - 1];
-        if (target !== undefined) {
-            expand(target);
+
+        // R3a: when the tile the reader was looking at is NOT in the fresh document, the
+        // selection is left alone. The old `kept ?? handles[handles.length - 1]` opened the
+        // NEWEST turn instead, so a rebuild whose window no longer held that tile silently
+        // moved the selection (and the viewport) to the end of the list. The entry-time
+        // default stays: a rebuild that starts with nothing expanded opens the newest
+        // surface — that is the conversation the reader just entered, not a mid-session yank.
+        if (kept !== undefined) expand(kept);
+        else if (keepId === undefined) {
+            const newest = handles[handles.length - 1];
+
+            if (newest !== undefined) expand(newest);
+            else notifyFocus();
         } else {
+            // Nothing expanded, nothing forced: report the focus the board still holds so the
+            // composer's routing line stays honest after the rebuild.
             notifyFocus();
         }
 
@@ -9641,7 +10004,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const existing = find(summary.id);
             if (existing !== undefined) {
                 existing.setSummary(summary);
-                existing.syncDisplay(display ?? emptyDisplay(summary.id));
+                // R4: a rows-only document (`getView` now carries NO trees) must not wipe a
+                // tile that is already painted. `upsertView` already follows this rule
+                // (:9755); `syncDisplay(emptyDisplay(id))` used to remove every section and
+                // row of the tile on EVERY poll, and the refetch-then-rebuild that followed
+                // is the per-second flicker this removes. Only a display the document really
+                // carries replaces the painted flow.
+                if (display !== undefined) existing.syncDisplay(display);
                 ordered.push(existing);
                 continue;
             }
@@ -9651,7 +10020,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const claimed = claim(summary.prompt);
             if (claimed !== undefined) {
                 claimed.setSummary(summary);
-                claimed.syncDisplay(display ?? emptyDisplay(summary.id));
+                if (display !== undefined) claimed.syncDisplay(display);
                 ordered.push(claimed);
                 continue;
             }
@@ -9699,6 +10068,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (!focusThread(keepFocus)) {
                 dropFocusState();
                 notifyFocus();
+                // R3b: the thread focus IS dropped above — `dropFocusState` clears every
+                // tile's child-conversation focus and the focused id — so the composer stops
+                // steering into a conversation the server deleted. The newest surface is then
+                // opened ONLY on entry: `pendingFirstFocus` is set by `bindSession` for a real
+                // session switch and cleared by the first reconcile, so while the reader is
+                // inside one conversation this branch cannot fire at all. That is the
+                // entry-time default the design keeps (a switch opens the conversation the
+                // reader just entered); the mid-session forces live in
+                // `hydrate`/`hydrateView` (R3a) and in the follow/scroll paths (R3c/R3d).
                 if (!explicitUnfocus && pendingFirstFocus) {
                     const newest = next[next.length - 1];
                     if (newest !== undefined) expand(newest);
@@ -9731,10 +10109,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         renderCrossSteers();
 
         const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
-        const target = kept ?? handles[handles.length - 1];
-        if (target !== undefined) {
-            expand(target);
+
+        // R3a: when the tile the reader was looking at is NOT in the fresh document, the
+        // selection is left alone. The old `kept ?? handles[handles.length - 1]` opened the
+        // NEWEST turn instead, so a rebuild whose window no longer held that tile silently
+        // moved the selection (and the viewport) to the end of the list. The entry-time
+        // default stays: a rebuild that starts with nothing expanded opens the newest
+        // surface — that is the conversation the reader just entered, not a mid-session yank.
+        if (kept !== undefined) expand(kept);
+        else if (keepId === undefined) {
+            const newest = handles[handles.length - 1];
+
+            if (newest !== undefined) expand(newest);
+            else notifyFocus();
         } else {
+            // Nothing expanded, nothing forced: report the focus the board still holds so the
+            // composer's routing line stays honest after the rebuild.
             notifyFocus();
         }
 

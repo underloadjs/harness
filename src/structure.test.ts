@@ -877,14 +877,14 @@ describe('import safety', () => {
         expect(typeof root.createHarnessRuntime).toBe('function');
         expect(typeof root.createHarnessServiceHandler).toBe('function');
         expect(typeof root.SessionStore).toBe('function');
-        // T5 + the roster/role-contract pass: the published catalogue is exactly the
-        // real production configurations — SEVEN live cards, DEFAULT FIRST. The
-        // scripted demo and the failure example are still exported (FIXTURE_PRESETS /
-        // ALL_PRESET_TEMPLATES) so a host can inject them and an older session can
-        // still be rebuilt, but the shipped list a UI or CLI offers must not contain
-        // them. Order is a contract, not a preference (../server/harnesses/presets.ts
-        // :486-494): it is what `GET /harnesses` returns, what a picker renders, and
-        // the order the frontend palette assigns tones by.
+        // The roster/role-contract pass: the published catalogue is exactly the real
+        // production configurations — SEVEN live cards, DEFAULT FIRST, and that is the
+        // WHOLE surface. The scripted `demo` and the `flaky` failure example used to be
+        // exported behind FIXTURE_PRESETS / ALL_PRESET_TEMPLATES; they are deleted, so the
+        // published root no longer has a fixture tier to leak into a picker. Order is a
+        // contract, not a preference (../server/harnesses/presets.ts): it is what
+        // `GET /harnesses` returns, what a picker renders, and the order the frontend
+        // palette assigns tones by.
         expect(root.presets.map((preset) => preset.name)).toEqual([
             'general',
             'instruct',
@@ -914,20 +914,13 @@ describe('import safety', () => {
         expect(
             root.presets.filter((preset) => preset.subagents.length === 0).map((preset) => preset.name)
         ).toEqual(['general']);
-        expect(root.FIXTURE_PRESETS.map((preset) => preset.name)).toEqual(['demo', 'flaky']);
-        // Catalogue-first, fixtures last: an injected registry lists the real presets
-        // before the examples, exactly as the UI used to (../harnesses/presets.ts:513).
-        expect(root.ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
-            'general',
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'planner',
-            'debugger',
-            'demo',
-            'flaky'
-        ]);
+        // The deleted fixtures are gone from the published surface, not hidden behind it:
+        // a root that still exported `FIXTURE_PRESETS` or `ALL_PRESET_TEMPLATES` would be
+        // offering a scripted card and a throwing tool to any host that imports the
+        // package. A test that wants one builds it itself
+        // (../server/harnesses/fixture-presets.test-support.ts).
+        expect(root.FIXTURE_PRESETS).toBeUndefined();
+        expect(root.ALL_PRESET_TEMPLATES).toBeUndefined();
         // Client (import-safe under Node; no DOM work at module scope). The browser's
         // fallback root is the canonical mount, not the retired `/api`.
         expect(root.API_ROOT).toBe('/v1/harness');

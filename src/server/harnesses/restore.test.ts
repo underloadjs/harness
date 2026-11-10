@@ -37,7 +37,6 @@ import { describe, expect, it } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import type { HarnessPresetRecord } from '../persistence';
 import {
-    ALL_PRESET_TEMPLATES,
     createHarnessRegistry,
     LEGACY_PRESET_DEFINITIONS,
     presetFromRecord,
@@ -47,6 +46,8 @@ import {
     restoreHarnessRegistry,
     teamOf
 } from './index';
+import { SHARED_TOOL_NAMES } from './toolbox';
+import { PRODUCTION_WITH_FIXTURES, SCRIPTED_FIXTURE } from './fixture-presets.test-support';
 
 const SETTINGS = { baseURL: 'http://provider.test/v1', apiKey: 'server-secret', model: 'test-model' };
 const progress: HarnessProgress = async () => undefined;
@@ -56,7 +57,7 @@ const shipped = (name: string) => {
     // describes what an OLDER build shipped, and this helper builds exactly those
     // rows. The superset is the honest source for "what any build of this package
     // has shipped", which is also what `presetFromRecord` uses for a scripted row.
-    const preset = ALL_PRESET_TEMPLATES.find((candidate) => candidate.name === name);
+    const preset = PRODUCTION_WITH_FIXTURES.find((candidate) => candidate.name === name);
     if (preset === undefined) throw new Error(`Missing shipped preset "${name}".`);
     return preset;
 };
@@ -385,17 +386,17 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         // T5: a host that WANTS the fixtures injects them, and then a saved row for
         // one replays through the normal metadata-only path (no legacy entry exists
         // for a fixture, so it is always treated as a customisation of its template).
-        const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+        const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
         const demo = presetToRecord(shipped('demo'));
         const flaky = presetToRecord(shipped('flaky'));
 
         restoreHarnessRegistry(registry, [
-            { ...demo, title: 'Scripted demo (mine)' },
+            { ...demo, title: 'Scripted fixture (mine)' },
             { ...flaky, description: 'Failure drill.' }
         ]);
 
         const restoredDemo = registry.find('demo')!;
-        expect(restoredDemo.title).toBe('Scripted demo (mine)');
+        expect(restoredDemo.title).toBe('Scripted fixture (mine)');
         expect(restoredDemo.template).toBe('scripted');
         // The scripted factory (timeNow only) is still what this entry runs.
         expect(Object.keys(restoredDemo.create(SETTINGS, progress).tools)).toEqual([
@@ -417,10 +418,22 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'timeNow'
         ]);
 
+        // A saved 'flaky' row carries executable fields, so the replay goes through the
+        // executable patch path and REBUILDS the factory — which is where the honest
+        // consequence of the deletion shows up. The template survives (the entry still
+        // routes through createToolboxHarness), but the example tool it used to re-attach
+        // came from `src/server/tools/examples`, and this build does not ship that folder.
+        // The declaration drops with the factory, so the card never advertises a tool the
+        // session cannot call. A metadata-only replay keeps the captured factory and its
+        // testFlaky — pinned in ./registry.test.ts.
         const restoredFlaky = registry.find('flaky')!;
         expect(restoredFlaky.description).toBe('Failure drill.');
         expect(restoredFlaky.template).toBe('flaky');
-        expect(Object.keys(restoredFlaky.create(SETTINGS, progress).tools)).toContain('testFlaky');
+        expect(restoredFlaky.tools).toEqual([...SHARED_TOOL_NAMES]);
+
+        const flakyTools = Object.keys(restoredFlaky.create(SETTINGS, progress).tools);
+        expect(flakyTools).not.toContain('testFlaky');
+        expect(flakyTools).toContain('read');
     });
 
     it('a frozen session still rebuilds from its own record after the refresh', () => {
@@ -566,35 +579,45 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
         expect(registry.deletedBuiltins()).toEqual([]);
     });
 
-    it('still rebuilds a frozen scripted session for a fixture that left the catalogue', () => {
-        // The other half of the same story: the CARD is gone, but a conversation
-        // recorded while it existed has to restore. `presetFromRecord` resolves a
-        // 'scripted' record through ALL_PRESET_TEMPLATES (the shipped-catalogue
-        // lookup alone would throw).
+    it('rebuilds a frozen scripted session from the injected template the host still has', () => {
+        // The other half of the same story: the CARD is not shipped, but a conversation
+        // recorded against it restores — provided the host still injects the scripted
+        // preset, which is the only place a scripted factory can come from now that no
+        // shipped template is scripted. `sessions.ts` passes exactly this: the registry's
+        // current entry for the name, as `fallback`.
         const record = presetToRecord(shipped('demo'));
         expect(record.template).toBe('scripted');
 
-        const preset = presetFromRecord(record);
+        const preset = presetFromRecord(record, SCRIPTED_FIXTURE);
         expect(preset.name).toBe('demo');
         expect(preset.template).toBe('scripted');
         expect(preset.requiresEndpoint).toBe(false);
 
         const offline = preset.create(SETTINGS, progress);
-        expect(Object.keys(offline.agents)).toEqual(['demo']);
+        // The agent key is the real `general` role, not `demo`: the preset name is the
+        // harness identity, the agent name is a profile this build ships.
+        expect(Object.keys(offline.agents)).toEqual(['general']);
 
-        // No registry entry is involved: this is how an old demo conversation keeps
-        // its transcript and its reported harness after the row disappears.
+        // A DEFAULT registry has no such entry: the scripted factory exists only because
+        // a host put it there.
         expect(createHarnessRegistry().find('demo')).toBeUndefined();
     });
 
     it('refuses a scripted record this build cannot rebuild at all', () => {
-        // Honest failure for a fixture that is NOT shipped in any form: the session
-        // cannot be restored, and inventing a live harness in its place would change
-        // what the transcript means.
-        expect(() =>
-            presetFromRecord({ ...presetToRecord(shipped('demo')), name: 'long-gone' })
-        ).toThrowError(
-            'Scripted harness "long-gone" is not shipped in this build; the session cannot be restored.'
+        // Honest failure for a scripted harness with no injected template: the session
+        // cannot be restored, and inventing a live harness in its place would change what
+        // the transcript means (the saved turns were produced without a provider).
+        //
+        // This is the case the deleted `demo` preset used to answer from a shipped
+        // superset. With the superset gone, a name the host has not injected — or an entry
+        // that is no longer scripted — is the error.
+        expect(() => presetFromRecord(presetToRecord(shipped('demo')))).toThrowError(
+            'Scripted harness "demo" is not shipped in this build; the session cannot be restored.'
         );
+
+        // A same-named but non-scripted fallback is a different harness, not a rebuild.
+        expect(() =>
+            presetFromRecord(presetToRecord(shipped('demo')), PRODUCTION_WITH_FIXTURES.find((p) => p.name === 'general'))
+        ).toThrowError('Scripted harness "demo" is not shipped in this build; the session cannot be restored.');
     });
 });

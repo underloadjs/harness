@@ -23,7 +23,6 @@ import { agent, harness, tool } from '../../harness';
 import type { HarnessProgress } from '../../harness';
 import { discoverToolMetadata } from '../../core';
 import {
-    EXAMPLE_APP_TOOL_SOURCES,
     SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,
     SHARED_APP_TOOL_SOURCES,
@@ -33,8 +32,9 @@ import {
     agentsFromProfiles,
     createToolboxHarness
 } from './toolbox';
-import { EXAMPLE_APP_TOOL_FOLDER, appToolSourcesFrom, scanAppToolDescriptors } from './tools';
-import { ALL_PRESET_TEMPLATES, createHarnessRegistry, findPreset } from './index';
+import { APP_TOOL_FOLDERS, appToolSourcesFrom, scanAppToolDescriptors } from './tools';
+import { createHarnessRegistry, findPreset } from './index';
+import { FLAKY_FIXTURE, PRODUCTION_WITH_FIXTURES, SCRIPTED_FIXTURE } from './fixture-presets.test-support';
 
 const SETTINGS = {
     baseURL: 'http://provider.test/v1',
@@ -174,56 +174,54 @@ export const execute = async () => ({ replaced: true });
         expect(await harness.executeTool('timeNow', {})).toEqual({ replaced: true });
     });
 
-    it('compiles the flaky example extra tool from its editable source entry', () => {
+    it('registers the flaky fixture extra tool as a definition, with no source record', () => {
         stubNoSearchKeys();
 
-        const preset = findPreset('flaky');
-        if (preset === undefined) throw new Error('missing flaky preset');
+        // The `flaky` PRESET and its `src/server/tools/examples` folder are deleted, so
+        // `testFlaky` is no longer a scanned SOURCE entry — the test fixture supplies it as
+        // a constructed Tool through `createToolboxHarness({ extraTools })`. That is the
+        // other documented registration path: a definition is registered last and wins
+        // over a source of the same name, but it has no editable file, so it gets no
+        // content-addressed `toolSource` revision. Asserting the ABSENCE is what keeps that
+        // distinction honest instead of quietly claiming a source-backed revision.
+        const harness = FLAKY_FIXTURE.create(SETTINGS, progress);
 
-        const harness = preset.create(SETTINGS, progress);
+        expect(harness.tools.testFlaky).toBeDefined();
+        expect(harness.toolSource('testFlaky')).toBeUndefined();
 
-        // Shipped exception in the tool SET, not in the registration path.
-        expect(harness.toolSource('testFlaky')).toMatchObject({
-            name: 'testFlaky',
-            revision: expect.stringMatching(/^[0-9a-f]{16}$/),
-            sourcePath: 'server/tools/examples/testFlaky.tool.ts',
-            dependencies: [],
-            format: 'module',
-            checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
-        });
-        // The shared toolbox is still compiled alongside it.
+        // The shared toolbox next to it is still compiled from its editable entries.
         expect(harness.toolSource('timeNow')).toMatchObject({
             sourcePath: 'server/tools/shared/timeNow.tool.ts',
             format: 'module'
         });
     });
 
-    it('keeps the flaky extra source through a registry template rebuild', () => {
+    it('drops the example tool when a registry rebuilds the flaky template', () => {
         stubNoSearchKeys();
 
-        // T5: the flaky example is an injected fixture now, so the registry that
-        // rebuilds its template asks for the templates explicitly.
-        const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+        // The fixture is injected, so the registry that rebuilds its template is built
+        // with the templates named explicitly.
+        const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
         const rebuilt = registry.update('flaky', { primary: 'workspace' });
         const harness = rebuilt.create(SETTINGS, progress);
 
-        expect(harness.toolSource('testFlaky')).toMatchObject({
-            name: 'testFlaky',
-            revision: expect.stringMatching(/^[0-9a-f]{16}$/),
-            sourcePath: 'server/tools/examples/testFlaky.tool.ts',
-            dependencies: [],
-            format: 'module',
-            checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
+        // The rebuild goes through the toolbox factory (that is what the template selects)
+        // and attaches no example source, because this build ships none. The card's declared
+        // tool list is rewritten to match — see the `downgradedFlaky` branch in ./registry.ts.
+        expect(rebuilt.tools).toEqual([...SHARED_TOOL_NAMES]);
+        expect(harness.tools.testFlaky).toBeUndefined();
+        expect(harness.toolSource('testFlaky')).toBeUndefined();
+        expect(harness.toolSource('timeNow')).toMatchObject({
+            sourcePath: 'server/tools/shared/timeNow.tool.ts'
         });
     });
 
-    it('compiles the scripted demo timeNow from its editable source entry', () => {
+    it('compiles the scripted fixture timeNow from its editable source entry', () => {
         stubNoSearchKeys();
 
-        const preset = findPreset('demo');
-        if (preset === undefined) throw new Error('missing demo preset');
-
-        const harness = preset.create(SETTINGS, progress);
+        // The scripted fixture is not in `findPreset`'s catalogue; it is injected, so the
+        // object is used directly.
+        const harness = SCRIPTED_FIXTURE.create(SETTINGS, progress);
 
         // The fixture keeps its one-tool SET, but the tool is a real compiled
         // revision rather than a prebuilt definition passed through `tools`.
@@ -273,7 +271,7 @@ describe('server tools folder derivation (T25)', () => {
         // The scan is the authority: the declared map must equal the discovered
         // entries of `src/server/tools/shared`, in registration order.
         const scanned = discoverToolMetadata({
-            folders: [SHARED_APP_TOOL_FOLDER, EXAMPLE_APP_TOOL_FOLDER]
+            folders: [SHARED_APP_TOOL_FOLDER]
         }).filter((descriptor) => descriptor.origin === 'folder');
 
         expect(
@@ -290,20 +288,19 @@ describe('server tools folder derivation (T25)', () => {
         // Every app entry lives under the dedicated server folder, and none of them
         // is under the package's default tools root — that separation is what keeps
         // them out of a library harness.
-        for (const sourcePath of [
-            ...Object.values(SHARED_APP_TOOL_SOURCES),
-            ...Object.values(EXAMPLE_APP_TOOL_SOURCES)
-        ]) {
-            expect(sourcePath).toMatch(/^server\/tools\/(shared|examples)\/[A-Za-z]+\.tool\.ts$/);
+        for (const sourcePath of Object.values(SHARED_APP_TOOL_SOURCES)) {
+            expect(sourcePath).toMatch(/^server\/tools\/shared\/[A-Za-z]+\.tool\.ts$/);
         }
     });
 
-    it('keeps the example tools out of the shared toolbox and out of a library harness', () => {
+    it('ships one app tool folder and keeps the app tools out of a library harness', () => {
         stubNoSearchKeys();
 
-        // `testFlaky` is catalogued and directly callable, but the shared set (what
-        // every live preset registers) does not contain it: the examples folder is
-        // the exclusion, not a name filter.
+        // There used to be a second, opt-in folder (`examples`, holding `testFlaky`) whose
+        // whole job was to be excluded from the shared set by not being `shared`. The
+        // example preset is deleted, so the folder is gone and the shared folder IS the
+        // app catalogue — no name filter, and no second map to keep in step.
+        expect(APP_TOOL_FOLDERS).toEqual([SHARED_APP_TOOL_FOLDER]);
         expect(SHARED_APP_TOOL_NAMES).toEqual([
             'timeNow',
             'textCount',
@@ -311,7 +308,6 @@ describe('server tools folder derivation (T25)', () => {
             'noteSearch',
             'textSummarize'
         ]);
-        expect(Object.keys(EXAMPLE_APP_TOOL_SOURCES)).toEqual(['testFlaky']);
         expect(SHARED_TOOL_NAMES).not.toContain('testFlaky');
 
         // A LIBRARY harness (no server folders configured) never sees them: the app
@@ -324,6 +320,10 @@ describe('server tools folder derivation (T25)', () => {
         expect(library.tools.testFlaky).toBeUndefined();
         expect(library.toolSource('timeNow')).toBeUndefined();
         expect(library.tools.read).toBeDefined();
+
+        // `testFlaky` is not catalogued anywhere in this build: it exists only as the
+        // fixture's constructed definition, so a library harness cannot reach it even by
+        // name. (The fixture's own harness registers it — pinned above.)
     });
 
     it('derives a catalogue for a folder that gained a brand-new entry, with no map edit', async () => {

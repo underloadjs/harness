@@ -707,6 +707,11 @@ export type DisplayLoader = {
     invalidate(): number;
     // Forgets the cache without dropping the generation (a reset emptied the window).
     reset(): void;
+    // R2/R4: un-marks ONE settled turn so a later read is allowed again (the document
+    // install calls it when the ROW moved after the tree was painted). A turn whose read is
+    // still in flight is left alone: its answer is already on the wire, and forgetting it
+    // there would be the duplicate read this loader exists to prevent.
+    forget(turnId: string): void;
     generation(): number;
 };
 
@@ -842,6 +847,20 @@ export const createDisplayLoader = (
         reset: () => {
             state.clear();
             backlog.length = 0;
+        },
+
+        // R2/R4: a settled (or failed) turn is put back on the market; an in-flight one is
+        // not, because a second read of the same tree while one is open is the exact waste
+        // the dedupe rule exists for. Dropping a queued id is safe: the next `pump`/`load`
+        // re-admits it through the same bounded queue.
+        forget: (turnId) => {
+            if (state.get(turnId) === 'loading') return;
+
+            state.delete(turnId);
+
+            const queued = backlog.indexOf(turnId);
+
+            if (queued !== -1) backlog.splice(queued, 1);
         },
 
         generation: () => generation

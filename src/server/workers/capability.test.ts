@@ -13,7 +13,7 @@
 import { describe, expect, it } from 'vitest';
 import type { HarnessPreset } from '../harnesses/types';
 import { createHarnessRegistry } from '../harnesses';
-import { ALL_PRESET_TEMPLATES } from '../harnesses/presets.ts';
+import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { ServerRuntimeError } from '../config';
 import {
     AUTHORITY_RUNTIME_METHODS,
@@ -335,8 +335,8 @@ describe('planWorkerToolSurfaces', () => {
 // checks passed because nothing was scanned, not because the toolbox was safe.
 describe('the real shipped toolbox through the capability lens', () => {
     const settings = { baseURL: 'http://localhost:9/v1', apiKey: '', model: 'demo' } as never;
-    const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES as never);
-    const preset = registry.list().find((entry: { name: string }) => entry.name === 'flaky') as {
+    const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never);
+    const preset = registry.list().find((entry: { name: string }) => entry.name === 'general') as {
         create: (runnerSettings: never, progress: () => void, options?: never) => any;
     };
     // A thread is created first because the thread trio (`threadRead`, `threadList`,
@@ -344,7 +344,7 @@ describe('the real shipped toolbox through the capability lens', () => {
     // untouched harness does not have it installed and a scan of it proves nothing.
     const harness = preset.create(settings as never, () => undefined);
 
-    harness.createThread('flaky');
+    harness.createThread('general');
 
     const revisions = new Map<string, string | undefined>(harness.toolSources().map((record: { name: string }) => [record.name, toolScanTextOf(record)]));
     const installed = Object.keys(harness.tools).sort();

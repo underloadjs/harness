@@ -9,7 +9,7 @@
 //     because an id is written into every saved record and has no alias fallback
 //     (../../agents/index.ts). The scripted demo and the flaky example are presets too,
 //     but T5 un-shipped them — they stay available through FIXTURE_PRESETS/
-//     ALL_PRESET_TEMPLATES so a host or a test injects them explicitly;
+//     PRODUCTION_WITH_FIXTURES so a host or a test injects them explicitly;
 //   - `general` is the DEFAULT card (it is `presets[0]` and `DEFAULT_CLI_PRESET`) and the
 //     ONLY live preset with no team: `subagents: []`, which means `delegate` is never
 //     even REGISTERED for it (src/harness.ts `activation: 'subagents'`), so it is absent
@@ -45,13 +45,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import {
-    ALL_PRESET_TEMPLATES,
     createHarnessRegistry,
     createToolCatalogue,
     createWebSearchCatalogueEntry,
     describeHarness,
     findPreset,
-    FIXTURE_PRESETS,
     LEGACY_PRESET_DEFINITIONS,
     presets,
     PRESET_ALIASES,
@@ -60,6 +58,7 @@ import {
     SPECIALIST_AGENT_NAMES,
     teamOf
 } from './index';
+import { FIXTURE_PRESETS, PRODUCTION_WITH_FIXTURES } from './fixture-presets.test-support';
 import { AGENT_PROFILES, agentInstruction } from '../../agents';
 import { DEFAULT_CLI_PRESET } from '../cli/options';
 
@@ -99,8 +98,12 @@ const SETTINGS = {
 // Constructing a preset routes no events, so this sink stays empty.
 const progress: HarnessProgress = async () => undefined;
 
+// Production names resolve through `findPreset` (whose default catalogue is `presets`,
+// the shipped list). The two TEST fixtures are not in that list any more — they are
+// injected objects from ./fixture-presets.test-support.ts — so the lookup falls back to
+// the catalogue a suite would inject. A typo still throws.
 const presetOf = (name: string) => {
-    const preset = findPreset(name);
+    const preset = findPreset(name) ?? PRODUCTION_WITH_FIXTURES.find((entry) => entry.name === name);
     if (!preset) throw new Error(`Missing preset "${name}".`);
     return preset;
 };
@@ -201,10 +204,11 @@ afterEach(() => {
 });
 
 describe('preset catalogue', () => {
-    it('ships the seven real roles and keeps the two examples as explicit fixtures (T5)', () => {
+    it('ships the seven real roles and nothing else; the fixtures are test-owned', () => {
         // The shipped catalogue is exactly the real roles: every card is a live
-        // harness a user can actually run. The scripted demo and the failure example
-        // are presets, but they are no longer product configurations.
+        // harness a user can actually run. The scripted `demo` and the failure example
+        // used to ship behind FIXTURE_PRESETS/ALL_PRESET_TEMPLATES; they are deleted, and
+        // what a suite injects now comes from ./fixture-presets.test-support.ts.
         expect(presets.map((preset) => preset.name)).toEqual([
             'general',
             'instruct',
@@ -235,19 +239,22 @@ describe('preset catalogue', () => {
         expect(presets[0].requiresEndpoint).toBe(true);
         expect(DEFAULT_CLI_PRESET).toBe('general');
 
-        // The review the removal came with: nothing in the shipped catalogue is
-        // offline, scripted, or registers a tool that fails on purpose.
+        // The review the removal came with, now provable from the catalogue alone: nothing
+        // shipped is offline, scripted, or registers a tool that fails on purpose. There is
+        // no fixture tier left to exclude them into.
         expect(presets.every((preset) => preset.requiresEndpoint)).toBe(true);
         expect(presets.every((preset) => preset.template === 'live')).toBe(true);
         expect(presets.flatMap((preset) => preset.tools)).not.toContain('testFlaky');
 
-        // The fixtures stay available for explicit injection and for restoring an
-        // older session, in the same order they used to ship in.
+        // The test fixtures are NOT in the catalogue — a suite reaches them through the
+        // test-support module, and `findPreset` cannot resolve either name.
+        expect(findPreset('demo')).toBeUndefined();
+        expect(findPreset('flaky')).toBeUndefined();
         expect(FIXTURE_PRESETS.map((preset) => [preset.name, preset.title])).toEqual([
-            ['demo', 'Scripted demo'],
-            ['flaky', 'Recoverable failures (example)']
+            ['demo', 'Scripted fixture'],
+            ['flaky', 'Recoverable failures (fixture)']
         ]);
-        expect(ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
+        expect(PRODUCTION_WITH_FIXTURES.map((preset) => preset.name)).toEqual([
             ...presets.map((preset) => preset.name),
             'demo',
             'flaky'
@@ -326,8 +333,11 @@ describe('preset catalogue', () => {
             card('debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'])
         ]);
 
-        // The fixtures are unchanged by the roster pass, and still declared honestly:
-        // demo is offline with timeNow only, flaky adds its example tool.
+        // The test fixtures are still declared honestly, and they select only ids this
+        // build knows: demo is offline with timeNow only, and flaky is a REAL profile plus
+        // its extra tool. There is no `flaky` agent profile any more, so the fixture runs
+        // on `general` — a live harness that named a deleted profile would fail validation
+        // against src/agents at construction.
         expect(
             FIXTURE_PRESETS.map((preset) => ({
                 name: preset.name,
@@ -340,17 +350,17 @@ describe('preset catalogue', () => {
         ).toEqual([
             {
                 name: 'demo',
-                primary: 'demo',
+                primary: 'general',
                 subagents: [],
-                agents: ['demo'],
+                agents: ['general'],
                 environmentTools: undefined,
                 template: 'scripted'
             },
             {
                 name: 'flaky',
-                primary: 'flaky',
+                primary: 'general',
                 subagents: [],
-                agents: ['flaky'],
+                agents: ['general'],
                 // The factory opts into search AND webfetch through
                 // createToolboxHarness, so the metadata says so too
                 // (descriptor/runtime agreement).
@@ -889,7 +899,7 @@ describe('one toolbox, different agents', () => {
 
     it('marks every template editable (compatibility field only)', () => {
         expect(
-            ALL_PRESET_TEMPLATES.map((preset) => ({
+            PRODUCTION_WITH_FIXTURES.map((preset) => ({
                 name: preset.name,
                 builtin: preset.builtin,
                 editable: preset.editable,

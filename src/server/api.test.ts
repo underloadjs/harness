@@ -46,12 +46,12 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-    ALL_PRESET_TEMPLATES,
     createHarnessRegistry,
     createToolCatalogue,
     createWebSearchCatalogueEntry,
     WEBSEARCH_UNCONFIGURED_HINT
 } from './harnesses';
+import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 import { agent, harness } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 // The shared policy lines of the trusted catalogue (src/agents/guidelines.ts). Profile-specific
@@ -143,9 +143,11 @@ const CARD_KEY_SET = [
     'tools'
 ];
 
-// The trusted agent registry (src/agents): seven roles, then the delegated summarizer, then the
-// two fixtures. This is `AGENT_PROFILE_NAMES` verbatim, and the registry also renders it into the
-// `Known agents: ...` validation messages asserted below, so one list pins both.
+// The trusted agent registry (src/agents): seven roles, then the delegated summarizer. That is
+// the whole roster — `AGENT_PROFILE_NAMES` verbatim — because the `demo`/`flaky` fixture PROFILES
+// are deleted: the two injected fixture CARDS exist, but the agents inside them are real roles.
+// The registry also renders this list into the `Known agents: ...` validation messages asserted
+// below, so one list pins both.
 const AGENT_NAMES = [
     'general',
     'instruct',
@@ -154,9 +156,7 @@ const AGENT_NAMES = [
     'reviewer',
     'planner',
     'debugger',
-    'summarizer',
-    'demo',
-    'flaky'
+    'summarizer'
 ];
 
 // The whole catalogue, in the order the route emits it: the fourteen harness-owned core rows,
@@ -193,7 +193,6 @@ const TOOL_NAMES = [
     'diceRoll',
     'noteSearch',
     'textSummarize',
-    'testFlaky',
     'search',
     'fetch'
 ];
@@ -310,11 +309,9 @@ const DEBUGGER_GUIDELINES = [
     'Report what you exercised, what held, what broke, and what you did not get to. Never invent a failure and never bury one.'
 ];
 
-const DEMO_IDENTITY = 'You are the offline demo agent. The transport is scripted; nothing is sent to a model.';
-const DEMO_GUIDELINES = [
-    'Narrate the loop the transport demonstrates: a toolRequest discovery round, one tool call, then the answer.',
-    'The demo registry is timeNow-only; the shared toolbox is not part of this fixture.'
-];
+// The scripted fixture card runs the REAL `general` profile (its transport is scripted, but the
+// agent inside it is a role this build ships), so every prompt assertion below about a `demo`
+// session is an assertion about the General prompt — GENERAL_IDENTITY/GENERAL_GUIDELINES above.
 
 // Filesystem fixtures live under a `Temp/` directory INSIDE the checkout (never OS temp). The
 // location is resolved by walking the tree instead of counting `..` segments: this package is both
@@ -417,7 +414,7 @@ const createRuntime = (
     return createHarnessRuntime({
         settings,
         defaults,
-        registry: createHarnessRegistry([...ALL_PRESET_TEMPLATES, ...extraPresets]),
+        registry: createHarnessRegistry([...PRODUCTION_WITH_FIXTURES, ...extraPresets]),
         loadEnvironment: false
     });
 };
@@ -430,7 +427,7 @@ const createConfiguredRuntime = (): HarnessRuntime => {
     return createHarnessRuntime({
         settings: SETTINGS,
         defaults: DEFAULTS,
-        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES),
         loadEnvironment: false,
         catalogue: createToolCatalogue({
             websearch: createWebSearchCatalogueEntry({ configuration: { env: { EXA_API_KEY: 'configured-exa-key' } } })
@@ -1019,8 +1016,8 @@ describe('harness catalogue reads', () => {
             ['reviewer', 'Reviewer'],
             ['planner', 'Manager'],
             ['debugger', 'Debugger'],
-            ['demo', 'Scripted demo'],
-            ['flaky', 'Recoverable failures (example)']
+            ['demo', 'Scripted fixture'],
+            ['flaky', 'Recoverable failures (fixture)']
         ]);
         // `limit` echoes the RETURNED row count (./api-paging.ts:148), and a page that is not full
         // carries no cursor.
@@ -1079,13 +1076,15 @@ describe('harness catalogue reads', () => {
         // timeNow-only (no package toolbox).
         expect(page.body.items[7]).toEqual({
             name: 'demo',
-            title: 'Scripted demo',
+            title: 'Scripted fixture',
             description:
-                'Runs a scripted transport: a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to the real presets.',
+                'Test fixture: runs a scripted transport — a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed. Not a production configuration.',
             requires_endpoint: false,
-            primary: 'demo',
+            // The AGENT is a real role even though the CARD is a fixture: there is no `demo`
+            // profile in this build, and a harness that named one could not be validated.
+            primary: 'general',
             subagents: [],
-            agents: ['demo'],
+            agents: ['general'],
             tools: ['timeNow'],
             builtin: true,
             definition_revision: 0
@@ -1172,7 +1171,7 @@ describe('harness catalogue reads', () => {
         expect(demo.body.harness.core_tools).toEqual(['toolRequest', 'tasks']);
         expect(demo.body.harness.tools).toEqual(['timeNow']);
         expect(demo.body.harness.instruction_summary).toEqual([
-            { agent: 'demo', source: 'catalogue', overridden: false, chars: 86 }
+            { agent: 'general', source: 'catalogue', overridden: false, chars: 135 }
         ]);
 
         // An unknown card is the registry's own 404 wording, and an identified read resolves a
@@ -1267,9 +1266,7 @@ describe('harness catalogue reads', () => {
             ['reviewer', 'Reviewer'],
             ['planner', 'Manager'],
             ['debugger', 'Debugger'],
-            ['summarizer', 'Summarizer'],
-            ['demo', 'Demo'],
-            ['flaky', 'Flaky']
+            ['summarizer', 'Summarizer']
         ]);
 
         // The DEFAULT profile, read whole: id, title, and the two prompt halves. Its guidelines are
@@ -1284,15 +1281,10 @@ describe('harness catalogue reads', () => {
         expect(generalProfile.body.agent.instruction).toBe(GENERAL_IDENTITY);
         expect(generalProfile.body.agent.guidelines).toEqual(GENERAL_GUIDELINES);
         expect(generalProfile.body.agent.instruction_source).toBe('catalogue');
-        expect(generalProfile.body.agent.referenced_by).toEqual([
-            'general',
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'planner',
-            'debugger'
-        ]);
+        // EVERY card in this runtime references it — the seven shipped cards AND the two
+        // injected fixture cards, whose agent is `general` because no `demo`/`flaky` profile
+        // exists in this build (./harnesses/fixture-presets.test-support.ts header).
+        expect(generalProfile.body.agent.referenced_by).toEqual(CARD_NAMES);
 
         const profile = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('instruct'));
 
@@ -1634,7 +1626,7 @@ describe('canonical sessions', () => {
         expect(session.harness).toBe('demo');
         expect(session.status).toBe('idle');
         expect(session.model).toBe('demo-model');
-        expect(session.agent_models).toEqual({ demo: 'demo-model' });
+        expect(session.agent_models).toEqual({ general: 'demo-model' });
         expect(session.endpoint).toEqual({ base_url: SETTINGS.baseURL, model: 'demo-model', has_api_key: true });
         expect(session.runtime_execution).toBe('inline');
         expect(session.created_at).toBe(session.updated_at);
@@ -1765,7 +1757,7 @@ describe('canonical sessions', () => {
         // The frozen copy names the card it was built from and stays behind the session id.
         expect(definition.definition.session_id).toBe(session.id);
         expect(definition.definition.name).toBe('demo');
-        expect(definition.definition.title).toBe('Scripted demo');
+        expect(definition.definition.title).toBe('Scripted fixture');
         expect(definition.definition.requires_endpoint).toBe(false);
         expect(definition.definition.tools).toEqual(['timeNow']);
         expect(definition.definition.core_tools).toEqual(['toolRequest', 'tasks']);
@@ -1795,14 +1787,14 @@ describe('canonical sessions', () => {
             'role'
         ].sort());
         expect(roster.agents[0]).toEqual({
-            agent_id: 'demo',
-            profile: 'demo',
+            agent_id: 'general',
+            profile: 'general',
             role: 'primary',
             origin: 'definition',
             model: 'demo-model',
             inherited_model: 'demo-model',
             instruction_source: 'catalogue',
-            instruction_chars: joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES).length,
+            instruction_chars: joinedPrompt(GENERAL_IDENTITY, GENERAL_GUIDELINES).length,
             // `guidelines_count` is the seeded SYSTEM-ENTRY count of the agent's brain
             // (./api-reads.ts:927 `brain.instructions.length`), i.e. the joined-prompt invariant:
             // exactly ONE entry, never identity + guidelines as two. The guideline ARRAY itself is
@@ -1819,16 +1811,16 @@ describe('canonical sessions', () => {
         const instruction = await readOk<Record<string, any>>(
             call_,
             'GET',
-            HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdInstruction(session.id, 'demo'),
+            HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdInstruction(session.id, 'general'),
             200
         );
         expect(Object.keys(instruction).sort()).toEqual(['agent_id', 'chars', 'guidelines', 'instruction', 'session_id', 'source']);
         expect(instruction.session_id).toBe(session.id);
-        expect(instruction.agent_id).toBe('demo');
+        expect(instruction.agent_id).toBe('general');
         expect(instruction.source).toBe('catalogue');
-        expect(instruction.instruction).toBe(joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES));
-        expect(instruction.chars).toBe(joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES).length);
-        expect(instruction.guidelines).toEqual(DEMO_GUIDELINES);
+        expect(instruction.instruction).toBe(joinedPrompt(GENERAL_IDENTITY, GENERAL_GUIDELINES));
+        expect(instruction.chars).toBe(joinedPrompt(GENERAL_IDENTITY, GENERAL_GUIDELINES).length);
+        expect(instruction.guidelines).toEqual(GENERAL_GUIDELINES);
 
         // The live toolbox is the session registry, budgeted, with no source text on a row.
         const tools = await readOk<Record<string, any>>(
@@ -1867,7 +1859,7 @@ describe('canonical sessions', () => {
         const session = await createDemo(runtime);
         const path = HARNESS_ROUTES.sessionsBySessionId(session.id);
 
-        expect(await callWithHeaders(runtime, 'PATCH', path, { agent_models: { demo: '  next/model  ' } })).toEqual({
+        expect(await callWithHeaders(runtime, 'PATCH', path, { agent_models: { general: '  next/model  ' } })).toEqual({
             status: 200,
             body: {
                 session: {
@@ -1875,7 +1867,7 @@ describe('canonical sessions', () => {
                     model: 'next/model',
                     updated_at: expect.any(Number),
                     revision: session.revision + 1,
-                    agent_models: { demo: 'next/model' }
+                    agent_models: { general: 'next/model' }
                 }
             },
             headers: { 'X-Harness-Epoch': runtime.events.epoch, 'X-Harness-Revision': String(session.revision + 1) }
@@ -1884,7 +1876,7 @@ describe('canonical sessions', () => {
         // A reload reports the change, and no second session was made.
         const read = await call(runtime, 'GET', path);
         expect(read.body.session.model).toBe('next/model');
-        expect(read.body.session.agent_models).toEqual({ demo: 'next/model' });
+        expect(read.body.session.agent_models).toEqual({ general: 'next/model' });
         // Attribution of what the session was BUILT with did not move: the frozen copy carries no
         // override map, because the card had none.
         const definition = await call(runtime, 'GET', `${path}/definition`);
@@ -1901,7 +1893,7 @@ describe('canonical sessions', () => {
         const patch = (body: unknown) => call(runtime, 'PATCH', path, body);
 
         // camelCase is not an alias: the request field is `agent_models`.
-        expect(await patch({ agentModels: { demo: 'x' } })).toEqual({
+        expect(await patch({ agentModels: { general: 'x' } })).toEqual({
             status: 400,
             body: { error: { message: 'Unknown field "agentModels". Allowed fields: agent_models, title.' } }
         });
@@ -1910,19 +1902,19 @@ describe('canonical sessions', () => {
         // space is THIS session's harness.
         expect(await patch({ agent_models: { ghost: 'x' } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentModels` names "ghost", which is not a member of this harness. Members: demo.' } }
+            body: { error: { message: '`agentModels` names "ghost", which is not a member of this harness. Members: general.' } }
         });
-        expect(await patch({ agent_models: { demo: '   ' } })).toEqual({
+        expect(await patch({ agent_models: { general: '   ' } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentModels.demo` cannot be empty.' } }
+            body: { error: { message: '`agentModels.general` cannot be empty.' } }
         });
-        expect(await patch({ agent_models: { demo: 7 } })).toEqual({
+        expect(await patch({ agent_models: { general: 7 } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentModels.demo` must be a model id string.' } }
+            body: { error: { message: '`agentModels.general` must be a model id string.' } }
         });
-        expect(await patch({ agent_models: ['demo'] })).toEqual({
+        expect(await patch({ agent_models: ['general'] })).toEqual({
             status: 400,
-            body: { error: { message: '`agentModels` names "0", which is not a member of this harness. Members: demo.' } }
+            body: { error: { message: '`agentModels` names "0", which is not a member of this harness. Members: general.' } }
         });
         expect(await patch({ model: 'sneaky/model' })).toEqual({
             status: 400,
@@ -1932,7 +1924,7 @@ describe('canonical sessions', () => {
             status: 400,
             body: { error: { message: 'Unknown field "status". Allowed fields: agent_models, title.' } }
         });
-        expect(await patch({ agent_models: { demo: 'ok/model' }, harness: 'instruct' })).toEqual({
+        expect(await patch({ agent_models: { general: 'ok/model' }, harness: 'instruct' })).toEqual({
             status: 400,
             body: { error: { message: 'Unknown field "harness". Allowed fields: agent_models, title.' } }
         });
@@ -1952,7 +1944,7 @@ describe('canonical sessions', () => {
         // live map is unchanged (the store's replace-with-no-entries is a no-op).
         const emptyMap = await patch({ agent_models: {} });
         expect(emptyMap.status).toBe(200);
-        expect(emptyMap.body.session.agent_models).toEqual({ demo: 'demo-model' });
+        expect(emptyMap.body.session.agent_models).toEqual({ general: 'demo-model' });
 
         // Setting a rail label is the other writable field.
         const renamed = await patch({ title: 'Rail row' });
@@ -1966,7 +1958,7 @@ describe('canonical sessions', () => {
             // The 405 quotes the CONCRETE path the caller used (./api.ts:3870), not the template.
             body: { error: { message: `Use GET, PATCH, DELETE for /v1/harness/sessions/${session.id}.` } }
         });
-        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.sessionsBySessionId('missing'), { agent_models: { demo: 'ok/model' } })).toEqual({
+        expect(await call(runtime, 'PATCH', HARNESS_ROUTES.sessionsBySessionId('missing'), { agent_models: { general: 'ok/model' } })).toEqual({
             status: 404,
             body: { error: { message: 'Unknown session "missing".' } }
         });
@@ -1974,7 +1966,7 @@ describe('canonical sessions', () => {
         // Every rejection above left the live session untouched apart from the two accepted writes.
         const after = await call(runtime, 'GET', path);
         expect(after.body.session.model).toBe('demo-model');
-        expect(after.body.session.agent_models).toEqual({ demo: 'demo-model' });
+        expect(after.body.session.agent_models).toEqual({ general: 'demo-model' });
     });
 
     // The create body's `settings` block is the SAME snake_case contract as `POST /models`: the
@@ -2349,9 +2341,9 @@ describe('task submit and recorded history', () => {
         // Each `usage` EVENT is one request's own figures (the scripted numbers the old file
         // asserted off the SSE frames): 48/18/66, then 96/22/118, then 148/64/212.
         expect(state.events.filter((row) => row.event.type === 'usage').map((row) => row.event)).toEqual([
-            { type: 'usage', agent: 'demo', usage: { input: 48, output: 18, total: 66, cached: 0 }, thread: { id: '1' } },
-            { type: 'usage', agent: 'demo', usage: { input: 96, output: 22, total: 118, cached: 48 }, thread: { id: '1' } },
-            { type: 'usage', agent: 'demo', usage: { input: 148, output: 64, total: 212, cached: 120 }, thread: { id: '1' } }
+            { type: 'usage', agent: 'general', usage: { input: 48, output: 18, total: 66, cached: 0 }, thread: { id: '1' } },
+            { type: 'usage', agent: 'general', usage: { input: 96, output: 22, total: 118, cached: 48 }, thread: { id: '1' } },
+            { type: 'usage', agent: 'general', usage: { input: 148, output: 64, total: 212, cached: 120 }, thread: { id: '1' } }
         ]);
 
         // The scripted loop's discovery call, verbatim: the dispatcher must not reshape content.
@@ -2525,12 +2517,12 @@ describe('task submit and recorded history', () => {
             'threadId',
             'threadLabel'
         ]);
-        expect(section.agent).toBe('demo');
+        expect(section.agent).toBe('general');
         expect(section.role).toBe('primary');
         expect(section.state).toBe('done');
         expect(section.startedAt).toBeLessThan(section.endedAt);
         expect(section.model).toBe('demo-model');
-        expect(section.threadLabel).toBe('DO1');
+        expect(section.threadLabel).toBe('GL1');
         expect(section.id).toBe(`${state.turnId}:0`);
 
         // One context block: the segment with its recorded text, one hop from the tree.
@@ -2554,8 +2546,8 @@ describe('task submit and recorded history', () => {
         expect(block.sessionId).toBe(state.sessionId);
         expect(block.inPrompt).toBe(true);
         // The stored system segment IS the joined prompt, byte for byte.
-        expect(block.entries).toEqual([joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES)]);
-        expect(block.chars).toBe(joinedPrompt(DEMO_IDENTITY, DEMO_GUIDELINES).length);
+        expect(block.entries).toEqual([joinedPrompt(GENERAL_IDENTITY, GENERAL_GUIDELINES)]);
+        expect(block.chars).toBe(joinedPrompt(GENERAL_IDENTITY, GENERAL_GUIDELINES).length);
 
         // One step: the recorded tool_call ordinal paired with its result event - the two verbatim
         // rows behind a display step.
@@ -2580,7 +2572,7 @@ describe('task submit and recorded history', () => {
             at: expect.any(Number),
             event: {
                 type: 'tool_call',
-                agent: 'demo',
+                agent: 'general',
                 call: { id: 'call_tool_request_1', name: 'toolRequest', arguments: '{"tags":["time"]}' },
                 thread: { id: '1' }
             }
@@ -3152,7 +3144,7 @@ describe('manual tool execution', () => {
         // T1 shape of the SAME result (src/core/task.ts project + copyItem): every
         // record carries its content `rev` (1 on add) and the write attribution, and
         // the envelope carries the monotonic `storeRev`. An execution route runs as the
-        // session PRIMARY ("demo") with NO thread, so `updatedBy` is set and
+        // session PRIMARY ("general") with NO thread, so `updatedBy` is set and
         // `updatedThreadId` stays absent — never `undefined`.
         //
         // This file deliberately never pins the wall clock (unlike ./sessions.test.ts),
@@ -3167,7 +3159,7 @@ describe('manual tool execution', () => {
                         text: 'check bounds',
                         completed: false,
                         rev: 1,
-                        updatedBy: 'demo',
+                        updatedBy: 'general',
                         updatedAt: expect.any(String)
                     }
                 ],
@@ -3183,7 +3175,7 @@ describe('manual tool execution', () => {
                     text: 'check bounds',
                     completed: false,
                     rev: 1,
-                    updatedBy: 'demo',
+                    updatedBy: 'general',
                     updatedAt: expect.any(String)
                 }
             },
@@ -3210,7 +3202,7 @@ describe('manual tool execution', () => {
                         text: 'check bounds',
                         completed: false,
                         rev: 1,
-                        updatedBy: 'demo',
+                        updatedBy: 'general',
                         updatedAt: writtenAt
                     }
                 ],
@@ -3991,28 +3983,28 @@ describe('harness registry writes over HTTP', () => {
 
         // Blank text is a visible mistake: clearing an override is omitting the key (or sending
         // `{}`), never storing an empty prompt.
-        expect(await patch('demo', { agent_instructions: { demo: '   ' } })).toEqual({
+        expect(await patch('demo', { agent_instructions: { general: '   ' } })).toEqual({
             status: 400,
             body: {
                 error: {
-                    message: '`agentInstructions.demo` cannot be empty. Omit the key to run the trusted instruction.'
+                    message: '`agentInstructions.general` cannot be empty. Omit the key to run the trusted instruction.'
                 }
             }
         });
-        expect(await patch('demo', { agent_instructions: { demo: 'a'.repeat(8_001) } })).toEqual({
+        expect(await patch('demo', { agent_instructions: { general: 'a'.repeat(8_001) } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentInstructions.demo` cannot exceed 8000 characters.' } }
+            body: { error: { message: '`agentInstructions.general` cannot exceed 8000 characters.' } }
         });
-        expect(await patch('demo', { agent_instructions: { demo: 'bad\u0000model' } })).toEqual({
+        expect(await patch('demo', { agent_instructions: { general: 'bad\u0000model' } })).toEqual({
             status: 400,
-            body: { error: { message: '`agentInstructions.demo` contains control characters.' } }
+            body: { error: { message: '`agentInstructions.general` contains control characters.' } }
         });
 
         // Multi-line prose IS legitimate prompt text (a model id, by contrast, rejects a newline).
-        const accepted = await patch('demo', { agent_instructions: { demo: 'Lead with the answer.\nThen cite the file.' } });
+        const accepted = await patch('demo', { agent_instructions: { general: 'Lead with the answer.\nThen cite the file.' } });
         expect(accepted.status).toBe(200);
         expect(accepted.body.harness.instruction_summary).toEqual([
-            { agent: 'demo', source: 'harness', overridden: true, chars: 'Lead with the answer.\nThen cite the file.'.length }
+            { agent: 'general', source: 'harness', overridden: true, chars: 'Lead with the answer.\nThen cite the file.'.length }
         ]);
 
         // Models: members only, an object of strings, bounded non-empty ids - naming the agent.
@@ -4226,7 +4218,7 @@ describe('deleting a harness over HTTP', () => {
             200
         );
         expect(definition.definition.name).toBe('demo');
-        expect(definition.definition.title).toBe('Scripted demo');
+        expect(definition.definition.title).toBe('Scripted fixture');
 
         const turns = await listTurns(call_, session.id);
         expect(turns.items.map((row: any) => [row.promptPreview, row.status])).toEqual([['What time is it?', 'done']]);
@@ -4263,7 +4255,7 @@ describe('deleting a harness over HTTP', () => {
         try {
             await writeTextFile(blocker, 'not a directory', 'utf8');
 
-            const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+            const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
             const store = new SessionStore(SETTINGS, registry, undefined, {
                 persistence: new HarnessPersistence(join(blocker, 'nested'))
             });

@@ -5,12 +5,18 @@
 // the source of the system prompt, so adding a guideline cannot silently become
 // documentation that never reaches a model.
 //
-// ROSTER (seven real roles + the delegated summarizer + two fixtures), in picker order:
-//   general, instruct, research, workspace, reviewer, planner, debugger, summarizer,
-//   demo, flaky
+// ROSTER (seven real roles + the delegated summarizer), in picker order:
+//   general, instruct, research, workspace, reviewer, planner, debugger, summarizer
 // `general` leads because it is the DEFAULT entry point. Order is pinned so a new profile
 // is an explicit addition, and so the frontend colour palette (which assigns tones by this
 // order) only shifts on purpose.
+//
+// EVERY ENTRY IS A PRODUCTION ROLE. The roster used to end with the `demo` and `flaky`
+// FIXTURE profiles — a scripted transport's identity text and a retry example's. They are
+// deleted: an `AgentProfile` is a role a harness can select and a client can list, and a
+// test that needs an offline loop builds its own agent instead (see
+// ../server/harnesses/fixture-presets.test-support.ts). The two rows those profiles held in
+// `PROMPT_LENGTHS` and `SHARED_COMPOSITION` below are gone with them.
 //
 // IDS ARE STABLE, TITLES ARE NOT (regression pin). `research` → Explore, `workspace` →
 // Analyst and `planner` → Manager keep their registry ids, because the id is persisted in
@@ -77,10 +83,10 @@ import { presets } from '../server/harnesses/presets';
 // The exact error text a client sees for a bad id: the message lists the known set
 // in picker order, so this is also a roster pin.
 const KNOWN =
-    'general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky';
+    'general, instruct, research, workspace, reviewer, planner, debugger, summarizer';
 
-// The seven roles a picker offers as usable work, in roster order (the summarizer and the
-// two fixtures are not selectable entry points for a real task).
+// The seven roles a picker offers as usable work, in roster order (the summarizer is a
+// delegated condenser, not a selectable entry point for a real task).
 const REAL_ROLES = [general, instruct, research, workspace, reviewer, planner, debuggerAgent];
 
 // The exact identity sentence of each real role. `agentInstruction` puts this first,
@@ -161,9 +167,7 @@ const PROMPT_LENGTHS = [
     // 1690: the widest prompt on the roster, because the debugger composes every shared line
     // (web + delegation + discovery + toolCreate + permissions) on top of its own five bullets.
     { name: 'debugger', length: 1690 },
-    { name: 'summarizer', length: 141 },
-    { name: 'demo', length: 294 },
-    { name: 'flaky', length: 344 }
+    { name: 'summarizer', length: 141 }
 ];
 
 // Labels for the shared guideline lines (./guidelines.ts), keyed by the exact string so the
@@ -178,7 +182,7 @@ const SHARED_LABELS = new Map<string, string>([
 ]);
 
 // The shared lines a profile composes, in its own declared order. An empty array means the
-// profile composes none of them (the summarizer and the fixtures are self-contained).
+// profile composes none of them (only the summarizer is that self-contained).
 const sharedLinesOf = (profile: AgentProfile): string[] =>
     profile.guidelines
         .map((line) => SHARED_LABELS.get(line))
@@ -210,9 +214,9 @@ const SHARED_COMPOSITION = [
     // Order is the profile's own declared order, so this also pins that WEB_SEARCH sits ABOVE
     // DELEGATION for the debugger (it reads the web before it reads the team).
     { name: 'debugger', shared: ['WEB_SEARCH', 'DELEGATION', 'DISCOVERY', 'TOOL_CREATE', 'PERMISSIONS'] },
-    { name: 'summarizer', shared: [] },
-    { name: 'demo', shared: [] },
-    { name: 'flaky', shared: [] }
+    // The summarizer composes none of them: it is a two-sentence condenser with its own
+    // two bullets, and it runs on a brief, not on the tool policy of a primary.
+    { name: 'summarizer', shared: [] }
 ];
 
 // The shared guideline block a profile composes, exactly as `agentInstruction` renders
@@ -235,9 +239,7 @@ describe('agent profiles', () => {
             'reviewer',
             'planner',
             'debugger',
-            'summarizer',
-            'demo',
-            'flaky'
+            'summarizer'
         ]);
         expect(agentProfiles().map((profile) => profile.name)).toEqual([...AGENT_PROFILE_NAMES]);
     });
@@ -296,13 +298,11 @@ describe('agent profiles', () => {
             'Reviewer',
             'Manager',
             'Debugger',
-            'Summarizer',
-            'Demo',
-            'Flaky'
+            'Summarizer'
         ]);
         // One word = exactly one whitespace-separated token per title.
         expect(agentProfiles().map((profile) => profile.title.trim().split(/\s+/).length)).toEqual([
-            1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+            1, 1, 1, 1, 1, 1, 1, 1
         ]);
     });
 
@@ -690,7 +690,8 @@ describe('agentInstruction', () => {
             );
         }
 
-        // The same rule spelled out for one fixture, so a reworded fixture is a diff here.
+        // The same rule spelled out for the shortest profile, so a reworded summarizer is
+        // a diff here rather than a silent change to what `textSummarize` delegates.
         expect(agentInstruction(summarizer)).toBe(
             'You compress technical notes into at most two sentences.\n\n' +
             'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'

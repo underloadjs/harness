@@ -23,7 +23,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { fileURLToPath } from 'node:url';
 import { createHarnessRegistry } from '../harnesses';
-import { ALL_PRESET_TEMPLATES } from '../harnesses/presets.ts';
+import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
 import type { ServerRuntimeConfiguration } from '../config';
 import type { LaneAuthority } from './lane-authority';
@@ -31,6 +31,7 @@ import type { SessionSnapshot, SessionTurn } from '../protocol';
 import { SessionStore } from '../sessions';
 import type { LaneHost } from './lane-host';
 import { buildTestWorkerEntry } from './worker-test-build.test-support';
+import { startScriptedProvider } from './provider-stub.test-support';
 
 // S9: a `.ts` entry is source mode (./lane-host.ts `resolveEntry`). Without this the host
 // prefers `dist/underload-harness.worker.mjs`, and every assertion below would be about a
@@ -54,16 +55,25 @@ const WORKER_RUNTIME: ServerRuntimeConfiguration = {
     workerHandshakeMs: 120_000
 };
 
-const SETTINGS = { baseURL: 'http://localhost:9/v1', apiKey: '', model: 'demo' };
+// WHY A PROVIDER IS NEEDED HERE NOW: a lane rebuilds the session's harness from the preset
+// RECORD, which works only for a template-backed factory. The scripted fixture's factory is a
+// closure over a stream function and cannot cross `worker_threads`, so the lane suites run a
+// LIVE preset (`general`) against a loopback provider that answers like the old script — a tool
+// round, then an answer quoting the tool result. See ./provider-stub.test-support.ts for why the
+// pacing of that stub is load-bearing rather than cosmetic.
+const provider = await startScriptedProvider();
+
+const SETTINGS = { baseURL: `${provider.origin}/v1`, apiKey: '', model: 'stub/model' };
 
 const stores: SessionStore[] = [];
 
-// `demo` is the shipped SCRIPTED preset: no provider, and its durable template record is what
-// a worker rebuilds, so every turn below is a real lane turn with a deterministic answer.
+// `general` is a shipped LIVE preset: its durable template record is what a worker rebuilds, so
+// every turn below is a real lane turn, and its answer is deterministic because the provider
+// above is scripted.
 const storeOf = (overrides: Partial<ServerRuntimeConfiguration> = {}): SessionStore => {
     const store = new SessionStore(
         SETTINGS,
-        createHarnessRegistry(ALL_PRESET_TEMPLATES as never),
+        createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never),
         undefined,
         { runtime: { ...WORKER_RUNTIME, ...overrides } }
     );
@@ -77,6 +87,8 @@ afterAll(async () => {
     for (const store of stores) store.dispose();
 
     await new Promise((resolve) => setTimeout(resolve, 250));
+
+    await provider.close();
 
     BUILT_TEST_WORKER?.dispose();
 });
@@ -191,7 +203,7 @@ const waitAuthorityIdle = async (
 describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => {
     it('runs eight turns of one conversation, reclaiming its lane every time, and centralises all of them', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         let threadId: string | undefined;
 
@@ -244,7 +256,7 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
 
     it('picks up a message another lane sent while this conversation was idle (T10 M4)', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const first = await store.dispatch(session.id, 'first correctness turn');
         const threadId = first.turn.threadId as string;
@@ -268,7 +280,7 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
         // replica), which is what keeps `threadSend` out of the nested-run doors.
         expect(sent?.delivered).toBe('started');
 
-        // `threadSend` records the SENDER inside the delivered text (`from agent "demo": ...`),
+        // `threadSend` records the SENDER inside the delivered text (`from agent "general": ...`),
         // so the sibling entry is matched by its payload; the lane's own prompts are matched
         // exactly. What matters here is that canonical ran ahead of the replica by exactly one
         // USER message while the lane was idle — the answer of the turn that message started
@@ -310,7 +322,7 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
 
     it('answers a cross-thread read from canonical state the lane never created (T10 S1)', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const submit = await store.dispatch(session.id, 'reader turn');
         const ownThread = submit.turn.threadId as string;
@@ -346,8 +358,8 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
 describe('worker mode: the lane worker bound and shutdown (T10 M8/M9)', () => {
     it('never runs more live lane workers than maxLaneWorkers, and the evicted lane still works', async () => {
         const store = storeOf({ maxLaneWorkers: 1 });
-        const first = await store.create('demo');
-        const second = await store.create('demo');
+        const first = await store.create('general');
+        const second = await store.create('general');
 
         const firstTurn = await store.dispatch(first.id, 'bounded turn one');
 
@@ -375,7 +387,7 @@ describe('worker mode: the lane worker bound and shutdown (T10 M8/M9)', () => {
 
     it('settles an in-flight turn when the host closes, instead of hanging (T10 M8)', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const submit = await store.dispatch(session.id, 'turn closed mid-flight');
 

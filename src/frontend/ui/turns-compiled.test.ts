@@ -20,7 +20,7 @@
 
 import type { SessionView } from '../../server/protocol';
 import type { HarnessPendingTool } from '../../types';
-import type { TurnDisplayOp, TurnSummary, DisplayStep, TurnSection, TurnDisplay } from '../../shared/turn-display';
+import type { TurnDisplayOp, TurnSummary, DisplayStep, TurnSection, TurnDisplay, DisplayTextNode } from '../../shared/turn-display';
 import type { TurnStepDetail } from '../../shared/turn-display';
 import type { TurnBoard } from './turns';
 import { createTurnBoard } from './turns';
@@ -1064,5 +1064,87 @@ describe('the delegated row clock (R9)', () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// V1 — an applied document that changed NOTHING must not re-render anything.
+// ---------------------------------------------------------------------------
+//
+// What this pins (review finding V1, the last R4 design bullet): every applied document hands
+// each loaded tile its display tree again (`reconcileView` → `syncDisplay`, turns.ts:9739), and
+// the poll carry (./main.ts `carryDisplays`) re-applies an UNCHANGED tree once a second while
+// work is pending. That node-level reconcile is idempotent but not free: a COMMITTED text node
+// takes the ungated branch of `syncCompiledNode` (turns.ts:7966) → `renderText` → `paintProse`
+// (turns.ts:5472) → `replaceChildren(markdownFragment(text))`. Before the fingerprint gate
+// (turns.ts:779 `displaySignatureOf`) a polling session re-parsed every loaded tile's Markdown
+// every second, and the reader's live text selection died with each replaced fragment.
+//
+// Both directions are pinned, in order: the skip must FIRE for an unchanged tree, and it must
+// never fire for a changed one — including a tree that was mutated IN PLACE, which is exactly
+// what a stream frame does to this very object (../view-state.ts:396 `sections.push`, :443
+// `node.text += op.delta`, :509 `sections.splice`). That is why the gate is structural and not
+// a reference check.
+
+describe('an unchanged applied tree does not re-render (V1)', () => {
+    it('keeps every parsed Markdown node for an unchanged tree, and re-renders as soon as the tree moves', () => {
+        // One committed prose node, painted through the real Markdown path, so the parsed
+        // <strong> is an object whose identity answers "did `paintProse` run again?".
+        const node: DisplayTextNode = { kind: 'text', id: 'n0', text: 'first **answer**', committed: true };
+        const section = rootSection({ state: 'done', nodes: [node] });
+        const row = summary({ status: 'done', state: 'done', updatedAt: T + 1000 });
+        const view = documentOf([row], { t1: [section] });
+        const { board } = mount();
+        const tile = board.upsertView(row, view);
+
+        tile.flush();
+
+        const prose = tile.element.querySelector<HTMLElement>('.agent-text');
+
+        if (prose === null) throw new Error('the committed prose node was never painted');
+
+        const strong = prose.querySelector('strong');
+
+        expect(strong).not.toBeNull();
+        // The block renderer ends a paragraph with a recorded newline (the same figure the
+        // live-path assertions in this file pin, e.g. 'root answer\n' at :257).
+        expect(prose.textContent).toBe('first answer\n');
+
+        // --- phase 1: the steady-state poll tick --------------------------------------
+        // The same document, re-applied: the same rows and the same tree, which is what
+        // `carryDisplays` hands the board on every tick of a conversation that has not moved.
+        board.reconcileView(view);
+        tile.flush();
+
+        // Identity, not content: the element the first parse created is still the element on
+        // screen. If the node-level pass had run, `paintProse` would have replaced the whole
+        // fragment and this reference would name a different object.
+        expect(prose.querySelector('strong')).toBe(strong);
+        expect(prose.textContent).toBe('first answer\n');
+        expect(tile.element.querySelector('.tile-status-text')?.textContent).toBe('done');
+
+        // --- phase 2: the tree moved IN PLACE -----------------------------------------
+        // A stream frame mutating the painted object (../view-state.ts:443). A reference
+        // skip would freeze the tile right here; the fingerprint sees the new bytes.
+        node.text = 'first **answer** **again**';
+        board.reconcileView(view);
+        tile.flush();
+
+        expect(prose.querySelector('strong')).not.toBe(strong);
+        expect(prose.textContent).toBe('first answer again\n');
+
+        // --- phase 3: a FRESH tree object for the same turn ----------------------------
+        // The plane's re-read path (./view-shell.ts `ensureVisible` installs a new object):
+        // different reference AND different content, so the tile advances while the block's
+        // own DOM survives — a re-render is not a rebuild.
+        const fresh = documentOf([row], {
+            t1: [rootSection({ state: 'done', nodes: [{ kind: 'text', id: 'n0', text: 'a **different** answer', committed: true }] })]
+        });
+
+        board.reconcileView(fresh);
+        tile.flush();
+
+        expect(tile.element.querySelector('.agent-text')).toBe(prose);
+        expect(prose.textContent).toBe('a different answer\n');
     });
 });

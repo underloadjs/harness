@@ -157,7 +157,7 @@ await check('createHarnessRuntime persists a session under the requested root', 
         method: 'POST',
         pathname: '/v1/harness/sessions',
         mount: '/v1/harness',
-        readBody: async () => ({ harness: 'demo' })
+        readBody: async () => ({ harness: 'general' })
     });
     assert(created.kind === 'json' && created.status === 201, 'the runtime API did not create a session');
 
@@ -193,16 +193,20 @@ try {
         assert(harnesses.status === 200, `/api/harnesses returned ${harnesses.status}`);
 
         const names = index.harnesses.map((entry) => entry.name);
-        assert(names.includes('demo'), 'the demo preset is missing from the harness index');
+        // `general` is the shipped default card (../src/server/harnesses/presets.ts). The
+        // scripted `demo` and the `flaky` example presets are deleted, so the built index
+        // lists ONLY production cards — asserting one of those two names here would be the
+        // package check re-adding the example tier the product just removed.
+        assert(names.includes('general'), 'the general preset is missing from the harness index');
 
         const session = await fetch(`${handle.url}/api/sessions`, {
             method: 'POST',
             headers: { ...CLIENT, 'content-type': 'application/json' },
-            body: JSON.stringify({ harness: 'demo' })
+            body: JSON.stringify({ harness: 'general' })
         });
         const sessionBody = await session.json();
         assert(session.status === 201, `/api/sessions returned ${session.status}`);
-        assert(sessionBody.session?.harness === 'demo', 'the created session is not the demo harness');
+        assert(sessionBody.session?.harness === 'general', 'the created session is not the general harness');
 
         return { url: handle.url, presets: names.length, session: session.status };
     });
@@ -310,7 +314,7 @@ await check('the built io-worker commits, journals and fences off-thread', async
                 kind: 'journal.append',
                 callId: 3,
                 target: { root: ioDirectory, sessionId: ioSession },
-                record: { turnId: 'turn-1', index: 0, at: 1_700_000_000_001, event: { type: 'text', agent: 'demo', delta: 'from the built bundle' } }
+                record: { turnId: 'turn-1', index: 0, at: 1_700_000_000_001, event: { type: 'text', agent: 'general', delta: 'from the built bundle' } }
             },
             { kind: 'journal.flush', callId: 4, target: { root: ioDirectory, sessionId: ioSession } }
         ]) {

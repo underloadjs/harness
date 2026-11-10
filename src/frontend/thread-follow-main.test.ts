@@ -621,15 +621,18 @@ it('reconciles every open pane after a reconnect whose replay window expired, wi
     // was mid-flight when the socket died would keep rendering its pre-outage tree forever.
     const treeReadsAfter = stub.canonical.filter((entry) => entry === 'GET /v1/harness/sessions/s1/turns/turn-1/display');
 
-    // Three re-reads of the opened tile's tree: one when the flow breaks (the tree cache is
-    // dropped, so the visible row refetches), one after the window reconcile, and one for
-    // the re-registered `turn` subscription's fresh baseline — which names no `revisions`,
-    // so the shell cannot prove its tree is covered by it and re-reads (the reconciliation
-    // anchor rule of ./stream.ts, rule 4). The third appeared when the socket double started
-    // answering EVERY subscribe the way the server does (./view-test-support.ts); the
-    // session window above is still re-read exactly ONCE, so the loss still costs one
-    // reconcile per resource, not one per frame.
-    expect(treeReadsAfter.length - treeReadsBeforeDrop).toBe(3);
+    // TWO re-reads of the opened tile's tree: one when the flow breaks (the tree cache is
+    // dropped, so the visible row refetches) and one for the re-registered `turn`
+    // subscription's fresh baseline — which names no `revisions`, so the shell cannot prove
+    // its tree is covered by it and re-reads (the reconciliation anchor rule of ./stream.ts,
+    // rule 4). The THIRD identical read this case used to count is gone by design: the window
+    // reconcile and the turn baseline land in the same tick, and `reloadTurnTree` now refuses
+    // to stack a read of a turn whose read is already in flight (R2 — one loss, one read per
+    // resource). Sequential re-reads still happen: the guard is released as soon as an answer
+    // lands, which is what keeps a later freshness re-read after a real reconnect intact. The
+    // session window above is still re-read exactly ONCE, so the loss still costs one reconcile
+    // per resource, not one per frame.
+    expect(treeReadsAfter.length - treeReadsBeforeDrop).toBe(2);
 
     // 3. the rows reconcile with it: the turn the server added during the outage is on
     //    screen, in recorded order, and the reader pressed NOTHING to get it.

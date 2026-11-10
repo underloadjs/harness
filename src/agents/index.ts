@@ -6,17 +6,23 @@
 // same profiles. A client never supplies instruction text.
 //
 // Order matters: the first entries are the real specialist roles a picker should
-// show first, followed by the delegated summarizer, then the two fixtures. Tests
-// pin the order, so a new profile is an explicit addition rather than an accident
-// of object key ordering.
+// show first, followed by the delegated summarizer. Tests pin the order, so a new
+// profile is an explicit addition rather than an accident of object key ordering.
 //
 // ROSTER (T3 + the role-contract pass): the seven real roles are general (the DEFAULT,
 // works alone), instruct (worker that delegates only context-burning steps), research
 // (title Explore — read-only investigator), workspace (title Analyst — the implementor),
 // reviewer (strict independent judge), planner (title Manager — orchestrates, never works)
 // and debugger (stress-tests everything). `summarizer` stays as the delegated condenser the
-// `textSummarize` tool looks for by id, and `demo`/`flaky` stay as fixtures — they are
-// examples, never a headline choice.
+// `textSummarize` tool looks for by id.
+//
+// EVERY ENTRY IS A PRODUCTION ROLE. The roster used to end with two FIXTURES — `demo`
+// (the scripted offline transport) and `flaky` (the `testFlaky` retry example). They are
+// gone: a registry entry is a role a user can pick and a harness can select, and neither
+// of those was a usable configuration — one never called a model, the other existed to
+// throw. A test or a host that wants an offline loop or an extra-tool harness now builds
+// its own agent and preset locally (see the note in ../server/harnesses/presets.ts), which
+// is where a fixture belongs. `isAgentProfileName`/`agentProfile` therefore reject both ids.
 //
 // IDS ARE STABLE, TITLES ARE NOT. `research`/`workspace`/`planner` keep their registry ids
 // while their display titles moved to Explore/Analyst/Manager, because the id is persisted
@@ -43,8 +49,6 @@ import { planner } from './planner';
 // registry id; the id lives in the profile's `name` field and in the key below.
 import { debuggerAgent } from './debugger';
 import { summarizer } from './summarizer';
-import { demo } from './demo';
-import { flaky } from './flaky';
 
 export type { AgentProfile } from './types';
 
@@ -58,18 +62,16 @@ export const AGENT_PROFILES = {
     reviewer,
     planner,
     debugger: debuggerAgent,
-    summarizer,
-    demo,
-    flaky
+    summarizer
 } as const satisfies Record<string, AgentProfile>;
 
 export type AgentProfileName = keyof typeof AGENT_PROFILES;
 
 // Display/selection order. Kept separate from the object so a reordering never
 // changes ids, and so a caller can iterate without relying on insertion order.
-// Real roles first (in preset order, DEFAULT FIRST), then the summarizer/fixtures: a
+// Real roles first (in preset order, DEFAULT FIRST), then the summarizer: a
 // picker that renders this list therefore offers the seven usable roles before the
-// examples. `general` leads because it is the default entry point (see
+// delegated condenser. `general` leads because it is the default entry point (see
 // DEFAULT_CLI_PRESET in ../server/cli/options.ts and the card order in
 // ../server/harnesses/presets.ts).
 //
@@ -83,9 +85,7 @@ export const AGENT_PROFILE_NAMES: readonly AgentProfileName[] = [
     'reviewer',
     'planner',
     'debugger',
-    'summarizer',
-    'demo',
-    'flaky'
+    'summarizer'
 ];
 
 // Every profile, in `AGENT_PROFILE_NAMES` order.

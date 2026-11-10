@@ -1848,8 +1848,10 @@ paths:
         inside the team the record already carries, so the write is accepted on every template. Whether it then
         survives a restart is the template's answer, not this route's promise: a `live` or `flaky` session
         rebuilds from its own saved team, so the text comes back exactly as written; a `scripted` session replays
-        the shipped factory, which ignores the saved team, so the override is live immediately and reverts to the
-        shipped prompt at the next restart; and a template-less (injected) preset restores only while its registry
+        the factory its host injected, which ignores the saved team, so the override is live immediately and
+        reverts to that factory's own prompt at the next restart (and with no scripted card shipped, such a
+        record restores only while the host still injects a matching scripted preset - otherwise the session is
+        dropped at restore with a named error); and a template-less (injected) preset restores only while its registry
         entry still matches the saved record, which a fresh override by definition changes - such a session is
         dropped at restore with a named error rather than quietly repainted. What DOES answer 409 here is the idle
         gate - a live run or any queued work in this session,
@@ -4271,7 +4273,7 @@ components:
           type: string
         requires_endpoint:
           type: boolean
-          description: False only for a scripted definition that needs no provider base URL.
+          description: False only for a scripted definition, which needs no provider base URL; no shipped card is endpoint-free.
         primary:
           type: string
           description: The entry agent, and the agent an unfocused submit opens a conversation for.

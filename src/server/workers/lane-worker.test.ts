@@ -37,7 +37,7 @@ import { createHarnessRegistry } from '../harnesses';
 // The built-in task collection SPEC, which a persisted collection block carries beside its
 // entries (Decision M) — so the expectation below names it instead of spelling it out.
 import { TASKS_COLLECTION } from '../../core';
-import { ALL_PRESET_TEMPLATES } from '../harnesses/presets.ts';
+import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { SHARED_APP_TOOL_SOURCES } from '../harnesses/toolbox';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
 import type { ServerRuntimeConfiguration } from '../config';
@@ -66,6 +66,7 @@ import {
     nestedRunRefusalMessage
 } from './capability';
 import { buildTestWorkerEntry } from './worker-test-build.test-support';
+import { startScriptedProvider } from './provider-stub.test-support';
 
 // A cold lane builds the harness, recompiles the created-tool sources and restores the
 // snapshot: measured at ~1.6 s on this machine, so the handshake bound is generous and the
@@ -98,7 +99,15 @@ const WORKER_RUNTIME: ServerRuntimeConfiguration = {
     workerHandshakeMs: 120_000
 };
 
-const SETTINGS = { baseURL: 'http://localhost:9/v1', apiKey: '', model: 'demo' };
+// WHY A PROVIDER IS NEEDED HERE NOW: a lane rebuilds the session's harness from the preset
+// RECORD, which works only for a template-backed factory. The scripted fixture's factory is a
+// closure over a stream function and cannot cross `worker_threads`, so this suite runs a LIVE
+// preset (`general`) against a loopback provider that answers like the old script — a tool
+// round, then an answer quoting the tool result. See ./provider-stub.test-support.ts for why the
+// pacing of that stub is load-bearing rather than cosmetic.
+const provider = await startScriptedProvider();
+
+const SETTINGS = { baseURL: `${provider.origin}/v1`, apiKey: '', model: 'stub/model' };
 
 const stores: SessionStore[] = [];
 
@@ -120,12 +129,12 @@ const tempRoot = (label: string): string => {
 };
 
 const storeOf = (): SessionStore => {
-    // `demo` is the shipped SCRIPTED preset: it needs no provider, and its durable template
-    // record is what a worker rebuilds (`presetFromRecord`), which is the whole point of the
-    // capability gate.
+    // `general` is a shipped LIVE preset: its durable template record is what a worker rebuilds
+    // (`presetFromRecord`), which is the whole point of the capability gate. The turns below are
+    // deterministic because the provider above is scripted.
     const store = new SessionStore(
         SETTINGS,
-        createHarnessRegistry(ALL_PRESET_TEMPLATES as never),
+        createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never),
         undefined,
         { runtime: WORKER_RUNTIME }
     );
@@ -141,6 +150,8 @@ afterAll(async () => {
     // Give every terminate() a tick to land, so a closing vitest pool cannot race a live
     // worker (a leaked worker would keep the process alive, which is its own failure).
     await new Promise((resolve) => setTimeout(resolve, 250));
+
+    await provider.close();
 
     BUILT_TEST_WORKER?.dispose();
 
@@ -225,7 +236,7 @@ const BURN_SOURCE = `
 describe('worker mode: a turn runs on its own lane', () => {
     it('executes two conversations concurrently and keeps this process responsive', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const a = await store.dispatch(session.id, 'what time is it?');
         const b = await store.dispatch(session.id, 'and once more');
@@ -267,7 +278,7 @@ describe('worker mode: a turn runs on its own lane', () => {
         expect(turnA.events.length).toBeGreaterThan(0);
         expect(turnB.events.length).toBeGreaterThan(0);
 
-        // Both turns really did work: two scripted demo turns each stream a full discovery +
+        // Both turns really did work: two stubbed turns each stream a full discovery +
         // tool + answer loop, and the wall clock stayed in the same order as ONE turn plus
         // cold starts (a serial pair would be roughly double).
         const elapsed = Date.now() - startedAt;
@@ -313,8 +324,8 @@ describe('worker mode: a turn runs on its own lane', () => {
 
     it('burns CPU on one lane while another session and the event loop keep moving', async () => {
         const store = storeOf();
-        const burner = await store.create('demo');
-        const sibling = await store.create('demo');
+        const burner = await store.create('general');
+        const sibling = await store.create('general');
 
         // The CPU-heavy tool is registered through a LANE (a routed `toolCreate`), so the
         // burn body exists in the replica through the authority's registry broadcast rather
@@ -440,7 +451,7 @@ describe('worker mode: shared state is central, not local', () => {
 
     it('writes a task through one lane and reads it back on a rebuilt lane', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const added = (await store.callTool(session.id, 'tasks', {
             tasks: [{ text: 'written from a lane' }]
@@ -457,7 +468,7 @@ describe('worker mode: shared state is central, not local', () => {
                     text: 'written from a lane',
                     completed: false,
                     rev: 1,
-                    updatedBy: 'demo',
+                    updatedBy: 'general',
                     updatedAt: stampOf(added?.tasks?.[0])
                 }
             ],
@@ -471,7 +482,7 @@ describe('worker mode: shared state is central, not local', () => {
                 text: 'written from a lane',
                 completed: false,
                 rev: 1,
-                updatedBy: 'demo',
+                updatedBy: 'general',
                 updatedAt: stampOf(added?.tasks?.[0])
             }
         });
@@ -521,12 +532,12 @@ describe('worker mode: shared state is central, not local', () => {
                     text: 'written from a lane',
                     completed: false,
                     rev: 1,
-                    updatedBy: 'demo',
+                    updatedBy: 'general',
                     updatedAt: stamp
                 }
             ],
             storeRev: 1,
-            changes: [{ rev: 1, id: '1', op: 'add', by: 'demo', at: stamp, itemRev: 1 }]
+            changes: [{ rev: 1, id: '1', op: 'add', by: 'general', at: stamp, itemRev: 1 }]
         });
         // The id counter is the STORE's, not the collection's (F3): one range mints ids
         // for every collection, so it lives beside the map rather than inside it.
@@ -535,7 +546,7 @@ describe('worker mode: shared state is central, not local', () => {
 
     it('sends across threads from a lane and reads the roster from the authority', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const submit = await store.dispatch(session.id, 'first');
         const target = submit.turn.threadId as string;
@@ -557,7 +568,7 @@ describe('worker mode: shared state is central, not local', () => {
         // rather than the old inert `appended`. Routing and non-blocking behaviour are
         // unchanged, which is what keeps `threadSend` an authority-routed operation
         // instead of a nested-run door (./capability.ts).
-        expect(sent).toEqual({ threadId: target, delivered: 'started', sender: 'demo' });
+        expect(sent).toEqual({ threadId: target, delivered: 'started', sender: 'general' });
 
         const roster = (await store.callTool(session.id, 'threadList', {})) as {
             threads: { id: string; origin?: string; status: string }[];
@@ -588,7 +599,7 @@ describe('worker mode: shared state is central, not local', () => {
 describe('worker mode: stop and crash have no late effects', () => {
     it('settles a cancelled lane run as cancelled and stops recording', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const submit = await store.dispatch(session.id, 'long enough to stop');
 
@@ -620,7 +631,7 @@ describe('worker mode: stop and crash have no late effects', () => {
 
     it('fails a turn whose worker disappears, and refuses that lane forever after', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const submit = await store.dispatch(session.id, 'turn whose worker dies');
         const target = submit.turn.threadId as string;
@@ -683,7 +694,7 @@ describe('worker mode: a stopped conversation resumes IN PLACE', () => {
     // stop is a pure backlog drop with no run to mirror the status away again.
     it('re-runs the interrupted row on a lane under the SAME turn id, with no second row', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         // Hold the gate first (a cold operator lane makes this window comfortably long), then
         // submit: the row is accepted, queued in its own lane, and never starts.
@@ -793,7 +804,7 @@ describe('worker mode: nested conversation state is refused, not faked (T12 / S7
     // ./lane-worker-loop.ts `sayHello` builds), because the promise is about the replica's
     // registry and its runtime route - not about a sentence in a document.
     it('removes the nested-run tools and closes harness.runtime.delegate', () => {
-        const preset = ALL_PRESET_TEMPLATES.find((candidate) => candidate.name === 'research');
+        const preset = PRODUCTION_WITH_FIXTURES.find((candidate) => candidate.name === 'research');
 
         expect(preset?.name).toBe('research');
 
@@ -848,7 +859,7 @@ export const execute = async (context) => {
         ((((instance.snapshot() as { threads?: { id: string }[] }).threads ?? []) as { id: string }[]).map((record) => record.id).sort());
 
     const researchReplica = (): Harness => {
-        const preset = ALL_PRESET_TEMPLATES.find((candidate) => candidate.name === 'research');
+        const preset = PRODUCTION_WITH_FIXTURES.find((candidate) => candidate.name === 'research');
 
         expect(preset?.name).toBe('research');
 
@@ -967,7 +978,7 @@ export const execute = async (context) => {
         };
 
         for (const presetName of ['instruct', 'research']) {
-            const preset = ALL_PRESET_TEMPLATES.find((candidate) => candidate.name === presetName);
+            const preset = PRODUCTION_WITH_FIXTURES.find((candidate) => candidate.name === presetName);
 
             expect(preset?.name).toBe(presetName);
 
@@ -1089,7 +1100,7 @@ export const execute = async (context) => {
 describe('worker mode: a steer is reported from the lane receipt, not the post (T12)', () => {
     it('refuses a steer for a conversation no lane owns, instead of claiming a queue', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         // The host exists only once a worker-mode dispatch has started the pump, so the turn
         // below is what makes `hostReady` answer at all.
@@ -1108,7 +1119,7 @@ describe('worker mode: a steer is reported from the lane receipt, not the post (
 
     it('lands a focused submit in exactly one record - the one the response names', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
         const run = await store.dispatch(session.id, 'open a conversation that keeps the lane busy');
         const threadId = run.turn.threadId ?? '';
         const lanes = await hostReady(store);
@@ -1310,14 +1321,14 @@ describe('worker mode: an in-place lane commit becomes canonical state, is saved
         // NOTE the argument order: the THIRD positional is the harness describer (an injected
         // `describeHarness`), and persistence is an OPTION (../sessions.ts
         // `SessionStoreOptions.persistence`) — ../persistence.test.ts uses the same shape.
-        const store = new SessionStore(SETTINGS, createHarnessRegistry(ALL_PRESET_TEMPLATES as never), undefined, {
+        const store = new SessionStore(SETTINGS, createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never), undefined, {
             persistence: new HarnessPersistence(root),
             runtime: WORKER_RUNTIME
         });
 
         stores.push(store);
 
-        const session = await store.create('demo');
+        const session = await store.create('general');
         const run = await store.dispatch(session.id, 'the turn that will be edited later');
         const turn = await settle(store, session.id, run.turn.id);
 
@@ -1388,7 +1399,7 @@ describe('worker mode: an in-place lane commit becomes canonical state, is saved
         //    process that wrote it. A store does not read its own document by itself (the host
         //    loads and validates it, then hands it in as `options.database`, which is what
         //    ./runtime.ts does on boot), so the restart is spelled the same way here.
-        const restarted = new SessionStore(SETTINGS, createHarnessRegistry(ALL_PRESET_TEMPLATES as never), undefined, {
+        const restarted = new SessionStore(SETTINGS, createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never), undefined, {
             persistence: new HarnessPersistence(root),
             database: new HarnessPersistence(root).load() ?? undefined,
             runtime: WORKER_RUNTIME
@@ -1441,7 +1452,7 @@ describe('worker mode: the record route is the only door (T1/T7)', () => {
 
     it('writes through every record surface and reads the canonical store back', async () => {
         const store = storeOf();
-        const session = await store.create('demo');
+        const session = await store.create('general');
 
         const CASES: Array<{ tool: string; parameters: Record<string, unknown>; key: string }> = [
             { tool: 'tasks', parameters: { tasks: [{ text: 'from the plan' }] }, key: 'tasks' },
@@ -1480,8 +1491,8 @@ describe('worker mode: the record route is the only door (T1/T7)', () => {
         expect((canonical?.collections.locations.items ?? []).map((item) => item.id)).toEqual(['4']);
 
         // Attribution is the coordinator's answer too: a manual call carries the session's
-        // primary and no conversation, so the record names `demo` and carries no thread.
-        expect(canonical?.collections.tasks.items[0]).toMatchObject({ updatedBy: 'demo' });
+        // primary and no conversation, so the record names `general` and carries no thread.
+        expect(canonical?.collections.tasks.items[0]).toMatchObject({ updatedBy: 'general' });
         expect('updatedThreadId' in (canonical?.collections.tasks.items[0] ?? {})).toBe(false);
     }, 180_000);
 

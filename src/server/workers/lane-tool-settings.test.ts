@@ -47,10 +47,12 @@
 // shared toolbox every live preset and every live lane is built from, AND it has a live
 // transport - so the request the replica sends arrives at a loopback stub as BYTES, which is
 // where a declaration list and a plugin's context decision stop being internal state. The
-// scripted `demo` factory builds its own `harness({...})` and had to be taught to forward
-// `toolSettings`/`pluginSettings` at all (../harnesses/presets.ts); it is pinned separately,
-// inline AND on a lane, because every lane integration test in this folder runs on that preset
-// and a switch the shipped fixture ignores is a switch an operator cannot see working.
+// scripted `demo` fixture builds its own `harness({...})` and had to be taught to forward
+// `toolSettings`/`pluginSettings` at all (../harnesses/fixture-presets.test-support.ts), so its
+// INLINE half is pinned separately below. Its LANE half is proven on `flaky` instead: a scripted
+// factory is a closure over a stream function, and the worker rebuilds a harness with
+// `presetFromRecord(blueprint.record)` - no fallback object can cross `worker_threads` - so a
+// scripted session is refused on a lane by construction (./provider-stub.test-support.ts).
 //
 // Cross-references:
 //   - ./protocol.ts                   `LaneBlueprint.disabledTools` / `.pluginSettings`
@@ -74,7 +76,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import { createHarnessRegistry, presetFromRecord } from '../harnesses';
 import { presetToRecord } from '../harnesses/registry';
-import { ALL_PRESET_TEMPLATES } from '../harnesses/presets';
+import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
 import type { ServerRuntimeConfiguration } from '../config';
 import { SessionStore } from '../sessions';
@@ -100,7 +102,7 @@ const SETTINGS: RunnerSettings = { baseURL: 'http://localhost:9/v1', apiKey: 'te
 const stores: SessionStore[] = [];
 
 const storeOf = (): SessionStore => {
-    const store = new SessionStore(SETTINGS, createHarnessRegistry(ALL_PRESET_TEMPLATES as never), undefined, {
+    const store = new SessionStore(SETTINGS, createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never), undefined, {
         runtime: WORKER_RUNTIME
     });
 
@@ -336,7 +338,7 @@ describe('R3 lane propagation: the harness the lane builds consults the snapshot
     // factory, and that factory is `createToolboxHarness` - the one place a report's
     // `toolSettings` becomes `HarnessConfiguration.toolSettings` (../harnesses/toolbox.ts).
     const flakyRecord = (): ReturnType<typeof presetToRecord> => {
-        const preset = createHarnessRegistry(ALL_PRESET_TEMPLATES as never).find('flaky');
+        const preset = createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never).find('flaky');
 
         if (preset === undefined) throw new Error('The flaky fixture preset is not shipped in this build.');
 
@@ -438,17 +440,18 @@ describe('R3 lane propagation: the harness the lane builds consults the snapshot
 // ---------------------------------------------------------------------------
 
 describe('R3 parity: the scripted demo factory forwards both deployment-wide switches', () => {
-    // The demo's factory builds the harness directly (../harnesses/presets.ts), so it is the
-    // one preset whose own forwarding has to be pinned: until it forwarded
-    // `report.toolSettings`/`report.pluginSettings`, a demo session - INLINE or on a LANE -
-    // ignored the operator's switches entirely, and every lane integration test in this
-    // folder runs on that preset.
+    // The fixture's factory builds the harness directly (../harnesses/fixture-presets.ts
+    // support), so it is the one preset whose own forwarding has to be pinned: until it
+    // forwarded `report.toolSettings`/`report.pluginSettings`, a demo session ignored the
+    // operator's switches entirely. `fallback` is load-bearing here: a scripted record cannot
+    // be rebuilt from durable data alone in a build that ships no scripted preset, so the
+    // registry's current entry for that name IS the factory (../harnesses/registry.ts).
     const demoReplica = (report: { toolSettings?: ReturnType<typeof laneToolSettingsProvider>; pluginSettings?: HarnessPluginSettingsProvider }) => {
-        const preset = createHarnessRegistry(ALL_PRESET_TEMPLATES as never).find('demo');
+        const preset = createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never).find('demo');
 
         if (preset === undefined) throw new Error('The scripted demo preset is not shipped in this build.');
 
-        return presetFromRecord(presetToRecord(preset)).create(SETTINGS, () => undefined, report);
+        return presetFromRecord(presetToRecord(preset), preset).create(SETTINGS, () => undefined, report);
     };
 
     it('refuses a globally disabled tool inside a demo run, and runs it otherwise', async () => {
@@ -656,7 +659,7 @@ describe('R3 lane propagation: a worker lane omits a disabled tool from its requ
         const provider = await startProvider([textRound('stubbed answer')]);
         const store = new SessionStore(
             { ...SETTINGS, baseURL: `${provider.origin}/v1` },
-            createHarnessRegistry(ALL_PRESET_TEMPLATES as never),
+            createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never),
             undefined,
             { runtime: LANE_RUNTIME }
         );
@@ -737,7 +740,7 @@ describe('R3 lane propagation: a lane replica delivers or skips a plugin pass on
 
         const store = new SessionStore(
             { ...SETTINGS, baseURL: `${provider.origin}/v1` },
-            createHarnessRegistry(ALL_PRESET_TEMPLATES as never),
+            createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never),
             undefined,
             { runtime: LANE_RUNTIME }
         );
@@ -789,18 +792,33 @@ describe('R3 lane propagation: a lane replica delivers or skips a plugin pass on
     }, 180_000);
 });
 
-describe('R3 lane propagation: the demo preset honours the switches on a lane too', () => {
-    it('refuses a globally disabled tool inside a lane-served demo run', async () => {
-        // The scripted preset needs no endpoint, so this is the cheapest real-lane run there
-        // is - and the one that used to ignore the switch even INLINE, because its factory
-        // dropped `report.toolSettings` (../harnesses/presets.ts).
-        const store = new SessionStore(SETTINGS, createHarnessRegistry(ALL_PRESET_TEMPLATES as never), undefined, {
-            runtime: LANE_RUNTIME
-        });
+describe('R3 lane propagation: a lane-served run honours the switch at the launch gate', () => {
+    it('refuses a globally disabled tool inside a lane-served run', async () => {
+        // Run on `flaky`, not on the scripted fixture: a lane rebuilds the harness from the
+        // preset RECORD alone, and a scripted factory is a closure the worker cannot receive
+        // (../harnesses/registry.ts throws for a scripted record with no fallback). `flaky` is
+        // rebuildable AND asks for a named tool, so the refusal is observable on the wire.
+        const provider = await startProvider([
+            // Round 1: the model guesses the disabled name; round 2 is the answer it adapts to.
+            callRound('call_lane_gate', 'timeNow', '{"timezone":"UTC"}'),
+            textRound('understood')
+        ]);
+
+        const store = new SessionStore(
+            { ...SETTINGS, baseURL: `${provider.origin}/v1` },
+            createHarnessRegistry(PRODUCTION_WITH_FIXTURES as never),
+            undefined,
+            { runtime: LANE_RUNTIME }
+        );
 
         laneStores.push(store);
 
-        const session = await store.create('demo');
+        const session = await store.create('flaky');
+
+        // `timeNow` is discovery-visibility, so put it in the SESSION's enabled set first - the
+        // same move the plugin case below makes - and only then switch it off globally. That way
+        // the only reason the call can fail is the operator's switch, not an out-of-scope name.
+        store.liveSession(session.id).harness.runtime.manageTool(undefined, { operation: 'enable', name: 'timeNow' });
 
         await store.updateToolEnabled('timeNow', false);
 
@@ -808,6 +826,9 @@ describe('R3 lane propagation: the demo preset honours the switches on a lane to
         const turn = await settledTurn(store, session.id, submitted.turn.id);
 
         expect(turn.status).toBe('done');
+        // The turn really was lane-served: the provider saw the replica's two requests.
+        expect(store.workerExecution).toBe(true);
+        expect(provider.requests).toHaveLength(2);
 
         const refused = (turn.events as unknown as { type: string; name?: string; content?: string }[]).filter(
             (event) => event.type === 'tool_result' && event.name === 'timeNow'
@@ -815,7 +836,7 @@ describe('R3 lane propagation: the demo preset honours the switches on a lane to
 
         expect(refused).toHaveLength(1);
         // The launch gate on the REPLICA answered, so the blueprint's deny list reached this
-        // lane's harness - and the demo's own scripted next round quotes that refusal.
+        // lane's harness - and the run survived it, which is what makes the next round happen.
         expect(refused[0]?.content).toBe('Tool "timeNow" is disabled on this server by the operator.');
     }, 180_000);
 });

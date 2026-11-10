@@ -44,7 +44,8 @@ const DRIVER = `// Scratch driver written by src/server/stream/service-stream.te
 // Boots the REAL service loader over the REAL harness endpoint folder on port 0.
 import http from 'node:http';
 import { startServer } from '../../packages/underload/service/src/server/start';
-import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from '../../packages/underload/harness/src/server/harnesses';
+import { createHarnessRegistry } from '../../packages/underload/harness/src/server/harnesses';
+import { PRODUCTION_WITH_FIXTURES } from '../../packages/underload/harness/src/server/harnesses/fixture-presets.test-support';
 import { createHarnessRuntime, setHarnessRuntime } from '../../packages/underload/harness/src/server/runtime';
 
 const target = http.Server.prototype;
@@ -77,7 +78,7 @@ const serviceRoot = process.env.HARNESS_SERVICE_DATABASE_ROOT;
 setHarnessRuntime(
     createHarnessRuntime({
         ...(serviceRoot === undefined ? {} : { root: serviceRoot }),
-        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES)
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES)
     }),
     serviceRoot
 );

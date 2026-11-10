@@ -32,7 +32,8 @@ import type {
 import type { TaskChange, TaskItem, TaskResult } from '../types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { ALL_PRESET_TEMPLATES, createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
+import { createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
+import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 import { AGENT_PROFILES, agentInstruction } from '../agents';
 import { SessionStore } from './sessions';
 import {
@@ -747,14 +748,14 @@ describe('R3b durable harness database', () => {
             root,
             settings: SETTINGS,
             defaults: DEFAULTS,
-            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+            registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES),
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
         const created = await first.store.create('demo');
         const frozenDefinition = first.store.get(created.id).harnessDefinition;
 
-        expect(frozenDefinition?.title).toBe('Scripted demo');
+        expect(frozenDefinition?.title).toBe('Scripted fixture');
 
         // Metadata-only patch of the shipped demo: the registry entry changes, the
         // session keeps its captured factory and descriptor.
@@ -767,7 +768,7 @@ describe('R3b durable harness database', () => {
             root,
             settings: SETTINGS,
             defaults: DEFAULTS,
-            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+            registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES),
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
@@ -778,14 +779,16 @@ describe('R3b durable harness database', () => {
         const restored = second.store.get(created.id);
         expect(restored.harness).toBe('demo');
         expect(restored.harnessDefinition).toEqual(frozenDefinition);
-        expect(restored.harnessDefinition?.title).toBe('Scripted demo');
+        expect(restored.harnessDefinition?.title).toBe('Scripted fixture');
         // The scripted factory survives a metadata-only patch: messages are the
         // seeded scripted system transcript (the demo fixture does not run here).
-        // ONE system message, because `agentInstruction()` joins the demo profile's
+        // ONE system message, because `agentInstruction()` joins the profile's
         // identity sentence and guidelines into a single prompt (../agents/index.ts).
+        // The profile is `general`: the fixture CARD is named `demo`, but no `demo`
+        // AGENT exists in this build (./harnesses/fixture-presets.test-support.ts).
         expect(restored.messages.map((message) => message.role)).toEqual(['system']);
         expect(withoutIds(restored.messages)).toEqual([
-            { role: 'system', content: agentInstruction(AGENT_PROFILES.demo) }
+            { role: 'system', content: agentInstruction(AGENT_PROFILES.general) }
         ]);
     });
 
@@ -1653,7 +1656,7 @@ describe('T5 durable harness deletion', () => {
         expect(second.store.list().map((session) => session.id)).toEqual([id]);
     });
 
-    it('keeps a deleted fixture session restorable AND runnable', async () => {
+    it('drops a deleted fixture session whose scripted factory no longer ships, without failing the load', async () => {
         const root = tempRoot('delete-fixture-session');
 
         // A host that injected the offline fixture records a real conversation, then
@@ -1662,7 +1665,7 @@ describe('T5 durable harness deletion', () => {
             root,
             settings: SETTINGS,
             defaults: DEFAULTS,
-            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+            registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES),
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
@@ -1670,7 +1673,7 @@ describe('T5 durable harness deletion', () => {
         const id = (await first.store.create('demo')).id;
         await first.store.run(id, 'first question', async () => {});
         const frozen = first.store.get(id).harnessDefinition;
-        expect(frozen?.title).toBe('Scripted demo');
+        expect(frozen?.title).toBe('Scripted fixture');
 
         expect((await first.store.mutateRegistry(() => first.registry.remove('demo'))).name).toBe('demo');
         expect(readState(root).deleted).toEqual(['demo']);
@@ -1678,9 +1681,10 @@ describe('T5 durable harness deletion', () => {
         first.store.dispose();
 
         // Restart WITHOUT the fixture injection: `demo` is not in the production
-        // catalogue at all, and the old row cannot resurrect it. The session is still
-        // there, with its transcript, because its frozen record names the scripted
-        // factory this build still ships as a preset.
+        // catalogue at all, and the old row cannot resurrect it. Its frozen record
+        // names the SCRIPTED template, and this build ships no scripted preset, so
+        // the honest answer is a per-session DROP with a readable reason — not a
+        // silent substitution of some other harness, and not a dead server.
         const second = createHarnessRuntime({
             root,
             settings: SETTINGS,
@@ -1699,21 +1703,22 @@ describe('T5 durable harness deletion', () => {
             'planner',
             'debugger'
         ]);
-        expect(second.store.restoreErrors).toEqual([]);
-
-        const restored = second.store.get(id);
-        expect(restored.harness).toBe('demo');
-        expect(restored.harnessDefinition).toEqual(frozen);
-        expect(restored.turns.map((turn) => turn.prompt)).toEqual(['first question']);
-        expect(restored.turns[0].status).toBe('done');
-
-        // The rebuilt frozen harness really runs: an offline turn on a harness the
-        // catalogue no longer lists.
-        await second.store.run(id, 'second question', async () => {});
-        expect(second.store.get(id).turns.map((turn) => turn.prompt)).toEqual([
-            'first question',
-            'second question'
+        expect(second.store.restoreErrors).toEqual([
+            `${stateFile(root)}: Session "${id}" could not be restored: ` +
+                'Scripted harness "demo" is not shipped in this build; the session cannot be restored.'
         ]);
+
+        // R6/R7: the drop is per SESSION. The row is absent (404, never a half-restored
+        // record), and everything else about the restart still works.
+        expect(second.store.list().map((session) => session.id)).toEqual([]);
+        expect(() => second.store.get(id)).toThrow(`Unknown session "${id}".`);
+
+        // The store is healthy: creation on a shipped card still works, and the dropped
+        // row is gone from the document the next save writes.
+        const fresh = await second.store.create('instruct');
+        expect(second.store.list().map((session) => session.id)).toEqual([fresh.id]);
+        second.store.dispose();
+        expect(readState(root).sessions.map((session) => session.id)).toEqual([fresh.id]);
     });
 
     it('re-creating a deleted built-in name clears the tombstone durably', async () => {

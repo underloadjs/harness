@@ -2,17 +2,18 @@
 //
 // WHY A MODULE: `index.ts` runs `main()` at import time (it IS the process), so a
 // test cannot import it to pin the preset default. The parser is pure, so the
-// product decision "no args means a real live role, never the scripted fixture" is
-// asserted directly instead of by parsing help text.
+// product decision "no args means a real live role" is asserted directly instead of
+// by parsing help text.
 //
-// The default is a LIVE role. `demo` remains available as an explicit
-// `--preset demo` for hosts without a provider; there is deliberately no silent
-// fallback to it, because a scripted answer is not a useful general harness.
+// Every selectable preset is a LIVE role. The scripted `demo` preset used to be the
+// one endpoint-free option and was deleted along with its transport, so `--preset`
+// now only ever names a real configuration and a missing base URL is an error rather
+// than a cue to fall back to a scripted transcript.
 //
 // Cross-references:
 //   - ./index.ts        - uses parseCliOptions() and applies the endpoint check
 //   - ../../agents      - the trusted roles the preset ids select
-//   - ../../harnesses   - findPreset / presets (demo is the offline exception)
+//   - ../../harnesses   - findPreset / presets (all live, all need a provider)
 
 import { parseArgs } from 'node:util';
 

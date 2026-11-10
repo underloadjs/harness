@@ -160,7 +160,9 @@ describe('tool catalogue', () => {
             'diceRoll',
             'noteSearch',
             'textSummarize',
-            'testFlaky',
+            // The `testFlaky` row is gone with the `flaky` example preset and the
+            // `src/server/tools/examples` folder that held it: the app catalogue is now
+            // exactly the shared toolbox's app half, with no example-only entry.
             'search',
             // R9-R11: the fetch entry rides with search. It is the second half of the
             // environment-backed core pair, so a card can only advertise the

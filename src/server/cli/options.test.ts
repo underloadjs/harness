@@ -1,14 +1,16 @@
-// CLI preset default + explicit offline demo (T5 + the roster/role-contract pass).
+// CLI preset default + "no endpoint-free preset is left" (the roster pass + the
+// fixture deletion).
 //
 // `index.ts` is executable at import time, so the parser lives in ./options and
 // these assertions pin the product decision without booting a process:
 //   - no `--preset` selects the LIVE General role (the default card the catalogue
-//     lists first), never the scripted fixture and never a silent demo fallback;
-//   - `--preset demo` still selects the offline fixture, which constructs and
-//     registers its tools with empty provider settings.
+//     lists first), never a silent fallback to something cheaper;
+//   - every preset the CLI can select needs a provider, because the scripted `demo`
+//     fixture that used to be the endpoint-free escape hatch is deleted. `--preset demo`
+//     is now an unknown name, and ./index.ts says so and lists what does exist.
 
 import { describe, expect, it } from 'vitest';
-import { findPreset } from '../harnesses';
+import { findPreset, presets } from '../harnesses';
 import { DEFAULT_CLI_PRESET, parseCliOptions } from './options';
 
 describe('CLI preset selection', () => {
@@ -43,44 +45,44 @@ describe('CLI preset selection', () => {
         });
     });
 
-    it('keeps demo as an explicit, endpoint-free preset', () => {
+    it('offers no endpoint-free preset: the scripted demo is gone', () => {
         const parsed = parseCliOptions(['--preset', 'demo', 'what time is it']);
-        const preset = findPreset(parsed.values.preset as string);
 
+        // The parser still accepts the flag (it takes a name, it does not validate it),
+        // but the catalogue has no such row, so ./index.ts takes its
+        // `unknown harness preset` branch and prints the real list instead of silently
+        // running a script.
         expect(parsed.values.preset).toBe('demo');
         expect(parsed.positionals).toEqual(['what time is it']);
-        expect(preset).toBeDefined();
-        expect({
-            name: preset!.name,
-            requiresEndpoint: preset!.requiresEndpoint,
-            primary: preset!.primary
-        }).toEqual({ name: 'demo', requiresEndpoint: false, primary: 'demo' });
+        expect(findPreset(parsed.values.preset as string)).toBeUndefined();
+        expect(findPreset('flaky')).toBeUndefined();
 
-        // No provider settings at all: the scripted demo must still construct and
-        // expose its offline toolset (it is explicitly chosen, never a fallback).
-        const offline = preset!.create({ baseURL: '', apiKey: '', model: '' }, () => {});
+        // The rule generalises: EVERY selectable preset is live, so the CLI's "needs a
+        // provider base URL" check fires for all of them. A future card with
+        // `requiresEndpoint: false` is a product decision and fails here.
+        expect(presets.filter((preset) => !preset.requiresEndpoint).map((preset) => preset.name)).toEqual([]);
 
-        expect(Object.keys(offline.tools)).toEqual([
-            'toolRegistry',
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'records',
+        // What the CLI's check really protects against: a live role needs BOTH a model and a
+        // transport at CONSTRUCTION, and each throws its own message first — the model check
+        // (src/core/agent.ts:419) runs before the transport check (src/core/agent.ts:153), and
+        // the toolbox preset builds its agents through `agentFromProfile`
+        // (../harnesses/toolbox.ts:327), so an empty BASE URL is not legal even before a
+        // request. The `needs a provider base URL` message in ./index.ts is the courtesy that
+        // names the missing setting instead of surfacing a HarnessError from the core.
+        expect(() =>
+            findPreset('general')!.create({ baseURL: '', apiKey: '', model: '' }, () => {})
+        ).toThrow('An agent requires a model.');
+        expect(() =>
+            findPreset('general')!.create({ baseURL: '', apiKey: '', model: 'test/model' }, () => {})
+        ).toThrow('Agent "general" has no transport: provide either `stream` or `provider.baseURL`.');
 
-            'tasks',
-            'profiles',
-            'chapters',
-            'locations',
-            'agentManage',
-            'agentResult',
-            // N6: forks are enabled by default, so threadFork is registered even
-            // in the scripted fixture (which has no owner interaction).
-            'threadFork',
-            'toolCancel',
-            'timeNow'
-        ]);
-        expect(offline.tools.delegate).toBeUndefined();
+        const live = findPreset('general')!.create(
+            { baseURL: 'http://provider.test/v1', apiKey: '', model: 'test/model' },
+            () => {}
+        );
+
+        expect(live.tools.delegate).toBeUndefined();
+        expect(Object.keys(live.tools).length).toBeGreaterThan(10);
     });
 
     it('still accepts the short -p form and leaves other options at their defaults', () => {

@@ -76,15 +76,16 @@ export const SERVER_TOOLS_DIRECTORY = 'server/tools';
 // directory; the package root is resolved the same way the rest of the server
 // resolves its files (../package-root.ts), so `src/` and a deployed copy agree.
 export const SHARED_APP_TOOL_FOLDER = packagePath('src', SERVER_TOOLS_DIRECTORY, 'shared');
-export const EXAMPLE_APP_TOOL_FOLDER = packagePath('src', SERVER_TOOLS_DIRECTORY, 'examples');
 
-// Both folders, shared first. This is the CATALOGUE order source: the server lists
-// every app tool it ships, including the example-only one (it is directly callable
-// through POST /tools/:name, exactly like before the move).
-export const APP_TOOL_FOLDERS: readonly string[] = Object.freeze([
-    SHARED_APP_TOOL_FOLDER,
-    EXAMPLE_APP_TOOL_FOLDER
-]);
+// The folders the server scans, in catalogue order. There is exactly ONE now.
+// `src/server/tools/examples` used to be the second: it held `testFlaky`, the tool the
+// `flaky` example preset registered and nothing else. With that preset deleted the folder
+// had no consumer, and a scanned-but-unregistered folder is worse than no folder —
+// `resolveToolFolders` rejects one that does not exist, so keeping the name would have
+// made the empty directory load-bearing for every server start. A host that wants extra
+// app tools passes them through `createToolboxHarness({ extraToolSources })` or a
+// `toolFolders` entry, which is the same mechanism without a shipped directory.
+export const APP_TOOL_FOLDERS: readonly string[] = Object.freeze([SHARED_APP_TOOL_FOLDER]);
 
 // A package-relative POSIX label for an absolute folder entry, mirroring the
 // compiler's own `labelOf` rule: the first source root that contains the file wins,
@@ -211,8 +212,10 @@ const lazyAppTool = (descriptor: DiscoveredTool): Tool => {
 
 // The scan result, in registration order (folder order, then `registration.order`).
 // Every app tool, keyed by wire name, in catalogue order. `testFlaky` is included
-// here (the server lists and can call it directly); it is EXCLUDED from the shared
-// toolbox by living in the examples folder, not by a name filter — see SHARED_APP_TOOLS.
+// here (the server lists and can call it directly). It used to include one example-only
+// entry, `testFlaky`, excluded from the shared toolbox by living in a second scanned
+// folder; that folder and its tool are gone, so the catalogue and the shared toolbox are
+// now the same set of app tools.
 // Frozen: the catalogue is a projection of the scan, and a caller must not be able to
 // add a row the folders do not contain.
 export const harnessTools: Readonly<Record<string, Tool>> = Object.freeze(
@@ -249,13 +252,10 @@ export const SHARED_APP_TOOL_SOURCES: Readonly<Record<string, string>> = Object.
     )
 );
 
-// The example-only source entries, same shape. Only the recoverable-failure example
-// registers these (./presets.ts + ./registry.ts), which is what keeps `testFlaky`
-// out of every real harness while still compiling it from its own editable file.
-export const EXAMPLE_APP_TOOL_SOURCES: Readonly<Record<string, string>> = Object.freeze(
-    Object.fromEntries(
-        appToolDescriptors
-            .filter((descriptor) => SHARED_APP_TOOLS[descriptor.name] === undefined)
-            .map((descriptor) => [descriptor.name, packageRelativeSourcePath(descriptor.sourcePath)])
-    )
-);
+// There is no `EXAMPLE_APP_TOOL_SOURCES` any more. It was the source map of
+// `src/server/tools/examples`, which held exactly one file — `testFlaky`, the tool the
+// deleted `flaky` example preset registered. With one scanned folder left, "shared" and
+// "everything" are the same set, so a second derived map would be a permanent empty
+// object. A host or a test that wants an extra tool supplies it through
+// `createToolboxHarness({ extraToolSources })` (a source path) or `{ extraTools }` (a
+// definition); both extension points are unchanged.
