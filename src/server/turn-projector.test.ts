@@ -25,7 +25,7 @@ import type {
     TurnRecordStatus,
     TurnSection
 } from '../shared/turn-display';
-import type { SessionTurn } from './protocol';
+import type { SessionTurn, SessionTurnEvent } from './protocol';
 import { createTurnProjector, DISPLAY_NO_TIMESTAMP, formatDuration, previewText, previewTextTail, projectTurn, refoldTurn, steerSubmitList } from './turn-projector';
 
 const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
@@ -2148,6 +2148,333 @@ describe('context bar (R6/R8)', () => {
             // tool's own measured span. A FAILED result still counts: its text is
             // delivered to the model like any other.
             ['0-tool-3', 16, 'error']
+        ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// DISPLAY LANE (C1) — the stacked rows of the context bar.
+//
+// A summarize pass raises the conversation's display lane at the moment it commits its
+// instruction, and the store's recorder stamps that lane on every event it records from
+// then on (./sessions.ts, ./protocol.ts `SessionTurnEvent.lane`). The fold is the ONLY
+// writer of `ContextBlock.lane`, from exactly two sources (./turn-projector.ts
+// `laneOfEvent` / `laneOfTurn`):
+//
+//   - an EVENT-driven segment takes the lane stamped on the event that minted it, so the
+//     summary's own answer lands on the NEW row inside the turn the compaction happened
+//     in — one compaction, two rows;
+//   - a NON-event segment (the `system` block, the `prompt` block, every `steer` block)
+//     takes the lane the TURN started on, which is what keeps a continuation turn from
+//     splitting its own prompt away from its own answer for no reason.
+//
+// 0 is never written (absence already means row 0), and the lane is mint-assigned: no
+// `context:set` patch ever carries it, so a block never drifts between rows in place.
+// ---------------------------------------------------------------------------
+
+describe('context-bar display lanes (C1)', () => {
+    // The recorder's stamp, applied to a fixture event. `undefined` keeps the event
+    // unstamped, which is what a pre-lane (or never-compacted) conversation records.
+    const laneOn = (event: HarnessEvent, lane?: number): SessionTurnEvent =>
+        lane === undefined ? event : { ...event, lane };
+
+    const ANSWER_DONE = {
+        type: 'done',
+        agent: 'one',
+        message: { role: 'assistant', content: 'Answer', model: 'gpt-x', stopReason: 'stop', toolCalls: [] }
+    } as HarnessEvent;
+
+    it('paints one compaction as two rows: the answer rides the lane on its own events', () => {
+        // The turn a compaction happened IN. It started on lane 0 (no `turn.lane`), the
+        // pre-boundary events are unstamped, and the recorder stamped 1 on every event
+        // from the instruction commit on — including the summary's own `text`/`done`.
+        const result = fold(
+            [
+                laneOn(starts()),
+                laneOn({ type: 'reasoning', agent: 'one', delta: 'pre' }),
+                laneOn({ type: 'text', agent: 'one', delta: 'Answer' }, 1),
+                laneOn(ANSWER_DONE, 1)
+            ],
+            turnOf(),
+            SOURCED
+        );
+
+        // Exact and whole: the instruction's row holds the system block, the prompt and
+        // the pre-compaction thinking (no `lane` key = row 0), and the summary's answer
+        // carries `lane: 1` — the second row of the same bar.
+        expect(result.display().sections[0].context).toEqual([
+            {
+                kind: 'system',
+                id: '0-system-instructions',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'instructions',
+                at: 900,
+                chars: 16,
+                inPrompt: true
+            },
+            {
+                kind: 'user',
+                id: '0-user-prompt',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'prompt',
+                at: 1_000,
+                chars: 12,
+                inPrompt: true
+            },
+            {
+                kind: 'reasoning',
+                id: '0-reasoning-1',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'reasoning',
+                at: 1_010,
+                chars: 3,
+                inPrompt: false,
+                eventFrom: 1,
+                eventTo: 1
+            },
+            {
+                kind: 'assistant',
+                id: '0-assistant-2',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'answer',
+                at: 1_020,
+                chars: 6,
+                inPrompt: true,
+                eventFrom: 2,
+                eventTo: 2,
+                lane: 1
+            }
+        ]);
+
+        // The `done` frame repeats the answer text and carries lane 1; it must not mint a
+        // second segment, and it must not move the lane of the block it patched.
+        expect(
+            result.display().sections[0].context?.filter((block) => block.kind === 'assistant')
+        ).toHaveLength(1);
+    });
+
+    it('keeps a continuation turn on ONE row, because every segment rides its starting lane', () => {
+        // The turn AFTER a compaction: `SessionTurn.lane` is 1 (the store copies the
+        // thread's current lane when it mints the record) and every event is stamped 1.
+        // The prompt, the system block, the thinking and the answer therefore all read
+        // 1 — a bar that split this turn in two would report a boundary that never
+        // happened in it.
+        const result = fold(
+            [
+                laneOn(starts(), 1),
+                laneOn({ type: 'reasoning', agent: 'one', delta: 'post' }, 1),
+                laneOn({ type: 'text', agent: 'one', delta: 'Answer' }, 1)
+            ],
+            turnOf({ lane: 1 }),
+            SOURCED
+        );
+
+        expect(
+            result.display().sections[0].context?.map((block) => [block.id, block.lane])
+        ).toEqual([
+            ['0-system-instructions', 1],
+            ['0-user-prompt', 1],
+            ['0-reasoning-1', 1],
+            ['0-assistant-2', 1]
+        ]);
+    });
+
+    it('splits at a mid-turn bump and leaves a steer on the row the turn started on', () => {
+        // A steer is a record mutation, not an event, so the fold has no per-steer lane to
+        // read: it rides `turn.lane` (1) while the segment minted by the post-bump answer
+        // event rides 2. That is the honest reading of the evidence — inventing a lane for
+        // the submit would need the store, which the fold never sees.
+        const result = fold(
+            [
+                laneOn(starts(), 1),
+                laneOn({ type: 'reasoning', agent: 'one', delta: 'pre' }, 1),
+                laneOn({ type: 'text', agent: 'one', delta: 'Answer' }, 2)
+            ],
+            turnOf({ lane: 1, steers: [{ at: 1_005, prompt: 'hurry' }] }),
+            SOURCED
+        );
+
+        expect(result.display().sections[0].context).toEqual([
+            {
+                kind: 'system',
+                id: '0-system-instructions',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'instructions',
+                at: 900,
+                chars: 16,
+                inPrompt: true,
+                lane: 1
+            },
+            {
+                kind: 'user',
+                id: '0-user-prompt',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'prompt',
+                at: 1_000,
+                chars: 12,
+                inPrompt: true,
+                lane: 1
+            },
+            {
+                kind: 'user',
+                id: '0-user-s1005-5',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'steer',
+                at: 1_005,
+                chars: 5,
+                inPrompt: true,
+                lane: 1
+            },
+            {
+                kind: 'reasoning',
+                id: '0-reasoning-1',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'reasoning',
+                at: 1_010,
+                chars: 3,
+                inPrompt: false,
+                eventFrom: 1,
+                eventTo: 1,
+                lane: 1
+            },
+            {
+                kind: 'assistant',
+                id: '0-assistant-2',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                name: 'answer',
+                at: 1_020,
+                chars: 6,
+                inPrompt: true,
+                eventFrom: 2,
+                eventTo: 2,
+                lane: 2
+            }
+        ]);
+    });
+
+    it('writes no lane key at all when every stamp is 0', () => {
+        // `lane: 0` is what absence already means (the same canonical rule the store and
+        // the snapshot follow), so a session that never compacted keeps the EXACT bar it
+        // painted before this field existed — byte for byte, key for key.
+        const result = fold(
+            [
+                laneOn(starts(), 0),
+                laneOn({ type: 'reasoning', agent: 'one', delta: 'pre' }, 0),
+                laneOn({ type: 'text', agent: 'one', delta: 'Answer' }, 0)
+            ],
+            turnOf({ lane: 0 }),
+            SOURCED
+        );
+
+        const blocks = result.display().sections[0].context ?? [];
+
+        expect(blocks.map((block) => Object.keys(block))).toEqual([
+            ['kind', 'id', 'turnId', 'sectionId', 'name', 'at', 'chars', 'inPrompt'],
+            ['kind', 'id', 'turnId', 'sectionId', 'name', 'at', 'chars', 'inPrompt'],
+            ['kind', 'id', 'turnId', 'sectionId', 'name', 'at', 'chars', 'inPrompt', 'eventFrom', 'eventTo'],
+            ['kind', 'id', 'turnId', 'sectionId', 'name', 'at', 'chars', 'inPrompt', 'eventFrom', 'eventTo']
+        ]);
+        expect(blocks.some((block) => 'lane' in block)).toBe(false);
+    });
+
+    it('mints the lane once: a growing segment keeps it, and no patch ever carries it', () => {
+        // The patch invariant. A prose block minted on lane 1 continues on lane 2 (the
+        // bump landed mid-stream), and the growth patches that follow carry ONLY the
+        // counters — a block that changed rows would be a `context:remove` +
+        // `context:add` pair, never an in-place edit
+        // (../shared/turn-display.ts `ContextBlockPatch`).
+        const result = fold([
+            laneOn(starts()),
+            laneOn({ type: 'text', agent: 'one', delta: 'one' }, 1),
+            laneOn({ type: 'text', agent: 'one', delta: ' two' }, 2)
+        ]);
+
+        expect(flatten(result.ops).filter((op) => op.op.startsWith('context'))).toEqual([
+            {
+                op: 'context:add',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                block: {
+                    kind: 'user',
+                    id: '0-user-prompt',
+                    turnId: 'turn-1',
+                    sectionId: 'turn-1:0',
+                    name: 'prompt',
+                    at: 1_000,
+                    chars: 12,
+                    inPrompt: true
+                }
+            },
+            {
+                op: 'context:add',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                block: {
+                    kind: 'assistant',
+                    id: '0-assistant-1',
+                    turnId: 'turn-1',
+                    sectionId: 'turn-1:0',
+                    name: 'answer',
+                    at: 1_010,
+                    chars: 0,
+                    inPrompt: true,
+                    eventFrom: 1,
+                    eventTo: 1,
+                    lane: 1
+                }
+            },
+            {
+                op: 'context:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                blockId: '0-assistant-1',
+                patch: { chars: 3 }
+            },
+            {
+                op: 'context:set',
+                turnId: 'turn-1',
+                sectionId: 'turn-1:0',
+                blockId: '0-assistant-1',
+                patch: { chars: 7, eventTo: 2, durationMs: 10 }
+            }
+        ]);
+
+        // The settled block still reports the lane it was minted on — the later event's 2
+        // never moved it.
+        expect(
+            result.display().sections[0].context?.find((block) => block.id === '0-assistant-1')
+        ).toMatchObject({ chars: 7, lane: 1 });
+    });
+
+    it('folds the same lanes live and cold', () => {
+        const script: SessionTurnEvent[] = [
+            laneOn(starts()),
+            laneOn({ type: 'reasoning', agent: 'one', delta: 'pre' }),
+            laneOn({ type: 'text', agent: 'one', delta: 'Answer' }, 1),
+            laneOn(ANSWER_DONE, 1)
+        ];
+        const live = fold([...script], turnOf(), SOURCED);
+        const cold = projectTurn(
+            turnOf({ events: [...script], eventTimes: script.map((_event, index) => timeOf(index)) }),
+            SOURCED
+        );
+
+        // One value in both paths: a reload paints the same two rows the stream painted.
+        expect(cold.display).toEqual(live.display());
+        expect(cold.display.sections[0].context?.map((block) => block.lane)).toEqual([
+            undefined,
+            undefined,
+            undefined,
+            1
         ]);
     });
 });

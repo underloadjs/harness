@@ -282,6 +282,7 @@ import type {
     SessionThread,
     SessionThreadView,
     SessionTurn,
+    SessionTurnEvent,
     SessionView,
     SessionViewStreamItem,
     SessionViewSummary,
@@ -1059,6 +1060,12 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     // R8: the conversation's display name travels WITH the turn, so a client can
     // label the root block even for a default conversation the roster omits.
     ...(turn.threadLabel === undefined ? {} : { threadLabel: turn.threadLabel }),
+    // DISPLAY LANE (C1): the lane this turn started on, copied like every other field so
+    // a response cannot rewrite the stored record. Copied ONLY when it is non-zero —
+    // absence already means lane 0 — which is what keeps a pre-lane (and never-compacted)
+    // record's key set byte-identical. Internal metadata: the canonical row/resource
+    // projections never read it (./api-reads.ts), so no wire key is added by this.
+    ...(turn.lane === undefined || turn.lane === 0 ? {} : { lane: turn.lane }),
     // Attachments are copied too (T3): the validated record is plain data and a
     // client/snapshot consumer must never be able to mutate the stored bytes. The
     // key stays absent for a text-only turn, preserving every old shape.
@@ -2706,6 +2713,41 @@ export class SessionStore {
             typeof harness.stopAllThreads === 'function' &&
             typeof harness.deleteThread === 'function'
         );
+    }
+
+    // DISPLAY LANE (C1) — the conversation's CURRENT display lane, the number the recorder
+    // stamps onto an event at the moment it is stored (../server/protocol.ts
+    // `SessionTurnEvent.lane`, and `SessionTurn.lane` for the lane a turn STARTED on).
+    //
+    // Always 0 (never `undefined`) so every caller has one canonical "no lane" value, and
+    // 0 is what `ContextBlock.lane` / `SessionTurnEvent.lane` omit rather than write.
+    //
+    // WHY A READ, NOT A CACHED COPY: the recorder calls this per event. A plugin
+    // (../plugins/context-compaction.plugin.ts, summarize mode) bumps the lane in the
+    // MIDDLE of a run, and the increment must show up on the very next recorded frame —
+    // that is the whole point of the feature, because one turn's context bar is what has
+    // to paint the pre- and post-compaction segments as two stacked rows. A value read
+    // once at turn start would put the boundary in the NEXT turn's bar and no bar would
+    // ever show two rows.
+    //
+    // A non-integer/negative value is treated as "no lane" rather than trusted: a
+    // hand-restored document must not put an unsortable number in front of a renderer.
+    //
+    // WORKER MODE IS NOT PROVEN TO REACH THIS READ. The value lives on the harness record, and
+    // the only writer is a plugin call (`setContextLane`, ../harness.ts), which mutates the
+    // harness instance that host runs on. `setContextLane` appears nowhere under
+    // ../server/workers, and that subsystem's op set carries no lane key (`thread:status` moves
+    // `status` alone, guarded by a status+label digest — ./workers/lane-commit.ts:685), so a
+    // bump raised on the lane side has no route back to the record read here and the bar stays
+    // one row. The lane tests all run the default `inline` engine (../config.ts), so this is an
+    // untested deployment shape, not a verified one — see 0017 (../docs/issues/) for the
+    // port-side resync of the same field.
+    private contextLaneOf(session: Session, threadId: string | undefined): number {
+        if (threadId === undefined || !this.threadsSupported(session)) return 0;
+
+        const lane = session.harness.thread(threadId)?.contextLane;
+
+        return typeof lane === 'number' && Number.isInteger(lane) && lane > 0 ? lane : 0;
     }
 
     // True while ANY thread lane is executing. Lanes are independent, so this is
@@ -5771,6 +5813,9 @@ export class SessionStore {
             prompt: input,
             // Omitted for a text-only turn so the record keeps its legacy shape.
             ...(validated.length === 0 ? {} : { attachments: validated }),
+            // DISPLAY LANE (C1): a legacy `/messages` turn has NO conversation, so its
+            // starting lane is 0 and the key is omitted (absent = lane 0). Every event this
+            // run records is stamped from the same 0, so the legacy shape stays byte-exact.
             status: 'running',
             startedAt,
             updatedAt: startedAt,
@@ -6673,12 +6718,21 @@ export class SessionStore {
         // `status: 'queued'` and no `startedAt`: this record is complete and
         // renderable before any execution, which is what lets a reload show the
         // backlog. `events`/`eventTimes` start empty and are filled by the pump.
+        //
+        // DISPLAY LANE (C1): the turn's STARTING lane, read off the conversation this
+        // submit is bound to — after `createSubmitThread` above, so a brand-new
+        // conversation reports its own (0) and a continuation reports the lane its
+        // conversation currently sits on (which a compaction may already have moved).
+        // 0 is omitted rather than written, so a first turn and a never-compacted
+        // session keep their exact record shape.
+        const startingLane = this.contextLaneOf(session, targetThread);
         const turn: SessionTurn = {
             id: randomUUID(),
             index,
             prompt: input,
             threadId: targetThread,
             ...(targetLabel === undefined ? {} : { threadLabel: targetLabel }),
+            ...(startingLane === 0 ? {} : { lane: startingLane }),
             // Omitted when nothing was referenced, so a plain task keeps the exact
             // legacy record shape. The bound list is persisted and expanded later.
             ...(boundReferences.length === 0 ? {} : { references: boundReferences }),
@@ -6869,7 +6923,9 @@ export class SessionStore {
         // Born 'running' (never 'queued' — there is no pump in its life) and with NO
         // threadId/threadLabel, which is the record shape the UI already renders for a
         // thread-less turn. No `attachments`/`references`/`usage` keys at all, so the
-        // record keeps the plainest historical shape (copyTurn omits absent keys).
+        // record keeps the plainest historical shape (copyTurn omits absent keys). The
+        // DISPLAY LANE follows the same rule: a command acts on the session, not on a
+        // conversation, so its lane is 0 and the key stays absent (C1).
         const turn: SessionTurn = {
             id: randomUUID(),
             index,
@@ -6918,7 +6974,16 @@ export class SessionStore {
             // the compact surface (R4).
             const index = turn.events.length;
             const projector = this.projectorFor(session, turn);
-            const stored = copyEvent(event);
+            const stored: SessionTurnEvent = copyEvent(event);
+            // DISPLAY LANE (C1): one rule for every recorder — the lane is read from the
+            // conversation at record time. A command turn has no conversation, so this is
+            // a 0 and the key stays off; the reason it is still written here is that a
+            // partially-stamped recorder is how a lane silently disappears from half a
+            // turn's events.
+            const lane = this.contextLaneOf(session, turn.threadId);
+
+            if (lane !== 0) stored.lane = lane;
+
             const at = Date.now();
 
             turn.events.push(stored);
@@ -7855,7 +7920,21 @@ export class SessionStore {
                 // call sequence a restore's cold fold performs (live ≡ replay, the one
                 // rule ./turn-projector.ts is built on).
                 const projector = this.projectorFor(session, turn);
-                const record = copyEvent(event);
+                const record: SessionTurnEvent = copyEvent(event);
+                // DISPLAY LANE (C1): stamped here, at record time, from the conversation's
+                // CURRENT lane (see `contextLaneOf` for why it is re-read per event rather
+                // than cached at turn start). A lane of 0 is NOT written, so an ordinary
+                // turn's events keep the exact bytes — and the exact journal lines — they
+                // had before lanes existed, and the display fold omits `ContextBlock.lane`.
+                //
+                // This is the ONLY place the number enters the record. Nothing in the
+                // runtime reports a lane (a `HarnessEvent` knows nothing about the bar), and
+                // nothing downstream may invent one: the fold copies it, the journal and the
+                // document persist it verbatim, a renderer only groups by it.
+                const lane = this.contextLaneOf(session, turn.threadId);
+
+                if (lane !== 0) record.lane = lane;
+
                 const at = Date.now();
                 turn.events.push(record);
                 turn.eventTimes?.push(at);
@@ -8778,10 +8857,21 @@ export class SessionStore {
         const previousStartedAt = turn.startedAt;
         const previousUpdatedAt = turn.updatedAt;
         const previousUsage = turn.usage;
+        // The lane this row carried, so the rollback below can put it back exactly.
+        const previousLane = turn.lane;
 
         turn.status = 'queued';
         delete turn.startedAt;
         delete turn.usage;
+        // DISPLAY LANE (C1): restamped from the conversation as it is NOW, because the row
+        // is being put back in the shape a fresh submit mints (the paragraph above) and a
+        // fresh submit reads the thread's current lane. A compaction that landed while the
+        // run was being stopped has therefore moved the resumed row's starting point too;
+        // 0 clears the key, the same normalization every other write of this field uses.
+        const startingLane = this.contextLaneOf(session, turn.threadId);
+
+        if (startingLane === 0) delete turn.lane;
+        else turn.lane = startingLane;
         // Clients order rows by a monotonic `updatedAt` (./turn-projector.ts and the view
         // guards), so the requeue must stamp newer than the stop did or its upsert would drop.
         turn.updatedAt = now;
@@ -8856,6 +8946,11 @@ export class SessionStore {
             if (previousStartedAt !== undefined) turn.startedAt = previousStartedAt;
             if (previousUsage !== undefined) turn.usage = previousUsage;
             turn.updatedAt = previousUpdatedAt;
+            // The lane goes back with the rest of the row: a requeue that never became
+            // durable did not move the conversation, so its starting lane is the one the
+            // interrupted record carried (C1).
+            if (previousLane === undefined) delete turn.lane;
+            else turn.lane = previousLane;
 
             turn.events.push(...droppedEvents);
             if (turn.eventTimes !== undefined && droppedTimes !== undefined) turn.eventTimes.push(...droppedTimes);

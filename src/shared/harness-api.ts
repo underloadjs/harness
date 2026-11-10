@@ -2113,6 +2113,7 @@ export interface ContextBlock {
     id: string;
     turnId: string;
     sectionId: string;
+    lane?: number;
     name?: string;
     label?: string;
     chars: number;

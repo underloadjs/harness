@@ -501,3 +501,79 @@ describe('node:insert ownership (T23, R23)', () => {
         expect(display.sections[0].nodes[0]).toEqual({ kind: 'reasoning', id: 'n0', text: 'zero', chars: 4 });
     });
 });
+
+// ---------------------------------------------------------------------------
+// The lane (C2): which stacked ROW of the one bar a segment belongs to
+// ---------------------------------------------------------------------------
+//
+// `../shared/turn-display.ts:474-491` states the rule the reducer has to honour: the
+// projector stamps `lane` when it mints a block and NEVER rewrites it, so the state half has
+// exactly two obligations — carry the published value through an add, and make sure no patch
+// can move it. `ContextBlockPatch` declares no `lane`, and `contextBlockLaneOf`
+// (./view-context.ts) reads an absent lane as 0, so a lost lane is a silently flattened bar:
+// a compaction stops being two rows and nothing else in the pipeline notices.
+describe('the lane a block was minted with', () => {
+    it('carries a published lane through an add, verbatim', () => {
+        const display = displayOf([section()]);
+
+        expect(apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block({ lane: 1 }) })).toBe(true);
+
+        // Exact and complete: the stored record is the delivered one, lane included.
+        expect(display.sections[0].context).toEqual([block({ lane: 1 })]);
+        expect(display.sections[0].context?.[0].lane).toBe(1);
+    });
+
+    it('treats lane 0 as a published value, not as an absence', () => {
+        // The projector says `lane: 0` for everything before the first compaction. A reducer
+        // that dropped falsy values would make the FIRST row indistinguishable from "no lane
+        // data", and `contextBarShowsLaneTagsOf` would stop labelling a bar that starts at a
+        // higher lane (./view-context.ts `contextBarShowsLaneTagsOf`).
+        const display = displayOf([section()]);
+
+        apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block({ lane: 0 }) });
+
+        expect(display.sections[0].context?.[0].lane).toBe(0);
+        expect('lane' in (display.sections[0].context?.[0] as ContextBlock)).toBe(true);
+    });
+
+    it('mints no lane for a record that never published one', () => {
+        // The other direction matters just as much: synthesizing `lane: 0` here would turn
+        // every legacy frame into an explicitly-first-row record, and a bar of mixed
+        // lane-less and lane-1 blocks would order by insertion instead of by lane.
+        const display = displayOf([section()]);
+
+        apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block() });
+
+        expect('lane' in (display.sections[0].context?.[0] as ContextBlock)).toBe(false);
+        expect(display.sections[0].context).toEqual([block()]);
+    });
+
+    it('never lets a patch move a lane, whatever a stale producer sends', () => {
+        const display = displayOf([section({ context: [block({ lane: 2 })] })]);
+
+        apply(display, {
+            op: 'context:set',
+            turnId: 't1',
+            sectionId: 't1:0',
+            blockId: '0-tool-7',
+            // Read structurally: `lane` is NOT in `ContextBlockPatch`, so a producer that
+            // patches one anyway is out of contract and the reducer must ignore it.
+            patch: { chars: 80, lane: 5 } as never
+        });
+
+        // The patched figure landed, the identity-shaped figure did not.
+        expect(display.sections[0].context?.[0].chars).toBe(80);
+        expect(display.sections[0].context?.[0].lane).toBe(2);
+    });
+
+    it('moves the lane only when a whole record replaces it', () => {
+        // A re-delivered `context:add` REPLACES the stored record (the reconnect path), which
+        // is the one documented way a lane changes: the new whole record states it.
+        const display = displayOf([section({ context: [block({ lane: 0 })] })]);
+
+        expect(apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block({ lane: 1 }) })).toBe(true);
+
+        expect(display.sections[0].context).toEqual([block({ lane: 1 })]);
+        expect(display.sections[0].context).toHaveLength(1);
+    });
+});

@@ -304,6 +304,14 @@ export const projectBlock = (block: WireContextBlock): ContextBlock => {
         id: block.id,
         turnId: block.turnId,
         sectionId: block.sectionId,
+        // C2: the DISPLAY LANE, copied ONLY when the wire stated it — the same idiom as every
+        // optional field here. Absent means lane 0 and `view-context.ts` owns that reading
+        // (`contextBlockLaneOf`); a projection that defaulted it to 0 would be synthesizing a
+        // number the server never sent, which the contract forbids
+        // (../shared/turn-display.ts:479-483). It is metadata only, so nothing downstream
+        // rewrites it: `ContextBlockPatch` has no `lane` key, so `context:set` cannot move a
+        // block between rows (that is a remove + add pair).
+        ...(block.lane === undefined ? {} : { lane: block.lane }),
         // `name` is the projector's spelling and the one this server sends; `label` is
         // the optional older spelling; `kind` is the last resort, never an empty string.
         name: block.name ?? block.label ?? block.kind,

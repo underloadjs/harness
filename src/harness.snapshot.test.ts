@@ -1955,3 +1955,167 @@ describe('task store snapshot/restore (T1)', () => {
 
 
 });
+
+// ---------------------------------------------------------------------------
+// DISPLAY LANE (C1) — the per-conversation number the context bar stacks rows by.
+//
+// `contextLane` is OPTIONAL on a host thread and the writer never emits a 0: the
+// plugin setter DELETES the key for 0 (./harness.ts `setThreadContextLane`) and the
+// reader normalizes a written 0 away (./core/snapshot.ts `readThreads`), so a
+// conversation that never compacted keeps its exact pre-lane document.
+//
+// These tests drive the READER with a hand-written lane, because the lane has no
+// public setter on the harness facade: only a plugin host can raise one
+// (./plugins/context-compaction.plugin.ts is the only producer in the product), and
+// the write/live side of the same field is pinned in ./server/threads.test.ts. What
+// is pinned here is what a host's `state.json` is allowed to say, plus the one
+// inheritance rule of minting a thread (NOTE-6, the last test below).
+// ---------------------------------------------------------------------------
+describe('snapshot persistence of the display lane', () => {
+    // A one-thread harness, so `snapshot().threads[0]` is the record the reader walks
+    // (./core/snapshot.ts `readThreads` labels entries exactly that way).
+    const laneSession = (): Harness => {
+        const session = harness({
+            agents: {
+                writer: agent({ model: 'merge/ds4-flash', stream: scripted([answer('idle')]) })
+            },
+            primary: 'writer',
+            presets: false
+        });
+
+        session.createThread('writer', { label: 'Lane' });
+
+        return session;
+    };
+
+    // The persisted thread record, as the reader sees it.
+    const threadOf = (snapshot: HarnessSnapshot): Record<string, unknown> =>
+        snapshot.threads![0] as unknown as Record<string, unknown>;
+
+    it('writes no lane key for a thread that never compacted, and restores the lane a host document carries', () => {
+        const plain = clone(laneSession().snapshot());
+
+        // Absence is the canonical shape: `snapshot()` emits no key while the lane is 0.
+        expect(JSON.stringify(plain)).not.toContain('contextLane');
+
+        const written = clone(plain);
+        threadOf(written).contextLane = 2;
+
+        const target = laneSession();
+        target.restore(written);
+
+        // The lane survives as a number on the record, and it is LIVE state rather
+        // than inert bytes: the thread accessor the context-bar stamp reads sees it.
+        expect(threadOf(target.snapshot()).contextLane).toBe(2);
+        expect(target.thread(String(threadOf(written).id))?.contextLane).toBe(2);
+
+        // Re-saving is lossless and stable, and a second restore of the same document
+        // replaces rather than duplicates or re-normalizes.
+        expect(target.snapshot()).toEqual(written);
+        target.restore(written);
+        expect(target.snapshot()).toEqual(written);
+    });
+
+    it('normalizes a hand-written `contextLane: 0` back to the omitted form', () => {
+        const plain = clone(laneSession().snapshot());
+
+        const zero = clone(plain);
+        threadOf(zero).contextLane = 0;
+
+        const target = laneSession();
+        expect(() => target.restore(zero)).not.toThrow();
+
+        // A lane of 0 is what absence already means, so the restored document is
+        // byte-identical to one that never carried the key — a session that never
+        // compacted cannot accumulate a lane field through save/restore cycles.
+        expect(JSON.stringify(target.snapshot())).not.toContain('contextLane');
+        expect(target.snapshot()).toEqual(plain);
+        expect(target.thread(String(threadOf(plain).id))?.contextLane).toBeUndefined();
+    });
+
+    it('refuses a lane a renderer could not sort, and leaves the target untouched', () => {
+        const plain = clone(laneSession().snapshot());
+
+        // The reader is the shared `readSnapshotInteger` (./core/snapshot-validation.ts),
+        // so a non-number and a fraction both fail its safe-integer check, and a
+        // negative fails the bound — no lane is restored at all, which is what protects
+        // a bar from an unsortable row rather than guessing a default.
+        const rejections = [
+            { value: 'one', message: 'snapshot.threads[0].contextLane must be a safe integer.' },
+            { value: 1.5, message: 'snapshot.threads[0].contextLane must be a safe integer.' },
+            { value: -1, message: 'snapshot.threads[0].contextLane must be between 0 and Infinity.' }
+        ];
+
+        for (const { value, message } of rejections) {
+            const invalid = clone(plain);
+            threadOf(invalid).contextLane = value;
+
+            const target = laneSession();
+            const before = target.snapshot();
+
+            expect(() => target.restore(invalid)).toThrow(message);
+            expect(target.snapshot()).toEqual(before);
+        }
+    });
+
+    // NOTE-6 — the ONE inheritance decision this field has, pinned so a future edit cannot
+    // flip it silently: a conversation minted by `createThread` starts at lane 0 EVEN WHEN it
+    // is created from a conversation that already sits on a lane. `ownerThreadId` is an
+    // OWNERSHIP link (scheduling, deletion, the resume path), while a lane is one
+    // conversation's own compaction history — the two stacked rows a bump paints describe
+    // what THAT conversation remembers, which a brand-new conversation does not have
+    // (./harness.ts:5045-5051 leaves the key out of the fresh record on purpose). Ownership
+    // travels, the lane does not, and every other record copy keeps the source's lane
+    // (`threadRecordCopy` is a spread, ./harness.ts:4689; `restore()` re-creates the record
+    // field-for-field, pinned above).
+    it('mints a new conversation at lane 0 instead of inheriting its owner lane', () => {
+        const plain = clone(laneSession().snapshot());
+
+        // Lane 3 on the only host thread, hand-written the way the tests above do it (the
+        // plugin setter is the product's only producer, so the reader is the seam here).
+        threadOf(plain).contextLane = 3;
+
+        const session = laneSession();
+        session.restore(plain);
+
+        const ownerId = String(threadOf(plain).id);
+
+        // A RECORD COPY preserves the lane — both read paths the facade exposes return one
+        // (`threads()` and `thread()` are both `threadRecordCopy` maps), which is what makes
+        // the absence below a creation decision rather than a copy dropping a field.
+        expect(session.thread(ownerId)?.contextLane).toBe(3);
+        expect(session.threads().find((thread) => thread.id === ownerId)?.contextLane).toBe(3);
+
+        // A delegation child OF the lanned conversation: the same creation call, one key
+        // present and one absent.
+        const child = session.createThread('writer', { label: 'Child', ownerThreadId: ownerId });
+
+        expect(Object.hasOwn(child, 'contextLane')).toBe(false);
+        expect(Object.hasOwn(session.thread(child.id) ?? {}, 'contextLane')).toBe(false);
+        expect(child.ownerThreadId).toBe(ownerId);
+
+        // The owner keeps its lane, so nothing moved on the conversation the child came from.
+        expect(session.thread(ownerId)?.contextLane).toBe(3);
+
+        // THE PERSISTED DOCUMENT says exactly that: one lane key, on one thread. Written the
+        // way `snapshot()` writes it — the child's row keeps its pre-lane shape (no key, not
+        // a `contextLane: 0`), which is what a never-compacted conversation always had.
+        const saved = session.snapshot();
+        const rows = saved.threads as unknown as Record<string, unknown>[];
+        const ownerRow = rows.find((row) => row.id === ownerId);
+        const childRow = rows.find((row) => row.id === child.id);
+
+        expect(ownerRow?.contextLane).toBe(3);
+        expect(childRow?.ownerThreadId).toBe(ownerId);
+        expect(Object.hasOwn(childRow ?? {}, 'contextLane')).toBe(false);
+
+        // The pair survives a second round trip unchanged: the lane stays on its own
+        // conversation and never leaks onto the row created next to it.
+        const again = laneSession();
+        again.restore(saved);
+
+        expect(again.snapshot()).toEqual(saved);
+        expect(again.thread(child.id)?.contextLane).toBeUndefined();
+        expect(again.thread(ownerId)?.contextLane).toBe(3);
+    });
+});

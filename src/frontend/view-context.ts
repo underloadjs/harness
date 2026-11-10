@@ -46,6 +46,17 @@
 //      stays clickable beside a 40,000-character result. The floors are display rules, never
 //      claims about the data: the tooltip and the accessible label always carry the true
 //      figures, and the accessible name says which axis is which.
+//   2b. LANES (C2), stacked rows of the SAME instrument: `ContextBlock.lane` (absent ⇒ 0,
+//      integer >= 0, mint-assigned and immutable — src/shared/turn-display.ts:474-491) says
+//      WHICH ROW a segment belongs to. `layoutContextBar` groups by lane, lays each group out
+//      by rule 2 AS ITS OWN STRIP (own gap shrinking, own water-filled time shares, own
+//      `maxChars` height denominator), and stacks the strips with lane 0 topmost and lanes
+//      ascending downward. Rows exist only for lanes the blocks actually occupy — a gap in the
+//      lane numbers is no row — and a bar with one lane is byte for byte the single strip rule
+//      2 always produced, which is the parity the renderer and stylesheet must never break.
+//      Per-row normalization is the whole point: a compaction mints a lane, and that lane's
+//      row is as readable as the first one, so "one compaction → two rows" is visible without
+//      anyone re-reading a tooltip.
 //   3. TONE comes from `kind` + `state` ONLY (the server decides, the renderer colours):
 //      a settled tool is green, a failed/cancelled tool red, a running tool faded green,
 //      reasoning amber, and `user`/`system`/`assistant` neutral. No text is ever
@@ -158,6 +169,13 @@ export const CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX = 3;
 // a strip with no characters. A strip WITH content is sized by `layout.heightPx` (T26), which
 // both modes set inline, so this constant is the floor and the empty case only.
 export const CONTEXT_BAR_TRACK_HEIGHT_PX = 18;
+
+// C2 (multi-lane): the visible separation between two LANES (rows) of one bar. It is the
+// same 2px as the segment gap so a stacked bar reads as one instrument with banded rows
+// rather than as N separate widgets, and `styles.css` states the same number as
+// `--context-bar-row-gap` on `.context-bar-rows`, so DOM stacking and the canvas' row bands
+// (which are computed here, not by CSS) cannot drift.
+export const CONTEXT_BAR_ROW_GAP_PX = 2;
 
 // A host that has not been laid out yet (a detached tile, a collapsed conversation, a
 // jsdom test) reports no width. Rather than zero-width segments, the painter uses this
@@ -406,6 +424,58 @@ const stateWordOf = (block: ContextBlock): string =>
     block.kind === 'tool' && block.state !== undefined ? block.state : '';
 
 /**
+ * The DISPLAY LANE of one block, defensively read.
+ *
+ * The contract (../shared/turn-display.ts:474-491) says `lane` is absent for lane 0 and an
+ * integer >= 0 when present, and that a renderer never synthesizes a different number. A
+ * malformed figure (a float, a negative, a string, NaN) is therefore NOT a lane to honour:
+ * it is a producer that said nothing usable, and the honest reading is the contract's own
+ * default, lane 0 — never a coerced `-1` row or a row that cannot be labelled.
+ */
+export const contextBlockLaneOf = (block: ContextBlock): number => {
+    const lane = block.lane;
+
+    return typeof lane === 'number' && Number.isInteger(lane) && lane >= 0 ? lane : 0;
+};
+
+/**
+ * Every lane this bar's blocks actually occupy, ASCENDING, with gaps skipped.
+ *
+ * Rows exist only for lanes that are present: a bar whose blocks jump from lane 0 to lane 3
+ * is TWO rows, not four, because a lane the server never minted has nothing to draw and an
+ * empty band would read as a compaction that did not happen. The order is the locked UI
+ * decision — lane 0 topmost, lanes ascending downward.
+ */
+export const contextBarLanesOf = (blocks: readonly ContextBlock[]): number[] => {
+    const lanes = new Set<number>();
+
+    for (const block of blocks) lanes.add(contextBlockLaneOf(block));
+
+    return [...lanes].sort((left, right) => left - right);
+};
+
+/**
+ * Whether the bar shows its per-row lane tags (the multi-lane CUE).
+ *
+ * A single-row bar on lane 0 — every bar produced before compaction, and every bar a
+ * compaction-less turn still produces — shows NOTHING new: the tag would repeat a fact the
+ * reader cannot get wrong. The cue appears exactly when the reader could: more than one row,
+ * or a bar whose only lane is not lane 0 (a thread whose lane-0 blocks were dropped, which
+ * would otherwise read as an ordinary one-row bar).
+ */
+export const contextBarShowsLaneTagsOf = (lanes: readonly number[]): boolean =>
+    lanes.length > 1 || (lanes.length === 1 && lanes[0] > 0);
+
+/** The tag one row carries: `L0`, `L1`, ... Short on purpose — it sits inside the track. */
+export const contextBarLaneTagOf = (lane: number): string => `L${lane}`;
+
+/**
+ * What a row announces to a screen reader instead of the tag it paints: the tag's number in
+ * words, plus the unit, so "L1" is never the only place the fact lives.
+ */
+export const contextBarLaneLabelOf = (lane: number): string => `context bar lane ${lane}`;
+
+/**
  * The full hover/accessible text of ONE segment: name, type, state, exact characters
  * (with the args+result split for a tool), time taken, and the honest note when the
  * server says the bytes were not replayed into the prompt.
@@ -462,12 +532,22 @@ export const contextSegmentLabelOf = (block: ContextBlock, index: number, total:
  *   empty (authoritative)  `no recorded context`
  *   one segment            `1 segment`
  *   two or more            `12 segments`
+ *   two or more LANES      `12 segments · 2 lanes` (C2 — the compaction cue)
  */
 export const contextBarStatsOf = (model: ContextBarModel): string => {
     const count = model.blocks.length;
     if (count === 0) return 'no recorded context';
 
-    return `${count} ${count === 1 ? 'segment' : 'segments'}`;
+    const text = `${count} ${count === 1 ? 'segment' : 'segments'}`;
+
+    // C2: one compaction means one more row, and the row heights are normalized PER ROW, so
+    // the count alone would understate what the reader is looking at. The suffix appears ONLY
+    // past one lane — a one-lane bar says exactly what it always said — and it names lanes,
+    // never "turns" or "compactions", because the lane number is opaque UI metadata
+    // (../shared/turn-display.ts:487) and only the server knows what minted one.
+    const lanes = contextBarLanesOf(model.blocks).length;
+
+    return lanes > 1 ? `${text} · ${lanes} lanes` : text;
 };
 
 /**
@@ -1114,6 +1194,11 @@ export const contextTailShowsProse = (section: TurnSection | undefined, nodeId: 
 // ---------------------------------------------------------------------------
 
 export type ContextBarSegmentLayout = {
+    /**
+     * Position of this segment's block in the FLAT block list the layout was built from — the
+     * index a tile activates by and the index its `data-index` carries. It is NOT the position
+     * inside the row: with several lanes, row 1 may start at index 7.
+     */
     index: number;
     block: ContextBlock;
     /** The exact character count this segment stands for — the HEIGHT weight. */
@@ -1140,18 +1225,69 @@ export type ContextBarSegmentLayout = {
      * line-heights and a small-but-real block is still a visible bar.
      */
     heightPx: number;
+    /**
+     * C2: the LANE this segment belongs to (`block.lane`, absent ⇒ 0), and the ORDINAL of the
+     * row that lane draws (0 = topmost, ascending downward). `row` is the index into
+     * `layout.rows`, which is where the row's band (`offsetY` / `heightPx`) lives — the two
+     * are stated here so a renderer never re-derives a grouping the model already decided.
+     */
+    lane: number;
+    row: number;
+};
+
+/**
+ * ONE row of a multi-lane bar (C2): the lane, the band it occupies in the stacked bar, and
+ * the geometry that lane's blocks were laid out with.
+ *
+ * Every width and height figure below is computed for THIS ROW ALONE — its own gap shrinking,
+ * its own water-filled time shares, its own `maxChars` height denominator. That independence
+ * is the point: a compaction's second row stays readable no matter how large the first row's
+ * biggest block was, which is what makes "one compaction → two rows" legible instead of a row
+ * of flat hairlines.
+ */
+export type ContextBarRowLayout = {
+    /** The lane this row renders. */
+    lane: number;
+    /** Row ordinal inside this bar: 0 = topmost, ascending downward. */
+    row: number;
+    /** Band top in CSS pixels, measured from the top of the WHOLE bar (canvas and DOM agree). */
+    offsetY: number;
+    /** Band height in CSS pixels: this row's tallest bar (or the base box for an empty bar). */
+    heightPx: number;
+    /** The gap actually applied inside this row (shrunk per row when it cannot fit). */
+    gapPx: number;
+    /** Width left for this row's segments: `width - gapPx * (n - 1)`. */
+    trackPx: number;
+    /** The aim floor THIS row could afford (it shrinks with the row's own segment count). */
+    minSegmentPx: number;
+    /** The baseline width THIS row gives a segment with no recorded span. */
+    unknownDurationPx: number;
+    /** Right edge of this row's last segment — what its own pointer test must reject beyond. */
+    rightEdge: number;
+    /** This row's height denominator: the largest `chars` figure IN THIS ROW. */
+    maxChars: number;
+    /** How many of this row's segments paint at the honest baseline width. */
+    durationsUnknown: number;
+    /** Sum of this row's recorded spans, or undefined when this row has none at all. */
+    totalDurationMs: number | undefined;
+    /** This row's segments, in display order — the same objects that appear in `layout.segments`. */
+    segments: ContextBarSegmentLayout[];
 };
 
 export type ContextBarLayout = {
-    /** The width the geometry was computed for. */
+    /** The width the geometry was computed for (every row is laid out at this same width). */
     width: number;
-    /** The gap actually applied (the requested gap, shrunk when it cannot fit). */
+    /**
+     * The gap actually applied (the requested gap, shrunk when it cannot fit). With several
+     * lanes each row shrinks its OWN gap, and this is the TOP row's figure — the per-row
+     * authority is `rows[i].gapPx`. A one-lane bar has one row, so the two are the same.
+     */
     gapPx: number;
-    /** Width left for the segments themselves: `width - gapPx * (n - 1)`. */
+    /** Width left for the segments themselves: `width - gapPx * (n - 1)` (the top row's). */
     trackPx: number;
-    /** The minimum segment width actually applied (the floor, shrunk when it cannot fit). */
+    /** The minimum segment width actually applied (the floor, shrunk when it cannot fit; the top row's). */
     minSegmentPx: number;
-    /** The baseline width actually applied to a segment with no recorded span. */
+    /** The baseline width actually applied to a segment with no recorded span (the top row's). */
     unknownDurationPx: number;
     /** How many segments took that baseline (R27: the strip's unmeasured count). */
     durationsUnknown: number;
@@ -1163,16 +1299,35 @@ export type ContextBarLayout = {
     maxHeightPx: number;
     /** The shortest bar a block with recorded characters can paint. */
     minSegmentHeightPx: number;
-    /** The largest `chars` figure in this strip — the height denominator. */
+    /**
+     * The largest `chars` figure in the WHOLE bar — the biggest of the per-row denominators.
+     * Every row normalizes against its OWN figure (`rows[i].maxChars`); this is the bar-level
+     * figure the element publishes as `data-max-chars`.
+     */
     maxChars: number;
     /**
-     * The strip's own physical box: the tallest bar it paints (so a canvas and a flex row
-     * reserve the same rectangle), or `CONTEXT_BAR_TRACK_HEIGHT_PX` for an empty strip, which
-     * is the box the dashed "nothing recorded" affordance needs.
+     * The bar's physical box, top edge to bottom edge: every row's `heightPx` plus the gaps
+     * between them. ONE row makes this exactly that row's box — the tallest bar it paints (so a
+     * canvas and a flex row reserve the same rectangle), or `CONTEXT_BAR_TRACK_HEIGHT_PX` for an
+     * empty strip, which is the box the dashed "nothing recorded" affordance needs.
      */
     heightPx: number;
+    /** Lanes this bar's blocks actually occupy: ascending, gaps skipped, [] when empty (C2). */
+    lanes: number[];
+    /** The separation applied BETWEEN rows (C2; `CONTEXT_BAR_ROW_GAP_PX`). */
+    rowGapPx: number;
+    /**
+     * One entry per lane present, topmost first — always at least one, because an empty bar
+     * still reserves its one dashed lane-0 box.
+     */
+    rows: ContextBarRowLayout[];
+    /**
+     * Every segment of every row, ROW-GROUPED (all of row 0, then all of row 1, ...): the order
+     * both renderers paint, tab through, and list for a screen reader, and the order the
+     * keyboard's Home/End/arrows walk. A one-lane bar makes this exactly the input order.
+     */
     segments: ContextBarSegmentLayout[];
-    /** Right edge of the last segment: what a pointer test must reject beyond. */
+    /** Right edge of the widest row's last segment: what a pointer test must reject beyond. */
     rightEdge: number;
 };
 
@@ -1322,48 +1477,61 @@ export const contextBarHeightsOf = (
     return clean.map((value) => Math.min(maxHeightPx, Math.max(minSegmentHeightPx, Math.round((maxHeightPx * value) / maxChars))));
 };
 
+/** Options `layoutContextBar` accepts; every figure has a shared default both modes agree on. */
+type ContextBarLayoutOptions = {
+    gapPx?: number;
+    minSegmentPx?: number;
+    unknownDurationPx?: number;
+    lineHeightPx?: number;
+    maxHeightPx?: number;
+    minSegmentHeightPx?: number;
+};
+
+/** The resolved vertical scale, computed ONCE per bar and handed to every row. */
+type ContextBarVerticalScale = {
+    lineHeightPx: number;
+    maxHeightPx: number;
+    minSegmentHeightPx: number;
+};
+
+/** The figures ONE strip (one lane's row) lays out with — the whole of `ContextBarLayout`
+ *  except the bar-level fields (lanes, rows, the stacked box) it does not own. */
+type ContextBarStripGeometry = {
+    gapPx: number;
+    trackPx: number;
+    minSegmentPx: number;
+    unknownDurationPx: number;
+    durationsUnknown: number;
+    totalDurationMs: number | undefined;
+    maxChars: number;
+    heightPx: number;
+    segments: ContextBarSegmentLayout[];
+    rightEdge: number;
+};
+
 /**
- * Pixel geometry for one bar, both axes (T26, R27).
+ * One ROW's geometry: the single-pass arithmetic T26 (R27) established, run for the blocks of
+ * ONE lane.
  *
- * Deterministic and total-exact: the horizontal edges come from rounding the CUMULATIVE
- * share, so rounding cannot drift a segment out of the track and the right edge of the last
- * segment is the width the painter has; segments follow each other SEQUENTIALLY (never an
- * absolute overlapping timeline). The vertical band comes from `contextBarHeightsOf`, and
- * `heightPx` is the tallest bar in the strip so both renderers reserve the same box and seat
- * every bar on its bottom edge. The gap and both floors shrink when they cannot fit (a
- * 3,000-segment turn in a 600px track), which is honest: below ~2px a proportion is not
- * visible anyway, and the tooltip still carries the true counts.
+ * C2 factors it out of `layoutContextBar` rather than rewriting it so the arithmetic stays
+ * literally the same code a one-lane bar has always run: the same gap shrinking, the same
+ * water-filled duration shares, the same per-strip height denominator. Passing `indices`
+ * (each block's position in the FLAT block list) is the only new input — a row's segments
+ * still report the index the tile activates by and the `data-index` the reader reads.
  */
-export const layoutContextBar = (
+const layoutContextBarStrip = (
     blocks: readonly ContextBlock[],
+    indices: readonly number[],
+    lane: number,
+    row: number,
     width: number,
-    options: {
-        gapPx?: number;
-        minSegmentPx?: number;
-        unknownDurationPx?: number;
-        lineHeightPx?: number;
-        maxHeightPx?: number;
-        minSegmentHeightPx?: number;
-    } = {}
-): ContextBarLayout => {
+    options: ContextBarLayoutOptions,
+    scale: ContextBarVerticalScale
+): ContextBarStripGeometry => {
+    const { lineHeightPx, maxHeightPx, minSegmentHeightPx } = scale;
     const n = blocks.length;
     const requestedGap = options.gapPx ?? CONTEXT_BAR_GAP_PX;
     const requestedMin = options.minSegmentPx ?? CONTEXT_BAR_MIN_SEGMENT_PX;
-    const safeWidth = Number.isFinite(width) && width > 0 ? width : CONTEXT_BAR_FALLBACK_WIDTH;
-
-    // The vertical scale comes from the HOST first (./ui/context-bar.ts resolves the real
-    // line-height, so "2 line-heights" survives a font or theme change), then from the shared
-    // constants. CSS pixels throughout: `devicePixelRatio` only ever scales the canvas BACKING
-    // STORE, so two line-heights are the same physical height in both modes and at any zoom.
-    const requestedLine = options.lineHeightPx ?? CONTEXT_BAR_LINE_HEIGHT_PX;
-    const lineHeightPx = Number.isFinite(requestedLine) && requestedLine > 0 ? requestedLine : CONTEXT_BAR_LINE_HEIGHT_PX;
-    const requestedMax = options.maxHeightPx ?? lineHeightPx * CONTEXT_BAR_MAX_HEIGHT_LINES;
-    const maxHeightPx = Number.isFinite(requestedMax) && requestedMax > 0 ? Math.round(requestedMax) : CONTEXT_BAR_MAX_TRACK_HEIGHT_PX;
-    const requestedBarMin = options.minSegmentHeightPx ?? CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX;
-    const minSegmentHeightPx =
-        Number.isFinite(requestedBarMin) && requestedBarMin > 0
-            ? Math.min(maxHeightPx, Math.round(requestedBarMin))
-            : Math.min(maxHeightPx, CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
 
     // The two axes, read once per segment from the server's own figures: `chars` for the
     // vertical, the recorded span for the horizontal.
@@ -1379,16 +1547,12 @@ export const layoutContextBar = (
 
     if (n === 0)
         return {
-            width: safeWidth,
             gapPx: 0,
-            trackPx: safeWidth,
+            trackPx: width,
             minSegmentPx: 0,
             unknownDurationPx: 0,
             durationsUnknown: 0,
             totalDurationMs: undefined,
-            lineHeightPx,
-            maxHeightPx,
-            minSegmentHeightPx,
             maxChars: 0,
             // An empty strip reserves the base box: that is the rectangle the dashed "nothing
             // recorded" affordance in `styles.css` draws.
@@ -1398,9 +1562,9 @@ export const layoutContextBar = (
         };
 
     // Gaps first, but never so many that a segment loses its last pixel.
-    const maxGap = n > 1 ? Math.max(0, Math.floor((safeWidth - n) / (n - 1))) : 0;
+    const maxGap = n > 1 ? Math.max(0, Math.floor((width - n) / (n - 1))) : 0;
     const gapPx = Math.max(0, Math.min(requestedGap, maxGap));
-    const trackPx = Math.max(0, safeWidth - gapPx * (n - 1));
+    const trackPx = Math.max(0, width - gapPx * (n - 1));
 
     // Then the two width floors: the aimable minimum, and the baseline for a span the record
     // never bracketed. Both shrink to what the track can actually afford.
@@ -1426,7 +1590,7 @@ export const layoutContextBar = (
         const painted = Math.max(1, Math.round(end) - x);
 
         segments.push({
-            index: i,
+            index: indices[i],
             block,
             chars: chars[i],
             durationMs: durations[i],
@@ -1435,23 +1599,21 @@ export const layoutContextBar = (
             x,
             width: painted,
             heightShare: maxChars === 0 ? 0 : chars[i] / maxChars,
-            heightPx: heights[i]
+            heightPx: heights[i],
+            lane,
+            row
         });
 
         cursor = end + gapPx;
     }
 
     return {
-        width: safeWidth,
         gapPx,
         trackPx,
         minSegmentPx,
         unknownDurationPx,
         durationsUnknown,
         totalDurationMs,
-        lineHeightPx,
-        maxHeightPx,
-        minSegmentHeightPx,
         maxChars,
         // The strip's box is its tallest bar: two line-heights when anything was recorded, the
         // minimum bar height when the whole strip recorded zero characters.
@@ -1462,36 +1624,230 @@ export const layoutContextBar = (
 };
 
 /**
+ * Pixel geometry for one bar, both axes (T26, R27) and every lane it stacks (C2).
+ *
+ * Deterministic and total-exact: the horizontal edges come from rounding the CUMULATIVE
+ * share, so rounding cannot drift a segment out of the track and the right edge of the last
+ * segment is the width the painter has; segments follow each other SEQUENTIALLY (never an
+ * absolute overlapping timeline). The vertical band comes from `contextBarHeightsOf`, and
+ * `heightPx` is the tallest bar in the strip so both renderers reserve the same box and seat
+ * every bar on its bottom edge. The gap and both floors shrink when they cannot fit (a
+ * 3,000-segment turn in a 600px track), which is honest: below ~2px a proportion is not
+ * visible anyway, and the tooltip still carries the true counts.
+ *
+ * THE LANES (C2, and the reason a compaction is visible): blocks are grouped by `lane`
+ * (absent ⇒ lane 0) and each group is laid out by the pass above AS ITS OWN STRIP, so the
+ * width shares, the gap shrinking and the height normalization are all PER ROW. `rows` then
+ * stacks those strips — lane 0 topmost, lanes ascending downward, `CONTEXT_BAR_ROW_GAP_PX`
+ * apart — and only the lanes that have blocks get a row.
+ *
+ * PARITY (the locked decision): a bar whose blocks are all lane 0 (or lane-absent) has exactly
+ * ONE row, and every bar-level figure below is that row's figure, so its segments carry byte
+ * for byte the x/width/heightPx/rightEdge they always did and `heightPx` is still the single
+ * strip's box, not a stacked total.
+ *
+ * `segments` is ROW-GROUPED (all of row 0, then all of row 1, ...): that is the order both
+ * renderers paint and tab through. With monotonic lanes — the only order the server mints,
+ * since a lane is assigned at mint time and never rewritten — that is also the input order.
+ */
+export const layoutContextBar = (
+    blocks: readonly ContextBlock[],
+    width: number,
+    options: ContextBarLayoutOptions = {}
+): ContextBarLayout => {
+    const safeWidth = Number.isFinite(width) && width > 0 ? width : CONTEXT_BAR_FALLBACK_WIDTH;
+
+    // The vertical scale comes from the HOST first (./ui/context-bar.ts resolves the real
+    // line-height, so "2 line-heights" survives a font or theme change), then from the shared
+    // constants. CSS pixels throughout: `devicePixelRatio` only ever scales the canvas BACKING
+    // STORE, so two line-heights are the same physical height in both modes and at any zoom.
+    // C2: resolved ONCE for the bar, because "two line-heights" is the same two lines in every
+    // row — only the DENOMINATOR (this row's biggest block) is per row.
+    const requestedLine = options.lineHeightPx ?? CONTEXT_BAR_LINE_HEIGHT_PX;
+    const lineHeightPx = Number.isFinite(requestedLine) && requestedLine > 0 ? requestedLine : CONTEXT_BAR_LINE_HEIGHT_PX;
+    const requestedMax = options.maxHeightPx ?? lineHeightPx * CONTEXT_BAR_MAX_HEIGHT_LINES;
+    const maxHeightPx = Number.isFinite(requestedMax) && requestedMax > 0 ? Math.round(requestedMax) : CONTEXT_BAR_MAX_TRACK_HEIGHT_PX;
+    const requestedBarMin = options.minSegmentHeightPx ?? CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX;
+    const minSegmentHeightPx =
+        Number.isFinite(requestedBarMin) && requestedBarMin > 0
+            ? Math.min(maxHeightPx, Math.round(requestedBarMin))
+            : Math.min(maxHeightPx, CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
+
+    // Grouping: one bucket per lane, in the order the blocks arrive, and each block keeps its
+    // position in the FLAT list (the activation index) beside it.
+    const lanes = contextBarLanesOf(blocks);
+    const buckets = new Map<number, { block: ContextBlock; index: number }[]>();
+
+    for (let i = 0; i < blocks.length; i += 1) {
+        const lane = contextBlockLaneOf(blocks[i]);
+        const bucket = buckets.get(lane);
+        const member = { block: blocks[i], index: i };
+
+        if (bucket === undefined) buckets.set(lane, [member]);
+        else bucket.push(member);
+    }
+
+    // An empty bar still has one row (lane 0): that is the dashed "nothing recorded" box
+    // `styles.css` draws, and both renderers need an element/canvas band to seat it on. The
+    // lane LIST stays empty because no block claimed a lane — the tag rule and the caption
+    // both read the blocks, not this placeholder.
+    const specs: { lane: number; members: { block: ContextBlock; index: number }[] }[] =
+        lanes.length === 0
+            ? [{ lane: 0, members: [] }]
+            : lanes.map((lane) => ({ lane, members: buckets.get(lane) ?? [] }));
+
+    const rows: ContextBarRowLayout[] = [];
+    const segments: ContextBarSegmentLayout[] = [];
+    let cursorY = 0;
+
+    for (let i = 0; i < specs.length; i += 1) {
+        const { lane, members } = specs[i];
+        // The gap between rows belongs to the seam, never above the first row or below the
+        // last — the same rule the segment gap follows inside a row.
+        if (i > 0) cursorY += CONTEXT_BAR_ROW_GAP_PX;
+
+        const strip = layoutContextBarStrip(
+            members.map((member) => member.block),
+            members.map((member) => member.index),
+            lane,
+            i,
+            safeWidth,
+            options,
+            { lineHeightPx, maxHeightPx, minSegmentHeightPx }
+        );
+
+        rows.push({
+            lane,
+            row: i,
+            offsetY: cursorY,
+            heightPx: strip.heightPx,
+            gapPx: strip.gapPx,
+            trackPx: strip.trackPx,
+            minSegmentPx: strip.minSegmentPx,
+            unknownDurationPx: strip.unknownDurationPx,
+            rightEdge: strip.rightEdge,
+            maxChars: strip.maxChars,
+            durationsUnknown: strip.durationsUnknown,
+            totalDurationMs: strip.totalDurationMs,
+            segments: strip.segments
+        });
+
+        segments.push(...strip.segments);
+        cursorY += strip.heightPx;
+    }
+
+    const first = rows[0];
+
+    return {
+        width: safeWidth,
+        // Bar-level reading of the per-row figures (documented on `ContextBarLayout`): the
+        // TOP row owns the horizontal knobs, because that is the row a reader's eye enters.
+        gapPx: first.gapPx,
+        trackPx: first.trackPx,
+        minSegmentPx: first.minSegmentPx,
+        unknownDurationPx: first.unknownDurationPx,
+        // The two figures a reader hears in the accessible name are bar-wide sums, so one row
+        // reports exactly its own numbers and several rows report the whole bar honestly.
+        durationsUnknown: rows.reduce((sum, row) => sum + row.durationsUnknown, 0),
+        totalDurationMs: rows.reduce<number | undefined>(
+            (sum, row) => (row.totalDurationMs === undefined ? sum : (sum ?? 0) + row.totalDurationMs),
+            undefined
+        ),
+        lineHeightPx,
+        maxHeightPx,
+        minSegmentHeightPx,
+        maxChars: rows.reduce((best, row) => (row.maxChars > best ? row.maxChars : best), 0),
+        // The bar's box: every row's height plus the seams between them. One row makes this
+        // exactly that row's box — the number `heightPx` has always been.
+        heightPx: cursorY,
+        lanes,
+        rowGapPx: CONTEXT_BAR_ROW_GAP_PX,
+        rows,
+        segments,
+        rightEdge: rows.reduce((best, row) => (row.rightEdge > best ? row.rightEdge : best), 0)
+    };
+};
+
+/**
+ * Which ROW a vertical position belongs to, or 0 for a bar with one row.
+ *
+ * THE BETWEEN-ROWS POLICY (C2, stated because both renderers implement exactly this): a row's
+ * aim band is the whole band, not the painted bars in it — the same column rule R27 applies
+ * horizontally, extended across the seam. Consecutive bands are split at the MIDPOINT of the
+ * seam between them (band i's bottom edge and band i+1's top edge), so:
+ *   - inside a band            -> that band's row;
+ *   - inside a seam            -> the nearer band, ties to the row ABOVE (the lower index);
+ *   - above the first band, or a y that is not a number -> row 0;
+ *   - below the last band      -> the LAST row, because the bar's remainder belongs to the
+ *     row that ends it, exactly as the last segment owns the remainder of its row.
+ */
+export const contextBarRowAt = (layout: ContextBarLayout, y: number): number => {
+    const rows = layout.rows;
+    if (rows.length <= 1) return 0;
+
+    const point = Number.isFinite(y) ? Math.max(0, y) : 0;
+
+    for (let i = 0; i < rows.length - 1; i += 1) {
+        const next = rows[i + 1];
+        if (point >= next.offsetY) continue;
+
+        // `point` is inside band i or inside the seam above it: the seam's midpoint splits it.
+        const seam = rows[i].offsetY + rows[i].heightPx;
+
+        return point <= (seam + next.offsetY) / 2 ? i : i + 1;
+    }
+
+    return rows.length - 1;
+};
+
+/**
  * Which segment a pointer is on, or -1 outside the bar.
  *
  * A hit inside a visible gap belongs to the NEARER neighbour: the gap is 2px of styling,
  * not a dead zone, and a reader aiming at a thin segment must not be told they missed.
- * Linear on purpose — this runs on a pointer event, not per frame — and bounded by
- * `rightEdge` so a click past the last segment is a miss.
+ * Linear on purpose — this runs on a pointer event, not per frame — and bounded by the
+ * resolved ROW's `rightEdge` so a click past that row's last segment is a miss (a wider row
+ * elsewhere in the bar does not make this row clickable).
  *
  * THE VERTICAL POLICY (T26, R27, stated because both renderers implement exactly this): the
  * strip is a COLUMN chart, so the aim target is the whole column, not only the painted bar.
  * A pointer in the blank area above a 6px bar still activates that segment. A 2px-tall bar
  * would otherwise be a target nobody could hit with a mouse, and the DOM mode reproduces the
  * same rule by falling back to this function when a click lands beside the buttons.
+ *
+ * THE ROW POLICY (C2): `y` picks the band, by `contextBarRowAt` — omitting it asks for the
+ * top of the bar, i.e. row 0. `x` then resolves inside THAT row only, exactly as it did when
+ * a bar had one row; a single-row bar answers exactly as it always did for any `y`.
  */
-export const contextBarSegmentAt = (layout: ContextBarLayout, x: number): number => {
+export const contextBarSegmentAt = (layout: ContextBarLayout, x: number, y = 0): number => {
     if (layout.segments.length === 0) return -1;
-    if (!Number.isFinite(x) || x < 0 || x > layout.rightEdge) return -1;
+    if (!Number.isFinite(x) || x < 0) return -1;
+
+    // A hand-built layout with no `rows` (a fixture, an older caller) is one row: fall back to
+    // the flat segment list rather than resolving against an empty band table.
+    const row = layout.rows.length > 0 ? layout.rows[contextBarRowAt(layout, y)] : undefined;
+    const segments = row === undefined ? layout.segments : row.segments;
+
+    if (segments.length === 0) return -1;
+    if (x > (row === undefined ? layout.rightEdge : row.rightEdge)) return -1;
 
     let previousEdge = -1;
+    let previousIndex = -1;
 
-    for (const segment of layout.segments) {
+    for (const segment of segments) {
         if (x >= segment.x && x < segment.x + segment.width) return segment.index;
 
         if (previousEdge !== -1 && x < segment.x) {
-            // Inside the gap between the previous segment and this one.
-            return x - previousEdge <= segment.x - x ? segment.index - 1 : segment.index;
+            // Inside the gap between the previous segment and this one. The neighbour is the
+            // PREVIOUS SEGMENT IN THIS ROW, not `index - 1`: with lanes the flat indices skip,
+            // and the reader aimed at the segment on this side of the gap.
+            return x - previousEdge <= segment.x - x ? previousIndex : segment.index;
         }
 
         previousEdge = segment.x + segment.width;
+        previousIndex = segment.index;
     }
 
-    // At or past the final edge: the last segment owns the remainder.
-    return layout.segments[layout.segments.length - 1].index;
+    // At or past the final edge: the last segment of this row owns the remainder.
+    return segments[segments.length - 1].index;
 };

@@ -472,6 +472,24 @@ export type ContextBlock = {
     turnId: string;
     sectionId: string;
     /**
+     * DISPLAY LANE — which stacked row of the context bar this segment belongs to
+     * (the bar renders one row per lane, so lane 1 sits under lane 0). Pure UI
+     * metadata: it is NEVER model-facing, so it never appears on `HarnessMessage`
+     * and no projection of it ever reaches the transcript.
+     *   - ABSENT means lane 0 (the default lane) — a producer that says nothing is
+     *     on lane 0, and a client never synthesizes a different number;
+     *   - when present it MUST be an integer >= 0 (no negative lanes, no floats);
+     *   - assigned at MINT time (the `context:add` that creates the block carries
+     *     it) and IMMUTABLE afterwards, so it is deliberately NOT a key of
+     *     `ContextBlockPatch` — a block that would change lanes is a
+     *     `context:remove` + `context:add` pair, exactly like an identity-field
+     *     change (see the patch doc comment below);
+     *   - a lane NUMBER is opaque here: the server wave owns what mints a new lane
+     *     (e.g. a compaction plugin incrementing the thread's current lane), and a
+     *     renderer only groups rows by it and never classifies text itself.
+     */
+    lane?: number;
+    /**
      * Display label, decided by the server so the renderer invents nothing: the
      * recorded tool name (`read`, `delegate`, …) for a tool block, and the fixed
      * strings `instructions` / `reasoning` / `answer` / `prompt` / `steer` for the
@@ -602,7 +620,10 @@ export type ContextBlock = {
 /**
  * What `context:set` may change. Identity fields (`id`, `kind`, `turnId`,
  * `sectionId`, `eventFrom`) are immutable — a block that would change one is a
- * `context:remove` + `context:add` pair instead, never a patch. Every count is a
+ * `context:remove` + `context:add` pair instead, never a patch. `lane` is
+ * immutable the SAME way (mint-assigned display metadata, `ContextBlock.lane`),
+ * so it is deliberately absent from this whitelist and a patch can never move a
+ * segment to another row. Every count is a
  * full replacement, not a delta: the projector sends the settled figure, so a client
  * accumulates nothing.
  */

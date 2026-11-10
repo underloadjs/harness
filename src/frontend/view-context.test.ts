@@ -24,6 +24,7 @@ import {
     CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
     CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
     CONTEXT_BAR_MIN_SEGMENT_PX,
+    CONTEXT_BAR_ROW_GAP_PX,
     CONTEXT_BAR_TONE_STYLES,
     CONTEXT_BAR_TRACK_HEIGHT_PX,
     CONTEXT_BAR_UNKNOWN_DURATION_PX,
@@ -31,11 +32,16 @@ import {
     CONTEXT_TAIL_PREVIEW_CHARS,
     contextBarDurationSharesOf,
     contextBarFiguresOf,
+    contextBarLaneLabelOf,
+    contextBarLaneTagOf,
+    contextBarLanesOf,
     contextBarHeightsOf,
     contextBarOf,
     contextBarReplacesChips,
+    contextBarRowAt,
     contextBarSegmentAt,
     contextBarSharesOf,
+    contextBarShowsLaneTagsOf,
     contextBarStatsOf,
     contextBarSummaryOf,
     contextBarToneOf,
@@ -52,6 +58,9 @@ import {
     formatContextCharCount,
     layoutContextBar
 } from './view-context';
+// C2: the multi-lane layout type, needed to state the parity comparison as data (the geometry a
+// bar publishes, with the block payloads stripped out).
+import type { ContextBarLayout } from './view-context';
 import { describe, expect, it } from 'vitest';
 
 const T = 1_700_000_000_000;
@@ -438,6 +447,41 @@ describe('contextBarStatsOf', () => {
         // The authoritative empty bar, and a tree with nothing in it at all.
         expect(contextBarStatsOf(contextBarOf(displayOf([section('t1:0', [])])))).toBe('no recorded context');
         expect(contextBarStatsOf(contextBarOf(undefined))).toBe('no recorded context');
+    });
+
+    it('names the LANES once a bar spans more than one (C2)', () => {
+        // One compaction mints a lane, and the caption is where the reader learns the strip
+        // stacked rather than scrolling past one short row. The suffix appears ONLY past one
+        // lane, and it counts LANES — never "compactions" or "turns", because the lane number is
+        // opaque UI metadata the renderer is not allowed to interpret
+        // (../shared/turn-display.ts:487-489).
+        const oneRow = contextBarOf(displayOf([section('t1:0', [prompt(), think(), tool()])]));
+        const twoRows = contextBarOf(displayOf([section('t1:0', [prompt(), think({ lane: 1 }), tool()])]));
+
+        expect(contextBarStatsOf(oneRow)).toBe('3 segments');
+        expect(contextBarStatsOf(twoRows)).toBe('3 segments · 2 lanes');
+
+        // A bar whose only lane is NOT lane 0 still prints the count alone: the sentence carries
+        // how many rows there are, and one row needs no sentence. The per-row tag is where a lone
+        // non-zero lane shows (see `contextBarShowsLaneTagsOf`).
+        expect(contextBarStatsOf(contextBarOf(displayOf([section('t1:0', [tool({ id: 'b', lane: 4 })])])))).toBe('1 segment');
+
+        // Four lanes pluralize and count exactly, gaps included; and the empty bar has no lane to
+        // mention at all.
+        expect(
+            contextBarStatsOf(
+                contextBarOf(
+                    displayOf([
+                        section('t1:0', [tool({ id: 'a' }), tool({ id: 'b', lane: 1 }), tool({ id: 'c', lane: 2 }), tool({ id: 'd', lane: 3 })])
+                    ])
+                )
+            )
+        ).toBe('4 segments · 4 lanes');
+        expect(contextBarStatsOf(contextBarOf(displayOf([section('t1:0', [])])))).toBe('no recorded context');
+
+        // The ACCESSIBLE figures keep their exact wording: the lane suffix belongs to the visible
+        // caption, and the row itself is what announces a lane to a screen reader.
+        expect(contextBarFiguresOf(twoRows)).not.toContain('lane');
     });
 
     it('keeps the label phrase and the character figures out of the visible line', () => {
@@ -1162,6 +1206,11 @@ describe('layoutContextBar', () => {
 
         // Widths follow the SPAN (10% / 20% / 70%), heights follow the CHARACTERS
         // (36 / 24 / 12 of the 36px ceiling), and every bar sits on the bottom edge.
+        //
+        // C2 adds exactly two fields to every segment — `lane` (the lane this block belongs to)
+        // and `row` (which row that lane draws) — and both are the defaults for a lane-absent
+        // bar. Every geometry figure below is the number this fixture produced before lanes
+        // existed: that is the parity proof, not a loosened assertion.
         expect(layout.segments).toEqual([
             {
                 index: 0,
@@ -1173,7 +1222,9 @@ describe('layoutContextBar', () => {
                 x: 0,
                 width: 60,
                 heightShare: 1,
-                heightPx: 36
+                heightPx: 36,
+                lane: 0,
+                row: 0
             },
             {
                 index: 1,
@@ -1185,7 +1236,9 @@ describe('layoutContextBar', () => {
                 x: 62,
                 width: 119,
                 heightShare: 2 / 3,
-                heightPx: 24
+                heightPx: 24,
+                lane: 0,
+                row: 0
             },
             {
                 index: 2,
@@ -1197,7 +1250,9 @@ describe('layoutContextBar', () => {
                 x: 183,
                 width: 417,
                 heightShare: 1 / 3,
-                heightPx: 12
+                heightPx: 12,
+                lane: 0,
+                row: 0
             }
         ]);
         expect(layout.segments.reduce((sum, segment) => sum + segment.share, 0)).toBeCloseTo(1, 12);
@@ -1334,6 +1389,8 @@ describe('layoutContextBar', () => {
         expect(layout.trackPx).toBe(98);
         expect(layout.maxChars).toBe(0);
         expect(layout.heightPx).toBe(CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
+        // C2: `lane`/`row` are the only additions, and both are the single-lane defaults; the
+        // widths, heights and the minimum-height box are the figures this fixture had.
         expect(layout.segments).toEqual([
             {
                 index: 0,
@@ -1345,7 +1402,9 @@ describe('layoutContextBar', () => {
                 x: 0,
                 width: 49,
                 heightShare: 0,
-                heightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX
+                heightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
+                lane: 0,
+                row: 0
             },
             {
                 index: 1,
@@ -1357,7 +1416,9 @@ describe('layoutContextBar', () => {
                 x: 51,
                 width: 49,
                 heightShare: 0,
-                heightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX
+                heightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
+                lane: 0,
+                row: 0
             }
         ]);
         expect(layout.rightEdge).toBe(100);
@@ -1371,6 +1432,11 @@ describe('layoutContextBar', () => {
     it('describes an empty bar without inventing a segment', () => {
         const layout = layoutContextBar([], 600);
 
+        // C2: the flat figures are byte for byte what an empty strip reported before lanes. The
+        // two new bar-level fields (`lanes`, `rowGapPx`) and the `rows` list are additive: an
+        // empty bar has NO lane — no block claimed one — and still exactly ONE row, because the
+        // dashed "nothing recorded" box needs a band to draw, and that row's figures are the
+        // flat ones. Nothing was invented and nothing moved.
         expect(layout).toEqual({
             width: 600,
             gapPx: 0,
@@ -1385,6 +1451,25 @@ describe('layoutContextBar', () => {
             maxChars: 0,
             // The base box, which is the rectangle the dashed "nothing recorded" state draws.
             heightPx: CONTEXT_BAR_TRACK_HEIGHT_PX,
+            lanes: [],
+            rowGapPx: CONTEXT_BAR_ROW_GAP_PX,
+            rows: [
+                {
+                    lane: 0,
+                    row: 0,
+                    offsetY: 0,
+                    heightPx: CONTEXT_BAR_TRACK_HEIGHT_PX,
+                    gapPx: 0,
+                    trackPx: 600,
+                    minSegmentPx: 0,
+                    unknownDurationPx: 0,
+                    rightEdge: 0,
+                    maxChars: 0,
+                    durationsUnknown: 0,
+                    totalDurationMs: undefined,
+                    segments: []
+                }
+            ],
             segments: [],
             rightEdge: 0
         });
@@ -1407,6 +1492,314 @@ describe('layoutContextBar', () => {
         expect(layout.rightEdge).toBe(900);
         expect(layout.segments[299].x + layout.segments[299].width).toBe(900);
         expect(layout.totalDurationMs).toBe(313_950);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// C2 — LANES: one row per lane, each row its own graph
+// ---------------------------------------------------------------------------
+
+describe('contextBarLanesOf / contextBlockLaneOf', () => {
+    it('lists every lane the blocks occupy, ascending, with gaps skipped', () => {
+        // The renderer draws a row per lane PRESENT, not per lane NUMBERED: a bar that jumps
+        // from lane 0 to lane 4 is two rows, because an empty band would read as a compaction
+        // that never happened.
+        expect(contextBarLanesOf([tool({ id: 'c', lane: 4 }), tool({ id: 'a' }), tool({ id: 'b', lane: 1 })])).toEqual([0, 1, 4]);
+        expect(contextBarLanesOf([tool({ id: 'a', lane: 2 }), tool({ id: 'b', lane: 2 })])).toEqual([2]);
+        expect(contextBarLanesOf([])).toEqual([]);
+    });
+
+    it('reads a lane the contract forbids as the contract default, lane 0', () => {
+        // `lane` is absent-or-integer->=0 (../shared/turn-display.ts:474-491). A float, a
+        // negative and a string are all "the producer said nothing usable", and the honest
+        // answer is the contract's own default — never a row that cannot be labelled.
+        expect(contextBarLanesOf([tool({ id: 'a', lane: 2.5 }), tool({ id: 'b', lane: -1 }), tool({ id: 'c', lane: 'x' as unknown as number })])).toEqual([0]);
+        expect(contextBarLanesOf([tool({ id: 'a', lane: Number.NaN })])).toEqual([0]);
+    });
+
+    it('shows the lane cue exactly when the reader could misread the bar', () => {
+        // One row on lane 0: every bar the board drew before compaction, and it says nothing new.
+        expect(contextBarShowsLaneTagsOf([])).toBe(false);
+        expect(contextBarShowsLaneTagsOf([0])).toBe(false);
+        // A bar whose ONLY lane is not lane 0 (its lane-0 blocks are gone) is still a stacked
+        // bar that got there, so it labels its row; and more than one row always labels them all.
+        expect(contextBarShowsLaneTagsOf([1])).toBe(true);
+        expect(contextBarShowsLaneTagsOf([0, 1])).toBe(true);
+        // The tag text and the words a screen reader hears for the same row.
+        expect(contextBarLaneTagOf(0)).toBe('L0');
+        expect(contextBarLaneTagOf(3)).toBe('L3');
+        expect(contextBarLaneLabelOf(3)).toBe('context bar lane 3');
+    });
+});
+
+describe('layoutContextBar, multi-lane (C2)', () => {
+    it('stacks one row per lane, lane 0 topmost, gaps skipped, in-lane order kept', () => {
+        // Three lanes with ONE block each in a 100px track. Each row is a strip of one, so each
+        // bar owns its whole row: x 0, width 100, and its own 36px box (the tallest bar a row of
+        // one can paint). The bands stack with the model's 2px seam: 0, 38, 76, and the bar's box
+        // is 3 * 36 + 2 * 2 = 112.
+        const layout = layoutContextBar(
+            [tool({ id: 'a', chars: 100 }), tool({ id: 'b', chars: 100, lane: 1 }), tool({ id: 'c', chars: 100, lane: 3 })],
+            100
+        );
+
+        expect(layout.lanes).toEqual([0, 1, 3]);
+        expect(layout.rowGapPx).toBe(CONTEXT_BAR_ROW_GAP_PX);
+        expect(layout.rows.map((row) => [row.lane, row.row, row.offsetY, row.heightPx])).toEqual([
+            [0, 0, 0, 36],
+            [1, 1, 38, 36],
+            [3, 2, 76, 36]
+        ]);
+        expect(layout.heightPx).toBe(112);
+        // Every row is its own strip: full width, no gap to shrink, and its own 100-character
+        // denominator — none of it borrowed from its neighbours.
+        expect(layout.rows.map((row) => [row.gapPx, row.trackPx, row.rightEdge, row.maxChars])).toEqual([
+            [0, 100, 100, 100],
+            [0, 100, 100, 100],
+            [0, 100, 100, 100]
+        ]);
+        // Each segment carries the lane it belongs to, the row that lane draws, and the FLAT
+        // index the tile activates by — which is what keeps one click pointing at one block.
+        expect(layout.segments.map((s) => [s.index, s.lane, s.row, s.x, s.width, s.heightPx])).toEqual([
+            [0, 0, 0, 0, 100, 36],
+            [1, 1, 1, 0, 100, 36],
+            [2, 3, 2, 0, 100, 36]
+        ]);
+    });
+
+    it('groups interleaved lanes without renumbering a segment', () => {
+        // Lanes are assigned at MINT time, so a real bar is monotonic; interleaving anyway is
+        // what proves the grouping is a grouping and not a sort. Blocks arrive 0,1,0,1 by lane:
+        // row 0 is blocks 0 and 2, row 1 is blocks 1 and 3, each row lays out its own pair, and
+        // the tab order is row-grouped (0, 2, then 1, 3).
+        const layout = layoutContextBar(
+            [
+                tool({ id: 'a', chars: 100, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'b', chars: 100, lane: 1, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'c', chars: 100, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'd', chars: 100, lane: 1, at: T, endedAt: T + 1_000 })
+            ],
+            100
+        );
+
+        expect(layout.rows.map((row) => row.segments.map((s) => s.index))).toEqual([[0, 2], [1, 3]]);
+        expect(layout.segments.map((s) => s.index)).toEqual([0, 2, 1, 3]);
+        // Two equal spans in a row of two: the 2px seam, then 49/49 — the same arithmetic the
+        // flat strip has always run, now per row.
+        expect(layout.rows.map((row) => row.segments.map((s) => [s.x, s.width]))).toEqual([
+            [[0, 49], [51, 49]],
+            [[0, 49], [51, 49]]
+        ]);
+        expect(layout.rows.map((row) => [row.offsetY, row.heightPx])).toEqual([
+            [0, 36],
+            [38, 36]
+        ]);
+        expect(layout.heightPx).toBe(74);
+    });
+
+    it('normalizes HEIGHT per row, so a compaction row is as readable as the first', () => {
+        // THE point of lanes. Lane 0 holds a 1,000-character block, so ITS 100-character block
+        // is a 4px bar. Lane 1 holds a 10-character block, so its 5-character block is an 18px
+        // bar — bigger than the lane-0 block that is twenty times its size. One shared
+        // denominator would have flattened the whole second row to the floor, and the reader
+        // would see nothing but the fact that a second row exists.
+        const layout = layoutContextBar(
+            [
+                tool({ id: 'big', chars: 1_000, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'mid', chars: 100, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'small', chars: 10, lane: 1, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'tiny', chars: 5, lane: 1, at: T, endedAt: T + 1_000 })
+            ],
+            600
+        );
+
+        expect(layout.rows.map((row) => row.maxChars)).toEqual([1_000, 10]);
+        expect(layout.rows[0].segments.map((s) => [s.heightPx, s.heightShare])).toEqual([
+            [36, 1],
+            [4, 0.1]
+        ]);
+        expect(layout.rows[1].segments.map((s) => [s.heightPx, s.heightShare])).toEqual([
+            [36, 1],
+            [18, 0.5]
+        ]);
+        // The bar-level figure is the biggest of the denominators (a host reads it off
+        // `data-max-chars`); the per-row authorities are on the rows themselves.
+        expect(layout.maxChars).toBe(1_000);
+    });
+
+    it('divides WIDTH per row, so one row never shrinks another', () => {
+        // Five blocks in lane 0 and ONE in lane 1, in a 100px track. Lane 0 shrinks its gap to 2
+        // and splits 92px five ways; lane 1 has a single segment, so it keeps the whole 100px and
+        // needs no gap at all. A shared track would have made the lone block a 20px bar beside
+        // four 18px ones — the same "one row's data decides another row's picture" bug, sideways.
+        const layout = layoutContextBar(
+            [
+                ...Array.from({ length: 5 }, (_, index) => tool({ id: `l0-${index}`, chars: 10, at: T, endedAt: T + 1_000 })),
+                tool({ id: 'alone', chars: 10, lane: 1, at: T, endedAt: T + 1_000 })
+            ],
+            100
+        );
+
+        expect(layout.rows.map((row) => [row.gapPx, row.trackPx, row.rightEdge])).toEqual([
+            [2, 92, 100],
+            [0, 100, 100]
+        ]);
+        expect(layout.rows[0].segments.map((s) => [s.x, s.width])).toEqual([
+            [0, 18],
+            [20, 19],
+            [41, 18],
+            [61, 19],
+            [82, 18]
+        ]);
+        expect(layout.rows[1].segments.map((s) => [s.x, s.width])).toEqual([[0, 100]]);
+        // Bar-level figures are the TOP row's (documented on `ContextBarLayout`), because the
+        // seam is where the reader's eye enters the bar.
+        expect([layout.gapPx, layout.trackPx]).toEqual([2, 92]);
+    });
+
+    it('sums the bar-wide figures across rows and keeps the per-row ones separate', () => {
+        // The accessible name and the caption speak for the WHOLE bar, so the two figures they
+        // print are sums; the per-row figures stay on the rows that own them.
+        const layout = layoutContextBar(
+            [
+                tool({ id: 'a', kind: 'user', name: 'prompt', endedAt: undefined, chars: 10 }),
+                tool({ id: 'b', chars: 10, lane: 1, at: T, endedAt: T + 500 })
+            ],
+            200
+        );
+
+        expect(layout.durationsUnknown).toBe(1);
+        expect(layout.totalDurationMs).toBe(500);
+        expect(layout.rows.map((row) => [row.durationsUnknown, row.totalDurationMs])).toEqual([
+            [1, undefined],
+            [0, 500]
+        ]);
+    });
+
+    it('is byte for byte the single-lane strip when no block names a lane', () => {
+        // THE PARITY PROOF. The same two blocks with NO `lane` and with an explicit `lane: 0`
+        // produce the same GEOMETRY, field for field, and that geometry has one row at offset 0
+        // whose box IS the bar's box (no seam is reserved above or below it). The block payloads
+        // are compared separately below: `lane` absent vs present is a fact about what the server
+        // SENT, and it must not leak into one pixel of what the reader gets.
+        const absent = [tool({ id: 'a', chars: 300 }), tool({ id: 'b', chars: 100 })];
+        const explicit = [tool({ id: 'a', chars: 300, lane: 0 }), tool({ id: 'b', chars: 100, lane: 0 })];
+
+        const baseline = layoutContextBar(absent, 600);
+        const written = layoutContextBar(explicit, 600);
+
+        // Everything but the block references: every number, both axes, plus the row table.
+        const geometry = (layout: ContextBarLayout) => ({
+            ...layout,
+            segments: layout.segments.map(({ block: _block, ...rest }) => rest),
+            rows: layout.rows.map((row) => ({ ...row, segments: row.segments.map(({ block: _block, ...rest }) => rest) }))
+        });
+
+        expect(geometry(written)).toEqual(geometry(baseline));
+        // The only difference between the two bars is the byte the server did or did not send.
+        expect('lane' in baseline.segments[0].block).toBe(false);
+        expect(written.segments[0].block.lane).toBe(0);
+        expect(written.segments[1].block.lane).toBe(0);
+        expect(baseline.lanes).toEqual(written.lanes);
+        expect(baseline.lanes).toEqual([0]);
+        expect(baseline.rows).toHaveLength(1);
+        expect(baseline.rows[0].offsetY).toBe(0);
+        // No second row means no seam, so the stacked total is exactly the strip's old box: the
+        // canvas and the DOM row still reserve the same 36px they reserved before lanes.
+        expect(baseline.heightPx).toBe(baseline.rows[0].heightPx);
+        expect(baseline.heightPx).toBe(CONTEXT_BAR_MAX_TRACK_HEIGHT_PX);
+        // ...and every flat figure a lane-absent bar has ever published.
+        expect([baseline.width, baseline.gapPx, baseline.trackPx, baseline.rightEdge, baseline.maxChars, baseline.heightPx]).toEqual([
+            600,
+            2,
+            598,
+            600,
+            300,
+            36
+        ]);
+        expect(baseline.segments.map((s) => [s.x, s.width, s.heightPx, s.lane, s.row])).toEqual([
+            [0, 299, 36, 0, 0],
+            [301, 299, 12, 0, 0]
+        ]);
+        // The top-level figures ARE the row's, which is what makes the per-row generalization a
+        // no-op for a one-lane bar.
+        expect([baseline.gapPx, baseline.trackPx, baseline.rightEdge, baseline.maxChars]).toEqual([
+            baseline.rows[0].gapPx,
+            baseline.rows[0].trackPx,
+            baseline.rows[0].rightEdge,
+            baseline.rows[0].maxChars
+        ]);
+        // ...and a one-lane bar shows no lane cue at all.
+        expect(contextBarShowsLaneTagsOf(baseline.lanes)).toBe(false);
+    });
+});
+
+describe('contextBarRowAt (C2 bands)', () => {
+    // Two rows, one block each, 100px wide: row 0 occupies y 0..36, the seam is 36..38, and row 1
+    // occupies 38..74. Both rows are one full-width bar, so any answer below is about the ROW.
+    const stacked = layoutContextBar([tool({ id: 'a', chars: 100 }), tool({ id: 'b', chars: 100, lane: 1 })], 100);
+
+    it('splits a seam at its midpoint and clamps the ends', () => {
+        expect(stacked.rows.map((row) => [row.offsetY, row.heightPx])).toEqual([
+            [0, 36],
+            [38, 36]
+        ]);
+
+        expect([0, 10, 36].map((y) => contextBarRowAt(stacked, y))).toEqual([0, 0, 0]);
+        // The seam itself is 36..38 and its midpoint 37 is the tie, resolved to the row ABOVE.
+        expect([37, 37.5, 38].map((y) => contextBarRowAt(stacked, y))).toEqual([0, 1, 1]);
+        // Inside row 1, and past the bottom of the bar: the last row owns the remainder, exactly
+        // as the last segment owns the remainder of its row.
+        expect([73, 74, 200].map((y) => contextBarRowAt(stacked, y))).toEqual([1, 1, 1]);
+        // No number, or a negative one, is the TOP of the bar — never a guess at a band.
+        expect([Number.NaN, -5].map((y) => contextBarRowAt(stacked, y))).toEqual([0, 0]);
+    });
+
+    it('answers 0 for a single-row bar whatever the y is', () => {
+        const flat = layoutContextBar([tool({ id: 'a', chars: 100 })], 100);
+
+        expect([0, 10, 36, 900].map((y) => contextBarRowAt(flat, y))).toEqual([0, 0, 0, 0]);
+    });
+});
+
+describe('contextBarSegmentAt, across rows (C2)', () => {
+    // Lane 0 is ONE bar 100px wide with no gap; lane 1 is two (25px + 2px + 73px). So the same x
+    // answers differently by row, and the gap that exists on one row does not exist on the other.
+    const stacked = layoutContextBar(
+        [
+            tool({ id: 'a', chars: 100 }),
+            tool({ id: 'b', chars: 100, lane: 1, at: T, endedAt: T + 1_000 }),
+            tool({ id: 'c', chars: 100, lane: 1, at: T, endedAt: T + 3_000 })
+        ],
+        100
+    );
+
+    it('aims inside the row the pointer is on', () => {
+        expect(stacked.rows.map((row) => row.segments.map((s) => [s.x, s.width]))).toEqual([
+            [[0, 100]],
+            [[0, 25], [27, 73]]
+        ]);
+
+        // y in row 0 -> the only block there; y in row 1 -> that row's columns.
+        expect(contextBarSegmentAt(stacked, 25, 0)).toBe(0);
+        expect(contextBarSegmentAt(stacked, 25, 38)).toBe(1);
+        expect(contextBarSegmentAt(stacked, 26.5, 38)).toBe(2);
+        // The gap between two row-1 columns still belongs to the NEARER column, and a tie goes
+        // to the one on the LEFT.
+        expect([25, 26].map((x) => contextBarSegmentAt(stacked, x, 38))).toEqual([1, 1]);
+        // A y below the bar still resolves to the last row, whose columns it then aims inside.
+        expect(contextBarSegmentAt(stacked, 60, 200)).toBe(2);
+        // Omitting y asks for the top of the bar — the row a single-lane bar has.
+        expect(contextBarSegmentAt(stacked, 25)).toBe(0);
+    });
+
+    it('bounds a miss by the resolved row, not by the widest row in the bar', () => {
+        // Both rows are 100 wide here, so anything past 100 is a miss in either band, and a
+        // negative x never resolves to a row at all.
+        expect(contextBarSegmentAt(stacked, 101, 38)).toBe(-1);
+        expect(contextBarSegmentAt(stacked, 101, 0)).toBe(-1);
+        expect(contextBarSegmentAt(stacked, -1, 38)).toBe(-1);
+        expect(contextBarSegmentAt(layoutContextBar([], 100), 10, 0)).toBe(-1);
     });
 });
 

@@ -110,6 +110,17 @@
 // `[instruction, summary]` plus whatever arrived after, which is the whole point: the
 // context is small again and the agent still knows what it was doing.
 //
+// THE DISPLAY LANE A SUMMARIZE PASS LEAVES BEHIND (C1)
+// ----------------------------------------------------
+// A summarize pass also raises the conversation's DISPLAY LANE by exactly one, at the
+// instant its instruction is committed. That lane is pure UI metadata — never model-facing,
+// never on a `HarnessMessage` — and it is what the store stamps onto every event it records
+// from then on, so the context bar of the turn the boundary happened IN paints its
+// pre-compaction segments on row N and the compaction answer on row N+1: one compaction, two
+// rows. `exclude` mode never bumps (see the block above `bumpLane` for why a prune does not
+// deserve a row), a bump is undone whenever the pass ends without a compaction, and a refused
+// lane write costs a diagnostic — never a failed compaction.
+//
 // THE PHASE MAP — WHY FIVE HOOKS AND NOT ONE
 // ------------------------------------------
 // The pass cannot finish inside `turn.before`: the answer it is waiting for is the one
@@ -308,8 +319,13 @@
 //   - ../types (`HarnessPluginApi.threads`) — the T8 park/unpark pair the summarize flow drives
 //                                     from OUTSIDE a hook (`pause`/`resume`), plus
 //                                     `messages`/`replaceMessages` (the idle-path rewrite,
-//                                     refused while a run is attached) and `send` (the
-//                                     continuation nudge)
+//                                     refused while a run is attached), `send` (the
+//                                     continuation nudge) and `setContextLane`/
+//                                     `getContextLane` (the display-lane pair above, whose
+//                                     implementation is `setThreadContextLane` in
+//                                     ../harness.ts and whose consumers are
+//                                     ../server/sessions.ts `contextLaneOf` and
+//                                     ../server/turn-projector.ts `laneOfEvent`)
 //   - ../plugin/hooks.ts            — sequential, fail-open dispatch of hook handlers
 //   - ../plugin/host.ts             — how this built-in is applied (and replaced by a host),
 //                                     and where `api.report.diagnostic` gets its `owner`
@@ -998,6 +1014,105 @@ export const createContextCompactionPasses = (
     // prunes (see "WHY THE COOLDOWN MAP IS NEVER PRUNED").
     const phases = new Map<string, HarnessCompactionPhase>();
 
+    // -----------------------------------------------------------------------
+    // THE DISPLAY LANE (C1) — one bump per SUMMARIZE pass, and the undo
+    // -----------------------------------------------------------------------
+    //
+    // WHAT IT IS FOR. The context bar paints one stacked row per display lane
+    // (../shared/turn-display.ts `ContextBlock.lane`), and the lane a recorded event lands
+    // on is the conversation's CURRENT lane at record time
+    // (../server/protocol.ts `SessionTurnEvent.lane`). Raising the thread's lane by one at
+    // the moment a compaction starts therefore splits THAT turn's bar in two: the
+    // pre-compaction segments stay on row N and the compaction answer, recorded a moment
+    // later, sits on row N+1. That is the whole feature: one compaction, two visible rows,
+    // in the bar of the turn the boundary actually happened in.
+    //
+    // WHY THE BUMP IS AT THE START OF THE PASS, NOT AT THE FINALIZE (traced, do not
+    // "simplify" this). The pass spans a run: `turn.before` commits the instruction, the
+    // model answers, `turn.after` flips the phase, and the range is written either at the
+    // NEXT `turn.before` or on `thread.idle` — after which the turn has already reached its
+    // terminal status (./sessions.ts records events only while the run lives, and the
+    // terminal transition is what closes the row). A bump placed at the finalize would
+    // therefore move the lane AFTER every event of this turn was recorded, and the
+    // pre-compaction segments and the summary would sit in two DIFFERENT turns' bars — no
+    // bar would ever show two rows. Bumping on the instruction commit is the only point in
+    // the machine where "the boundary is inside this turn" is still true.
+    //
+    // WHY `exclude` MODE NEVER BUMPS. An exclude pass withholds individual superseded tool
+    // units, and it fires whenever a conversation is over the limit — often several times
+    // per conversation, one small range at a time. A lane bump per pass would slice one
+    // conversation's history into a stack of thin rows keyed to no meaningful boundary: the
+    // bar's rows would report when a prune happened, not when the conversation changed what
+    // it knows. Summarize is different in kind — it rewrites what the conversation REMEMBERS
+    // — so it is the one mode whose boundary deserves a row.
+    //
+    // THE UNDO. A pass that never produced a compaction (the commit threw, the run failed
+    // or ended without an answer, the instruction got rolled back with it) must not leave a
+    // lane it never earned, or a bar would show a boundary that never happened. So the
+    // value live BEFORE the bump is remembered per thread, and every abandon path restores
+    // it. The map holds at most one entry per in-flight pass — the same bounded-shape
+    // caveat the two maps above have (a thread purged mid-pass leaves one stale key).
+    //
+    // A LANE WRITE CAN NEVER FAIL A COMPACTION: both directions are wrapped, and the only
+    // consequence of a refused write is a diagnostic saying the bar will not show the
+    // boundary. Compaction is about the model's context; the bar is downstream of it.
+    const laneBefore = new Map<string, number>();
+
+    // The pass's lane bump, and the marker that it still owes an undo.
+    const bumpLane = (threadId: string): void => {
+        try {
+            const before = api.threads.getContextLane(threadId);
+
+            laneBefore.set(threadId, before);
+            api.threads.setContextLane(threadId, before + 1);
+        } catch (error) {
+            // Either read or write refused (a purged conversation, a rejected value). Drop
+            // the undo marker with it: there is nothing this pass moved.
+            laneBefore.delete(threadId);
+            api.report.diagnostic({
+                message:
+                    `context-compaction could not raise the display lane of thread ${threadId}; the compaction ` +
+                    `still ran, but its context bar will not show the boundary as a second row.`,
+                data: {
+                    mode: MODE_SUMMARIZE,
+                    threadId,
+                    reason: error instanceof Error ? error.message : String(error)
+                }
+            });
+        }
+    };
+
+    // The pass finished its job: the bump is real, so forget the undo.
+    const keepLaneBump = (threadId: string): void => {
+        laneBefore.delete(threadId);
+    };
+
+    // The pass produced no compaction: put the lane back exactly where it was.
+    const revertLaneBump = (threadId: string): void => {
+        const before = laneBefore.get(threadId);
+
+        if (before === undefined) return;
+
+        laneBefore.delete(threadId);
+
+        try {
+            api.threads.setContextLane(threadId, before);
+        } catch (error) {
+            api.report.diagnostic({
+                message:
+                    `context-compaction could not restore the display lane of thread ${threadId} after an ` +
+                    `abandoned pass; the conversation may show one empty row in its context bar.`,
+                data: {
+                    mode: MODE_SUMMARIZE,
+                    threadId,
+                    lane: before,
+                    reason: error instanceof Error ? error.message : String(error)
+                }
+            });
+        }
+    };
+
+
     // `modelLimits` is free text an operator edits rarely, and this handler runs on
     // EVERY turn, so parsing it per turn is waste. Keyed by the exact stored string: the
     // compare is one reference/length check, and any change from the UI re-parses on the
@@ -1078,6 +1193,15 @@ export const createContextCompactionPasses = (
                 { role: 'user', content: COMPACTION_INSTRUCTION }
             ]);
 
+            // DISPLAY LANE (C1): the boundary exists the moment the instruction is in the
+            // canonical transcript, so the lane moves HERE — after the commit that could
+            // still fail, before this hook releases the request that will carry the answer.
+            // Every event recorded from here on (the summary's own `text`/`done` frames
+            // first) is stamped with lane N+1 by the store's recorder, which re-reads the
+            // thread live per event, so THIS turn's bar paints both rows. See the block
+            // above `laneBefore` for why a bump at the finalize would have been too late.
+            bumpLane(threadId);
+
             api.report.diagnostic({
                 message:
                     `context-compaction parked thread ${threadId} and asked it to compact itself: ` +
@@ -1090,7 +1214,15 @@ export const createContextCompactionPasses = (
             // park — a stranded park is the one failure this plugin may never cause — and
             // let the error reach the bus, the single fail-open authority (plugin/hooks.ts
             // rule 2). `resume()` is a no-op when the pause itself never landed.
+            //
+            // DISPLAY LANE (C1): the undo runs here too. `bumpLane` is the last thing the
+            // happy path does, so a throw can come from before it (nothing to undo — the
+            // map simply has no entry) or after it (the instruction landed, but the answer
+            // will never arrive on this pass). Either way a pass that produced no
+            // compaction must not leave a lane behind, because a lane is a claim that a
+            // boundary happened.
             phases.delete(threadId);
+            revertLaneBump(threadId);
             await context.resume();
             throw error;
         }
@@ -1108,7 +1240,12 @@ export const createContextCompactionPasses = (
             // The instruction is gone: the run that committed it rolled it back
             // (`brain.messages.splice(commitIndex)`, src/harness.ts ~9677) or a host rewrote
             // the transcript. Either way the pass is over — with nothing left to disable.
+            //
+            // DISPLAY LANE (C1): with the instruction gone there is no compaction to
+            // report, so the bump this pass made is undone rather than left as a phantom
+            // boundary in the bar.
             phases.delete(threadId);
+            revertLaneBump(threadId);
             return;
         }
 
@@ -1125,6 +1262,9 @@ export const createContextCompactionPasses = (
         }
 
         phases.delete(threadId);
+        // DISPLAY LANE (C1): the range is written, so this pass DID compact the conversation
+        // and its bump is final — forget the undo.
+        keepLaneBump(threadId);
 
         reportFinalize(threadId, range, 'turn.before', entries.length);
     };
@@ -1171,14 +1311,22 @@ export const createContextCompactionPasses = (
         } catch {
             // Unknown or already purged: nothing to rewrite, and no conversation left to
             // resume. The phase dies with the thread in every practical case.
+            //
+            // DISPLAY LANE (C1): the bump's marker goes with it — the conversation, and
+            // with it the lane, no longer exists, so there is nothing left to undo and a
+            // write attempt would only report a diagnostic about a deleted thread.
             phases.delete(threadId);
+            laneBefore.delete(threadId);
             return 'nothing';
         }
 
         const range = planCompactionRetention(messages);
 
         if (range.instructionIndex === -1) {
+            // No instruction left to anchor the range: nothing was compacted, so the lane
+            // this pass raised goes back (C1).
             phases.delete(threadId);
+            revertLaneBump(threadId);
             return 'nothing';
         }
 
@@ -1193,10 +1341,17 @@ export const createContextCompactionPasses = (
             // A run attached between the idle hook and this write (a host turn raced the
             // nudge), or the document refused the shape. Keep `finishing`: the next
             // `turn.before` writes the same range through the flags instead.
+            //
+            // DISPLAY LANE (C1): the bump marker stays for the same reason — the pass is
+            // still open, its answer is still committed, and the retry at the next boundary
+            // owns the undo if it ends up needing one.
             return 'refused';
         }
 
         phases.delete(threadId);
+        // The rewrite landed: this conversation is compacted, so its lane bump is the real
+        // boundary and the undo is dropped (C1).
+        keepLaneBump(threadId);
 
         reportFinalize(threadId, range, 'thread.idle', messages.length);
 
@@ -1407,7 +1562,21 @@ export const createContextCompactionPasses = (
         // `finishing` itself still survives this hook (only `compacting` clears): the
         // `thread.idle` that follows it in the same `finally` is where the range is written,
         // and that path needs the phase.
-        if (phase === 'compacting') phases.delete(threadId);
+        if (phase === 'compacting') {
+            phases.delete(threadId);
+            // DISPLAY LANE (C1): the pass ended without ever producing a compaction
+            // answer, so the instruction it committed never became a summary. The lane it
+            // raised on the way in is undone here, or every later turn of this conversation
+            // would be drawn one row too low with no boundary that happened.
+            //
+            // THE RESIDUAL: this restores the COUNTER only. Events the recorder already
+            // stamped carry the bumped lane verbatim (../server/sessions.ts stamps at record
+            // time and nothing rewrites a stored event), so an abandoned pass can leave the
+            // boundary turn's bar showing the bumped row — the conversation may show one
+            // empty row in its context bar, exactly as the refused-write diagnostic in
+            // `revertLaneBump` says.
+            revertLaneBump(threadId);
+        }
 
         // A no-op in the ordinary `finishing` case — `turn.after` un-parked two hooks
         // earlier — which is also why no report is emitted for it: the pass is not
@@ -1443,7 +1612,21 @@ export const createContextCompactionPasses = (
         // the range from the surviving entries, and if it did not, that boundary finds no
         // instruction and clears the phase itself. What never survives is the park: a
         // thread left 'paused' is a conversation its host cannot reach.
-        if (phase === 'compacting') phases.delete(threadId);
+        if (phase === 'compacting') {
+            phases.delete(threadId);
+            // DISPLAY LANE (C1): the run's rollback took the instruction and any answer
+            // back out of the transcript, so this pass left nothing behind and its lane
+            // bump is undone with the rest. A `finishing` pass keeps its bump: its summary
+            // may well have survived (the failure came later), and the next boundary owns
+            // that decision.
+            //
+            // THE RESIDUAL: as in `runFinished`, only the COUNTER comes back — events the
+            // recorder stamped while the lane was raised keep their bumped `lane` key
+            // (../server/sessions.ts), so this abandoned pass can leave the boundary turn's
+            // bar showing the bumped row: one empty row in its context bar, the same
+            // cosmetic cost the refused-write diagnostic in `revertLaneBump` reports.
+            revertLaneBump(threadId);
+        }
 
         unpark(threadId);
 

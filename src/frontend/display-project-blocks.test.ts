@@ -290,6 +290,48 @@ describe('projectBlock - the record the route actually transports', () => {
         // segment that has no call behind it.
         expect('callId' in projectBlock(routeOf(promptBlock))).toBe(false);
     });
+
+    it('carries the lane the record publishes, and mints none when the record does not (C2)', () => {
+        // C2: `lane` is WHICH STACKED ROW of the one bar a segment belongs to
+        // (../shared/turn-display.ts:474-491, and the spec's `ContextBlock.lane` beside
+        // `callId`). The bar's grouping reads it off the stored block, so the projector's
+        // compaction signal survives only if this projection copies it — the same bug class as
+        // the dropped `durationMs` this file exists for.
+        expect(projectBlock(routeOf({ ...toolBlock, lane: 1 }))).toStrictEqual({
+            kind: 'tool',
+            id: '2-tool-7',
+            turnId: 't1',
+            sectionId: 't1:2',
+            name: 'read',
+            chars: 34,
+            inPrompt: true,
+            state: 'ok',
+            at: T,
+            endedAt: T + 800,
+            durationMs: 800,
+            argsChars: 23,
+            resultChars: 11,
+            eventFrom: 7,
+            eventTo: 9,
+            lane: 1
+        });
+
+        // Lane 0 is a PUBLISHED value, not an absence: the projector stamps `lane: 0` on
+        // everything before the first compaction, and a truthiness check would silently drop
+        // it (a 0 that becomes "no lane" is still 0 downstream, but it is no longer
+        // distinguishable from a legacy record, which is what `lane: 0` + a later lane 1 is
+        // exactly the case the lane tag rule keys off).
+        expect(projectBlock(routeOf({ ...toolBlock, lane: 0 })).lane).toBe(0);
+        expect('lane' in projectBlock(routeOf({ ...toolBlock, lane: 0 }))).toBe(true);
+
+        // A record with no lane stays lane-less, and the key list is what proves nothing was
+        // synthesized here: `contextBlockLaneOf` (./view-context.ts) supplies the 0 default at
+        // read time, not the projection.
+        const laneless = projectBlock(routeOf(promptBlock));
+
+        expect('lane' in laneless).toBe(false);
+        expect(Object.keys(projectBlock(routeOf({ ...toolBlock, lane: 2 }))).sort()).toContain('lane');
+    });
 });
 
 describe('projectSection - the ONE bar is built from these segments', () => {

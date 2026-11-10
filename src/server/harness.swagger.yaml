@@ -8119,6 +8119,18 @@ components:
           type: string
         sectionId:
           type: string
+        lane:
+          type: integer
+          minimum: 0
+          description: >-
+            DISPLAY LANE: which stacked row of the context bar this segment belongs to (the bar renders one row per
+            lane). Pure UI metadata and NEVER model-facing - it is not on `HarnessMessage` and never part of a
+            projection. ABSENT means lane 0, the default lane, so a producer that says nothing is lane 0 and a
+            client never synthesizes another number. Assigned at MINT time by the `context:add` that creates the
+            block and IMMUTABLE afterwards, so it is not a key of `ContextBlockPatch` (the shared whitelist in
+            src/shared/turn-display.ts `ContextBlockPatch` is the authority): a block that would change lanes is a
+            `context:remove` + `context:add` pair, exactly like an identity-field change. The NUMBER is opaque
+            here - the server decides what mints a new lane, a renderer only groups rows by it.
         name:
           type: string
           description: >-

@@ -105,7 +105,8 @@ export type SessionStatus = 'idle' | 'running' | 'error';
 // because a browser reload loses the stream but must still render the same
 // transcript. `index` is the position in the session (0-based, monotonic) and
 // `events` holds every `HarnessEvent` observed while the turn ran — including
-// events from subagents a delegation reached — in emission order.
+// events from subagents a delegation reached — in emission order, each one stamped
+// with the display lane it was recorded on (`SessionTurnEvent` below).
 //
 // `startedAt`/`updatedAt` are epoch milliseconds from the server clock.
 // `startedAt` never changes once the turn opens — with ONE exception: a stopped
@@ -145,6 +146,23 @@ export type SessionTurn = {
     // `RR3` and the next conversation is `RR4`.
     // `#` resolution, so it fails the load like any other corruption. Old documents simply have no key.
     threadLabel?: string;
+    // DISPLAY LANE (C1) — the lane this turn STARTED on, copied off the conversation's
+    // current `contextLane` when the row was minted (../types `HarnessThreadRecord.contextLane`).
+    //
+    // It is the turn's own starting point, nothing more: what the context bar actually
+    // stacks is the per-event lane (see `SessionTurnEvent.lane` below), which may move
+    // WITHIN this turn (a summarize compaction bumps the thread mid-run, and the events
+    // recorded after it carry lane+1 — that is what paints two rows in ONE bar). This
+    // field is what tells a client, without folding any event, where the turn began, and
+    // it is what a resumed row is restamped with when its attempt is requeued.
+    //
+    // INTERNAL ONLY. It is deliberately NOT part of `TurnSummary` / `TurnResource` / the
+    // swagger spec / `projectRow` / `turnRowOf` / `turnResourceOf`, so the canonical wire
+    // key sets are unchanged; the number is opaque metadata and never model-facing.
+    //
+    // ABSENT means lane 0, and a lane of 0 is never written, so every turn recorded before
+    // lanes exist keeps its exact persisted shape.
+    lane?: number;
     // Result blocks this task was submitted with (R2). A block is referenced by
     // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
     // invocation) and its compact conversation-scoped label. The server binds these
@@ -181,7 +199,7 @@ export type SessionTurn = {
     // resumed run, because the row states the attempt now in flight.
     startedAt?: number;
     updatedAt: number;
-    events: HarnessEvent[];
+    events: SessionTurnEvent[];
     // Epoch milliseconds parallel to `events`: entry i is when events[i] was
     // recorded. Persisted with the turn so a reload can show per-step and
     // per-tool elapsed time without replaying the stream. Optional so an older
@@ -229,6 +247,30 @@ export type SessionTurn = {
     // whatever the surviving ring still holds rather than inventing text.
     steerTexts?: SessionSteerText[];
 };
+
+// One event as the SERVER recorded it: the harness's own progress frame (`start`,
+// `text`, `tool_call`, …) plus the display-lane stamp the recorder added while storing
+// it (C1).
+//
+// WHY THE STAMP IS THE STORE'S, NOT THE RUNTIME'S: `HarnessEvent`
+// (../types/index.ts) is what a harness reports, and a harness has no idea what a
+// context bar is. The lane is a property of the CONVERSATION the event arrived in, and
+// the recorder is the one step that knows both (./sessions.ts `record`), so the number
+// is written at record time, read LIVE from the thread's `contextLane` — never cached at
+// turn start, because a mid-run increment (a compaction) has to take effect on the very
+// next event for one turn's bar to show both rows.
+//
+//   - ABSENT means lane 0, and a lane of 0 is never written, so every event recorded
+//     before lanes exist — and every event of a conversation that never compacted —
+//     keeps its exact recorded bytes;
+//   - persisted for free: the journal writes each event verbatim (./journal.ts) and the
+//     document reader keeps events opaque (./persistence.ts), so a restart replays the
+//     same lanes and the display fold reproduces the same rows;
+//   - NEVER model-facing. It rides the display fold and the verbatim events page (the
+//     spec's `HarnessEvent` object is open, so the extra key is contract-valid), and it
+//     is not a key of `ContextBlockPatch` (../shared/turn-display.ts), so a block can
+//     only change lanes by being removed and re-minted.
+export type SessionTurnEvent = HarnessEvent & { lane?: number };
 
 // One archived steered submit: identity, timing, destination and the EXACT text the user
 // submitted (the same `prompt` bytes the audit ring keeps, kept for every submit instead of

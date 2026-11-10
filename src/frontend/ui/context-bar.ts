@@ -33,6 +33,25 @@
 // bar still activates that segment, in canvas mode by construction and in DOM mode by the
 // documented x-coordinate fallback in `onSegmentClick`.
 //
+// THE LANES (C2 — why a compaction is visible)
+// --------------------------------------------
+// A block's `lane` (absent ⇒ 0) is which STACKED ROW of this one widget it belongs to, and
+// ./view-context.ts `layoutContextBar` already stacked the rows: `layout.rows` is one entry
+// per lane the blocks actually occupy (lane 0 topmost, ascending downward) and
+// `layout.heightPx` is the whole stack. The painter adds no grouping of its own — canvas mode
+// paints every row into ONE taller canvas at `row.offsetY`, DOM mode mints one
+// `.context-bar-segments` element per row inside a `.context-bar-rows` column — so both modes
+// still describe one rectangle decided by one arithmetic.
+//
+// A one-lane bar therefore paints EXACTLY what it painted before: one row at offset 0, the
+// same `fillRect` rectangles, one `.context-bar-segments` element (in a wrapper that is a plain
+// pass-through), the same caption, the same keyboard order. The multi-lane CUE is a small
+// `L0`/`L1` tag per row (real DOM text in both modes, so a screen reader reads it too) that
+// appears only when the reader could be confused: more than one row, or a bar whose only lane
+// is not lane 0. Keyboard traversal follows the row-grouped order — all of row 0, then all of
+// row 1 — which is the flat order for any bar whose lanes are monotonic (all lanes are, since
+// a lane is assigned at mint time and never rewritten).
+//
 // THE BAR NEVER FETCHES (R8)
 // --------------------------
 // Rendering reads nothing but the block metadata. A request happens when the reader
@@ -56,7 +75,10 @@ import {
     CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
     CONTEXT_BAR_OPTION_LIMIT,
     CONTEXT_BAR_TONE_STYLES,
+    contextBarLaneLabelOf,
+    contextBarLaneTagOf,
     contextBarSegmentAt,
+    contextBarShowsLaneTagsOf,
     contextBarStatsOf,
     contextBarSummaryOf,
     contextBarToneOf,
@@ -359,10 +381,20 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
     live.setAttribute('role', 'status');
     live.setAttribute('aria-live', 'polite');
 
-    // DOM mode's rows: the buttons ARE the widget, so no option list and no tabindex on
-    // the wrapper (Tab would otherwise stop twice).
-    const rows = document.createElement('div');
-    rows.className = 'context-bar-segments';
+    // DOM mode's ROW STACK (C2): one `.context-bar-segments` element per lane, laid out as a
+    // column. The buttons ARE the widget, so no option list and no tabindex on the wrapper
+    // (Tab would otherwise stop twice). A bar with a single lane gets exactly one row element
+    // in here: the wrapper is a pass-through box, and that is the entire structural cost of
+    // lanes on a strip that has none.
+    const rowStack = document.createElement('div');
+    rowStack.className = 'context-bar-rows';
+
+    // The lane tags (C2): ONE absolutely positioned overlay in BOTH modes, aligned to the top
+    // of the track area (the canvas, or the row stack, is always the first child). Real DOM
+    // text rather than canvas glyphs, so the same element serves the eye and the screen reader
+    // — and `pointer-events: none` in `styles.css` keeps it out of every pointer target.
+    const laneTags = document.createElement('div');
+    laneTags.className = 'context-bar-lanes';
 
     // The figures line (T16/R16b): segment count + exact character total, right-aligned
     // under the track by `styles.css`. It carries NO leading label wording, and it is NOT
@@ -373,9 +405,9 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
 
     if (mode === 'canvas') {
         element.tabIndex = 0;
-        element.append(canvas, optionsList, live);
+        element.append(canvas, laneTags, optionsList, live);
     } else {
-        element.append(rows);
+        element.append(rowStack, laneTags);
     }
 
     element.append(caption);
@@ -388,15 +420,15 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
     // conversation) therefore still has real geometry, and a host that LAYS OUT later gets
     // its true width from the observer rather than keeping the hint.
     //
-    // T27 (parity check): the surface first, NOT the wrapper. The canvas and the flex row are
-    // both `width: 100%` of `.context-bar`'s CONTENT box, while `element.clientWidth` also
+    // T27 (parity check): the surface first, NOT the wrapper. The canvas and the flex ROW STACK
+    // are both `width: 100%` of `.context-bar`'s CONTENT box, while `element.clientWidth` also
     // counts the strip's own `padding: 4px` — 8px of phantom track. Sizing the geometry from
     // the wrapper squashed every bar by that ratio and drifted the pointer mapping (the canvas
     // hit test measures `canvas.getBoundingClientRect()`, i.e. the content box), and it stays
     // wrong for a host with no `ResizeObserver` to correct it. The observer path already reports
     // the content box, so this only makes the pre-observer and observer-less paths agree with it.
     const surfaceWidth = (): number =>
-        (mode === 'canvas' ? canvas.clientWidth : rows.clientWidth) || element.clientWidth || 0;
+        (mode === 'canvas' ? canvas.clientWidth : rowStack.clientWidth) || element.clientWidth || 0;
 
     const resolveWidth = (): number => {
         if (width > 0) return width;
@@ -434,10 +466,12 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         if (mode !== 'canvas' || context === null || destroyed) return;
 
         const tracks = layout;
-        // The strip's box is the TALLEST bar in this strip (at most two line-heights), so the
-        // canvas and the DOM row reserve the same rectangle and the reader can compare bar
-        // bottoms across both modes. An empty strip keeps the base box (the dashed
-        // "nothing recorded" affordance), which `layout.heightPx` already says.
+        // The bar's box is the TALLEST bar in the strip (at most two line-heights) — and with
+        // lanes (C2) the SUM of every row's box plus the seams between them, which is exactly
+        // what the DOM row stack occupies. One canvas therefore reserves the same rectangle as
+        // the flex rows, and the reader can compare bar bottoms across both modes. An empty bar
+        // keeps the base box (the dashed "nothing recorded" affordance), which `layout.heightPx`
+        // already says.
         const height = Math.max(1, tracks.heightPx);
         const ratio = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1;
 
@@ -461,11 +495,18 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         for (const segment of tracks.segments) {
             const tone = contextBarToneOf(segment.block);
             const style = CONTEXT_BAR_TONE_STYLES[tone];
+            // C2: the band this segment's ROW occupies inside the (possibly taller) canvas.
+            // One row means offset 0 and the whole canvas height, so every rectangle below is
+            // the one this painter drew before lanes existed; the guard is only for a
+            // hand-built layout with no `rows`.
+            const band = tracks.rows[segment.row] ?? { offsetY: 0, heightPx: height };
 
-            // BOTTOM-ALIGNED (R27): every bar sits on the strip's floor, so "less context"
-            // reads as a shorter bar against one shared baseline instead of a floating block.
-            const barHeight = Math.max(1, Math.min(segment.heightPx, height));
-            const top = height - barHeight;
+            // BOTTOM-ALIGNED (R27): every bar sits on its ROW's floor, so "less context"
+            // reads as a shorter bar against one shared baseline per lane instead of a
+            // floating block. Each lane owns its own baseline because each lane is its own
+            // graph — that is what makes a second row read as a second row.
+            const barHeight = Math.max(1, Math.min(segment.heightPx, band.heightPx));
+            const top = band.offsetY + band.heightPx - barHeight;
 
             context.globalAlpha = style.alpha;
             context.fillStyle = colorOf(tone);
@@ -501,6 +542,50 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
 
     // --- accessible text ---------------------------------------------------
 
+    /**
+     * The per-row lane cue (C2): `L0` / `L1` / ... one chip per row, positioned into that row's
+     * band, identical in both renderers.
+     *
+     * The rule is the one the brief locks: show it only when the reader could genuinely
+     * misread the picture — more than one row, or a bar whose only lane is not lane 0. A
+     * single-lane bar therefore mints no chip at all, which is also what keeps its DOM byte for
+     * byte what it was. The chips are DOM text, so canvas mode gets the cue AND the
+     * screen-reader announcement from the same nodes the DOM mode paints — no second painter
+     * path, and nothing a reader cannot select or a theme cannot restyle.
+     */
+    const applyLaneTags = (): void => {
+        const show = model !== undefined && contextBarShowsLaneTagsOf(layout.lanes);
+
+        laneTags.hidden = !show;
+
+        if (!show) {
+            laneTags.replaceChildren();
+
+            return;
+        }
+
+        const nodes: Element[] = [];
+
+        for (const row of layout.rows) {
+            const tag = document.createElement('span');
+            tag.className = 'context-bar-lane';
+            tag.dataset.lane = String(row.lane);
+            tag.dataset.row = String(row.row);
+            // Inline positioning only: the overlay is aligned to the top of the track area, so
+            // these two numbers ARE the row's band, in the same CSS pixels both modes paint in.
+            tag.style.top = `${Math.round(row.offsetY)}px`;
+            tag.style.height = `${Math.round(row.heightPx)}px`;
+            // The visible string is the short tag; the accessible name spells the same fact in
+            // words, so a reader never has to expand `L1` and the tag is never the only place
+            // the lane is stated.
+            tag.setAttribute('aria-label', contextBarLaneLabelOf(row.lane));
+            tag.textContent = contextBarLaneTagOf(row.lane);
+            nodes.push(tag);
+        }
+
+        laneTags.replaceChildren(...nodes);
+    };
+
     const applyLabels = (): void => {
         // TWO strings, two audiences (T16, R16b):
         //   - `summary` is the ACCESSIBLE name: label phrase + figures, so a screen reader
@@ -532,8 +617,20 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         element.dataset.maxChars = String(layout.maxChars);
         element.dataset.unknownDurations = String(layout.durationsUnknown);
         element.dataset.totalDurationMs = layout.totalDurationMs === undefined ? '' : String(Math.round(layout.totalDurationMs));
+        // C2: how many LANES this bar stacks and whether it labels them, readable without a
+        // layout pass. `data-row-offsets` is every row's band origin, topmost first, so a test
+        // (or a host) can prove the rows are where the model says they are.
+        element.dataset.lanes = String(layout.lanes.length);
+        element.dataset.laneTags = contextBarShowsLaneTagsOf(layout.lanes) ? 'true' : 'false';
+        element.dataset.rowOffsets = layout.rows.map((row) => String(row.offsetY)).join(',');
         element.dataset.empty = model !== undefined && model.available && model.blocks.length === 0 ? 'true' : 'false';
         caption.textContent = stats;
+
+        // The lane tags (C2), rebuilt with every repaint and in BOTH modes: one chip per row,
+        // inline-positioned into that row's band so nothing about the track's geometry changes.
+        // They exist only when the reader could otherwise read one row of a stacked bar as an
+        // ordinary one-row strip.
+        applyLaneTags();
 
         if (model === undefined) {
             // Nothing to show: the live region, the hover and the painted track all go
@@ -580,9 +677,13 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             // failure mode this widget's whole accessible design exists to avoid. `data-focused`
             // stays false until something really is current, so "reachable" and "current"
             // remain different facts.
-            const tabStop = focused >= 0 ? focused : 0;
+            //
+            // C2: "first" means first IN TAB ORDER, i.e. the first segment of the topmost row —
+            // `layout.segments[0]`, which the model already put in row order. For a one-lane bar
+            // that is index 0, exactly as before.
+            const tabStop = focused >= 0 ? focused : (layout.segments[0]?.index ?? 0);
 
-            for (const button of Array.from(rows.querySelectorAll<HTMLButtonElement>('.context-bar-segment'))) {
+            for (const button of Array.from(rowStack.querySelectorAll<HTMLButtonElement>('.context-bar-segment'))) {
                 const index = Number(button.dataset.index);
                 const current = index === focused;
                 button.tabIndex = index === tabStop ? 0 : -1;
@@ -603,76 +704,117 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
 
     // --- DOM mode build ----------------------------------------------------
 
+    /**
+     * DOM mode: ONE `.context-bar-segments` flex row per lane (C2), stacked by
+     * `.context-bar-rows`.
+     *
+     * Each row is an INDEPENDENT graph, exactly like the canvas' band for that row: it gets its
+     * own inline height (`row.heightPx` — its tallest bar, not the whole stack's) and its own
+     * rendered gap (`row.gapPx` — the gap THIS row could afford). Nothing about a segment's own
+     * box changes: the buttons, their `data-*` vocabulary, their flex weights and their inline
+     * heights are the ones the flat strip minted, and for a bar with one lane the row wrapper is
+     * the only difference at all.
+     */
     const buildDomSegments = (): void => {
         const blocks = model?.blocks ?? [];
         const withLabels = blocks.length <= CONTEXT_BAR_DOM_LABEL_LIMIT;
+        const showLanes = model !== undefined && contextBarShowsLaneTagsOf(layout.lanes);
         const nodes: Element[] = [];
+        // The keyboard's entry point: the first segment of the TOP row, in the model's row order
+        // (`layout.segments` is row-grouped). Index 0 for a one-lane bar, exactly as before.
+        const tabEntry = focused >= 0 ? focused : (layout.segments[0]?.index ?? 0);
 
-        // The row is the SAME box the canvas sized itself to, and `styles.css` gives it
-        // `align-items: flex-end` so every bar sits on the strip's bottom edge exactly where
-        // the painter puts it (R28).
-        rows.style.height = layout.heightPx > 0 ? `${Math.round(layout.heightPx)}px` : '';
+        for (const row of layout.rows) {
+            const rowElement = document.createElement('div');
 
-        // RENDERED gap = the gap the geometry was divided by (T27 parity check). The stylesheet
-        // ships `gap: 2px`, which is `CONTEXT_BAR_GAP_PX` and therefore correct for a short
-        // strip; but `layoutContextBar` SHRINKS the gap when hundreds of segments cannot afford
-        // it (300 bars in a 600px track drop to 1px, 600 bars to 0), and the canvas paints the
-        // shrunk gaps. With a fixed 2px the flex row pays 299px of phantom space at n=300: every
-        // bar clamps to its 1px `min-width`, the row overflows its `overflow: hidden` box, and
-        // the last third of the strip disappears — while `nearestIndex` still aims at columns the
-        // model placed with the shrunk gap. Pinning the inline value keeps both renderers on one
-        // arithmetic (R28) and leaves the CSS default in charge for an unscripted host.
-        rows.style.gap = `${layout.gapPx}px`;
+            rowElement.className = 'context-bar-segments';
+            // Which band this element IS: the click fallback reads `data-row` to aim inside the
+            // right row, and a test can pin the stack without measuring anything.
+            rowElement.dataset.row = String(row.row);
+            rowElement.dataset.lane = String(row.lane);
 
-        for (const segment of layout.segments) {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.className = 'context-bar-segment';
-            button.dataset.index = String(segment.index);
-            button.dataset.blockId = segment.block.id;
-            button.dataset.sectionId = segment.block.sectionId;
-            button.dataset.kind = segment.block.kind;
-            button.dataset.tone = contextBarToneOf(segment.block);
-            button.dataset.state = segment.block.state ?? '';
-            button.dataset.chars = String(segment.chars);
-            button.dataset.durationMs = contextDurationAttr(segment.block);
-            // R27: which axis is which, per segment. `durationKnown='false'` is the strip's
-            // way of saying "this width is the honest baseline, not a measurement", and the
-            // height figures are what the bar was actually seated at.
-            button.dataset.durationKnown = segment.durationKnown ? 'true' : 'false';
-            button.dataset.heightPx = String(segment.heightPx);
-            button.dataset.heightShare = String(Math.round(segment.heightShare * 10_000) / 10_000);
-            button.setAttribute('aria-label', contextBarSegmentLabelOf(segment.block, segment.index, blocks.length));
-            button.title = contextBarSegmentTitleOf(segment.block);
-            // The flex weight carries the layout's WIDTH share and the inline style carries
-            // its HEIGHT, so both modes are sized by one arithmetic (R28).
-            button.style.flexGrow = String(Math.max(1, Math.round(segment.share * 10_000)));
-            button.style.flexBasis = '0%';
-            button.style.height = `${segment.heightPx}px`;
-            // Same roving rule as `paintFocused`: the first segment is the Tab entry until the
-            // reader aims somewhere specific.
-            button.tabIndex = segment.index === (focused >= 0 ? focused : 0) ? 0 : -1;
-            button.dataset.focused = segment.index === focused ? 'true' : 'false';
-
-            // The same minting rule the canvas applies (R28): wide enough for the glyphs AND
-            // at least one line-height tall. A 6px bar has no room for an 18px line of text in
-            // either renderer, so a segment is labelled in one mode exactly when it is in the
-            // other.
-            const labelFits =
-                segment.width >= CONTEXT_BAR_LABEL_MIN_PX &&
-                segment.heightPx >= layout.lineHeightPx * CONTEXT_BAR_LABEL_MIN_LINES;
-
-            if (withLabels && labelFits) {
-                const label = document.createElement('span');
-                label.className = 'context-bar-segment-name';
-                label.textContent = segment.block.name;
-                button.append(label);
+            // A11y (C2): once there is more than one row to tell apart, each row announces its
+            // lane as the group it is. A single-row bar gets NO role and NO label — it is
+            // labelled by the bar itself, and adding a nested group there would change the
+            // accessibility tree of every bar the board has ever drawn.
+            if (showLanes) {
+                rowElement.setAttribute('role', 'group');
+                rowElement.setAttribute('aria-label', contextBarLaneLabelOf(row.lane));
             }
 
-            nodes.push(button);
+            // The row is the SAME box its own canvas band sized itself to, and `styles.css`
+            // gives it `align-items: flex-end` so every bar sits on THAT ROW's bottom edge
+            // exactly where the painter puts it (R28).
+            rowElement.style.height = row.heightPx > 0 ? `${Math.round(row.heightPx)}px` : '';
+
+            // RENDERED gap = the gap THIS row's geometry was divided by (T27 parity check). The
+            // stylesheet ships `gap: 2px`, which is `CONTEXT_BAR_GAP_PX` and therefore correct
+            // for a short strip; but `layoutContextBar` SHRINKS the gap when hundreds of segments
+            // cannot afford it (300 bars in a 600px track drop to 1px, 600 bars to 0), and the
+            // canvas paints the shrunk gaps. With a fixed 2px the flex row pays 299px of phantom
+            // space at n=300: every bar clamps to its 1px `min-width`, the row overflows its
+            // `overflow: hidden` box, and the last third of the strip disappears — while
+            // `nearestIndex` still aims at columns the model placed with the shrunk gap. Pinning
+            // the inline value keeps both renderers on one arithmetic (R28) and leaves the CSS
+            // default in charge for an unscripted host.
+            rowElement.style.gap = `${row.gapPx}px`;
+
+            const buttons: Element[] = [];
+
+            for (const segment of row.segments) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'context-bar-segment';
+                button.dataset.index = String(segment.index);
+                button.dataset.blockId = segment.block.id;
+                button.dataset.sectionId = segment.block.sectionId;
+                button.dataset.kind = segment.block.kind;
+                button.dataset.tone = contextBarToneOf(segment.block);
+                button.dataset.state = segment.block.state ?? '';
+                button.dataset.chars = String(segment.chars);
+                button.dataset.durationMs = contextDurationAttr(segment.block);
+                // R27: which axis is which, per segment. `durationKnown='false'` is the strip's
+                // way of saying "this width is the honest baseline, not a measurement", and the
+                // height figures are what the bar was actually seated at.
+                button.dataset.durationKnown = segment.durationKnown ? 'true' : 'false';
+                button.dataset.heightPx = String(segment.heightPx);
+                button.dataset.heightShare = String(Math.round(segment.heightShare * 10_000) / 10_000);
+                button.setAttribute('aria-label', contextBarSegmentLabelOf(segment.block, segment.index, blocks.length));
+                button.title = contextBarSegmentTitleOf(segment.block);
+                // The flex weight carries the layout's WIDTH share and the inline style carries
+                // its HEIGHT, so both modes are sized by one arithmetic (R28).
+                button.style.flexGrow = String(Math.max(1, Math.round(segment.share * 10_000)));
+                button.style.flexBasis = '0%';
+                button.style.height = `${segment.heightPx}px`;
+                // Same roving rule as `paintFocused`: the FIRST segment in tab order is the Tab
+                // entry until the reader aims somewhere specific.
+                button.tabIndex = segment.index === tabEntry ? 0 : -1;
+                button.dataset.focused = segment.index === focused ? 'true' : 'false';
+
+                // The same minting rule the canvas applies (R28): wide enough for the glyphs AND
+                // at least one line-height tall. A 6px bar has no room for an 18px line of text in
+                // either renderer, so a segment is labelled in one mode exactly when it is in the
+                // other. `layout.lineHeightPx` is bar-wide on purpose: two line-heights are the
+                // same two lines in every row.
+                const labelFits =
+                    segment.width >= CONTEXT_BAR_LABEL_MIN_PX &&
+                    segment.heightPx >= layout.lineHeightPx * CONTEXT_BAR_LABEL_MIN_LINES;
+
+                if (withLabels && labelFits) {
+                    const label = document.createElement('span');
+                    label.className = 'context-bar-segment-name';
+                    label.textContent = segment.block.name;
+                    button.append(label);
+                }
+
+                buttons.push(button);
+            }
+
+            rowElement.append(...buttons);
+            nodes.push(rowElement);
         }
 
-        rows.replaceChildren(...nodes);
+        rowStack.replaceChildren(...nodes);
     };
 
     const apply = (): void => {
@@ -697,24 +839,54 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         activate?.({ block: blocks[index], index, total: blocks.length, source });
     };
 
-    const nearestIndex = (x: number): number => {
+    /**
+     * The segment a pointer is on — including WHICH ROW it is on (C2). `y` is a CSS-pixel
+     * offset from the top of the track area; omitting it asks for the top of the bar, i.e. the
+     * only row a one-lane strip has.
+     */
+    const nearestIndex = (x: number, y = 0): number => {
         recompute();
 
-        return contextBarSegmentAt(layout, x);
+        return contextBarSegmentAt(layout, x, y);
     };
 
-    /** Pointer x relative to the painted track (canvas and DOM share this origin). */
-    const localX = (event: MouseEvent): number => {
-        const box = mode === 'canvas' ? canvas.getBoundingClientRect() : rows.getBoundingClientRect();
-        // A detached/unlaid-out host reports an all-zero rect; treating the event's own
-        // x as the offset keeps the bar usable there instead of pinning every hit to 0.
-        if (box.width === 0) return event.clientX;
+    /**
+     * Aim inside ONE named row (C2, DOM mode). The row element under the pointer knows which
+     * band it is, so the hit test runs at that band's MIDDLE — the row's full height is the aim
+     * target, never just the painted bars, which is the R27 column policy taken across rows.
+     * A row the model no longer has (a resize rebuilt the layout meanwhile) is no error: the
+     * pointer still gets the row the bar's own y says it is on.
+     */
+    const nearestIndexInRow = (x: number, rowIndex: number): number => {
+        recompute();
 
-        return event.clientX - box.left;
+        const row = layout.rows[rowIndex];
+
+        return row === undefined ? contextBarSegmentAt(layout, x) : contextBarSegmentAt(layout, x, row.offsetY + row.heightPx / 2);
+    };
+
+    /**
+     * Pointer position relative to the painted track — both axes, canvas and DOM sharing one
+     * origin (C2 needs the second axis because the rows are stacked inside one surface). The
+     * canvas' box in canvas mode and the row stack's box in DOM mode are each the box the
+     * model's pixels were computed for, so `x` and `y` mean the same thing to
+     * `contextBarSegmentAt` whichever mode this host got.
+     */
+    const localPoint = (event: MouseEvent): { x: number; y: number } => {
+        const box = mode === 'canvas' ? canvas.getBoundingClientRect() : rowStack.getBoundingClientRect();
+
+        // A detached/unlaid-out host reports an all-zero rect; treating the event's own
+        // coordinates as the offsets keeps the bar usable there instead of pinning every hit to
+        // the top-left corner of an unlaid-out box.
+        return {
+            x: box.width === 0 ? event.clientX : event.clientX - box.left,
+            y: box.height === 0 ? event.clientY : event.clientY - box.top
+        };
     };
 
     const onPointerMove = (event: MouseEvent): void => {
-        const index = nearestIndex(localX(event));
+        const point = localPoint(event);
+        const index = nearestIndex(point.x, point.y);
         if (index < 0 || index === focused) return;
 
         rememberFocus(index);
@@ -728,31 +900,43 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
     };
 
     const onClick = (event: MouseEvent): void => {
-        activateIndex(nearestIndex(localX(event)), 'pointer');
+        const point = localPoint(event);
+
+        activateIndex(nearestIndex(point.x, point.y), 'pointer');
     };
 
     const onKeyDown = (event: KeyboardEvent): void => {
         const total = model?.blocks.length ?? 0;
         if (total === 0) return;
 
+        // C2: the traversal order is the MODEL's row order (`layout.segments` is row-grouped:
+        // all of row 0, then all of row 1), so the arrows walk a stacked bar the way the reader
+        // sees it instead of jumping between rows when the lanes interleave. For a one-lane bar
+        // this sequence is exactly `0, 1, 2, ... total - 1`, which is the arithmetic this handler
+        // performed before lanes existed.
+        const sequence = layout.segments.map((segment) => segment.index);
+
         const key = event.key;
 
         if (key === 'ArrowRight' || key === 'ArrowLeft' || key === 'Home' || key === 'End') {
             event.preventDefault();
 
+            // `indexOf` is -1 while nothing is current, which is the same "aim at the first
+            // segment" answer the old `focused < 0` branch gave.
+            const position = sequence.indexOf(focused);
             const next =
                 key === 'Home'
-                    ? 0
+                    ? sequence[0]
                     : key === 'End'
-                      ? total - 1
-                      : focused < 0
-                        ? 0
-                        : Math.min(total - 1, Math.max(0, focused + (key === 'ArrowRight' ? 1 : -1)));
+                      ? sequence[sequence.length - 1]
+                      : position < 0
+                        ? sequence[0]
+                        : sequence[Math.min(sequence.length - 1, Math.max(0, position + (key === 'ArrowRight' ? 1 : -1)))];
 
             rememberFocus(next);
             paintFocused();
 
-            if (mode === 'dom') rows.querySelectorAll<HTMLButtonElement>(`.context-bar-segment[data-index="${next}"]`)[0]?.focus();
+            if (mode === 'dom') rowStack.querySelectorAll<HTMLButtonElement>(`.context-bar-segment[data-index="${next}"]`)[0]?.focus();
 
             return;
         }
@@ -763,7 +947,7 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             // mode fire the same single callback (the tool chip solves it the same way,
             // ./tools.ts:857).
             event.preventDefault();
-            activateIndex(focused < 0 ? 0 : focused, 'keyboard');
+            activateIndex(focused < 0 ? sequence[0] : focused, 'keyboard');
         }
     };
 
@@ -776,7 +960,22 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             // gap between flex items, belongs to the segment whose x-range it landed in — the
             // exact rule the canvas hit test applies. A miss past the last column stays a miss
             // (`activateIndex` ignores an index of -1).
-            activateIndex(nearestIndex(localX(event)), 'pointer');
+            //
+            // C2 adds the other axis: the ROW element the click landed in says which band it is
+            // on, which is both exact and layout-independent (a jsdom host reports no rects at
+            // all). A click that hit the row STACK itself — the seam between two rows — carries
+            // no row of its own, so the pointer's own y decides, by `contextBarRowAt`'s
+            // nearest-band rule.
+            const rowElement = (event.target as Element | null)?.closest?.('.context-bar-segments') as HTMLElement | null;
+            const rowIndex = rowElement === null ? -1 : Number(rowElement.dataset.row ?? '-1');
+            const point = localPoint(event);
+
+            activateIndex(
+                rowIndex >= 0 && Number.isFinite(rowIndex)
+                    ? nearestIndexInRow(point.x, rowIndex)
+                    : nearestIndex(point.x, point.y),
+                'pointer'
+            );
 
             return;
         }
@@ -804,11 +1003,13 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         canvas.addEventListener('click', onClick);
         element.addEventListener('keydown', onKeyDown);
     } else {
-        rows.addEventListener('click', onSegmentClick);
-        rows.addEventListener('focusin', onSegmentFocus);
+        // One set of listeners for the WHOLE stack: events bubble from every row, and the
+        // handlers resolve the row from the element the event actually landed on (C2).
+        rowStack.addEventListener('click', onSegmentClick);
+        rowStack.addEventListener('focusin', onSegmentFocus);
         // Keyboard on a button: jsdom does not translate Enter/Space into a click, a real
         // browser does. `activateIndex` is idempotent, so a doubled activation is one call.
-        rows.addEventListener('keydown', onKeyDown);
+        rowStack.addEventListener('keydown', onKeyDown);
     }
 
     // Repaint on a real width change. `ResizeObserver` is the cheap path (it fires for the
@@ -897,13 +1098,14 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
                 canvas.removeEventListener('click', onClick);
                 element.removeEventListener('keydown', onKeyDown);
             } else {
-                rows.removeEventListener('click', onSegmentClick);
-                rows.removeEventListener('focusin', onSegmentFocus);
-                rows.removeEventListener('keydown', onKeyDown);
+                rowStack.removeEventListener('click', onSegmentClick);
+                rowStack.removeEventListener('focusin', onSegmentFocus);
+                rowStack.removeEventListener('keydown', onKeyDown);
             }
 
             optionsList.replaceChildren();
-            rows.replaceChildren();
+            rowStack.replaceChildren();
+            laneTags.replaceChildren();
             caption.textContent = '';
 
             // A destroyed bar describes NOTHING: its geometry goes with its listeners, so a

@@ -1555,7 +1555,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 resumeThreadState(state);
 
                 return threadRecordCopy(state.record);
-            }
+            },
+            // DISPLAY LANE (C1). Both are thin arrows over the thread-state helpers above —
+            // the same rule every other member of this block follows (a plugin reaches the
+            // host's operation, never a private path with different rules), and both are
+            // SYNCHRONOUS because `setStatus`/`pause`/`resume` are: a plugin that bumps the
+            // lane mid-run must see it on the very next event the run records.
+            setContextLane: (threadId, lane) => setThreadContextLane(threadId, lane),
+            getContextLane: (threadId) => contextLaneOfThread(threadId)
         },
         // T3.5 — the host's persisted-state read, exposed read-only to a plugin. An
         // ARROW, not a reference: `snapshot` is declared far below (the same
@@ -5038,6 +5045,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 sequence: ++threadSequence,
                 ...(ownerThreadId === undefined ? {} : { ownerThreadId }),
                 ...(label === undefined ? {} : { label })
+                // DISPLAY LANE: intentionally absent (= lane 0). A conversation opened
+                // here is a NEW conversation, so it does not inherit the lane of its
+                // creator (`ownerThreadId`) or of the agent it is a thread OF — the two
+                // stacked rows a bump paints are about one conversation's own history.
+                // Every other record copy keeps the source's lane: `threadRecordCopy` is a
+                // spread, and `restore()` re-creates each host record field-for-field.
             },
             agent: threadAgent,
             queue: [],
@@ -5739,6 +5752,57 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         target.record.status = status;
 
+        notifyStateChange('thread', { agent: target.agent.name });
+
+        return threadRecordCopy(target.record);
+    };
+
+    // DISPLAY LANE (C1) — the conversation's current display lane, the counter the server
+    // stamps onto every event it records from this thread from now on
+    // (../server/protocol.ts `SessionTurnEvent.lane`, which the display fold turns into
+    // `ContextBlock.lane` so the context bar paints one stacked row per lane).
+    //
+    // WHY IT LIVES ON THE THREAD RECORD: the record IS the runtime mirror. `ThreadState`
+    // (line ~4638) holds exactly one `record`, and that same record is what `snapshot()`
+    // writes and `restore()` re-creates, so a lane written here is (a) visible to the next
+    // event the run records — the recorder reads `harness.thread(id)` live, never a value
+    // cached at turn start — and (b) durable, with no second store to keep in step.
+    //
+    // WHY ONLY A PLUGIN WRITES IT: the lane is UI metadata, so the model-facing path never
+    // reads it; the only producer in the product is the summarize pass of
+    // ../plugins/context-compaction.plugin.ts, which bumps it once per compaction so the
+    // boundary is visible. A renderer groups by the number and never mints one.
+    //
+    // NAMING: `contextLane` (display) is NOT the execution-lane vocabulary
+    // (`ThreadLane` / `laneOf` / `pumpLane` / `src/server/workers/lane-*`), which is about
+    // worker concurrency.
+    const contextLaneOfThread = (threadId: string): number => threadStateOf(threadId).record.contextLane ?? 0;
+
+    const setThreadContextLane = (threadId: string, lane: number): HarnessThreadRecord => {
+        // The VALUE is checked before the lookup, and a rejected write mutates NOTHING: a
+        // lane that is NaN, fractional or negative is a lane a renderer cannot sort, which
+        // is worse for the bar than no lane at all. TypeError (not HarnessError) because
+        // this is an argument contract, the same way the persistence readers report a bad
+        // field (../server/persistence.ts).
+        if (typeof lane !== 'number' || !Number.isInteger(lane) || lane < 0) {
+            throw new TypeError(
+                `Context lane must be an integer >= 0; received ${typeof lane === 'number' ? String(lane) : typeof lane}.`
+            );
+        }
+
+        // Unknown or already-deleted thread: the same HarnessError every other thread
+        // member gives, so a plugin cannot write a lane onto a conversation that is gone.
+        const target = threadStateOf(threadId);
+
+        // CANONICAL SHAPE: lane 0 is what absence already means, so a write of 0 clears the
+        // key instead of storing it. `snapshot()` and `readThreads` follow the same rule,
+        // which is why a session that never compacted keeps its exact pre-lane document.
+        if (lane === 0) delete target.record.contextLane;
+        else target.record.contextLane = lane;
+
+        // The only durability mechanism a lane write has: the state-change notification is
+        // what reaches the store's persistence observer (the same one `setThreadStatus`
+        // relies on), and the record is live before this returns, so mid-run stamping works.
         notifyStateChange('thread', { agent: target.agent.name });
 
         return threadRecordCopy(target.record);
@@ -10567,6 +10631,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(state.record.invocationId === undefined || state.record.status === 'running'
                     ? {}
                     : { invocationId: state.record.invocationId }),
+                // DISPLAY LANE (C1). Written ONLY when it is non-zero: absence already
+                // means lane 0, so a session that never compacted (and every snapshot
+                // written before lanes existed) keeps its exact document shape.
+                ...(state.record.contextLane === undefined || state.record.contextLane === 0
+                    ? {}
+                    : { contextLane: state.record.contextLane }),
                 messages: readHarnessMessages(
                     state.agent.messages,
                     `thread "${state.record.id}" messages`
@@ -10874,10 +10944,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 state.run = undefined;
                 state.controller = undefined;
                 delete state.record.invocationId;
-                // L2: default conversations are implicit, so restore cannot bring
-                // an owner link back; clear it here (a host thread's owner IS
-                // persisted and is re-created below).
+                // L2: default conversations are implicit, so restore cannot bring an
+                // owner link back; clear it here (a host thread's owner IS persisted and
+                // is re-created below). The DISPLAY LANE follows the same rule for the
+                // same reason: only a host thread persists one, so a stale value left on
+                // a default conversation would state a lane the document cannot justify.
                 delete state.record.ownerThreadId;
+                delete state.record.contextLane;
             }
         }
 
@@ -10898,7 +10971,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     ...(entry.label === undefined ? {} : { label: entry.label }),
                     ...(entry.invocationId === undefined
                         ? {}
-                        : { invocationId: entry.invocationId })
+                        : { invocationId: entry.invocationId }),
+                    // DISPLAY LANE (C1): the persisted lane comes back exactly as written,
+                    // so a conversation that compacted twice still paints two rows after a
+                    // restart, and its NEXT compaction bumps 2 -> 3 rather than restarting
+                    // at 0. `readThreads` normalized away a `0`, so a present value here is
+                    // always a real lane >= 1.
+                    ...(entry.contextLane === undefined ? {} : { contextLane: entry.contextLane })
                 },
                 agent: threadAgent,
                 queue: [],

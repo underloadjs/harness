@@ -236,6 +236,100 @@ describe('one bar per turn', () => {
         expect(tile().querySelector('.context-bar')?.getAttribute('data-max-chars')).toBe('1184');
     });
 
+    it('stacks one row per lane when the turn spans lanes, and stays one row when it does not (C2)', () => {
+        // The same five blocks the test above draws, with the server's lane assignment on them:
+        // the prompt, the instructions and the thinking belong to the FIRST request (lane 0) and
+        // the two calls were issued after a compaction (lane 1). Nothing else about the turn
+        // changes, so this is the end-to-end half of the parity promise — the tile hands the bar
+        // exactly the blocks the section carried, and the bar decides the rows.
+        const laned: ContextBlock[] = CONTEXT.map((entry, position) => ({ ...entry, lane: position < 3 ? 0 : 1 }));
+        const view = documentOf([summary()], { t1: [rootSection({ context: laned })] });
+        const { board, tile } = mount();
+        board.upsertView(summary(), view).renderDisplay((view.displays as Record<string, TurnDisplay>).t1);
+
+        const bar = tile().querySelector('.context-bar') as HTMLElement;
+        const segmentsOf = (row: Element): HTMLElement[] => Array.from(row.querySelectorAll<HTMLElement>('.context-bar-segment'));
+        const rows = Array.from(bar.querySelectorAll<HTMLElement>('.context-bar-rows > .context-bar-segments'));
+
+        // Lane 0 topmost, ascending downward, and only the lanes the blocks occupy.
+        expect(rows).toHaveLength(2);
+        expect(rows.map((row) => row.dataset.row)).toEqual(['0', '1']);
+        expect(rows.map((row) => row.dataset.lane)).toEqual(['0', '1']);
+        expect(rows.map((row) => segmentsOf(row).map((node) => node.dataset.blockId))).toEqual([
+            ['0-user-prompt', '0-system-instructions', '0-reasoning-3'],
+            ['0-tool-7', '0-tool-12']
+        ]);
+
+        // EACH ROW IS ITS OWN GRAPH. Both rows are 36px because each lane has its own biggest
+        // block (200 chars in row 0, 1,184 in row 1) — row 0 is not squashed to share the strip
+        // with row 1, and the 200-char bar is 36px here where the flat bar above drew it at 6px.
+        expect(rows.map((row) => row.style.height)).toEqual(['36px', '36px']);
+        expect(segmentsOf(rows[0]).map((node) => node.style.height)).toEqual(['7px', '11px', '36px']);
+        expect(segmentsOf(rows[1]).map((node) => node.style.height)).toEqual(['36px', '3px']);
+        // The width axis is per-row too: row 0's three segments water-fill their own track
+        // (8px baselines for the two unbracketed blocks, the timed 800ms block taking the rest),
+        // and row 1's two equal 800ms calls split theirs exactly in half.
+        expect(segmentsOf(rows[0]).map((node) => node.style.flexGrow)).toEqual(['126', '126', '9748']);
+        expect(segmentsOf(rows[1]).map((node) => node.style.flexGrow)).toEqual(['5000', '5000']);
+        expect(rows.map((row) => row.style.gap)).toEqual(['2px', '2px']);
+
+        // Rows announce the lane they are, once there is more than one to tell apart.
+        expect(rows.map((row) => row.getAttribute('role'))).toEqual(['group', 'group']);
+        expect(rows.map((row) => row.getAttribute('aria-label'))).toEqual(['context bar lane 0', 'context bar lane 1']);
+
+        // Bar-level figures: the STACK's box, the lanes it stacks, and every row's band origin.
+        expect(bar.getAttribute('data-lanes')).toBe('2');
+        expect(bar.getAttribute('data-lane-tags')).toBe('true');
+        expect(bar.getAttribute('data-row-offsets')).toBe('0,38');
+        expect(bar.getAttribute('data-height-px')).toBe('74');
+        // A figure that is a sum or a maximum stays bar-wide, not per-row: the character ceiling
+        // is the biggest block ANYWHERE in the bar.
+        expect(bar.getAttribute('data-max-chars')).toBe('1184');
+        expect(bar.getAttribute('data-total-duration-ms')).toBe('2400');
+        expect(bar.getAttribute('data-unknown-durations')).toBe('2');
+
+        // THE CUE: a reader who sees two rows is TOLD the turn spans two lanes — once in the
+        // figures line, and once per row as a tag the eye and the screen reader share.
+        expect(bar.querySelector('.context-bar-caption')?.textContent).toBe('5 segments · 2 lanes');
+
+        const tags = Array.from(bar.querySelectorAll<HTMLElement>('.context-bar-lane'));
+
+        expect(tags.map((tag) => tag.textContent)).toEqual(['L0', 'L1']);
+        expect(tags.map((tag) => tag.style.top)).toEqual(['0px', '38px']);
+        expect(tags.map((tag) => tag.style.height)).toEqual(['36px', '36px']);
+        expect(tags.map((tag) => tag.getAttribute('aria-label'))).toEqual(['context bar lane 0', 'context bar lane 1']);
+
+        // PARITY: the identical five blocks with NO published lane are the bar this board printed
+        // before lanes existed — one row, no group semantics, no tags, no lane clause.
+        const flatView = documentOf([summary()], { t1: [rootSection({ context: CONTEXT })] });
+        const flatMount = mount();
+        flatMount.board.upsertView(summary(), flatView).renderDisplay((flatView.displays as Record<string, TurnDisplay>).t1);
+
+        const flatBar = flatMount.tile().querySelector('.context-bar') as HTMLElement;
+        const flatRows = Array.from(flatBar.querySelectorAll<HTMLElement>('.context-bar-rows > .context-bar-segments'));
+
+        expect(flatRows).toHaveLength(1);
+        expect(flatRows[0].dataset.row).toBe('0');
+        expect(flatRows[0].dataset.lane).toBe('0');
+        expect(flatRows[0].getAttribute('role')).toBeNull();
+        expect(flatRows[0].hasAttribute('aria-label')).toBe(false);
+        expect(flatRows[0].style.height).toBe('36px');
+        expect(flatRows[0].style.gap).toBe('2px');
+        // The flat geometry is exactly what the two tests above pin for these fixtures, which is
+        // the hard parity rule stated as data: the per-row normalization collapses to the strip's.
+        expect(segmentsOf(flatRows[0]).map((node) => node.dataset.blockId)).toEqual(CONTEXT.map((entry) => entry.id));
+        expect(segmentsOf(flatRows[0]).map((node) => node.style.height)).toEqual(['3px', '3px', '6px', '36px', '3px']);
+        expect(segmentsOf(flatRows[0]).map((node) => node.style.flexGrow)).toEqual(['127', '127', '3249', '3249', '3249']);
+        expect(flatBar.getAttribute('data-lanes')).toBe('1');
+        expect(flatBar.getAttribute('data-lane-tags')).toBe('false');
+        expect(flatBar.getAttribute('data-row-offsets')).toBe('0');
+        expect(flatBar.getAttribute('data-height-px')).toBe('36');
+        // The overlay is always in the DOM (one shape in both modes) but contributes nothing here.
+        expect(flatBar.querySelectorAll('.context-bar-lane')).toHaveLength(0);
+        expect(flatBar.querySelector('.context-bar-lanes')?.hasAttribute('hidden')).toBe(true);
+        expect(flatBar.querySelector('.context-bar-caption')?.textContent).toBe('5 segments');
+    });
+
     it('gives the root strip only its own segments, and the delegated card its own strip', () => {
         const view = documentOf([summary()], {
             t1: [

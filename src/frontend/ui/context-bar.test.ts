@@ -882,3 +882,333 @@ describe('context bar, canvas mode', () => {
         expect(layout.segments.filter((segment) => segment.durationKnown).every((segment) => segment.durationMs !== undefined)).toBe(true);
     });
 });
+
+// ---------------------------------------------------------------------------
+// C2 — LANES: one stacked row per lane, in both renderers
+// ---------------------------------------------------------------------------
+
+// The fixture: lane 0 holds the prompt (unmeasured, 100 chars) and one 800ms call (300 chars);
+// lane 1 — the row a compaction minted — holds a 1.6s call (40 chars) and a 400ms thinking
+// window (20 chars). Every number below is that bar's geometry at 600px:
+//
+//   row 0 (offsetY 0,  heightPx 36): prompt 0+8 (12px tall, the 8px honest baseline),
+//                                    read  10+590 (36px tall, 300 chars is this row's maximum)
+//   seam                                2px, `CONTEXT_BAR_ROW_GAP_PX`
+//   row 1 (offsetY 38, heightPx 36): bash       0+478 (36px, this ROW's maximum is 40 chars)
+//                                    reasoning 480+120 (18px, half of 40)
+//   the bar's box                      36 + 2 + 36 = 74
+//
+// The heights are the whole point: lane 1's 40-character block reaches the ceiling while lane 0's
+// 300-character block is 36 and its 100-character prompt is 12 — each row normalizes against its
+// OWN biggest block, so a second row is as readable as the first.
+const LANED = [
+    block({
+        id: '0-user-prompt',
+        kind: 'user',
+        name: 'prompt',
+        chars: 100,
+        argsChars: undefined,
+        resultChars: undefined,
+        state: undefined,
+        endedAt: undefined,
+        eventFrom: undefined,
+        eventTo: undefined
+    }),
+    block({ id: '0-tool-7', name: 'read', chars: 300 }),
+    block({ id: '2-tool-9', name: 'bash', chars: 40, at: T, endedAt: T + 1_600, lane: 1 }),
+    block({
+        id: '2-reasoning-4',
+        kind: 'reasoning',
+        name: 'reasoning',
+        chars: 20,
+        argsChars: undefined,
+        resultChars: undefined,
+        state: undefined,
+        at: T,
+        endedAt: T + 400,
+        lane: 1
+    })
+];
+
+describe('context bar, multi-lane (C2)', () => {
+    it('stacks one DOM row per lane, each sized and gapped by its OWN row', () => {
+        const bar = mount(LANED);
+
+        expect(bar.mode()).toBe('dom');
+        expect(bar.element.querySelectorAll('.context-bar-rows')).toHaveLength(1);
+
+        const rows = Array.from(bar.element.querySelectorAll<HTMLElement>('.context-bar-segments'));
+
+        expect(rows).toHaveLength(2);
+        // Rows are the model's rows, topmost first, and each says which lane it is.
+        expect(rows.map((row) => [row.dataset.row, row.dataset.lane])).toEqual([
+            ['0', '0'],
+            ['1', '1']
+        ]);
+        // Each row reserves its OWN band (36px, its tallest bar), not the stack's 74px, and each
+        // renders the gap ITS own geometry could afford.
+        expect(rows.map((row) => row.style.height)).toEqual(['36px', '36px']);
+        expect(rows.map((row) => row.style.gap)).toEqual(['2px', '2px']);
+
+        // The buttons are the same widgets as ever — flat `data-index`, block id, flex weight and
+        // inline height from the model — only now they live in their lane's row. Row 1's 20-char
+        // thinking window is an 18px bar because 20 is half of 40, this row's maximum, while row
+        // 0's 100-char prompt is a 12px bar. One shared denominator would have flattened lane 1.
+        expect(
+            rows.map((row) =>
+                Array.from(row.querySelectorAll<HTMLButtonElement>('.context-bar-segment')).map((button) => [
+                    button.dataset.index,
+                    button.dataset.blockId,
+                    button.style.height,
+                    button.style.flexGrow,
+                    button.dataset.heightPx
+                ])
+            )
+        ).toEqual([
+            [
+                ['0', '0-user-prompt', '12px', '134', '12'],
+                ['1', '0-tool-7', '36px', '9866', '36']
+            ],
+            [
+                ['2', '2-tool-9', '36px', '8000', '36'],
+                ['3', '2-reasoning-4', '18px', '2000', '18']
+            ]
+        ]);
+    });
+
+    it('publishes the lanes on the element and states them in the caption', () => {
+        const bar = mount(LANED);
+
+        expect(bar.element.dataset.segments).toBe('4');
+        expect(bar.element.dataset.lanes).toBe('2');
+        expect(bar.element.dataset.laneTags).toBe('true');
+        // The bands, readable without a layout pass: 0 and 38 inside a 74px box.
+        expect(bar.element.dataset.rowOffsets).toBe('0,38');
+        expect(bar.element.dataset.heightPx).toBe('74');
+        // The bar-wide figures are sums/maxima across rows: 2.8s of recorded time, one unmeasured
+        // segment (the prompt), and the biggest block ANYWHERE in the bar (300 characters).
+        expect(bar.element.dataset.totalDurationMs).toBe('2800');
+        expect(bar.element.dataset.unknownDurations).toBe('1');
+        expect(bar.element.dataset.maxChars).toBe('300');
+        // The compaction is visible in words too (T22/R24 kept the caption minimal; this is the
+        // one figure the row stack genuinely added).
+        expect(bar.element.querySelector('.context-bar-caption')?.textContent).toBe('4 segments · 2 lanes');
+
+        // A11y: each row announces its lane, so a reader who cannot see the tags still knows which
+        // lane a segment belongs to.
+        const rows = Array.from(bar.element.querySelectorAll<HTMLElement>('.context-bar-segments'));
+
+        expect(rows.map((row) => [row.getAttribute('role'), row.getAttribute('aria-label')])).toEqual([
+            ['group', 'context bar lane 0'],
+            ['group', 'context bar lane 1']
+        ]);
+    });
+
+    it('tags the rows only when the reader could misread the bar', () => {
+        const laned = mount(LANED);
+
+        // The tags are DOM text in both modes, positioned into the band they name.
+        expect(
+            Array.from(laned.element.querySelectorAll<HTMLElement>('.context-bar-lane')).map((tag) => [
+                tag.textContent,
+                tag.dataset.lane,
+                tag.dataset.row,
+                tag.style.top,
+                tag.style.height,
+                tag.getAttribute('aria-label')
+            ])
+        ).toEqual([
+            ['L0', '0', '0', '0px', '36px', 'context bar lane 0'],
+            ['L1', '1', '1', '38px', '36px', 'context bar lane 1']
+        ]);
+
+        // PARITY: a lane-absent bar shows NO cue at all — no tag, no row role, no row label, and
+        // the same caption it always had. The wrapper is the only structural change it sees.
+        const flat = mount(THREE);
+
+        expect(flat.element.querySelectorAll('.context-bar-lane')).toHaveLength(0);
+        expect(flat.element.querySelector('.context-bar-lanes')?.hidden).toBe(true);
+        expect(flat.element.dataset.lanes).toBe('1');
+        expect(flat.element.dataset.laneTags).toBe('false');
+        expect(flat.element.dataset.rowOffsets).toBe('0');
+
+        const single = flat.element.querySelector<HTMLElement>('.context-bar-segments') as HTMLElement;
+
+        expect(flat.element.querySelectorAll('.context-bar-segments')).toHaveLength(1);
+        expect(single.dataset.row).toBe('0');
+        expect(single.dataset.lane).toBe('0');
+        expect(single.getAttribute('role')).toBeNull();
+        expect(single.getAttribute('aria-label')).toBeNull();
+        expect(single.style.height).toBe(`${CONTEXT_BAR_MAX_TRACK_HEIGHT_PX}px`);
+        expect(flat.element.querySelector('.context-bar-caption')?.textContent).toBe('3 segments');
+
+        // One row, but NOT lane 0: its lane-0 blocks are gone, and a reader who cannot see the row
+        // would otherwise assume an ordinary strip. The tag appears; the caption still says nothing.
+        const second = mount([block({ id: 'a', chars: 100, lane: 2 }), block({ id: 'b', chars: 50, lane: 2 })]);
+
+        expect(
+            Array.from(second.element.querySelectorAll<HTMLElement>('.context-bar-lane')).map((tag) => [tag.textContent, tag.style.top])
+        ).toEqual([['L2', '0px']]);
+        expect(second.element.querySelector('.context-bar-caption')?.textContent).toBe('2 segments');
+    });
+
+    it('tabs into the top row and walks the flat cross-row sequence', () => {
+        const activated: ContextBarActivateInput[] = [];
+        const bar = mount(LANED, { onActivate: (input) => activated.push(input) });
+        const buttons = Array.from(bar.element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+
+        // Tab enters ONCE, at the first segment of the TOP row; everything else is -1.
+        expect(buttons.map((button) => button.tabIndex)).toEqual([0, -1, -1, -1]);
+
+        buttons[1].focus();
+        expect(bar.focused()).toBe(1);
+
+        // ArrowRight at the END of row 0 crosses into row 1 — the reader follows the rows in the
+        // order they are stacked, which is the flat order for a bar whose lanes are monotonic.
+        buttons[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        expect(bar.focused()).toBe(2);
+        expect(document.activeElement).toBe(buttons[2]);
+
+        buttons[2].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+        expect(bar.focused()).toBe(1);
+        expect(document.activeElement).toBe(buttons[1]);
+
+        // Home/End name the ends of the WHOLE bar, not of one row, and the tab stop follows.
+        buttons[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+        expect(bar.focused()).toBe(3);
+        expect(buttons[3].tabIndex).toBe(0);
+
+        buttons[3].dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }));
+        expect(bar.focused()).toBe(0);
+
+        buttons[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        expect(activated).toEqual([{ block: LANED[0], index: 0, total: 4, source: 'keyboard' }]);
+    });
+
+    it('activates the row a click landed in, and the column inside that row', () => {
+        const activated: ContextBarActivateInput[] = [];
+        const bar = mount(LANED, { onActivate: (input) => activated.push(input) });
+        const rows = Array.from(bar.element.querySelectorAll<HTMLElement>('.context-bar-segments'));
+
+        // The same x means different things per row: row 0's columns are 0+8 and 10+590, row 1's
+        // are 0+478 and 480+120. A click above a short bar still activates that bar's COLUMN, in
+        // its own row (R27/R28 taken across the rows).
+        rows[1].dispatchEvent(new MouseEvent('click', { clientX: 10, bubbles: true }));
+        expect(activated).toEqual([{ block: LANED[2], index: 2, total: 4, source: 'pointer' }]);
+
+        rows[0].dispatchEvent(new MouseEvent('click', { clientX: 10, bubbles: true }));
+        expect(activated[1]).toEqual({ block: LANED[1], index: 1, total: 4, source: 'pointer' });
+
+        rows[1].dispatchEvent(new MouseEvent('click', { clientX: 500, bubbles: true }));
+        expect(activated[2]).toEqual({ block: LANED[3], index: 3, total: 4, source: 'pointer' });
+
+        // Past THAT row's right edge is a miss, whatever a wider row elsewhere in the bar does.
+        rows[1].dispatchEvent(new MouseEvent('click', { clientX: 601, bubbles: true }));
+        expect(activated).toHaveLength(3);
+
+        // A click straight on a button still activates exactly that segment, lane notwithstanding.
+        const second = Array.from(bar.element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'))[3];
+        second.click();
+        expect(activated[3]).toEqual({ block: LANED[3], index: 3, total: 4, source: 'pointer' });
+    });
+
+    it('paints every row into one taller canvas, at that row offset', () => {
+        const fake = stubCanvas();
+        const activated: ContextBarActivateInput[] = [];
+        const bar = mount(LANED, { onActivate: (input) => activated.push(input) });
+
+        expect(bar.mode()).toBe('canvas');
+        // ONE element for the whole stack, 74px tall.
+        expect(bar.element.querySelectorAll('canvas')).toHaveLength(1);
+        expect(bar.element.querySelectorAll('.context-bar-segment')).toHaveLength(0);
+        expect((bar.element.querySelector('.context-bar-canvas') as HTMLCanvasElement).style.height).toBe('74px');
+
+        // Row 0's rectangles are the ones this fixture paints as a single strip (y = 36 - height);
+        // row 1's are the SAME arithmetic offset by its band origin, 38.
+        expect(fake.paints).toEqual([
+            { x: 0, y: 24, width: 8, height: 12, fill: '#d8deea', alpha: 1 },
+            { x: 10, y: 0, width: 590, height: 36, fill: '#4ade80', alpha: 1 },
+            { x: 0, y: 38, width: 478, height: 36, fill: '#4ade80', alpha: 1 },
+            { x: 480, y: 56, width: 120, height: 18, fill: '#fbbf24', alpha: 1 }
+        ]);
+
+        // In-segment labels sit at the middle of their OWN bar, so a row-1 label is 38px lower
+        // than the same bar would be in row 0.
+        expect(fake.texts).toEqual([
+            ['read', 16, 18],
+            ['bash', 6, 56],
+            ['reasoning', 486, 65]
+        ]);
+
+        // The focus ring hugs the painted bar of the row it is on.
+        bar.setFocused(3);
+        expect(fake.outlines).toEqual([[481, 57, 118, 16]]);
+
+        // Pointer aim: the same x in two rows answers twice, because y picks the band first.
+        const canvas = bar.element.querySelector('canvas') as HTMLCanvasElement;
+
+        canvas.dispatchEvent(new MouseEvent('pointermove', { clientX: 10, clientY: 10, bubbles: true }));
+        expect(bar.focused()).toBe(1);
+
+        canvas.dispatchEvent(new MouseEvent('pointermove', { clientX: 10, clientY: 50, bubbles: true }));
+        expect(bar.focused()).toBe(2);
+
+        canvas.dispatchEvent(new MouseEvent('click', { clientX: 500, clientY: 50, bubbles: true }));
+        expect(activated).toEqual([{ block: LANED[3], index: 3, total: 4, source: 'pointer' }]);
+    });
+
+    it('is the same stack in both modes (R28 parity, extended to rows)', () => {
+        const dom = mount(LANED);
+        const fake = stubCanvas();
+        const canvasBar = mount(LANED);
+        const bands = canvasBar.layout().rows.map((row) => [row.offsetY, row.heightPx]);
+
+        expect(bands).toEqual([
+            [0, 36],
+            [38, 36]
+        ]);
+
+        // Each DOM row reserves exactly the band the canvas paints into...
+        expect(Array.from(dom.element.querySelectorAll<HTMLElement>('.context-bar-segments')).map((row) => row.style.height)).toEqual([
+            '36px',
+            '36px'
+        ]);
+        // ...every painted bar stays inside its own band...
+        for (const paint of fake.paints) {
+            const band = canvasBar.layout().rows.find((row) => paint.y >= row.offsetY && paint.y + paint.height <= row.offsetY + row.heightPx);
+
+            expect(band).toBeDefined();
+        }
+        // ...and the two renderers agree on every bar height and every x, segment by segment, in
+        // row order. One arithmetic, one tab order, one picture.
+        expect(Array.from(dom.element.querySelectorAll<HTMLElement>('.context-bar-segment')).map((button) => button.dataset.heightPx)).toEqual(
+            fake.paints.map((paint) => String(paint.height))
+        );
+        expect(Array.from(dom.element.querySelectorAll<HTMLElement>('.context-bar-segment')).map((button) => button.dataset.index)).toEqual([
+            '0', '1', '2', '3'
+        ]);
+    });
+
+    it('keeps exactly one dashed row for an authoritative empty bar', () => {
+        // An empty bar has NO lane — nothing claimed one — but it still needs one band, because
+        // that is the box the dashed "nothing recorded" affordance draws in both modes.
+        const bar = mountContextBar({ width: 600 });
+        document.body.replaceChildren(bar.element);
+        bar.setModel(EMPTY_MODEL);
+
+        expect(bar.element.dataset.lanes).toBe('0');
+        expect(bar.element.dataset.laneTags).toBe('false');
+        expect(bar.element.dataset.heightPx).toBe(String(CONTEXT_BAR_TRACK_HEIGHT_PX));
+
+        const rows = Array.from(bar.element.querySelectorAll<HTMLElement>('.context-bar-segments'));
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].dataset.row).toBe('0');
+        expect(rows[0].dataset.lane).toBe('0');
+        expect(rows[0].querySelectorAll('.context-bar-segment')).toHaveLength(0);
+        expect(bar.element.querySelectorAll('.context-bar-lane')).toHaveLength(0);
+        expect(bar.element.querySelector('.context-bar-caption')?.textContent).toBe('no recorded context');
+
+        bar.destroy();
+    });
+});

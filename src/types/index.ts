@@ -2483,6 +2483,26 @@ export type HarnessThreadRecord = {
     // persistent record to the `HarnessThread.id` carried by its events and to
     // `agentResult`. Absent until the thread has run once.
     invocationId?: string;
+    // DISPLAY LANE — this conversation's CURRENT lane, the number a run's recorded
+    // events are stamped with (../server/protocol.ts `SessionTurnEvent.lane`, and
+    // ../shared/turn-display.ts `ContextBlock.lane` inherits it).
+    //
+    // It is PURE UI METADATA and never model-facing: no projection of it reaches a
+    // `HarnessMessage`, so the transcript the provider sees is unchanged. The context
+    // bar renders one stacked row per lane, so a conversation whose lane moved (a
+    // summarize compaction) paints its pre- and post-compaction segments as two rows.
+    //
+    //   - ABSENT means lane 0, and a write of 0 normalizes to absent (a snapshot this
+    //     harness produced therefore keeps its exact pre-lane shape);
+    //   - when present it is an integer >= 0, and only the SERVER mints a new one
+    //     (`api.threads.setContextLane`) — a renderer groups rows by it, never invents one;
+    //   - it is DURABLE (persisted on the thread record, so a restart continues the same
+    //     lane), which is why a host thread carries it in `HarnessThreadSnapshot` below.
+    //
+    // NAMING: `contextLane` is the DISPLAY lane. The execution-lane vocabulary
+    // (`ThreadLane`, `laneOf`, `pumpLane`, `max_lane_workers`, `src/server/workers/lane-*`)
+    // means worker concurrency and is a different thing entirely.
+    contextLane?: number;
 };
 
 export type HarnessThreadCreateOptions = {
@@ -2910,6 +2930,12 @@ export type HarnessThreadSnapshot = {
     ownerThreadId?: string;
     label?: string;
     invocationId?: string;
+    // The conversation's DISPLAY LANE (see `HarnessThreadRecord.contextLane`). Optional
+    // and additive: a document written before lanes exist has no key and restores to lane
+    // 0, and a lane of 0 is never written, so every pre-lane record keeps its exact shape.
+    // Only a HOST thread carries it — a default `agent:<name>` conversation is implicit
+    // and is not persisted at all, exactly like its owner link (L2).
+    contextLane?: number;
     // The thread's committed transcript. Required (a host thread's history lives
     // nowhere else), and restored into a fresh Agent seeded from the owner's
     // configuration.
@@ -4539,6 +4565,28 @@ export type HarnessPluginApi = {
         // park that payload's `pause()` owns, which is what stops a stranded park from
         // hiding a conversation from its host.
         resume: (threadId: string) => HarnessThreadRecord;
+        // SET this conversation's DISPLAY LANE (the counter every event it records from
+        // now on is stamped with — see `HarnessThreadRecord.contextLane`). Pure UI
+        // metadata: the lane never reaches a `HarnessMessage`, so what the model is sent
+        // does not change; only the context bar's stacked rows do.
+        //
+        // SYNCHRONOUS and immediately visible, like `setStatus`: the write lands on the
+        // live record before this returns, so an event the run records a microsecond later
+        // already carries the new lane (which is what lets one turn's bar show two rows),
+        // and the state-change notification is what makes the thread snapshot persist it.
+        //
+        //   - unknown/deleted `threadId`  → throws (the same message every other member gives);
+        //   - `lane` must be an integer >= 0 — NaN, a float, a negative, or a non-number
+        //     throws a TypeError and mutates NOTHING, because a lane a renderer cannot sort
+        //     is worse than no lane at all.
+        //
+        // Returns the updated DETACHED record copy (like `setStatus`), so the caller can
+        // see what changed without holding the live record.
+        setContextLane: (threadId: string, lane: number) => HarnessThreadRecord;
+        // READ the current display lane. `0` when the conversation has never had one set
+        // (absent means lane 0, and a reader never synthesizes a different number).
+        // Throws for an unknown thread, like every other member.
+        getContextLane: (threadId: string) => number;
     };
 
     // The harness's persisted state, read-only (T3.5). This is the SAME value the host's

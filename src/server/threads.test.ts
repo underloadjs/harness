@@ -24,7 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '../harness';
-import type { HarnessMessage, HarnessStreamEvent } from '../harness';
+import type { HarnessMessage, HarnessPluginApi, HarnessStreamEvent } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
@@ -280,6 +280,67 @@ const flakyFixture = (): { preset: HarnessPreset; heal: () => void } => {
         heal: () => {
             failing = false;
         }
+    };
+};
+
+// C1 FIXTURE: the same scripted transport, plus a HOST PLUGIN that owns the lane write.
+// `api.threads.setContextLane` is the only way anything raises a display lane (the shipped
+// compactor does it through this very api), so the plugin captures its api at setup and the
+// test performs the bump BETWEEN two recorded events — the exact moment a compaction moves
+// the boundary. That is what pins "the recorder re-reads the conversation per event"
+// (./sessions.ts `contextLaneOf`) against the alternative it must never fall back to, "the
+// lane was read once when the turn started".
+const laneFixture = (): {
+    preset: HarnessPreset;
+    api: () => HarnessPluginApi;
+    gate: Deferred;
+    started: Deferred;
+} => {
+    let captured: HarnessPluginApi | undefined;
+    const gate = deferred();
+    const started = deferred();
+
+    const preset = presetOf('probe', (settings, progress) =>
+        harness({
+            agents: {
+                probe: agent({
+                    model: settings.model,
+                    instruction: 'sys',
+                    stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                        // Frame 1 is on the wire (recorded, with whatever lane the
+                        // conversation holds at that instant) before the test is told to
+                        // move the lane; frames 2 and 3 can only be recorded after it.
+                        yield { type: 'reasoning', delta: 'before' };
+                        started.resolve();
+                        await gate.promise;
+                        yield { type: 'text', delta: 'after' };
+                        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                    }
+                })
+            },
+            primary: 'probe',
+            presets: false,
+            plugins: [
+                {
+                    name: 'lane-probe',
+                    setup: (api: HarnessPluginApi) => {
+                        captured = api;
+                    }
+                }
+            ],
+            report: { progress }
+        })
+    );
+
+    return {
+        preset,
+        api: () => {
+            if (captured === undefined) throw new Error('the lane probe never saw its api');
+
+            return captured;
+        },
+        gate,
+        started
     };
 };
 
@@ -4037,6 +4098,224 @@ describe('delegated conversation identity in the compiled view (R18)', () => {
         ).toEqual([['0', false]]);
 
         store.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// DISPLAY LANE (C1) — the server half of the context bar's stacked rows.
+//
+// A summarize compaction raises the conversation's display lane (the plugin api's
+// `threads.setContextLane`), and the store's recorder reads that lane PER EVENT while the
+// run is still alive (./sessions.ts `contextLaneOf`). Everything the bar needs is therefore
+// decided at record time, and these cases pin the two properties the UI depends on:
+//
+//   1. a lane raised MID-RUN lands on the events recorded after it, inside the SAME turn,
+//      so one compaction paints two stacked rows in one bar (the alternative — reading the
+//      lane once at turn start — would move the boundary into the NEXT turn's bar, where no
+//      bar would ever show it);
+//   2. the lane survives the turn, the document and a restart, so the next conversation
+//      turn starts on the row the compaction created instead of dropping back to row 0.
+//
+// The bump is performed through a host plugin (the fixture above), because that api IS the
+// only writer — the shipped compactor raises lanes through the same pair.
+// ---------------------------------------------------------------------------
+
+describe('display lane (C1)', () => {
+    it('stamps a mid-run lane bump onto the events recorded after it, in the same turn', async () => {
+        pinClock(1_000);
+        const fixture = laneFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const first = await store.enqueue(created.id, 'hello');
+
+        // The turn record was minted while the conversation sat on lane 0, and 0 is
+        // ABSENCE: the receipt carries no `lane` key at all (the shape every pre-lane
+        // session keeps).
+        expect(first.turn).not.toHaveProperty('lane');
+
+        await fixture.started.promise;
+
+        // THE BUMP, at the moment a compaction would perform it: the first recorded frame
+        // is already on the wire, the run is still attached, and the answer has not been
+        // produced yet.
+        fixture.api().threads.setContextLane('thread-1', 1);
+        fixture.gate.resolve();
+
+        await first.settled;
+        await store.waitForIdle(created.id);
+
+        const turn = store.get(created.id).turns[0];
+        const laneOf = (event: Record<string, unknown>): number | undefined =>
+            event.lane as number | undefined;
+
+        // Recorded exactly as the conversation moved: `start` and the pre-boundary thinking
+        // carry NO lane (row 0), the post-boundary answer frames carry 1. The turn's own
+        // starting lane stays absent, because the bump moved the conversation, not the row
+        // the turn began on.
+        expect(turn.events.map((event) => laneOf(event as unknown as Record<string, unknown>))).toEqual([
+            undefined,
+            undefined,
+            1,
+            1
+        ]);
+        expect(turn.events[2]).toEqual({
+            type: 'text',
+            agent: 'probe',
+            delta: 'after',
+            thread: { id: '1' },
+            lane: 1
+        });
+        expect('lane' in turn).toBe(false);
+
+        // THE BAR, from the store's own projection: the prompt sits on row 0 and the
+        // answer's segment on row 1 — one compaction, two rows, no second turn involved.
+        const context = store.getView(created.id).displays[turn.id].sections[0].context ?? [];
+
+        expect(context.map((block) => [block.id, block.name, block.lane])).toEqual([
+            ['0-system-instructions', 'instructions', undefined],
+            ['0-user-prompt', 'prompt', undefined],
+            ['0-reasoning-1', 'reasoning', undefined],
+            ['0-assistant-2', 'answer', 1]
+        ]);
+    });
+
+    it('starts the next turn on the raised lane, and keeps it across a restart', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 'c1-lane-'));
+        const persistence = new HarnessPersistence(root);
+        const fixture = laneFixture();
+        const store = createStore([fixture.preset], persistence);
+        const created = await store.create('probe');
+
+        const first = await store.enqueue(created.id, 'hello');
+        await fixture.started.promise;
+        fixture.api().threads.setContextLane('thread-1', 1);
+        fixture.gate.resolve();
+        await first.settled;
+        await store.waitForIdle(created.id);
+
+        // A CONTINUATION of the same conversation reports the lane it starts on, and every
+        // one of its frames is stamped with it: its prompt and its answer share one row, so
+        // the bar never splits a turn that contained no boundary.
+        const second = await store.enqueue(created.id, 'again', undefined, undefined, 'thread-1');
+        expect(second.turn.lane).toBe(1);
+
+        await second.settled;
+        await store.waitForIdle(created.id);
+
+        const continuation = store.get(created.id).turns[1];
+
+        // Four frames (`start`, the thinking, the answer, `done`), every one of them on the
+        // lane the turn started on — the recorder read it per event and got the same number
+        // all the way through, which is what keeps this bar at one row.
+        expect(
+            continuation.events.map((event) => (event as Record<string, unknown>).lane as number | undefined)
+        ).toEqual([1, 1, 1, 1]);
+
+        // Durable, in both halves of the document: the conversation's current lane on the
+        // thread snapshot, and the per-event stamps on the recorded frames.
+        const document = persistence.load()?.sessions[0] as unknown as Record<string, any>;
+
+        expect(document.turns.map((entry: Record<string, any>) => entry.lane)).toEqual([undefined, 1]);
+        expect(
+            document.core.threads.find((entry: Record<string, any>) => entry.id === 'thread-1')
+                .contextLane
+        ).toBe(1);
+
+        // RESTART: the restored conversation is still on lane 1, and the store stamps the
+        // next turn from the restored value — a lane that survived the wave must not
+        // silently fall back to row 0 and repaint a completed boundary away.
+        const reopened = createStore([fixture.preset], persistence, persistence.load());
+        const third = await reopened.enqueue(created.id, 'third', undefined, undefined, 'thread-1');
+
+        expect(third.turn.lane).toBe(1);
+        await third.settled;
+        await reopened.waitForIdle(created.id);
+
+        const restoredTurn = reopened.get(created.id).turns[2];
+
+        expect(
+            restoredTurn.events.map((event) => (event as Record<string, unknown>).lane as number | undefined)
+        ).toEqual([1, 1, 1, 1]);
+
+        // The turn the bump happened IN kept its starting lane (absent = 0) through all of
+        // it, which is what the projector pairs with the unstamped prompt block.
+        expect(
+            reopened.get(created.id).turns.map((entry) => (entry as Record<string, unknown>).lane)
+        ).toEqual([undefined, 1, 1]);
+
+        reopened.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it('refuses a lane the bar could not sort, from the plugin edge to the loader', async () => {
+        const fixture = laneFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        // The gate is already open here: this case never pauses the run, it only probes the
+        // lane contract at the api and at the loader.
+        fixture.gate.resolve();
+        await store.enqueue(created.id, 'hello');
+        await store.waitForIdle(created.id);
+
+        // The plugin api validates before it looks anything up, and a rejected write mutates
+        // nothing (src/harness.ts `setThreadContextLane`).
+        expect(() => fixture.api().threads.setContextLane('thread-1', 1.5)).toThrow(
+            'Context lane must be an integer >= 0; received 1.5.'
+        );
+        expect(() => fixture.api().threads.setContextLane('thread-1', -1)).toThrow(
+            'Context lane must be an integer >= 0; received -1.'
+        );
+        expect(fixture.api().threads.getContextLane('thread-1')).toBe(0);
+
+        // A hand-edited document is refused by the loader for the same reason: a lane a
+        // renderer cannot sort is worse for the bar than no lane.
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 'c1-lane-bad-'));
+        const good = laneFixture();
+        const persistence = new HarnessPersistence(root);
+        const durable = createStore([good.preset], persistence);
+        const session = await durable.create('probe');
+
+        good.gate.resolve();
+        await durable.enqueue(session.id, 'hello');
+        await durable.waitForIdle(session.id);
+        durable.dispose();
+
+        const written = JSON.parse(
+            fs.readFileSync(path.join(root, 'harness', 'state.json'), 'utf8')
+        ) as Record<string, any>;
+
+        // Two validation stages, in this order: the number check (`requireNumber`, the same
+        // one every other numeric field goes through) and then the lane's own rule, which is
+        // what the contract's `minimum: 0` says (../shared/turn-display.ts `ContextBlock.lane`).
+        for (const bad of [-1, 1.5] as const) {
+            const broken = structuredClone(written);
+
+            broken.sessions[0].turns[0].lane = bad;
+
+            expect(() => readHarnessDatabase(broken)).toThrow(
+                'sessions[0].turns[0].lane must be an integer >= 0.'
+            );
+        }
+
+        const notANumber = structuredClone(written);
+
+        notANumber.sessions[0].turns[0].lane = 'one';
+
+        expect(() => readHarnessDatabase(notANumber)).toThrow(
+            'sessions[0].turns[0].lane must be a finite number.'
+        );
+
+        // A written 0 is normalized AWAY (absence is the canonical shape), so a document an
+        // older build left behind restores exactly as a fresh one would.
+        const zero = structuredClone(written);
+
+        zero.sessions[0].turns[0].lane = 0;
+
+        expect(readHarnessDatabase(zero).sessions[0].turns[0]).not.toHaveProperty('lane');
+
         fs.rmSync(root, { recursive: true, force: true });
     });
 });

@@ -35,6 +35,7 @@ import type {
     DisplayState,
     HarnessUsage,
     PageMeta,
+    PatchTurnBlockRequest,
     PluginDetailResponse,
     PluginSettingsUpdate,
     PluginSummary,
@@ -44,6 +45,7 @@ import type {
     SessionSummaryPage,
     TaskReceipt,
     TranscriptWriteReceipt,
+    TurnBlockWriteReceipt,
     TurnDisplay,
     TurnSummaryPage,
     UpdateThreadTranscriptRequest,
@@ -558,6 +560,102 @@ describe('harness contract type wiring (compile time)', () => {
         ];
         const guards: AliasGuards = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
         expect(guards.every((guard) => guard)).toBe(true);
+    });
+
+    // HAND-MAINTAINED BLOCKS (C1 follow-up): two regenerations of this file collapsed
+    // `PatchTurnBlockRequest` to `unknown | unknown` and stripped the property doc blocks of
+    // `TurnBlockWriteReceipt`, because the spec's `anyOf` members
+    // (src/server/harness.swagger.yaml:8417-8419) carry only `required` with no `properties`,
+    // which the renderer turns into `unknown` (scripts/generate-harness-contract.mjs:141-142
+    // and :183). `unknown` accepts ANY value, so plain assignability cannot see the collapse —
+    // hence `keyof` and indexed-access probes: both are errors on `unknown`, so the collapse
+    // fails to COMPILE here (this file is excluded from `npm run typecheck`; the scoped `npx
+    // tsc` run recorded in the task report is what proves it) instead of surfacing as the
+    // server's two `body.<axis>` reads going red (src/server/api.ts:4602-4620). The dropped
+    // doc comments are a generator gap, recorded in docs/issues/.
+    it('keeps the block-detail write body and receipt reachable through their declared keys', () => {
+        // EXACT KEY SETS, both directions. `keyof unknown` is `never`, so a collapsed member
+        // cannot even hold the literals below; the `Equal` guards the other direction, so a
+        // regenerated member that ADDS or renames a key fails too.
+        type PatchFieldSet = Equal<keyof PatchTurnBlockRequest, 'included' | 'reasoningIncluded'>;
+        type ReceiptFieldSet = Equal<
+            keyof TurnBlockWriteReceipt,
+            | 'session_id'
+            | 'turn_id'
+            | 'block_id'
+            | 'included'
+            | 'reasoning_included'
+            | 'thread_id'
+            | 'revision'
+            | 'links'
+        >;
+        const fieldSets: [Expect<PatchFieldSet>, Expect<ReceiptFieldSet>] = [true, true];
+
+        expect(fieldSets).toEqual([true, true]);
+
+        // THE TWO AXES the route validates, with their exact declared types (an optional
+        // boolean reads as `boolean | undefined`, which is what lets `api.ts` tell "absent"
+        // from `false` before it picks the join).
+        const axisTypes: [
+            Expect<Equal<PatchTurnBlockRequest['included'], boolean | undefined>>,
+            Expect<Equal<PatchTurnBlockRequest['reasoningIncluded'], boolean | undefined>>
+        ] = [true, true];
+
+        expect(axisTypes).toEqual([true, true]);
+
+        // A wire-shaped body of each kind the route accepts. `satisfies` re-checks the literal
+        // against the declared member, so a `properties`-less regeneration that lands on
+        // `unknown` still has to keep these keys spelled here — and any stray key is rejected.
+        const unitWrite = { included: false } satisfies PatchTurnBlockRequest;
+        const thinkingWrite = { included: true, reasoningIncluded: false } satisfies PatchTurnBlockRequest;
+
+        expect(unitWrite).toEqual({ included: false });
+        expect(thinkingWrite).toEqual({ included: true, reasoningIncluded: false });
+
+        // THE RECEIPT the route answers with (src/server/api.ts:4715-4727), spelled field by
+        // field: the thinking-axis read-back and the links are optional, so both shapes must
+        // stay assignable and the required four must stay required.
+        const thinkingReceipt: TurnBlockWriteReceipt = {
+            session_id: 'ses_1',
+            turn_id: 'turn_1',
+            block_id: '2-reasoning-3',
+            included: true,
+            reasoning_included: true,
+            thread_id: 'thr_1',
+            revision: 4,
+            links: {
+                block: HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdBlocksByBlockId('ses_1', 'turn_1', '2-reasoning-3'),
+                transcript: HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscript('ses_1', 'thr_1')
+            }
+        };
+        const unitReceipt: TurnBlockWriteReceipt = {
+            session_id: 'ses_1',
+            turn_id: 'turn_1',
+            block_id: '2-tool-7',
+            included: false
+        };
+
+        // Byte-for-byte the two receipts, including the exact link strings the route builds.
+        expect(thinkingReceipt).toEqual({
+            session_id: 'ses_1',
+            turn_id: 'turn_1',
+            block_id: '2-reasoning-3',
+            included: true,
+            reasoning_included: true,
+            thread_id: 'thr_1',
+            revision: 4,
+            links: {
+                block: '/v1/harness/sessions/ses_1/turns/turn_1/blocks/2-reasoning-3',
+                transcript: '/v1/harness/sessions/ses_1/threads/thr_1/transcript'
+            }
+        });
+        expect(unitReceipt).toEqual({ session_id: 'ses_1', turn_id: 'turn_1', block_id: '2-tool-7', included: false });
+
+        // The optional pair stays OPTIONAL (an unset field is ABSENT, never `null`), which is
+        // what the route's conditional spread and the dialog's chip both rely on.
+        expect(Object.hasOwn(unitReceipt, 'reasoning_included')).toBe(false);
+        expect(Object.hasOwn(unitReceipt, 'links')).toBe(false);
+        expect(unitReceipt.links).toBeUndefined();
     });
 
     it('narrows update frames on kind and message frames on type', () => {

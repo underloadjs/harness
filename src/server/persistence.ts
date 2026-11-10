@@ -781,12 +781,41 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
                   return parts.label;
               })();
 
+    // DISPLAY LANE (C1): the lane this turn started on (./protocol.ts `SessionTurn.lane`).
+    // OPTIONAL and additive — a document written before lanes exist has no key and restores
+    // to lane 0, and `copyTurn`/`readTurn` never write a 0, so every pre-lane record keeps
+    // its exact bytes. A value must be an integer >= 0 for the same reason the contract
+    // says `minimum: 0` (../shared/turn-display.ts `ContextBlock.lane`): a lane a renderer
+    // cannot sort is worse than no lane, so a corrupt one fails the load like any other
+    // corruption rather than restoring a bar that cannot be painted.
+    //
+    // The PER-EVENT lanes (./protocol.ts `SessionTurnEvent.lane`) need no reader of their
+    // own: `events` stays opaque below — the harness's own event payloads are user content
+    // the store never rewrites — so a recorded lane persists and replays verbatim, and
+    // ./turn-projector.ts `laneOfEvent` treats anything that is not an integer >= 1 as
+    // "no lane" instead of trusting a hand-edited document.
+    const lane =
+        record.lane === undefined
+            ? undefined
+            : (() => {
+                  const value = requireNumber(record.lane, `${label}.lane`);
+
+                  if (!Number.isInteger(value) || value < 0) {
+                      throw new TypeError(`${label}.lane must be an integer >= 0.`);
+                  }
+
+                  return value;
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         index: requireNumber(record.index, `${label}.index`),
         prompt: requireString(record.prompt, `${label}.prompt`),
         ...(threadId === undefined ? {} : { threadId }),
         ...(threadLabel === undefined ? {} : { threadLabel }),
+        // Written only when it is a real lane (> 0): absence IS lane 0 (the comment above),
+        // so a restored row has the exact shape `copyTurn` produces for a lane-0 turn.
+        ...(lane === undefined || lane === 0 ? {} : { lane }),
         ...(references === undefined ? {} : { references }),
         // T14 gap (c): the stripped labels, normalized and non-empty only (see the reader
         // above). An empty list is dropped so a restored row has the exact shape `copyTurn`

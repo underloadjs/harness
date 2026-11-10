@@ -8,6 +8,10 @@
 //     `CONTEXT_BAR_MAX_TRACK_HEIGHT_PX` as the strip box in BOTH modes — the latter published
 //     as the `--context-bar-*` tokens in `:root`, which `resolveContextBarTrackHeights` reads
 //     so a theme change moves the canvas and the DOM row together (T26, R27);
+//   - C2: the same agreement for the LANES — `CONTEXT_BAR_ROW_GAP_PX` as the `.context-bar-rows`
+//     column gap via `--context-bar-row-gap`, the frame padding as `--context-bar-frame-padding`
+//     (the lane-tag overlay is inset by it), and `pointer-events: none` on the tag overlay so a
+//     chip never steals a click from the segment under it;
 //   - that the DOM row SEATS its bars (`align-items: flex-end`) exactly as the canvas
 //     bottom-aligns its rectangles (R28);
 //   - the tone table, from the same `--ok` / `--danger` / `--warn` / `--text` values
@@ -40,6 +44,7 @@ import {
     CONTEXT_BAR_MAX_HEIGHT_LINES,
     CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
     CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
+    CONTEXT_BAR_ROW_GAP_PX,
     CONTEXT_BAR_TONE_STYLES,
     CONTEXT_BAR_TRACK_HEIGHT_PX
 } from '../view-context';
@@ -460,4 +465,54 @@ it('styles the segment dialog with the panes and states the payload already has'
     expect(blockOf(".block-detail-note[data-detail='error'] {")).toContain('border-left-color: var(--danger);');
     // A long recorded body scrolls inside its pane instead of growing the modal forever.
     expect(blockOf('.block-detail-text {')).toContain('max-height:');
+});
+
+it('stacks lanes with the model row seam, and keeps the lane tags out of every pointer target (C2)', () => {
+    // C2: the canvas paints its row BANDS from `CONTEXT_BAR_ROW_GAP_PX` and the DOM stack is
+    // laid out by CSS, so the seam exists in two places and must be ONE number. The painter
+    // cannot ask CSS for the offsets it computed, so the sheet mirrors the model constant as a
+    // token — exactly the pattern the three vertical-scale tokens above already use. A drift
+    // here is invisible in a screenshot and fatal to the parity promise: identical layout,
+    // rows at different y in the two modes.
+    const root = blockOf(':root {');
+
+    expect(root).toContain(`--context-bar-row-gap: ${CONTEXT_BAR_ROW_GAP_PX}px;`);
+
+    const rows = blockOf('.context-bar-rows {');
+
+    // A COLUMN, because lane 0 is the top row and lanes descend. `row-reverse` or a row
+    // direction would put the newest lane where the reader expects the first request.
+    expect(rows).toContain('display: flex;');
+    expect(rows).toContain('flex-direction: column;');
+    expect(rows).toContain('gap: var(--context-bar-row-gap);');
+    // A flex item this narrow is the one failure mode a stack of bars has: without `min-width`
+    // a row of hundreds of 1px bars cannot shrink below its content and the strip overflows.
+    expect(rows).toContain('min-width: 0;');
+
+    // The frame padding is a token for the same reason: the lane-tag overlay is inset BY it, so
+    // the chips line up with the track area the rows (or the canvas) actually occupy, and the
+    // painter's `originX` is the same 4px the frame is padded by.
+    expect(root).toContain('--context-bar-frame-padding: 4px;');
+
+    const frame = blockOf('.context-bar {');
+
+    expect(frame).toContain('padding: var(--context-bar-frame-padding);');
+    // The frame owns the containing block the overlay and every chip resolve against.
+    expect(frame).toContain('position: relative;');
+
+    const lanes = blockOf('.context-bar-lanes {');
+
+    expect(lanes).toContain('position: absolute;');
+    expect(lanes).toContain('inset: var(--context-bar-frame-padding) var(--context-bar-frame-padding) auto;');
+    // LOAD-BEARING: the chips hang over the bars, and an element in front of a column would
+    // steal the click from the segment under it (both modes route every activation through
+    // this box's own subtree).
+    expect(lanes).toContain('pointer-events: none;');
+
+    // The chip is real DOM text in BOTH modes — that is what lets one element serve the eye and
+    // the screen reader, and it is why there is no canvas-glyph path to keep in sync.
+    const tag = blockOf('.context-bar-lane {');
+
+    expect(tag).toContain('position: absolute;');
+    expect(tag).toContain('white-space: nowrap;');
 });

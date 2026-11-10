@@ -161,6 +161,12 @@ type FakeApi = {
     // The live agent registry the trigger reads the model id from. Mutable by identity:
     // `api.agents` is this same object, so a test can register a brain between turns.
     agents: Record<string, Agent>;
+    // C1 — the display lanes the fake api holds, keyed by thread id (an absent thread is
+    // lane 0). Asserted directly by the lane cases below.
+    lanes: Map<string, number>;
+    // ...or makes every lane WRITE refuse, reads included stay working, so a case can prove
+    // a refused lane write costs a compaction nothing but a diagnostic.
+    failLanes: (value: boolean) => void;
     // Simulates an operator changing the stored limit between turns.
     setLimit: (value: number) => void;
     // ...or any other setting the action reads.
@@ -190,6 +196,9 @@ const createFakeApi = (
 ): FakeApi => {
     const touches: string[] = [];
     const diagnostics: HarnessPluginDiagnosticReport[] = [];
+    // C1 — the lane state, and the switch that makes writes refuse (see `FakeApi`).
+    const lanes = new Map<string, number>();
+    let failLanes = false;
 
     // `mode: 'exclude'` is seeded because nearly every case in the guard/action blocks below
     // pins the PRUNING lifecycle — the park/action/resume triple, the flag writes, the pass
@@ -265,7 +274,44 @@ const createFakeApi = (
             // control: `unpark` swallows the throw (an unknown thread is not an error), so the
             // touch is the observable half of the call.
             pause: () => skip('threads.pause'),
-            resume: () => skip('threads.resume')
+            resume: () => skip('threads.resume'),
+            // C1 — the DISPLAY LANE pair. Backed by a real map (not `skip`), because a
+            // summarize pass now bumps the lane as part of starting, and a fake that threw
+            // would silently turn every summarize case into a "the lane write failed" case.
+            // The values are asserted case by case below; `touches` still records every read,
+            // so "the exclude pass never touched a lane" stays provable.
+            getContextLane: (threadId) => {
+                touches.push(`threads.getContextLane:${threadId}`);
+                return lanes.get(threadId) ?? 0;
+            },
+            setContextLane: (threadId, lane) => {
+                touches.push(`threads.setContextLane:${threadId}:${lane}`);
+
+                if (!Number.isInteger(lane) || lane < 0) {
+                    throw new TypeError(`Context lane must be an integer >= 0; received ${lane}.`);
+                }
+
+                if (failLanes) {
+                    throw new Error('the lane store refused the write');
+                }
+
+                // CANONICAL SHAPE, mirrored from the real store (src/harness.ts
+                // `setThreadContextLane`): lane 0 is what ABSENCE already means, so a write
+                // of 0 clears the key instead of storing it. The revert paths rely on this —
+                // a fake that kept `0` in the map would report "the phantom row is still
+                // there" for a lane the harness would have dropped.
+                if (lane === 0) lanes.delete(threadId);
+                else lanes.set(threadId, lane);
+
+                return {
+                    id: threadId,
+                    agent: 'writer',
+                    origin: 'host',
+                    status: 'idle',
+                    sequence: 1,
+                    ...(lane === 0 ? {} : { contextLane: lane })
+                };
+            }
         },
         enableTool: () => skip('enableTool'),
         disableTool: () => skip('disableTool'),
@@ -282,6 +328,10 @@ const createFakeApi = (
         touches,
         diagnostics,
         agents,
+        lanes,
+        failLanes: (value: boolean) => {
+            failLanes = value;
+        },
         setLimit: (value: number) => {
             values.contextLimit = value;
         },
@@ -2384,6 +2434,12 @@ describe('context-compaction summarize flow (T9)', () => {
     it('compacts the conversation itself: park, instruction, answer, withhold, resume, nudge', async () => {
         const seen: HarnessStreamRequest[] = [];
         const statuses: string[] = [];
+        // C1 — the conversation's display lane, sampled from INSIDE each provider request.
+        // `turn.before` has already run by the time a request leaves, so this array is the
+        // mid-run visibility proof: the recorder stamps every event from here on with lane 1,
+        // and that is what puts the summary's own segments on the second row of THIS turn's
+        // context bar.
+        const lanes: string[] = [];
         const events: string[] = [];
         const estimates: number[] = [];
         const diagnostics: HarnessDiagnosticEvent[] = [];
@@ -2400,6 +2456,7 @@ describe('context-compaction summarize flow (T9)', () => {
             seen,
             (index) => {
                 statuses.push(String(handle?.thread(threadId)?.status));
+                lanes.push(String(handle?.thread(threadId)?.contextLane));
 
                 if (index === 0) midPass = handle?.threadMessages(threadId);
             }
@@ -2455,6 +2512,15 @@ describe('context-compaction summarize flow (T9)', () => {
         expect(events).toEqual(['paused', 'resumed']);
         expect(writer.thread(threadId)?.status).toBe('idle');
 
+        // C1 — THE DISPLAY LANE, sampled mid-run and after. It was already 1 while the FIRST
+        // provider request (the compaction itself) was in flight, so every event the server
+        // records from that request on is stamped with lane 1 and THIS turn's context bar
+        // splits at the boundary — the summary's segments sit under the pre-compaction ones.
+        // One pass raises it exactly once: after the summary AND the continuation run it is
+        // still 1, never 2.
+        expect(lanes).toEqual(['1', '1']);
+        expect(writer.thread(threadId)?.contextLane).toBe(1);
+
         // What the run had committed when the instruction was handed to the model: the
         // instruction as the LAST entry, and NO `included` flag anywhere. The commit does not
         // quietly rewrite the transcript's visibility before the answer exists — the range is
@@ -2475,6 +2541,18 @@ describe('context-compaction summarize flow (T9)', () => {
             { role: 'assistant', content: 'SUMMARY' },
             { role: 'user', content: CONTINUATION_NUDGE },
             { role: 'assistant', content: 'resumed' }
+        ]);
+
+        // C1 — and the lane never reached the transcript: the display row number is UI
+        // metadata, so NO entry above carries a `lane` key (a transport that field-selects
+        // messages never sees it, and the model is sent exactly the same bytes as before).
+        expect(writer.threadMessages(threadId).map((message) => 'lane' in message)).toEqual([
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
         ]);
 
         // THREE reports, one per edge of the pass, with the numbers an operator would ask for.
@@ -2862,6 +2940,11 @@ describe('context-compaction summarize flow (T9)', () => {
         ]);
         expect(seen.map(instructions)).toEqual([1, 1, 2, 1]);
 
+        // C1 — two compactions, two boundaries: each pass raised the lane exactly once, so this
+        // conversation now sits on lane 2 (a bar renders its turns as rows 0, 1 and 2, split at
+        // the two turns the compactions happened in).
+        expect(writer.thread(threadId)?.contextLane).toBe(2);
+
         // Seven of nine withheld: everything up to and including pass one's answer, because
         // pass two's summary replaces all of it.
         expect(diagnostics[5].data).toEqual({
@@ -2930,6 +3013,17 @@ describe('context-compaction summarize flow (T9)', () => {
         // so there is no paused state to restore.
         expect(fresh.thread(threadId)?.status).toBe('idle');
         expect(withoutIds(fresh.threadMessages(threadId))).toEqual(before);
+
+        // C1 — the DISPLAY LANE is durable, the same way the withheld flags are. The pass that
+        // happened before the restart left lane 1 on the persisted HOST-thread record, so the
+        // restored conversation resumes on that lane: its bar keeps the two rows the
+        // compaction created, and the NEXT pass raises 1 -> 2 instead of minting a second row
+        // from 0. Both sides are asserted: the document's field, and what the live record
+        // reads back after `restore()`.
+        expect(
+            (snapshot.threads ?? []).find((entry) => entry.id === threadId)?.contextLane
+        ).toBe(1);
+        expect(fresh.thread(threadId)?.contextLane).toBe(1);
 
         expect((await fresh.sendThreadInput(threadId, 'still there?')).content).toBe('after restart');
 
@@ -3531,6 +3625,11 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
         );
         expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
 
+        // C1 — the bump is part of STARTING a pass: the lane is already 1 while the answer is
+        // still being produced, which is what lets the recorder stamp the summary's own events
+        // with it (see the flow cases for the mid-run proof).
+        expect(fake.lanes.get('thread-1')).toBe(1);
+
         // Everything below is about the two terminal edges, so the trigger's own reads and its
         // 'entering' report are cleared out of the way here.
         fake.touches.length = 0;
@@ -3599,6 +3698,8 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
 
         // The pass is open: parked, and the instruction committed into history AND this request.
         expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        // C1 — and the lane it raised to mark the boundary.
+        expect(fake.lanes.get('thread-1')).toBe(1);
         fake.touches.length = 0;
         fake.diagnostics.length = 0;
 
@@ -3607,7 +3708,16 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
             message: { role: 'assistant', content: 'not a compaction answer' }
         });
 
-        expect(fake.touches).toEqual(['threads.resume', 'report.diagnostic']);
+        // The restore comes FIRST (the lane goes back before the park is lifted, so no event
+        // can be recorded against a phantom row), then the lift, then the report.
+        expect(fake.touches).toEqual([
+            'threads.setContextLane:thread-1:0',
+            'threads.resume',
+            'report.diagnostic'
+        ]);
+        // C1 — an abandoned pass produced NO compaction, so the bump is undone: the key goes
+        // back to absent (lane 0), because a lane is a claim that a boundary happened.
+        expect(fake.lanes.has('thread-1')).toBe(false);
         expect(fake.diagnostics).toHaveLength(1);
         expect(fake.diagnostics[0].message).toContain(
             'abandoned its summarize pass on thread thread-1'
@@ -3629,6 +3739,263 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
             status: 'idle'
         });
         expect(fake.touches).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// C1 — THE DISPLAY LANE: one bump per SUMMARIZE PASS, and the undo
+//
+// WHY THESE CASES EXIST. The context bar paints one stacked row per display lane, and the
+// lane of a recorded event is the conversation's CURRENT lane at record time
+// (../server/protocol.ts `SessionTurnEvent.lane`). So the boundary a compaction creates is
+// only VISIBLE if the lane moves at the moment the pass STARTS: an increment at the finalize
+// would land after the turn's last event, and the pre-compaction segments and the summary
+// would sit in two different turns' bars — no bar would ever show two rows. The cases below
+// pin that moment, one bump per pass (never two), and every path that must UNDO a bump that
+// produced no compaction. The end-to-end proof (a real run, lane visible while the answer is
+// in flight) is in the summarize-flow block above.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction display lane (C1)', () => {
+    const runLifecycle = { threadId: 'thread-1', agent: 'writer', depth: 1, input: 'go' };
+
+    // The thread-idle payload, in the shape the real `thread.idle` hook hands out (a
+    // DETACHED `HarnessThreadRecord`).
+    const idleOf = () => ({
+        id: 'thread-1',
+        agent: 'writer',
+        origin: 'host' as const,
+        sequence: 1,
+        status: 'idle' as const
+    });
+
+    // Every lane touch, in order — the assertions ask for this slice instead of comparing a
+    // whole `touches` list, because the settings reads a trigger pays are not this feature's
+    // business.
+    const laneTouches = (touches: readonly string[]): string[] =>
+        touches.filter((entry) => entry.includes('ContextLane'));
+
+    it('raises the lane at the instruction commit, before the pass report', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls })
+        );
+
+        // The pass started: park, instruction into history AND into this request...
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        // ...and the lane, read then raised by exactly one. The order below is the whole
+        // contract: the bump happens AFTER the commit that could still fail and BEFORE the
+        // report, so a pass that committed has already moved the boundary by the time this
+        // hook releases the request the answer arrives on.
+        expect(fake.lanes.get('thread-1')).toBe(1);
+        expect(laneTouches(fake.touches)).toEqual([
+            'threads.getContextLane:thread-1',
+            'threads.setContextLane:thread-1:1'
+        ]);
+    });
+
+    it('keeps the bump when the lazy finalize writes the range, and a second pass raises it again', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // Pass 1 opens.
+        const started: string[] = [];
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: started })
+        );
+        expect(fake.lanes.get('thread-1')).toBe(1);
+
+        // The answer landed, so the phase is `finishing`; the run then KEPT GOING, which is
+        // the shape `finalizeInRequest` owns — the next boundary writes the range through the
+        // flags. Its transcript is a compacted head: history, instruction, answer.
+        passes.turnAfter({
+            ...runLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        const finalized: string[] = [];
+
+        passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls: finalized,
+                entries: [
+                    entryOf(0, { role: 'user', content: 'question' }),
+                    entryOf(1, { role: 'user', content: COMPACTION_INSTRUCTION }),
+                    entryOf(2, { role: 'assistant', content: 'SUMMARY' })
+                ]
+            })
+        );
+
+        // The range was written (the history before the instruction stops being sent), so the
+        // compaction is REAL and its lane stays at 1 — the finalize never raises a second row.
+        expect(finalized).toEqual(['setIncluded:0:false']);
+        expect(fake.lanes.get('thread-1')).toBe(1);
+
+        // A fresh crossing later in the same conversation (under the limit first, which clears
+        // the cooldown, then over it) is a SECOND boundary, so it raises a second row.
+        passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 10, currentTokens: 10, calls: [] })
+        );
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+        );
+        expect(fake.lanes.get('thread-1')).toBe(2);
+    });
+
+    it('reverts the bump when the run fails mid-pass', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+        );
+        expect(fake.lanes.get('thread-1')).toBe(1);
+
+        // The run's own rollback removed the instruction and any answer, so no compaction
+        // happened: the lane goes back to where it was (absent = 0), not one row too low.
+        passes.runFailed({
+            ...runLifecycle,
+            error: { message: 'provider exploded' } as never
+        });
+
+        expect(fake.lanes.has('thread-1')).toBe(false);
+    });
+
+    it('reverts the bump when the instruction vanished before the lazy finalize', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+        );
+        passes.turnAfter({
+            ...runLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        // The next boundary finds NO instruction (the run rolled it back, or a host rewrote
+        // the transcript), so the pass closes with nothing withheld — and nothing to show.
+        const calls: string[] = [];
+
+        passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls })
+        );
+
+        expect(calls).toEqual([]);
+        expect(fake.lanes.has('thread-1')).toBe(false);
+    });
+
+    it('drops the undo for a purged conversation instead of writing a lane onto it', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+        );
+        passes.turnAfter({
+            ...runLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        // `threads.messages` refuses here (the fake's `skip`), which is the plugin's
+        // unknown/purged-thread branch: the conversation, and the lane with it, is gone, so
+        // the marker is dropped WITHOUT a write attempt. One touch, and it is the read.
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+        passes.threadIdle(idleOf());
+
+        expect(fake.touches).toEqual(['threads.messages', 'threads.resume']);
+        expect(laneTouches(fake.touches)).toEqual([]);
+        expect(fake.lanes.get('thread-1')).toBe(1);
+        expect(fake.diagnostics).toHaveLength(0);
+    });
+
+    it('takes only a diagnostic when the lane write refuses, and the compaction still starts', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // A refused lane write is a bar problem, not a context problem: the instruction is
+        // committed and the pass proceeds, and the operator is told the rows will not show.
+        fake.failLanes(true);
+
+        const calls: string[] = [];
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls })
+        );
+
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(fake.lanes.size).toBe(0);
+        expect(fake.diagnostics).toHaveLength(2);
+        expect(fake.diagnostics[0].message).toContain(
+            'could not raise the display lane of thread thread-1'
+        );
+        expect(fake.diagnostics[1].message).toContain('parked thread thread-1');
+    });
+
+    it('reports a revert that refuses without throwing out of the run-terminal net', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        await passes.turnBefore(
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+        );
+        expect(fake.lanes.get('thread-1')).toBe(1);
+
+        // The pass is abandoned and the undo itself is refused: two reports, in this order
+        // (the failed restore, then the pass it belongs to), and a hook that never throws.
+        fake.failLanes(true);
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+
+        expect(() =>
+            passes.runFinished({ ...runLifecycle, message: { role: 'assistant', content: 'x' } })
+        ).not.toThrow();
+
+        expect(fake.diagnostics).toHaveLength(2);
+        expect(fake.diagnostics[0].message).toContain(
+            'could not restore the display lane of thread thread-1'
+        );
+        expect(fake.diagnostics[1].message).toContain('abandoned its summarize pass');
+    });
+
+    it('never touches a lane in exclude mode, where a bump would fragment the bar', async () => {
+        // The DEFAULT seeded by `createFakeApi` is `exclude`, which is what makes this the
+        // shipped prune path: it fires per over-limit turn and prunes one unit at a time, so
+        // a lane per pass would stack a thin row for every prune. `minTokens`/`safetyTurns`
+        // are seeded exactly as the other prune cases do (the defaults keep this transcript's
+        // one superseded unit inside the horizon, and a pass that withheld nothing would prove
+        // nothing about lanes).
+        const fake = createFakeApi(250, { minTokens: 10, safetyTurns: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+
+        await passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls,
+                entries: prunableEntries()
+            })
+        );
+
+        // A real prune pass ran (the one superseded unit was withheld, on its leader)...
+        expect(calls).toEqual(['pause', 'setIncluded:1:false', 'resume']);
+        // ...and it never asked for a lane, let alone raised one.
+        expect(fake.lanes.size).toBe(0);
+        expect(laneTouches(fake.touches)).toEqual([]);
     });
 });
 

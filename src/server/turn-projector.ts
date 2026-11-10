@@ -1406,6 +1406,48 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     const blockIdOf = (record: SectionRecord, kind: ContextBlockKind, key: string): string =>
         `${record.ordinal}-${kind}-${key}`;
 
+    // DISPLAY LANE (C1) — which stacked row of the context bar a segment belongs to
+    // (../shared/turn-display.ts `ContextBlock.lane`). The fold is the ONLY writer of the
+    // field, from two sources, and it never invents a number:
+    //
+    //   - an EVENT-driven segment takes the lane stamped on the event that minted it
+    //     (./protocol.ts `SessionTurnEvent.lane`, written by the recorder in ./sessions.ts
+    //     from the conversation's CURRENT `contextLane` at record time);
+    //   - a NON-event segment (the one `system` block, the `prompt` block, and every
+    //     `steer` block — none of them is an event) takes the lane the TURN started on
+    //     (`SessionTurn.lane`). That pairing is what makes the arithmetic the UI sees come
+    //     out right: a turn that starts on lane 1 (the continuation after a compaction)
+    //     paints its prompt and its answer on the SAME row, while the turn the compaction
+    //     happened IN paints prompt+pre-compaction events on row 0 and the summary answer
+    //     on row 1 — one compaction, two rows, and no turn ever splits for no reason.
+    //
+    // 0 is NEVER written: absence already means lane 0, so a session that never moved a
+    // lane produces the byte-identical ops it produced before this field existed.
+    //
+    // THE PATCH INVARIANT (the other half of the contract): a lane is mint-assigned and
+    // IMMUTABLE, so it is deliberately not a key of `ContextBlockPatch`
+    // (../shared/turn-display.ts). The TypeScript type enforces that for every
+    // `patchBlock(...)` call in this file, and the WIRE patch payload is an open object,
+    // so the rule is enforced by the producer: the server never mints a `context:set`
+    // patch that carries `lane`. A block that would change lanes is a `context:remove` +
+    // `context:add` pair, exactly like an identity-field change. If a future writer ever
+    // needs one, it has to go through `addBlock`, not through a patch.
+    const laneOfEvent = (event: HarnessEvent): number | undefined => {
+        const lane = (event as { lane?: unknown }).lane;
+
+        return typeof lane === 'number' && Number.isInteger(lane) && lane > 0 ? lane : undefined;
+    };
+
+    const laneOfTurn = (): number | undefined => {
+        const lane = turn.lane;
+
+        return typeof lane === 'number' && Number.isInteger(lane) && lane > 0 ? lane : undefined;
+    };
+
+    // The spread fragment every mint below uses, so "omit when there is no lane" is one
+    // rule with one spelling instead of a copy in eight places.
+    const laneFieldsOf = (lane: number | undefined): { lane?: number } => (lane === undefined ? {} : { lane });
+
     // Bar order inside one section: the system block (it heads every request), then
     // the turn's prompt, then every flow segment in recorded time order. Two rules
     // make a live stream and a cold replay converge on the SAME array: insertion is
@@ -1517,7 +1559,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                         name: 'instructions',
                         ...(at === undefined ? {} : { at }),
                         chars: charsOfEntries(source.instructions),
-                        inPrompt: true
+                        inPrompt: true,
+                        // Not an event, so the turn's own starting lane (see `laneOfTurn`).
+                        ...laneFieldsOf(laneOfTurn())
                     },
                     ops
                 );
@@ -1539,7 +1583,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     // The row already carries the FULL prompt (`TurnSummary.prompt`), so
                     // the segment counts it and duplicates nothing.
                     chars: typeof turn.prompt === 'string' ? turn.prompt.length : 0,
-                    inPrompt: true
+                    inPrompt: true,
+                    // Not an event, so the turn's own starting lane (see `laneOfTurn`).
+                    ...laneFieldsOf(laneOfTurn())
                 },
                 ops
             );
@@ -1608,7 +1654,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     name: 'steer',
                     ...(at === undefined ? {} : { at }),
                     chars: steer.prompt.length,
-                    inPrompt: true
+                    // Not an event (a steer is a record mutation), so the turn's starting
+                    // lane. A steer that arrived AFTER a mid-turn compaction therefore sits
+                    // with the pre-compaction row — the fold has no per-steer lane, and
+                    // inventing one from the thread would need the store. (C1)
+                    inPrompt: true,
+                    ...laneFieldsOf(laneOfTurn())
                 },
                 ops
             );
@@ -2107,7 +2158,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                             // request of this conversation.
                             inPrompt: true,
                             eventFrom: index,
-                            eventTo: index
+                            eventTo: index,
+                            // Display lane, copied off this event (see `laneOfEvent`, C1).
+                            ...laneFieldsOf(laneOfEvent(event))
                         },
                         ops
                     );
@@ -2161,7 +2214,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                             // (../shared/turn-display.ts `inPrompt`).
                             inPrompt: false,
                             eventFrom: index,
-                            eventTo: index
+                            eventTo: index,
+                            // Display lane, copied off this event (see `laneOfEvent`, C1).
+                            ...laneFieldsOf(laneOfEvent(event))
                         },
                         ops
                     );
@@ -2253,7 +2308,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                         inPrompt: true,
                         state: 'running',
                         eventFrom: index,
-                        eventTo: index
+                        eventTo: index,
+                        // Display lane, copied off this event (see `laneOfEvent`, C1).
+                        ...laneFieldsOf(laneOfEvent(event))
                     },
                     ops
                 );
@@ -2428,7 +2485,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                             state,
                             ...(duration === undefined ? {} : { durationMs: duration }),
                             eventFrom: index,
-                            eventTo: index
+                            eventTo: index,
+                            // Display lane, copied off this event (see `laneOfEvent`, C1).
+                            ...laneFieldsOf(laneOfEvent(event))
                         },
                         ops
                     );
@@ -2539,7 +2598,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                                 chars: content.length,
                                 inPrompt: true,
                                 eventFrom: index,
-                                eventTo: index
+                                eventTo: index,
+                                // Display lane, copied off this event (see `laneOfEvent`, C1).
+                                ...laneFieldsOf(laneOfEvent(event))
                             },
                             ops
                         );

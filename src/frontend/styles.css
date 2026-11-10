@@ -69,6 +69,15 @@
     --context-bar-max-height: 36px;
     --context-bar-min-height: 3px;
 
+    /* Context bar lanes (C2) — the seam between two LANES of one bar, and the frame the whole
+       strip is drawn inside. Both are stated once here because the painter cannot ask CSS for
+       either one: `view-context.ts` `CONTEXT_BAR_ROW_GAP_PX` computes the row bands it paints
+       into, and the lane-tag overlay is positioned FROM the frame padding, so a value that only
+       lived in one rule would silently slide the tags off their rows. `ui/context-bar-style.test.ts`
+       pins the gap against the model constant, exactly like the two numbers above. */
+    --context-bar-row-gap: 2px;
+    --context-bar-frame-padding: 4px;
+
     /* Agent identity (R3, recoloured by T5/R4). Every agent-owned block is painted from
        ui/agent-color.ts, which overrides these two on the element: `.tile` and `.agent`
        plus the `IT1`/`RR2` labels (`.thread-tile`/`.thread-select`, ui/turns.ts),
@@ -7483,8 +7492,13 @@ body.is-resizing-rail {
     flex-direction: column;
     gap: 4px;
     /* The strip is a control the reader aims at, so it reads as one: a frame around
-       the track and the caption that explains it. */
-    padding: 4px;
+       the track and the caption that explains it. The frame's padding is a token (C2)
+       because the lane-tag overlay is positioned FROM it — the tags hang off the same
+       edge the track starts at, and only one number can own both. */
+    padding: var(--context-bar-frame-padding);
+    /* The lane tags (C2) are absolutely positioned inside this box, in BOTH modes,
+       aligned to the top-left of the track area. Nothing else about the box moves. */
+    position: relative;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--bg-deep);
@@ -7505,10 +7519,25 @@ body.is-resizing-rail {
     height: var(--context-bar-max-height);
 }
 
+/* DOM mode's ROW STACK (C2): one `.context-bar-segments` row per LANE, stacked top to bottom
+   in ascending lane order (lane 0 first) with the same seam the canvas paints its bands with —
+   `CONTEXT_BAR_ROW_GAP_PX`, mirrored as the token above, because the painter cannot ask CSS for
+   the offsets it already computed. A bar with ONE lane still comes through here: the stack is a
+   pass-through column, and that wrapper is the entire structural change a lane-less strip
+   sees. */
+.context-bar-rows {
+    display: flex;
+    flex-direction: column;
+    gap: var(--context-bar-row-gap);
+    min-width: 0;
+}
+
 /* DOM mode: the same box, built from flex weights instead of pixels. `align-items:
    flex-end` SEATS the bars on the strip's bottom edge — the canvas draws each bar at
    `height - barHeight`, and a strip whose bars floated in the middle of the track would
-   read as two different charts in the two modes (R28). */
+   read as two different charts in the two modes (R28). With lanes (C2) this is one ROW, and
+   each row seats its own bars on its OWN bottom edge: every lane is its own graph, which is
+   exactly why a compaction's second row is as readable as the first. */
 .context-bar-segments {
     display: flex;
     flex-direction: row;
@@ -7591,6 +7620,38 @@ body.is-resizing-rail {
     font-size: 10px;
     line-height: var(--context-bar-line-height);
     text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The lane cue (C2): ONE absolutely positioned overlay per bar, in BOTH renderers, aligned to
+   the top-left of the TRACK AREA (`.context-bar`'s padding box, which is where the canvas and
+   the row stack both start). A chip's inline `top`/`height` are that row's band in CSS pixels,
+   so the two numbers land on the row they name in canvas mode too, where there is no row
+   element to hang a label on.
+   `pointer-events: none` is load-bearing: the tags sit ON the bars, and a chip in front of an
+   aim target would steal clicks from the segment under it. They are real DOM text, so the
+   picture and the screen reader read the same nodes — no canvas glyphs to keep in sync. */
+.context-bar-lanes {
+    position: absolute;
+    inset: var(--context-bar-frame-padding) var(--context-bar-frame-padding) auto;
+    pointer-events: none;
+}
+
+/* The tag itself: a cue, not a control. Quiet ink on the track's own deep background, so it
+   never competes with the bars it labels — and it appears only on a bar that spans lanes, so a
+   normal turn never grows one. */
+.context-bar-lane {
+    position: absolute;
+    left: 2px;
+    display: flex;
+    align-items: center;
+    padding: 0 3px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--bg-deep) 78%, transparent);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.06em;
     white-space: nowrap;
 }
 

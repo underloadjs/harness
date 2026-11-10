@@ -671,10 +671,11 @@ const readThreads = (
                 'ownerThreadId',
                 'label',
                 'invocationId',
+                'contextLane',
                 'messages'
             ],
             entryLabel,
-            ['ownerThreadId', 'label', 'invocationId']
+            ['ownerThreadId', 'label', 'invocationId', 'contextLane']
         );
 
         const id = readSnapshotString(record.id, `${entryLabel}.id`, { min: 1 });
@@ -746,6 +747,20 @@ const readThreads = (
             thread.invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
                 min: 1
             });
+        }
+
+        // DISPLAY LANE (C1). OPTIONAL: a document written before lanes exist restores to
+        // lane 0, and an absent key is kept absent so the record's shape matches what
+        // `snapshot()` writes. A non-integer or negative lane is refused — a renderer
+        // cannot sort one, and `ContextBlock.lane` (../shared/turn-display.ts) promises
+        // integer >= 0 — while a written `0` is NORMALIZED AWAY, because a lane of 0 is
+        // what absence already means and `snapshot()` never emits the key for it.
+        if (record.contextLane !== undefined) {
+            const contextLane = readSnapshotInteger(record.contextLane, `${entryLabel}.contextLane`, {
+                min: 0
+            });
+
+            if (contextLane !== 0) thread.contextLane = contextLane;
         }
 
         ids.add(id);
