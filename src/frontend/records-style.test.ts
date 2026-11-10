@@ -16,7 +16,7 @@
  *     costs the disclosure or the accessible name;
  *   - leave an animation running under `prefers-reduced-motion` (R3);
  *   - style a class the panels no longer paint, or paint a class nobody styles, which is
- *     how a skeleton quietly becomes invisible;
+ *     how a corner state box quietly becomes invisible;
  *   - reach outside the `.panel-tasks-*` / `.panel-records-*` namespaces, which is what
  *     keeps one panel's rules from ever touching the other.
  *
@@ -83,19 +83,12 @@ const styledClasses = (): Set<string> =>
     new Set([...section.matchAll(/\.panel[a-z0-9-]*/g)].map((match) => match[0].slice(1)));
 
 // The classes the panels actually paint: every string literal that starts with `panel`,
-// plus the skeleton rows and cells ./records-dom.ts builds by suffixing the wrapper's own
-// class name (`${className}-row`).
+// which is how a class nobody styles is caught the moment it is painted.
 const paintedClasses = (): Set<string> => {
     const found = new Set<string>();
 
     for (const match of panelSources.matchAll(/'((?:panel[\w -]*)+)'/g)) {
         for (const name of match[1].split(' ')) found.add(name);
-    }
-
-    // `recordsSkeletonOf('panel-tasks-skeleton', …)` and its records twin.
-    for (const match of panelSources.matchAll(/'panel-(tasks|records)-skeleton'/g)) {
-        found.add(`panel-${match[1]}-skeleton-row`);
-        found.add(`panel-${match[1]}-skeleton-cell`);
     }
 
     // `recordsStateOf('panel-tasks-error', …)` appends `-action` to the class it is
@@ -135,6 +128,7 @@ describe('the live panel stylesheet', () => {
         const shared = new Set([
             'panel-actor',
             'panel-expand',
+            'panel-extension',
             'panel-history',
             'panel-history-actor',
             'panel-history-stamp',
@@ -142,11 +136,10 @@ describe('the live panel stylesheet', () => {
             'panel-live',
             'panel-live-line',
             'panel-new-pill',
-            'panel-skeleton',
-            'panel-skeleton-cell',
-            'panel-skeleton-row',
             'panel-stamp',
-            'panel-state'
+            'panel-state',
+            'panel-status',
+            'panel-title-toggle'
         ]);
 
         for (const name of styledClasses()) {
@@ -180,16 +173,22 @@ describe('the live panel stylesheet', () => {
         // or a text span, never the thing the reader looks at.
         const structural = new Set([
             'panel-history-fields',
-            'panel-records-skeleton',
             'panel-records-states',
             'panel-tasks-group',
             'panel-tasks-lists',
-            'panel-tasks-skeleton',
             'panel-tasks-states'
         ]);
 
+        // Painted here, styled ABOVE the section: the card heading keeps the one rule the
+        // whole shell uses for it (styles.css `.panel-title`), and a live panel only adds
+        // the button reset `.panel-title-toggle` on top. Restating the heading in this
+        // section is what the "the card frame stays above" rule forbids.
+        const styledAbove = new Set(['panel-title']);
+
         const styled = styledClasses();
-        const missing = [...paintedClasses()].filter((name) => !styled.has(name) && !structural.has(name));
+        const missing = [...paintedClasses()].filter(
+            (name) => !styled.has(name) && !structural.has(name) && !styledAbove.has(name)
+        );
 
         // A new painted class has to appear here (with a rule) or above (with a reason).
         expect(missing).toEqual([]);
@@ -277,25 +276,43 @@ describe('the motion contract', () => {
         expect(section).toContain('.panel-records-row[data-flip]');
     });
 
-    it('shimmers only a skeleton that is actually on screen, and mirrors the row layout', () => {
-        const cell = blockOf('.panel-skeleton-cell,');
-        expect(cell).toContain('animation: records-skeleton-shimmer 1.2s linear infinite');
+    it('names the state in a fixed corner box instead of shimmering the tile', () => {
+        // THE POINT OF THE BOX: it is pinned to the card, so a state change moves nothing.
+        // A skeleton is a block of bars inserted over the list and pulled out when the
+        // read lands, which on a card that re-reads a delta every few seconds reads as the
+        // whole tile flickering. The box never enters and never leaves.
+        const box = blockOf('.panel-status {');
 
-        // ./records-dom.ts `recordsSkeletonOf` suffixes the wrapper's class name, so both
-        // panels' rows and cells have their OWN names — and both must be styled here or
-        // the skeleton collapses into an invisible box.
-        const row = blockOf('.panel-skeleton-row,');
-        for (const name of ['panel-tasks-skeleton-row', 'panel-records-skeleton-row']) {
-            expect(section).toContain(`.${name}`);
-        }
-        for (const name of ['panel-tasks-skeleton-cell', 'panel-records-skeleton-cell']) {
-            expect(section).toContain(`.${name}`);
-        }
-        expect(row).toContain('min-height: 18px');
+        expect(box).toContain('position: absolute');
+        expect(box).toContain('top: 8px');
+        expect(box).toContain('right: 8px');
+        // The base box is still; only one state animates, and it animates a word.
+        expect(box).not.toContain('animation:');
 
-        const keyframes = blockOf('@keyframes records-skeleton-shimmer {');
-        expect(keyframes).toContain('background-position: 120% 0');
-        expect(keyframes).toContain('background-position: -120% 0');
+        // `hidden` is a real removal — a blank box left in the corner still reads as a box.
+        expect(blockOf('.panel-status[hidden]')).toContain('display: none');
+
+        const loading = blockOf(".panel-status[data-state='loading'] {");
+
+        expect(loading).toContain('animation: records-status-pulse 1.1s ease-in-out infinite alternate');
+        expect(loading).toContain('color: var(--accent)');
+
+        // The other four states are an edge and a word, never a motion, and the colour is
+        // never alone: the sync line and the note say the same thing in sentences.
+        for (const [state, token] of [
+            ['stale', '--warn'],
+            ['error', '--danger'],
+            ['ready', '--ok-line']
+        ] as const) {
+            expect(blockOf(`.panel-status[data-state='${state}'] {`)).toContain(token);
+        }
+
+        expect(blockOf(".panel-status[data-state='empty'] {")).toContain('border-style: dashed');
+
+        const keyframes = blockOf('@keyframes records-status-pulse {');
+
+        expect(keyframes).toContain('opacity: 1');
+        expect(keyframes).toContain('opacity: 0.45');
     });
 
     it('stops every animation under prefers-reduced-motion, and keeps every fact', () => {
@@ -304,7 +321,7 @@ describe('the motion contract', () => {
         // The two animations die; the highlight's BORDER and tint do not, because
         // `data-fresh` is a fact about the row a reader still deserves to see.
         expect(reduced).toContain('animation: none !important');
-        expect(reduced).toContain('.panel-skeleton-cell');
+        expect(reduced).toContain(".panel-status[data-state='loading']");
         expect(reduced).toContain(".panel-tasks-row[data-fresh='true']");
         expect(reduced).toContain(".panel-records-row[data-fresh='true']");
         expect(reduced).toContain('transition: none');
@@ -319,7 +336,7 @@ describe('the motion contract', () => {
             .filter((line) => /^\s*animation(-name)?:\s*records-/.test(line));
 
         expect(animated.map((line) => line.trim())).toEqual([
-            'animation: records-skeleton-shimmer 1.2s linear infinite;',
+            'animation: records-status-pulse 1.1s ease-in-out infinite alternate;',
             'animation: records-land 1.5s ease-out;'
         ]);
     });
@@ -432,6 +449,37 @@ describe('the accessibility furniture', () => {
         expect(blockOf('.panel-tasks-detail[hidden]')).toContain('display: none');
         expect(blockOf('.panel-tasks-detail-text')).toContain('overflow-wrap: anywhere');
         expect(blockOf('.panel-tasks-detail-meta')).toContain('flex-wrap: wrap');
+    });
+
+    it('makes the card heading the collapse control, and never a second button', () => {
+        // The heading is a real `<button>` wearing `.panel-title`, so the browser supplies
+        // Enter, Space and the focus ring and `aria-expanded` carries the state. This rule
+        // only strips the UA's chrome and keeps the words left-aligned.
+        const toggle = blockOf('.panel-title-toggle {');
+
+        expect(toggle).toContain('cursor: pointer');
+        expect(toggle).toContain('text-align: left');
+        expect(toggle).toContain('background: none');
+        expect(toggle).toContain('border: 0');
+        // Room for the corner box, which shares the title's line.
+        expect(toggle).toContain('padding: 0 78px 0 0');
+        // The heading's face is NOT restated here: one `.panel-title` rule above the
+        // section styles every card's title, live or tool-drawn.
+        expect(toggle).not.toContain('font');
+        expect(toggle).not.toContain('color');
+
+        expect(blockOf('.panel-title-toggle:focus-visible')).toContain('outline: 1px solid var(--accent)');
+
+        // The card is the corner box's coordinate system, and only an extension card gets
+        // one — the tool cards above stay exactly as `.panel` draws them.
+        expect(blockOf('.panel-extension {')).toContain('position: relative');
+
+        // BOTH bodies collapse now, and `hidden` is a real removal for both: the flex
+        // display above would otherwise beat the UA's `[hidden]` rule.
+        const hidden = blockOf('.panel-tasks-body[hidden],');
+
+        expect(hidden).toContain('display: none');
+        expect(section).toContain('.panel-records-body[hidden]');
     });
 
     it('keeps the state word in the accessible name, clipped rather than hidden', () => {

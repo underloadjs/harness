@@ -550,14 +550,17 @@ it('places the Plugins toggle immediately after the Tools toggle with the same c
 });
 
 it('keeps both catalogue toggles disabled while the server is unreachable', async () => {
-    // No route answers at all, so boot lands on the offline pane.
+    // A REAL transport failure, not an unwired route double. The double composes canonical
+    // answers on its own — a synthesized `ServiceInfo` for the root read and empty pages for
+    // the catalogue reads (./view-test-support.ts:1449-1456) — so `viewAwareFetch` over a
+    // throwing handler RESOLVES the bootstrap with no harnesses. Since T3 that answer is the
+    // healthy empty-catalogue state, not the offline pane, so the old fixture could no longer
+    // reach R3; only a rejected fetch can.
     vi.stubGlobal(
         'fetch',
-        vi.fn(
-            viewAwareFetch(async (input: RequestInfo | URL) => {
-                throw new Error(`unexpected request: ${String(input)}`);
-            }, { root: '/api' })
-        )
+        vi.fn(async () => {
+            throw new TypeError('Failed to fetch');
+        })
     );
 
     await boot();

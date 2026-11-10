@@ -29,14 +29,16 @@
 // panel in a try/catch and disposes the half-built instance — a broken panel is one
 // card, not a dead page).
 //
-// THE COLLAPSE GATE (records only)
-// --------------------------------
-// The Records panel ships COLLAPSED and builds its engine only while it is open. A
-// card the reader has not opened must cost the conversation nothing: no snapshot
-// read, no delta, no registration on the realtime plane. Expanding the card is what
-// mounts the engine; collapsing it again releases the wake and the client and clears
-// the surface, so every expansion is a fresh boot rather than a stale view kept
-// "live" by nothing.
+// THE COLLAPSE GATE (BOTH PANELS, AND THE TITLE IS THE CONTROL)
+// -------------------------------------------------------------
+// Both cards open and close, and the thing the reader presses is the card's own
+// heading — a `<button class="panel-title">` that replaces the plain heading the
+// runtime drew (see `titleToggleOf` below). A card the reader has not opened must
+// cost the conversation nothing: no snapshot read, no delta, no registration on the
+// realtime plane. Expanding the card is what mounts the engine; collapsing it again
+// releases the wake and the client and clears the surface, so every expansion is a
+// fresh boot rather than a stale view kept "live" by nothing. Records ships CLOSED
+// (the feed is the long one); Tasks ships OPEN (it is the card a reader glances at).
 //
 // HOW A ROW ARRIVES ON SCREEN
 // ---------------------------
@@ -56,7 +58,8 @@
 //
 // THE FIVE STATES
 // ---------------
-// `loading` (a skeleton, delayed so a fast read never flashes one), `empty`, `error`
+// `loading` (one word in the corner box — never a shimmer laid over the list, which
+// is what made the tile flicker every time a re-read came and went), `empty`, `error`
 // (+ Retry), `stale` (rows on screen, a note saying they may not be current) and
 // `ready`. All five are a `data-phase` on the panel's own root, so the CSS, the tests
 // and a screen reader (`aria-busy`) read the same single fact, and the phase is derived
@@ -73,10 +76,9 @@ import type { RecordsDeltaResponse, RecordsSnapshotResponse } from '../../shared
 import type { RecordsClient, RecordsClientOptions, RecordsFeedRow, RecordsNotice, RecordsTask } from './records-client';
 import { RECORDS_FEED_WINDOW, TASKS_COLLECTION, createRecordsClient, recordsActorOf } from './records-client';
 import type { PanelContext } from './context';
-import type { RecordsAnnouncer, RecordsSchedule } from './records-dom';
+import type { RecordsAnnouncer, RecordsSchedule, RecordsSurfaceState } from './records-dom';
 import {
     RECORDS_LIVE_EDGE_THRESHOLD,
-    RECORDS_SKELETON_DELAY_MS,
     createRecordsAnnouncer,
     createRecordsFlip,
     createRecordsFollow,
@@ -85,9 +87,9 @@ import {
     recordsElement,
     recordsLiveRegionOf,
     recordsNewPillOf,
-    recordsSkeletonOf,
     recordsStampOf,
     recordsStateOf,
+    recordsStatusOf,
     recordsTruncate,
     refreshRecordsStamps
 } from './records-dom';
@@ -130,8 +132,6 @@ export type RecordsPanelOptions = {
     schedule?: RecordsSchedule;
     /** Stamp/footer tick. Default 30s. */
     tickMs?: number;
-    /** How long a read may take before the panel shows a skeleton. Default 250ms. */
-    skeletonDelayMs?: number;
     /** Test seam: build the client with an injected reader (see ./records-client.ts). */
     clientOptions?: Pick<RecordsClientOptions, 'reader' | 'schedule' | 'bodyRefreshMs' | 'feedLimit'>;
 };
@@ -528,8 +528,10 @@ const reconcile = <T,>(
 
 // The closed set of states a panel publishes as `data-phase` on its root. It is a TYPE,
 // not a runtime array: the stylesheet switches on the attribute and `recordsPanelPhaseOf`
-// below is the only derivation, so a sixth state cannot appear without failing to compile.
-export type RecordsPanelPhase = 'loading' | 'empty' | 'error' | 'stale' | 'ready';
+// below is the only derivation, so a sixth state cannot appear without failing to
+// compile. The set itself is the DOM layer's (./records-dom.ts `RecordsSurfaceState`),
+// because the corner box paints the same five words.
+export type RecordsPanelPhase = RecordsSurfaceState;
 
 // THE FIVE STATES, DERIVED. `loading` is the client's own phase; `error` is the full
 // state only while there is nothing on screen, because rows that did arrive are worth
@@ -567,15 +569,99 @@ export const recordsSyncLineOf = (client: RecordsClient, nowMs: number): string 
     return parts.join(' · ');
 };
 
-// The chrome row every panel draws above its list: the connection/sync note, and the
-// retry affordance when the reader may want one. `data-phase` on the ROOT is what the
-// stylesheet switches on, so this only maintains the text.
-const paintChrome = (root: HTMLElement, note: HTMLElement, phase: RecordsPanelPhase, text: string): void => {
+// What the corner box says, one short word per state. The box is small and pinned to a
+// corner, so it carries the NAME of the state; the sentence about why — when the data
+// last landed, whether the plane is down, what a failed read said — is the chrome line
+// under the body, which has room for the whole clause.
+const PHASE_LABEL: Record<RecordsPanelPhase, string> = {
+    loading: 'reading',
+    empty: 'empty',
+    error: 'error',
+    stale: 'stale',
+    ready: 'live'
+};
+
+// The chrome every panel draws: the corner box that says what the surface is doing, and
+// the one honest line about the data under it. `data-phase` on the ROOT is what the
+// stylesheet switches on, so this only maintains the two attributes and the text. The
+// box is never re-inserted — it is built once at mount and only its word changes, which
+// is the whole reason it replaced the skeleton.
+const paintChrome = (
+    root: HTMLElement,
+    status: HTMLElement,
+    note: HTMLElement,
+    phase: RecordsPanelPhase,
+    text: string
+): void => {
     root.dataset.phase = phase;
+    root.setAttribute('aria-busy', String(phase === 'loading'));
+
+    status.hidden = false;
+    status.dataset.state = phase;
+    status.textContent = PHASE_LABEL[phase];
+
     note.dataset.state = phase === 'ready' || phase === 'loading' ? 'live' : phase;
     note.hidden = phase === 'ready';
     note.textContent = text;
-    root.setAttribute('aria-busy', String(phase === 'loading'));
+};
+
+// ---------------------------------------------------------------------------
+// The card heading is the collapse control
+// ---------------------------------------------------------------------------
+
+// `aria-controls` needs an id, and one board — or one test fixture — can mount the same
+// panel twice, so the sequence is this module's (the same reasoning as
+// `tasksDetailSequence` below).
+let panelBodySequence = 0;
+
+// THE HEADING IS THE CONTROL. The runtime draws a plain `<h3 class="panel-title">` for a
+// registered panel (./context.ts `setTitle`); a live panel replaces it with a real
+// `<button>` carrying the SAME class, so it keeps the heading's look, the `.panel-title`
+// selector the shell and the stylesheet already use, and the collapse state on
+// `aria-expanded`. A separate "Show records" button under the heading was one control too
+// many for a card whose title is the thing every reader already presses — and it made the
+// Tasks card, which had no such button, the odd one out.
+const titleToggleOf = (options: {
+    ctx: PanelContext;
+    /** The heading's own words, which double as the button's accessible name. */
+    label: string;
+    /** Names the card for a host that styles or queries one panel's toggle. */
+    panel: string;
+    body: HTMLElement;
+    onToggle: () => void;
+}): HTMLButtonElement => {
+    const button = recordsElement('button', 'panel-title panel-title-toggle') as HTMLButtonElement;
+
+    panelBodySequence += 1;
+
+    const bodyId = `panel-body-${panelBodySequence}`;
+
+    options.body.id = bodyId;
+    button.type = 'button';
+    button.dataset.panelToggle = options.panel;
+    button.textContent = options.label;
+    button.setAttribute('aria-controls', bodyId);
+
+    // The heading the context prepended goes first, and this takes its place: the card
+    // still reads title-then-body, and a later `setTitle` rewrites THIS node.
+    options.ctx.setTitle('');
+    options.ctx.element.prepend(button);
+
+    button.addEventListener('click', () => {
+        if (options.ctx.disposed) return;
+
+        options.onToggle();
+    });
+
+    return button;
+};
+
+const paintTitleToggle = (button: HTMLButtonElement, label: string, expanded: boolean): void => {
+    button.dataset.expanded = String(expanded);
+    button.setAttribute('aria-expanded', String(expanded));
+    // The visible affordance is the heading itself, so the hint is where a pointer
+    // reader looks before pressing: the tooltip, not a second label.
+    button.title = expanded ? `Collapse the ${label} panel` : `Expand the ${label} panel`;
 };
 
 // The history disclosure's body: the events this client accumulated for ONE record,
@@ -764,7 +850,6 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
     progress.append(status, bar, chrome);
 
     const scroller = recordsElement('div', 'panel-tasks-scroller');
-    const skeleton = recordsSkeletonOf('panel-tasks-skeleton', 3, 3);
     const stateArea = recordsElement('div', 'panel-tasks-states');
     const listWrap = recordsElement('div', 'panel-tasks-lists');
 
@@ -798,9 +883,34 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
     // box in CSS, and inside the scroller it would scroll away with the rows it counts.
     const pill = recordsNewPillOf();
 
+    // The corner box: built ONCE, never re-inserted, and a child of the CARD rather than
+    // of the body — a collapsed card has no body to pin it to. It starts hidden because a
+    // card with no conversation has no state to report yet (./records-dom.ts
+    // `recordsStatusOf`). `statusBox`, because `status` is already the progress sentence.
+    const statusBox = recordsStatusOf('loading', PHASE_LABEL.loading);
+
+    statusBox.hidden = true;
     body.append(progress, scroller, pill);
     scroller.append(stateArea, listWrap);
-    ctx.element.append(mount.region, body);
+    ctx.element.append(mount.region, statusBox, body);
+
+    // --- the collapse gate ---------------------------------------------------
+    // Tasks ships OPEN: it is the card a reader glances at without thinking. The title
+    // still closes it like any other card, and a closed card holds nothing — no client,
+    // no plane registration, no announcements (`collapsePanel`, at the engine below).
+    let panelExpanded = true;
+    const toggle = titleToggleOf({
+        ctx,
+        label: 'Tasks',
+        panel: 'tasks',
+        body,
+        onToggle: () => {
+            if (panelExpanded) collapsePanel();
+            else expandPanel();
+        }
+    });
+
+    paintTitleToggle(toggle, 'Tasks', panelExpanded);
 
     // --- per-mount state -----------------------------------------------------
     const expanded = new Set<string>();
@@ -1023,8 +1133,6 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
     };
 
     // --- the paint -----------------------------------------------------------
-    let skeletonArmed = false;
-
     const paint = (client: RecordsClient): void => {
         current = client;
 
@@ -1033,7 +1141,7 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         const done = tasks.filter((task) => task.completed).sort((left, right) => compareIds(left.id, right.id));
         const phase = recordsPanelPhaseOf(client, tasks.length);
 
-        paintChrome(body, chrome, phase, recordsSyncLineOf(client, now()));
+        paintChrome(body, statusBox, chrome, phase, recordsSyncLineOf(client, now()));
         status.textContent = `${tasks.length} task${tasks.length === 1 ? '' : 's'} · ${done.length} completed · ${pending.length} open`;
         const percent = tasks.length === 0 ? 0 : Math.round((done.length / tasks.length) * 100);
 
@@ -1045,31 +1153,17 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         bar.style.setProperty('--records-progress', `${percent}%`);
         doneCount.textContent = String(done.length);
 
-        // LOADING — a skeleton, but only if the read is slow. A panel that answers
-        // inside the delay never shows one, which is the whole point of the delay.
+        // LOADING — the corner box says `reading` and the list chrome stays out of the
+        // way. Nothing is inserted over the body: the card keeps its size, so a re-read
+        // that comes and goes cannot flicker the tile the way a skeleton did.
         if (phase === 'loading') {
             pendingGroup.hidden = true;
             doneGroup.hidden = true;
             stateArea.hidden = true;
             stateArea.replaceChildren();
 
-            if (!skeletonArmed) {
-                skeletonArmed = true;
-
-                mount.schedule(() => {
-                    // The guard is what makes a fast read a no-op: if anything else has
-                    // painted since, the rows are already on screen.
-                    if (ctx.disposed || !skeletonArmed) return;
-
-                    if (skeleton.parentElement === null) scroller.insertBefore(skeleton, scroller.firstChild);
-                }, options?.skeletonDelayMs ?? RECORDS_SKELETON_DELAY_MS);
-            }
-
             return;
         }
-
-        skeletonArmed = false;
-        skeleton.remove();
 
         if (phase === 'empty') {
             pendingGroup.hidden = true;
@@ -1143,6 +1237,11 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
     };
 
     const paintNow = (): void => {
+        // Closed: there is no engine to read from and nothing on screen to paint into,
+        // so a late notice and the clock tick are both inert (the same guard the records
+        // panel keeps).
+        if (!panelExpanded) return;
+
         const client = mount.engine();
 
         if (client !== undefined) paint(client);
@@ -1166,10 +1265,11 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         doneGroup.hidden = true;
         stateArea.hidden = true;
         stateArea.replaceChildren();
-        // The skeleton belongs to a read that will never answer now: disarm the flag
-        // first so a pending timer's guard bails instead of re-inserting it.
-        skeletonArmed = false;
-        skeleton.remove();
+        // A surface with nothing to report says nothing: the corner box goes blank with
+        // the rows, rather than sitting there claiming a state no read backs.
+        statusBox.hidden = true;
+        statusBox.textContent = '';
+        delete statusBox.dataset.state;
         chrome.hidden = true;
         chrome.textContent = '';
         pill.hidden = true;
@@ -1228,9 +1328,42 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         }
     };
 
+    // --- the collapse gate ---------------------------------------------------
+    // Closing the card releases the conversation exactly the way a session switch does:
+    // the wake first, then the client, then the surface. Re-opening is a fresh boot, not
+    // a resurrection of rows nothing was reading.
+    const collapsePanel = (): void => {
+        panelExpanded = false;
+        paintTitleToggle(toggle, 'Tasks', false);
+        body.hidden = true;
+        mount.stopEngine();
+        expanded.clear();
+        fresh.clear();
+        rows.clear();
+        current = undefined;
+        freshMarker.clearAll();
+        flip.reset();
+        clearSurface();
+    };
+
+    const expandPanel = (): void => {
+        panelExpanded = true;
+        paintTitleToggle(toggle, 'Tasks', true);
+        body.hidden = false;
+
+        // No conversation: the card opens onto the cleared surface and waits, exactly as
+        // a mount with no session draws.
+        if (ctx.sessionId !== null) {
+            mount.retarget(ctx.sessionId, paintNow);
+            paintNow();
+        }
+    };
+
     // --- the engine ----------------------------------------------------------
     const clock = globalThis.setInterval(() => {
-        if (ctx.disposed) return;
+        // A closed card has nothing to re-age and no engine to repaint; the tick must not
+        // be the thing that keeps a collapsed panel "working".
+        if (ctx.disposed || !panelExpanded) return;
 
         refreshRecordsStamps(ctx.element, now());
         paintNow();
@@ -1255,7 +1388,8 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         freshMarker.clearAll();
         flip.reset();
 
-        if (ctx.sessionId === null) {
+        // Closed, or no conversation to read: the surface goes back to blank and waits.
+        if (ctx.sessionId === null || !panelExpanded) {
             clearSurface();
 
             return;
@@ -1293,8 +1427,8 @@ const compareIds = (left: string, right: string): number => (left < right ? -1 :
 //
 // THE PANEL SHIPS COLLAPSED. The card mounts with its body hidden and its engine
 // UNBUILT: no snapshot read, no wake registration, no clock work — a panel the reader
-// has not opened holds no plane slot and pays for no read. The toggle below is the
-// only thing that starts the engine; collapsing releases the wake and the client and
+// has not opened holds no plane slot and pays for no read. The card's own title is the
+// toggle, and the only thing that starts the engine; collapsing releases the wake and the client and
 // clears the surface, so a re-opening is a fresh boot. The open/closed choice belongs
 // to the reader: it survives a session change delivered to a mounted card, while the
 // runtime's own path for this session-scoped panel — a dispose and re-mount per
@@ -1324,7 +1458,6 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
     chrome.hidden = true;
 
     const scroller = recordsElement('div', 'panel-records-scroller');
-    const skeleton = recordsSkeletonOf('panel-records-skeleton', 4, 4);
     const stateArea = recordsElement('div', 'panel-records-states');
     const feed = recordsElement('ol', 'panel-records-feed');
 
@@ -1333,13 +1466,21 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
     const pill = recordsNewPillOf();
     const footer = recordsElement('p', 'panel-records-footer');
 
+    // The corner box (./records-dom.ts `recordsStatusOf`): one fixed box in the card's
+    // top-right corner that names the state, in place of a skeleton that came and went
+    // over the feed. A child of the CARD, not of the body, because a collapsed card has
+    // no body to hold it.
+    const statusBox = recordsStatusOf('loading', PHASE_LABEL.loading);
+
+    statusBox.hidden = true;
     stateArea.hidden = true;
-    // COLLAPSED BY DEFAULT: the body starts hidden and stays that way until the
-    // reader opens the card (the toggle block below). Nothing is read while it is.
+    // COLLAPSED BY DEFAULT: the body starts hidden and stays that way until the reader
+    // opens the card by pressing its title (the collapse gate below). Nothing is read
+    // while it is.
     body.hidden = true;
     body.append(filters, chrome, scroller, pill, footer);
     scroller.append(stateArea, feed);
-    ctx.element.append(mount.region, body);
+    ctx.element.append(mount.region, statusBox, body);
 
     // --- per-mount state -----------------------------------------------------
     // `null` is "all collections": the client publishes no collection list until the
@@ -1560,31 +1701,21 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         const newestFirst = [...rows].reverse();
         const phase = recordsPanelPhaseOf(client, feedRows.length);
 
-        paintChrome(body, chrome, phase, recordsSyncLineOf(client, now()));
+        paintChrome(body, statusBox, chrome, phase, recordsSyncLineOf(client, now()));
         paintChips(client);
 
+        // LOADING: the corner box says `reading`, the footer says the sentence, and the
+        // feed stays out of the way. Nothing is inserted over the scroller, so the card
+        // never resizes and the tile never flickers.
         if (phase === 'loading') {
             feed.hidden = true;
             stateArea.hidden = true;
             stateArea.replaceChildren();
 
-            if (!skeletonArmed) {
-                skeletonArmed = true;
-
-                mount.schedule(() => {
-                    if (ctx.disposed || !skeletonArmed) return;
-
-                    if (skeleton.parentElement === null) scroller.insertBefore(skeleton, scroller.firstChild);
-                }, options?.skeletonDelayMs ?? RECORDS_SKELETON_DELAY_MS);
-            }
-
             paintFooter(client, phase, 0, 0);
 
             return;
         }
-
-        skeletonArmed = false;
-        skeleton.remove();
 
         if (phase === 'empty') {
             feed.hidden = true;
@@ -1683,8 +1814,6 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         footer.dataset.state = client.feedTruncated() ? 'truncated' : 'live';
     };
 
-    let skeletonArmed = false;
-
     paintNow = (): void => {
         // Collapsed: there is no engine to read from and nothing on screen to paint
         // into. This guard is what keeps a late notice and the clock tick inert
@@ -1707,8 +1836,10 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         feed.setAttribute('aria-busy', 'false');
         stateArea.hidden = true;
         stateArea.replaceChildren();
-        skeletonArmed = false;
-        skeleton.remove();
+        // Nothing to report, so nothing claimed: the corner box goes blank with the feed.
+        statusBox.hidden = true;
+        statusBox.textContent = '';
+        delete statusBox.dataset.state;
         chrome.hidden = true;
         chrome.textContent = '';
         filters.replaceChildren();
@@ -1755,25 +1886,26 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
     // card is what builds it; closing it again releases the wake and the client
     // (`stopEngine`, the same order a session switch uses) and clears the surface, so
     // a re-opening is a fresh boot rather than a resurrection of rows nothing is
-    // reading anymore. The control is the row disclosure's voice (`.panel-expand`):
-    // a real button whose `aria-expanded` is the one state claim.
-    const toggle = recordsElement('button', 'panel-expand') as HTMLButtonElement;
+    // reading anymore. THE CONTROL IS THE CARD'S OWN HEADING (`titleToggleOf`): the word
+    // "Records" is a real `<button>`, and `aria-expanded` on it is the one state claim.
+    // There is no second "Show records" button — a card whose title is the toggle does
+    // not need a caption telling the reader what to press.
+    const toggle = titleToggleOf({
+        ctx,
+        label: 'Records',
+        panel: 'records',
+        body,
+        onToggle: () => {
+            if (panelExpanded) collapsePanel();
+            else expandPanel();
+        }
+    });
 
-    toggle.type = 'button';
-    toggle.dataset.panelToggle = 'records';
-    body.before(toggle);
-
-    const paintToggle = (): void => {
-        toggle.dataset.expanded = String(panelExpanded);
-        toggle.setAttribute('aria-expanded', String(panelExpanded));
-        toggle.textContent = panelExpanded ? 'Hide records' : 'Show records';
-    };
-
-    paintToggle();
+    paintTitleToggle(toggle, 'Records', panelExpanded);
 
     const collapsePanel = (): void => {
         panelExpanded = false;
-        paintToggle();
+        paintTitleToggle(toggle, 'Records', false);
         body.hidden = true;
         mount.stopEngine();
         expanded.clear();
@@ -1787,7 +1919,7 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
 
     const expandPanel = (): void => {
         panelExpanded = true;
-        paintToggle();
+        paintTitleToggle(toggle, 'Records', true);
         body.hidden = false;
 
         // No conversation: the card opens onto the cleared surface and waits, exactly
@@ -1797,13 +1929,6 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
             paintNow();
         }
     };
-
-    toggle.addEventListener('click', () => {
-        if (ctx.disposed) return;
-
-        if (panelExpanded) collapsePanel();
-        else expandPanel();
-    });
 
     // --- the engine ----------------------------------------------------------
     const clock = globalThis.setInterval(() => {

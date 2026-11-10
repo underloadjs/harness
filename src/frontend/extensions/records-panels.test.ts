@@ -214,7 +214,7 @@ type Timers = {
     delays: () => number[];
 };
 
-// The panel's every timer is captured rather than armed: the skeleton delay, the
+// The panel's every timer is captured rather than armed: the announcer's coalescing
 // announcer's coalescing window, the FLIP frames and the freshness expiry are then
 // things a test triggers, never things it waits for.
 const createTimers = (): Timers => {
@@ -331,7 +331,6 @@ type HostOptions = {
     api?: PanelApiOverrides;
     seam?: Seam;
     sessionId?: string | null;
-    skeletonDelayMs?: number;
     bodyRefreshMs?: number;
 };
 
@@ -365,7 +364,6 @@ const createHost = (options: HostOptions): Host => {
         schedule: timers.schedule,
         // Long enough that the 30s clock tick never fires inside a test.
         tickMs: 60 * 60_000,
-        skeletonDelayMs: options.skeletonDelayMs ?? 250,
         clientOptions: { bodyRefreshMs: options.bodyRefreshMs ?? 0 }
     });
 
@@ -463,16 +461,29 @@ describe('records panel phase derivation', () => {
 // -----------------------------------------------------------------------------
 
 describe('harness.tasks — the five states', () => {
-    it('pre-mounts the live region, reads as loading, and only shimmers when the read is slow', async () => {
+    it('mounts the title as the control, pre-mounts the live region, and reads as loading', async () => {
         const backend = createBackend();
 
         backend.holdSnapshots(true);
         const host = tasksHost({ backend });
         await host.settle();
 
-        // The live region is the FIRST child, and it is there before any content moves:
-        // a region that appears with its own text may never be registered by AT.
-        expect(host.element.firstElementChild).toBe(host.query('.panel-live'));
+        // THE HEADING IS THE CONTROL, and it is the card's first child: a live card reads
+        // title-then-body exactly as a tool card does, and the title is a real `<button>`
+        // wearing the heading's own class (./records-panels.ts `titleToggleOf`).
+        const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="tasks"]');
+
+        expect(host.element.firstElementChild).toBe(toggle);
+        expect(toggle?.tagName).toBe('BUTTON');
+        expect(toggle?.className).toBe('panel-title panel-title-toggle');
+        expect(toggle?.textContent).toBe('Tasks');
+        expect(toggle?.getAttribute('type')).toBe('button');
+        expect(toggle?.getAttribute('aria-expanded')).toBe('true');
+        expect(toggle?.getAttribute('aria-controls')).toBe(host.query('.panel-tasks-body')?.id);
+
+        // The live region is next, and it is there before any content moves: a region that
+        // appears with its own text may never be registered by AT.
+        expect(host.element.children[1]).toBe(host.query('.panel-live'));
         expect(host.query('.panel-live')?.getAttribute('role')).toBe('status');
         expect(host.query('.panel-live')?.getAttribute('aria-live')).toBe('polite');
         expect(host.query('.panel-live')?.getAttribute('aria-atomic')).toBe('false');
@@ -482,18 +493,27 @@ describe('harness.tasks — the five states', () => {
         expect(body?.dataset.phase).toBe('loading');
         expect(body?.getAttribute('aria-busy')).toBe('true');
         expect(host.text('.panel-tasks-status')).toBe('0 tasks · 0 completed · 0 open');
-        expect(host.query('.panel-tasks-skeleton')).toBeNull();
 
-        host.timers.fire(250);
-        expect(host.query('.panel-tasks-skeleton')?.getAttribute('aria-hidden')).toBe('true');
-        expect(host.queryAll('.panel-tasks-skeleton-row')).toHaveLength(3);
+        // LOADING is one word in a box that was already on screen. Nothing is inserted
+        // over the list, so there is no delay to wait for and no block of bars to swap in
+        // and out — that swap is what made the tile flicker every time a read came and
+        // went, and it is why no timer is armed behind the box at all.
+        const box = host.query<HTMLElement>('.panel-status') as HTMLElement;
+
+        expect(box).not.toBeNull();
+        expect(box.hidden).toBe(false);
+        expect(box.textContent).toBe('reading');
+        expect(box.dataset.state).toBe('loading');
+        expect(host.query('[data-role="skeleton"]')).toBeNull();
 
         backend.holdSnapshots(false);
         backend.release();
         await host.settle();
 
-        // A read that lands after the shimmer replaces it, it never stacks under it.
-        expect(host.query('.panel-tasks-skeleton')).toBeNull();
+        // The SAME element, one new word: never removed, never re-added.
+        expect(host.query('.panel-status')).toBe(box);
+        expect(box.dataset.state).toBe('ready');
+        expect(box.textContent).toBe('live');
         expect(body?.dataset.phase).toBe('ready');
         expect(body?.getAttribute('aria-busy')).toBe('false');
         expect(host.text('.panel-tasks-sync')).toBe('updated just now');
@@ -819,7 +839,7 @@ describe('harness.records — the five states', () => {
         host.dispose();
     });
 
-    it('shimmers only a feed that is actually slow to read, and says so in the footer', async () => {
+    it('says what the feed is doing in the corner box and in the footer', async () => {
         const backend = createBackend();
         const host = recordsHost({ backend });
 
@@ -829,16 +849,22 @@ describe('harness.records — the five states', () => {
         expect(host.phase()).toBe('loading');
         expect(host.query('ol.panel-records-feed')?.hasAttribute('hidden')).toBe(true);
         expect(host.text('.panel-records-footer')).toBe('Reading the record store…');
-        expect(host.query('.panel-records-skeleton')).toBeNull();
 
-        host.timers.fire(250);
-        expect(host.query('.panel-records-skeleton')).not.toBeNull();
+        const box = host.query<HTMLElement>('.panel-status') as HTMLElement;
+
+        expect(box.textContent).toBe('reading');
+        expect(box.dataset.state).toBe('loading');
+        expect(host.query('[data-role="skeleton"]')).toBeNull();
 
         backend.holdSnapshots(false);
         backend.release();
         await host.settle();
 
-        expect(host.query('.panel-records-skeleton')).toBeNull();
+        // The box that said `reading` is the box that says `live`: one element, one word
+        // changed, nothing for the card to resize around.
+        expect(host.query('.panel-status')).toBe(box);
+        expect(box.dataset.state).toBe('ready');
+        expect(box.textContent).toBe('live');
         expect(host.phase()).toBe('ready');
         expect(host.query('ol.panel-records-feed')?.hasAttribute('hidden')).toBe(false);
 
@@ -901,11 +927,19 @@ describe('harness.records — the collapse gate', () => {
 
         const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="records"]');
 
+        // The gate is the card's own HEADING: the word "Records" is the button, and there
+        // is no second "Show records" control under it.
+        expect(host.element.firstElementChild).toBe(toggle);
+        expect(toggle?.className).toBe('panel-title panel-title-toggle');
         expect(toggle?.getAttribute('type')).toBe('button');
         expect(toggle?.getAttribute('aria-expanded')).toBe('false');
         expect(toggle?.dataset.expanded).toBe('false');
-        expect(toggle?.textContent).toBe('Show records');
+        expect(toggle?.textContent).toBe('Records');
+        expect(toggle?.getAttribute('aria-controls')).toBe(host.query('.panel-records-body')?.id);
+        expect(host.queryAll('button.panel-expand')).toHaveLength(0);
         expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(true);
+        // A card with no engine has no state to report, so it shows no box either.
+        expect(host.query<HTMLElement>('.panel-status')?.hidden).toBe(true);
         // The gate is the whole point: not one request, not one plane slot.
         expect(backend.reads).toEqual([]);
         expect(seam.specs).toEqual([]);
@@ -923,7 +957,10 @@ describe('harness.records — the collapse gate', () => {
         expect(host.phase()).toBe('ready');
         expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(false);
         expect(host.query('button[data-panel-toggle="records"]')?.getAttribute('aria-expanded')).toBe('true');
-        expect(host.text('button[data-panel-toggle="records"]')).toBe('Hide records');
+        // Opening changes `aria-expanded` and the box, never the heading's word: the title
+        // is the same title open or shut.
+        expect(host.text('button[data-panel-toggle="records"]')).toBe('Records');
+        expect(host.text('.panel-status')).toBe('live');
         expect(backend.snapshotReads()).toBe(1);
         expect(seam.specs).toHaveLength(1);
         expect(host.queryAll('ol.panel-records-feed > li')).toHaveLength(2);
@@ -944,9 +981,13 @@ describe('harness.records — the collapse gate', () => {
         // The last listener let go, so the registration went with the card.
         expect(seam.unsubscribed).toEqual(['sub_1']);
         expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(true);
-        expect(host.text('button[data-panel-toggle="records"]')).toBe('Show records');
+        expect(host.query('button[data-panel-toggle="records"]')?.getAttribute('aria-expanded')).toBe('false');
         expect(host.queryAll('li.panel-records-row')).toHaveLength(0);
         expect(host.phase()).toBeUndefined();
+        // Closed: the corner box goes blank with the surface, rather than claiming a state
+        // no read is backing anymore.
+        expect(host.query<HTMLElement>('.panel-status')?.hidden).toBe(true);
+        expect(host.text('.panel-status')).toBe('');
 
         // The store keeps moving while the card is closed: not one read answers it.
         const readsBefore = backend.reads.length;
@@ -999,6 +1040,73 @@ describe('harness.records — the collapse gate', () => {
         expect(backend.snapshotReads()).toBe(1);
         expect(seam.specs).toHaveLength(1);
         expect(host.phase()).toBe('ready');
+
+        host.dispose();
+    });
+});
+
+// -----------------------------------------------------------------------------
+// The title is the toggle: the tasks card closes the same way
+// -----------------------------------------------------------------------------
+
+describe('harness.tasks — the title as the collapse control', () => {
+    it('ships open, closes from its own heading, and holds nothing while shut', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = tasksHost({ backend, seam });
+
+        await host.settle();
+
+        const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="tasks"]') as HTMLButtonElement;
+
+        // Tasks ships OPEN — it is the card a reader glances at without thinking — but the
+        // heading is the control all the same, and it is the ONLY control: no second button
+        // under it, the way the records card has none either.
+        expect(toggle.getAttribute('aria-expanded')).toBe('true');
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(false);
+        expect(host.queryAll('button.panel-expand')).toHaveLength(0);
+        expect(host.text('.panel-status')).toBe('live');
+
+        toggle.click();
+        await host.settle();
+
+        expect(toggle.getAttribute('aria-expanded')).toBe('false');
+        expect(toggle.dataset.expanded).toBe('false');
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(true);
+        // Shut: the surface is blank, the corner box included, and the plane let go.
+        expect(host.phase()).toBeUndefined();
+        expect(host.query<HTMLElement>('.panel-status')?.hidden).toBe(true);
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(0);
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+
+        // The store keeps moving while the card is shut: not one read answers it.
+        const readsBefore = backend.reads.length;
+
+        backend.push({
+            seq: 3,
+            collection: 'tasks',
+            rev: 1,
+            id: 'rec_b',
+            op: 'update',
+            fields: ['completed'],
+            item_rev: 1,
+            at: LATER,
+            by: 'agent'
+        });
+        host.seam.wake(3);
+        await host.settle();
+
+        expect(backend.reads).toHaveLength(readsBefore);
+
+        toggle.click();
+        await host.settle();
+
+        // Re-opening is a fresh boot, not a resurrection of the rows it dropped.
+        expect(toggle.getAttribute('aria-expanded')).toBe('true');
+        expect(backend.snapshotReads()).toBe(2);
+        expect(host.phase()).toBe('ready');
+        expect(host.text('.panel-status')).toBe('live');
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
 
         host.dispose();
     });

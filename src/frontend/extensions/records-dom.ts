@@ -653,26 +653,27 @@ export const createRecordsFreshMarker = (options: {
 // The non-ready states: loading, empty, error, stale
 // ---------------------------------------------------------------------------
 
-// Skeleton rows that MIRROR the final row layout (same height, same columns), so the
-// surface does not jump when the data lands. The delay before a skeleton is worth
-// showing at all is the caller's (`RECORDS_SKELETON_DELAY_MS`) — a read that answers
-// in 40ms should paint rows, never a shimmer.
-export const RECORDS_SKELETON_DELAY_MS = 250;
+// The closed set of things a mounted surface can be doing. It lives in the DOM layer
+// because this is the set the SURFACE paints: the panels derive it from their client
+// (./records-panels.ts `recordsPanelPhaseOf`), and the corner box, the chrome note and
+// `aria-busy` all read the one attribute that derivation writes.
+export type RecordsSurfaceState = 'loading' | 'empty' | 'error' | 'stale' | 'ready';
 
-export const recordsSkeletonOf = (className: string, rows: number, columns: number): HTMLElement => {
-    const wrap = el('div', `panel-skeleton ${className}`);
+// THE CORNER BOX, not a skeleton. A shimmering skeleton is a block of bars inserted over
+// the list and pulled out again the moment the read lands, which on a card that
+// re-reads a delta every second reads as the whole tile flickering. This is one fixed
+// box in the card's top-right corner — the title's own line — that says `reading` while
+// a read is in flight and the name of the state the rest of the time. Nothing is
+// inserted, nothing moves, and a read that answers in 40ms costs one word. CSS draws the
+// box and the pulse (`../styles.css` `.panel-status`); the WORD is never the only
+// signal, because `data-state` carries the colour and `aria-busy` carries the fact.
+export const recordsStatusOf = (state: RecordsSurfaceState, text: string): HTMLElement => {
+    const box = el('span', 'panel-status', text);
 
-    wrap.dataset.role = 'skeleton';
-    wrap.setAttribute('aria-hidden', 'true');
+    box.dataset.state = state;
+    box.dataset.role = 'status';
 
-    for (let index = 0; index < rows; index += 1) {
-        const row = el('div', `${className}-row`);
-
-        for (let column = 0; column < columns; column += 1) row.append(el('span', `${className}-cell`));
-        wrap.append(row);
-    }
-
-    return wrap;
+    return box;
 };
 
 // The one-line state message every panel uses for `empty`, `error` and `stale`. It is

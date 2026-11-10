@@ -89,8 +89,10 @@ beforeEach(() => {
             if (url === '/api') {
                 return json({
                     rootPath: '/api',
-                    // A preset is required for the app to finish booting (an empty
-                    // list is the "no harnesses" offline path).
+                    // A preset so boot lands on a SELECTED harness: this file's tool card
+                    // needs a session-bound context to call into. An empty list is NOT an
+                    // error any more (T3) — it boots into the empty-catalogue guidance — but
+                    // it would leave this file with no harness to run `files` in.
                     presets: [
                         {
                             name: 'instruct',

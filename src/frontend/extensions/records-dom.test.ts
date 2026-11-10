@@ -5,7 +5,7 @@
  * from: relative/absolute stamps, the truncation bound, the actor badge, the pre-mounted
  * live region and its batching announcer, the reading-position controller and its
  * "N new" pill, the FLIP animator's keyed enter/reorder bookkeeping, the "just landed"
- * marker, and the skeleton/state surfaces. Geometry the panels need is faked per element
+ * marker, and the corner state box / state-note surfaces. Geometry the panels need is faked per element
  * (a detached jsdom node reports an all-zero rect), so every assertion is about the
  * attribute, label or offset the helper actually writes.
  *
@@ -16,7 +16,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     RECORDS_JUST_NOW_MS,
     RECORDS_LIVE_EDGE_THRESHOLD,
-    RECORDS_SKELETON_DELAY_MS,
     RECORDS_TEXT_PREVIEW,
     createRecordsAnnouncer,
     createRecordsFollow,
@@ -29,9 +28,9 @@ import {
     recordsNewPillOf,
     recordsReducedMotion,
     recordsRelativeOf,
-    recordsSkeletonOf,
     recordsStampOf,
     recordsStateOf,
+    recordsStatusOf,
     recordsTruncate,
     refreshRecordsStamps,
     type RecordsSchedule
@@ -674,24 +673,26 @@ describe('records fresh marker', () => {
 // The non-ready states
 // -----------------------------------------------------------------------------
 
-describe('records skeleton and state surfaces', () => {
-    it('mirrors the final row layout so nothing jumps when the data lands', () => {
-        const skeleton = recordsSkeletonOf('panel-tasks-skeleton', 3, 2);
+describe('records corner state box and state-note surfaces', () => {
+    it('builds one fixed box that names the state, and carries the state twice', () => {
+        // The box REPLACED the skeleton: a panel that is reading used to insert a block of
+        // shimmering bars over its list and pull them out again when the read landed, which
+        // on a card that re-reads a delta every few seconds read as the whole tile
+        // flickering. This is one element that never enters and never leaves — only its
+        // word and its attribute change (./records-panels.ts `paintChrome`).
+        const box = recordsStatusOf('loading', 'reading');
 
-        expect(skeleton.className).toBe('panel-skeleton panel-tasks-skeleton');
-        expect(skeleton.dataset.role).toBe('skeleton');
-        expect(skeleton.getAttribute('aria-hidden')).toBe('true');
-        expect([...skeleton.children].map((row) => row.className)).toEqual([
-            'panel-tasks-skeleton-row',
-            'panel-tasks-skeleton-row',
-            'panel-tasks-skeleton-row'
-        ]);
-        expect([...skeleton.children].map((row) => row.children.length)).toEqual([2, 2, 2]);
-        expect(skeleton.querySelector('span')?.className).toBe('panel-tasks-skeleton-cell');
-    });
-
-    it('names the skeleton delay as a constant the panels read', () => {
-        expect(RECORDS_SKELETON_DELAY_MS).toBe(250);
+        expect(box.tagName).toBe('SPAN');
+        expect(box.className).toBe('panel-status');
+        expect(box.textContent).toBe('reading');
+        // The word is for the eye; `data-state` is the fact the stylesheet, the tests and
+        // a forced-colours mode read, so the label and the colour cannot drift apart.
+        expect(box.dataset.state).toBe('loading');
+        expect(box.dataset.role).toBe('status');
+        // NOT `aria-hidden` and not a live region of its own: the panel's pre-mounted
+        // region already announces, and a second region would say it twice.
+        expect(box.getAttribute('aria-hidden')).toBeNull();
+        expect(box.getAttribute('aria-live')).toBeNull();
     });
 
     it('paints a state note, with the retry action as a real button', () => {

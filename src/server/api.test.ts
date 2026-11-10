@@ -1587,6 +1587,91 @@ describe('harness catalogue reads', () => {
         });
     });
 });
+// A catalogue with NO harness in it at all: what a server holds before the first create, and
+// what it holds again after a reader deletes every harness from the UI.
+//
+// `createHarnessRegistry([])` had never been exercised here, and the frontend's healthy empty
+// state depends on exactly these two answers: the list is a NORMAL paged 200 with an empty
+// `items` array (not an error), and the first create needs nothing pre-existing (its primary
+// only has to be a trusted agent, which the shipped catalogue always provides). A UI that read
+// the empty list as "no server" would lock "+ New" and make the empty state unrecoverable.
+describe('a zero-harness registry', () => {
+    // The same runtime `createRuntime` builds, minus every template: search keys are stubbed
+    // exactly the same way, so no provider credential is read and nothing here touches the net.
+    const createEmptyRuntime = (): HarnessRuntime => {
+        stubEmptySearchKeys();
+
+        return createHarnessRuntime({
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            registry: createHarnessRegistry([]),
+            loadEnvironment: false
+        });
+    };
+
+    it('answers the harness page as an empty collection', async () => {
+        const runtime = createEmptyRuntime();
+
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+
+        // A healthy 200 with the standard page envelope: `limit` echoes the RETURNED row count
+        // (./api-paging.ts:148), so an empty catalogue is `limit: 0` with no cursor, and the
+        // hub has never moved the harnesses revision.
+        expect(page.status).toBe(200);
+        expect(page.body).toEqual({
+            items: [],
+            limit: 0,
+            next_cursor: null,
+            observed_at: expect.any(Number),
+            revision: 0
+        });
+    });
+
+    it('creates its first harness with no catalogue entry to start from', async () => {
+        const runtime = createEmptyRuntime();
+
+        // The state the write starts from - and the answer the UI boots on.
+        expect((await call(runtime, 'GET', HARNESS_ROUTES.harnesses())).body.items).toEqual([]);
+
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
+            name: 'release-captain',
+            title: 'Release captain',
+            description: 'The first harness of an empty registry.',
+            primary: 'instruct',
+            subagents: []
+        });
+
+        expect(created.status).toBe(201);
+        // Same card shape as a create against a full catalogue: no team means no `delegate` in
+        // the core set (GENERAL_CORE_TOOLS), and the instruction summary is the trusted
+        // profile's own char count.
+        expect(created.body.harness).toEqual({
+            name: 'release-captain',
+            title: 'Release captain',
+            description: 'The first harness of an empty registry.',
+            requires_endpoint: true,
+            primary: 'instruct',
+            subagents: [],
+            agents: ['instruct'],
+            tools: [...TOOLBOX, 'fetch'],
+            builtin: false,
+            definition_revision: 1,
+            core_tools: GENERAL_CORE_TOOLS,
+            instruction_summary: [{ agent: 'instruct', source: 'catalogue', overridden: false, chars: 132 }]
+        });
+        expect(created.headers).toEqual({
+            'X-Harness-Epoch': runtime.events.epoch,
+            'X-Harness-Revision': '1'
+        });
+
+        // The catalogue now holds exactly that one card, with the plain card row.
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+        expect(page.body.items.map((card: any) => card.name)).toEqual(['release-captain']);
+        expect(page.body.limit).toBe(1);
+        expect(page.body.next_cursor).toBeNull();
+        expect(Object.keys(page.body.items[0]).sort()).toEqual(CARD_KEY_SET);
+    });
+});
 // Sessions over HTTP: a session RESOURCE is metadata + counters, never a snapshot.
 //
 // Replaces the old full-snapshot assertions (`messages`, `turns`, `harnessDefinition` on one

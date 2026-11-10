@@ -8133,17 +8133,18 @@ body.is-resizing-rail {
 
    WHY SO MANY RULES FOR TWO PANELS: a panel that stays mounted while a server
    pushes into it needs things a tool card never needed — a live region that is
-   invisible, a skeleton that must not shift the rows, a highlight that says
+   invisible, a state box that never shifts the rows, a highlight that says
    "this one just landed", a pill that says "you are not at the end", and five
    named states that must each look like themselves. Each of those is a handful
    of lines here and an attribute in the TS, never a style object.
 
-   NAMESPACING: `.panel-tasks-*` and `.panel-records-*` only, plus seven shared
-   `.panel-*` roots (`panel-live`, `panel-new-pill`, `panel-actor`, `panel-stamp`,
-   `panel-expand`, `panel-skeleton`, `panel-state`) that both panels use, and the
-   `panel-*` sub-element variants those rules address (`panel-live-line`,
-   `panel-skeleton-row`/`-cell`, `panel-history-*`). The per-panel prefixes keep a
-   rule for one feed from ever reaching the other.
+   NAMESPACING: `.panel-tasks-*` and `.panel-records-*` only, plus the shared
+   `.panel-*` roots that BOTH panels use (`panel-live`, `panel-new-pill`, `panel-actor`,
+   `panel-stamp`, `panel-expand`, `panel-status`, `panel-state`) and the two card-level
+   hooks a live panel adds to the shared card chrome (`panel-extension`,
+   `panel-title-toggle`), and the `panel-*` sub-element variants those rules address
+   (`panel-live-line`, `panel-history-*`). The per-panel prefixes keep a rule for one
+   feed from ever reaching the other.
 
    STATE vs DECORATION: `data-phase` on the panel body is the ONE fact every
    visual derives from (loading / empty / error / stale / ready); `data-fresh`,
@@ -8184,12 +8185,45 @@ body.is-resizing-rail {
     min-width: 0;
 }
 
-/* The records panel ships COLLAPSED (./records-panels.ts): the body starts
-   `hidden`, and this rule is what makes that stick — the `display: flex` above
-   would otherwise beat the UA's `[hidden]` rule, for the same reason
-   `.panel-new-pill[hidden]` exists below. */
+/* BOTH panels collapse (./records-panels.ts `titleToggleOf`): the body starts `hidden`
+   for the feed and becomes `hidden` the moment the reader presses the title, and this
+   rule is what makes that stick — the `display: flex` above would otherwise beat the
+   UA's `[hidden]` rule, for the same reason `.panel-new-pill[hidden]` exists below. */
+.panel-tasks-body[hidden],
 .panel-records-body[hidden] {
     display: none;
+}
+
+/* A live panel's card is the coordinate system the corner state box pins itself to.
+   Only an extension card gets one: the tool cards above stay exactly as `.panel` draws
+   them, and the rule costs nothing, because nothing else inside is positioned. */
+.panel-extension {
+    position: relative;
+}
+
+/* THE HEADING IS THE TOGGLE (./records-panels.ts `titleToggleOf`). The `<button>`
+   carries `.panel-title`, so the heading's colour, mono face, size and weight still come
+   from the rule above the section — this only strips the UA's button chrome, keeps the
+   words left-aligned, and leaves room on the line for the corner box. The pointer and
+   the underline are the whole affordance: a card's title is the thing readers already
+   press, so it is not dressed up as a second control, and `aria-expanded` carries the
+   state for anyone who cannot see a cursor. */
+.panel-title-toggle {
+    margin: 0;
+    padding: 0 78px 0 0;
+    border: 0;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+}
+
+.panel-title-toggle:hover {
+    text-decoration: underline;
+}
+
+.panel-title-toggle:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 2px;
 }
 
 .panel-tasks-scroller,
@@ -8211,58 +8245,76 @@ body.is-resizing-rail {
    The five states
    -------------------------------------------------------------------------- */
 
-/* LOADING mirrors the final row layout so the surface does not jump when the
-   data lands. The skeleton is `aria-hidden` (the region already says "loading"
-   through `aria-busy` on the root) and the delay before one is worth drawing at
-   all lives in TS (`RECORDS_SKELETON_DELAY_MS`), so a warm re-read never
-   shimmers. */
-.panel-skeleton {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
+/* THE CORNER STATE BOX, in place of a loading skeleton. A skeleton is a block of bars
+   inserted over the list and pulled out again the moment the read lands; on a card that
+   re-reads a delta every few seconds that reads as the whole tile flickering. This is
+   one fixed box in the card's top-right corner, on the title's own line, that changes a
+   single word: `reading` while a read is in flight, then the name of the state. Nothing
+   is inserted and nothing moves, so there is nothing to flicker — and the box keeps
+   being useful after the first read instead of only during it.
 
-/* Rows and cells carry the OWNING panel's prefix (`panel-tasks-skeleton-row`,
-   ./records-dom.ts `recordsSkeletonOf`), so all three names are listed: the generic
-   one for a host that passes no prefix, the two namespaced ones for the live panels. */
-.panel-skeleton-row,
-.panel-tasks-skeleton-row,
-.panel-records-skeleton-row {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    min-height: 18px;
-}
-
-.panel-skeleton-cell,
-.panel-tasks-skeleton-cell,
-.panel-records-skeleton-cell {
-    flex: 1 1 auto;
-    height: 10px;
+   The word is never the only signal: `data-state` carries the colour, the sync line
+   under the body carries the whole sentence, and `aria-busy` on the body carries
+   "reading" to a screen reader. ./records-dom.ts `recordsStatusOf` builds the box and
+   ./records-panels.ts `paintChrome` writes its one word. */
+.panel-status {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 1;
+    padding: 1px 7px;
+    border: 1px solid var(--border);
     border-radius: 999px;
-    background: linear-gradient(
-        90deg,
-        var(--border) 0%,
-        var(--border-strong) 42%,
-        var(--border) 66%
-    );
-    background-size: 220% 100%;
-    animation: records-skeleton-shimmer 1.2s linear infinite;
+    background: var(--bg);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    white-space: nowrap;
 }
 
-/* The last cell of every row is short: a row of four equal bars reads as a
-   table, and these rows carry a trailing stamp. */
-.panel-skeleton-cell:last-child {
-    flex: 0 0 34px;
+/* A card with no conversation and no engine has no state to report, so it shows no box.
+   `hidden` has to win the same way `.panel-new-pill[hidden]` does. */
+.panel-status[hidden] {
+    display: none;
 }
 
-@keyframes records-skeleton-shimmer {
+/* LOADING is the one state that moves, and it moves inside the box: a slow breath on
+   the word, never a shimmer across the tile. */
+.panel-status[data-state='loading'] {
+    border-color: var(--accent);
+    color: var(--accent);
+    animation: records-status-pulse 1.1s ease-in-out infinite alternate;
+}
+
+/* The three states that are not the data's fault, and the one that is. Each keeps the
+   word and gains an edge, so the box says its state in shape and colour at once. */
+.panel-status[data-state='stale'] {
+    border-color: var(--warn);
+    color: var(--warn);
+}
+
+.panel-status[data-state='error'] {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.panel-status[data-state='empty'] {
+    border-style: dashed;
+}
+
+.panel-status[data-state='ready'] {
+    border-color: var(--ok-line);
+}
+
+@keyframes records-status-pulse {
     from {
-        background-position: 120% 0;
+        opacity: 1;
     }
 
     to {
-        background-position: -120% 0;
+        opacity: 0.45;
     }
 }
 
@@ -8917,14 +8969,15 @@ body.is-resizing-rail {
 /* --------------------------------------------------------------------------
    Reduced motion: the animations are decoration, the attributes are the data
    --------------------------------------------------------------------------
-   The skeleton shimmer and the "just landed" fade both stop. The highlight's
+   The corner box's breath and the "just landed" fade both stop — the box still
+   says `reading`, it simply stops breathing while it does. The highlight's
    border and tint stay, because `data-fresh` is a fact about the row and a
    reader who cannot see a fade still deserves to see which row is new. The FLIP
    transform itself is never applied at all under this preference
    (./records-dom.ts `recordsReducedMotion`), which is why nothing has to be
    overridden for it here.                                                */
 @media (prefers-reduced-motion: reduce) {
-    .panel-skeleton-cell,
+    .panel-status[data-state='loading'],
     .panel-tasks-row[data-fresh='true'],
     .panel-records-row[data-fresh='true'] {
         animation: none !important;

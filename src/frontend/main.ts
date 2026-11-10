@@ -13370,22 +13370,48 @@ const boot = async (): Promise<void> => {
         // Catalogue-dependent actions become usable only now.
         createHarnessButton.disabled = false;
 
-        if (presetDescriptors.length === 0) {
-            showOffline('The server reported no harnesses.');
-            setStatus('error', 'no harnesses');
-            return;
-        }
-
         booted = true;
         // R1 (T3) / R4 (T9) / R3 (this pass): the header's New-session button is the only
         // create control, and its enabled state is derived from `booted`, so this runs
-        // AFTER the flag flips (the rail used to force the buttons on directly). With no
-        // harness at all it stays disabled, which is the truth: `newSession` has nothing
-        // to start a conversation from.
+        // AFTER the flag flips (the rail used to force the buttons on directly).
+        //
+        // T3 (zero-harness boot): a RESOLVED bootstrap that reports ZERO harnesses is a
+        // healthy server, not an offline one. The tool catalogue, the agent library and the
+        // session directory all came back, and `POST /v1/harness/harnesses` needs no
+        // pre-existing harness (its primary only has to be a known agent), so an empty
+        // catalogue must boot exactly like a normal one: `booted = true`, the same control
+        // painting, and the empty-catalogue UI the live delete-all path already lands in
+        // (`applyHarnessRemoved`). Bailing out into `showOffline` here is what made a
+        // delete-everything server look dead AND left "+ New" refused by the `!booted` click
+        // guard, so the reader could never create the first harness. Only a FAILED request
+        // is offline — that is the catch below.
         paintSessionActions();
         // R9/R10: paint the single composer action now that submitting is allowed
         // (it stays hidden while the field is empty and nothing is pending).
         paintComposer();
+
+        if (presetDescriptors.length === 0) {
+            // The identical screen a reader gets after deleting the last harness, so a
+            // reload of that server does not move them: no chat head, no composer, the
+            // centre column names the way back (`emptyStagePane`), and the rail keeps the
+            // "No harnesses reported by the server yet." hint `buildHarnesses` painted
+            // above. Saved sessions of the deleted harness stay reachable.
+            agentSlot.hidden = true;
+            composer.hidden = true;
+            stage.replaceChildren(emptyStagePane());
+            renderSessions();
+            // Every control is then derived from `booted` by the SHARED painter, which is
+            // what the live delete-all state already reflects: "+ New" and the header "+"
+            // are enabled (the header "+" is a no-op with no instance — `newSession`'s
+            // `current === undefined` guard, exactly like that state), and the two
+            // server-wide catalogue toggles stay usable because their rows arrived with the
+            // bootstrap.
+            paintControls();
+            // Informational, never `error`: the pill reads `idle` and its detail names the
+            // action that leaves the empty state.
+            setStatus('idle', 'no harnesses · create one with “+ New”');
+            return;
+        }
         // T24: `selectHarness` now resolves the harness on screen by itself, and boot must
         // not stack a second automatic open on top of it. Marking the first harness as
         // already entered hands that ONE decision to the awaited block below, which is the

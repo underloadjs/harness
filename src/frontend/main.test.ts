@@ -4014,6 +4014,178 @@ it('shows the offline pane when a proxy answers 200 with HTML instead of JSON', 
 });
 
 // ---------------------------------------------------------------------------
+// Startup on a server that reports NO harness (T3)
+// ---------------------------------------------------------------------------
+//
+// The offline pane above is for a bootstrap that FAILS. A bootstrap that RESOLVES with an
+// empty catalogue is a healthy server with nothing in the registry (a fresh host, or the
+// state after a reader deleted every harness), and the UI must say so instead of lying about
+// the transport:
+//   - no offline card, no "No server connection." rail text, and the status pill is `idle`
+//     with an informational detail — never `error`;
+//   - the centre column shows the SAME guidance the live delete-all path lands in
+//     (`emptyStagePane`, pinned in harness-delete-main.test.ts), so deleting everything and
+//     reloading does not change the screen;
+//   - `booted` is true, so "+ New" is clickable and creating the first harness works
+//     end to end — the bug this pass fixes was boot returning early, which left the whole
+//     shell disabled with no way out.
+
+// The empty-catalogue status detail `boot()` sets (mirrors the informational detail the
+// live delete-all path leaves behind, and names the action that gets the reader out).
+const EMPTY_CATALOGUE_DETAIL = 'no harnesses · create one with “+ New”';
+
+// A bootstrap with a healthy server and an empty registry: the agent library and the tool
+// catalogue still come back (that is what a real server always answers), only `presets` is
+// empty — exactly the shape of `GET /v1/harness/harnesses` -> 200 `{ items: [] }`.
+const stubEmptyCatalogue = (): Call[] =>
+    stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap({ presets: [] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+
+        if (url === '/api/harnesses' && method === 'POST') {
+            const request = body as { name: string; title: string; primary: string; subagents: string[] };
+            return json(
+                {
+                    harness: descriptor({
+                        name: request.name,
+                        title: request.title,
+                        agents: [request.primary, ...request.subagents],
+                        primary: request.primary,
+                        subagents: request.subagents,
+                        builtin: false
+                    })
+                },
+                201
+            );
+        }
+
+        return undefined;
+    });
+
+it('boots into the empty-catalogue guidance when the server reports no harness', async () => {
+    stubEmptyCatalogue();
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // NOT the offline pane: the "Harness server unavailable" card and its Retry action
+    // belong to a failed request only (R3), so neither is on screen.
+    expect(document.querySelector('.empty-title')).toBeNull();
+    expect(document.querySelector('.empty-text')).toBeNull();
+    expect(document.querySelector('.empty-hint')).toBeNull();
+    expect(document.querySelectorAll('.stage .composer-actions button')).toHaveLength(0);
+
+    // The same guidance the live delete-all path paints (harness-delete-main.test.ts:499).
+    expect(document.querySelector('.stage .empty .field-hint')?.textContent).toBe(
+        'No harness is available. Create one with “+ New” in the harnesses panel.'
+    );
+
+    // The rail is empty but named, with the hint `buildHarnesses` owns — and NOT the
+    // offline rail text.
+    expect(document.querySelectorAll('.harness-row')).toHaveLength(0);
+    expect(document.querySelector('.harness-list .field-hint')?.textContent).toBe(
+        'No harnesses reported by the server yet.'
+    );
+
+    // The pill is informational: an idle state whose detail names the way out, never the
+    // red `error` the offline path stamps.
+    expect(statusText()).toBe('idle');
+    expect(statusTitle()).toBe(EMPTY_CATALOGUE_DETAIL);
+    expect(document.querySelector('.status-detail')?.textContent).toBe(EMPTY_CATALOGUE_DETAIL);
+    expect(document.querySelector<HTMLElement>('.status')?.dataset.state).toBe('idle');
+
+    // The chat is out of the way (there is no harness to chat with), exactly as after a
+    // delete-all: no composer, no agent control.
+    expect(byClass('.composer', 'form').hidden).toBe(true);
+    expect(byClass('.agent-slot', 'div').hidden).toBe(true);
+
+    // Boot completed, so every catalogue-scoped control is live: "+ New" (the way out of
+    // this state), the header "+", and the two server-wide catalogue toggles whose rows
+    // came back with the bootstrap. The header "+" is a no-op with no instance — the same
+    // state the live delete-all path leaves it in.
+    expect(byClass('.new-harness', 'button').disabled).toBe(false);
+    expect(byClass('.harness-title-row .new-session', 'button').disabled).toBe(false);
+    expect(byClass('.tools-toggle', 'button').disabled).toBe(false);
+    expect(byClass('.plugins-toggle', 'button').disabled).toBe(false);
+
+    // A press of the header "+" cannot invent a session out of nowhere: no harness means no
+    // `current`, and `newSession`'s guard returns before any request.
+    byClass('.harness-title-row .new-session', 'button').click();
+    await flush();
+    expect(document.querySelector('.stage .empty .field-hint')).not.toBeNull();
+});
+
+it('creates the first harness from the empty-catalogue state, then selects it', async () => {
+    const calls = stubEmptyCatalogue();
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // "+ New" is enabled and opens the create panel — the reported bug was this click being
+    // a silent no-op because boot had bailed out before flipping `booted`.
+    const newHarness = byClass('.new-harness', 'button');
+    expect(newHarness.disabled).toBe(false);
+    newHarness.click();
+
+    const panel = byClass('.create-harness', 'section');
+    expect(panel.hidden).toBe(false);
+    expect(newHarness.getAttribute('aria-expanded')).toBe('true');
+
+    // The trusted agent library is available even with an empty catalogue, which is what
+    // makes a first create possible at all.
+    expect([...byClass('.create-primary', 'select').options].map((option) => option.value)).toEqual([
+        'instruct',
+        'summarizer',
+        'workspace'
+    ]);
+    byClass('.create-name', 'input').value = 'release-captain';
+    byClass('.create-title-input', 'input').value = 'Release captain';
+
+    byClass('.create-form', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    await flush();
+
+    // The browser dials the canonical `POST /v1/harness/harnesses` (../shared/harness-api.ts);
+    // `calls` is inside the route adapter, so the body above is asserted on this file's raw
+    // twin. The canonical log (recorded OUTSIDE the adapter, on the function the browser calls)
+    // holds exactly two hits on the collection route, in this order: boot's paged catalogue
+    // read (`?limit=25`, the empty page) and then the create. Nothing re-reads the catalogue
+    // after the write — `onSubmit` builds the rail from the descriptor the server answered.
+    const post = calls.find((entry) => entry.url === '/api/harnesses' && entry.method === 'POST');
+    expect(post?.body).toEqual({
+        name: 'release-captain',
+        title: 'Release captain',
+        primary: 'instruct',
+        subagents: []
+    });
+    expect(canonicalReads.filter((url) => url.split('?')[0] === '/v1/harness/harnesses')).toEqual([
+        '/v1/harness/harnesses?limit=25',
+        '/v1/harness/harnesses'
+    ]);
+
+    // The harness exists now: the rail lists it, the empty hint is gone, and it is selected.
+    expect(harnessNames()).toEqual(['release-captain']);
+    expect(document.querySelector('.harness-list .field-hint')).toBeNull();
+    expect(byClass('.harness-item[data-harness="release-captain"]', 'button').getAttribute('aria-pressed')).toBe(
+        'true'
+    );
+    expect(document.querySelector('.main-title')?.textContent).toBe('Release captain');
+
+    // The centre column left the empty-catalogue guidance for the chat. The chat has an
+    // `.empty` block of its own when the fresh harness has no conversation yet ("Send a task
+    // below to start this harness."), so the discriminating node is the guidance hint.
+    expect(panel.hidden).toBe(true);
+    expect(document.querySelector('.stage .empty .field-hint')).toBeNull();
+    expect(document.querySelector('.stage .empty-title')?.textContent).toBe('Release captain');
+    expect(byClass('.composer', 'form').hidden).toBe(false);
+    expect(byClass('.agent-slot', 'div').hidden).toBe(false);
+    expect(statusText()).toBe('idle');
+    expect(statusTitle()).toBe('created release-captain · choose the team if needed');
+});
+
+// ---------------------------------------------------------------------------
 // R8: permanent session deletion (T1/R1: one click, no confirmation step)
 // ---------------------------------------------------------------------------
 //
