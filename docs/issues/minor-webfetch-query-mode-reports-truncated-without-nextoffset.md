@@ -32,12 +32,12 @@ The consumer needs to know which limit it hit and what to do next.
 ## Why it is the way it is
 
 Partly an oversight, partly an unstated contract. The non-`query` path was explicitly fixed for
-this: `index.ts:664-666` — *"Where the NEXT window starts, present only when more exists. Every
+this: `index.ts:662-665` — *"Where the NEXT window starts, present only when more exists. Every
 other content tool in this harness pages; fetch used to be the one that silently lost the rest
 of the document."* The `query` branch returns before that block and was not covered by the fix.
 
 `offset` being ignored with `query` is a real design consequence — section selection runs on the
-whole converted document (`index.ts:565-568` slices `safeContent`, not `window`) — but it is
+whole converted document (`index.ts:576-577` selects from `safeContent`, not `window`) — but it is
 **nowhere documented**, so a caller that combines `query` with `offset` gets a silently ignored
 argument.
 
@@ -49,12 +49,12 @@ complete`. `fetch` `query` mode has no equivalent.
 
 | Fact | Source |
 |---|---|
-| `nextOffset` is emitted only on the non-`query` path | `src/tools/webfetch/index.ts:666` (`...(truncated ? { nextOffset: … } : {})`), reached only after the `query` branch returns |
-| The `query` branch returns its own object, without `offset`/`nextOffset` | `src/tools/webfetch/index.ts:595-640` |
-| `query` selection runs on the whole page, so `offset` is ignored | `src/tools/webfetch/index.ts:565-568` (`selectSections(safeContent, …)` — not `window`) |
-| The documented promise that `nextOffset` accompanies `truncated` | `src/types/index.ts:2235-2238` ("Present only when `truncated` is true, so resuming is a fact from the tool rather than a guess") |
-| The section cap | `src/tools/webfetch/request.ts:124` (`MAX_QUERY_BLOCKS = 20`) |
-| The cap is documented as bounding the answer | `src/tools/webfetch/sections.ts:93-95` ("a one-word query against a long page would otherwise match most of it and smuggle the whole document back") |
+| `nextOffset` is emitted only on the non-`query` path | `src/tools/webfetch/index.ts:665` (`...(truncated ? { nextOffset: … } : {})`), reached only after the `query` branch returns |
+| The `query` branch returns its own object, without `offset`/`nextOffset` | `src/tools/webfetch/index.ts:576-632` (the branch), returning its own object at `:605-631` — `characters`, `matches`, `totalMatches`, `matchMode`, `pageCharacters`, and no `offset`/`nextOffset` |
+| `query` selection runs on the whole page, so `offset` is ignored | `src/tools/webfetch/index.ts:576-577` (the selection call is `:577` — `selectSections(safeContent, invocation.query, MAX_QUERY_BLOCKS)`, not `window`) (`selectSections(safeContent, …)` — not `window`) |
+| The documented promise that `nextOffset` accompanies `truncated` | `src/types/index.ts:2269-2272` ("Present only when `truncated` is true, so resuming is a fact from the tool rather than a guess") |
+| The section cap | `src/tools/webfetch/request.ts:121` (`MAX_QUERY_BLOCKS = 20`) |
+| The cap is documented as bounding the answer | `src/tools/webfetch/sections.ts:96-98` ("a one-word query against a long page would otherwise match most of it and smuggle the whole document back") |
 | Siblings disambiguate the cause | `src/tools/files/glob.tool.ts:140`, `src/tools/files/grep.tool.ts:250` (`stopReason`) |
 | Runtime 2026-11-10: `query="quantum"` on Quantum_mechanics → `characters: 60314, truncated: true, matches: 20, totalMatches: 25`, **no `nextOffset`** | live fetch |
 | Runtime: `query="surface code"` on Quantum_error_correction → 52,643 chars, `matches: 3`, `truncated: false` — so the flag is not always set, and its absence is meaningful | live fetch |
@@ -110,3 +110,24 @@ complete`. `fetch` `query` mode has no equivalent.
 - Changing `MAX_QUERY_BLOCKS` itself.
 - The markdown verbosity that inflates citation metadata (a link per identifier) — related, but
   it belongs with the converter work in 0012.
+
+## Update (2026-11-11)
+
+- **Re-anchored** (the `query` branch sits ~11 lines lower than filed, and two cites were
+  stale by 3 lines): the branch is `src/tools/webfetch/index.ts:576-632` and its own return
+  object is `:605-631`; the section selection that ignores `offset` is `:577`
+  (`selectSections(safeContent, invocation.query, MAX_QUERY_BLOCKS)`); the `nextOffset`
+  emission this issue contrasts with is `:665` (the comment quoted in "Why it is the way it
+  is" is `:662-665`); `MAX_QUERY_BLOCKS = 20` is `src/tools/webfetch/request.ts:121`; the
+  "bounds the answer" rationale is `src/tools/webfetch/sections.ts:96-98`; and the
+  `nextOffset` contract in the types is `src/types/index.ts:2269-2272`.
+- **Re-verified exact, no edit needed**: the `query` branch's early return means `:665` is
+  unreachable with `query` — the asymmetry is unchanged; the no-match error is
+  `src/tools/webfetch/index.ts:595`; the `offset` parameter description is `index.ts:405` and
+  still never mentions `query` (`grep -n 'ignored with\|"query"' src/tools/webfetch/index.ts`
+  returns nothing about the interaction), so proposal step 2 is still a real doc gap; the
+  sibling `stopReason` precedents are `src/tools/files/glob.tool.ts:140` and
+  `src/tools/files/grep.tool.ts:250`.
+- The runtime rows are left **as recorded** (live 2026-11-10): re-running them costs provider
+  spend, and the shape they describe is what the code at `:605-631` still produces.
+- Status stays **Open**.

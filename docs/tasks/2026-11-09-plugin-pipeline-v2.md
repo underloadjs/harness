@@ -15,6 +15,9 @@ this entry named is either shipped or explicitly closed below, and the authoring
 
 Line numbers describe the working tree reviewed on 2026-11-09. Names are the durable anchors
 and the *drift check* near the end lists the commands to re-verify them.
+**Update 2026-11-11:** both probes are still open, so every anchor inside the two probe sections,
+the substrate table and the closed-decision notes below has been re-pointed to the tree as it
+stands on that date; the wording they carry is unchanged, and nothing about the findings moved.
 
 Companion entries:
 [2026-11-09-context-inclusion-followups.md](./2026-11-09-context-inclusion-followups.md)
@@ -51,8 +54,8 @@ and tool-registry lifecycle —
 - **Observation parity.** A plugin must be able to observe what the host observes, or a stated
   subset. Today the failure channel is host-only, which is exactly Probe 1's subject.
 - **No overlapping harness execution for one actor key.** The run serializer
-  (`serializeTurn`, `src/harness.ts:7931`, called as `serializeTurn(run.actorKey, …)` at
-  `:8854`) is the reason a `turn.before` handler calling back into the same thread is a
+  (`serializeTurn`, `src/harness.ts:8339`, called as `serializeTurn(run.actorKey, …)` at
+  `:9405`) is the reason a `turn.before` handler calling back into the same thread is a
   question at all; `src/server/queue.test.ts` pins peak concurrency 1 per actor. Probe 2's
   subject.
 - **The synchronous fast path.** A hook that does nothing may cost no microtask; any new
@@ -67,13 +70,13 @@ so this file stays self-contained.
 
 | Fact | Where |
 |---|---|
-| The lifecycle catalogue is exactly **18** events — the 17 run/thread events plus `host.state_change` | `src/types/index.ts:3428-3451` (`HarnessLifecycleEvent`) |
+| The lifecycle catalogue is exactly **18** events — the 16 run/thread events plus `host.state_change` and `harness.dispose` | `src/types/index.ts:3726-3749` (`HarnessLifecycleEvent`) |
 | There is **no** `plugin_error` (or any plugin-failure) event: the grep is empty across `src/` | — |
-| Plugin failures are reported on a **host-only** channel: `configuration.report.diagnostic` | `src/types/index.ts:2961`; the event and its kinds `handler-threw` \| `handler-timed-out` \| `invalid-decision` \| `policy` at `:3656-3658` (`HarnessDiagnosticEvent`) |
+| Plugin failures are reported on a **host-only** channel: `configuration.report.diagnostic` | `src/types/index.ts:3217-3223`; the event and its kinds `handler-threw` \| `handler-timed-out` \| `invalid-decision` \| `policy` at `:3974-3976` (`HarnessDiagnosticEvent`); the plugin-authored half of the same channel — `api.report.diagnostic` — is at `:4620-4622` |
 | The bus already swallows a reporter's own throw, and a wildcard subscription receives every event except `host.state_change` | `src/plugin/hooks.ts`, and the `WILDCARD_DELIVERABLE` set that forces a new event's author to decide whether an audit plugin sees it |
-| The server journals diagnostics durably, bounded | `notePluginDiagnostic`, `src/server/sessions.ts:3008-3028`, capped at `PLUGIN_DIAGNOSTIC_LIMIT`; projected as `plugin_diagnostics` (`src/server/api-reads.ts:241-243`) |
-| A `turn.before` decision is exactly four actions — `continue` \| `replace` \| `pause` \| `stop` | `src/types/index.ts:4048-4052` (`HarnessTurnDecision`) |
-| A lane CAN rewrite the committed prefix in place: the mutation op, the replica's base digest, the authority's replay seam, and the contract sentence | `transcript:patch` at `src/server/workers/lane-commit.ts:240`; `LaneWorkerState.committedDigest` at `src/server/workers/lane-worker-loop.ts:152` and the whole-prefix diff at `:703-710`; authority replay at `src/server/workers/lane-authority.ts:899` through `harness.patchThreadMessages` (`src/harness.ts:5338`); restart-durable wording at `src/types/index.ts:3865` |
+| The server journals diagnostics durably, bounded | `notePluginDiagnostic`, `src/server/sessions.ts:3239-3260`, capped at `PLUGIN_DIAGNOSTIC_LIMIT` = 24 (`src/server/protocol.ts:626`); projected as `plugin_diagnostics` (`src/server/api-reads.ts:256`) |
+| A `turn.before` decision is exactly four actions — `continue` \| `replace` \| `pause` \| `stop` | `src/types/index.ts:4421-4425` (`HarnessTurnDecision`) |
+| A lane CAN rewrite the committed prefix in place: the mutation op, the replica's base digest, the authority's replay seam, and the contract sentence | `transcript:patch` at `src/server/workers/lane-commit.ts:240`; `LaneWorkerState.committedDigest` at `src/server/workers/lane-worker-loop.ts:155`, recomputed by the whole-prefix digest helper at `:705` and re-adopted at `:719-723`; the CAS that raises the patch op at `:745-752`; authority replay at `src/server/workers/lane-authority.ts:923` through `harness.patchThreadMessages` (`src/harness.ts:5646`); restart-durable wording at `src/types/index.ts:4183` |
 
 ## Tasks
 
@@ -83,11 +86,11 @@ A plugin can make the **host** see everything that goes wrong with it — a hand
 one that never resolves, a decision it cannot parse, and the policy report it files for itself —
 but **no plugin can see another plugin's failure**: the whole diagnostic channel is host-only.
 
-- **What exists.** `configuration.report.diagnostic` (`src/types/index.ts:2961`) is the only
+- **What exists.** `configuration.report.diagnostic` (`src/types/index.ts:3217-3223`) is the only
   failure channel, its kinds are `handler-threw` | `handler-timed-out` | `invalid-decision` |
-  `policy` (`:3656-3658`), and the server journals them durably
-  (`src/server/sessions.ts:3008-3028`).
-- **What is missing.** One new entry in `HarnessLifecycleEvent` (`src/types/index.ts:3428-3451`,
+  `policy` (`:3974-3976`), and the server journals them durably
+  (`src/server/sessions.ts:3239-3260`).
+- **What is missing.** One new entry in `HarnessLifecycleEvent` (`src/types/index.ts:3726-3749`,
   currently exactly 18) — a `host.plugin_error`-style event that carries the same
   `HarnessDiagnosticEvent` payload — plus the decision of whether a `'*'` subscriber receives it
   (`src/plugin/hooks.ts` `WILDCARD_DELIVERABLE` forces that decision the moment the event is
@@ -116,13 +119,34 @@ Still **FORBIDDEN UNTIL TESTED**, and the answer recorded here is a prohibition,
 
 - **The question.** A `turn.before` handler that calls `api.threads.send(threadId, …)` for the
   thread whose turn is parked re-enters the serializer for that actor key (`serializeTurn`,
-  `src/harness.ts:7931`; the run enters it at `:8854`). Whether that deadlocks or queues behind
+  `src/harness.ts:8339`; the run enters it at `:9405`). Whether that deadlocks or queues behind
   the parked turn has never been observed; the property at stake is the "no overlapping harness
   execution" invariant `src/server/queue.test.ts` pins.
-- **Why it is still open as a matter of evidence.** No test exercises it. The only `threads.send`
-  references inside plugin tests are stubs that record the call and never re-enter a run:
+- **Why it is still open as a matter of evidence.** The claim this entry carried, kept verbatim so
+  the reasoning stays auditable: *"No test exercises it. The only `threads.send` references inside
+  plugin tests are stubs that record the call and never re-enter a run:
   `src/plugin/host.test.ts:62`, `src/plugin/context-compaction.test.ts:192`,
-  `src/plugin/async-ping.test.ts:189`.
+  `src/plugin/async-ping.test.ts:189`."* **Corrected 2026-11-11 — that claim was over-broad.** A
+  same-actor send through the real api IS exercised, only never from a parked `turn.before`: the
+  shipped plugin performs one from its `thread.idle` hook,
+  `api.threads.send(threadId, CONTINUATION_NUDGE)` at
+  `src/plugins/context-compaction.plugin.ts:1529`, pinned end to end through a real harness at
+  `src/plugin/context-compaction.test.ts:2483-2513` — the nudge arrives as the SECOND provider
+  request (request 2 is instruction + summary + nudge, `:2501-2505`) and the thread's observed
+  `statuses` are exactly `['paused', 'running']` (`:2511`), so the run the nudge starts queues
+  behind the dying run's actor lock instead of overlapping it; the plugin's own comment on that
+  lock is at `src/plugins/context-compaction.plugin.ts:1522-1527`. A **different**-actor send
+  landing on a parked conversation is observed as well at
+  `src/plugin/context-compaction.test.ts:3285-3289` (a delegate's `threadSend` arriving during the
+  shipped park queues, never starts a second run, and drains as a retained entry). The stubs named
+  in the original claim are still stubs (`src/plugin/host.test.ts:62`,
+  `src/plugin/async-ping.test.ts:189`); `context-compaction.test.ts:192` has moved to `:267`, and
+  the same `threads.send` fake now exists a second time at `src/plugin/context-trimmer.test.ts:244`.
+- **The question, narrowed 2026-11-11 — this is what is actually still open.** A same-actor
+  `api.threads.send` issued **from a `turn.before` hook while that turn is parked** has never been
+  observed or tested. Every landed case sends either from `thread.idle` (after a run has settled)
+  or from a different actor key, so neither answers re-entry from inside an unfinished turn, and
+  the prohibition below stands until someone runs the probe.
 - **The boundary that is NOT in question.** A send under a **different** actor key is a different
   actor's queue and is already exercised by the `threadSend` merge.
 - **What closing it needs.** One probe: a `turn.before` handler that sends to its own thread
@@ -141,11 +165,11 @@ by the observation (deadlock, queued-behind, or refused), with the timing it mea
   installed?" was **no**: the server runs only code the application shipped. That answer is why
   nothing loads plugins today: `src/server/harnesses/toolbox.ts` wires no plugin list (it
   forwards the diagnostic sink and the settings provider, nothing else), and a replica is
-  built without plugin input (`src/server/workers/lane-worker-loop.ts:1089-1113`) — a preset
+  built without plugin input (`src/server/workers/lane-worker-loop.ts:1268-1277`) — a preset
   factory closure cannot cross `worker_threads`. A host plugin running ON a lane is therefore a
   consequence of that decision, not a separate task.
 - **`respond` / `retry` are deferred**: the decision union is exactly
-  `continue` | `replace` | `pause` | `stop` (`src/types/index.ts:4048-4052`), and a variant that
+  `continue` | `replace` | `pause` | `stop` (`src/types/index.ts:4421-4425`), and a variant that
   answers the model's next request without a provider call changes what `done` means and
   interacts with the iteration cap and the run record. `stop` itself is settled: it joins the
   closed list of things that end a run, and it is a policy assertion at a boundary the run is
@@ -160,11 +184,11 @@ by the observation (deadlock, queued-behind, or refused), with the timing it mea
 ## Known boundary (a note, not a task)
 
 A lane replica's diagnostic sink is a deliberate no-op — `diagnostic: () => undefined` at
-`src/server/workers/lane-worker-loop.ts:1097-1106` — because a report fired inside a hook has no
-frame to travel on; the comment says so in the line itself ("giving the diagnostics a frame is
-lane-protocol work, not this"). A plugin that throws on a lane is still fail-open and still
-invisible to the authority. Probe 1 does not change that; a lane diagnostic frame is protocol
-work owned by the lane.
+`src/server/workers/lane-worker-loop.ts:1277` (the block that builds the replica's host object is
+`:1268-1277`) — because a report fired inside a hook has no frame to travel on; the comment says so
+in the line itself ("giving the diagnostics a frame is lane-protocol work, not this", `:1276`). A
+plugin that throws on a lane is still fail-open and still invisible to the authority. Probe 1 does
+not change that; a lane diagnostic frame is protocol work owned by the lane.
 
 ## Verify before starting — drift check
 
@@ -173,9 +197,10 @@ cd packages/underload/harness
 git rev-parse --show-toplevel              # must be .../packages/underload/harness
 git log -1 --format='%h %s'
 grep -rn "plugin_error" src/                                   # Probe 1: still no plugin-visible failure event?
-grep -n "export type HarnessLifecycleEvent =" src/types/index.ts   # count the catalogue (18 today)
+grep -n "export type HarnessLifecycleEvent =" src/types/index.ts   # count the catalogue (18 today: 16 run/thread + host.state_change + harness.dispose)
 grep -n "WILDCARD_DELIVERABLE" src/plugin/hooks.ts                  # the set a new event must be judged against
-grep -rn "threads.send" src/plugin/*.test.ts                       # Probe 2: still stubs only?
+grep -rn "threads.send" src/plugin/*.test.ts                       # Probe 2 (2026-11-11): the plugin-test hits are still stubs — but the SHIPPED plugin sends same-actor from `thread.idle` (src/plugins/context-compaction.plugin.ts:1529, pinned at src/plugin/context-compaction.test.ts:2483-2513), so what this grep must now ask is whether ANY case sends from inside a parked `turn.before`
+grep -rn "api.threads.send" src/plugins/                           # which shipped plugin sends, and from which hook
 grep -rn "api.threads.send\|threads.send" src/server/workers/      # any lane path that would re-enter the serializer?
 npx vitest run src/server/queue.test.ts                     # BASELINE green before any edit
 npm run typecheck

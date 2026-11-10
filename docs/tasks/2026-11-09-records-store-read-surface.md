@@ -1,6 +1,6 @@
 # Records store — the read surface loses single-record results and mixes two page orders
 
-Status: **fixed 2026-11-09** — all seven defects implemented and independently reviewed; see "Resolution" at the end.
+Status: **fixed 2026-11-09** — all seven defects implemented and independently reviewed; see "Resolution" at the end. **Re-verified against the current tree on 2026-11-11** — every closure still holds and the pinned test blocks are unchanged; the Resolution's source anchors have drifted and `## Update (2026-11-11)` at the end records their current locations.
 Produced by a live stress test of the five store tools from inside a running
 session, then re-verified by two independent reviewing agents, then grounded against the source.
 Seven defects were open (R1–R7); five first-pass claims were overturned or restated and are kept
@@ -482,9 +482,44 @@ regenerated. Anchors below are the post-fix tree at `packages/underload/harness`
 * **Mixed offset→keyset walks remain unsupported by contract.** Each mode's own walk is
   complete; an offset page's `nextAfterId` makes a switch safe against the records that page
   carried, but it cannot reach a match that sorts later and carries a smaller id. The two
-  `afterId` descriptions state the rule rather than the code enforcing it.
+  `afterId` descriptions state the rule rather than the code enforcing it. Clarified 2026-11-11:
+  that gap is only for a walk that spans REQUESTS — inside ONE request the two cursors cannot be
+  sent together at all, because `afterId` + `offset` is refused with `invalid-input` by code
+  (`src/core/records.ts:2791-2798`).
 * **`scripts/check-package-tools.mjs` still reports 2 failures** (`scripted model registers
   and invokes a tool without a discovery round`, and `all tool contexts saw one
   strict-identical harness and intact state`). Both are pre-existing on this tree,
   A/B-proven unrelated to these changes, and concern `toolRegistry` visibility at the
   packaged-harness boundary rather than the record engine.
+
+## Update (2026-11-11)
+
+Re-verified read-only against the current tree; no code was touched, and nothing was re-run beyond
+reading anchors.
+
+* **All seven closures still hold.** Each finding is still pinned by the same dedicated block in
+  `src/core/records.test.ts`, and the Resolution's test ranges are unchanged and exact: R4
+  `:329-477`, R5 `:478-588`, R1 `:749-900`, R2 `:901-1098`, R3 `:1099-1280`, R6 `:1281-1512`,
+  R7 `:1513-1981` (the R7 `describe` closes at `:1981`, so the Resolution's `:1513-1982` runs one
+  line past the block — the block is the anchor, not the number).
+* **The Resolution's SOURCE anchors have drifted.** Its header is right that those numbers were
+  the post-fix tree; that tree has moved. Current locations, each re-read today: R1 — the
+  carry-through `src/core/records.ts:3464-3465`, `TaskResult` `src/types/index.ts:1822-1827`;
+  R2 — the sortable-collection cursor rule `src/core/records.ts:2603-2641`, its prose now at
+  `src/tools/runtime/tasks.tool.ts:141-142` and `src/tools/runtime/records.tool.ts:140`;
+  R3 — the epoch map `src/core/records.ts:2356`, the re-`define` that continues the count
+  `:3090-3095`, the `drop` that keeps the mark `:3177`, `revision-epoch-reset` `:2849-2860`, the
+  restore seed `:3850-3853`, and `reset()` still rewinding `:3784-3798`; R4 — the computed advice
+  `:1230-1315`; R5 — the three-way step-3 pre-check `:1668-1716` and the whole-store id sweep
+  `:2875-2884`; R6 — the flag `:501-503`, the answer-before-paging rule `:2743-2748`, the
+  companion guard `:2770-2777`, the detached copy `:383-386`, `describeCollection` `:3118-3126`;
+  R7 — the filter and its validation `:516-610` with `matchesWhere` at `:607-610`, applied to the
+  item set before the order is chosen and the slice is cut at `:2538-2560`, refused beside `since`
+  at `:2800-2809` and beside `ids` at `:2811-2833`. The Findings and Corrected-claims tables above
+  keep their 2026-11-09 numbers and were left as written, exactly as the flag at the head of this
+  file states; the index row in `README.md` carries the same re-pointed anchors in summary form.
+* **One residual is stated more precisely than it was**: see the clause added to Residual 2 — the
+  mixed-mode rule is contract-only for a walk across REQUESTS, while `afterId` + `offset` inside a
+  single request is refused by code.
+* **The `scripts/check-package-tools.mjs` residual was not re-run** in this read-only pass, so its
+  two failures stand exactly as recorded above: neither re-confirmed nor refuted.

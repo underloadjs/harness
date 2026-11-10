@@ -9,13 +9,18 @@ elision for superseded LARGE results (the `annotate` writer), blocked on Open de
 on nothing else; and **T7's residue** — real-corpus and live-provider observations only.
 **T5.5** (provider overflow recovery) belongs to
 [../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
-and stays here as a pointer, not a task. The roadmap anchor is `knowledge.md:3861`
-("Not built yet"), item 2 at `:3866-3882`, which names both T6 and the storage question that
-blocks T5.3. The original framing still holds — a persisted tool outcome and a canonical
+and stays here as a pointer, not a task. The roadmap anchor is `knowledge.md:4345`
+("Not built yet"), item 2 at `:4350-4369`, which now names the THIRD writer and the storage
+question that blocks T5.3 (the T5.3 clause itself at `:4363-4366`) — no longer the checkpoint,
+which shipped. The original framing still holds — a persisted tool outcome and a canonical
 argument fingerprint are what any further policy stands on, and both are shipped.
 
 Line numbers describe the working tree reviewed on 2026-11-09. Names are the durable anchors
 and the *drift check* near the end lists the commands to re-verify the numbers.
+**Update 2026-11-11:** T5.3, T5.5 and T7 are still open, so every anchor inside their sections and
+in the substrate table has been re-pointed to the tree as it stands on that date; where a claim the
+anchor carried has been overtaken by the `summarize` writer it is restated with the date, and the
+two corrections inside the landed T6 record are marked `corrected` with their originals kept.
 
 Companion entries:
 [2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) (what a plugin **may
@@ -73,13 +78,13 @@ inlined so this file stays self-contained.
 
 | Fact | Where |
 |---|---|
-| `executeCompaction` is the shipped writer: it prunes superseded tool failures and **only** calls `context.setIncluded` — no summarizer, no `replaceHistory` | `src/plugins/context-compaction.plugin.ts:295-402` |
-| `COMPACTION_MODES` implements `exclude` alone; `annotate` is declared in the setting's UI text and deliberately NOT in the list, so it degrades | `:222` (the list), `:191` (the descriptor text), `:315` (the fallback) — pinned by `src/plugin/context-compaction.test.ts:1036-1049` (`degrades an unimplemented mode to exclude and reports both`, exact `mode exclude, setting mode annotate`) |
-| The candidate list is computed BEFORE anything is written, so an `annotate` mode later is a second **writer** over the same plan, not a second policy | `src/core/context-pruning.ts:12` (the seam, stated in the header), `:101` (`UnitClass` — "a future `annotate` writer needs the same vocabulary"), `:169` (`PrunePlan.candidates`) |
+| `executeCompaction` is the shipped `exclude` writer: it prunes superseded tool failures and **only** calls `context.setIncluded` — no summarizer, no `replaceHistory` (the `summarize` machine is a separate one, `createContextCompactionPasses`) | `src/plugins/context-compaction.plugin.ts:743-856`; the single flag write is `setIncluded(entry, false)` at `:825` |
+| `COMPACTION_MODES` ships **two** writers, `summarize` (the default) and `exclude` — re-pointed 2026-11-11, this row used to read "implements `exclude` alone"; `annotate` is declared in the setting's UI text and deliberately NOT in the list, so it degrades | `:471` (the list), `:466-470` (why `annotate` stays out), `:428` (the descriptor text), `:758-768` (the fallback, and why it is `exclude` and not the default) — pinned by `src/plugin/context-compaction.test.ts:1679-1697` (`degrades an unimplemented mode to exclude and reports both`, exact `mode exclude, setting mode annotate`) |
+| The candidate list is computed BEFORE anything is written, so an `annotate` mode later is a second **writer** over the same plan, not a second policy | `src/core/context-pruning.ts:12` (the seam, stated in the header), `:102` (`UnitClass` — "a future `annotate` writer needs the same vocabulary"), `:169` (`PrunePlan.candidates`) |
 | The "re-fetchable" condition the pruning rule requires is spelled to the model at write time: an over-cap result is a head/tail envelope whose `note` names the call to re-run | `src/core/result-budget.ts:37` (the rule), `:219` (the note), `boundToolResult` `:308`; the per-turn aggregate is `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES = 512 KiB` at `:94`, applied by `createToolResultTurnBudget` `:358` |
 | The full text of a spilled result lives nowhere addressable — the envelope REPLACES it in the committed message, so re-running is the only way back | `src/core/result-budget.ts:37` (the header states this honest limit) and the note text at `:219` |
-| A branch round never prunes (guard and action both check `branchId`), which is why the cooldown map holds one live key per conversation | `src/plugins/context-compaction.plugin.ts:303` (action), `:460` (guard), explained at `:36-39` and `:84-98` |
-| `replaceHistory()` exists as framework surface — the checkpoint T6 would use | `src/types/index.ts:3983` (`HarnessTurnBeforeContext.replaceHistory`) |
+| A branch round never prunes (guard and action both check `branchId`), which is why the cooldown map holds one live key per conversation | `src/plugins/context-compaction.plugin.ts:751` (action), `:1389` (guard), explained at `:32-43` (branch skip) and `:275` (why the cooldown map is never pruned) |
+| `replaceHistory()` exists as framework surface — the checkpoint T6 would use (re-pointed 2026-11-11: T6 has since landed and DOES call it, see the T6 section) | `src/types/index.ts:4346` (`HarnessTurnBeforeContext.replaceHistory`) |
 | The persisted tool outcome, its absent-means-`completed` rule, and the fingerprint the policy compares | `src/core/tool-outcome.ts:90-92` (`toolOutcomeOf`), `src/core/argument-fingerprint.ts:171` (`toolCallFingerprint`) |
 
 ## Tasks
@@ -90,13 +95,15 @@ The `annotate` half of the `mode` setting, applied to *large* results, not only 
 This is the trade opencode's `keep.tokens` knob exists to make — its default and its settings
 table are in `services/site/src/docs/content/compaction.mdx` at rev `caf8d6a` (*References*).
 
-- **What is still open.** The writer. `COMPACTION_MODES` lists `exclude` only
-  (`src/plugins/context-compaction.plugin.ts:222`), and `annotate` is deliberately unlisted so
-  an operator who stores it gets `exclude` plus a report naming both (`:315`, pinned at
-  `src/plugin/context-compaction.test.ts:1036-1049`) — a documented degradation, not a
+- **What is still open.** The writer. `COMPACTION_MODES` now ships two writers, `summarize` and
+  `exclude` — re-pointed 2026-11-11, this bullet used to read "lists `exclude` only" — and
+  `annotate` is still deliberately unlisted (`src/plugins/context-compaction.plugin.ts:471`, the
+  omission and its report rule spelled out at `:466-470`), so an operator who stores it gets
+  `exclude` plus a report naming both (the fallback at `:758-768`, pinned at
+  `src/plugin/context-compaction.test.ts:1679-1697`) — a documented degradation, not a
   validated operator choice.
 - **What it does NOT wait on.** Substrate. The candidate list is already computed before any
-  write (`src/core/context-pruning.ts:12`, `:101`), the mode setting already exists, and the
+  write (`src/core/context-pruning.ts:12`, `:102`), the mode setting already exists, and the
   "re-fetchable" condition is already spelled to the model at write time (the spill envelope
   names the call to re-run, `src/core/result-budget.ts:37`/`:219`).
 - **What it DOES wait on.** Open decisions 2: does an annotated result keep its original text
@@ -111,7 +118,7 @@ table are in `services/site/src/docs/content/compaction.mdx` at rev `caf8d6a` (*
 `npx vitest run src/plugin/context-compaction.test.ts src/core/result-budget.test.ts` shows an
 over-cap, superseded result arriving as a handle (or an annotated copy) rather than as an
 excluded unit, with the pass diagnostic reporting the mode it actually used — and the
-degradation case at `src/plugin/context-compaction.test.ts:1036-1049` updated to match whatever
+degradation case at `src/plugin/context-compaction.test.ts:1679-1697` updated to match whatever
 the decision was.
 
 ### T5.5 — Provider overflow recovery (pointer, not a task)
@@ -126,8 +133,8 @@ contributed to it is a more honest estimate to guard against.
 ### T6 — The full checkpoint — **built 2026-11-10 as `mode: 'summarize'`**
 
 Recorded so the design survives: a summarize-and-reinitialize pass would use
-`replaceHistory()` (`src/types/index.ts:3983`; the implementation throws when the run has no
-persistent conversation, `src/harness.ts:8647-8653`) with
+`replaceHistory()` (`src/types/index.ts:4346`; the implementation throws when the run has no
+persistent conversation, `src/harness.ts:9181-9185`) with
 
 1. a **structured summary template** — Objective / Requirements / Decisions / Work State /
    Next Move / Relevant Files / Constraints — the "recall first, then precision" guidance in
@@ -143,15 +150,24 @@ persistent conversation, `src/harness.ts:8647-8653`) with
    `docs/subsystems/compaction.md` at rev `fcc0ad46`, *References*);
 5. the newest turn **re-stated** in the replacement, because `replaceHistory` replaces
    everything including the prompt the run just appended — the shipped action's own header
-   states this rule and is why it deliberately stays inside `setIncluded`
-   (`src/plugins/context-compaction.plugin.ts:291-294`).
+   states this rule and is why that action deliberately stays inside `setIncluded`
+   (`src/plugins/context-compaction.plugin.ts:739-742`; re-pointed 2026-11-11, and the rule is
+   honoured by the `summarize` finalize, which re-states the whole transcript).
 
-**What a stage opening on this needs to know:** `executeCompaction` today only calls
-`context.setIncluded` (`src/plugins/context-compaction.plugin.ts:295-402`) and never calls a
-model; `replaceHistory` is framework surface with no compaction caller
-(`src/types/index.ts:3983`); and the shipped trigger/cooldown/pause machinery is inherited
-unchanged by whatever fills the action, which is why a checkpoint can be added beside the
-pruner rather than instead of it.
+**What a stage opening on this needs to know** — the paragraph as written 2026-11-09, kept
+verbatim: *"`executeCompaction` today only calls `context.setIncluded`
+(`src/plugins/context-compaction.plugin.ts:295-402`) and never calls a model; `replaceHistory` is
+framework surface with no compaction caller (`src/types/index.ts:3983`); and the shipped
+trigger/cooldown/pause machinery is inherited unchanged by whatever fills the action, which is why
+a checkpoint can be added beside the pruner rather than instead of it."* **Corrected 2026-11-11 —
+the middle clause is false**: `replaceHistory` now HAS a compaction caller. The `summarize`
+finalize calls `context.replaceHistory([...])` at `src/plugins/context-compaction.plugin.ts:1181`
+to append the instruction, `context.setTranscript` at `:1191` for the in-flight request, and
+`api.threads.send(threadId, CONTINUATION_NUDGE)` at `:1529`; the entry's own drift check is the
+grep that shows it. The two clauses that still hold are the load-bearing ones: the `exclude` writer
+is `setIncluded`-only (`:743-856`, its single flag write at `:825`), and the shipped
+trigger/cooldown/pause machinery is still what the checkpoint rides on — the summarize machine is
+built beside the pruner, exactly as this paragraph predicted.
 
 **What shipped on 2026-11-10, and where it departs from the text above.** The checkpoint
 exists as the plugin's `summarize` mode — the default — in
@@ -202,7 +218,12 @@ The stage's test list is pinned; what is left here is measurement, not implement
   unquantified.** The bar is still pure `chars / 4` (`src/core/context-estimate.ts:17-19`
   states the shared convention; `src/frontend/ui/turns.ts` renders it) while the plugin's
   trigger may be anchored on provider `usage`; the setting descriptors say so, nothing measures
-  how often it matters. Surfacing that is the companion entry's T7.
+  how often it matters. Clarified 2026-11-11: the divergence is between the bar's SEGMENTS and
+  the plugin's anchor, not between every figure on screen — the tile's headline context figure is
+  already the provider's own `usage.input` for the latest root-scope request, not the estimate
+  (`src/frontend/ui/turns.ts:4003-4032` states that scoping rule and its reversal), so the
+  estimate-vs-usage gap only shows in the `chars / 4` bar and its percentages. Surfacing that is
+  the companion entry's T7.
 - **Whether pruning changes agent behaviour favourably on a real long task.** The cost
   argument is arithmetic; the quality argument is borrowed from *References*, and the changelog
   evidence there says the failure mode (thrash, lost constraints) is real.
@@ -210,15 +231,17 @@ The stage's test list is pinned; what is left here is measurement, not implement
 ## Open decisions
 
 1 and 5 closed with the landed work and were removed; the numbering below is kept because
-`knowledge.md:3882` cites "Open decisions 2".
+`knowledge.md:4366` cites "Open decisions 2".
 
 2. **Annotate vs exclude**: whether an annotated result keeps the original text in the message
    (reversible, costs bytes) or only a handle (cheap, needs a re-read path). Not decided, and
    still unbuilt — but the seam is real rather than promised: `exclude` is one writer over the
-   pre-computed candidate list (`src/core/context-pruning.ts:12`, `:101`), `mode` is a declared
-   setting whose only implemented value is `exclude`
-   (`src/plugins/context-compaction.plugin.ts:222`), and a second value needs a new writer
-   beside `executeCompaction`, not a new policy. The shipped spill envelope answers "where does the full text
+   pre-computed candidate list (`src/core/context-pruning.ts:12`, `:102`), and `mode` is a declared
+   setting that now implements TWO values — `summarize` (the default) and `exclude`
+   (`src/plugins/context-compaction.plugin.ts:471`, re-pointed 2026-11-11; this clause used to read
+   "whose only implemented value is `exclude`") — with `annotate` still the deliberately unlisted
+   third. A third value needs a new writer beside `executeCompaction` and beside the summarize
+   machine (`createContextCompactionPasses`, `:1003`), not a new policy. The shipped spill envelope answers "where does the full text
    live?" with the cheapest honest address there is — the call that made it
    (`re-run tool 'read' (call c1) with narrower arguments`, `src/core/result-budget.ts:219`),
    not a stored copy. So a pruned result IS re-fetchable in the sense the pruning rule needs,
@@ -231,15 +254,16 @@ The stage's test list is pinned; what is left here is measurement, not implement
    prose, and `isError` is derived FROM the outcome, never the reverse. There is deliberately
    **no** text bridge: a reader that re-derives an outcome from result prose is refused, and
    the snapshot reader states that as a migration decision rather than a fallback
-   (`src/core/snapshot.ts:253-255`). What remains is a data question — a distribution with
+   (`src/core/snapshot.ts:280`). What remains is a data question — a distribution with
    important old sessions may still prefer "absent means unknown", which would add a fourth
    state rather than change a reader. Marked **unconfirmed** until a real corpus is inspected
    (T7).
 4. **The fingerprint's treatment of tools whose arguments legitimately vary while doing the
    same work** (a `read` with a different `offset`, a paged `threadRead`). The landed rule is
-   exact match (`toolCallFingerprint`, `src/core/argument-fingerprint.ts:171`, consumed at
-   `src/core/context-pruning.ts:285`); a per-tool normalization hook is the alternative and is
-   not free.
+   exact match (`toolCallFingerprint`, `src/core/argument-fingerprint.ts:171`, consumed through
+   the rule's own `keyOf` at `src/core/context-pruning.ts:180` — re-pointed 2026-11-11, where the
+   old `:285` sits is now the comment stating the same rule, `:283`); a per-tool normalization
+   hook is the alternative and is not free.
 
 ## Why this policy
 
@@ -323,7 +347,7 @@ grep -n "COMPACTION_MODES" src/plugins/context-compaction.plugin.ts   # T5.3: is
 grep -n "annotate" src/plugins/context-compaction.plugin.ts           # still a documented degradation?
 grep -n "candidates" src/core/context-pruning.ts                      # the seam an `annotate` writer plugs into
 grep -rn "MODE_DEFAULT" src/plugins/context-compaction.plugin.ts      # which writer a fresh install gets
-sed -n '3934,3960p' knowledge.md           # roadmap entry still names the third writer, not the checkpoint?
+sed -n '4345,4370p' knowledge.md           # roadmap entry still names the third writer, not the checkpoint?
 npm run plugins:manifest:check             # BASELINE green before any edit
 ```
 

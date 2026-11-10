@@ -41,7 +41,7 @@ written independently, and nothing in the package forces them together.
 | Second writer for the standalone Node adapter | `src/server/handler.ts:163-198` |
 | Loader passthroughs available to any endpoint: `{ raw: Response }` and `{ stream: AsyncIterable }` | `packages/underload/service/src/server/start.ts:357-361` (raw passthrough), `:363-387` (stream path) |
 | The `{ stream }` path stops writing on `stream.aborted` but never signals the handler's run | `packages/underload/service/src/server/start.ts:363-387` |
-| A `{ stream }` handler gets no abort signal for its own run, so the wiring step is unstated anywhere a host would look | `packages/underload/service/src/server/start.ts:363-387`; `README.md:3417-3420` lists the route modules but not the abort wiring |
+| A `{ stream }` handler gets no abort signal for its own run, so the wiring step is unstated anywhere a host would look | `packages/underload/service/src/server/start.ts:363-387`; `README.md:223-230` lists the route modules but not the abort wiring |
 
 ## Proposal
 
@@ -76,4 +76,25 @@ harness-side doc note should land first and the loader change is filed in 0007.
 - HTTP/2 or WebSocket transport (the canonical stream is now `/v1/harness/stream` over
   WebSocket; this issue is about the SSE writer a host writes for its own endpoint).
 - The persistence/queue scaling items (0007).
+
+## Update (2026-11-11)
+
+- **One anchor corrected**: the route/server-module listing this issue points at
+  as the place a host would look for the abort wiring is `README.md:223-230` (the
+  `src/server/` block naming `handler.ts` — "the /v1/harness mount" — and
+  `service.ts` — "/v1/harness, Origin gate, CORS, the stream upgrade"); the number
+  it carried predated the README realignment.
+- **Re-verified exact**: `createSseResponse` is still module-private at
+  `src/server/service.ts:184` (the frame contract is documented in its header at
+  `:182-183`, and the only use is the raw passthrough at `:595`), the second
+  writer is still `src/server/handler.ts:163-198` (`runStream`: the same
+  `: connected` preamble at `:175`, the same `X-Accel-Buffering` at `:172`), the
+  raw-`Response` rationale is still `src/server/service.ts:16`, and the loader
+  passthroughs are still `packages/underload/service/src/server/start.ts:357-361`
+  (raw) and `:363-387` (the `{ stream }` path that breaks on `stream.aborted` at
+  `:367` without signalling the handler).
+- Status stays **Open**. Note for the owner: a third transport has since landed
+  (the `/v1/harness/stream` WebSocket upgrade, T15) — see 0007's code-health row;
+  it does not close either gap here, both of which are about the SSE writer a
+  **host** writes for its own endpoint.
 

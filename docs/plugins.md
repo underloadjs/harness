@@ -264,8 +264,9 @@ not assume your `entries` snapshot is another handler's.
 ## `turn.before` — anatomy of the round
 
 The payload (`HarnessTurnBeforeContext`) is the exact request about to go
-out plus the controls to change it. Four pairs of views, each with a
-different freshness contract:
+out plus the controls to change it. Two pairs of views, each with a
+different freshness contract, plus the per-handler `entries` snapshot
+below:
 
 | Entry-time (stable for the handler) | Live (at access time) |
 |---|---|
@@ -315,7 +316,7 @@ host push may carry no id at all — address those by entry. `edit` stays
 text under an index that shifted is exactly the risk a flag can tolerate
 and text cannot.
 
-### The two writes
+### The three writes
 
 - **`setIncluded(target, included)`** — switch one transcript entry, or the
   WHOLE tool-call unit it belongs to (an assistant block plus every result
@@ -327,6 +328,19 @@ and text cannot.
   (`'yes'`, `1`, `0`, `null` are refused, not coerced); the value is checked
   after the target and before anything is written, so a refused call writes
   nothing.
+- **`setReasoningIncluded(target, included)`** — the SECOND axis: withhold
+  one entry's THINKING while the entry itself keeps travelling. Same shape
+  as `setIncluded` on purpose (the same three targets, the same
+  strict-boolean check before anything is written, the same in-place write
+  and re-projection, the same single `agent_message` change), with two
+  differences: **no unit cascade** — thinking belongs to exactly ONE
+  message, so the assistant entry of a tool-call block does not touch its
+  results — and an **assistant-only** target, since a non-assistant entry
+  has no thinking to withhold. Only `false` is stored
+  (`reasoningIncluded: false`); the projection resolves the flag OUT, so a
+  flagged entry OMITS `reasoning` entirely and the transport carries no new
+  field. The entry stays in the request, in place, with `content` and
+  `toolCalls` intact.
 - **`edit(entry, patch)`** — change the TEXT of one canonical entry in
   place, under closed role rules (`HarnessContextEditPatch`): `content` for
   every role, `reasoning` for an assistant only. A `tool` result may change
@@ -341,16 +355,16 @@ and text cannot.
   projection cache so **the same request carries the new text**, and
   reports one `agent_message` change.
 
-Both writes are **canonical**: they survive later turns,
+All three writes are **canonical**: they survive later turns,
 `snapshot()`/`restore()`, and any store that persists on the notification
 (the server's `state.json`) — in BOTH execution lanes (under
 `threadExecution: 'worker'` the lane pushes the in-place change as a
 whole-prefix, digest-guarded `transcript:patch`; the authority replays and
 reports it. When canonical rewrote that prefix first, the patch is refused
 WHOLE, the lane re-reads, and this round's write is dropped — the policy
-re-derives it on the next `turn.before`). On a **branch run** both writes
-land on the ephemeral copy — its own request is still filtered — and report
-nothing, because there is no conversation to persist them into.
+re-derives it on the next `turn.before`). On a **branch run** all three
+writes land on the ephemeral copy — its own request is still filtered — and
+report nothing, because there is no conversation to persist them into.
 
 `edit` introduces **no new message field** — `content`/`reasoning` are
 already whitelisted per role in `src/core/snapshot.ts` and
@@ -366,11 +380,12 @@ Four distinct decisions, four scopes — never conflate them:
 |---|---|
 | `setTranscript(messages)` (or returning `{ transcript }`) | THIS REQUEST only; committed history untouched. Last non-empty wins; an empty array is never an override. |
 | `replaceHistory(messages)` | the COMMITTED transcript, validated through the snapshot reader and notified like every transcript write. Requested re-reads: it invalidates captured entries. **Refused on a branch run** (a branch owns an ephemeral copy). |
-| `setIncluded` / `edit` | canonical, per-entry/unit writes — durable, reversible, re-projected into the same request. |
+| `setIncluded` / `setReasoningIncluded` / `edit` | canonical, per-entry/unit writes — durable, reversible, re-projected into the same request. |
 | returning `{ decision }` | the RUN (below); it says nothing about the request unless it is a `replace`. |
 
 A plugin round reports **one** `agent_message` per round, however many
-canonical writes it made: `setIncluded` and `edit` mark the round dirty and
+canonical writes it made: `setIncluded`, `setReasoningIncluded` and `edit`
+mark the round dirty and
 the round close flushes the single report BEFORE the request goes out, so
 durability is never later than it was. A 40-unit prune schedules one
 whole-document save, not forty. Two edges ride along: a write that lands
@@ -564,8 +579,12 @@ with different rules.
   registries; registrations REPLACE a name (the plugin phase runs after the
   built-ins and `configuration.commands`).
 - `threads.*` — `list` `create` `delete` (+ `remove` alias) `stop` `send`
-  `steer` `messages` `replaceMessages` `setStatus`. See the prohibition
-  below about `send` on your own thread.
+  `steer` `messages` `replaceMessages` `setStatus` `pause` `resume`
+  `setContextLane` `getContextLane`. The `pause`/`resume` pair here is the
+  OWNERLESS spelling: unlike the `turn.before` payload's `resume()`, this
+  lift also frees a park that payload's `pause()` owns, and the lane pair is
+  pure display metadata that never changes what the model is sent. See the
+  prohibition below about `send` on your own thread.
 - `snapshot()` — the SAME detached document the host's `harness.snapshot()`
   returns: agents and transcripts, discovery, created tools, thread records,
   the record stores. Safe MID-RUN (a synchronous read of COMMITTED state;

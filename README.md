@@ -10,8 +10,10 @@ yarn add @underload/harness
 ```
 
 Zero runtime dependencies for the library and the browser client. Node 18+ (`fetch`
-is the default transport). The Node server entry declares one runtime dependency,
-`dotenv` (it is external, not bundled — see [npm Publishing](#npm-publishing)).
+is the default transport). The package declares no runtime dependencies beyond `dotenv`
+and `typescript` — `dotenv` by the Node entries' `.env` loader, `typescript` by the
+tool-source compiler (`src/core/tool-source.ts`); both are external, not bundled, and the
+browser build reaches neither (see [npm Publishing](#npm-publishing)).
 
 ## Usage
 
@@ -185,7 +187,7 @@ threads satisfy this automatically.
   CORRECTED IN PLACE: an idle target used to get an inert append
   (`delivered: 'appended'`) that no run was obliged to read.
 
-Threads persist through snapshot v1 as an optional `threads`/`threadSequence`
+Threads persist through snapshot v2 as an optional `threads`/`threadSequence`
 pair (absent while only default conversations exist). See `src/harness.ts` and
 `src/types/index.ts` for the full contract.
 
@@ -213,7 +215,7 @@ src/
   util/             errors                   (shared leaf helpers)
   types/            every public type
   shared/           isomorphic helpers both trees evaluate (origin/loopback/Pages rules)
-  server/           HTTP API, sessions, SSE, catalogue presets, CLI, discovered routes
+  server/           HTTP API, sessions, the WebSocket update stream, catalogue presets, CLI, discovered routes
   frontend/         browser client + the app shell it renders
 ```
 
@@ -225,8 +227,8 @@ src/server/
                         SessionStore, protocol, presets) -> @underload/harness/server
   start.ts              startHarnessServer: the ONLY listener, created when called
   api.ts                transport-neutral dispatcher: routes, body policy, bootstrap
-  handler.ts            Node adapter: /api prefix, X-Harness-Client gate, SSE writer
-  service.ts            @underload/service adapter: /v1/harness, Origin gate, raw SSE
+  handler.ts            Node adapter: the /v1/harness mount, no header gate, plain HTTP (no CORS)
+  service.ts            @underload/service adapter: /v1/harness, Origin gate, CORS, the stream upgrade
   runtime.ts            lazy shared store/catalogue for the discovered service routes
   persistence.ts        durable database: versioned JSON, atomic write, DTO validation
   sessions.ts           authoritative turns + FIFO queue; restore + write-through
@@ -243,7 +245,9 @@ src/frontend/
                         -> @underload/harness/frontend
   main.ts               the app shell (imports styles.css, mounts the DOM on load)
   api.ts                root resolution (query/saved URL/injected/build/Pages chain,
-                        defaulting to /v1/harness) + fetch + SSE
+                        defaulting to /v1/harness) + the REST reads and writes
+  stream.ts             the realtime client: the `harness.v1` WebSocket at
+                        /v1/harness/stream (subscribe, resume, resync)
   deployment.ts         the local/LAN gateway chain a GitHub Pages host probes
   contract.ts           wire validation/presentation helpers
   ui/                   turns, agents, create form, markdown, panels, tools, tokens,
@@ -279,6 +283,8 @@ Imports resolve by environment as well as by name, so a browser never loads a
 | `@underload/harness` (node/import) | `src/index.ts` | library + shared + server + client |
 | `@underload/harness` (browser) | `src/browser.ts` | library + shared + client |
 | `@underload/harness/server` | `src/server/index.ts` | server API only |
+| `@underload/harness/worker` | `src/server/workers/lane-worker.ts` | the lane-worker ENTRY a `Worker` is spawned with (`threadExecution: 'worker'`) — not an API surface |
+| `@underload/harness/io-worker` | `src/server/workers/io-worker.ts` | the IO-worker ENTRY (`HARNESS_IO_EXECUTION=worker`) — same shape, durability arm |
 | `@underload/harness/frontend` | `src/frontend/index.ts` | browser client only |
 | `@underload/harness/shared` | `src/shared/index.ts` | origin/loopback helpers |
 
@@ -338,7 +344,7 @@ tools/
                         + the loader (generated import() or source compilation)
   lazy.ts               builds a callable Tool whose body loads on first use
   runtime/              the harness-owned core entries (toolRequest, toolCreate,
-                        task, delegate, threadFork, …) — one *.tool.ts each
+                        tasks, delegate, threadFork, …) — one *.tool.ts each
   syntax/               syntax.tool.ts (javascript.ts, typescript.ts, json.ts and
                         python.ts load on demand)
   files/                read.tool.ts, write.tool.ts, edit.tool.ts,
@@ -356,10 +362,15 @@ tools/
   presets.test.ts       covers every preset, standalone and in a harness
 ```
 
-Tests sit next to the module they cover and import **only** from
-`@underload/harness` — never a relative path. That keeps them honest about the
-public surface and free of `../` chains. The specifier is aliased to
-`src/harness.ts` in `vitest.config.ts`, so `vitest run` needs no build.
+Tests sit next to the module they cover and reach the published surface through the
+package specifiers — the bare `@underload/harness` and its published subpaths (e.g.
+`@underload/harness/shared`), never a hand-written path into `dist/`. There is
+deliberately **no `resolve.alias`** in `vitest.config.ts`: every one of those
+specifiers resolves through `package.json` `exports.development`, which maps the
+`development` condition (what Vite/Vitest/vite-node select in dev and test mode)
+onto the raw TypeScript entries under `src/`. So `vitest run` needs no build, and a
+test can never assert a stale bundle. `src/structure.test.ts` pins the manifest,
+the config, and the `tsconfig.json` `paths` mirror against each other.
 
 Each folder has an `index.ts` barrel, and `harness.ts` re-exports the public
 surface, so consumers only ever import from `@underload/harness`.
@@ -584,12 +595,13 @@ claiming nothing matched. These entries are never enabled, never count against
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools, `download`, `search`, and `fetch` run directly. |
 | Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
 | Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are always declared and never count. |
-| Already available | Core tools the caller already has (`delegate` with subagents, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding (docs/tasks/2026-11-08-delegate-stress-test.md, finding 1). |
+| Already available | Core tools the caller already has (`delegate` with subagents, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding. |
 | No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full searchable `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
 | Reserved names | `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, and `agentResult` belong to the harness, and `delegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
-| Manual call | an operator may run any registered tool through `harness.executeTool()` / `POST /tools/:name`; discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
+| Manual call | an operator may run any registered tool through `harness.executeTool()` /
+  `POST /v1/harness/tools/:id/executions` (or the session-scoped form of it); discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
 
 `selectTools(tools, query, options?)` is the uncapped selector without a harness;
 `searchTools(tools, tags, limit?, offset?, options?)` keeps the legacy paged
@@ -667,19 +679,20 @@ a single counter, so the first profile of a session that already holds one task 
 
 | Call | Effect |
 |---|---|
-| `task()` / `task({})` / `task({ parameters: undefined })` | read: return the current page, change nothing |
+| `tasks()` / `tasks({})` / `tasks({ parameters: undefined })` | read: return the current page, change nothing |
 | `tasks` entry **without** `id` | add one task (`text` required, trimmed, max 4000 chars) with the next stable id (`"1"`, `"2"`, …) |
 | `tasks` entry **with** a known `id` | patch that task: `text` and/or `completed`, whichever you send; omitted fields are unchanged |
 | `remove: ["7", "9"]` | remove those ids |
-| `claim` / `release` / `takeover: ["4"]` | hold a record while you work on it, hand it back, or seize it from whoever holds it (`leaseMs`, default 15 minutes, 1 minute-24 hours) |
-| `expects: [{ id, rev }]` | the revisions you READ, one per id this call patches or removes; required for those writes whenever the runtime knows the caller, optional for the ownership verbs |
+| `ids: ["4"]` | read named records instead of a page — one id answers in `entry`, several in `entries` |
+| `where: { completed: true }` | equality filter for a list read (`{ field: value }`, AND across the keys), applied BEFORE ordering and paging, so the page and its cursors move over the matching records and `counts` describes the filtered set; it cannot combine with `since` or `ids` |
+| `expects: [{ id, rev }]` | the revisions you READ, one per id this call patches or removes; required for every such write whenever the runtime knows the caller — the lock and its ownership verbs are gone, so this is the only conflict control |
 | `since: <storeRev>` | also return the store events after that revision (`changes`) |
 | `offset` / `limit` | index-page the returned list (limit 1-100, default 20) |
 | `afterId: "12"` | keyset-page it: the records with an id above `"12"`; cannot be combined with `offset` |
 | `mergeDisjoint: true` | opt-in: apply a stale content patch when the concurrent change touched only fields this patch leaves out |
 
 ```text
-task({ "tasks": [{ "text": "Draft the plan" }] })
+tasks({ "tasks": [{ "text": "Draft the plan" }] })
   -> { tasks: [{ id: "1", text: "Draft the plan", completed: false, rev: 1,
                 updatedBy: "instruct", updatedThreadId: "agent:instruct",
                 updatedAt: "2026-11-08T09:15:32.772Z" }],
@@ -687,15 +700,17 @@ task({ "tasks": [{ "text": "Draft the plan" }] })
        page: { offset: 0, limit: 20, hasMore: false },
        storeRev: 1 }
 
-task({ "tasks": [{ "id": "1", "completed": true }],
-       "expects": [{ "id": "1", "rev": 1 }], "offset": 20, "limit": 20 })
+tasks({ "tasks": [{ "id": "1", "completed": true }],
+        "expects": [{ "id": "1", "rev": 1 }], "offset": 20, "limit": 20 })
   -> { tasks: [...], counts: { total: 42, completed: 3, pending: 39 },
        page: { offset: 20, limit: 20, hasMore: true, nextOffset: 40 },
        storeRev: 22 }
 ```
 
 - **Every successful call answers the same envelope** — `{ tasks, counts, page,
-  storeRev }` with no per-action wrapper. `counts` reports `total`, `completed`, and
+  storeRev }` with no per-action wrapper, plus `entry` when exactly one record answers
+  (a single patch, or an `ids` read of one id), `entries` when `ids` names several, and
+  `removed` / `removedIds` when the call deleted one record / two or more. `counts` reports `total`, `completed`, and
   `pending` (`pending` is the count of unfinished tasks; the store itself keeps
   `completed: boolean` per task) and is always derived from the WHOLE list, never
   from the page. `page.nextOffset` (offset mode) or `page.nextAfterId` (`afterId`
@@ -705,28 +720,28 @@ task({ "tasks": [{ "id": "1", "completed": true }],
 - **Each record carries `rev`**, its CONTENT revision: 1 when it is added, +1 only
   when `text` (after trimming) or `completed` actually changes. The PATCH itself is
   event-free when the values you send already match — no `rev` bump, no attribution,
-  no store event — so a model that restates the list cannot flood the log. (A no-op
-  patch over an EXPIRED foreign claim is still accompanied by that clear: the claim is
-  lifted first, and the clear is attribution plus one `release` event.) Ownership
-  actions never move `rev` either, so a claim can never knock another agent off its
-  compare-and-swap token. `updatedBy` / `updatedThreadId` / `updatedAt` attribute the
+  no store event — so a model that restates the list cannot flood the log. Nothing
+  else can move `rev` either: with the lock deleted there is no ownership action left
+  to knock another agent off its compare-and-swap token. `updatedBy` /
+  `updatedThreadId` / `updatedAt` attribute the
   last write and come from the tool context (the calling agent and conversation), never
   from tool arguments, so a model cannot forge who edited what.
 - **The list is shared, so writes are guarded.** A call that HAS an agent identity (a
   model call, `harness.executeTool`, a slash command, a lane worker) must send
-  `expects` for every id it patches or removes; a call with no identity (a bare
-  `tool()` or driver call) may still write blind, and cannot claim, release or take
-  over at all.
+  `expects` for every id it patches or removes, or the write is refused as
+  `guarded write: pass "expects" [{ id, rev }] for task "1" (read it first).`; a call
+  with no identity (a bare `tool()` or driver call) may still write blind.
 - The patch is **atomic**: the whole call is validated before anything mutates, so a
   bad entry leaves the list, the id counter, `storeRev` and the change log exactly as
   they were, and names the offending field
-  (`task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`).
+  (`tasks "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`).
   Unknown ids, a duplicate id inside one call, an id that appears in two of `tasks` /
-  `remove` / `claim` / `release` / `takeover`, a repeated id in `remove`, the 201st
-  task, a 4001-character text, a stale `expects`, and a blocked claim all produce
+  `remove` / `ids` (`tasks id "1" appears in both "tasks" and "remove"; one operation
+  per id per call.`), a repeated id in `remove`, the 201st
+  task, a 4001-character text, and a stale `expects` all produce
   readable, recoverable tool results.
 - **The change feed is bounded.** The store keeps a FIFO log of 200 recorded events
-  (`add` / `update` / `remove` / `claim` / `release`); `since` returns the events after
+  (`add` / `update` / `remove`); `since` returns the events after
   the revision you pass, at most 50 and inside the same 64 KiB budget, with
   `changesHasMore` when the feed was cut and `changesTruncated` when the retained
   window no longer covers the gap. A `since` ahead of the store is an error, not an
@@ -734,19 +749,20 @@ task({ "tasks": [{ "id": "1", "completed": true }],
 - Every result is a defensive copy, never a live reference.
 - The list is **per harness**, shared by the primary and its subagents, kept across
   turns, and cleared by `reset()` (ids restart at `"1"`, `storeRev` restarts at 0, the
-  log empties). Snapshot/restore carry it: the persisted record keeps its snapshot-v1
-  key `records.todos` and is now `{ items, nextId, storeRev?, changes? }`, where each
-  `items` entry is a full `TaskItem` (`id`, `text`, `completed`, `rev`, plus the
-  optional `updatedBy`/`updatedThreadId`/`updatedAt` and the optional claim triple
-  `owner`/`ownerThreadId`/`leaseUntil`). Those additions are OPTIONAL on read, so a
-  pre-T1 snapshot still loads and restores as `storeRev: 0`, `changes: []`, and
-  `rev: 1` per record. Compatibility runs one way only: persisted keys are validated
+  log empties). Snapshot/restore carry it inside the snapshot-v2 `records` block: one
+  collection map `{ nextId, collections: { tasks: { definition?, items, storeRev?, changes? } } }`
+  with ONE id counter across every collection, where each `items` entry is a full
+  `TaskItem` (`id`, `text`, `completed`, `rev`, plus the optional
+  `updatedBy`/`updatedThreadId`/`updatedAt`). `rev` and the attribution triple are
+  OPTIONAL on read (`rev` restores as `1`), a missing `storeRev` restores as the last
+  retained change, and `changes` restores as `[]`. Compatibility runs one way only:
+  persisted keys are validated
   exactly, never ignored (`<label> has an unknown field "<key>".`), and an older build
   knows only `id`/`text`/`completed`, so a snapshot written by this build is REFUSED
-  there rather than silently downgraded. Claims survive a
-  restart, and a restore drops any claim whose `ownerThreadId` is not part of the
-  restored session (`src/harness.ts`), because no live conversation could ever release
-  it. Two harnesses — and therefore two server sessions — never share tasks.
+  there rather than silently downgraded. A persisted claim field is refused the same
+  way: `leaseUntil` / `owner` / `ownerThreadId` are not part of the v2 entry shape, so
+  an old file cannot smuggle a lock back in, and a restored store simply has no
+  claims to drop. Two harnesses — and therefore two server sessions — never share tasks.
 
 #### Concurrency and ownership
 
@@ -759,71 +775,64 @@ a silent overwrite into an explicit, recoverable error:
   store as it was when you read it, not as it is when your next call lands.
 - **`expects` is the proof of what you read.** Send the `rev` of every id you patch or
   remove. A mismatch rejects the WHOLE call and names the current revision, the last
-  editor, and (when the log covers the gap) the fields that changed:
-  `task "1" changed since revision 1 (now 2, last edited by "coder"); re-read and
-  retry; changed fields: completed.` A token whose record the store no longer has IS
+  editor and when it wrote, and (when the log covers the gap) the fields that changed —
+  and it CARRIES THE CURRENT RECORD, so the retry needs no extra read:
+  `tasks "1" changed since revision 1 (now 2, last edited by "coder" at 2026-11-08T09:30:53.657Z); changed fields: completed; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: {"id":"1","rev":2,"text":"…","completed":true}`
+  (the entry rides along whole up to an 8 KiB budget; past it the large fields are
+  withheld and the message says so). A token whose record the store no longer has IS
   the race you hit, whichever half of the call named it — a `tasks` patch, a `remove`,
-  an ownership verb, or the token alone — and it always answers
-  `task "1" was removed since revision 1; re-read the list.` Only a call that sent no
-  token for that id hears the plainer `task has no task with id "1".`, and a token for
-  a live id this call does not touch is still rejected as a token for nothing.
-- **`rev` is content-only; `storeRev` counts every event.** A concurrent claim
-  therefore never invalidates your token, while `since: <last storeRev>` still shows
-  everything that moved — content and ownership alike.
-- **A claim reserves a record while you edit it**, so a long edit is not stomped and
-  two agents do not do the same work. `claim` sets `owner`/`ownerThreadId`/`leaseUntil`
-  — the holder is the exact pair `(owner, ownerThreadId)`, so the same agent name on
-  another thread is a different holder. The default lease is 15 minutes and the
-  accepted range is 1 minute-24 hours: a model or `executeTool` call outside it is
-  rejected by the schema, a call that bypasses the schema is clamped into it. While a
-  claim is live, a non-holder's content write, claim, or release is refused:
-  `task "1" is claimed by "coder" until 2026-11-08T09:30:53.657Z; release it or take
-  it over first.` Re-claiming a record you
-  already hold only renews the lease (nothing else changes); releasing an unowned
-  record is a no-op success. A claim is expired AT or after `leaseUntil` (`leaseUntil
-  <= now`, so the expiry instant itself frees it), and the next writer then clears it
-  — logged as a `release` — and proceeds. A claim with no `leaseUntil` is indefinite
-  and never auto-expires; it only appears in a restored or hand-edited store.
-- **`takeover` is the deliberate override** of a live claim: it moves the holder to
-  you, re-leases the record, and is logged as a `claim`. It is the answer when the
-  holder is gone; nothing has to expire first.
+  or the token alone — and it answers
+  `tasks "1" was removed since revision 1 — re-read the list and add or retry.` while
+  the removal is still inside the 200-event window, and names both possibilities (never
+  in this collection, or aged out of the window) when it is not. Only a call that sent
+  no token for that id hears the plainer `tasks has no task with id "1".`, and a token
+  for a live id this call does not touch is still rejected as a token for nothing
+  (`tasks "expects" names id "4", which this call does not change`).
+- **`rev` is content-only; `storeRev` counts every event.** A write that changes
+  nothing, or one that lands on a different record, therefore never invalidates your
+  token, while `since: <last storeRev>` still shows everything that moved.
+- **There is no lock and no lease.** Any agent on any thread may write any task at any
+  time; there is nothing to hold, hand back, or seize, so the token above is the ONLY
+  conflict control and a long edit is protected by retrying rather than by reserving.
+  The same rule survives a restart: the snapshot has no claim fields, so nothing can
+  come back locked.
 - **`mergeDisjoint` is the one escape from a stale rejection**, and only for a content
   patch: it applies the patch when the change log PROVES every concurrent update since
   your read touched only fields your patch does not set. An overlapping field still
   rejects, a removal never merges, and a log that cannot prove full coverage rejects
-  rather than guessing.
-- **A stopped or deleted conversation cannot leave the list locked.** The harness
-  clears every claim tagged with a thread id when that thread stops, is deleted, or
-  loses its default conversation, and a restore sweeps claims whose thread is missing
-  from the snapshot. Content revisions stay untouched; each clear is one `release`
-  event that carries only the thread id.
+  rather than guessing — and when it rejects a second time the advice says why
+  (`"mergeDisjoint" is already set, and the change window no longer covers every
+  revision since <expected>, so it cannot prove this patch disjoint.`).
 
 ```ts
 // ONE harness session, two agents: `coder` and `reviewer`. Record "1" sits at
-// content rev 3 and nobody holds it.
+// content rev 3, and nothing reserves it — both writers are free to go.
 
 // — compare-and-swap: the loser is told, never silently overwritten —
-coder:     task({})                                  // -> tasks[0] = { id: "1", rev: 3, … }
-reviewer:  task({ tasks: [{ id: "1", completed: true }],
-                  expects: [{ id: "1", rev: 3 }] })  // -> applied: content rev 4
-coder:     task({ tasks: [{ id: "1", text: "Rewrite the intro" }],
-                  expects: [{ id: "1", rev: 3 }] })  // -> the WHOLE call is REJECTED:
-                                                     //    task "1" changed since revision 3 (now 4, last edited by "reviewer"); re-read and retry; changed fields: completed.
-coder:     task({})                                  // -> re-read: rev 4, completed true, text untouched
-coder:     task({ tasks: [{ id: "1", text: "Rewrite the intro" }],
-                  expects: [{ id: "1", rev: 4 }] })  // -> applied on top: rev 5
+coder:     tasks({})                                  // -> tasks[0] = { id: "1", rev: 3, … }
+reviewer:  tasks({ tasks: [{ id: "1", completed: true }],
+                   expects: [{ id: "1", rev: 3 }] })  // -> applied: content rev 4
+coder:     tasks({ tasks: [{ id: "1", text: "Rewrite the intro" }],
+                   expects: [{ id: "1", rev: 3 }] })  // -> the WHOLE call is REJECTED, and the
+                                                      //    refusal carries the CURRENT record:
+                                                      //    tasks "1" changed since revision 3 (now 4, last edited by "reviewer" at 2026-11-08T09:30:53.657Z); changed fields: completed; retry with "expects" [{ id: "1", rev: 4 }] or pass "mergeDisjoint": true. current: {"id":"1","rev":4,"text":"…","completed":true}
+coder:     tasks({ tasks: [{ id: "1", text: "Rewrite the intro" }],
+                   expects: [{ id: "1", rev: 4 }] })  // -> it retries straight from the refusal
+                                                      //    it was just handed: content rev 5
 
-// — claim and release: one record is protected while it is being edited —
-coder:     task({ claim: ["1"] })                    // -> owner/ownerThreadId = coder (+ its thread),
-                                                     //    15-minute lease; rev is STILL 5, so no token broke
-reviewer:  task({ tasks: [{ id: "1", completed: false }],
-                  expects: [{ id: "1", rev: 5 }] })  // -> REJECTED while the lease is live:
-                                                     //    task "1" is claimed by "coder" until 2026-11-08T09:30:53.657Z; release it or take it over first.
-coder:     task({ release: ["1"] })                   // -> coder's own claim clears (one `release` event); rev stays 5
-reviewer:  task({ tasks: [{ id: "1", completed: false }],
-                  expects: [{ id: "1", rev: 5 }] })  // -> applied now: rev 6
-reviewer:  task({ takeover: ["1"] })                  // takeover is the override: it seizes even a LIVE lease —
-coder:     task({ release: ["1"] })                   // -> refused, because reviewer holds it now
+// — mergeDisjoint: the escape hatch when the two patches do not touch —
+reviewer:  tasks({ tasks: [{ id: "1", completed: false }],
+                   expects: [{ id: "1", rev: 4 }] })  // -> STALE (the record is at 5): refused,
+                                                      //    and the refusal names rev 5
+coder:     tasks({ tasks: [{ id: "1", completed: false }],
+                   expects: [{ id: "1", rev: 4 }],
+                   mergeDisjoint: true })             // -> APPLIED: the log proves the skipped
+                                                      //    rev 5 touched only "text", which
+                                                      //    this patch leaves out — content rev 6
+reviewer:  tasks({ tasks: [{ id: "1", text: "Retitle" }],
+                   expects: [{ id: "1", rev: 4 }],
+                   mergeDisjoint: true })             // -> still REJECTED: the skipped rev 5 set
+                                                      //    "text", which this patch sets too
 ```
 
 **Not OpenCode parity.** OpenCode's current dev branch (`fd8268e`, 2026-10-27)
@@ -911,7 +920,7 @@ system instructions, transcript messages, tool arguments, or tool bodies. Result
 are held in a bounded per-harness registry (64 completed records, active runs are
 never evicted) and are **durable across snapshot/restore**: terminal results —
 completed, failed, or cancelled — are stored as an optional `agentResults` array
-in the existing snapshot v1 (`invocationId`, `sequence`, `completedOrder`, agent,
+in the existing snapshot v2 (`invocationId`, `sequence`, `completedOrder`, agent,
 role, kind, status, content, error?), so a restart keeps every answer that already
 exists. Running invocations are omitted from a snapshot (they have no answer yet),
 old snapshots without the field restore with an empty registry, restore advances
@@ -958,7 +967,7 @@ share one.
 `profiles`, `chapters`, and `locations` were added under their final
 names, so they have no removed-name row. All three are core session tools with the
 same incremental action set — see
-[Session records](#session-records-profilemanage-chaptermanage-locationmanage).
+[Session records](#session-records-profiles-chapters-locations).
 `actionRequest` and `threadFork` were also added under their final names and follow
 the `<namespace><action>` shape (`action`+`Request`, `thread`+`Fork`) where a single
 action names them; they are
@@ -1063,8 +1072,9 @@ await write([{ path: 'a.ts', content: 'a' }, { path: 'b.ts', content: 'b' }]);
 await edit([{ path: 'a.ts', oldString: 'a', newString: 'b' }]);
 ```
 
-**`read` is bounded by default.** Each result window returns at most 5000 lines
-(`maxLines`, hard maximum 20000) starting at `startLine` (1-based, default 1). The
+**`read` is bounded by default.** A window carries **no default line cap** — the byte
+budget below is what decides where it stops — while an explicit `maxLines` is honoured
+and capped at 1..20000. `startLine` is 1-based and defaults to 1. The
 whole batch shares a fixed 256 KiB budget measured on the **serialized JSON** result
 (escaping included), allocated by **demand** rather than by headcount: a file that
 needs less than its share hands the difference back to the files that were actually
@@ -1124,8 +1134,8 @@ process; it makes no claim about another process or worker thread.
 | `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected; serialized per file against a concurrent `edit` |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted; read-match-write is one per-file critical section |
 | `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` — non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` gives `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (200 entries by default, 1000 maximum, one shared 64 KiB entry-text budget across the call), `move`/`copy` give `{ path, to, kind, bytes }` and gate an existing destination on `overwrite`, `delete` gives `{ path, removed, recursive }` and refuses a non-empty directory without `recursive` (`force` reports a missing path as a no-op), `mkdir` gives `{ path, created }`; a failed list entry carries its own `error: { code, message }`, a failed mutation rejects the call naming the operations already applied (no rollback) |
-| `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — NAMES only, capped at 100; there is no `content` property any more |
-| `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }`; caps at 100 matches and 64 KiB of match text, matching time-bounded |
+| `glob` | `({ patterns?, paths?, maxResults?, offset? })` | `{ files, truncated, offset, limit, nextOffset \| null, bytes, contentBudget, stopReason, partial, searched, excluded, patterns, note? }` — NAMES only; `maxResults` defaults to **100 and is clamped to 1-1000** (the effective cap is echoed as `limit`), and a page also stops before the entry that would cross the 64 KiB path-text budget; there is no `content` property any more |
+| `grep` | `({ pattern, patterns?, paths?, maxResults?, offset?, output?, context? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget, offset, limit, nextOffset?, partial?, stopReason }`; `maxResults` defaults to **100 and is clamped to 1-1000**, alongside a 64 KiB match-text budget, and matching is time-bounded |
 | `shell` | `({ command, cwd?, timeoutMs?, input?, saveOutput? })` | `{ exitCode, stdout, stderr, truncated, stdoutTruncated, stderrTruncated, stdoutBytes, stderrBytes, stdoutDroppedBytes, stderrDroppedBytes, outputPath, timedOut, aborted, exitSignal, durationMs, linesChained }`; caps keep the **beginning and the end** with an in-band `[... N bytes omitted ...]` marker, and a cut stream is teed whole to `outputPath` |
 | `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut }`; read-only |
 
@@ -1248,7 +1258,7 @@ example are deleted, so every card requires a provider.
 
 **Catalogue visibility (server and UI).** The harness app always lists
 `search` in its direct-call catalogue, configured or not. With a key it is a
-normal callable entry (`POST /api/tools/search`); without one the entry is
+normal callable entry (`POST /v1/harness/tools/search/executions`); without one the entry is
 marked `unconfigured`, carries the provider variable *names* and a non-secret hint,
 and a direct call answers a normal `{ "ok": false }` tool failure explaining what
 to set and that a restart is required. The catalogue is built when the server
@@ -1341,7 +1351,8 @@ const writer = harness({
 const definition = createWebFetchTool({ env: process.env });
 
 await definition?.({ url: 'https://example.com/article' });
-// -> { provider: 'native', url, contentType, format: 'markdown', characters, truncated, content, title? }
+// -> { provider: 'native', url, contentType, format: 'markdown', characters, truncated, content,
+//      pageCharacters, offset, nextOffset?, title? }
 
 // Text instead of converted markdown, and a hosted crawler when one is configured
 await definition?.({ url: 'https://example.com/article', format: 'text' });
@@ -1362,8 +1373,9 @@ await definition?.({ url: 'https://example.com/sso-page', provider: 'linkup' });
 
 | Bound | Value |
 |---|---|
-| Native response body | **100 KiB** (102,400 bytes) — declared `content-length` first (the body is cancelled before a byte is read), then counted per streamed chunk |
-| Returned content | 24,000 characters (`truncated: true` when cut) |
+| Native response body | **1 MiB** (1,048,576 bytes) — declared `content-length` first (the body is cancelled before a byte is read), then counted per streamed chunk. It is a **transfer** budget, not a content budget: the old 100 KiB was refusing pages whose raw HTML merely weighed more than their converted text needed |
+| Returned content | 240,000 characters across the whole page (`truncated: true` while more of the page exists) |
+| One serialized result | **64 KiB** — the tool keeps its own result inside the harness's model-facing budget instead of being re-wrapped by a generic envelope that would drop `url`/`title`/`truncated`/`nextOffset`, so the content slice is capped at 64 KiB minus a 2,048-byte object allowance. Paging keys ride along: `pageCharacters` is the page's real character count, `offset` echoes where this window started (an out-of-range request is clamped and reports `offsetClamped` plus a `note`), and `nextOffset` is present **only when `truncated`** — pass it back as `offset` to read on. They count CHARACTERS, not bytes, and only within one `format` |
 | Hosted provider response body | 512 KiB — the shared provider-request budget, not the page budget |
 | Per-request timeout | 15 s, `AbortController`, timer cleared in `finally` |
 | Retries | None, except one honest-`User-Agent` retry when Cloudflare challenges the browser one |
@@ -1423,7 +1435,7 @@ point:
 - the **bytes** travel on the committed `tool` message's `attachments`, which is
   what lets them survive history, snapshot restore, and forks;
 - a `tool_result` progress event, and the server's manual
-  `POST /api/tools/download` answer, carry `ToolMediaDescriptor[]` (id, kind,
+  `POST /v1/harness/tools/download/executions` answer, carry `ToolMediaDescriptor[]` (id, kind,
   name, mime, size) — **metadata only, never base64**;
 - the **transport** expands the attachments into a clearly labelled USER-role
   multimodal payload **after** the whole contiguous tool block, so strict
@@ -1839,9 +1851,9 @@ actionRequest({
 On the server, answer one pending question with the only owner-answer route:
 
 ```text
-POST /api/sessions/:id/actions/:requestId/answer
-{ "choice": { "kind": "option", "optionId": "core" } }   // or { kind: 'custom', text }
--> 200 { "ok": true }
+POST /v1/harness/sessions/:id/actions/:requestId/answer
+{ "choice": { "kind": "option", "option_id": "core" } }  // or { kind: 'custom', text }
+-> 200 { "ok": true, "request_id": "…", "resolved_at": 1762000000000 }
 ```
 
 Statuses: `400` malformed body or an id/text outside the recorded request, `404`
@@ -1892,7 +1904,7 @@ threadFork({ input: 'Audit the parser for edge cases.', label: 'parser audit' })
 - **Ephemeral audit.** `harness.branches()` / `branch(id)` return detached
   `HarnessBranchRecord` values (`status`, remap map, messages, optional result or
   error). Branch records and their events are runtime/session state, deliberately
-  **not** part of snapshot v1: a restart does not restore them.
+  **not** part of snapshot v2: a restart does not restore them.
 - **`Agent.fork({ label? })` is the standalone primitive.** It does the same
   materialization without a harness; `reset()` on that fork restores its
   fork-time baseline.
@@ -1971,7 +1983,7 @@ try {
 - The harness server retries a failed catalogue request (`'request'` or
   `'response'`, never `'configuration'`): each attempt gets a fresh abort
   deadline of 10 s, 20 s, 40 s, ... doubling up to ten total attempts (the last
-  at 5,120 s), and the first success wins. `POST /api/models` therefore answers
+  at 5,120 s), and the first success wins. `POST /v1/harness/models` therefore answers
   `400` for unusable settings and `502` only after every attempt has failed.
 
 ## Progress events
@@ -2072,13 +2084,18 @@ Transport behaviour:
 - the model receives `serialize(content)` exactly as for an ordinary return value;
   the envelope and panels never enter the request/message transcript;
 - a `tool_result` event gains an optional `ui: ToolUiPanel[]` (absent for standard
-  tools), which flows through the existing SSE frame and the recorded turn, so a
-  reload shows the same panels and `eventTimes` stays aligned;
-- `POST /tools/:name` (direct and session-bound) returns `{ ok: true, result,
-  panels?, media?, durationMs }` — `result` is the underlying content, and `media`
-  is the `ToolMediaDescriptor[]` projection (`id`, `kind`, `name`, `mime`, `size`)
-  of anything a tool attached with `toolMedia()`, so a `download` answer never puts
-  base64 on the wire either;
+  tools), and it is RECORDED in the turn, so `GET …/turns/:id/events` re-serves the
+  same panels after a reload and `eventTimes` stays aligned. The DISPLAY tree carries
+  only a bounded SUMMARY per step (`DisplayPanelSummary`, `src/server/turn-projector.ts`):
+  full panels are an event read or a manual-call answer, never a display node;
+- `POST /v1/harness/tools/:tool_id/executions` and
+  `POST /v1/harness/sessions/:id/tools/:tool_id/executions` both answer
+  `{ ok: true, result, panels?, media?, duration_ms }` — `result` is the underlying
+  content, and `media` is the `ToolMediaDescriptor[]` projection (`id`, `kind`, `name`,
+  `mime`, `size`) of anything a tool attached with `toolMedia()`, so a `download` answer
+  never puts base64 on the wire either. A tool that RAN and failed is still `200`, with
+  `{ ok: false, error, duration_ms }`; only a call the server could not make at all is an
+  HTTP error, so a client branches on `ok` and not on the status code.
 - both manual paths share the model budget: a result or error over **64 KiB of
   UTF-8** is returned as the explicit envelope `{ truncated: true, originalBytes,
   budgetBytes, content }` (panels stay on the separate tool-UI limit), and a result
@@ -2088,13 +2105,14 @@ Transport behaviour:
   "direct" mode, so both `["src"]` and `{ "paths": ["src"] }` reach the tool and a
   wrong type is an `ok: false` tool error. `parameters: null` means "no arguments";
 - a tool created at runtime (`toolCreate`) or added by a plugin lives in its
-  session's harness, not in the static catalogue: `POST /tools/:name` with that
-  `sessionId` resolves it, any other session answers `404 Tool "<name>" is not
-  available in this session.`, and a session-less call answers `404 Unknown tool`.
-  For listing, read the session (`GET /sessions/:id`): a created tool is registered
-  AND enabled at once, so its name appears in `discoveredTools` alongside the
-  discovered catalogue tools. `GET /tools` stays the static catalogue;
-- `GET /tools` is unchanged. The shipped `timeNow` tool is the in-app
+  session's harness, not in the static catalogue: the SESSION execution route resolves
+  it, a route naming another session answers `404 Tool "<name>" is not available in
+  this session.`, and the global route answers `403` because the name is session-bound.
+  For listing, read the session (`GET /v1/harness/sessions/:id/definition`): a created
+  tool is registered AND enabled at once, so its name appears in `discovered_tools`
+  alongside the discovered catalogue tools. `GET /v1/harness/tools` stays the static
+  catalogue;
+- `GET /v1/harness/tools` is otherwise unchanged. The shipped `timeNow` tool is the in-app
   demonstration: its API result is still `{ timezone, iso, unix }`, with a
   right-slot key/value panel attached.
 
@@ -2116,8 +2134,9 @@ packages/underload/harness/.env
 `yarn dev:server` (standalone API), `yarn cli --serve` (CLI opt-in) and
 `yarn cli` all use the same loader, through `src/server/environment.ts`. The path
 is resolved from the package, not the current directory, so launching from the
-workspace root still finds it. In this workspace the file is
-`D:/Projects/typescript/noobscript/packages/underload/harness/.env`. Copy
+workspace root still finds it. The loader resolves it from the package directory
+regardless of cwd, so in a workspace checkout that is
+`packages/underload/harness/.env` relative to the repo root. Copy
 `.env.example` to `.env`; the real file is git-ignored.
 
 | Variable | Used by |
@@ -2129,6 +2148,7 @@ workspace root still finds it. In this workspace the file is
 | `TAVILY_API_KEY` | Second opt-in `search` provider (search only — Tavily has no `fetch` provider) |
 | `LINKUP_API_KEY` | Third opt-in `search` provider, and the second optional hosted `fetch` provider |
 | `HARNESS_THREAD_EXECUTION` | Server only: `inline` (default) or `worker` — runs each conversation's turn on its own OS worker thread. See [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker) |
+| `HARNESS_DEV_API` | **Vite only** (`src/frontend/vite-proxy.ts`, read when the UI's dev/preview config loads): the mount the `/v1/harness` proxy forwards to. Default `http://127.0.0.1:5000/v1/harness`; the point it at the standalone launcher with `http://127.0.0.1:5181/v1/harness`. No server or CLI entry reads it |
 | `HARNESS_WORKER_IDLE_MS`, `HARNESS_MAX_LANE_WORKERS`, `HARNESS_WORKER_HANDSHAKE_MS`, `HARNESS_WORKER_ENTRY` | Server only: the lane-worker bounds and entry file for `worker` execution (same section; every value is validated, and a bad one aborts startup) |
 | `HARNESS_IO_EXECUTION` | Server only: `inline` (default) or `worker` — runs the database checkpoint and the event journal on one IO worker thread instead of on the request loop. See [Off-loop durability](#off-loop-durability-ioexecution-worker) |
 | `HARNESS_IO_WORKER_ENTRY` | Server only: explicit IO worker entry file; otherwise `dist/underload-harness.io-worker.mjs`, else the source entry (dev/test) |
@@ -2252,7 +2272,7 @@ Each answers the same readable block: `#<id> [x]/[ ] <text>` rows (or `No tasks.
 `/task complete 7` reads as what it is: a stale revision token, answered with the current
 record. The `#` prefix on each
 id is there so an operator can copy `/task complete 7` straight out of the listing.
-Because these are `harness.executeTool('task', …)` calls and not a private store, the
+Because these are `harness.executeTool('tasks', …)` calls and not a private store, the
 command inherits the tool's own bounds (200 tasks, 4000 characters each, 20 per page by
 default, 100 maximum) and the next `/task` really lists what `/task add` wrote.
 
@@ -2260,11 +2280,8 @@ default, 100 maximum) and the next `/task` really lists what `/task add` wrote.
 first (following `page.nextOffset` until the list is exhausted) and sends the real
 `expects: [{ id, rev }]` tokens, so an edit by another agent between the read and the
 write is the tool's stale error instead of a lost update — never an invented revision.
-An unknown id gets no token, so the tool's own `task has no task with id "99".` is what
-the operator reads. `claim`, `release` and `takeover` send no token at all: an ownership
-action never changes `rev`. They also run **unthreaded**, which makes the holder pair
-`(entry agent, no thread)` — so `/task release` lifts only the operator's own or an
-expired claim, and `/task takeover` is the documented override for a live one. The read
+An unknown id gets no token, so the tool's own `tasks has no task with id "99".` is what
+the operator reads. The read
 costs one extra `tool_execute` notification per guarded command (a debounced save, not a
 model turn).
 
@@ -2340,9 +2357,10 @@ response is already terminal and nothing ever entered a queue.
   unsafe right now is refused by the harness, and that refusal becomes an error turn.
 - An unknown command, and anything a host command throws, becomes a **readable error
   turn** (status `error`, the message as the tool result) rather than a `500`.
-- The legacy `POST /sessions/:id/messages` route does **not** treat a leading `/` as a
-  command: its response-owned SSE contract predates the registry, so that line still
-  goes to the model. Slash commands are supported on `/tasks` only.
+- There is no second submit route to be inconsistent with: the response-owned
+  `POST …/messages` stream was deleted, so the queue submit is the ONLY way a line reaches
+  the model, and a leading `/` on it is a command. The host's own `dispatch()`/`execute()`
+  path answers a leading `/` the same way.
 - A host handle built before the command registry has no `executeCommand`; `dispatch`
   then falls back to `enqueue()`, which is exactly what such a server did before.
 
@@ -2387,8 +2405,8 @@ Everything an operator can get wrong is an answer, not an exception:
 | missing argument | `/task: "add" needs the task text.` then `usage: …`, with `isError` (same for `"complete" needs a task id.` and `a query is required.` / `a URL is required.`) |
 | too many arguments | `/task: "list" takes no arguments (got 1).`, `/task: "complete" takes one id (got 2).`, `/help: "help" takes at most one command name.` |
 | unknown `/task` action | `/task: unknown action "bogus".` plus the usage line |
-| tool not registered | the `/websearch` / `/webfetch` guidance text above, or `/task: the "task" tool is not registered in this harness.` |
-| the tool rejects the call | `<label>: <the tool's own message>` — the label is the command and subaction (`/task add`, `/webfetch`), covering an unknown task id, a failed provider call, a non-text page, a stale `expects` (another agent changed the record between the command's read and its write), and a record another agent holds a live claim on |
+| tool not registered | the `/websearch` / `/webfetch` guidance text above, or `/task: the "tasks" tool is not registered in this harness.` |
+| the tool rejects the call | `<label>: <the tool's own message>` — the label is the command and subaction (`/task add`, `/webfetch`), covering an unknown task id, a failed provider call, a non-text page, and a stale `expects` (another agent changed the record between the command's read and its write) |
 
 Only a command that throws on purpose escapes: `executeCommand` does not wrap a host
 command's exception, so a built-in's recoverable failures return
@@ -2477,7 +2495,7 @@ same fields.
 The UI is a client. It does not import the harness package, construct a harness,
 or execute a tool. Every action is a request to the server: a task submit is the
 `202` JSON accept from `POST /tasks`, and its live progress arrives on the
-session's `GET /events` SSE stream as the same `report.progress` events a CLI
+session's `GET /v1/harness/stream` WebSocket as the same `report.progress` events a CLI
 prints. The server, not the browser, keeps the queue and the transcript.
 
 On a phone (`max-width: 860px`) both side rails start **collapsed** and the topbar
@@ -2573,7 +2591,7 @@ To run the UI against that standalone API instead of the service, point Vite's
 proxy mount at it (a shell variable, read by `vite.config.ts`):
 
 ```bash
-HARNESS_DEV_API=http://127.0.0.1:5181/api yarn dev:frontend
+HARNESS_DEV_API=http://127.0.0.1:5181/v1/harness yarn dev:frontend
 ```
 
 The default stays `http://127.0.0.1:5000/v1/harness`, so ordinary development
@@ -2665,8 +2683,12 @@ alias could also collide with an existing user-created harness on restart, so th
 title carries the rename instead.
 
 The server keeps one harness per session, so submitting a second task continues
-the same conversation. `POST /api/sessions/:id/tasks` accepts a task with
-`202 { session, turn }` and the server runs it FIFO behind anything already
+the same conversation. `POST /v1/harness/sessions/:id/tasks` accepts a task with
+a `202` **`TaskReceipt`** — `{ session_id, turn_id, status, thread_id, session_revision,
+accepted_at, links { turn, turns, thread, stream } }`, plus `queue_position` while it
+waits or `steered` / `steered_thread_id` when it folded into a running conversation —
+and never echoes the session or the turn record; the content arrives on the stream and
+a bounded `/turns` page carries the row. The server runs it FIFO behind anything already
 pending, so tasks execute in submission order even when they arrive while a run
 streams. **Team membership and the descriptor snapshot are frozen at
 session creation**: the preset object and a `harnessDefinition` are captured, so a
@@ -2675,7 +2697,7 @@ or the history it reports. The UI's Endpoint panel is sent when a session is
 created; changing it starts a fresh session on the next run.
 
 One field is deliberately not frozen: an agent's **model**. `PATCH
-/api/sessions/:id` with `{ agentModels: { <agent>: <model> } }` retargets an
+/v1/harness/sessions/:id` with `{ agent_models: { <agent>: <model> } }` retargets an
 existing session in place (see the session table below). The map MERGES into the
 live map, every key must name a member of that session's harness, values are
 validated like a harness override, and the whole patch is all-or-nothing. It is
@@ -2684,83 +2706,164 @@ with (the assistant message it commits names that model), and the **next request
 of that agent uses the new one — including a queued task, whose request starts
 after the patch. Nothing is aborted, rebuilt, or replayed, and the
 frozen `harnessDefinition.agentModels` remains the creation-time record. Team
-editing (primary/subagents) still applies to the next session you start. Sessions
-are in memory and are lost when the server restarts. Created tools live in the
+editing (primary/subagents) still applies to the next session you start. A session is in
+memory ONLY where no database root is configured: with one (the service's
+`DATABASE_ROOT`, or `startHarnessServer({ databaseRoot })`) it is persisted and restored
+on the next boot (see [Persistence](#persistence-database_root)). Created tools live in the
 session's harness: they survive `reset()` (which clears the conversation,
 discovery, `tasks`, and the three record stores) and disappear with the
 session.
 
-Every submit — queued (`/tasks`) or legacy (`/messages`) — is also the server's
+Every submit (`/tasks`) is also the server's
 record: every task becomes a `SessionTurn` (id, index, prompt, status, timestamps,
 every event the run produced, a parallel `eventTimes` array of epoch-ms stamps,
 and a `usage` tally summed from the per-request `usage` events — `input` with the
 cached part in `cached`). A queued task is a turn immediately: `status: 'queued'`,
 a stable `id` and `index`, and **no `startedAt`** until the server pump begins it,
-so a client can render the backlog before execution. `GET /api/sessions` and `GET
-/api/sessions/:id` always include the full `turns` array, so a browser reload — or
+so a client can render the backlog before execution. Reads are bounded and lazy:
+`GET /v1/harness/sessions` answers a PAGE of `SessionSummary` rows (`limit` default
+25 and max 100, an opaque `cursor`, plus the `status` and `harness` filters) and
+`GET /v1/harness/sessions/:id` answers one session's metadata; NEITHER embeds the
+heavy children. Turns, threads, transcripts, recorded events and each display tree
+are their own named, paged routes, so a browser reload — or
 a second client — renders the same transcript, the same per-step/per-tool elapsed
-time, and the same token count without having seen the stream. A turn that is
-still running (or still queued) is included too, which is what the UI reattaches
-to through `GET /api/sessions/:id/events`, with snapshot polling as its fallback.
-A snapshot's `queueDepth` counts waiting turns only — the active turn is not in it
-— and is omitted when the queue is empty, so pre-queue snapshot shapes are
-unchanged. Each snapshot also carries `harnessDefinition` (the frozen descriptor:
-members, primary, and the models the session was created with), `agentModels`
+time, and the same token count from `/turns`, `/turns/:id/display` and
+`/turns/:id/events` without having seen the stream. A turn that is
+still running (or still queued) is in the page too, which is what the UI reattaches
+to; its live channel is the `GET /v1/harness/stream` WebSocket, with a session
+bounded REST reads as its fallback: there is no SSE and no second transport. A row's `queue_depth` counts waiting turns only
+— the active turn is not in it — and is omitted when the queue is empty. The
+identified read adds `agent_models`
 (the session's LIVE effective model of every agent — overrides resolved,
 rewritten by a session PATCH, so a per-agent dropdown survives a reload and shows
-what the next request will use), and `discoveredTools` (what `toolRequest` had
-enabled), so a reload loses neither the configuration nor the discovery state.
+what the next request will use), the key-free `endpoint` view, `definition_revision`,
+`pending_action_count` and `created_tool_count`; the frozen descriptor itself
+(members, primary, and the models the session was created with) is
+`GET /sessions/:id/definition`, and that read is also where `discovered_tools`
+lives, so a reload loses neither the configuration nor the discovery state.
 
-`/api` is the standalone mount. The `@underload/service` host serves the same
-resource paths below `/v1/harness` and adds a bootstrap document at its root; see
+There is **one mount**: `HARNESS_API_ROOT` = `/v1/harness`, and both the standalone
+listener (`startHarnessServer`, `127.0.0.1:5181` by default) and the
+`@underload/service` gateway serve exactly the paths below — the same dispatcher, the
+same bootstrap document at `/v1/harness`, and the same WebSocket at
+`/v1/harness/stream`. The legacy `/api` root is not mounted at all: a request to it
+answers `This server serves /v1/harness; "/api" is not mounted.`, and the `/presets`,
+`/views`, `/tools/bootstrap`, `/tools/:name/call` and `/sessions/:id/messages` aliases
+were deleted rather than kept behind a flag. See
 [Service host](#service-host-v1harness) below.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/health` | Liveness and session count |
-| `GET /api/harnesses` | Harness descriptors (`primary`, `subagents`, `coreTools`, `agentModels?`, `agentInstructions?`, `builtin`, `editable`), provider defaults, and the trusted `agents` list. Every entry is an editable application copy; `editable` is always `true` (compatibility only) |
-| `POST /api/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agentModels?, agentInstructions? }` → `201 { harness }` |
-| `PATCH /api/harnesses/:name` | Change any harness — body `{ title?, description?, primary?, subagents?, agentModels?, agentInstructions? }` → `{ harness }` |
-| `DELETE /api/harnesses/:name` | Remove one harness — `200 { deleted: true }`; `404` for an unknown name or a repeat delete. Any harness is removable, including a shipped built-in (its name is remembered in the database's `deleted` list so a restart does not re-ship it). Existing and saved sessions are untouched: each runs and restores from the definition it captured |
-| `GET /api/harnesses/:name` | Read ONE harness definition — `200 { harness }`, the same projection the index lists, including `agentInstructions` when the card overrides any (the compiled `/views` document omits that map, so the configuration dialog reads the one card it is about to show). A legacy alias resolves to the card it redirects to; `404` for an unknown name |
-| `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
-| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `search` always appears with `availability` |
-| `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
-| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) needs `sessionId`; every other tool - including the core file tools - keeps its session-less runner. `actionRequest`/`threadFork` are refused because they need the owning run. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
-| `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
-| `POST /api/models` | Server-side `GET {baseURL}/models`; returns `{ models: string[] }` for the UI dropdown |
-| `POST /api/sessions` | Create a session for a preset |
-| `GET /api/sessions`, `GET /api/sessions/:id` | List or read sessions |
-| `PATCH /api/sessions/:id` | Retarget models in a live session: body `{ agentModels: { agent: model } }` → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
-| `POST /api/sessions/:id/messages` | Legacy submit; response is `text/event-stream`. This response OWNS the run: a disconnect cancels it, and a busy session or a pending queue is a `409`. New clients should prefer `/tasks` + `/events` |
-| `POST /api/sessions/:id/tasks` | Queue a task (`{ input, attachments?, references?, threadId? }`) → `202 { session, turn }`. The turn is `queued` with a stable id/index and no `startedAt`; each thread runs its own lane FIFO (cap 100 pending across all lanes, `429`) and continues after a task fails. Omitting `threadId` opens a new thread; a running `threadId` steers, or queues a continuation when attachments/an unfinished reference prevent it. In memory only |
-| `GET /api/sessions/:id/events` | Watch the session: `text/event-stream` opening with one `snapshot`, then `turn` upserts (queued → running → terminal) and `event` frames, then one final `snapshot` when the queue drains. A disconnect only unsubscribes; server-owned tasks keep running |
-| `POST /api/sessions/:id/reset` | Reset every agent and clear discovery, tasks, and the three record stores; `409` while a run or queued work is pending |
-| `POST /api/sessions/:id/cancel` | Optional `{ all?: true }` → `{ cancelled }`. Default cancels the active run only; `all: true` (the UI Stop button) also cancels every queued turn, which stays in `turns` as a `cancelled` row |
-| `POST /api/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', optionId } \| { kind: 'custom', text } }` → `{ ok: true }`. Settles one pending `actionRequest`; allowed while the session is busy. `400` invalid/unknown option, `404` unknown session/request, `409` answered or expired |
-| `DELETE /api/sessions/:id` | Forget a session: abort active work, drop queued work, and close its watchers |
+| `GET /v1/harness` | The constant-size boot document: identity, links, capabilities, limits, epoch and server time — no catalogue, no defaults, no sessions |
+| `GET /v1/harness/health` | Liveness probe |
+| `GET /v1/harness/config` | Global provider defaults and the deployment runtime facts (never per-session) |
+| `PATCH /v1/harness/config` | Change the global provider defaults — `{ settings: { base_url?, model?, api_key? } }`; an explicit `null` puts the shipped default back |
+| `GET /v1/harness/harnesses` | Harness definitions, paged (`q` matches name/title/description). Every entry is an editable application copy |
+| `POST /v1/harness/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` |
+| `PATCH /v1/harness/harnesses/:name` | Change a harness definition |
+| `DELETE /v1/harness/harnesses/:name` | Remove one — `{ deleted: true, harness_name, tombstoned, restored_by_restart: false }`; a deleted built-in stays deleted across a restart. Existing and saved sessions are untouched: each runs and restores from the definition it captured |
+| `GET /v1/harness/harnesses/:name` | Read ONE definition — the identified read carries what a card omits (the per-agent model map, instruction text, resolved core-tool set); `404` for an unknown name |
+| `GET /v1/harness/harnesses/:name/instructions` | Which members carry an instruction override (not paged: membership is bounded by the definition) |
+| `GET /v1/harness/harnesses/:name/instructions/:agentId` | One member's effective instruction text |
+| `GET /v1/harness/agents` | The trusted agent profiles, paged |
+| `GET /v1/harness/agents/:id` | One profile |
+| `PATCH /v1/harness/agents/:id` | Override a profile's declarative text (`title`, `description`, `instruction`) — future sessions only, and durable in the agent-state layer |
+| `DELETE /v1/harness/agents/:id` | Retire the override |
+| `GET /v1/harness/tools` | The global tool catalogue, paged |
+| `GET /v1/harness/tools/:id` | One catalogue entry with its argument schema |
+| `PATCH /v1/harness/tools/:id` | Enable or disable one catalogue entry for EVERY session (no un-register, so a run in flight keeps the declarations it was given) |
+| `POST /v1/harness/tools/:id/executions` | Execute a catalogue tool without a session, against the deployment catalogue; a session-bound name is a `403` naming the session route; an unconfigured tool answers `200 { ok: false }`. See [the call body](#the-tool-call-body) |
+| `GET /v1/harness/plugins` | The built-in plugins with their settings and current values (answerable with no harness and no model) |
+| `PATCH /v1/harness/plugins/:id` | Change one plugin's settings — write-anytime, honoured from the next turn of every session; `{ settings: { enabled: false } }` is the global off switch |
+| `POST /v1/harness/models` | Server-side `GET {base_url}/models`; returns `{ models, observed_at }` for the UI dropdown |
+| `GET /v1/harness/sessions` | Sessions as bounded summaries — paged (`limit` 25 default / 100 max, `cursor`, `status`, `harness`); turns and threads are separate routes |
+| `POST /v1/harness/sessions` | Create a session from a harness definition — `{ harness, title?, settings? }` → `201 { session }` |
+| `GET /v1/harness/sessions/:id` | One session's metadata plus its live model map and counters — still no turns, threads, transcripts or display trees |
+| `PATCH /v1/harness/sessions/:id` | Retarget models in a live session: body `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
+| `DELETE /v1/harness/sessions/:id` | Dispose a session — `{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }` |
+| `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` |
+| `GET /v1/harness/sessions/:id/usage` | The session's token accounting (server-summed from the recorded `usage` events) |
+| `GET /v1/harness/sessions/:id/commands` | The slash commands this session can run (discovery only — execution is a task submit) |
+| `GET /v1/harness/sessions/:id/records` | The session record store, whole or as a `?since=` delta; read-only, so polling it moves no revision |
+| `GET /v1/harness/sessions/:id/queue` | The tasks waiting in this session's queue |
+| `POST /v1/harness/sessions/:id/tasks` | Submit a task (`{ input, attachments?, references?, thread_id? }`) or steer a running conversation → `202` **`TaskReceipt`** (see above). Each thread runs its own lane FIFO (cap 100 pending across all lanes, `429`) and continues after a task fails. Omitting `thread_id` opens a new thread; a running `thread_id` steers, or queues a continuation when attachments/an unfinished reference prevent it |
+| `POST /v1/harness/sessions/:id/reset` | Discard a session's conversation state — `{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`; `409` while a run or queued work is pending |
+| `POST /v1/harness/sessions/:id/cancel` | Optional `{ all?: true }` → the cancel receipt. Default cancels the active run only; `all: true` (the UI Stop button) also drains every queued turn, which stays in `/turns` as a `cancelled` row |
+| `GET /v1/harness/sessions/:id/actions` | The owner questions still waiting for an answer |
+| `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` → `{ ok: true, request_id, resolved_at }`. Settles one pending `actionRequest`; allowed while the session is busy. `400` invalid/unknown option, `404` unknown session/request, `409` answered or expired |
+| `GET /v1/harness/sessions/:id/agents` | This session's agent roster (bindings joined with what the session actually runs) |
+| `POST /v1/harness/sessions/:id/agents` | Bind a trusted profile, or define a session-owned agent, into this session only |
+| `GET /v1/harness/sessions/:id/agents/:agentId` | One binding |
+| `PATCH /v1/harness/sessions/:id/agents/:agentId` | Override one session agent's model or instruction |
+| `DELETE /v1/harness/sessions/:id/agents/:agentId` | Remove one binding (the primary is not detachable; live or queued work is a `409`) |
+| `GET /v1/harness/sessions/:id/agents/:agentId/instruction` | One session agent's effective instruction, naming the layer it came from |
+| `PATCH /v1/harness/sessions/:id/agents/:agentId/instruction` | Replace or clear it (`{ instruction: "…" \| null }`) and return that same document |
+| `GET /v1/harness/sessions/:id/tools` | This session's toolbox |
+| `POST /v1/harness/sessions/:id/tools` | Register a session-local tool |
+| `GET /v1/harness/sessions/:id/tools/:toolId` | One session tool with its argument schema |
+| `PATCH /v1/harness/sessions/:id/tools/:toolId` | Edit or re-enable one session tool (withholding it from the model does not unregister it) |
+| `DELETE /v1/harness/sessions/:id/tools/:toolId` | Remove one registration — the implementation, its captured revision, its created-tool record and its enabled slot go in one step, so a restart does not resurrect the name |
+| `GET /v1/harness/sessions/:id/tools/:toolId/source` | One tool's installed source revision |
+| `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Execute a tool through THIS session's registry (a replaced preset, a created tool and a session-owned core tool all run what the session holds); a busy session is a `409`. See [the call body](#the-tool-call-body) |
+| `GET /v1/harness/sessions/:id/threads` | This session's conversations |
+| `POST /v1/harness/sessions/:id/threads` | Open an additional conversation |
+| `GET /v1/harness/sessions/:id/threads/:threadId` | One conversation's metadata |
+| `DELETE /v1/harness/sessions/:id/threads/:threadId` | Delete one conversation (it stops that conversation first, then purges it) |
+| `POST /v1/harness/sessions/:id/threads/:threadId/cancel` | Stop one conversation |
+| `POST /v1/harness/sessions/:id/threads/:threadId/resume` | Re-run the interrupted turn of one halted conversation → `200` with the receipt of the REQUEUED row (same `turn_id`) |
+| `GET /v1/harness/sessions/:id/threads/:threadId/transcript` | One transcript's state and size (`{ transcript }`: state, `message_count`, `chars`, `bytes`, `role_counts`, `revision`) |
+| `PUT /v1/harness/sessions/:id/threads/:threadId/transcript` | Replace it with a whole document — `{ messages, if_revision? }` → the write receipt (see [Editable thread transcripts](#editable-thread-transcripts)) |
+| `GET /v1/harness/sessions/:id/threads/:threadId/transcript/messages` | Page through one transcript's messages (`limit`/`cursor`, optional `role`); `total` stays the whole transcript's count |
+| `GET /v1/harness/sessions/:id/threads/:threadId/transcript/document` | One transcript as the editor's JSON TEXT document — the edit/export surface |
+| `GET /v1/harness/sessions/:id/turns` | Page through recorded turns |
+| `GET /v1/harness/sessions/:id/turns/:turnId` | One turn's record metadata |
+| `GET /v1/harness/sessions/:id/turns/:turnId/display` | One turn's compiled display tree |
+| `GET /v1/harness/sessions/:id/turns/:turnId/events` | Page through one turn's recorded events |
+| `GET /v1/harness/sessions/:id/turns/:turnId/steps/:stepId` | One step's recorded request and result together |
+| `GET /v1/harness/sessions/:id/turns/:turnId/blocks/:blockId` | One context segment's recorded text |
+| `PATCH /v1/harness/sessions/:id/turns/:turnId/blocks/:blockId` | Switch one context segment in or out of the following requests |
+| `GET /v1/harness/sessions/:id/turns/:turnId/attachments/:attachmentId` | One attachment's recorded bytes |
+| `GET /v1/harness/stream` | The live-update channel: a **WebSocket** upgrade on the `harness.v1` subprotocol (a plain `GET` answers `400` saying so). See [Live updates](#live-updates-the-websocket-stream) |
+
+Every collection read above is paged (`limit` 25 default, 100 maximum, opaque
+`cursor`), and every page stamps its collection revision — in the body and in the
+`X-Harness-Revision` header — against the per-process `X-Harness-Epoch`, so a client
+can order a read against a stream frame. Writes answer SLIM RECEIPTS
+(`TaskReceipt`, `ResetSessionResult`, `CancelSessionResult`, `DeleteSessionResult`,
+`TranscriptWriteReceipt`, …) and never the mutated aggregate. A path that exists but
+not for the verb you used is a `405` naming the verbs it does take.
 
 #### The tool call body
 
-`POST /api/tools/:name` always takes **one wrapper object with a `parameters`
-property**; `{ "parameters": {} }` is a valid argument-less call, and a body without
-`parameters` is a `400`. What `parameters` HOLDS depends on the tool's schema, and the
-two forms are not interchangeable:
+**Two execution routes, one body.** `POST /v1/harness/tools/:tool_id/executions` runs a
+CATALOGUE tool with no session at all, against the deployment catalogue;
+`POST /v1/harness/sessions/:id/tools/:tool_id/executions` runs one inside a SESSION (a
+session-bound tool, a session registration, or a harness-owned control tool). Both take
+**one wrapper object with a `parameters` property** and nothing else — an unknown body
+field is a `400`, and an absent `parameters` is the same empty argument box as
+`{ "parameters": {} }`. A session-bound tool asked of the GLOBAL route is a `403` that
+names the route to use:
+`Tool "toolRequest" runs inside a session; call it through
+/v1/harness/sessions/{session_id}/tools/toolRequest/executions.` What `parameters` HOLDS
+depends on the tool's schema, and the two forms are not interchangeable:
 
 ```jsonc
 // files declares ONE property, so the value IS that property (the same unwrapping
 // a model call gets and a direct call passes):
-POST /api/tools/files   { "parameters": [{ "op": "list", "path": ["src", "task"] }] }
+POST /v1/harness/tools/files/executions
+     { "parameters": [{ "op": "list", "path": ["src", "tasks"] }] }
 
-// its schema, as listed by GET /api/tools, is still an object:
+// its schema, as listed by GET /v1/harness/tools, is still an object:
 { "type": "object", "properties": { "ops": { "type": "array", … } }, "required": ["ops"], … }
 
 // a multi-property tool takes the whole object, because there is nothing to unwrap:
-POST /api/tools/glob       { "parameters": { "patterns": ["**/*.ts"], "paths": ["src"] } }
-POST /api/tools/grep       { "parameters": { "pattern": "TODO", "patterns": ["*.ts"] } }
-POST /api/tools/download   { "parameters": { "url": "https://example.com/a.pdf", "name": "a.pdf" } }
-POST /api/tools/search     { "parameters": { "query": "harness docs", "provider": "linkup" } }
-POST /api/tools/toolRequest { "parameters": { "tags": ["files"] }, "sessionId": "…" }
+POST /v1/harness/tools/glob/executions     { "parameters": { "patterns": ["**/*.ts"], "paths": ["src"] } }
+POST /v1/harness/tools/grep/executions     { "parameters": { "pattern": "TODO", "patterns": ["*.ts"] } }
+POST /v1/harness/tools/download/executions { "parameters": { "url": "https://example.com/a.pdf", "name": "a.pdf" } }
+POST /v1/harness/tools/search/executions   { "parameters": { "query": "harness docs", "provider": "linkup" } }
+
+// a session-bound tool has no global route: the session moves into the PATH
+POST /v1/harness/sessions/…/tools/toolRequest/executions { "parameters": { "tags": ["files"] } }
 ```
 
 The single-property tools are `read`, `write`, `edit`, and `files`;
@@ -2777,7 +2880,7 @@ a `{ "ops": [...] }` wrapper and a bare `[...]` are the same request (the same
 unwrapping rule), while an empty argument box and `{ "ops": [] }` are both refused -
 only a `list` entry may omit `path`, and that one means the working directory.
 
-**Harness creation and overrides.** `POST /api/harnesses` adds a live harness
+**Harness creation and overrides.** `POST /v1/harness/harnesses` adds a live harness
 built from trusted agents and the shared toolbox; `PATCH` changes any harness,
 including the shipped templates (`general`, `instruct`, `research`, `workspace`,
 `reviewer`, `planner`, `debugger`). Every entry is an editable template copy;
@@ -2785,9 +2888,13 @@ including the shipped templates (`general`, `instruct`, `research`, `workspace`,
 metadata-only `PATCH` (`title`/`description`) preserves the template's captured
 factory, so a harness that does not use the live profiled factory keeps whatever it
 was built with. An executable `PATCH`
-(`primary`/`subagents`/`agentModels`/`agentInstructions`) rebuilds the harness as a
+(`primary`/`subagents`/`agent_models`/`agent_instructions`) rebuilds the harness as a
 live profiled harness from the shared toolbox.
-`builtin: true` still marks provenance. There is no delete; with a database root
+`builtin: true` still marks provenance. `DELETE /v1/harness/harnesses/:name` removes one
+and answers `{ deleted: true, harness_name, tombstoned, restored_by_restore }`:
+`tombstoned` is `true` when a SHIPPED name was removed, because its template still exists
+and a later restore can bring it back. Re-creating a name that is tombstoned answers
+`restored_by_restore: true`. With a database root
 the registry is restored from `<root>/harness/state.json` (see Persistence), and
 without one it is in memory only. Registry edits affect FUTURE sessions only,
 because a session freezes its captured preset and descriptor at creation. Both
@@ -2810,7 +2917,7 @@ saved. A title/description the operator edited is preserved across a refresh.
 Frozen sessions are never rewritten: each session restores from its own recorded
 preset and descriptor, so an old conversation keeps the team it started with.
 
-`agentModels` is the one model-shaped field: a map of **selected agent id → model
+`agent_models` is the one model-shaped field: a map of **selected agent id → model
 id**, e.g. `{ "summarizer": "small/fast" }`. A member it omits uses the session's
 `settings.model`, so a dropdown can show "default". Values are trimmed, non-empty,
 at most 200 characters, and free of control characters; keys must belong to the
@@ -2819,59 +2926,105 @@ Only ids are overridable — never a provider, base URL, or key. On `PATCH` the 
 REPLACES the previous one, so `{}` clears every override; changing membership
 without restating the map drops the overrides of agents that are no longer selected.
 The factory closure captures the map, so a harness edit never rewrites an existing
-session: those models change only through `PATCH /api/sessions/:id` (which merges
+session: those models change only through `PATCH /v1/harness/sessions/:id` (which merges
 and never touches the frozen definition).
 
-`agentInstructions` is the one text-shaped field: a map of **selected agent id →
+`agent_instructions` is the one text-shaped field: a map of **selected agent id →
 instruction OVERRIDE**, e.g. `{ "summarizer": "Condense to one line." }`. It is
-validated like `agentModels` (keys must be final members; values trimmed, non-empty,
+validated like `agent_models` (keys must be final members; values trimmed, non-empty,
 at most 8000 characters, and free of control characters other than tab/newline/CR, so
 multi-line prose is legal) and REPLACED wholesale on `PATCH`, so `{}` clears every
-override and an agent the map omits runs its trusted `GET /api/agents` instruction.
+override and an agent the map omits runs its trusted `GET /v1/harness/agents` instruction.
 A stored value IS the member's **complete prompt**: `agentInstruction(profile, override)`
 returns it verbatim, so the profile's `guidelines` are the default an un-overridden
 member runs on and are never appended underneath an override, and the shipped profile in
 `src/agents` is never rewritten. An instruction edit is EXECUTABLE, so it rebuilds the harness factory and
 is persisted with the registry row; a saved session keeps the instructions its agents
 were built with (its system messages are already in the transcript), which is why
-`PATCH /api/sessions/:id` still accepts `agentModels` only. The browser's agent dialog
+`PATCH /v1/harness/sessions/:id` still accepts `agent_models` only. The browser's agent dialog
 edits all of this as a local draft: nothing is written until its bottom-right action,
 and dismissing the dialog sends nothing at all.
 
-`POST /api/models` takes `{ settings?: { baseURL?, apiKey?, model? } }`. It exists
+`POST /v1/harness/models` takes `{ settings?: { base_url?, api_key?, model? } }` — every
+field optional, an unknown field a `400`, and the key is never echoed back. It exists
 because the browser must not hold the server key and providers rarely send CORS
-headers; the server performs the request with the merged settings and returns ids
-only. A blank `baseURL` is `400`, a provider failure or unusable body is `502`, and
-an empty catalogue is `200` with `{ "models": [] }`.
+headers; the server performs `GET {base_url}/models` with the merged settings and returns
+ids only: `{ models, observed_at }`. A blank `base_url` is `400`, a provider failure or
+unusable body is `502`, and an empty catalogue is `200` with
+`{ "models": [], "observed_at": "…" }`.
 
-Every request must send `X-Harness-Client: ui`. The browser UI does this on every
-call; a foreign page cannot set the header without a CORS preflight, which the
-server does not answer. A `curl` client must add it explicitly.
+No request header is required any more: the legacy `X-Harness-Client: ui` gate is GONE
+(`src/server/handler.ts`), and the browser still sends the header as an inert marker.
+Access control is an ORIGIN policy, not authentication — the service gateway applies it to
+REST, and the SAME rule guards the stream handshake (`isStreamOriginAllowed`,
+`src/server/stream/mount.ts`, one definition in `src/shared/origin.ts`), while the
+standalone listener sends no CORS headers at all. That is why a cross-origin page dials the
+service mount and never `:5181`.
 
-Each SSE `data:` frame is one of:
+### Live updates (the WebSocket stream)
 
-```ts
-| { type: 'turn'; turn: SessionTurn }               // legacy: opens the run;
-                                                    // watch: an UPSERT by turn id
-| { type: 'event'; turnId; event; at?; usage? }     // `at` = epoch-ms stamp,
-                                                    // `usage` = running tally
-| { type: 'snapshot'; session: SessionSnapshot }    // complete state
-| { type: 'failed'; error; session }                // legacy run failed
-```
+There is ONE live channel: `GET /v1/harness/stream`, upgraded with the `harness.v1`
+subprotocol (`HARNESS_WS_SUBPROTOCOL`, `src/shared/harness-api.ts`). A plain `GET` on that
+path is a `400` — `GET /stream expects a WebSocket upgrade (Sec-WebSocket-Key/Version) for
+the harness.v1 subprotocol.` — and there is no SSE route left: the run-owning
+`POST …/messages` stream and the `GET …/events` watcher were deleted rather than aliased,
+and neither ever owned the execution of a queued task.
 
-The legacy `POST .../messages` stream owns its run: closing the response aborts it.
-The `GET .../events` watcher stream reuses the same shapes but never owns
-execution — `turn` is an upsert for the queued, running, and terminal state of one
-id, it opens with one `snapshot`, and it ends with one `snapshot` when the queue
-drains. Closing the watcher only unsubscribes; the server pump keeps running for
-nobody, which is why a reload or a hidden tab costs nothing.
+Both frame vocabularies are CLOSED (`src/shared/harness-stream.ts`):
+
+| direction | frames |
+|---|---|
+| client → server | `hello` · `subscribe` · `unsubscribe` · `ack` · `ping` · `bye` |
+| server → client | `welcome` · `subscription_state` · `update` · `resync_required` · `error` · `heartbeat` · `pong` |
+
+- **`hello`** is optional and is the ONLY resume input: it carries the last `epoch` and
+  `cursor` the client applied, and it counts only as the first frame of a connection (a
+  late one is refused with `late_hello`). With no `hello`, every subscription starts fresh
+  at the server's current position.
+- **`subscribe`** is discriminated by `scope`, and the ids ARE the contract: `global` takes
+  none, `session` takes `session_id`, `thread` takes `session_id` + `thread_id`, `turn`
+  takes `session_id` + `turn_id`. Narrowing a session subscription by conversation is a
+  `thread_id` FILTER — a filter removes frames, it does not name a resource. `pace` is
+  `ordered` (default) or `ack`, and an `ack` names the highest sequence the client applied.
+- **`welcome`** arrives before anything else with the process `epoch` and the `limits` of
+  THIS connection; one `subscription_state` follows per subscription, carrying its baseline
+  `revisions`, its `seq`, and `replayed_frames` when the server had history to send. A
+  client reconciles against those numbers instead of assuming a position.
+- **`update`** carries one of sixteen kinds, and no kind carries a session tree:
+  `session.updated`, `turn.upsert`, `turn.removed`, `display.ops`, `usage.updated`,
+  `action.opened`, `action.closed`, `thread.upsert`, `thread.removed`, `transcript.updated`,
+  `records.updated`, `tool.registry_updated`, `agent.registry_updated`, `run.event` (opt-in
+  raw events), `catalogue.updated`, `config.updated`. A `display.ops` frame is at most 32
+  addressed ops with each append bounded at 2,000 characters, and `records.updated` carries
+  two watermarks and no records at all.
+- **`resync_required`** is recovery: a cursor from a previous epoch, or one older than the
+  replay window (512 frames / 60 s), answers `epoch_mismatch` or `cursor_expired` with the
+  `link`ed reads to re-fetch — bounded pages, never a snapshot boot.
+- **`heartbeat` / `pong`** keep the connection honest: one heartbeat per 15 s, and three
+  missed intervals close it with code `4408`.
+
+The counter policy is the REST policy: cursors are opaque base64url(`epoch:sequence`),
+revisions restart at 1 per resource and are compared only WITHIN one epoch, and the epoch
+rides every REST response as `X-Harness-Epoch` beside each read's `X-Harness-Revision`.
+Protocol problems are `error` frames with one closed code (`invalid_payload`,
+`unknown_subscription`, `unknown_resource`, `unsupported_filter`, `late_hello`,
+`too_many_subscriptions`, `frame_too_large`, `rate_limited`, `internal`), and the whole
+budget is `HARNESS_WS_STREAM_LIMITS`: 64 subscriptions per connection, 32 client messages
+per second, 16 KiB in / 64 KiB out per frame, a 256-frame / 1 MiB send queue, and a 10 s
+sustained-stall cut.
+
+The browser keeps exactly ONE of these connections per page (`src/frontend/stream.ts`):
+every pane is a scoped subscription on it, a gap (`sequence > expected`) re-subscribes THAT
+subscription instead of painting a wrong view, and a dropped socket never cancels a task —
+execution is server-owned, so the socket re-opens an OBSERVATION and nothing else, and with
+no socket at all the UI keeps working from bounded reads.
 
 ### Per-thread CPU isolation (`threadExecution: 'worker'`)
 
 By default the server is single-threaded in the honest sense: every session's turns
 interleave on one event loop, and the sentence in [The loop](#the-loop) still holds —
-a CPU-bound tool body blocks that loop, so a sibling conversation, an SSE stream and
-an HTTP read all wait for it.
+a CPU-bound tool body blocks that loop, so a sibling conversation, a live stream frame
+and an HTTP read all wait for it.
 `threadExecution: 'worker'` removes that limitation for **server-hosted** sessions:
 each live conversation executes on its own OS worker thread.
 
@@ -2884,8 +3037,8 @@ What moves to the lane worker, and what does not:
 | Runs on the lane worker | Stays on the coordinator |
 |---|---|
 | the agent loop, provider stream handling, and **every tool body** (sync, CPU-heavy, or created by `toolCreate`) | the **canonical** harness and session document |
-| a queued thread turn **and** the legacy root `POST .../messages` run | persistence, the event journal, the display view, and every SSE response |
-| a session-bound manual `POST .../tools/:name` call and a slash `/command` (both on the session's operator lane) | the single-flight gate, the queue pump, and cancellation classification |
+| a queued thread turn **and** the session's root (default-conversation) turn | persistence, the event journal, the display view, and every frame the coordinator publishes |
+| a session-bound manual `POST …/tools/:tool_id/executions` call and a slash `/command` (both on the session's operator lane) | the single-flight gate, the queue pump, and cancellation classification |
 | the guidance text of a focused submit, taken into the lane's own running conversation | the identity ledger, the writer leases, and the commit journal |
 | a `nested` child conversation | **not in worker mode at all** — every door that can start one is refused (see the limitation below), because the child would exist only inside that lane |
 
@@ -3005,7 +3158,7 @@ source module. A cold lane measures ~1.6–2.4 s in source mode (it rebuilds the
 harness, recompiles created-tool sources and restores the snapshot) and less against
 `dist/`; reclaim is always safe because the next turn rebuilds from committed state.
 
-Branch state is deliberately absent from snapshot v1 (a `harness.branch` listing belongs
+Branch state is deliberately absent from snapshot v2 (a `harness.branch` listing belongs
 to the run that created it), which is exactly why worker mode refuses `threadFork` rather
 than keeping a private branch the coordinator cannot list: a fork that ran on a lane would
 commit only its returned summary, and the branch detail would vanish with the lane. In
@@ -3025,7 +3178,7 @@ A durable server writes two things: the whole `harness/state.json` document (a
 two-space `JSON.stringify` of every session's every event) and one JSON line per
 harness event under `harness/sessions/<id>/events.jsonl`. Inline, both happen on the
 request loop, so a big checkpoint is a synchronous block that every other session and
-every open SSE stream pays for. `ioExecution: 'worker'` moves **the write side of
+every live stream connection pays for. `ioExecution: 'worker'` moves **the write side of
 durability** onto one IO worker thread per database root:
 
     HARNESS_IO_EXECUTION=worker yarn dev:server    # or runtime: { ioExecution: 'worker' }
@@ -3142,30 +3295,34 @@ duplicated the tile's own thread badge and cost a permanent row of height.)
   the composer paints submit + a separate `×` (`Stop all tasks`), which sends
   `POST /sessions/:id/cancel { all: true }`. With an empty field the inline action
   is already that stop, so only one control is shown.
-- **Deletion is authoritative at once.** `DELETE /sessions/:id/threads/:threadId`
-  returns the whole snapshot, and the client treats any authoritative snapshot that
-  no longer lists a thread the same way (so an API/other-tab deletion is learned
+- **Deletion is authoritative at once.** `DELETE /v1/harness/sessions/:id/threads/:threadId`
+  answers a SLIM receipt (`{ deleted: true, thread_id, session_id, removed_descendants,
+  removed_turns, revision }`), and the client treats any authoritative page that no
+  longer lists a thread the same way (so an API/other-tab deletion is learned
   identically): the thread's turns disappear, its focus is dropped — even while a
   pending optimistic row still names it — and any `#` reference chip that pointed at
   one of those turns is removed from the draft (the reader is told) instead of
   failing the next submit (a failed submit restores its draft without any dead
   reference). The deletion is also remembered locally — scoped to its session — so a
-  late snapshot, SSE turn or in-flight answer cannot bring the thread back,
+  late snapshot, stream update or in-flight answer cannot bring the thread back,
   re-focus it or delete a newer row. Labels of surviving blocks never change.
 
 Wire additions are optional and additive, so an older server keeps working: a
 snapshot without `threads` leaves the routing decision to focus alone, a turn
-without `threadId` renders no badge, and a submit with no target omits `threadId`
+without `threadId` renders no badge, and a submit with no target omits `thread_id`
 (the pre-thread body).
 
 ```
-POST   /sessions/:id/tasks                    { input, attachments?, references?, threadId? }
-GET    /sessions/:id/threads/:threadId/transcript                           -> { transcript }
-PUT    /sessions/:id/threads/:threadId/transcript { messages }              -> { session, transcript }
-POST   /sessions/:id/threads/:threadId/cancel { }   -> { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }
-POST   /sessions/:id/threads/:threadId/resume { }     -> the submit receipt, re-running the interrupted turn
-DELETE /sessions/:id/threads/:threadId                                  -> { deleted: true, session }
-POST   /sessions/:id/cancel                   { all: true }              -> { cancelled }
+POST   /v1/harness/sessions/:id/tasks       { input, attachments?, references?, thread_id? }
+GET    /v1/harness/sessions/:id/threads                    -> a PAGE of conversation rows
+GET    /v1/harness/sessions/:id/threads/:threadId/transcript -> { transcript } — state and SIZE only
+GET    /v1/harness/sessions/:id/threads/:threadId/transcript/document -> { document, transcript_state, revision, … }
+PUT    /v1/harness/sessions/:id/threads/:threadId/transcript { messages, if_revision? } -> a write receipt
+POST   /v1/harness/sessions/:id/threads/:threadId/cancel { }   -> { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }
+POST   /v1/harness/sessions/:id/threads/:threadId/resume { }   -> the submit receipt, re-running the interrupted turn
+DELETE /v1/harness/sessions/:id/threads/:threadId            -> { deleted: true, thread_id, session_id,
+                                                  removed_descendants, removed_turns, revision }
+POST   /v1/harness/sessions/:id/cancel      { all: true }      -> { cancelled }
 ```
 
 - The thread-cancel receipt is the store's own answer, never a constant: `cancelled` is
@@ -3193,28 +3350,51 @@ browser UI edits it. Only `messages` are editable: turns, events, statuses, time
 and `usage` stay server-owned history, because they are the record of what actually
 ran, not an input to it.
 
-`GET /sessions/:id/threads/:threadId/transcript` answers the editor's document
-(`ThreadTranscriptResponse`, `src/server/protocol.ts`):
+**Three reads, because they cost different things.** `GET
+/v1/harness/sessions/:id/threads/:threadId/transcript` answers METADATA only
+(`{ transcript }`: `transcript_state`, `message_count`, `chars`, `bytes`, `revision`,
+`role_counts`, and `unreadable_reason?`) — the row a client opens with, at constant size.
+`GET …/transcript/messages` pages the entries (`limit`/`cursor`, optional `role` filter,
+and `total` counting the WHOLE transcript so a filter never renumbers the cursor). The
+editor reads `GET …/transcript/document` (`TranscriptDocumentResponse`):
 
 ```json
 {
-  "transcript": {
-    "threadId": "0f0d…",
-    "agent": "instruct",
-    "messages": [{ "role": "user", "content": "draft a plan" }],
-    "raw": "[\n  {\n    \"role\": \"user\",\n    \"content\": \"draft a plan\"\n  }\n]"
-  }
+  "session_id": "ses_01…",
+  "thread_id": "0f0d…",
+  "agent": "instruct",
+  "revision": 7,
+  "transcript_state": "ok",
+  "document": "[\n  {\n    \"role\": \"user\",\n    \"content\": \"draft a plan\"\n  }\n]",
+  "content_type": "application/json"
 }
 ```
 
-- `messages` is the LIVE transcript the model will be sent next;
-- `raw` is the pretty-printed (2-space) JSON the editor holds and edits;
-- `invalid: { error, messages }` is present **only** when the stored value cannot be
-  read — then `messages` is the placeholder and `raw` is the broken value verbatim.
+- `document` is the pretty-printed (2-space) JSON the editor holds and edits, generated
+  from the LIVE transcript the model will be sent next;
+- when the stored value cannot be read, `transcript_state` is `"unreadable"` and
+  `document` is the BROKEN value verbatim — the text the operator is fixing;
+- there is NO session-level transcript path: the DEFAULT conversation is addressed by
+  its own `thread_id` (an `agent:<name>` row), and every transcript route names one
+  `threads/:thread_id`.
 
-`PUT /sessions/:id/threads/:threadId/transcript` with body `{ messages }` replaces the
-whole transcript and answers `{ session, transcript }` — the post-write snapshot plus
-the same document — so a client repaints everything from one response.
+`PUT …/transcript` with body `{ messages, if_revision? }` replaces the whole transcript
+and answers a SLIM RECEIPT (`TranscriptWriteReceipt`), never the mutated aggregate:
+
+```json
+{
+  "session_id": "ses_01…",
+  "thread_id": "0f0d…",
+  "accepted_as": "transcript",
+  "message_count": 1,
+  "revision": 8,
+  "links": { "transcript": "…", "messages": "…", "document": "…" }
+}
+```
+
+`accepted_as` is `"raw"` when the submitted value was stored as unreadable, and then
+`invalid: { error, stored_type }` says why; `links` points back at the three reads so a
+client repaints from one response.
 
 **A broken value is a successful write.** `messages` is deliberately `unknown`
 (`UpdateThreadTranscriptRequest`): any JSON value round-trips. A structurally invalid
@@ -3235,8 +3415,8 @@ from silently emptying a transcript.
 | `200` | a valid replacement, **or** a value that is not a readable transcript (it is stored and reported as unreadable) |
 | `400` | absent `messages`, or a body that is not an object |
 | `404` | unknown session or unknown thread. On `GET`, a thread that survives only in the unreadable map is still served — its raw value is the useful part |
-| `405` | any method other than `GET` / `PUT` |
-| `409` | the thread is running (stop it first), or the session's harness handle predates `setThreadMessages` |
+| `405` | a verb the path does not take: the transcript path serves `GET`/`PUT`, and the document is its own path (`…/transcript/document`, `GET` only) |
+| `409` | the thread is running (stop it first), the session's harness handle predates `setThreadMessages`, **or** `if_revision` did not match — `This transcript is at revision N; the write expected M. Re-read before writing.` |
 
 Live work is refused twice, on purpose: the store checks the thread record and its
 execution lane before touching anything, and `harness.setThreadMessages(threadId,
@@ -3308,8 +3488,9 @@ unreadable file, malformed JSON, an unknown database version, an invalid record 
 or a malformed `invalidThreads` map still aborts startup — and a failed load never
 rewrites the operator's file.
 
-The browser client surface is `getThreadTranscript(sessionId, threadId)` and
-`updateThreadTranscript(sessionId, threadId, messages)` (`src/frontend/api.ts`); the
+The browser client surface is `getTranscriptMetadata(id, threadId)`,
+`listTranscriptMessages(id, threadId, …)`, `getTranscriptDocument(id, threadId)` and
+`putTranscriptDocument(id, threadId, messages, ifRevision?)` (`src/frontend/api.ts`); the
 dialog is `src/frontend/ui/thread-transcript.ts`. A Save parses locally first (invalid
 JSON keeps the text in the editor and never sends it), and a refresh never overwrites
 the textarea — only an explicit Save, Cancel, or opening a different thread does — so
@@ -3334,9 +3515,11 @@ an unrelated stream frame cannot destroy an in-progress repair.
   is pending; switching harness or session is allowed and only unsubscribes the
   observer, because the work belongs to the server.
 - **Reload and switching recover from the record.** Selecting a session that still
-  has work opens one `GET /events` observer (a submit also opens or reopens it); a
-  lost stream falls back to `GET /sessions/:id` polling at 1 s (up to about two
-  minutes), and a reload re-reads the snapshot, reconciles turns by id, and reopens
+  has work opens one `GET /v1/harness/stream` observer (a submit also opens or reopens
+  it); a lost socket is re-opened with its
+  `hello` cursor, and while none is open the pane keeps working from bounded reads
+  (`GET /v1/harness/sessions/:id/turns` paged), reconciling turns by id, until the
+  observer
   the observer when work is still pending. A settled turn never re-animates, and a
   queued task lights nothing.
 - **A turn stays `running` while background work is pending.** `done` is per
@@ -3364,7 +3547,7 @@ an unrelated stream frame cannot destroy an in-progress repair.
   rendering in a browser.
 
 The sidebar's **Tools** tab lists the whole catalogue — the session-bound core tools
-first, then every direct-call tool — and calls `POST /api/tools/:name` for all of
+first, then every direct-call tool — and calls `POST /v1/harness/tools/:id/executions` for all of
 them. Execution is server-side only; nothing in the browser runs a tool. The
 direct-call entries really run there, so the path exercises the same `execute` a
 session registers, including `shell`, the file tools, and a configured
@@ -3396,7 +3579,8 @@ needs no key); a host that did not enable it still sees the row, listed as
 core, so the model needs no `toolRequest` round to research a page.
 
 **Cancellation is cooperative and signal-based.** Aborting a run
-(`POST /sessions/:id/cancel`, `DELETE /sessions/:id`, or a closed legacy stream)
+(`POST /sessions/:id/cancel`, `DELETE /sessions/:id`, or a per-thread stop —
+NOT a closed stream: dropping the WebSocket cancels nothing)
 signals every call that is running, and `toolCancel({ callId })` targets one call.
 `toolCancel` logically settles/aborts that call's own task; its late result is
 ignored, and cancelling an already settled (or already cancelled) call succeeds
@@ -3431,7 +3615,7 @@ allow the port through the firewall only there.
 
 `src/frontend/vite.config.ts` no longer aliases `@underload/harness` or stubs
 `node:`: the browser bundle never reaches the package. `yarn dev:frontend` starts
-Vite only and proxies `/api` to the service gateway; `yarn dev:server` is the
+Vite only and proxies `/v1/harness` to the service gateway; `yarn dev:server` is the
 separate standalone API launcher (explicit, no Vite). Production hosting is the
 service gateway below.
 
@@ -3504,7 +3688,7 @@ first builds the UI for the gateway prefixes (`/harness/` page base,
 `/v1/harness` API root) and then imports the service entry without changing the
 repository-root cwd, so harness tools keep resolving the repository as their
 project root. That entry scans the repository root, so the two modules above are
-discovered. The frontend dev launch expects this service (its `/api` proxy
+discovered. The frontend dev launch expects this service (its `/v1/harness` proxy
 targets `http://127.0.0.1:5000/v1/harness`). This package ships no generic
 `start`/`serve` script: the gateway owns the normal listener, and nothing starts
 a harness server implicitly. `startHarnessServer()` remains an explicit API; the
@@ -3530,16 +3714,43 @@ create sessions and drive tools, so use this only on a trusted network.
 
 ```json
 {
-    "rootPath": "/v1/harness",
-    "presets": [{ "name": "general", "title": "General", "requiresEndpoint": true, "primary": "general", "subagents": [], "agents": ["general"], "tools": ["…the shared toolbox…"], "coreTools": ["toolRequest", "tasks"], "builtin": true, "editable": true }],
-    "agents": [{ "name": "instruct", "title": "Instruct", "description": "…", "instruction": "…", "guidelines": ["…"] }],
-    "tools": [{ "name": "toolRequest", "group": "Core tools", "tags": ["discovery"], "visibility": "core", "sessionBound": true, "parameters": {}, "availability": { "state": "available", "hint": "Runs inside a session harness: send a sessionId with the call." } }, { "name": "read", "group": "Package presets", "tags": ["files"], "visibility": "core", "parameters": {} }],
-    "defaults": { "baseURL": "…", "model": "…", "hasApiKey": true },
-    "sessions": []
+  "api_root": "/v1/harness",
+  "service": "noobscript-harness",
+  "api_version": "v1",
+  "server_time": 1762819200000,
+  "epoch": "01jfh2xz8q4t9v3w7y5kcm2p1r",
+  "capabilities": {
+    "websocket_stream": true, "tool_execution": true, "tool_registration": true,
+    "transcript_editing": true, "command_dispatch": true, "model_discovery": true,
+    "harness_definition_writes": true, "agent_writes": true, "persistent_threads": true
+  },
+  "limits": {
+    "body_bytes": 1000000, "submit_body_bytes": 16777216, "input_chars": 200000,
+    "pending_tasks": 100, "thread_records": 256, "attachments_per_turn": 4,
+    "attachment_bytes": 4194304, "total_attachment_bytes": 8388608,
+    "result_references": 16, "pending_actions": 4, "steer_records": 64,
+    "created_tools": 32, "tool_result_bytes": 262144,
+    "page_limit_default": 25, "page_limit_max": 100
+  },
+  "links": {
+    "self": "/v1/harness", "health": "/v1/harness/health", "config": "/v1/harness/config",
+    "harnesses": "/v1/harness/harnesses", "agents": "/v1/harness/agents",
+    "tools": "/v1/harness/tools", "plugins": "/v1/harness/plugins",
+    "models": "/v1/harness/models", "sessions": "/v1/harness/sessions",
+    "stream": "/v1/harness/stream"
+  }
 }
 ```
 
-`rootPath` is the **API URL this document was served from**, not a filesystem
+This document is **constant size** (`ServiceInfo`, `src/shared/harness-api.ts`): it
+carries identity (`api_root`, `service`, `api_version`, optional `build_version`,
+`server_time`), the per-process `epoch` every revision and stream cursor is compared
+within, the capability advertisement, the enforced `limits` (the same numbers a refusal
+quotes — 100 pending tasks, 4 attachments per turn, 25/100 page limit), and the link map
+a client follows from there. NO harnesses, agents, tools or sessions are embedded: each is
+its own paged read, so booting costs one small response instead of the whole catalogue.
+
+`api_root` is the **API URL this document was served from**, not a filesystem
 path. There is deliberately no advertised workspace root: the file and command
 tools resolve relative paths against the server process's working directory
 (`process.cwd()`) and have no sandbox or fence, so a file-root option would
@@ -3641,49 +3852,56 @@ exist while the session snapshot does not include its result yet. The interrupte
 turn is marked and its recorded events are kept, but it is never replayed — that is
 deliberate, so no tool operation can run twice.
 
-The rest of the surface is the same table as `/api`, one level below the mount:
+The paths below are the SAME dispatcher the standalone listener serves — one mount, one
+bootstrap document, one error shape — printed here for scanning. The endpoint table in
+[Server and UI](#server-and-ui) is the full list, including every child route:
 
 ```text
 GET    /v1/harness                        bootstrap document
-GET    /v1/harness/health                 liveness + session count
-GET    /v1/harness/harnesses              harness descriptors + defaults + agents
-GET    /v1/harness/presets                alias of /harnesses
+GET    /v1/harness/health                 liveness probe
+GET    /v1/harness/config                 global provider defaults + runtime facts
+PATCH  /v1/harness/config                 change the global defaults
+GET    /v1/harness/harnesses              harness descriptors (paged)
 POST   /v1/harness/harnesses              create a harness → 201 { harness }
-GET    /v1/harness/harnesses/:name        read one harness -> { harness }
-PATCH  /v1/harness/harnesses/:name        change any harness
-DELETE /v1/harness/harnesses/:name        remove any harness → 200 { deleted: true }
-GET    /v1/harness/agents                 trusted agent registry
-GET    /v1/harness/tools                  full catalogue (session-bound core first)
-GET    /v1/harness/tools/bootstrap        alias of /tools
-POST   /v1/harness/tools/:name            call one tool (sessionId only for session-bound tools)
-POST   /v1/harness/tools/:name/call       alias of the call route
-POST   /v1/harness/models                 server-side GET {baseURL}/models
-GET    /v1/harness/sessions               session snapshots (with turns)
-POST   /v1/harness/sessions               create a session
-GET    /v1/harness/sessions/:id           one snapshot (with turns)
-PATCH  /v1/harness/sessions/:id           retarget agent models (next request)
+GET    /v1/harness/harnesses/:name        read one harness → { harness }
+PATCH  /v1/harness/harnesses/:name        change one
+DELETE /v1/harness/harnesses/:name        remove one
+GET    /v1/harness/harnesses/:name/instructions[/:agentId]   member instruction text
+GET/PATCH/DELETE /v1/harness/agents/:id   trusted agent profiles
+GET    /v1/harness/tools[/:id]            catalogue
+PATCH  /v1/harness/tools/:id              enable/disable one entry for every session
+POST   /v1/harness/tools/:id/executions   run a catalogue tool, no session
+GET    /v1/harness/plugins                built-in plugins + their settings
+PATCH  /v1/harness/plugins/:id            change one plugin's settings
+POST   /v1/harness/models                 server-side GET {base_url}/models
+GET    /v1/harness/sessions               paged SessionSummary rows (no children)
+POST   /v1/harness/sessions               create → 201 { session }
+GET    /v1/harness/sessions/:id           metadata + live agent_models (no turns)
+PATCH  /v1/harness/sessions/:id           retarget agent_models (next request)
 DELETE /v1/harness/sessions/:id           forget a session
-POST   /v1/harness/sessions/:id/messages  legacy task → text/event-stream (owns the run)
-POST   /v1/harness/sessions/:id/tasks     queue a task, or run a `/command` → 202 { session, turn }
-GET    /v1/harness/sessions/:id/events    watch the queue → text/event-stream
-POST   /v1/harness/sessions/:id/reset     reset agents, discovery, tasks, records
-POST   /v1/harness/sessions/:id/cancel    cancel active work ({ all } also drops the queue)
-POST   /v1/harness/sessions/:id/actions/:requestId/answer   answer one pending actionRequest
-GET    /v1/harness/sessions/:id/threads/:threadId/transcript       one transcript (editable JSON)
-PUT    /v1/harness/sessions/:id/threads/:threadId/transcript       replace it → { session, transcript }
-POST   /v1/harness/sessions/:id/threads/:threadId/resume           re-run a halted (stopped OR idle) conversation's unanswered turn → 200 submit receipt
+GET    /v1/harness/sessions/:id/definition|usage|commands|records
+POST   /v1/harness/sessions/:id/tasks     submit a task, or run a `/command` → 202 TaskReceipt
+GET    /v1/harness/sessions/:id/turns[/:id][/display|/events|/context]
+POST   /v1/harness/sessions/:id/reset|cancel
+GET    /v1/harness/sessions/:id/queue|actions
+POST   /v1/harness/sessions/:id/actions/:request_id/answer   answer one pending actionRequest
+GET    /v1/harness/sessions/:id/agents[/:agentId] · tools · threads
+POST   /v1/harness/sessions/:id/tools[/:tool_id][/executions]
+GET/PUT /v1/harness/sessions/:id/threads/:thread_id/transcript[/messages|/document]
+POST   /v1/harness/sessions/:id/threads/:thread_id/cancel|resume
+GET    /v1/harness/stream                 the harness.v1 WebSocket (live updates)
 ```
 
 A `POST …/tasks` whose `input` starts with `/` is executed as a slash command in the
-server process and answers `202` with an already-terminal turn; the legacy `/messages`
-route keeps sending such a line to the model
-(see [Slash commands](#slash-commands)).
+server process and answers `202` with an already-terminal turn (see
+[Slash commands](#slash-commands)).
 
-**Standalone `/api` compatibility is unchanged.** The `/api` root stays a 404 (it
-has no bootstrap document), every `/api` request still needs
-`X-Harness-Client: ui`, and `/api/presets` exists as an alias of `/api/harnesses`.
-The canonical mount does not use that header: the service loader installs
-permissive CORS, so a custom header is not an access boundary there.
+**One mount, one dispatcher.** `HARNESS_API_ROOT` (`/v1/harness`) is the only mount on
+either host, and the legacy `/api` root is not mounted at all: a request to it answers
+`This server serves /v1/harness; "/api" is not mounted.` The `/presets`, `/views`,
+`/tools/bootstrap` and `/tools/:name/call` aliases were deleted rather than kept behind a
+flag, and so was the `X-Harness-Client: ui` header gate — the service loader installs
+permissive CORS, so a custom header was never an access boundary there.
 
 **Access control is an Origin gate, not authentication.** The service app is built
 with `cors({ origin: '*', allowHeaders: '*' })`, and it listens on `0.0.0.0` by
@@ -3802,8 +4020,8 @@ What the client cannot do alone:
 - **CORS / Private Network Access** — already satisfied by the service loader
   (`cors({ origin: '*', allowHeaders: '*' })` plus
   `Access-Control-Allow-Private-Network: true`), which is why the Pages UI must dial
-  the **service** mount, not the standalone `:5181` server (that one has no CORS
-  answer for its `X-Harness-Client` header, so a cross-origin preflight fails).
+  the **service** mount, not the standalone `:5181` server (that one sends no CORS headers
+  at all, so any cross-origin preflight fails against it).
 - **Mixed content** — Pages serves HTTPS while the harness serves plain HTTP.
   Browsers exempt `localhost`/`127.0.0.1`, but Chrome blocks an HTTPS page fetching a
   plain-HTTP LAN address, so the third entry needs relaxed mixed-content blocking or an
@@ -3843,10 +4061,11 @@ not in this package.
 
 **Sessions and reloads.** The server, not the browser, owns the transcript. Each
 task is a turn with stable `id`/`index`, and every streamed event names its turn
-(`{ type: 'turn' }` opens a legacy run; `GET /events` sends the same id as an
-upsert). Reloading the UI re-reads `sessions` from the bootstrap document (or
-`/sessions`), which already contains every turn and its events, then reopens the
-`GET /events` watcher; if that stream is lost the UI polls the session instead.
+and every live frame names it too: a `turn.upsert` update carries the turn row and its
+id). Reloading the UI re-reads the bounded paged reads (`GET /v1/harness/sessions` and
+`GET /v1/harness/sessions/:id/turns`), which already contain every settled turn and point
+at its recorded events, then re-subscribes on the one `GET /v1/harness/stream` socket; if
+no socket is open the UI still works from those reads.
 Queued and running work belongs to the server, so a reload, a hidden tab, or a
 closed watcher never cancels it. With a database root, sessions, turns, created
 tools, discovery, tasks, and the queued backlog are durable under
@@ -3870,7 +4089,7 @@ yarn typecheck         # tsc --noEmit
 yarn build             # library + server + client entries -> dist/
 yarn build:frontend    # the UI application -> src/frontend/dist (standalone/deploy base)
 yarn cli --list        # CLI preset catalogue
-yarn dev:frontend      # Vite UI on all interfaces, dual-stack (LAN + localhost), /api -> the service on :5000
+yarn dev:frontend      # Vite UI on all interfaces, dual-stack (LAN + localhost), /v1/harness -> the service on :5000
 yarn dev:server        # optional standalone API on :5181 (no Vite/UI)
 yarn start-service     # repo root: builds UI for /harness/, serves it + /v1/harness on :5000
 yarn build:harness-ui  # repo root: rebuild just the gateway UI (/harness/ base)
@@ -3881,21 +4100,41 @@ yarn build:harness-ui  # repo root: rebuild just the gateway UI (/harness/ base)
 The package is publishable to npm as `@underload/harness`.
 
 ```bash
-yarn build      # five ESM entries + their .d.ts tree -> dist/
-yarn publish    # prepublishOnly runs: typecheck -> test -> build -> test:package -> test:package:runtime
+yarn build      # browser entry, then the SIX Node ESM entries (index / server / frontend /
+                # shared / worker / io-worker) + their .d.ts tree -> dist/
+yarn publish    # prepublishOnly runs, in order: typecheck -> test -> build ->
+                # test:package:files -> test:package -> test:package:runtime -> test:package:tools
 ```
 
-- **The library entry is stable: `src/harness.ts`.** It is the published library
-  barrel (`harness()` / `agent()` / `tool()` plus every public type), and the tests
-  keep aliasing `@underload/harness` to it. JS is bundled by Vite into
-  `dist/underload-harness.mjs`; declarations are emitted to `dist/index.d.ts`.
+- **The library barrel is stable: `src/harness.ts`.** It is the published library
+  barrel (`harness()` / `agent()` / `tool()` plus every public type), which the Node root
+  `src/index.ts` re-exports — and `src/index.ts` is the entry the published package
+  resolves: `main`/`module`/`types` point at it (`package.json:6-8`), `exports` serves it
+  under the `development` condition (`package.json:17`), and the `node`/`import`/`default`
+  answer is the built `dist/underload-harness.mjs` (`package.json:18-20`, the
+  **Entries and conditions** bullet below). The bare `@underload/harness` specifier in tests resolves
+  through `package.json` `exports.development` onto those `src/` TypeScript entries —
+  `vitest.config.ts` has **no `resolve.alias`**, so a test can never assert a stale bundle
+  (the full note is under [TypeScript consumers](#typescript-consumers)). JS is bundled by
+  Vite into `dist/underload-harness.mjs`; declarations are emitted to `dist/index.d.ts`.
 - **The JavaScript application also lives under `src/`, next to the library:**
-  `src/server` (HTTP API, sessions, SSE, catalogue presets, CLI, discovered service
+  `src/server` (HTTP API, sessions, the WebSocket stream, catalogue presets, CLI, discovered service
   routes), `src/frontend` (browser client + app shell) and `src/shared` (helpers
-  both trees evaluate). Each has its own barrel that becomes a published entry.
-- **Entries and conditions.** `exports` maps the root to `src/index.ts` for
-  `node`/`import` (library + shared + server + client) and to `src/browser.ts` for
-  `browser` (library + shared + client, never the server tree). `./server`,
+  both trees evaluate). Each has its own barrel that becomes a published entry, and the
+  Node build emits **six** entries in all: those three, `index`, and the two worker
+  EXECUTABLES — `./worker` (`src/server/workers/lane-worker.ts`) and `./io-worker`
+  (`src/server/workers/io-worker.ts`), spawned as processes rather than imported as APIs
+  (`vite.config.ts:141-160`). The browser entry is built separately, before them
+  (`vite.config.ts:184-191`).
+- **Entries and conditions.** `exports` maps the root to `dist/underload-harness.mjs`
+  for `node`/`import` (library + shared + server + client); only the `development`
+  condition — what Vite/Vitest/vite-node select — maps it to `src/index.ts`
+  (CORRECTED IN PLACE 2026-11-11: this sentence used to say the root maps to
+  `src/index.ts` for `node`/`import`; that is `package.json:17`'s `development`
+  condition, while `:18-20` maps `node`/`import`/`default` to the built bundle). The
+  `browser` condition (`package.json:11-15`) maps to `src/browser.ts`
+  under `development` and to `dist/underload-harness.browser.mjs` by default
+  (library + shared + client, never the server tree). `./server`,
   `./frontend` and `./shared` expose each layer on its own. Every condition
   declares an **explicit `types` target**; nothing relies on implicit `.d.ts`
   sibling resolution.
@@ -3909,22 +4148,30 @@ yarn publish    # prepublishOnly runs: typecheck -> test -> build -> test:packag
   catalogue compiles it from its editable source instead (`prepareToolCandidate`), so
   the Node surface stays honest while `yarn tools:manifest` is only needed for the
   browser build.
-- `package.json` `files` ships all of `dist/` (entry, `.d.ts` tree, and the chunks),
-  so a consumer's `import { read }` still resolves its body after publishing.
-- `package.json` points `main` / `module` / `types` / `exports` at `dist/`;
-  tooling configs and tests never reach npm.
+- `package.json` `files` ships all of `dist/` (entry, `.d.ts` tree, and the chunks) **and
+  `src/`** — the sources the `development` condition resolves to — with tests, specs,
+  snapshots, `src/frontend/dist`, and nested `node_modules`/`.vite` excluded
+  (`package.json:59-70`), so a consumer's `import { read }` still resolves its body after
+  publishing.
+- `package.json` points `main` / `module` / `types` at `./src/index.ts`
+  (`package.json:6-8`); inside `exports` every shipped condition points at `dist/` except
+  `development`, which maps each entry onto its `src/` barrel. Tooling configs and tests
+  never reach npm.
 - **UI-only packages are devDependencies.** `marked`, `dompurify`,
   `highlight.js`, and `jsdom` are used only by `src/frontend/` (browser client and
   its jsdom tests), so they stay in `devDependencies`. The UI application build
   (`yarn build:frontend`) lands in `src/frontend/dist` for a static host or the
   standalone server, not in the published `dist/`.
-- **`dotenv` is the one runtime dependency, and it is external.** It is CommonJS
+- **`dotenv` and `typescript` are the only runtime dependencies, and both are external**
+  (`package.json:121-124`). `dotenv` is CommonJS
   (`require('fs')`/`require('path')`), so bundling it into the ESM output left
   rolldown with a `require` an ESM module cannot run — the built
   `loadEnvironmentFile()` threw and took `startHarnessServer()` with it. It is
   externalised in `vite.config.ts` and declared in `dependencies`; only the server
-  entry imports it. `yarn test:package:runtime` fails the release if that breaks
-  again.
+  entry imports it. `typescript` is in `dependencies` for the same reason: the tool-source
+  compiler imports it at RUN time (`src/core/tool-source.ts:246`), so it stays external and
+  ships with the package (`vite.config.ts:60-76`). `yarn test:package:runtime` fails the
+  release if that breaks again.
 - `sideEffects: false` + `exports` make the package tree-shakeable.
 - **`.env` is never bundled.** Package-relative paths are resolved by
   `src/server/package-root.ts` (a walk up to `package.json`), not by

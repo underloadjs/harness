@@ -68,7 +68,7 @@ All four are staged or documented omissions, not defects:
    two lines below does (`:144-150`), and a member that carries only `required` has no type to
    render, so `baseType` answers `unknown` (`:183`). Per-property `description` is not
    rendered anywhere: `objectBody` (`:188-217`) emits keys and optionality only, and
-   `jsdoc` (`:228`) is applied to the schema, not to its properties. So the property prose in
+   `jsdoc` (`:227`) is applied to the schema, not to its properties. So the property prose in
    `src/shared/harness-api.ts` is hand-authored, and `--check` was already red at HEAD
    ("harness contract types are stale", exit 1) — the file's real status quo is
    generated-plus-hand-patched, which the generated header does not say;
@@ -98,11 +98,11 @@ All four are staged or documented omissions, not defects:
 | The lane write has no worker-side route: no `setContextLane` under `src/server/workers`, and the `thread:status` commit digests only `status` + `label` | `src/server/workers/lane-commit.ts:685`, op set in the same file; `grep setContextLane src/server/workers` is empty |
 | Worker mode is the untested deployment shape and the default is inline | `src/server/sessions.ts:2736-2744` (the comment inside `contextLaneOf`), `src/server/config.ts:42` (`ThreadExecutionMode`), `:118` (`DEFAULT_THREAD_EXECUTION = 'inline'`) |
 | The `anyOf` branch ignores sibling `properties`; a `required`-only member renders `unknown` | `scripts/generate-harness-contract.mjs:141-142` vs `:144-150`, `:183`; spec body `src/server/harness.swagger.yaml:8417-8420` (`anyOf: [required: [included], required: [reasoningIncluded]]` with the real `properties:` map starting at `:8420`) |
-| Per-property `description` is never rendered, so the property doc blocks are hand-authored | `scripts/generate-harness-contract.mjs:188-217` (`objectBody`), `:222+` (`jsdoc`, schema-level only); spec prose that is therefore dropped: `src/server/harness.swagger.yaml:8458-8470` |
+| Per-property `description` is never rendered, so the property doc blocks are hand-authored | `scripts/generate-harness-contract.mjs:188-217` (`objectBody`), `:227` (`jsdoc`, schema-level only); spec prose that is therefore dropped: `src/server/harness.swagger.yaml:8458-8470` |
 | The regeneration's cost, measured: `PatchTurnBlockRequest` collapsed to `unknown \| unknown` and `TurnBlockWriteReceipt` lost its two property doc blocks, which is 13 `tsc` errors in the block-write route | `src/server/api.ts:4602-4620` (the two `body.<axis>` reads), `:4715-4727` (the receipt it answers with); `src/shared/harness-api.test.ts` "keeps the block-detail write body and receipt reachable through their declared keys" is the guard that now fails to compile on that collapse |
 | The generated header forbids hand edits while `--check` is red at HEAD | `src/shared/harness-api.ts:1-3`; `node scripts/generate-harness-contract.mjs --check` at `a2f36d7`: "harness contract types are stale: src/shared/harness-api.ts", exit 1 |
 | Producer half, no store: shipped plugin, real harness, lane sampled per request | `src/plugin/context-compaction.test.ts:2437-2522` (`lanes` sampled inside the stream, `expect(lanes).toEqual(['1', '1'])`), bump site `src/plugins/context-compaction.plugin.ts:1199-1203` |
-| Store half, no shipped plugin: hand-written bump between two recorded events, folded bar asserted | `src/server/threads.test.ts:286-340` (`laneFixture`), `:4125-4182` (`store.getView(...).displays[turn.id]` two-row expectation) |
+| Store half, no shipped plugin: hand-written bump between two recorded events, folded bar asserted | `src/server/threads.test.ts:286-340` (`laneFixture`), `:4124-4182` (`describe('display lane (C1)')` opens at `:4124`; its `store.getView(...).displays[turn.id]` two-row expectation closes the block at `:4182`) |
 | The chip's colors and the missing forced-colors rule | `src/frontend/styles.css:7643-7656` (`background: color-mix(... --bg-deep 78%, transparent)`, `color: var(--muted)`, no border), versus `:8013-8019` for `.context-bar-segment`; painted at `src/frontend/ui/context-bar.ts:571-583` |
 
 ## Proposal
@@ -167,3 +167,45 @@ Per item, smallest change first, alternatives noted:
   recorded here;
 - no re-running of the contract generator as part of closing items 3 or 4 — item 2 is the only
   one that may touch the generated file.
+
+## Update (2026-11-11)
+
+- **Re-anchored** — this issue was filed today, so almost nothing had moved: three cites, each by
+  a few lines. The store-half block is `src/server/threads.test.ts:4124-4182` (the Evidence row
+  said `:4125`, and `describe('display lane (C1)')` opens at `:4124`); the generator's `jsdoc`
+  helper is `scripts/generate-harness-contract.mjs:227` (the Why section said `:228` and the
+  Evidence row said `:222+`, which is the blank line above the `File writers` banner).
+- **Re-verified exact, no edit needed**: `src/server/sessions.ts:2745` (`contextLaneOf`) with the
+  worker-mode caveat at `:2736-2744` and the two stamp sites at `:7934` / `:6983`;
+  `src/server/workers/lane-commit.ts:685` (`case 'thread:status': {`) — the comment inside
+  `contextLaneOf` cross-references that same line and both are current;
+  `grep -rn setContextLane src/server/workers` is still empty; `src/server/config.ts:42`
+  (`ThreadExecutionMode`) and `:118` (`DEFAULT_THREAD_EXECUTION = 'inline'`);
+  `scripts/generate-harness-contract.mjs:141-142` (`const variants = node.oneOf ?? node.anyOf;`)
+  against the `allOf` branch at `:144-150` that does fold sibling `properties`, the `unknown`
+  fallback at `:183`, and `objectBody` at `:188-217`; the spec body at
+  `src/server/harness.swagger.yaml:8417-8420` (the `anyOf` pair, `properties:` at `:8420`) and the
+  dropped prose at `:8458-8470`; `src/server/api.ts:4602-4620` (the two `body.<axis>` reads) and
+  `:4715-4727` (the `TurnBlockWriteReceipt` it builds); `src/shared/harness-api.ts:1-3` (the
+  do-not-edit header); `src/plugin/context-compaction.test.ts:2437-2522` (the assertion is at
+  `:2521`) and the bump site `src/plugins/context-compaction.plugin.ts:1199-1203`;
+  `laneFixture` at `src/server/threads.test.ts:286-340`; the chip at
+  `src/frontend/styles.css:7643-7656` versus the `.context-bar-segment` rule at `:8013-8019`, and
+  the paint at `src/frontend/ui/context-bar.ts:571-583` (the accessible name is `:581`);
+  `src/frontend/records-style.test.ts:122`, `:508`.
+- **One claim re-measured, fresh today**: `node scripts/generate-harness-contract.mjs --check`
+  still answers `harness contract types are stale: src/shared/harness-api.ts` and exits 1, so item
+  2's "red at HEAD" is still the state of the tree. The check is read-only — the writer only
+  touches the file when `--check` is absent (`scripts/generate-harness-contract.mjs:627`) — so
+  re-running it changed nothing.
+- **Left as recorded, not re-run**: the `PatchTurnBlockRequest = unknown | unknown` collapse and
+  the 13 `typecheck` errors. Reproducing them means running the generator WITHOUT `--check`, which
+  overwrites `src/shared/harness-api.ts` — out of bounds for a documentation pass. The hand-
+  restored state the issue describes is still visible: `PatchTurnBlockRequest` at
+  `src/shared/harness-api.ts:2222` carries the per-property doc blocks the generator cannot emit.
+- **Cross-reference for whoever picks item 2 up**: 0017's update records that the Rust port now
+  carries the lane everywhere except the published contract field, and that field comes from this
+  same spec (`src/server/harness.swagger.yaml:8122`). Fixing the `anyOf` / `description` renderer
+  is what makes `ContextBlock.lane` land through a regeneration instead of by hand, so the two
+  issues should close in that order.
+- Status stays **Open**.

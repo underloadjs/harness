@@ -44,7 +44,7 @@ compaction**, no planning" (`src/core/agent.ts:3-11`), and the dependency-free r
 argues at length in its header. Compaction policy was placed at the plugin bus on purpose:
 `turn.before` is documented as "the ONLY hook whose return value matters (it may replace the
 transcript the provider is about to see) … that is what makes context compaction and the
-per-agent context limit possible" (`src/types/index.ts:3410-3414`).
+per-agent context limit possible" (`src/types/index.ts:3709-3713`).
 
 So the remaining gap is not a missing component. It is that the guard belongs nowhere in the
 documented request path, and the vocabulary for "this transcript is too big" does not exist on
@@ -55,13 +55,13 @@ the wire.
 | Fact | Source |
 |---|---|
 | `agent()` explicitly owns no compaction | `src/core/agent.ts:3-11` |
-| A streamed request posts the full transcript, unguarded | `src/transport/openai.ts:770-785` |
-| Every non-2xx collapses to one error frame carrying status + raw body text | `src/transport/openai.ts:792-796` |
-| No `contextWindow` / `maxPromptTokens` field on provider or agent configuration | `src/types/index.ts:410-434` (`HarnessSampling`, `HarnessProviderConfiguration`); grep `contextWindow\|maxPromptTokens` over `src/types/index.ts` → 0 matches |
-| The estimator is internal: defined in core, imported by the harness, never re-exported — re-checked **2026-11-09** and still true: the hybrid sibling (`estimateContextTokensHybrid`) landed with compaction T5.4 and is **also** not on the published surface (neither `src/core/index.ts` nor the root export block re-exports either name) | `src/core/context-estimate.ts:167` (`estimateContextTokens`), `:250` (hybrid), `:221` (`anchorFromUsage`); `src/harness.ts:388-392` (imports the hybrid), `:8621`/`:8632` (the two `turn.before` estimates), `src/core/context-pruning.ts:90,361` (the floor) — and grep `estimateContextTokens` over `src/index.ts` / the root `export {` block / `dist/index.d.ts` → no match |
-| The root barrel's public-surface block exports no context helper; the only star-export is types | `src/harness.ts:11403` (the `export { agent, tool, … }` public-surface block), `:11550` (`export type * from './types'`) |
-| The limit is plugin settings, not provider config, and is checked at the turn boundary | `src/plugins/context-compaction.plugin.ts:148` (`contextLimit`), `:196` (default), `:464`, `:476` (the comparison) |
-| A per-request retry re-sends the same oversized request, so an overflow costs the full backoff ladder; cancellation is the one existing non-retriable precedent | `src/core/agent.ts:354` (`isAbortError`), `:757-765` (the abort boundary — the rethrow before the backoff), `:25-30` (the retry-policy comment) |
+| A streamed request posts the full transcript, unguarded | `src/transport/openai.ts:812-837` |
+| Every non-2xx collapses to one error frame carrying status + raw body text | `src/transport/openai.ts:844-847` |
+| No `contextWindow` / `maxPromptTokens` field on provider or agent configuration | `src/types/index.ts:447-467` (`HarnessSampling`, `HarnessProviderConfiguration`), `:409-417` (`HarnessStreamRequest`); grep `contextWindow\|maxPromptTokens` over `src/types/index.ts` → 0 matches |
+| The estimator is internal: defined in core, imported by the harness, never re-exported — re-checked **2026-11-09** and still true: the hybrid sibling (`estimateContextTokensHybrid`) landed with compaction T5.4 and is **also** not on the published surface (neither `src/core/index.ts` nor the root export block re-exports either name) | `src/core/context-estimate.ts:167` (`estimateContextTokens`), `:250` (hybrid), `:221` (`anchorFromUsage`); `src/harness.ts:388-392` (imports the hybrid), `:9150`/`:9161` (the two `turn.before` estimates), `src/core/context-pruning.ts:90,361` (the floor) — and grep `estimateContextTokens` over `src/index.ts` / the root `export {` block / `dist/index.d.ts` → no match |
+| The root barrel's public-surface block exports no context helper; the only star-export is types | `src/harness.ts:11988` (the `export { agent, tool, … }` public-surface block), `:12135` (`export type * from './types'`) |
+| The limit is plugin settings, not provider config, and is checked at the turn boundary | `src/plugins/context-compaction.plugin.ts:377` (`contextLimit`), `:380`/`:439` (the default, written twice by design), `:657` (the resolved limit), `:1375`/`:1442` (the turn-boundary read and the comparison that fires the pass) |
+| A per-request retry re-sends the same oversized request, so an overflow costs the full backoff ladder; cancellation is the one existing non-retriable precedent | `src/core/agent.ts:405` (`isAbortError`), `:816` (the abort boundary — the rethrow before the backoff), `:25-30` (the retry-policy comment) |
 | README documents none of this — re-checked **2026-11-09**: `turn.before` now appears as the hook a context policy writes through (the transcript-routes paragraph and the `plugins` configuration row), but the README still never names the estimator, the `contextLimit` setting, or the shipped `context-compaction` plugin, and the `agent()` section still states only "no compaction" | grep `context-compaction\|contextLimit\|estimatedTokens\|estimateContextTokens` over `README.md` → 0 matches (grep `turn.before` → the flag/plugins rows); the "no compaction" line stands where it was |
 
 ## Proposal
@@ -125,4 +125,27 @@ the wire.
 - Cost accounting/UI (the server already folds usage per turn and per session).
 - Streaming a partial reply on overflow.
 - Changing where the compaction policy lives (the plugin bus is correct).
+
+## Update (2026-11-11)
+
+- **Anchors re-grounded** against the current tree; status stays **Open** and no
+  part closed. Re-checked on the way: `grep` for `contextWindow` /
+  `maxPromptTokens` over
+  `src/types/index.ts` is still 0 matches, `estimateContextTokens` is still
+  absent from the root public-surface block (`src/harness.ts:11988-12004` — only
+  `export type * from './types'` at `:12135` carries types out), and
+  `agent()` still owns "no compaction" (`src/core/agent.ts:3-11`,
+  `README.md:379`).
+- Re-pointed anchors: the unguarded full-transcript post is
+  `src/transport/openai.ts:812-837`, the non-2xx collapse `:844-847`; the
+  `turn.before` estimates are `src/harness.ts:9150`/`:9161` (the hybrid import
+  stays at `:388-392`); the compaction plugin's `contextLimit` is `:377` with its
+  duplicated default at `:380`/`:439`, the resolved limit at `:657` and the
+  turn-boundary read and comparison at `:1375`/`:1442`; the abort precedent is
+  `src/core/agent.ts:405` (`isAbortError`) and `:816` (the rethrow before the
+  backoff). The `turn.before` hook documentation this issue quotes moved to
+  `src/types/index.ts:3709-3713`.
+- `src/core/context-estimate.ts:167`/`:221`/`:250`,
+  `src/core/context-pruning.ts:90`/`:361`, `src/core/agent.ts:25-30` and
+  `README.md:12-14` were re-checked and are still exact.
 

@@ -2,18 +2,26 @@
 
 Status: **trimmed 2026-11-09 — the edges this file named have been closed one by one, and the
 closed ones (with their landing notes) have been REMOVED from this file rather than left as
-done-markers.** One task is still open: **T7 — no UI marker for an excluded turn.** Two
+done-markers.** One task is still open: **T7 — no marker for an excluded turn ON THE
+CONVERSATION BOARD.** (Updated 2026-11-11: the segment-dialog half of T7 landed on 2026-11-10 —
+the flag is now both shown and switchable there — so what is open is the board marker and the
+count, the savings figures, and the diagnostics UI; the T7 section records the landed half.) Two
 non-items are kept as one-line pointers because they are standing decisions a future change
 trades against: the deferral rule for per-call partial inclusion (unclaimed) and the two
 decision records T6.2 / T1.4, kept below. The stale "cooldown pollution is still there" framing
 from the closed branch-discriminator work is gone:
 the shipped compactor declines branch rounds outright
-(`src/plugins/context-compaction.plugin.ts:303` and `:460`, explained at `:36-39`), so the
+(`src/plugins/context-compaction.plugin.ts:751` (action) and `:1389` (guard), re-pointed
+2026-11-11, explained at `:32-43` and `:275`), so the
 cooldown map no longer accumulates `branch:<id>` keys. This file is not a defect report: every
 remaining item is a scope limit the stage chose on purpose.
 
 Line numbers describe the working tree reviewed on 2026-11-09; the names are the durable
 anchors and the *drift check* at the end lists the commands to re-verify them.
+**Update 2026-11-11:** T7 is still open, so its anchors, the substrate table and the T7.1–T7.3
+pointers have been re-pointed to the tree as it stands on that date. The claim that the frontend
+had **zero** consumers of `included` was overtaken by the segment dialog that landed on 2026-11-10
+and is marked `corrected` in T7.1 with its original text kept.
 
 Companion entries:
 [2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) (the framework work
@@ -49,44 +57,65 @@ self-contained.
 
 | Fact | Where |
 |---|---|
-| The flag itself: `included?: boolean` on all four `HarnessMessage` variants; absent/`true` = included, only `false` is stored | `src/types/index.ts:173`, `:191`, `:208`, `:269`; the single normalization point is `withIncluded` in `src/core/agent.ts` |
-| A stable address for an entry, so a marker can name the turn it dimmed | `messageId` on all four variants (`src/types/index.ts:173`, `:191`, `:208`, `:269`), minted by `src/core/message-id.ts` |
-| The live metric a UI would have to agree with | `currentEstimatedTokens()` (`src/types/index.ts:3832`, implemented in `src/harness.ts`), the same estimator the context bar uses (`src/core/context-estimate.ts:17-19`) |
-| The branch discriminator, already exposed and already consumed by the shipped compactor | `actorKey` `:3797`, `branchId` `:3804` |
-| The per-pass diagnostic a UI could show, end to end on the server side | producer `api.report.diagnostic` (`src/plugins/context-compaction.plugin.ts:334` below the floor, `:378` the pass report); server journal `notePluginDiagnostic` (`src/server/sessions.ts:3008-3028`), bounded by `PLUGIN_DIAGNOSTIC_LIMIT`, durable through `HarnessSessionRecord.pluginDiagnostics`; projected as `plugin_diagnostics` (`src/server/api-reads.ts:241-243`); typed in the client contract (`src/shared/harness-api.ts:961`) |
+| The flag itself: `included?: boolean` on all four `HarnessMessage` variants; absent/`true` = included, only `false` is stored | `src/types/index.ts:182`, `:196`, `:212`, `:298` (re-pointed 2026-11-11); the single normalization point is `withIncluded` in `src/core/agent.ts` |
+| A stable address for an entry, so a marker can name the turn it dimmed | `messageId` on all four variants (`src/types/index.ts:182`, `:196`, `:212`, `:298`), minted by `src/core/message-id.ts` |
+| The live metric a UI would have to agree with | `currentEstimatedTokens()` (`src/types/index.ts:4150`, implemented in `src/harness.ts`), the same estimator the context bar uses (`src/core/context-estimate.ts:17-19`) |
+| The branch discriminator, already exposed and already consumed by the shipped compactor | `actorKey` `:4115`, `branchId` `:4122` |
+| The per-pass diagnostic a UI could show, end to end on the server side | producer `api.report.diagnostic` (`src/plugins/context-compaction.plugin.ts:788` below the floor, `:832` the pass report); server journal `notePluginDiagnostic` (`src/server/sessions.ts:3239-3262`), bounded by `PLUGIN_DIAGNOSTIC_LIMIT` = 24 (`src/server/protocol.ts:626`), durable through `HarnessSessionRecord.pluginDiagnostics`; projected as `plugin_diagnostics` (`src/server/api-reads.ts:249-256`); typed in the client contract (`src/shared/harness-api.ts:978`) |
 
 ## Tasks
 
 ### T7 — UI and observability
 
-The flag works and persists; nothing in the product shows it. After a compactor prunes 30
-units, the visible conversation tells you nothing, and the context bar's number moves with no
-explanation.
+The flag works and persists; the BOARD shows nothing (as of 2026-11-10 the segment dialog does —
+the note below records that half). After a compactor prunes 30 units, the visible conversation
+tells you nothing, and the context bar's number moves with no explanation.
 
 > **Landed 2026-11-10 (the segment dialog half, and the write path it needed).** A context-bar
 > segment now states its state as a colour plus an `aria-hidden` glyph (`src/frontend/ui/context-detail.ts`
-> `blockDetailFactsOf`/`createFact`, styled off `[data-tone]` in `src/frontend/styles.css`), and its
-> inclusion is a real `<button aria-pressed>` that reads `in the prompt` / `excluded from context`.
+> — the chip is `inclusionFactOf` at `:297-313`, feeding `blockDetailFactsOf`/`createFact`, styled
+> off `[data-tone]` in `src/frontend/styles.css`), and its inclusion is a real `<button
+> aria-pressed>` (`:319` decides when the chip is a control rather than a statement, `:693` sets the
+> pressed state) that reads `in the prompt` / `excluded from context`.
 > The click goes to the segment's OWN route — `PATCH /v1/harness/sessions/{s}/turns/{t}/blocks/{b}`
-> with `{ included }`, handled by `patchSessionTurnBlock` in `src/server/api.ts` — which resolves the
-> transcript unit behind the recorded call id (`blockCallIdOf`, `transcriptUnitOfCall`,
-> `messagesWithUnitInclusion`) and installs the flag through `updateThreadTranscript`; no whole-document
-> transcript PUT is involved, and the dialog repaints from the receipt rather than from the click. The
-> read publishes `ContextBlock.included` (absent / `true` / `false`, `src/shared/turn-display.ts:542-560`)
+> with `{ included }` (the request field is `src/shared/harness-api.ts:2229`; the receipt answers
+> the state the server PERSISTED at `:2254`, with the thinking axis at `:2260`), handled by
+> `patchSessionTurnBlock` in `src/server/api.ts:4597-4730`, registered at `:4829`) — which resolves
+> the transcript unit behind the recorded call id (`blockCallIdOf` `:802`, `transcriptUnitOfCall`
+> `:829`, `messagesWithUnitInclusion` `:927`; the thinking axis is written by
+> `messagesWithReasoningInclusion` `:909-923`, the flag itself at `:915-920`) and installs the flag
+> through `updateThreadTranscript`; no whole-document transcript PUT is involved, and the dialog
+> repaints from the receipt rather than from the click (the browser-side writer is
+> `src/frontend/api.ts:1304-1310`, reached through `src/frontend/view-api.ts:1093-1109`). The
+> read publishes `ContextBlock.included` (absent / `true` / `false`,
+> `src/shared/turn-display.ts:595-600` — re-pointed 2026-11-11, where `:542-560` used to sit)
 > on the block detail route only — the compact display tree keeps counting the recorded ledger — and the
 > detail cache's fingerprint covers it. Pinned in `src/server/view.test.ts`,
 > `src/frontend/ui/context-detail.test.ts` and `src/frontend/context-bar-block-route-main.test.ts`.
+> All of the line numbers in this note were re-read on 2026-11-11.
 > **Still open here:** the board-level marker and count (T7.1, the bar shows no inclusion state at all
-> today), the excluded-count/tokens-saved figures (T7.2), and the compactor diagnostic (T7.3).
+> today — `src/frontend/display-project.ts:333-339` copies the field and its own comment says the bar
+> ignores it), the excluded-count/tokens-saved figures (T7.2), and the compactor diagnostic (T7.3).
 
-- **T7.1 — an "excluded from context" marker plus a count on the conversation board.** Zero
-  consumers of `included` exist in `src/frontend/`: every `included` hit there is prose or an
-  unrelated local (`src/frontend/main.ts:1655`). The board is event-driven and the progress
-  union `HarnessEvent` (`src/types/index.ts:2322-2486`) carries no inclusion field in any
-  variant, so the board cannot show what no event reports. The flag IS visible in the transcript
+- **T7.1 — an "excluded from context" marker plus a count on the conversation board.** The claim
+  this entry carried, kept verbatim so the reasoning stays auditable: *"Zero consumers of
+  `included` exist in `src/frontend/`: every `included` hit there is prose or an unrelated local
+  (`src/frontend/main.ts:1655`). The board is event-driven and the progress union `HarnessEvent`
+  (`src/types/index.ts:2322-2486`) carries no inclusion field in any variant, so the board cannot
+  show what no event reports."* **Corrected 2026-11-11 — the "zero consumers" half is false** since
+  the 2026-11-10 dialog work: `src/frontend/ui/context-detail.ts` renders the chip from the flag
+  (`inclusionFactOf` `:297-313`), decides whether it is a control (`:319`) and writes it (`:693`);
+  `src/frontend/api.ts:1304-1310` issues the PATCH through `src/frontend/view-api.ts:1093-1109`;
+  and `src/frontend/display-project.ts:333-339` copies the field onto the render model. What is
+  still exactly as the claim says is the part the task is about: **the board and the bar ignore
+  it** — `display-project.ts:333-339` states that in its own comment — so the segment dialog is the
+  only surface that acts on it. The union still carries no inclusion field, now at
+  `src/types/index.ts:2578-2742`, and the unrelated local the claim pointed at is still there
+  (`src/frontend/main.ts:1709-1714`). The flag IS visible in the transcript
   dialog — a `<pre>` of the server's recorded messages
   (`src/frontend/ui/thread-transcript.ts:31-33`) — and IS published for all four variants in
-  `src/server/harness.swagger.yaml`. **Prefer the transcript read over a new event field:** the
+  `src/server/harness.swagger.yaml` (`:8785`, `:8815`, `:8847`, `:8917`). **Prefer the transcript
+  read over a new event field:** the
   document is the authority, and an event would have to be replayed to reconstruct state.
 - **T7.2 — transcript metadata: the excluded count and the estimated tokens saved**, surfaced
   where the context bar already lives. Nothing carries it today: there is no such field
@@ -96,10 +125,13 @@ explanation.
   from that estimator or be labelled as not comparable.
 - **T7.3 — surface the compactor's per-pass diagnostic in the UI.** The producer and the server
   sides are already landed (see the substrate row above: the pass report at
-  `src/plugins/context-compaction.plugin.ts:378`, the bounded durable journal at
-  `src/server/sessions.ts:3008-3028`, the `plugin_diagnostics` projection at
-  `src/server/api-reads.ts:241-243`, typed at `src/shared/harness-api.ts:961`) and **the
-  frontend never consumes it** — zero references to `plugin_diagnostics` in `src/frontend/`.
+  `src/plugins/context-compaction.plugin.ts:832`, the bounded durable journal at
+  `src/server/sessions.ts:3239-3262` — cap `PLUGIN_DIAGNOSTIC_LIMIT` = 24 at
+  `src/server/protocol.ts:626` — the `plugin_diagnostics` projection at
+  `src/server/api-reads.ts:249-256`, typed at `src/shared/harness-api.ts:978`) and **the
+  frontend never consumes it** — zero references to `plugin_diagnostics` in `src/frontend/`
+  (re-checked 2026-11-11; the only hits anywhere under `src/frontend/` are in the built bundle,
+  not in source).
   This task's part is only making an already-durable record visible.
 
 *Check:* a frontend test in the existing transcript/board suites asserting the marker renders
@@ -112,7 +144,7 @@ exactly; `npm run test:frontend` (`package.json:97`) green.
   use case is written here with a name.* No name has been written. The unit-level rule is what
   keeps provider pairing unbreakable, and the shipped surface refuses a call-level patch — a
   `toolCalls` edit is one of the refused inputs pinned at
-  `src/harness.inclusion.test.ts:2467`.
+  `src/harness.inclusion.test.ts:2477` (re-pointed 2026-11-11).
 - **T6.2 — decision record: no read-side normalization.** `threadMessages()` (and with it
   `api.threads.messages` and the server's transcript GET) shows canonical state verbatim, so a
   `true` written straight into the public mutable `agent.messages` stays visible to that reader
@@ -129,10 +161,10 @@ exactly; `npm run test:frontend` (`package.json:97`) green.
 cd packages/underload/harness
 git rev-parse --show-toplevel              # must be .../packages/underload/harness
 git log -1 --format='%h %s'; git status --short
-grep -rn "included" src/frontend/ | grep -v "entries included" | grep -v test    # T7.1: zero real consumers?
-grep -rn "plugin_diagnostics\|pluginDiagnostics" src/frontend/                   # T7.3: still unconsumed?
-grep -n "excluded\|tokensSaved\|tokens_saved" src/shared/harness-api.ts          # T7.2: still no field?
-grep -n "export type HarnessEvent =" src/types/index.ts                          # T7.1: the union to extend (or not)
+grep -rn "included" src/frontend/ --include=*.ts --include=*.tsx | grep -v "core entries\|tools included\|included)" | grep -v "\.test\."   # T7.1 (2026-11-11): HALF-triggered — ui/context-detail.ts, api.ts and view-api.ts consume the flag, and display-project.ts:333-339 copies it while the BAR ignores it; what is still absent is a board/bar consumer
+grep -rn "plugin_diagnostics\|pluginDiagnostics" src/frontend/ --include=*.ts --include=*.tsx    # T7.3: still unconsumed? (re-checked 2026-11-11: no source hits; only the built bundle mentions it)
+grep -n "excluded\|tokensSaved\|tokens_saved" src/shared/harness-api.ts          # T7.2: still no field? (2026-11-11: the only hit is prose inside the write receipt's doc)
+grep -n "export type HarnessEvent =" src/types/index.ts                          # T7.1: the union to extend (or not) — 2026-11-11: starts at :2578, still no inclusion field
 npx vitest run src/harness.inclusion.test.ts                                     # BASELINE green before any edit
 ```
 
@@ -150,7 +182,12 @@ Stop-and-recheck conditions:
 ## Not tested
 
 - **UI behaviour with an excluded turn** — no frontend surface consumes the flag, so nothing has
-  been observed; the transcript dialog shows it only as raw JSON.
+  been observed; the transcript dialog shows it only as raw JSON. **Corrected 2026-11-11 (the
+  first half is overtaken):** since the 2026-11-10 dialog the flag IS consumed — rendered and
+  switched in `src/frontend/ui/context-detail.ts` and pinned by `src/frontend/ui/context-detail.test.ts`
+  and `src/server/view.test.ts` (the toggle and its `PATCH` write). What this bullet still
+  correctly records is the rest: NO board surface, and no observation of how a person behaves when
+  a turn is excluded (T7.1).
 - **An id used by a client of the HTTP transcript routes** — the server-side id and its
   persistence are pinned; no consumer outside the package has addressed a turn by it.
 - **Whether one notification per write is actually slow** — the save model is a whole-document

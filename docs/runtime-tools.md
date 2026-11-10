@@ -61,10 +61,17 @@ scans the package's `tools/**/*.tool.ts` entries and reads each entry's exported
 that list, so a metadata-only entry (or one whose imports would fail) is still
 discoverable — the failure only matters when the body is loaded for execution.
 
-Each discovered row carries `{ name, metadata, sourcePath, label, origin, group,
-activation, order, pendingOnly?, control?, primaryOnly?, answerExtraction?,
-sessionBound?, listed? }`. One loop in `src/harness.ts` registers every row whose
-`activation` the current configuration satisfies, in `order` (scan order):
+Each discovered row carries `{ name, metadata, sourcePath, label, origin,
+group, activation, mode?, order, pendingOnly?, control?, primaryOnly?,
+answerExtraction?, sessionBound?, listed?, alwaysDeclared? }`. `mode` is the
+resolved turn policy — WHEN a completion may re-enter the model — bound to
+the published DEFINITION rather than the wire name, and ABSENT when the
+entry declared none so a consumer can tell "defaulted" (the runtime applies
+`DEFAULT_TOOL_MODE`, `'sync'`) from "stated"; `alwaysDeclared` is a
+DECLARATION classification (membership in the always-declared core
+projection from `coreToolMetadata()`), not a registration condition. One
+loop in `src/harness.ts` registers every row whose `activation` the current
+configuration satisfies, in `order` (scan order):
 
 | `activation` | registered when |
 | --- | --- |

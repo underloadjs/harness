@@ -1,6 +1,9 @@
 # 0012 — The markdown converter drops `<sup>`/`<sub>` markers and leaks `data-mw` metadata into prose
 
-> **Status:** Open
+> **Status:** Open — reduced on 2026-11-11 (the "real parser, not a regex hack"
+> evidence row and acceptance criterion 5 were deleted outright: the module header no
+> longer makes that claim — `src/tools/webfetch/native.ts:4-10` now says the conversion
+> is "a bounded regex pass" and "is not a DOM")
 > **Severity:** Significant
 > **Area:** `src/tools/webfetch/native.ts` (the markdown and text conversion passes)
 > **Date opened:** 2026-11-10
@@ -30,21 +33,22 @@ and has no way to know. Specifically the consumer needs:
 - **Superscript and subscript markers preserved**, so an exponent survives as an exponent
   rather than being concatenated into the base.
 - **A disclosure when math markup was flattened**, so a model that needs the exact value can
-  re-fetch rather than cite a corrupted one. The tool already has a `note` field for exactly
-  this kind of disclosure.
+  re-fetch rather than cite a corrupted one. `fetch` already has a `note` field for exactly
+  this kind of disclosure (`src/tools/webfetch/index.ts:623-625` emits one when a headingless
+  `query` falls back to a proximity window; `:666-671` emits one for a clamped offset).
 - **Attribute metadata kept out of the text stream**, so a tag boundary is a tag boundary.
 
 ## Why it is the way it is
 
 Partly deliberate. The module header states the conversion contract as a set of regex passes
-and names its own limits (`native.ts:15-17`: markdown "keeps headings, links, images, emphasis,
-code, list items, blockquotes, and rules"; `:247-248`: list "Nesting is flattened — a known
+and names its own limits (`native.ts:15-16`: markdown "keeps headings, links, images, emphasis,
+code, list items, blockquotes, and rules"; `:245-246`: list "Nesting is flattened — a known
 limit of a regex pass"). Math and superscripts are simply **not in the enumerated list** of
 what markdown output keeps, so their loss is consistent with the documented contract.
 
 What is *not* argued anywhere is that the loss is **unreported**. Every other lossy boundary in
 this tool family is reported — `grep` emits a `note` naming what it skipped, `fetch` reports
-`offsetClamped` with a `note` when an offset overshoots (`request.ts`/`index.ts:562-568`), and
+`offsetClamped` with a `note` when an offset overshoots (`src/tools/webfetch/index.ts:564-566` computes it and `:666-671` reports `offsetClamped` with the `note`), and
 `download` reports `searchable` so a model does not grep a JPEG. Math flattening is the one
 degradation this tool performs silently.
 
@@ -53,14 +57,13 @@ degradation this tool performs silently.
 | Fact | Source |
 |---|---|
 | Every inline tag is deleted with its marker, keeping only its text | `src/tools/webfetch/native.ts:263` (`output.replace(/<[^>]*>/g, '')`) — the catch-all that runs after the named passes |
-| `<sup>`/`<sub>` are handled only inside `<pre>`, never in prose | `src/tools/webfetch/native.ts:146` (`PRE_WRAPPER_TAGS` strips them so a code sample survives) |
-| No `<sup>`, `<sub>`, `<math>`, or MathML rule exists in the markdown pass | `src/tools/webfetch/native.ts:191-282` (the whole of `convertHtmlToMarkdown`: emphasis, links, images, headings, blockquotes, lists, rules, block boundaries) |
-| The documented markdown contract does not list math | `src/tools/webfetch/native.ts:15-17` |
-| The module claims to be "a real parser, not a regex hack" | `src/tools/webfetch/native.ts:4` — contradicted by the pass structure above |
+| `<sup>`/`<sub>` are handled only inside `<pre>`, never in prose | `src/tools/webfetch/native.ts:146` (`PRE_WRAPPER_TAGS`, applied to `<pre>` bodies at `:163` so a code sample survives) |
+| No `<sup>`, `<sub>`, `<math>`, or MathML rule exists in the markdown pass | `src/tools/webfetch/native.ts:191-277` (the whole of `convertHtmlToMarkdown`: emphasis at `:210-214`, links, images, headings, blockquotes, lists at `:245-250`, rules, block boundaries at `:258-263`) |
+| The documented markdown contract does not list math | `src/tools/webfetch/native.ts:15-16` |
 | The served HTML carries the marker; the converter discards it | measured 2026-11-10: `en.wikipedia.org/wiki/Quantum_mechanics` HTML contains `10<sup id="mwZA">12</sup>`; `format=markdown` returns `within 1 part in 1012`; `&action=raw` wikitext contains `10<sup>12</sup>` |
 | Plain `<sup>` on a non-MediaWiki site corrupts the same way | measured 2026-11-10: `physics.nist.gov/cgi-bin/cuu/Value?hbar` → `x 10-34 J s` (source HTML has `10<sup>-34</sup>`); no MathML, no LaTeX involved |
 | Fractions flatten to juxtaposition | measured: `\sigma_X \sigma_P \geq \frac{\hbar}{2}` → `σXσP≥ℏ2`; `\tfrac12` → `12` |
-| `format=text` does not fix it | measured: same sentence returns `within 1 part in 10 12` — a space, still no exponent marker |
+| `format=text` does not fix it | measured: same sentence returns `within 1 part in 10 12` — a space, still no exponent marker; `src/tools/webfetch/native.ts:283-309` is that pass and its own catch-all is `:297` (`replace(/<[^>]*>/g, ' ')`) — the same defect, one space apart |
 | `format=html` is lossless | measured: returns `10<sup id="mwZA">12</sup>` intact, plus the original LaTeX verbatim in `data-mw` (`"extsrc":"\\sigma_X \\sigma_P \\geq \\frac{\\hbar}{2}."`) |
 | The metadata leak is mid-prose, not in References | measured: leaks at HTML byte offsets 250857 (*Free particle*) and 369843/370233 (*Philosophical implications*), all before the References heading at 419870 |
 | The leak is an attribute-boundary error, not a template-expansion failure | the raw `{{…}}` text lives in a `data-mw='{…}'` attribute on the ref element, and Parsoid escapes `<` as `&lt;` but leaves a literal `>` inside the quoted value; a tokenizer that ends the tag at the first `>` emits the remainder as text — which is why the fragment ends in the tell-tale `'>` |
@@ -74,7 +77,7 @@ defect.
 
 1. **Convert `<sup>`/`<sub>` to an explicit marker** in both the markdown and text passes:
    `10<sup>12</sup>` → `10^12` (or `10¹²`), `<sub>n</sub>` → `_n`. A few lines beside the
-   existing emphasis pass at `native.ts:210-213`. This fixes the numeric case everywhere,
+   existing emphasis pass at `native.ts:210-214`. This fixes the numeric case everywhere,
    including the NIST page, and needs no parser change.
 2. **Disclose the loss.** When any `<sup>`, `<sub>`, `<math>`, or MathML node was flattened,
    set the existing `note` to e.g. `"math markup flattened; use format=html for exact values"`.
@@ -106,7 +109,6 @@ defect.
    `format=html` remedy; a page with none sets no such note.
 4. `{{rp|`, `{{cite journal`, and `"i":0` do not appear in markdown output for
    `en.wikipedia.org/wiki/Quantum_mechanics`.
-5. The module header's "real parser, not a regex hack" claim is either earned or corrected.
 
 ## Tests to add
 
@@ -123,3 +125,25 @@ defect.
 - Full MathML/LaTeX semantic rendering, or recovering `extsrc` into the text (follow-up).
 - Replacing the converter wholesale (may be its own issue once (1) and (2) land).
 - List nesting, which the header already declares a known limit.
+
+## Update (2026-11-11)
+
+- **Reduced** — the Evidence row "The module claims to be 'a real parser, not a regex hack'"
+  and acceptance criterion 5 are deleted. The header no longer claims it: `src/tools/webfetch/native.ts:4-10`
+  now states the opposite in plain terms ("the HTML handling below is a bounded regex pass",
+  "It is not a DOM: it will not resolve CSS, run scripts, or preserve nesting perfectly"), so
+  the claim this row contradicted is gone and there is nothing left to earn or correct. The
+  measurement rows below it still stand on their own.
+- **Re-anchored** — `convertHtmlToMarkdown` is `src/tools/webfetch/native.ts:191-277` (not
+  `191-282`: the text pass begins at `:283`), the catch-all tag strip is still `:263`, the
+  `<pre>` wrapper rule is `:146` and its application site is `:163`, the emphasis pass the
+  proposal points at is `:210-214`, the documented conversion contract is `:12-18` (the
+  markdown bullet the issue quotes is `:15-16`), and the list-nesting limit comment is
+  `:245-246`. The text pass, newly cited here, is `:283-309` with its own catch-all at `:297`.
+- **Re-verified** — no `<sup>`, `<sub>`, `<math>` or MathML rule exists anywhere in either
+  pass (`grep -nE 'sup\|sub\|math' src/tools/webfetch/native.ts` returns exactly one line —
+  `PRE_WRAPPER_TAGS` at `:146`, where `sub`/`sup` are stripped rather than converted), so the headline defect is unchanged. The reported-clamp
+  precedent the issue leans on is `src/tools/webfetch/index.ts:564-566` + `:666-671`.
+- The measured rows are left **as recorded** (2026-11-10 measurements against live pages);
+  nothing in the tree contradicts them, and the `format=html` escape hatch is unchanged.
+- Status stays **Open**.

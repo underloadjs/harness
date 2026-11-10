@@ -13,7 +13,7 @@ instead of proxying an OpenAI-compatible relay from the browser. Its current
 browser client sends
 `{ model, stream: true, stream_options: { include_usage: true }, messages }`
 and depends on the trailing usage frame for the per-conversation token totals
-(`distribution/chat-assistant/src/api/provider.ts:137-146`). Through the harness
+(`distribution/chat-assistant/src/api/provider.ts:146-150`). Through the harness
 transport that opt-in cannot be expressed at all, so the same UI feature
 regresses to "no usage reported".
 
@@ -40,7 +40,7 @@ completion body beyond the five sampling knobs. Concretely, it cannot:
 
 The last point is what makes this blocking rather than merely annoying: writing
 a custom `HarnessStream` is the documented escape hatch, and it costs a full
-fork of an 877-line file, because nothing of the default transport is reusable.
+fork of a 929-line file, because nothing of the default transport is reusable.
 
 ## Why it is the way it is
 
@@ -51,7 +51,7 @@ Deliberate, and documented:
   is captured when a provider reports it anyway."
 - Zero-runtime-dependency rule (`README.md:12-14`, `openai.ts:8-14`): the
   transport is hand-written, so there is no SDK request object to widen.
-- `HarnessSampling` is a fixed OpenAI field list (`src/types/index.ts:414-420`),
+- `HarnessSampling` is a fixed OpenAI field list (`src/types/index.ts:447-453`),
   which keeps sampling typed instead of an opaque bag.
 
 Every proposal below keeps those rules: a caller-supplied body is still
@@ -62,18 +62,18 @@ gateway that rejects unknown fields receives.
 
 | Fact | Source |
 |---|---|
-| The outbound body is exactly `{ model, stream, messages, tools?, ...sampling }` | `src/transport/openai.ts:777-783` |
+| The outbound body is exactly `{ model, stream, messages, tools?, ...sampling }` | `src/transport/openai.ts:829-835` |
 | The omission is documented in the source header | `src/transport/openai.ts:16-20` |
-| …and in one README line, with no alternative offered | `README.md:1920` ("`stream_options` is not sent — several gateways reject unknown request fields") |
-| Sampling is a closed set of five fields | `src/types/index.ts:414-420` |
-| Provider configuration accepts `baseURL`, `apiKey`, `headers`, `sampling` — nothing else | `src/types/index.ts:424-434` |
-| `HarnessStreamRequest` carries `model`, `messages`, `tools?`, `signal` only | `src/types/index.ts:376-384` |
-| A custom transport is `(request) => AsyncIterable<HarnessStreamEvent>` and wins over `provider` | `src/types/index.ts:410`, `:454-455`, `src/core/agent.ts:148-159` |
-| `openAICompatible` is the **only** export of the transport module; `wireMessage`, `wireTool`, `samplingBody` are module-private | `src/transport/openai.ts:295` (`wireMessage`), `:540` (`wireTool`), `:620` (`samplingBody`), `:737` (`openAICompatible`) |
-| `usage` on the committed answer is optional by contract | `src/types/index.ts:285-286` |
-| Server-side turn tallies are summed from per-request `usage` events, so an absent frame is an absent tally | `src/server/protocol.ts:176-183`, `README.md:2676-2680` |
-| Consumer depends on `stream_options.include_usage` | `distribution/chat-assistant/src/api/provider.ts:137-146` |
-| Schema validation the package already exports and could reuse for structured output | `src/harness.ts:11436-11449` (`validateSchemaValue`, `checkToolSchemaComplexity`, `MAX_CREATED_SCHEMA_*`) |
+| …and in one README line, with no alternative offered | `README.md:1938` ("`stream_options` is not sent — several gateways reject unknown request fields") |
+| Sampling is a closed set of five fields | `src/types/index.ts:447-453` |
+| Provider configuration accepts `baseURL`, `apiKey`, `headers`, `sampling` — nothing else | `src/types/index.ts:457-467` |
+| `HarnessStreamRequest` carries `model`, `messages`, `tools?`, `signal` only | `src/types/index.ts:409-417` |
+| A custom transport is `(request) => AsyncIterable<HarnessStreamEvent>` and wins over `provider` | `src/types/index.ts:443`, `:455-456`, `src/core/agent.ts:148-159` |
+| `openAICompatible` is the only **chat-completion** export of the transport module (the module also exports the `PreparedToolMedia` type and the `groupToolMedia` helper for attachment grouping — neither is a request-body seam); `wireMessage`, `wireTool`, `samplingBody` are module-private | `src/transport/openai.ts:295` (`wireMessage`), `:592` (`wireTool`), `:672` (`samplingBody`), `:789` (`openAICompatible`); the two non-body exports are `:416` (`PreparedToolMedia`), `:483` (`groupToolMedia`) |
+| `usage` on the committed answer is optional by contract | `src/types/index.ts:318-319` |
+| Server-side turn tallies are summed from per-request `usage` events, so an absent frame is an absent tally | `src/server/protocol.ts:208-213`, `README.md:2717-2719` |
+| Consumer depends on `stream_options.include_usage` | `distribution/chat-assistant/src/api/provider.ts:142-149` |
+| Schema validation the package already exports and could reuse for structured output | `src/harness.ts:12021-12034` (`validateSchemaValue` :12028, `checkToolSchemaComplexity` :12029, `MAX_CREATED_SCHEMA_*` `:12030-12032`) |
 
 `unconfirmed`: whether the LAN relay used by this workspace already emits a
 usage frame without the opt-in. The package contract still makes the answer
@@ -140,12 +140,12 @@ reused rather than rewritten:
 - the outbound field goes through (A);
 - the reply is validated with the exported `validateSchemaValue`, and the schema
   itself with `checkToolSchemaComplexity` / `MAX_CREATED_SCHEMA_*`
-  (`src/harness.ts:11436-11449`) — the same gates a created tool's schema passes;
+  (`src/harness.ts:12021-12034`) — the same gates a created tool's schema passes;
 - an invalid answer must be an explicit, typed failure (or one schema-repair
-  retry inside the existing retry budget, `src/types/index.ts:353-372`) — never
+  retry inside the existing retry budget, `src/types/index.ts:386-405`) — never
   a silent `{}`;
 - `stopReason: 'length'` stays distinguishable from a schema failure, because a
-  truncated answer is a different problem (`src/types/index.ts:284`, `:291`).
+  truncated answer is a different problem (`src/types/index.ts:317`, `:324`).
 
 **Alternatives considered.**
 
@@ -173,8 +173,8 @@ reused rather than rewritten:
 4. A documented, exported way to reuse the default transport while overriding
    only the body (or its primitives) exists, and the package's own browser/node
    import split is unchanged (no new Node built-in reaches the browser chunk —
-   `README.md:300-305`).
-5. `README.md:1920` (the "`stream_options` is not sent" line) and the transport
+   `README.md:278-288`, `README.md:305-312`).
+5. `README.md:1938` (the "`stream_options` is not sent" line) and the transport
    section point at the new setting, and `docs/` states what is and is not sent
    on the wire.
 
@@ -199,3 +199,23 @@ reused rather than rewritten:
 - Structured-output **storage** (a session-level result schema) — belongs with
   0005 if it belongs anywhere.
 - Sandboxing or cost/latency policy.
+
+## Update (2026-11-11)
+
+- **Anchors re-grounded** against the current tree; the code is unchanged, and no
+  claim was added or removed. The gap is intact: the body is still
+  `{ model, stream, messages, tools?, ...sampling }`
+  (`src/transport/openai.ts:829-835`), `stream_options` is still deliberately
+  absent (`src/transport/openai.ts:16-20`, `README.md:1938`), and
+  `HarnessProviderConfiguration` still accepts only `baseURL`/`apiKey`/`headers`/
+  `sampling` (`src/types/index.ts:457-467`).
+- **Factual correction:** the transport file is **929 lines**, not 877 — the cost
+  of the "write your own transport" workaround is larger than first stated.
+- **Factual correction:** `openAICompatible` is no longer literally the module's
+  **only** export. It is still the only **chat-completion** export; the module
+  also exports `PreparedToolMedia` (a type, `src/transport/openai.ts:416`) and
+  `groupToolMedia` (`:483`), both for the attachment-grouping limits. Neither is
+  a request-body seam, so the substance stands: `wireMessage` (`:295`),
+  `wireTool` (`:592`) and `samplingBody` (`:672`) remain module-private.
+- Status stays **Open**; the `unconfirmed` note about whether the LAN relay
+  already emits a usage frame is unchanged.

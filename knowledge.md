@@ -2,14 +2,29 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-09 for this file's documentation pass — the header
+> **Last verified:** 2026-11-11 for this file's documentation-vs-code realignment pass — the
+> workspace-consumer line, the `Layout` trees (now complete at DIRECTORY level: `src/plugins/`,
+> `src/tools/runtime/`, `src/server/workers/`, `src/server/stream/`, `src/server/tools/shared/`,
+> `src/frontend/extensions/` and the `src/core/`, `src/shared/`, `src/plugin/`, `src/frontend/`
+> additions; the deleted `core/task.test.ts`, the renamed `command/shell.tool.ts` /
+> `command/gitDiff.tool.ts`, the derived catalogue, and the SIX published entries corrected), the
+> Index anchors and omissions, the [Session tasks](#session-tasks) section's claims/lease content
+> (Decision P), the `tool_result` event's `media` key, the `harness()` tool/member/config lists,
+> the "Not built yet" `patch` item, and the `plugin` row of the dependency-direction table; every
+> line anchor cited in this file was re-grounded against the current tree, and no code was touched —
+> runtime behaviour was NOT re-executed and the test suite was NOT re-run, so an independent
+> verifier still owns both — and 2026-11-09 for this file's documentation pass — the header
 > dependencies, the plugin-pipeline member of the run-end lists, and the grep
 > matching-time paragraph (all corrected in place; the landed plugin surface is
 > documented in `docs/plugins.md`) — and 2026-11-08 for the shared `task` store
 > and its concurrency contract (`src/core/task.ts`, `src/tools/runtime/task.tool.ts`,
 > the `/task` verbs in
 > `src/core/command-builtins.ts`, and the `records.todos` snapshot/restore path in
-> `src/core/snapshot.ts` and `src/harness.ts`), and 2026-11-03 for the documentation
+> `src/core/snapshot.ts` and `src/harness.ts`) [BRACKETED CORRECTION 2026-11-11, the entry itself
+> left verbatim: `src/tools/runtime/task.tool.ts` is not in the current tree — that entry is
+> `src/tools/runtime/tasks.tool.ts`; the "concurrency contract" verified here (claims/leases) was
+> deleted the next day by records-engine Decision P; and the snapshot block is now
+> `records.collections.tasks` under snapshot v2, not `records.todos`], and 2026-11-03 for the documentation
 > review of the server-side slash-command
 > layer (`src/core/command.ts`, `src/core/command-builtins.ts`, `src/harness.ts`
 > registry, `src/server/sessions.ts` `dispatch`/`executeCommandTurn`,
@@ -26,7 +41,14 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 > (`src/core/tool-source.ts`, Node-only). CORRECTED IN PLACE 2026-11-09: this line
 > used to read "none". The DEFAULT transport still adds nothing — it is plain
 > `fetch` (Node 18+), and the browser build reaches neither dependency's module.
-> **Workspace consumers:** none yet
+> **Workspace consumers:** `@erosire/chat-assistant` (`distribution/chat-assistant`) — it declares
+> `@underload/harness` in `dependencies` (`distribution/chat-assistant/package.json:24`) and imports
+> the root, `/server` and `/frontend` entries (`src/server/presets.ts:34-35`,
+> `src/server/main.ts:35-36`, `src/server/main.test.ts:25-26`, `src/api/harness.ts:68,69,119`).
+> `@underload/dashboard` is NOT a consumer: it declares no dependency on this package at all, and its
+> own README says the example runs with "no `@underload/harness` import"
+> (`packages/underload/dashboard/README.md:360`). VERIFIED IN PLACE 2026-11-11: this line used to
+> read "none yet".
 
 ---
 
@@ -34,36 +56,69 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 
 1. Read `src/harness.ts` for the public barrel and the loop
 2. Check `src/core/agent.ts`, `src/core/tool.ts`, `src/core/discovery.ts`,
-   `src/core/creation.ts`, `src/core/task.ts`, `src/core/profile.ts`,
+   `src/core/creation.ts`, `src/core/records.ts` (the ONE session store engine, and the
+   engine `src/core/task.ts` / `profile.ts` / `chapter.ts` / `location.ts` are specs for),
+   `src/core/profile.ts`,
    `src/core/chapter.ts`, `src/core/location.ts`, `src/core/action.ts`,
    `src/core/branch.ts`, and `src/transport/openai.ts` + `src/transport/models.ts`
 3. Check `src/tools/catalogue.ts` / `src/tools/lazy.ts` when touching presets
-4. Check `src/server/`, `src/frontend/` (including `ui/action-request.ts`), and
+4. Check `src/plugins/` (the shipped auto-discovered plugins that become
+   `src/plugin/manifest.ts`) when touching plugin behaviour, settings, or the run-end lists
+5. Check `src/server/`, `src/frontend/` (including `ui/action-request.ts`), and
    `src/shared/` for the app contract
-5. Update the "Last verified" date
-6. Keep the "Not built yet" list honest — it is the roadmap
+6. Update the "Last verified" date
+7. Keep the "Not built yet" list honest — it is the roadmap
 
 ---
 
 ## Layout
 
-`src/` has exactly one root *source* file, `harness.ts`; its test sits next to
-it. Everything else lives in a role folder with its own barrel, and `harness.ts`
+`src/` has THREE root *source* files — `harness.ts` (the library and public barrel),
+`index.ts` (the Node root) and `browser.ts` (the browser root) — and the rest of the
+root level is colocated tests: `structure.test.ts` plus 36 `harness.*.test.ts`
+suites. Everything else lives in a role folder with its own barrel, and `harness.ts`
 re-exports the public surface.
+
+> **Structural completeness note (2026-11-11).** The two trees below are complete at
+> DIRECTORY level; individual files are named where they matter or where a reader
+> would otherwise be misled. A per-file annotation older than 2026-11-11 reflects the
+> review date it was written; the 2026-11-11 pass guarantees the directory list and
+> every file name it spells out match the tree on disk. Test files are usually named
+> only as a group.
 
 ```
 src/
-  harness.ts            the only root source file: harness() + the public barrel
-  harness.test.ts       its test, next to it
+  harness.ts            the library entry: harness() + the public barrel
+  index.ts              the Node root (library + shared + server + client)
+  browser.ts            the browser root (library + shared + client)
+  structure.test.ts     the layout/import-safety contract (its items 1-9): the app tree
+                        lives under `src/`, package.json/exports resolve SOURCE FIRST
+                        through a `development` condition, each root entry composes only
+                        the layers it may reach (the browser root never the server
+                        tree), the client barrel carries no shell or stylesheet, the
+                        service endpoint keeps its `service-route*.ts` contract, and the
+                        Vite resolver + tsconfig `paths` mirror the same `src/*.ts`
+                        targets
+  harness.test.ts       its test, next to the loop
   harness.creation.test.ts    toolCreate behaviour, next to the loop
   harness.delegation.test.ts  primary/subagents + delegate, next to the loop
-  harness.task.test.ts        task declaration/state in a harness
+  harness.task.test.ts        the `tasks` collection in a live harness: declaration, one
+                              shared list, and the boundary checks (incl. that no
+                              claim/lease shape survives stop/delete/snapshot/restore)
   harness.commands.test.ts    command registry: built-in/config/plugin/runtime order,
                               collisions, replace-by-name, executeCommand contracts
-  harness.records.test.ts     profileManage/chapterManage/locationManage in a harness
-  harness.metadata.test.ts    core tool metadata (R7 cap, schemas) as registered
+  harness.records.test.ts     the profiles/chapters/locations wrappers in a harness
+  harness.metadata.test.ts    core tool metadata (R7 cap, schemas, and the pinned
+                              model-facing descriptions) as registered
   harness.websearch.test.ts   opt-in search registration/core declaration/secrets
   harness.webfetch.test.ts    opt-in fetch registration (native default, hosted keys)
+  harness.*.test.ts     the other 28 root-level loop suites: action-request,
+                        agent-results, already-available, attachments, background,
+                        browser-fallback, budget, creation-policy, discovery, fork,
+                        inclusion, media, missing-source, nested-runs, plugin, races,
+                        retry, self-modifying, snapshot, sync-async, thread-park-queue,
+                        thread-read, thread-runtime, threads, tool-failures,
+                        tool-folders, tool-list, tool-settings
   core/
     index.ts            barrel: agent, tool, searchTools, compileToolSource, createDynamicTool,
                         createRecordEngine + the four collection SPECS (TASKS_COLLECTION,
@@ -73,30 +128,53 @@ src/
                         one engine, one store, specs instead of factories,
                         action/branch internals (validateActionRequestParameters,
                         validateActionChoice, agentBranchOf, forkAgent, materialize/incorporate)
+    records.ts          THE ONE session store engine: collections, one id counter, the
+                        `expects` compare-and-swap, the per-collection change feed, the
+                        bounds, and snapshot/restore (`readRecordsStoreState`)
+    action.ts           strict actionRequest parameters/choice parsing + limits (N3)
     agent.ts            the brain
-    agent.test.ts
-    tool.ts             an action the model can request, or you can call
-    tool.test.ts
-    discovery.ts        tag ranking behind toolRequest
-    discovery.test.ts
-    metadata.ts         core tool metadata (name/description/tags/schema) — one copy for harness.ts, the record factories, and src/harnesses/core.ts
+    agent-limits.ts     the R3 inspection bounds a tool DECLARES and the runtime ENFORCES
+    argument-fingerprint.ts  canonical tool-argument fingerprint (compaction T2.1/T2.2)
+    branch.ts           fork identity, tool-id materialization, incorporation, bounds (N3)
+    chapter.ts          the `chapters` COLLECTION SPEC (summaries, status, order, body only from get)
+    command.ts          the ONE slash-line parser: tokenizer, name rules, /help renderer
+    command-builtins.ts the built-in set (/help /tools /task /websearch /webfetch)
+    context-estimate.ts rough context sizing + the hybrid estimate anchored on real usage (T5.4)
+    context-pruning.ts  the one pure pruning policy behind the shipped trimmer (compaction T3)
     creation.ts         validate + compile a tool from an async function body
-    creation.test.ts
+    discovery.ts        tag ranking behind toolRequest
+    location.ts         the `locations` COLLECTION SPEC (name, description, notes)
+    message-id.ts       stable message ids (context-inclusion follow-ups, T1)
+    metadata.ts         core-tool metadata COMPATIBILITY aggregation — each declarative half now
+                        lives in its own `src/tools/runtime/<name>.tool.ts` (T13→T19); the record
+                        specs and `tool-source.ts` still read these re-exports, while
+                        `src/server/harnesses/core.ts` builds its catalogue from `tools/descriptors`
+    nested-runs.ts      the nested-run POLICY: limitation code, its sentence, validated arm (T14)
+    profile.ts          the `profiles` COLLECTION SPEC (per-harness character/people records)
+    result-budget.ts    the model-facing tool-result budget, per result AND per turn (R10)
+    scheduler.ts        the background board that keeps a run open while calls are in flight (T3)
+    schema-validation.ts runtime JSON Schema validation for tool arguments (R11)
+    snapshot.ts         the snapshot schema + validation; v2 persists ONE `records` collection map
+    snapshot-validation.ts the shared validators for UNTRUSTED persisted JSON
     task.ts             the `tasks` COLLECTION SPEC (fields, caps, count facets, canonical
                         field order, wrapper mapping) — no store, no factory, no lock
                         (records-engine T3/T5; the releaseThread hook died with Decision P)
-    task.test.ts
-    profile.ts          per-harness character/people records (add/list/get/update/remove)
-    profile.test.ts
-    chapter.ts          per-harness chapters (summaries, status, order, body only from get)
-    chapter.test.ts
-    location.ts         per-harness locations/places (name, description, notes)
-    location.test.ts
-    action.ts           strict actionRequest parameters/choice parsing + limits (N3)
-    branch.ts           fork identity, tool-id materialization, incorporation, bounds (N3)
-    command.ts          the ONE slash-line parser: tokenizer, name rules, /help renderer
-    command.test.ts
-    command-builtins.ts the built-in set (/help /tools /task /websearch /webfetch)
+    thread.ts           persistent threads (R2) — the middle level of the three-level model
+    tool.ts             an action the model can request, or you can call
+    tool-discovery.ts   the public metadata API over the AST scan (T19 / R8-R9)
+    tool-manifest.ts    GENERATED browser manifest — not the Node truth (live scan wins)
+    tool-metadata.ts    leaf type module: a tool's declarative half + the discovery descriptor
+    tool-media.ts       declarative tool MEDIA — the `toolUi()` seam, for file BYTES
+    tool-outcome.ts     the persisted tool outcome (compaction T1)
+    tool-scan.ts        the AST half of discovery, with NO dependency on the manifest
+    tool-source.ts      tool source compilation and loading (R1/R2, Node-only)
+    tool-source-browser.ts the browser stub of `tool-source` (keeps the browser graph Node-free)
+    tool-ui.ts          declarative tool panels — the server-tool→client seam (R20.2)
+    *.test.ts           colocated suites (64 files in this folder in total, tests included);
+                        `records.test.ts` pins the whole engine and
+                        `records.store-events.test.ts` the store-change events, and there
+                        is NO `task.test.ts` any more — task behaviour is
+                        pinned by `records.test.ts` and the root `harness.task.test.ts`
   agents/
     index.ts            trusted AgentProfile registry + agentInstruction()
     types.ts            AgentProfile (name, title, description, instruction, guidelines)
@@ -125,9 +203,17 @@ src/
     models.test.ts
   tools/
     index.ts            barrel: the presets + presetTools (preload catalogue)
-    catalogue.ts        static metadata + dynamic-import load table
+    catalogue.ts        DERIVED, not maintained: PRESET_TOOLS is built from the discovered
+                        descriptors, so no hand-written projection and no per-name import
+                        switch survive — a new `.tool.ts` appears on the next cold start
+                        (src/tools/catalogue.ts:11-32,70-76)
+    descriptors.ts      the single seam onto the discovered catalogue + the generated
+                        loader: a LIVE scan on Node, the generated manifest only as the
+                        browser / scanner-less fallback
     lazy.ts             callable Tool whose body loads on first execution
-    laziness.test.ts
+    catalogue.test.ts / descriptors.test.ts / descriptors.scan-failure.test.ts /
+    descriptors.browser.test.ts / laziness.test.ts
+                        the derived catalogue, its scan failures, and laziness
     syntax/
       index.ts
       syntax.tool.ts      public tool: language dispatch, two properties
@@ -139,18 +225,35 @@ src/
       index.ts
       read.tool.ts
       write.tool.ts       was fileWrite
-      edit.tool.ts
+      edit.tool.ts        multi-edit and multi-file in ONE call: one `edits[]` property
+                          (path/oldString/newString/`replaceAll`), so a rename across
+                          several files is one request (src/tools/files/edit.tool.ts:1-8,124-136)
       files.tool.ts
       glob.tool.ts        names only          } the two halves of the old fileGlob
       grep.tool.ts        contents only      }
       glob.ts           shared walker (used by glob and grep)
       search.ts         shared pattern/root/argument rules for both searches
+      lock.ts           one async mutex per REAL FILE — the lost-update guard (D4)
+      identity.ts       one canonical key per real file (T16)
+      gitignore.ts      dependency-free `.gitignore` matching for the walker
+      bounded-regex.ts  a content matcher that cannot hang (T16)
       *.test.ts
     command/
       index.ts
-      shell.ts
-      gitDiff.ts
+      shell.tool.ts     the shell entry (the tree used to name this `shell.ts`)
+      gitDiff.tool.ts   the gitDiff entry (the tree used to name this `gitDiff.ts`)
+      boundedOutput.ts  incremental capture that keeps the HEAD *and* the TAIL
+      boundedText.ts    incremental UTF-8 capture with a hard BYTE cap
+      processTree.ts    `terminateTree` — ends a child AND the tree it started
       *.test.ts
+    runtime/            the SESSION-BOUND tool entries: one `.tool.ts` per harness-owned
+                        tool, each carrying only its name/description/schema/routing —
+                        the state lives in the harness, not in the entry (21 entries):
+                        tasks, records, profiles, chapters, locations, toolRequest,
+                        toolList, toolManage, toolRegistry, toolCreate, toolCancel,
+                        delegate, threadFork, threadList, threadRead, threadSend,
+                        actionRequest, agentManage, agentResult, search, fetch
+                        (`threadRead.ts` is its shared helper; `threadRead.test.ts` its test)
     websearch/
       index.ts          createWebSearchTool: key resolution, validation, dispatch
       request.ts        bounds, fetch/timeout, sanitized errors, normalization, redaction
@@ -160,19 +263,33 @@ src/
       websearch.test.ts factory + all three adapters, env injected, fetch stubbed
     webfetch/
       index.ts          createWebFetchTool: native is always the default provider
-      request.ts        page bounds (100 KiB / 24 000 chars), text-only gate, URL rules
+      request.ts        page bounds (1 MiB / 240 000 chars), text-only gate, URL rules
       native.ts         the direct GET + dependency-free HTML→markdown/text converter
       exa.ts            Exa /contents adapter (dynamic import)
       linkup.ts         Linkup /v1/fetch adapter (dynamic import)
+      sections.ts       section selection for the optional `query` argument
       webfetch.test.ts  native + both hosted providers, env injected, fetch stubbed
     webdownload/
       index.ts          type-only barrel (no value import, keeps the entry lazy)
       download.tool.ts  the `download` preset: 20 MiB cap, toolMedia() envelope
       download.test.ts  caps, streaming, names, kinds, cancellation
     presets.test.ts     covers every preset, standalone and in a harness
-  plugin/
-    index.ts            barrel: runPlugins
-    host.ts             programmatic extension host
+  plugin/               the programmatic extension host (four parts, one folder)
+    index.ts            barrel: runPlugins, resolvePluginList, createHookBus, the two
+                        settings providers, and BUILTIN_PLUGINS / BUILTIN_PLUGIN_DESCRIPTORS
+    manifest.ts         GENERATED (scripts/generate-plugin-manifest.mjs): the auto-discovered
+                        built-ins scanned out of `src/plugins`
+    host.ts             precedence (built-in first, then `configuration.plugins` REPLACING
+                        that name) and the per-plugin api (scoped settings + `on`)
+    hooks.ts            the typed, sequential, fail-open lifecycle bus (priority/timeoutMs)
+    settings.ts         the host read model + the per-plugin typed settings view
+  plugins/              the SHIPPED plugins, auto-discovered into `plugin/manifest.ts`
+                        (referenced from `src/types/index.ts:3231-3234`); a configured
+                        plugin of the same name replaces the built-in instead of colliding
+    context-compaction.plugin.ts  the two compaction modes — `exclude` and the default
+                        `summarize` (the conversation compacts ITSELF, one of its own turns)
+    context-trimmer.plugin.ts     the shipped preset trimmer over `core/context-pruning`
+    async-ping.plugin.ts          the recurring wake while background calls are pending
   util/
     index.ts            barrel: HarnessError, toErrorInfo
     errors.ts           HarnessError, toErrorInfo
@@ -180,21 +297,33 @@ src/
     index.ts            every public type
 ```
 
-The published package bundles five entries, all under `src/`: the library
-(`harness.ts`), the Node root (`index.ts`), the browser root (`browser.ts`), and the
-per-layer barrels (`server/index.ts`, `frontend/index.ts`, `shared/index.ts`). The
-application layers are never separate top-level folders:
+The published package bundles SIX entries (`package.json:9-59`: `.`, `./server`,
+`./worker`, `./io-worker`, `./frontend`, `./shared`, plus the `./package.json`
+export), all under `src/`:
+`.` (the library, whose Node root is `index.ts` and whose browser root is `browser.ts`),
+`./server`, `./worker` (`server/workers/lane-worker.ts`), `./io-worker`
+(`server/workers/io-worker.ts`), `./frontend`, and `./shared`. The application
+layers are never separate top-level folders:
 
 ```
 src/index.ts            Node root: library + shared + server + client
 src/browser.ts          browser root: library + shared + client
 src/shared/
+  index.ts              the /shared barrel (isomorphic code only — safe in either runtime)
   origin.ts             loopback/same-origin rules (inbound gate + outbound gate)
+  harness-api.ts        GENERATED from src/server/harness.swagger.yaml — the canonical REST
+                        contract types (scripts/generate-harness-contract.mjs)
+  harness-stream.ts     GENERATED from the same spec — the update-stream wire vocabulary
+  attachments.ts        the SINGLE attachment gate shared by composer, route, run, snapshot
+                        and transport
+  agent-results.ts      result "block" references shared by server and browser
+  turn-display.ts       the server-compiled turn DISPLAY contract (R1/R3/R4)
+  *.test.ts             colocated contract/validation tests
 src/server/
   index.ts              server barrel -> @underload/harness/server
   start.ts              startHarnessServer: standalone node:http server (explicit)
   api.ts                transport-neutral dispatcher: routes, body policy, bootstrap
-  handler.ts            Node adapter: /api prefix, X-Harness-Client gate, SSE writer
+  handler.ts            Node adapter on /v1/harness; no header gate (T15); dormant SSE writer
   service.ts            @underload/service adapter: /v1/harness, Origin gate, raw SSE
   runtime.ts            lazy shared store/catalogue for the service routes, keyed by root
   persistence.ts        durable database: versioned JSON DTO, atomic write, validation
@@ -211,8 +340,21 @@ src/server/
                         `SessionInvalidThread`, `ThreadTranscriptResponse`)
   package-root.ts       package root discovered by walking to package.json (build-layout free)
   static.ts             src/frontend/dist serving
+  api-errors.ts         the ONE HttpError the dispatcher and every helper throw (T13)
+  api-events.ts         the server-side event hub + the single home of per-process EPOCH and
+                        RESOURCE REVISIONS (T13)
+  api-paging.ts         the one paging helper every paginated canonical route shares (T13)
+  api-reads.ts          the bounded read model behind the canonical REST surface (T13)
+  journal.ts            the per-step durable journal beside the checkpoint (R4)
+  turn-projector.ts     the fold from one turn's HarnessEvent stream to a TurnDisplay tree
+                        (the work the browser used to do)
+  plugins.ts            the runtime plugin-settings layer: what a built-in plugin's setting
+                        is worth for EVERY session in this process (T5/R2-R3)
+  tool-settings.ts      the runtime GLOBAL tool switch: which names this deployment runs,
+                        for every session and thread at once (R3)
   cli/
     index.ts            argv parsing, one-shot, interactive, --serve
+    options.ts          the argv parser alone (index.ts runs main() at import time)
     commands.ts         the REPL's slash-command dispatch (local set first, then the
                         harness registry) + the two-section /help
     commands.test.ts
@@ -220,6 +362,10 @@ src/server/
   endpoint/harness/     discovered by @underload/service
     service-route.ts        /v1/harness/*
     service-route-root.ts   /v1/harness    (bare bootstrap document)
+    service-route-stream.ts GET /v1/harness/stream on the @underload/service
+                        gateway — its own endpoint module, so the loader can attach
+                        the `upgrade` handler to an exact path instead of racing the
+                        `/v1/harness/*` wildcard
   harnesses/
     index.ts            createToolCatalogue: runtime catalogue for CLI and server
     core.ts             core-tool catalogue entries (sessionBound) for the server (R8)
@@ -234,19 +380,101 @@ src/server/
                     (one scanned folder, `src/server/tools/shared`; the opt-in
                     `examples` folder and its `testFlaky` are deleted)
     websearch.ts        always-listed search entry (configured or not)
+    webfetch.ts         the catalogue view of web fetch (its own module, unlike search)
+    agent-state.ts      the GLOBAL agent-override layer (T19)
     fixture-presets.test-support.ts  TEST-ONLY `demo` (scripted) + `flaky`
                     (toolbox + `testFlaky`) presets a suite injects; not production
     types.ts            RunnerSettings, HarnessPreset, CatalogueEntry, availability
+  tools/shared/         the five app tools the toolbox scans (one folder, no hand table):
+                    timeNow.tool.ts, textCount.tool.ts, diceRoll.tool.ts,
+                    noteSearch.tool.ts, textSummarize.tool.ts
+  stream/               the realtime half of the server: ONE update stream at
+                        `/v1/harness/stream` (13 files)
+    index.ts            the subsystem barrel and the layout rule each file owns
+    protocol.ts         closed vocabularies, per-scope tables, the opaque cursor codec,
+                        and the client-frame validator that runs FIRST
+    broker.ts           counters, subscriptions, sequences and replay windows; never touches
+                        a socket, so the REST side can drive it by plain calls
+    connection.ts       the per-connection conversation between the `101` and the close —
+                        the ONLY place a client frame mutates broker state
+    transport.ts        a minimal standards-safe RFC 6455 server transport (no `ws`)
+    mount.ts            attaching the stream to an HTTP listener + the bridge that lets the
+                        store/registry answer the stream's three cheap questions
+    *.test.ts           broker/connection/protocol/transport + standalone- and
+                        service-host upgrade tests
+  workers/              the lane-worker subsystem (29 files): each conversation can run on
+                        its own worker thread (`threadExecution: 'worker'`), and the same
+                        folder carries the durability arm (`ioExecution: 'worker'`)
+    index.ts            the subsystem barrel
+    lane-worker.ts      the Worker ENTRY file (two load modes, one file)
+    lane-worker-loop.ts one persistent lane thread's execution, on its own OS
+                        thread: a replica of the session harness rebuilt from the
+                        `hello` blueprint, so the agent loop, the provider stream and
+                        every synchronous tool BODY run off the main thread (R1)
+    lane-host.ts        the coordinator-side host that spawns and supervises lanes
+    lane-authority.ts   the authority: rebuilds the tool context from the crossing
+                        `LaneCallIdentity`, so a routed write keeps its (agent, threadId)
+    lane-commit.ts      the receipted commit path — shared state is mutated AT the
+                        authority, never merged into a replica (T3 findings F1-F8)
+    lane-identity.ts    the crossing call identity
+    lane-memory.ts      shared harness memory across lanes: faithful transfer and
+                        compare-and-set against the AUTHORITY's value (T3 finding F4)
+    capability.ts       the ONE decision a session makes at creation/restore about whether
+                        its turns may run on lane workers
+    protocol.ts         the lane wire vocabulary
+    io-worker.ts        the lane worker's durability arm (entry file)
+    io-worker-loop.ts   what runs on the IO thread (checkpoint + journal writes)
+    io-client.ts        the coordinator side: one FIFO durability queue per database root
+    io-protocol.ts      the IO request/response types
+    *.test.ts           authority, commit, identity, memory, capability, protocol,
+                        correctness, tool-settings + the two test-support stubs
 src/frontend/
   index.ts              client barrel -> @underload/harness/frontend (no CSS, no shell)
   main.ts               app shell: imports styles.css, mounts the DOM (NOT exported)
   vite.config.ts        Vite dev/build/preview; dev binds the dual-stack wildcard
-                        (localhost + LAN), /api proxy
+                        (localhost + LAN), /v1/harness proxy
                         to the service on :5000; proxy stamps target origin so the
                         service gate accepts LAN-browser traffic without CORS changes
-  vite-proxy.ts         /api route map: target, changeOrigin, target-origin header, rewrite
-  api.ts                root resolution (query/injected/build/api) + fetch + SSE parser
+  vite-proxy.ts         /v1/harness proxy map: target, changeOrigin, target-origin
+                        header, rewrite, `ws` upgrade
+  api.ts                root resolution (query/injected/build/api) + fetch; no SSE
+                        parser left (`src/frontend/api.ts:6-9`)
+  stream.ts             the realtime plane: ONE centralized `harness.v1` WebSocket (T14)
   contract.ts           wire validation/presentation helpers
+  view-api.ts           the browser's DISPLAY FACADE over the canonical control plane — the
+                        only place the UI assembles a render document (T14)
+  view-model.ts         the frontend's OWN render model for one conversation (T14)
+  view-state.ts         the browser-side display state: a `SessionView` plus the
+                        `TurnDisplayOp` stream that mutates it (R1/R3)
+  view-context.ts       the ONE context bar's model (segments, widths, tone, a11y text)
+  view-detail.ts        the ONE place a lazy detail body becomes view data (R2/R8)
+  view-shell.ts         the shell's existing vocabulary, bound to the canonical contract
+  display-project.ts    wire display record -> internal projector model (T14)
+  deployment.ts         where the harness API lives when the UI is on a STATIC origin
+                        (the GitHub Pages case)
+  build-label.ts        the build identity the topbar brand shows
+  index.html            the standalone client document
+  styles.css            the shell stylesheet, imported ONLY by `main.ts` (`main.ts:99`),
+                        which is what keeps the published barrel CSS-free
+  view-test-support.ts  the shared helper the frontend suites use to stand up a fake
+                        control plane
+  vite-env.d.ts         ambient types for the Vite client build
+  vitest.config.ts      the jsdom suite (`yarn test:frontend`)
+  extensions/           the plug-and-play panel seam under the panel pipeline (T5/R1)
+    index.ts            the subsystem barrel
+    runtime.ts          the mount/unmount engine the shell paints THROUGH
+    panel-kinds.ts      the closed panel-kind vocabulary
+    context.ts          the extension context handed to a panel
+    records-panels.ts / records-client.ts / records-dom.ts / records-wake.ts
+                        the two live shell panels (`harness.tasks`, `harness.records`)
+    shell-panels.ts     the shell's own panel registrations
+  ui/                   29 modules for the DOM surface (+ colocated tests, + dialog.css and
+                        agent-dialog.css): action-request, activity, agent-color,
+                        agent-control, agent-dialog, agent-label, agents, attachments,
+                        composer, context-bar, context-detail, create-harness, dialog,
+                        editor, file-links, file-preview, markdown, model-order, panels,
+                        preview, rail-resize, references, thread-transcript, threads, time,
+                        tokens, tools, turns, usage-summary (+ highlight-core.d.ts)
   ui/turns.ts           linear turn timeline: completed grey, active green, queued neutral;
                         one independently expandable entry per delegated invocation,
                         nested depth-first outside every collapsible body
@@ -275,16 +503,28 @@ so the `main.ts` stream/snapshot routing needs no per-agent case.
 
 `src/server` and `src/server/cli` import `src/harness.ts` relatively (they are
 inside the package) and re-use the public harness surface. `src/frontend` imports
-the wire types **type-only** from `src/server/protocol.ts` (erased at build time)
-and takes its only runtime cross-tree dependency from `src/shared/origin.ts`, so the
-client never loads server code — which is why the old `node:` stubs are gone.
+the server wire types **type-only** from `src/server/protocol.ts` (erased at build
+time — `main.ts:100-113`, `contract.ts:33-42`, `view-state.ts:44-50`,
+`ui/turns.ts`, `ui/thread-transcript.ts`), so the client never loads server code;
+its runtime cross-tree dependencies are all in the isomorphic `src/shared/` layer —
+`harness-api.ts` (route/constant values), `harness-stream.ts` (the stream wire),
+`origin.ts` (the trust gate) and `attachments.ts` (the shared attachment gate) —
+which is why the old `node:` stubs are gone. The one exception is
+`view-test-support.ts`, a TEST-ONLY helper that does import server runtime
+(`server/turn-projector.ts`) to drive the projector the client renders.
 
-Tests are colocated with the module they cover, and they import **only** from
-`@underload/harness` — never a relative path. That keeps them honest about the
-public surface and free of `../` chains. `vitest.config.ts` aliases the specifier
-to `src/harness.ts` (and tsconfig `paths` mirrors it), so `vitest run` needs no
-build and can never accidentally test `dist/`. Application-layer tests use the
-`/server`, `/frontend` and `/shared` aliases; the jsdom client suite runs with
+Tests are colocated with the module they cover, and the harness's own behaviour is
+exercised through the PUBLISHED specifiers — `@underload/harness` and its
+subpaths — while an internal that is not on the public surface is imported
+relatively (e.g. `./core`, `./core/tool-outcome`, `./server/harnesses/toolbox`).
+Those specifiers resolve with NO `resolve.alias` block at all: `package.json`
+`exports.development` (the condition Vite/Vitest/vite-node select in dev and test
+mode) maps them onto the raw `src/*.ts` entries, so `vitest run` needs no build and
+can never accidentally test `dist/`; an alias here would shadow that map and let the
+manifest and the suite drift apart (`vitest.config.ts:3-18`). `tsconfig.json`
+`paths` mirror the same six targets for editors and `tsc`, and
+`src/structure.test.ts` (items 8-9) pins manifest, config and tsconfig against each
+other. The Node suite excludes `src/frontend/**`; the jsdom client suite is
 `src/frontend/vitest.config.ts` (`yarn test:frontend`).
 
 **Declaration contract (R1 types).** The shipped `.d.ts` tree must satisfy two
@@ -343,8 +583,14 @@ public surface clean.
 | `transport` | `types`, `util` |
 | `core` | `types`, `util`, `transport` |
 | `tools` | `types`, `util`, `core` |
-| `plugin` | `types`, `util` |
-| `harness` | `types`, `util`, `core`, `transport`, `tools`, `plugin` |
+| `plugins` | `types`, `core` — the shipped plugins reach the pure helpers they need (`core/context-pruning`, `core/argument-fingerprint`, `core/context-estimate`, `core/tool-outcome`) |
+| `plugin` | `types`, `util`, `plugins` — the host and the settings view stay clean; only the GENERATED `plugin/manifest.ts` names the built-ins (`:26-28`) |
+| `harness` | `types`, `util`, `core`, `transport`, `tools`, `plugin` (and `plugins` transitively, through that manifest) |
+
+CORRECTED IN PLACE 2026-11-11: the `plugin` row used to read "`types`, `util`" and the
+`plugins` folder was not in the table at all — that was true before the shipped plugins
+were auto-discovered, and the folder is now `plugin/{manifest,host,hooks,settings}.ts`
+plus `src/plugins/*.plugin.ts`.
 
 Internal folders import each other through barrels. A barrel is never
 load-bearing for runtime wiring; it only defines what consumers can reach.
@@ -361,23 +607,30 @@ reach into `src/`.
 - [agent](#agent) — The brain, usable on its own
 - [tool](#tool) — An executable action: call it directly, or let the model call it
 - [Tool discovery](#tool-discovery) — Tags, visibility, toolRequest, and the ranking
-- [Session tasks](#session-tasks) — Core task, incremental ids, per-harness state,
-  revisions, claims and the change feed
-- [Session records](#session-records) — Core profileManage/chapterManage/locationManage stores
+- [Turn modes](#turn-modes-sync-vs-async-t2) — sync vs async calls, and the background board
+- [Session tasks](#session-tasks) — The `tasks` collection of the one session store:
+  incremental ids, per-harness state, revisions, guarded writes and the change feed
+- [Session records](#session-records) — The `profiles`/`chapters`/`locations` collections of
+  the one record engine (`src/core/records.ts`)
 - [Agent results](#agent-results-r3) — Core agentManage/agentResult result inspection
-- [toolCreate](#createtool) — Runtime tool creation from an async function body
+- [toolCreate](#toolcreate) — Runtime tool creation from an async function body
 - [Delegation](#delegation) — Explicit primary/subagents, one level deep
 - [Owner questions and history forks](#owner-questions-and-history-forks) —
   Conditional `actionRequest`/`threadFork`, autoanswer owner forks, ephemeral branches
 
+<!-- The `-1` slugs below are not typos: this Index's own group headings
+     ("### Preset Tools", "### Harness") slug to the same anchors as the sections
+     they list, so github-slugger gives the LATER heading the `-1` suffix. Linking
+     the bare slug would jump back into this Index instead of to the section. -->
+
 ### Preset Tools
-- [Preset tools](#preset-tools) - the ten lazy presets, executable on their own
+- [Preset tools](#preset-tools-1) - the ten lazy presets, executable on their own
 - [Web search](#web-search) — opt-in per-harness `search` over Exa/Tavily/Linkup
 - [Web fetch](#web-fetch) — opt-in `fetch`: keyless `native` default, hosted `exa`/`linkup`
 - [Web download](#web-download) — always-registered `download`: 20 MiB bytes as model media
 
 ### Harness
-- [harness](#harness) — Callable execution loop
+- [harness](#harness-1) — Callable execution loop
 - [Slash commands](#slash-commands) — Operator-facing registry, built-ins, and the
   command turn (no model, server state, UI renders)
 
@@ -389,12 +642,24 @@ reach into `src/`.
 - [HarnessEvent](#harnessevent) — Progress events
 - [HarnessMessage](#harnessmessage) — Transcript entries
 - [HarnessAssistantMessage](#harnessassistantmessage) — Finished turn
-- [ToolVisibility / ToolSearchResult](#toolvisibility--toolsearchresult) — Discovery data
+- [ToolVisibility / selectTools / searchTools](#toolvisibility--selecttools--searchtools) —
+  Discovery data
+- [Action and branch types](#action-and-branch-types-n3) — The N3 wire shapes
+- [Declarative tool panels](#declarative-tool-panels-r202) — `toolUi()`, the server-tool→client seam
 
 ### Application
 - [CLI, server, and UI](#cli-server-and-ui) — The app built on the harness
+- [API](#api) — The canonical REST surface and its generated contract
 - [Task queue and presentation](#task-queue-and-presentation-r4r5) — Server-owned FIFO queue, watcher stream, timeline, Markdown
+- [Persistent threads in the UI](#persistent-threads-in-the-ui-t5--r5-r7) — Host threads, resume, steer, stop
+- [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords) — The two panel-host panels
+- [Lane workers](#lane-workers-threadexecution-worker) — One conversation per worker thread
+- [IO workers](#io-workers-ioexecution-worker) — Checkpoint and journal writes off the request loop
 - [Agents and the harness registry](#agents-and-the-harness-registry) — Trusted profiles, create/patch, frozen teams, live models
+
+### Document
+- [Decisions worth remembering](#decisions-worth-remembering) — The rulings a change must not undo
+- [Not built yet](#not-built-yet) — The roadmap, in the order it is expected
 
 ---
 
@@ -572,7 +837,7 @@ What is deliberately **not** renamed:
 
 - **harness / preset ids** — `general`, `instruct`, `research`, `workspace`,
   `reviewer`, `planner`, `debugger` are identities, not tool names, and sessions/aliases
-  reference them (`demo`/`flaky` are deleted, so those two names resolve to nothing). `workspace` keeps its id while its visible title is "Coder", so
+  reference them (`demo`/`flaky` are deleted, so those two names resolve to nothing). `workspace` keeps its id while its visible title is "Analyst", so
   every saved session and bookmark still resolves;
 - **agent ids** — `summarize`'s delegated half still targets the `summarizer` agent;
 - **the `websearch` harness configuration field** — it names the *feature*, not the
@@ -760,10 +1025,20 @@ bytes (or delete the new file) and surface rollback failure.
 
 ## Session tasks
 
-`src/core/task.ts` builds the `task` tool (R9-R11 renamed it from `todoManage`).
-It is a **deliberate exception to the stateless-tool rule**: the state lives in the
-factory closure, never in a module singleton, so the harness owns exactly one list
-per instance.
+`src/core/task.ts` is the `tasks` **collection SPEC** — 66 lines of field definitions,
+caps, count facets, the canonical field order and the wrapper mapping. It used to be the
+whole task store (~1,700 lines of CRUD, bounds, pagination, CAS and change feed); all of
+that now lives ONCE in the engine, `src/core/records.ts` (records-engine T2/T3, finding
+F9). The wire tool is `tasks`, named and described by `TASKS_NAME`/`TASKS_METADATA`
+(`src/tools/runtime/tasks.tool.ts:20-22`), and it holds no state and no logic of its own
+(Decision E). The spelling history: Decision J renamed the TOOL to the plural, Decision K
+made the collection key identical to the tool name, Decision I kept it `core`, and R9-R11
+renamed the original `todoManage`.
+
+It is still a **deliberate exception to the stateless-tool rule**: the state lives in the
+engine instance the harness constructs (`src/harness.ts:3364`), never in a module
+singleton, so one harness owns exactly one store and two harnesses — i.e. two server
+sessions — can never share records.
 
 ```ts
 // One STORE per harness, owned by the engine — not one factory per tool (records-engine T2).
@@ -771,13 +1046,14 @@ const engine = createRecordEngine();   // collections + the single id counter + 
 ```
 
 - The wire shape is one **merge command**, not an action enum: `tasks` holds patch
-  entries, `remove` holds ids, `claim`/`release`/`takeover` hold ids for the
-  ownership verbs, and `offset`/`limit`/`afterId`/`since` shape the answer. No
+  entries, `remove` holds ids, `ids` reads specific records, and
+  `offset`/`limit`/`afterId`/`since` shape the answer. No
   arguments (or `{}`) is a read. An entry **without** `id` adds a task (`text`
   required); an entry **with** a known `id` patches it — `text` and/or `completed`,
   whichever are sent; omitted fields are unchanged. An unknown id, an entry with
-  neither `text` nor a known `id`, one id in two of the five id lists, or an id
-  patched twice are all rejections.
+  neither `text` nor a known `id`, one id in two of the three id lists, or an id
+  patched twice are all rejections. (`claim`/`release`/`takeover` were parameters too;
+  they died with the lock — see the Decision P note below.)
 - The whole patch is validated **before** anything mutates, so a rejected call
   leaves the records, the id counter, `storeRev` and the change log exactly as they
   were. Apply order is fixed: claims → releases → takeovers → expired-claim clears →
@@ -788,91 +1064,128 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   `owner`/`ownerThreadId`/`leaseUntil` on a record: **every patch is accepted unless it is
   stale**, and a stale rejection returns the CURRENT record (R9). The sentence above is kept
   so the reasoning stays auditable; `src/core/records.ts` is the implementation.
-- Ids are decimal strings (`"1"`, `"2"`, …), monotonic per instance; a removed id
-  is never re-used. `reset()` clears the list, the counter, `storeRev` and the log.
+- Ids are decimal strings (`"1"`, `"2"`, …), monotonic per harness and unique across
+  EVERY collection of the store (F3 — one counter, so a task id and a chapter id can no
+  longer both be `"1"`); a removed id is never re-used. `reset()` clears every
+  collection with its counter, per-collection `storeRev` and per-collection window.
 - **Every record carries concurrency state** (T1), on top of `id`/`text`/`completed`:
   `rev` (its CONTENT revision — 1 on add, `+1` only when trimmed `text` or
   `completed` actually changes, so a restated value is a silent no-op FOR THE PATCH
-  ITSELF), the write attribution `updatedBy`/`updatedThreadId`/`updatedAt`, and the
-  optional claim triple `owner`/`ownerThreadId`/`leaseUntil`. Attribution comes from the
+  ITSELF) plus the write attribution `updatedBy`/`updatedThreadId`/`updatedAt`. Those
+  five are the RESERVED entry keys — `id, rev, updatedBy, updatedThreadId, updatedAt`
+  (`src/core/records.ts:279`) — so no collection may define a field that claims one.
+  Attribution comes from the
   `ToolContext` (`agent?.name`, `threadId`), never from arguments, so a model cannot
-  forge it. Optional fields stay ABSENT rather than `undefined`-valued, so a store
-  nobody has claimed serializes exactly like a pre-T1 store.
-- **Every recorded event also bumps the store**: one `TaskChange` per accepted
-  `add`/`update`/`remove`/`claim`/`release` goes into a FIFO log capped at
-  `TASK_MAX_CHANGES` (200) and `storeRev` advances by one. A no-op patch and a lease
-  renewal record nothing THEMSELVES — the one event such a call can still append is
-  clearing an expired foreign claim on a record it patches or removes — which is why a
-  heartbeat cannot knock a reader off its revision.
+  forge it. Optional fields stay ABSENT rather than `undefined`-valued. (CORRECTED IN
+  PLACE 2026-11-11: the "optional claim triple `owner`/`ownerThreadId`/`leaseUntil`"
+  this bullet used to list no longer exists.)
+- **Every recorded event also bumps the store**: one `RecordChange` per accepted change
+  goes into THAT collection's FIFO window capped at `RECORD_MAX_CHANGES` (200,
+  `src/core/records.ts:165`) and that collection's `storeRev` advances by one; the op is
+  `add` | `update` | `remove` ONLY (`src/types/index.ts:1491` — `claim`/`release` are
+  gone, so there is no ownership event to log and nothing to sweep when a thread dies).
+  A no-op patch records nothing, which is why a heartbeat cannot knock a reader off its
+  revision.
 - Every success answers the SAME bounded envelope, with no action wrapper:
   `{ tasks, counts: { total, completed, pending }, page: { offset, limit, hasMore,
-  nextOffset? | afterId? + nextAfterId? }, storeRev }` (20 items by default, hard
+  nextOffset? | afterId? + nextAfterId?, budgetTruncated? }, storeRev, entry?,
+  removed? | removedIds? }` (20 items by default, hard
   maximum 100, and a 64 KiB serialized page budget that stops BEFORE an item which
   would cross it). `tasks` is the current page — including right after an add, a
-  patch, a removal or an ownership action — and is a defensive copy, so mutating a
-  result can never mutate the session list. `counts` always describes the WHOLE
-  store, never the page. Caps: 200 tasks and 4000 characters of text each.
+  patch or a removal — and is a defensive copy, so mutating a
+  result can never mutate the session list. `entry` is present when ONE record answers
+  (an `ids` read or a single patch), `removed` when exactly one record was deleted and
+  `removedIds` when two or more were; `budgetTruncated` appears only when the byte
+  budget cut the page short of `limit`. `counts` always describes the WHOLE
+  collection, never the page. Caps: 200 tasks and 4000 characters of text each
+  (`TASK_MAX_RECORDS`/`TASK_MAX_TEXT`, `src/core/task.ts:35-36`). The whole description —
+  this key set included — is pinned byte-for-byte by `src/harness.metadata.test.ts:307-309`
+  against `src/tools/runtime/tasks.tool.ts:37`.
 - **Two cursors, deliberately different.** `offset` is an index; `afterId` is a
   keyset cursor over the numeric ids ("everything after id 7"), which cannot skip or
-  repeat a record when another agent deletes one mid-walk. Passing an EXPLICIT
+  repeat a record when another agent deletes one mid-walk. The walk runs in **id
+  order**, which on a `sortable` collection is NOT the page order, and one walk may not
+  mix the two modes: passing an EXPLICIT
   `offset` alongside `afterId` is a rejection, and a keyset page reports `afterId`
   plus `nextAfterId` while `hasMore` — never `nextOffset`.
 - **The change feed** is the cheap alternative to re-reading: `since: <storeRev>`
   adds `changes` (the events after that revision, oldest first, at most
-  `TASK_MAX_CHANGES_IN_RESULT` = 50 entries, added to the result only when the byte
+  `RECORD_MAX_CHANGES_IN_RESULT` = 50 entries — `src/core/records.ts:166`, added to the
+  result only when the byte
   budget allows), `changesHasMore` (the feed was cut, by count or by bytes) and
   `changesTruncated` (the retained window no longer covers `since + 1`, so the reader
-  never saw part of the gap). A `since` ahead of `storeRev` is an error, and those
+  never saw part of the gap). The window is PER COLLECTION (Decision B), so a task
+  reader is never woken by chapter edits. A `since` ahead of `storeRev` is an error, and those
   three keys are absent from every other result.
-- Validation names the offending field with a quoted, balanced path
-  (`task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`);
+- Validation names the offending field with a quoted, balanced path, labelled by the
+  TOOL name (the engine's `callLabelOf`, `src/core/records.ts:270-271`):
+  `tasks "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`
+  (`src/core/records.ts:1538`);
   the harness turns the throw into a recoverable tool result.
-- **The model-facing contract lives in `src/tools/runtime/task.tool.ts`**
-  (`TASK_METADATA`: description + JSON Schema + `registration`), and
-  `src/core/metadata.ts` is only the generated-manifest projection the factory
-  consumes. The two must stay in step, and two boundaries are deliberate: the schema's
-  `pattern: '^[0-9]+$'` on `afterId` is DECLARATIVE — the shared validator
-  (`src/core/schema-validation.ts`) implements type/minimum/maximum/
-  `additionalProperties` but not regex, so a non-decimal cursor reaches the store and
-  `readAfterId` is what rejects it — and the `leaseMs` clamp (1 minute..24 hours) only
-  ever fires on a call that bypasses the schema (a bare `tool().execute(...)`), because
-  a model call and a `harness.executeTool` call are both schema-gated and an
-  out-of-range lease is rejected there as `$.leaseMs must be >= 60000.`
-- `src/harness.ts` registers the factory's tool under the exact name `task`, marks
-  it core (`alwaysDeclared`, so it is declared to every agent with no discovery),
-  adds it to `RESERVED_TOOL_NAMES`, calls the returned `reset()` from
-  `harness.reset()`, and passes the calling agent + conversation into the tool
-  context on every door (model call, `executeTool`, slash command). Because
+- **The model-facing contract lives in `src/tools/runtime/tasks.tool.ts`**
+   (`TASKS_METADATA`: description + JSON Schema; the registration flags are a SEPARATE
+   literal at `:174`, still `core`/always-declared, order 60), and
+   `src/core/metadata.ts` is only the compatibility aggregation over those entries. The
+   two must stay in step, and this boundary is deliberate: the schema's
+   `pattern: '^[0-9]+$'` on `afterId` (`:133`) is DECLARATIVE — the shared validator
+   (`src/core/schema-validation.ts`) implements type/minimum/maximum/
+   `additionalProperties` but not regex, so a non-decimal cursor reaches the store and
+   `readAfterId` (`src/core/records.ts:451`) is what rejects it. (CORRECTED IN PLACE
+   2026-11-11: the second half of this bullet — the `leaseMs` clamp and its
+   `$.leaseMs must be >= 60000.` rejection — described a parameter Decision P deleted.)
+- `src/harness.ts` registers the collection through the ENGINE (`createRecordEngine()`,
+  `:3364`; the wrappers are executed by `recordEngine.executeRecords(name, context)`,
+  `:3412`), and the `tasks` entry keeps `visibility: 'core'` so it is declared to every
+  agent with no discovery (Decision I). `reset()` clears the engine via
+  `recordEngine.reset()` (`:11905`), and the harness passes the calling agent +
+  conversation into the tool context on every door (model call, `executeTool`, slash
+  command). Names are NOT reserved any more — harness.ts:1141 and :1891 state that no
+  reserved-name or "already registered" gate exists, so a replacement by name is legal.
+  Because
   `src/server/sessions.ts` creates one harness per session, tasks are isolated per
   session and shared by the primary and its subagents within one harness.
-- Snapshot persistence keeps the store's wire key: `records.todos` (snapshot v1,
-  still version 1) is now `{ items, nextId, storeRev?, changes? }`, where `items`
-  entries are full `TaskItem` records including `rev`, the attribution fields and the
-  claim triple. `readTaskStoreState` validates that block and returns a deep copy; it
-  is the SAME reader `src/core/snapshot.ts` runs the persisted value through before a
-  session is accepted, so a corrupt file cannot half-restore a live store. Duplicate
-  or non-positive integer ids still report with the persisted field name
-  (`todo state contains the duplicate id "1".`).
+- Snapshot persistence keeps the WHOLE store as one block: `records` (snapshot **v2** —
+  `HARNESS_SNAPSHOT_VERSION = 2`, `src/core/snapshot.ts:76`) is
+  `{ nextId, collections: { tasks: { definition, items, storeRev?, changes? }, … } }`
+  (`src/core/records.ts:2140,2221`), so the per-collection block still exists — the
+  collection key is `tasks`, and the v1 sibling `records.todos` is gone (Decision K made
+  the key equal the tool name). Entries are full records including `rev` and the
+  attribution fields, and the definition persists with them (Decision M).
+  `readRecordsStoreState` (`src/core/records.ts:2218`) validates that block and returns
+  deep copies; it is the SAME reader `src/core/snapshot.ts:985` runs the persisted value
+  through before a session is accepted, so a corrupt file cannot half-restore a live
+  store. A duplicate id inside one collection reports with the persisted field name
+  (`records state.collections.tasks.items lists the same id twice; ids are unique.`,
+  `src/core/records.ts:2162-2164`).
 - **Old snapshots load, new snapshots do not go backwards.** `storeRev` and
   `changes` are optional and default to `0` / `[]`, and a record without `rev`
   defaults to `1` — the revision it was created with — so a pre-T1 file restores
-  unchanged. The reverse is refused: the validator rejects unknown persisted keys
-  (`<label> has an unknown field "<key>".`), so a snapshot written by THIS build —
+  unchanged (`src/core/records.ts:1948-1964`). The reverse is refused: the validator keeps an
+  EXACT key set (`src/core/snapshot-validation.ts:109-130`), so a snapshot written by THIS build —
   whose records carry `rev` and whose block carries `storeRev`/`changes` — cannot be
-  restored by an older build. It also refuses a `leaseUntil` with no `owner`, a
-  change `rev` outside `1..storeRev`, a change log that is not strictly ascending, a
-  `storeRev` behind its newest event, and an over-cap `items` (200) or `changes` (200)
-  list.
+  restored by an older build, and a snapshot from another shape is refused by the version
+  gate rather than half-read. It also refuses a persisted claim field
+  (`items[0] has an unknown field "leaseUntil".` — `src/harness.snapshot.test.ts:1786,1790`
+  pins that a claim is never silently restored), a
+  change `rev` outside `1..storeRev`, a change log that is not strictly ascending
+  (`records state.collections.<name>.changes must be strictly ascending in "rev"; …`), a
+  `storeRev` behind its newest event, an over-cap `items` (the collection's own
+  `maxRecords`) or an over-`RECORD_MAX_CHANGES` window, and a collection map whose key
+  disagrees with the definition it holds.
 - **~~Thread lifecycle clears claims~~ (deleted in place, records-engine Decision P).**
   `releaseThread(threadId)` used to drop every claim tagged with a conversation id, and the
   harness called it when a thread stopped (`stopThread` and every path through it), when one
   was purged/deleted, when an agent's default conversation was dropped from the roster, and
   on `restore` for any claim whose `ownerThreadId` is absent from the restored session
   — a claim from a thread that no longer exists could never be renewed or released.
-- Beyond the tool result there is no separate host getter: the store crosses to a
-  host only through `harness.snapshot()`'s `records.todos`, and
-  `readTaskStoreState()` is the exported pure reader that path and `restore()` share.
-  No UI panel and no dedicated HTTP endpoint.
+- Beyond the tool result the store reaches a host three ways (CORRECTED IN PLACE
+  2026-11-11 — this bullet used to claim "no separate host getter" and named the deleted
+  `readTaskStoreState()`): `harness.snapshot().records` for the durable document, the
+  live `harness.records()` / `recordsChanges(since)` / `onRecordsChange(listener)`
+  control-plane members (`src/types/index.ts:3441-3443`), and the server's record
+  routes over them. `readRecordsStoreState()` is the exported pure reader that the
+  snapshot and `restore()` paths share. The browser renders the live view in the two
+  shell panels — see [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords).
 
 **Concurrency and ownership (T1).** One store is shared by every agent on every
 thread, and a call is not a transaction: a read is a snapshot, and somebody else can
@@ -882,45 +1195,52 @@ explicit instead of letting the last write win:
 - A caller the runtime **knows** (any model call, `executeTool`, a command, a lane
   worker — anything with `context.agent`) must send `expects: [{ id, rev }]` for
   every id it patches or removes; that is the GUARDED WRITE rule. A bare `tool()` /
-  driver call has no identity, may write blind (the pre-T1 behaviour hosts and tests
-  rely on), and cannot claim, release or take over at all.
-- A token that does not match the stored `rev` rejects the WHOLE call and names what
-  moved: `task "1" changed since revision 1 (now 2, last edited by "coder"); re-read
-  and retry; changed fields: completed.` A token naming a record the store no longer
-  has always answers `task "1" was removed since revision 1; re-read the list.`:
-  `readPatch` compares the tokens (step 3) BEFORE it runs the existence lookups
-  (step 4), so a `tasks` patch, a `remove`, an ownership verb or a token alone all
+  driver call has no identity and may write blind (the pre-T1 behaviour hosts and tests
+  rely on). CORRECTED IN PLACE 2026-11-11: this bullet ended "…and cannot claim, release
+  or take over at all" — those verbs no longer exist, so the sentence had nothing left
+  to exclude.
+- A token that does not match the stored `rev` rejects the WHOLE call, names what
+  moved, and CARRIES THE CURRENT RECORD (R9 — one round trip, not two):
+  `tasks "1" changed since revision 1 (now 2, last edited by "writer" at <ISO>); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: {"id":"1",…}`
+  (`src/core/records.ts:1301-1317`, pinned byte-for-byte at
+  `src/harness.task.test.ts:589`). A token naming a record the log says was removed
+  answers `tasks "1" was removed since revision 1 — re-read the list and add or retry.`
+  (`src/core/records.ts:1704`), and one naming an id the log holds no removal for answers
+  the two-case sentence at `:1713-1715` ("never in "tasks", or its removal aged out of
+  the 200-event window").
+  The tokens are compared (step 3) BEFORE the existence lookups
+  (step 4), so a `tasks` patch, a `remove` or a token alone all
   name the removal the caller actually hit. The generic
-  `task has no task with id "1".` is only what a call that sent NO token for that id
-  hears, and a token for a live id the call does not touch is still rejected as a
-  token for nothing.
-- `rev` is content-only and `storeRev` counts every event, which is exactly why a
-  claim, a release, a takeover or a lease renewal can never break another agent's
-  compare-and-swap.
-- `claim` holds a record for the exact holder pair `(owner, ownerThreadId)` with
-  `leaseUntil = now + leaseMs`; `TASK_DEFAULT_LEASE_MS` is 15 minutes, and a lease
-  outside 1 minute..24 hours is REJECTED on a schema-gated call (model or
-  `executeTool`) and CLAMPED into that range on a call that bypasses the schema.
-  While a claim is live, a non-holder's
-  content write, claim, or release is refused (`task "1" is claimed by "coder" until
-  <ISO>; release it or take it over first.`); a holder re-claiming its own record only
-  renews the lease; releasing an unowned record is a no-op success; a claim stops
-  blocking AT or after `leaseUntil` — `isExpired` is `leaseUntil <= now`, so the expiry
-  instant itself frees it — and the next writer clears it (logged as a `release`)
-  before applying its own change. `owner` with no `leaseUntil` is an indefinite claim
-  that never auto-expires, so only a restored or hand-edited store holds one forever.
-- `takeover` is the DELIBERATE override: it moves the holder to the caller even under
-  a live lease and logs a `claim`. `mergeDisjoint: true` is the one escape from a
+  `tasks has no task with id "1".` (`:1725`) is only what a call that sent NO token for
+  that id hears, and a token for a live id the call does not touch is still rejected as
+  a token for nothing (step 5, coverage).
+- `rev` is content-only and per-collection `storeRev` counts every event. CORRECTED IN
+  PLACE 2026-11-11: the rest of this bullet ("…which is exactly why a claim, a release,
+  a takeover or a lease renewal can never break another agent's compare-and-swap")
+  described events that no longer exist. With no lock, the `expects` token is the ONLY
+  conflict control — which is exactly why its rejection has to be complete.
+- ~~`claim` / `leaseUntil` / `TASK_DEFAULT_LEASE_MS`~~ — **deleted with the lock
+  (records-engine Decision P), restated here 2026-11-11 so the deletion is one edit
+  rather than folklore:** there is no `claim` verb, no `leaseMs` parameter, no
+  `TASK_DEFAULT_LEASE_MS` constant, no live-lease refusal for a non-holder, no renewal
+  path, no indefinite `owner`-only claim, and no `takeover` override. Two agents that
+  both want the same record simply both write, and the loser is the one whose `expects`
+  token went stale.
+- `takeover` is gone with that same decision; `mergeDisjoint: true` SURVIVES
+  (`src/types/index.ts:1692`) and is the one escape from a
   stale content patch: the patch applies only when the log proves every concurrent
   update since the caller's read covers `expected+1 … current` with no gap or
   duplicate and touched none of the fields the patch sets. A logged `remove` of that
   id, an overlapping field, or an uncovered tail all refuse; a stale `remove` is never
-  merged.
+  merged, because a removal carries no patch to prove disjoint
+  (`src/core/records.ts:1237`).
 - **Corrected in place (Decision P):** there is no claim, so a conversation ending strands
   nothing — no sweep, no wiring, and no lease for a crashed agent to hold. The guarantee is
-  structural, and `src/harness.task.test.ts` pins it by SHAPE (no `owner`/`leaseUntil` key
-  anywhere in a persisted store after stop/delete/snapshot/restore).
-- Worker mode changes nothing: a `task` call made on a lane is ROUTED, and the
+  structural, and `src/harness.task.test.ts:1062-1082` pins it by SHAPE (no
+  `claim`/`release`/`takeover`/`leaseMs` parameter, and no `owner`/`leaseUntil` key
+  anywhere in a persisted store after stop/delete/snapshot/restore — and a snapshot that
+  DID carry a claim is refused as an unknown field instead of re-locking the record).
+- Worker mode changes nothing: a `tasks` call made on a lane is ROUTED, and the
   authority rebuilds the tool context from the crossing `LaneCallIdentity`
   (`src/server/workers/lane-authority.ts`), so a lane's write is attributed to — and
   guarded by — the same `(agent, threadId)` pair it would have inline.
@@ -934,33 +1254,44 @@ Sources:
 [`plugin/todo.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/todo.ts),
 [`todowrite.txt`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/todowrite.txt),
 [`tool-todo.test.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/test/tool-todo.test.ts).
-`task` is a partial patch with stable ids, not parity: it never rewrites the whole
+`tasks` is a partial patch with stable ids, not parity: it never rewrites the whole
 list and it does not carry `in_progress`/`cancelled` states.
 
-**Operator surface.** `/task [list|add|complete|reopen|remove|claim|release|takeover]`
-is the built-in slash command over this SAME tool: it calls
-`harness.executeTool('task', …)`, so a terminal, an HTTP submit, or the composer reads
+**Operator surface.** `/task [list | add <text> | complete <id> | reopen <id> |
+remove <id>…]` (`src/core/command-builtins.ts:265`) is the built-in slash command over
+this SAME tool: it calls `harness.executeTool('tasks', …)` (`TASK_TOOL_NAME`, `:95`), so
+a terminal, an HTTP submit, or the composer reads
 and changes this session's list without spending a model turn, and it inherits every
-bound above. `complete`/`reopen`/`remove` are guarded writes, so the command first walks
-the store (`offset` paging at `limit: 100`, following `page.nextOffset` until it is
+bound above. (The COMMAND name stays singular `/task` by Decision J even though the tool
+is plural — the command addresses one task at a time.)
+`complete`/`reopen`/`remove` are guarded writes, so the command first walks
+the store (`readTaskRevisions`, `:220` — `offset` paging at `limit: 100`, following
+`page.nextOffset` until it is
 exhausted) and sends the REAL `expects: [{ id, rev }]` tokens it read — never an invented
-revision — which turns a concurrent edit into the tool's stale error instead of a lost
+revision (`:336-347` for `complete`/`reopen`, `:366-373` for `remove`) — which turns a
+concurrent edit into the tool's stale error instead of a lost
 update; an id the read did not see gets no token, so the tool's own unknown-id rejection
-is what an operator reads. `claim`/`release`/`takeover` send no token (an ownership
-action never moves `rev`) and run **unthreaded**, so their holder pair is `(entry agent,
-no thread)` — `/task release` can therefore lift only the operator's own or an expired
-claim, and `/task takeover` is the documented override for a live one. The listing marks
-a reserved record — `#1 [ ] testing (claimed by writer until <ISO>)`, with `@<threadId>`
-when the holder is a conversation — because the fix (`/task takeover 1`, or waiting out
-the lease) is otherwise invisible. See [Slash commands](#slash-commands).
+is what an operator reads. `/task claim|release|takeover` are GONE: Decision P deleted the
+three verbs, the tool's `leaseMs` parameter and its ownership block, and the comment at
+`:380-386` says why — an operator who types one now falls through to
+`unknown action "<verb>".` (`:388`), which is the honest answer because there is no
+ownership state left to move. The listing is one `#<id> [x| ] <text>` line per task plus
+the totals and the page line (`formatTaskPage`, `:185-205`); the old
+`(claimed by <agent> until <ISO>)` suffix is gone because the lock it described is gone,
+while `rev` and the attribution still ride in the command's machine-readable `data`.
+See [Slash commands](#slash-commands).
 
 Tests: `src/core/records.test.ts` (the ENGINE — one id counter across collections, per-collection
 feeds, patch semantics, bounds, keyset and offset paging, `rev`/attribution, guarded writes
 and CAS, disjoint merges, `define`/`drop`, snapshot/restore and the corrupted-file rejections;
 the claim/lease tests left with the lock), `src/harness.task.test.ts` (declaration, one shared
-list in a live harness, and the T8 harness-boundary checks), `src/harness.commands.test.ts` (every `/task` verb, including the
-read-before-write `expects` and the claimed-record rendering), and
-`src/server/workers/lane-authority.test.ts` (a routed `task` call against the canonical
+list in a live harness, and the harness-boundary checks — `:1062-1082` is the no-claim-by-shape
+guarantee), `src/harness.metadata.test.ts:307-309` (the pinned `tasks` description),
+`src/harness.commands.test.ts` (the five `/task` verbs — `list`/`add`/`complete`/`reopen`/
+`remove` — including the read-before-write `expects`, and `unknown action` for the three
+ownership verbs that were deleted), `src/harness.snapshot.test.ts:1786,1790` (a persisted
+claim field is refused, never restored), and
+`src/server/workers/lane-authority.test.ts` (a routed `tasks` call against the canonical
 harness).
 
 ---
@@ -1188,14 +1519,27 @@ Implementation notes worth keeping:
   `{ "paths": ["a", "b"] }` the same code path. `read` keeps that property while
   allowing range objects as ITEMS (`{ path, startLine?, startColumn?, startByte?,
   maxLines? }`); per-file windows are not a second top-level property.
-- **`read` is bounded by default.** 5000 lines per file (`maxLines`, hard max
-  20000) from a 1-based `startLine`, plus a fixed 256 KiB aggregate budget measured on
+- **`read` is bounded by the BYTE BUDGET, with no default line cap.** A window starts at a
+  1-based `startLine`; `maxLines` is optional, its DEFAULT is "no cap"
+  (`FILE_READ_DEFAULT_MAX_LINES = Number.MAX_SAFE_INTEGER`), and an EXPLICIT value is still
+  capped at 20000 (`FILE_READ_MAX_LINES` — `src/tools/files/read.tool.ts:296-297`), so a
+  hand-written `maxLines: 100000000` cannot ask for an unbounded line window. On top of that
+  sits a fixed 256 KiB aggregate budget measured on
   the SERIALIZED result (`FILE_READ_WIRE_BUDGET`), allocated by DEMAND: every readable
   file gets an equal share, files needing less hand the difference back to the files
-  actually cut, and the passes are capped. The default is sized so the BUDGET binds
-  before the line count on typical source — a 200-line default used 14.2% of the
-  envelope and a 1200-line default 22.7%, so a call spent a round trip to return a
-  fifth of what it was allowed. It streams 64 KiB chunks and stops at the cap, so a
+  actually cut, and the passes are capped.
+  **Corrected in place (D6, 2026-11-11):** this bullet used to read "bounded by default. 5000
+  lines per file (`maxLines`, hard max 20000)" and justified the default as "sized so the
+  BUDGET binds before the line count on typical source — a 200-line default used 14.2% of the
+  envelope and a 1200-line default 22.7%". That sizing holds for ~55-byte source lines and
+  nowhere else: a default read of a 60,001-line file of short lines used 11.2% of the budget,
+  and even the 20,000-line hard maximum only 49.3% (measured), so a call spent a round trip to
+  return a fifth of what it was allowed. A 256 KiB window cannot exceed 256 KiB however many
+  lines it holds, so a line cap below the budget buys latency, not safety; the default is now
+  "the budget decides" and `maxLines` survives as an explicit per-request guard. The measured
+  reasoning and the honest cost of the change (a default read now commits up to the whole
+  budget) are in the comment at `src/tools/files/read.tool.ts:274-295`. It streams 64 KiB
+  chunks and stops at the cap, so a
   huge file or giant line is never read wholesale. `content` is raw text
   (line 1 is `startLine`); a truncated entry reports `nextLine`/`nextColumn`/`nextByte`,
   where `nextColumn` is a 0-based byte offset inside the line (non-zero only for a line
@@ -1380,7 +1724,8 @@ captured once for the handler's lifetime (never at module evaluation). `websearc
 is group `'Web search'` and `webfetch` is group `'Web fetch'` (the `ToolGroup` union in
 `src/server/harnesses/types.ts`); existing groups and the CLI column layout are
 unchanged.
-`GET /api/tools` sends the optional `availability` field; `POST /api/tools/search`
+`GET /v1/harness/tools` sends the optional `availability` field on every row;
+`POST /v1/harness/tools/search/executions`
 executes the injected tool when configured and returns `{ ok: false, error }` with
 the hint when not. No path echoes a key value — the hint carries variable names
 only.
@@ -1432,7 +1777,7 @@ bounds, not a claim that a search result is trustworthy.
 pre-check, 15 s timeout via `AbortController` cleared in
 `finally`, `redirect: 'error'`, http(s)-only result URLs. Rows without a valid URL
 are dropped, not fatal; the first row's title falls back to its URL. The 512 KiB
-budget is the PROVIDER budget; the `fetch` tool's page GET is held to 100 KiB
+budget is the PROVIDER budget; the `fetch` tool's page GET is held to 1 MiB
 instead (see [Web fetch](#web-fetch)).
 
 **Cost policy:** one request, no retry, no failover, one provider. The default is
@@ -1510,11 +1855,17 @@ keeps the folder name while the TOOL is `fetch`.
 | Redirects | Followed; the result reports the final URL (the hosted JSON calls keep search's `redirect: 'error'`). |
 
 **Text only, and the bound is a policy pair.** `tools/webfetch/request.ts` caps a
-native page at **100 KiB** (`100 * 1024` bytes) — checked against `content-length`
-before the body is touched and then per streamed chunk, cancelling the reader the
-moment the budget is crossed — and returns at most **24,000 characters**
-(`truncated: true` when cut). 100 KiB (not the 512 KiB the provider requests
-allow) is the point: a page that does not fit is a file, not an article. The
+native page at **1 MiB** (`MAX_RESPONSE_BYTES = 1024 * 1024`, `:71`) — checked against
+`content-length` before the body is touched and then per streamed chunk, cancelling the reader
+the moment the budget is crossed — and returns at most **240,000 characters**
+(`MAX_CONTENT_CHARS`, `:75`; `truncated: true` when cut). 1 MiB (not the 512 KiB the provider
+requests allow) is the point: a page that does not fit is a file, not an article.
+**Corrected in place 2026-11-11:** this paragraph quoted **100 KiB / 24,000 characters**; both
+figures were raised 10x, the byte cap because the old 100 KiB was acting as a CONTENT budget
+(a measured run over the top ten results of a real search found 5 of 8 pages unreadable purely
+because their raw HTML was over 100 KiB — GitHub, a13n.dev, arxiv, a docs site, Wikipedia — each
+costing a wasted model turn), and the measured reasoning is the comment at
+`src/tools/webfetch/request.ts:62-70`. The
 content-type gate agrees with that sentence: no header is treated as text, and the
 readable set is `text/*`, `application/json`, `*+json`, `application/xml`,
 `*+xml`, `application/xhtml+xml`, the JS/TS MIMEs and `image/svg+xml` (SVG is
@@ -1539,7 +1890,7 @@ session always has `fetch` registered (native on a keyless host) and declares it
 core. It is part of the server's direct-call catalogue too
 (`src/server/harnesses/webfetch.ts`, group `Web fetch`): `createToolCatalogue()`
 holds the package presets, the app tools, the `search` entry, and the `fetch`
-entry, so `POST /api/tools/fetch` is answered whenever the host enabled webfetch —
+entry, so `POST /v1/harness/tools/fetch/executions` is answered whenever the host enabled webfetch —
 which is what lets a preset card advertise the declaration its harness really makes.
 A host that passes `createWebFetchCatalogueEntry({ enabled: false })` still LISTS the
 tool, with `availability.state: 'unconfigured'`, the static `WEB_FETCH_METADATA`
@@ -1735,7 +2086,8 @@ const team = harness({
   be able to ask for what it is missing. Before this, a child scoped to
   `["read","glob"]` and told to write looped on `glob` for 45 messages instead of
   failing cleanly, and `scope: { tools: [] }` produced no output at all
-  (docs/tasks/2026-11-08-delegate-stress-test.md, finding 2). Enabling a tool through
+  (docs/tasks/2026-11-08-delegate-stress-test.md, finding 2 — that task file has since been
+  removed from `docs/tasks/`, so this is a historical reference). Enabling a tool through
   discovery is still not the same as being allowed to call it — the launch gate keeps
   the allowlist for everything else.
 
@@ -1744,7 +2096,7 @@ const team = harness({
 `src/server/harnesses/presets.ts` derives every real preset's allowlist from ONE
 list (`SPECIALIST_AGENT_NAMES`) with `teamOf(primary)`: the other four real roles,
 then `summarizer`. The five primaries are `instruct`, `research` (title
-"Researcher"), `workspace` (title "Coder"), `reviewer`, and `planner`. Consequences:
+"Explore"), `workspace` (title "Analyst"), `reviewer`, and `planner`. Consequences:
 
 - every real preset registers `delegate` (there is always a target), and the
   Planner's `research`/`workspace`/`reviewer` targets exist by id;
@@ -1937,8 +2289,11 @@ threadFork({ input: string; label?: string })
 
 ### Server broker and UI
 
-- Route: `POST /sessions/:id/actions/:requestId/answer` (standalone `/api`, service
-  `/v1/harness`) with body `{ choice }` and response `{ ok: true }`.
+- Route: `POST /v1/harness/sessions/:id/actions/:requestId/answer` — ONE mount on both
+  hosts (CORRECTED IN PLACE 2026-11-11: this named "standalone `/api`, service
+  `/v1/harness`", and the answer no longer replies with a bare `{ ok: true }`) — with
+  body `{ choice }` and response `{ ok: true, request_id, resolved_at }`
+  (`src/server/api.ts:3056`).
   `SessionStore.answerAction` validates against the recorded request and settles
   the handler promise exactly once. Status mapping: 400 malformed body/unknown
   option/out-of-bounds text, 404 unknown session or request id, 409 already
@@ -2035,24 +2390,28 @@ await writer('tell me about new year');
 - The registry key is the identity for both agents and tools; `agent.name` /
   `tool.name` are overwritten to match.
 - **Tool declarations are filtered, not the registry.** `writer.tools` holds the
-  preset preload, the configured tools, `toolRequest`, `toolCreate`, `task`,
-  `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`,
-  `threadFork` when forks are
+  preset preload, the configured tools, the record-engine wrappers (`tasks`,
+  `records`, `profiles`, `chapters`, `locations`), `toolRequest`, `toolList`,
+  `toolManage`, `toolRegistry`, `toolCreate`, `toolCancel`,
+  `agentManage`, `agentResult`, the thread surface
+  (`threadList`/`threadRead`/`threadSend`), `threadFork` when forks are
   enabled, `actionRequest` when interaction is configured, and `delegate` when
   there is a subagent; a request declares every core tool
-  (`read`/`write`/`edit`/`glob`/`grep`, the environment `search`/`fetch` pair it
-  actually registered, and the declared harness-owned set), then whatever toolRequest
-  enabled. The searchable remainder (`files`, `shell`, `download`, ...) waits for
-  discovery. `delegate` is core for
-  the primary only.
+   (`read`/`write`/`edit`/`glob`/`grep`, the environment `search`/`fetch` pair it
+   actually registered, and the declared harness-owned set), then whatever toolRequest
+   enabled. The searchable remainder (`files`, `shell`, `download`, ...) waits for
+   discovery. `delegate` is core for
+   the primary only. (CORRECTED IN PLACE 2026-11-11: the old list named the dead
+   `task`/`profileManage`/`chapterManage`/`locationManage` names — Decision J renamed
+   the tools to the plurals and the records engine added `records`.)
 - **`discoveredTools`** is a read-only copy of the enabled set, in discovery order.
   It persists for the harness's lifetime (every call/turn) and is emptied by
   `reset()`; a server snapshot records it so a reload can show it.
 - **`executeTool(name, parameters)`** (R8) runs one REGISTERED tool directly with
   this harness's context (`agent: primary`, `agents`, `run`). It is the server's
   manual-execution path for the session-bound tools (`POST /tools/:name` with a
-  `sessionId`), so a manual toolRequest/toolCreate/task/profileManage/
-  chapterManage/locationManage/agentManage/agentResult/delegate call mutates
+  `sessionId`), so a manual toolRequest/toolCreate/tasks/records/profiles/chapters/
+  locations/agentManage/agentResult/delegate call mutates
   this session. Core file tools and search are ordinary direct-call catalogue
   entries and do not need a session. Discovery gates the MODEL only: an explicit
   operator call may run a searchable tool that was never enabled. Nothing else is bypassed — `toolCreate` keeps its guarded
@@ -2082,22 +2441,63 @@ await writer('tell me about new year');
   name that collides with one — or repeats inside the list — fails construction;
   plugins and `registerCommand` run later and override by name.
   See [Slash commands](#slash-commands).
-- `reset()` clears the entry agent's conversation, the discovered-tool set, the session
-  task list (records, the id counter, `storeRev` and the change log — `reset()` in
-  `src/core/task.ts`), the three record stores, and the agent-result archive, so a
+- `reset()` clears the entry agent's conversation, the discovered-tool set, the ONE
+  session store (every collection with its entries, the shared id counter, each
+  collection's `storeRev` and change window — the reset lives in the ENGINE,
+  `src/core/records.ts`, reached as `recordEngine.reset()` at `src/harness.ts:11905`;
+  `src/core/task.ts` has no `reset()` of its own), and the agent-result archive, so a
   reset run starts from the core set and empty session state. The terminal result
   archive is otherwise durable through snapshot/restore (see
   [Agent results](#agent-results-r3)).
-  Created tools stay registered (registry state), just no longer enabled. The
+  Created tools stay registered (registry state), just no longer enabled — the
+  lifetime `maxCreatedTools` budget is NOT restored either. The
   server resets every agent in a session, not only the primary; its extra
   agent-loop reset does not replace `harness.reset()`, which is what clears the
-  shared `task` and record state. Branch records and action-request state are
+  shared store. Branch records and action-request state are
   ephemeral runtime state and are not cleared by `reset()`.
 
+**Configuration fields this section did not already cover** (every line anchor is
+`src/types/index.ts`, the `HarnessConfiguration` type):
+
+- `maxIterations` (`:3104`) — the REQUEST-COUNT bound on one run (default
+  `DEFAULT_MAX_ITERATIONS`, 16 — `src/harness.ts:504`; the shipped presets set
+  `PRESET_MAX_ITERATIONS`, 1000 — `src/server/harnesses/toolbox.ts:102`). On
+  exhaustion the pending work is aborted and the transcript rolled back.
+- `toolCreation` (`:3117`) — who may create tools at runtime (R12): `'all'` (default)
+  or `'primary'`. A gated agent neither sees nor calls `toolCreate`; the host path
+  `harness.toolCreate()` still works, because an operator action is not a model
+  privilege.
+- `wakeIntervalMs` (`:3130`) — how often a run with background calls emits `wakeup`
+  (the 600000 ms default is stated above); a `pluginSettings` value for
+  `async-ping.intervalMs` wins over it.
+- `maxCreatedTools` (`:3139`) — the LIFETIME creation budget for this instance.
+  Created tools outlive `reset()`, so `reset()` deliberately does not refill it.
+- `toolSources` (`:3158`) — `name → source text` for tools compiled at startup. A
+  source with virtual dependencies needs `harness.registerTool({ moduleText,
+  dependencies })` instead.
+- `toolFolders` (`:3170`) — ordered external folders of editable `*.tool.ts` modules;
+  `toolManage` disk writes are fenced to them, and source compilation is Node-only.
+- `maxEnabledTools` (`:3178`) — the bound on how many SEARCHABLE tools may be enabled
+  at once (default 32); core tools are always declared and never count.
+- `report.stateChange` (`:3216`) — the persistence observer (R3a): synchronous,
+  advisory, runs after a snapshot-recorded mutation, and its errors are ignored.
+- `report.diagnostic` (`:3223`) — the plugin diagnostics channel (T1.5), the one place
+  a BROKEN plugin becomes visible instead of looking like a plugin that did nothing.
+- `pluginSettings` (`:3241`) — the host's read-only per-plugin settings provider
+  (`<pluginName>.<key>`); absent means an in-memory provider seeded from each plugin's
+  declared defaults.
+- `toolSettings` (`:3256`) — the host's GLOBAL tool switch (R3): one live provider over
+  the names this deployment disables for every session, core control plane included.
+
 **Members:** callable, `name`, `agent`, `agents`, `subagents`, `tools`, `plugins`,
-`discoveredTools`, `toolCreate(config)`, `executeTool(name, parameters)`,
+`discoveredTools`, `toolCreate(config)`, `registerTool(candidate)` (`src/types/index.ts:3292`),
+`executeTool(name, parameters)`, `callTool(name, parameters, options)` (`:3306`, the
+registry-resolving twin that keeps caller/thread/signal),
+`toolSource(name)` (`:3298`) / `toolSources()` (`:3300`),
 `commands`, `executeCommand(input)`, `registerCommand(command)`, `branches()`,
-`branch(id)`, `reset()` — plus the thread surface (`threads()`, `thread(id)`,
+`branch(id)`, `memory` (`:3313`), `runtime` (`:3316`), `nestedRuns()` (`:3590`),
+`records()` / `recordsChanges(since)` / `onRecordsChange(listener)` (`:3441-3443`),
+`reset()` — plus the thread surface (`threads()`, `thread(id)`,
 `threadMessages(id)`, `setThreadMessages(id, messages)`, `createThread()`,
 `sendThreadInput()`, `steerThread()`, `stopThread()`, `deleteThread()`) and
 `snapshot()`/`restore()`.
@@ -2217,19 +2617,29 @@ implementation per name — which is the invariant this whole layer exists to pr
   only when the command set them, so a host can spread the result safely.
 - **Built-ins (`src/core/command-builtins.ts`, exported as
   `createBuiltinCommands()`).** `/help [command]`, `/tools [filter]`,
-  `/task [list|add|complete|reopen|remove|claim|release|takeover]`, `/websearch <query>`
+  `/task [list|add|complete|reopen|remove]` — the FIVE live verbs, exactly the `usage` string
+  at `:265`. **Corrected in place (records-engine Decision P, 2026-11-11):** this list used to
+  read ~~`[list|add|complete|reopen|remove|claim|release|takeover]`~~. Decision P
+  deleted those three ownership verbs with the lock they served, so `/task claim 1` now falls
+  through to `unknown action "<verb>".` (`:388`; the comment at `:380-386` says why). The
+  eight-verb spelling is kept struck through so the deletion stays auditable, and
+  [Session tasks](#session-tasks) carries the full history. `/websearch <query>`
   (the RAW tail is the query, so an exact phrase survives), `/webfetch <url>` (the FIRST
   token is the URL, so a trailing flag cannot corrupt it). The last three are
   **pass-throughs to the live tools** through
-  `context.harness.executeTool('task' | 'search' | 'fetch', …)`, so they mutate THIS
+  `context.harness.executeTool('tasks' | 'search' | 'fetch', …)` (`TASK_TOOL_NAME`, `:95` —
+  CORRECTED IN PLACE 2026-11-11: this line said `'task'`, which is the COMMAND name, not the
+  tool it calls), so they mutate THIS
   harness's stores and inherit the tools' bounds (200 tasks, 4000 characters, 20/page by
   default; the fetch content-type gate) instead of duplicating them. Because
   `executeTool` always supplies an agent identity, `/task complete|reopen|remove` are
   GUARDED writes: the command reads the whole store first (`offset` paging at limit 100,
   bounded to 16 pages) and sends the `expects` revisions it read, so a concurrent edit
-  surfaces as the tool's stale error; `claim|release|takeover` send no token, and the
-  command's own holder pair is `(entry agent, no thread)` (see [Session
-  tasks](#session-tasks)). `search`/`fetch` are conditional, so an unconfigured session
+  surfaces as the tool's stale error. **Corrected in place (records-engine Decision P,
+  2026-11-11):** this sentence used to end "`claim|release|takeover` send no token, and the
+  command's own holder pair is `(entry agent, no thread)`" — those three verbs are deleted, so
+  no `/task` write is token-less any more and there is no holder pair left to describe (see
+  [Session tasks](#session-tasks)). `search`/`fetch` are conditional, so an unconfigured session
   answers guidance naming the configuration field and the key names rather than
   `Tool "search" is not registered`. Nothing in the built-ins throws: a usage
   mistake, an unregistered tool, or a rejected tool call returns
@@ -2280,8 +2690,10 @@ implementation per name — which is the invariant this whole layer exists to pr
   — except for a disposed session or a closing store, where the save is skipped so a
   shutdown file is not overwritten with an empty session list. A host handle without
   `executeCommand` (built before this layer) falls back to `enqueue()`, which is
-  exactly what that server did before. The legacy `/messages` route never treats `/`
-  as a command: its SSE envelope predates the registry and has no terminal-turn frame.
+  exactly what that server did before. The legacy `/messages` route never treated `/`
+  as a command: its SSE envelope predated the registry and had no terminal-turn frame —
+  CORRECTED IN PLACE 2026-11-11: that route is DELETED (`src/server/api.ts:12-15`), so
+  this sentence is history, not a live caveat.
 - **CLI path (`src/server/cli/commands.ts`).** Everything except readline/stdout, so
   the REPL is testable from a plain object: the host injects a `CliCommandHost`
   (`harness`, `presets`, `write`, `writeError`, `reset`, `exit`, `printTools`,
@@ -2378,7 +2790,7 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 - The key travels only in the `authorization` header (omitted when empty) and is
   redacted from every error message; errors quote a URL without userinfo, query,
   or fragment.
-- The server calls it with a per-attempt abort (`POST /api/models`) because it
+- The server calls it with a per-attempt abort (`POST /v1/harness/models`) because it
   owns the key and the browser cannot call the provider (no CORS, no key).
   Failed provider requests (`'request'`/`'response'`) are retried immediately
   with a fresh controller and a doubled deadline: 10 s, 20 s, 40 s, ... up to
@@ -2395,7 +2807,7 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'text';           agent: string; delta: string }
 | { type: 'reasoning';      agent: string; delta: string }
 | { type: 'tool_call';      agent: string; call: HarnessToolCall }
-| { type: 'tool_result';    agent: string; name: string; callId?: string; content: string; isError: boolean; outcome?: HarnessToolOutcome; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[] }
+| { type: 'tool_result';    agent: string; name: string; callId?: string; content: string; isError: boolean; outcome?: HarnessToolOutcome; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[]; media?: ToolMediaDescriptor[] }
 | { type: 'usage';         agent: string; usage: HarnessUsage }
 | { type: 'done';           agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
 | { type: 'wakeup';         agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
@@ -2421,6 +2833,12 @@ concurrently. A tool-call id must be non-empty and **unique for the whole
 conversation**; a duplicate/reused id is rejected before the call is launched and
 never reaches persistence. `ui` is the optional declarative panel list from
 `toolUi()` (see “Declarative tool panels” below); the model never sees it.
+`media` is the optional list from `toolMedia()` (`src/core/tool-media.ts`; the event
+field is `src/types/index.ts:2607-2614`) and carries `ToolMediaDescriptor`s ONLY —
+`{ id, kind, name, mime, size }`, `src/types/index.ts:91-98`, never the base64, because
+every event is JSON round-tripped and persisted while the bytes live exactly once, on the
+committed `tool` message. Like `ui`, it is absent for every medialess tool, so recorded
+events keep their historical shape.
 
 The three concurrency fields are additive, and a client must fall back to its
 pre-concurrency rendering when they are absent (old persisted turns):
@@ -2462,7 +2880,7 @@ a run going — `done` only ever reports the final request, so this is the only
 per-request feed a client can tally. It is absent when the provider reported no
 usage block for that request. The server folds every one of them into
 `SessionTurn.usage` (subagent requests included) and repeats the running sum on
-each SSE frame; the UI prints the LATEST model request's input/context size with
+each `usage.updated` stream frame; the UI prints the LATEST model request's input/context size with
 the turn's cumulative cached input in brackets, e.g. `150 (140)` (the label's
 title names both scopes). The wire tally's `input` stays the cumulative sum for
 other metrics.
@@ -2672,7 +3090,8 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   serializes only `ui.content`; the envelope/panels never enter the transcript or
   a transport request.
 - **The event carries it.** `tool_result.ui` is present only for a recognized
-  envelope. `src/server/sessions.ts` copies events as before, so SSE and the recorded
+  envelope. `src/server/sessions.ts` copies events as before, so the opt-in `run.event`
+  stream frame and the recorded
   turn keep the panels and `eventTimes` stays a parallel array with the same
   length/order.
 - **Manual calls unwrap.** `src/server/api.ts` projects `ToolCallResult.result` to the
@@ -2683,7 +3102,7 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   key/value items, bounded text/cell/label lengths, and a 256 KiB total; malformed
   panels/blocks are dropped, non-string cells blanked/padded, and oversized
   panels dropped whole.
-- **Demonstration.** `src/harnesses/tools.ts` `timeNow` returns a right-slot key/value
+- **Demonstration.** `src/server/harnesses/tools.ts` `timeNow` returns a right-slot key/value
   panel while keeping its `{ timezone, iso, unix }` content. The server API result
   is unchanged; the chat transcript shows the panel. A direct callable consumer
   receives the branded envelope and should use `toolUiOf()`.
@@ -2762,16 +3181,25 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   as a tool result naming the tags that would enable it, which is recoverable and
   still teaches the model the vocabulary.
 - **Preload the catalogue, declare only the core.** Shipping the presets into
-  every harness by default stays cheap: only the five core file tools are declared
-  up front, alongside toolRequest/toolCreate/task/profileManage/
-  chapterManage/locationManage/agentManage/agentResult (and delegate when
-  applicable), while the searchable remainder costs no context until discovered.
+  every harness by default stays cheap: only the `visibility: 'core'` rows are declared
+  up front — the five core file tools (`read`/`write`/`edit`/`glob`/`grep`), `tasks`,
+  `toolRequest`, `toolCancel`, the thread trio (`threadList`/`threadRead`/`threadSend`)
+  when the harness has threads, the configured `search`/`fetch` pair, and `delegate` for
+  the primary — while every searchable row costs no context until discovered: the
+  record wrappers `records`/`profiles`/`chapters`/`locations`, `agentManage`/
+  `agentResult`, `toolList`/`toolManage`/`toolRegistry`/`toolCreate`, `files`, `shell`,
+  `download`, `threadFork` and `actionRequest`. (CORRECTED IN PLACE 2026-11-11: this
+  bullet named `task`/`profileManage`/`chapterManage`/`locationManage`, and listed
+  `toolCreate` among the declared set although it is `visibility: 'searchable'` with
+  `activation: 'creation'`.)
   `presets: false` exists for callers who want an empty catalogue, which is also
   what the harness tests use when they assert exact discovery results.
-- **Session state is factory state, not module state.** Tasks, profiles, chapters,
-  and locations each get one closure per harness with its own id counter, so two
-  sessions never share records and `reset()` is a complete "start over" that no
-  module singleton could express.
+- **Session state is instance state, not module state.** The ONE record engine is
+  constructed per harness (`src/harness.ts:3364`), so two sessions never share records —
+  and its id counter is shared ACROSS the `tasks`/`profiles`/`chapters`/`locations`
+  collections plus anything an agent `define`s (F3), which is what makes an id
+  conversation-wide rather than per-store. `reset()` is therefore a complete "start
+  over" that no module singleton could express.
 - **A model is a per-request choice, so it is editable live.** The harness always
   reads an agent's model when it starts a request (`requestModel` in
   `src/core/agent.ts`), which is what lets `PATCH /sessions/:id` retarget an agent
@@ -2807,9 +3235,17 @@ as their own entries.
   imports it.
 - **Server (`src/server/`)** owns HTTP and sessions, not harness policy. Routing and
   validation live in transport-neutral `api.ts`; `handler.ts` is only the Node
-  adapter for `/api` (client header, streamed body bound, SSE writer) and
-  `service.ts` the `@underload/service` adapter for `/v1/harness` (Origin gate,
-  content-length/serialized body bound, raw SSE `Response`). `start.ts` holds
+  adapter for the ONE mount `/v1/harness` (no header gate since T15, streamed body
+  bound, an SSE writer kept dormant) and
+  `service.ts` the `@underload/service` adapter for the SAME mount (Origin gate,
+  content-length/serialized body bound, raw SSE `Response` for a streamed result).
+  CORRECTED IN PLACE 2026-11-11: this bullet called `handler.ts` "the Node adapter for
+  `/api` (client header, …)" — neither the mount nor the `X-Harness-Client` gate exists
+  any more (`STANDALONE_MOUNT`, `src/server/api.ts:307`; gate removed,
+  `src/server/handler.ts:8-13`), and no route returns a `stream` result today, which is
+  why both adapters' SSE writers are dormant
+  (`src/server/handler.ts:139-164`, `src/server/service.ts:184`;
+  "REST routes never stream", `src/server/api.ts:399`). `start.ts` holds
   `startHarnessServer` — the only listener, created when called. `SessionStore`
   keeps one `Harness` per session and owns each run's `SessionTurn`s plus the FIFO
   task queue, so a second task continues the conversation in order, a reload can
@@ -2828,8 +3264,12 @@ as their own entries.
   serves `localhost` (`::1`), `127.0.0.1` and the LAN IPv4 address; an IPv4-only
   bind made Vite's printed `Local` URL false because `localhost` resolves to `::1`
   first. Preview stays pinned to `localhost` (loopback, IPv6-only on Windows).
-  Set `HARNESS_DEV_API=http://127.0.0.1:5181/api` to point that same proxy at the
-  standalone launcher instead. There is no CORS in the standalone Node mode: the
+  Set `HARNESS_DEV_API=http://127.0.0.1:5181/v1/harness` to point that same proxy at the
+  standalone launcher instead — CORRECTED IN PLACE 2026-11-11: this example named the
+  removed `/api` mount (the launcher serves `mount /v1/harness`,
+  `src/server/dev.ts:45`); that `/api` spelling survives only as an example of an
+  arbitrary upstream mount path inside the proxy's own comment
+  (`src/frontend/vite-proxy.ts:17-21`, `:109-115`). There is no CORS in the standalone Node mode: the
   UI is same-origin in production and proxied (or service-hosted) in development.
 - **Service host (`src/server/endpoint/` + `src/server/service.ts`)** is the same API on the
   repository's Hono gateway. `@underload/service` scans the repo root for
@@ -2839,8 +3279,10 @@ as their own entries.
   match the bare path). Neither declares a `port`, so both run on the gateway's
   single listener — no worker server, no 307, no second port. `src/server/runtime.ts`
   builds one shared store/catalogue lazily on the first request (`.env` loaded
-  there, never at import). The bootstrap document's `rootPath` is the canonical
-  API URL (`/v1/harness`), not a filesystem root: file tools resolve against
+  there, never at import). The boot document's root — `api_root` on the
+  wire (CORRECTED IN PLACE 2026-11-11: this named the retired `rootPath` field, which
+  survives only as the browser client's own property, `src/frontend/api.ts:1650`) — is
+  the canonical API URL (`/v1/harness`), not a filesystem root: file tools resolve against
   `process.cwd()` and have no sandbox, so advertising a workspace root would be a
   lie. `variables.root` is the service's database boundary, not a workspace. The
   handler selects a runtime keyed by that resolved root, and the runtime writes
@@ -2868,8 +3310,10 @@ as their own entries.
   an assistant tool call and its result, restore appends explicit interrupted tool
   results for the unmatched ids (no re-execution), so the next provider request is
   coherent.
-  The loader's permissive CORS means `X-Harness-Client` is not a boundary there;
-  instead the adapter rejects a browser `Origin` that is neither the request host
+  The loader's permissive CORS means no request header is a boundary there — and the
+  standalone `X-Harness-Client: ui` gate is gone as well (T15,
+  `src/server/handler.ts:8-13`), so the header is an inert marker on both hosts.
+  Instead, the adapter rejects a browser `Origin` that is neither the request host
   nor loopback (`localhost`, `127.0.0.1`, `[::1]`), and allows requests with no
   `Origin`. That is not authentication: the service binds `0.0.0.0`, so anyone
   who can reach the port is trusted, and the tools are unsandboxed. Prefer a
@@ -2902,8 +3346,12 @@ as their own entries.
   `window.__HARNESS_CONFIG__.apiRoot` / meta tag → build-time
   `VITE_HARNESS_API` → the compiled Pages chain → `/v1/harness` on the page's own
   origin), then lists presets/tools, creates sessions,
-  enqueues tasks (`POST /tasks`, `202`), and observes the session's queue through
-  one `GET /events` watcher while work is pending (polling fallback). A `/…` composer
+  enqueues tasks (`POST /sessions/:id/tasks`, `202 TaskReceipt`), and observes the
+  session through a subscription on the page's single `harness.v1` WebSocket,
+  `GET /v1/harness/stream`, while work is pending (bounded poll as fallback).
+  CORRECTED IN PLACE 2026-11-11: this named the deleted `GET /events` SSE watcher —
+  `src/frontend/api.ts:6-9` states that the `text/event-stream` observer and its parsers
+  are gone from the client and realtime lives in `src/frontend/stream.ts`. A `/…` composer
   line is submitted like any other task and answered as a server-side command turn —
   the client has NO command table of its own, because commands are server state and
   the UI is a renderer. The transcript dialog reads
@@ -2958,51 +3406,73 @@ as their own entries.
 
 ### API
 
-`/api` is the standalone mount; the `@underload/service` host serves the same
-paths below `/v1/harness` **plus** the bare root:
+**One mount, one dispatcher.** CORRECTED IN PLACE 2026-11-11: this section opened with
+"`/api` is the standalone mount; the `@underload/service` host serves the same paths
+below `/v1/harness`". There is now exactly ONE mount on BOTH hosts:
+`STANDALONE_MOUNT = SERVICE_MOUNT = HARNESS_API_ROOT = '/v1/harness'`
+(`src/server/api.ts:307-308`), and the paths below are the contract's
+(`HARNESS_PATH_TEMPLATES`, `src/shared/harness-api.ts:54`). Every collection read is
+paged (`HARNESS_PAGE_LIMIT` — `limit` default 25, max 100, plus an opaque `cursor` —
+`src/shared/harness-api.ts:51`), every write answers a SLIM RECEIPT
+rather than the mutated aggregate, and request/wire field names are snake_case
+(`thread_id`, `agent_models`) while the display subtree keeps the domain's camelCase
+(`src/server/api.ts:30-38`). Full table with every receipt shape: README's endpoint
+table.
 
 | Route | Purpose |
 |---|---|
-| `GET /api/health` | Liveness and session count |
-| `GET /api/harnesses` | Harness descriptors (`primary`/`subagents`/`coreTools`/`agentModels?`/`agentInstructions?`/`builtin`/`editable`), provider defaults, and `agents`; every entry is editable and `editable` is always `true` |
-| `POST /api/harnesses` | `{ name, title?, description?, primary, subagents?, agentModels?, agentInstructions? }` → `201 { harness }` |
-| `PATCH /api/harnesses/:name` | `{ title?, description?, primary?, subagents?, agentModels?, agentInstructions? }` → `{ harness }`; every template is patchable |
-| `GET /api/harnesses/:name` | `200 { harness }` — one definition with the index's own projection, `agentInstructions` included when the card overrides any; the compiled `/views` document omits that map, so the configuration dialog reads the single card it opens. A legacy alias resolves to its target; unknown is `404` |
-| `DELETE /api/harnesses/:name` | `200 { deleted: true }`; `404` unknown name or repeat delete (aliases are not deletable identities). Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. Existing and saved sessions keep the definition they captured, so deleting a harness never loses a conversation |
-| `GET /api/agents` | Trusted agent registry (`AgentDescriptor[]`) |
-| `GET /api/tools` | Full catalogue: session-bound core entries first (`group: 'Core tools'`, `sessionBound: true`), then every direct-call tool (including the core file tools); `search` always present with `availability` |
-| `GET /api/tools/bootstrap` | Alias of `GET /api/tools` — the list the root bootstrap document carries |
-| `POST /api/tools/:name` | `{ parameters, sessionId? }` → `{ ok, result | error, durationMs }`. A `sessionBound` core tool requires `sessionId` (`400` without, `404` unknown session or unavailable tool, `409` while the session is busy - a run, reset, or another manual call) and executes inside that session's harness; `actionRequest`/`threadFork` answer a readable "requires the owning run" refusal; a direct-call tool is unchanged and ignores `sessionId` |
-| `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
-| `POST /api/models` | `{ settings? }` → `{ models: string[] }`; server-side `listModels` |
-| `POST /api/sessions` | `{ harness, settings? }` → `{ session }` |
-| `GET /api/sessions`, `GET /api/sessions/:id` | Snapshots, always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`; `model`/`agentModels` are LIVE; `queueDepth` counts pending turns and is omitted at zero; the additive `invalidThreads` roster appears only when a conversation's stored transcript could not be read |
-| `PATCH /api/sessions/:id` | `{ agentModels: Record<agent, model> }` → `{ session }`. Merges into the live map, validates every key against the session's agents and every value as a model id (400 with nothing applied), rejects `{}` as a no-op, is allowed while the session is busy (no abort/rebuild), and leaves `harnessDefinition` frozen. The current request keeps the model it started with; the next request uses the new one |
-| `POST /api/sessions/:id/messages` | `{ input }` → SSE. LEGACY: the response owns the run (close aborts it); `409` when busy or when queued work is pending. A leading-`/` line is NOT a command here — it still goes to the model, because this route's envelope predates the command registry |
-| `POST /api/sessions/:id/tasks` | `{ input, attachments?, references?, threadId? }` → `202 { session, turn }`. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart. An `input` starting with `/` is a **slash command**: `dispatch()` runs it in this process through `harness.executeCommand`, never calls the model, never enters a lane, and returns the ALREADY-TERMINAL turn (`status: 'done' \| 'error'`, events `start`/`tool_call`/`tool_result`, no `usage`); `attachments`/`references` are `400` and `threadId` is accepted and ignored |
-| `GET /api/sessions/:id/threads/:threadId/transcript` | `{ transcript }` = `{ threadId, agent, messages, raw, invalid? }` — `messages` is the live transcript, `raw` the pretty JSON the editor edits, `invalid` present only for an unreadable transcript (reason + raw value). `404` unknown session/thread |
-| `PUT /api/sessions/:id/threads/:threadId/transcript` | `{ messages }` → `{ session, transcript }`. Wholesale transcript replace. A structurally invalid value is a **200**: it is persisted, the live transcript becomes the `[transcript unreadable: …]` placeholder, and `transcript.invalid` explains why. `400` absent `messages`/non-object body, `404` unknown thread, `405` other methods, `409` running thread or a harness handle without `setThreadMessages` |
-| `GET /api/sessions/:id/events` | SSE watcher: one `snapshot`, `turn` upserts (queued/running/terminal), `event` frames, one final `snapshot` on drain. Disconnect only unsubscribes |
-| `POST /api/sessions/:id/reset` | Reset every agent + discovery + tasks + record stores; `409` while a run or queued work is pending |
-| `POST /api/sessions/:id/threads/:threadId/cancel` | `{}` → `200 { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }` (the generated `CancelThreadResult`, `src/shared/harness-api.ts`). `cancelled` is the STORE's honest answer: true exactly when this call terminated work — an aborted run, a turn released from a reference PARK (its lane had claimed work the runtime never started), or at least one dropped queued continuation, counting the named conversation and every conversation it owns; false when the stop only marked the conversation `stopped`. `status` is the conversation's real post-stop status read from its own record (never a constant), `dropped_queued_tasks` is the NAMED conversation's own backlog measured before the stop (a floor, not the cascade's total), and `revision` is the thread resource's counter the roster repaint reads |
-| `DELETE /api/sessions/:id/threads/:threadId` | `200 { deleted, thread_id, session_id, removed_descendants, removed_turns, revision }`. Stops that conversation first (the cancel above, so live and queued rows are dropped as `cancelled`) and only then purges it: the conversations it owns, their owning turns, transcripts and persisted copies. The agent's own `agent:<name>` conversation is `400` (use reset) |
-| `POST /api/sessions/:id/cancel` | `{ all?: boolean }` → `{ cancelled }`. Default aborts the active run only; `all: true` also cancels every queued turn, which stays in `turns` as `cancelled` |
-| `POST /api/sessions/:id/actions/:requestId/answer` | `{ choice: HarnessActionChoice }` → `{ ok: true }`. Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
-| `DELETE /api/sessions/:id` | Forget the session: abort active work, drop queued work, close watchers |
-| `GET /v1/harness` | Service only: bootstrap `{ rootPath, presets, agents, tools, defaults, sessions }` |
+| `GET /v1/harness/health` | Liveness and session count (`{ ok, sessions, epoch }`, `src/server/api.ts:1675-1680`) |
+| `GET /v1/harness/harnesses` | Harness definitions, **paged** (`q` matches name/title/description); every entry is an editable application copy and `editable` is always `true`. CORRECTED IN PLACE 2026-11-11: this row also used to promise "provider defaults, and `agents`" in the same answer — defaults are `GET /config` now and the registry is `GET /agents`, each its own bounded page |
+| `POST /v1/harness/harnesses` | `{ name, title?, description?, primary, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:499-505`) |
+| `PATCH /v1/harness/harnesses/:name` | `{ title?, description?, primary?, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `{ harness }`; every template is patchable, and each map field REPLACES the map it names |
+| `GET /v1/harness/harnesses/:name` | `200 { harness }` — one definition with the IDENTIFIED read's own projection, `agent_instructions` included when the card overrides any; the paged listing omits that map, so the configuration dialog reads the single card it opens. A legacy NAME alias (`writer` → `instruct`) resolves to its target; unknown is `404` |
+| `DELETE /v1/harness/harnesses/:name` | `200 { deleted: true, harness_name, tombstoned, restored_by_restart: false }`; `404` unknown name or repeat delete (name aliases are not deletable identities). Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. Existing and saved sessions keep the definition they captured, so deleting a harness never loses a conversation |
+| `GET /v1/harness/agents` | Trusted agent registry (`AgentDescriptor[]` rows), **paged** |
+| `GET /v1/harness/tools` | The host-wide catalogue, **paged**: session-bound core entries (`group: 'Core tools'`, `sessionBound: true`) plus every directly callable tool (including the core file tools); `search` always present with `availability` |
+| `GET /v1/harness/tools/:id` | One catalogue entry with its argument schema. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `GET /api/tools/bootstrap` alias ("the list the root bootstrap document carries") — the boot document carries no catalogue any more |
+| `POST /v1/harness/tools/:id/executions` | `{ parameters }` (the only accepted body field) → `200 { ok, result \| error, duration_ms, panels?, media? }`, run against the DEPLOYMENT catalogue with no session. A `sessionBound` name is a `403` naming the session route (`src/server/api.ts:2277-2282`); a listed-but-unconfigured tool is `200 { ok: false, error, duration_ms }` carrying the catalogue hint (`:2290-2297`); an unknown name is `404` whatever the body. CORRECTED IN PLACE 2026-11-11: the deleted `POST /api/tools/:name` route took `sessionId` in the BODY instead. See the R8/N4 note below |
+| `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Same body, executed through THIS session's registry (`SessionStore.callTool`, `src/server/api.ts:3950-3979`): a replaced preset, a created tool and a session-owned core tool all run what the session holds. `404` a name the session does not list, `409` a busy session, `403` a name whose execution scope is not manual. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `POST /api/tools/:name/call` alias |
+| `POST /v1/harness/models` | `{ settings? }` → `{ models, observed_at }` (the generated `ModelIndex`); server-side `listModels`. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ models: string[] }`, and `observed_at` is now part of the contract (`src/server/models.test.ts:16-18`) |
+| `POST /v1/harness/sessions` | `{ harness, title?, settings? }` → `201 { session }` |
+| `GET /v1/harness/sessions`, `GET /v1/harness/sessions/:id` | BOUNDED reads, never a snapshot: the list is paged (`limit`/`cursor`, plus `status`/`harness` filters) and one session is its metadata + live `agent_models` + counters. CORRECTED IN PLACE 2026-11-11: this row used to promise "always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`" — turns (`/turns`), threads (`/threads`), the queue (`/queue`), the frozen definition (`/definition`) and the display trees (`/turns/:turnId/display`) are each their own route, and no route assembles a session aggregate (`src/server/api.ts:22-23`). The old additive `invalidThreads` roster is not a session field on this contract either: an unreadable conversation is reported on the transcript read (`transcript_state: 'unreadable'` + `unreadable_reason`, `src/shared/harness-api.ts:1763-1779`) |
+| `PATCH /v1/harness/sessions/:id` | `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key against the session's agents and every value as a model id (400 with nothing applied), rejects `{}` as a no-op, is allowed while the session is busy (no abort/rebuild), and leaves the frozen definition untouched. The current request keeps the model it started with; the next request uses the new one. CORRECTED IN PLACE 2026-11-11: the body field is `agent_models`, not `agentModels` |
+| `POST /v1/harness/sessions/:id/tasks` | `{ input, attachments?, references?, thread_id? }` → `202` **`TaskReceipt`** (`{ session_id, turn_id, status, thread_id, … }`, `src/shared/harness-api.ts:1366-1382`) — a task receipt, never the mutated document. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart. An `input` starting with `/` is a **slash command**: `dispatch()` runs it in this process through `harness.executeCommand`, never calls the model, never enters a lane, and returns the ALREADY-TERMINAL turn (`status: 'done' \| 'error'`, events `start`/`tool_call`/`tool_result`, no `usage`); `attachments`/`references` are `400` and `thread_id` is accepted and ignored. A `thread_id` that is RUNNING steers instead of queueing. CORRECTED IN PLACE 2026-11-11: the old answer was `202 { session, turn }` and the field was camelCase `threadId` |
+| `GET /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ transcript }` = the transcript's cheap HEAD: `transcript_state`, `message_count`, `chars`, `bytes`, `role_counts`, `revision` (plus `unreadable_reason`/`stored_type` when it could not be parsed) — NO content. The messages are the paged `…/transcript/messages` read and the editor's JSON document is `…/transcript/document` (`src/shared/harness-api.ts:1763-1790`, `src/server/api.ts:4230`, `:4278`). `404` unknown session/thread. CORRECTED IN PLACE 2026-11-11: this row described the retired `{ threadId, agent, messages, raw, invalid? }` document |
+| `PUT /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ messages, if_revision? }` → the **`TranscriptWriteReceipt`** (`{ session_id, thread_id, accepted_as, message_count, revision, invalid?, links? }`, `src/shared/harness-api.ts:1842-1857`). Wholesale transcript replace. A structurally invalid value is still a **200**: it is persisted, the live transcript becomes the `[transcript unreadable: …]` placeholder, and `receipt.invalid` explains why. `400` absent `messages`/non-object body, `404` unknown thread, `405` other methods, `409` running thread or a harness handle without `setThreadMessages`. CORRECTED IN PLACE 2026-11-11: the old answer was the `{ session, transcript }` aggregate |
+| `GET /v1/harness/stream` | The ONE live-update channel: a **WebSocket** upgrade on the `harness.v1` subprotocol (`src/shared/harness-api.ts:42`); a plain `GET` is a `400` naming the upgrade (`src/server/api.ts:4759`). Frames, scopes and recovery are in the live-plane note below. CORRECTED IN PLACE 2026-11-11: this row replaces the two deleted SSE rows — `GET /api/sessions/:id/events` (the watcher) and `POST /api/sessions/:id/messages` (the run-owning stream whose close aborted the harness). Neither is aliased, and dropping the socket never cancels a task because execution is server-owned |
+| `POST /v1/harness/sessions/:id/reset` | Reset every agent + discovery + tasks + record stores → the **`ResetSessionResult`** receipt (`{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`, `src/shared/harness-api.ts:1388-1395`); `409` while a run or queued work is pending |
+| `POST /v1/harness/sessions/:id/threads/:threadId/cancel` | `{}` → `200 { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }` (the generated `CancelThreadResult`, `src/shared/harness-api.ts:1749-1756`). `cancelled` is the STORE's honest answer: true exactly when this call terminated work — an aborted run, a turn released from a reference PARK (its lane had claimed work the runtime never started), or at least one dropped queued continuation, counting the named conversation and every conversation it owns; false when the stop only marked the conversation `stopped`. `status` is the conversation's real post-stop status read from its own record (never a constant), `dropped_queued_tasks` is the NAMED conversation's own backlog measured before the stop (a floor, not the cascade's total), and `revision` is the thread resource's counter the roster repaint reads |
+| `DELETE /v1/harness/sessions/:id/threads/:threadId` | `200 { deleted, thread_id, session_id, removed_descendants, removed_turns, revision }` (the generated `DeleteThreadResult`, `src/shared/harness-api.ts:1736-1743`). Stops that conversation first (the cancel above, so live and queued rows are dropped as `cancelled`) and only then purges it: the conversations it owns, their owning turns, transcripts and persisted copies. The agent's own `agent:<name>` conversation is `400` (use reset) |
+| `POST /v1/harness/sessions/:id/cancel` | `{ all?: true }` → the **`CancelSessionResult`** receipt (`{ cancelled, session_id, dropped_queued_tasks, active_turn_id?, revision }`, `src/shared/harness-api.ts:1409-1415`). Default aborts the active run only; `all: true` (the UI's Stop) also cancels every queued turn, which stays in `/turns` as a `cancelled` row. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ cancelled }` |
+| `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` (the generated `AnswerActionRequest`, `src/shared/harness-api.ts:1592-1594`; the domain type is `HarnessActionChoice`) → `{ ok: true, request_id, resolved_at }` (`src/server/api.ts:3056`). Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
+| `DELETE /v1/harness/sessions/:id` | Forget the session → the **`DeleteSessionResult`** receipt (`{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }`, `src/shared/harness-api.ts:1000-1005`): abort active work, drop queued work, close watchers |
+| `GET /v1/harness` | The **boot document**, on this host AND on the standalone listener: `{ api_root, service, api_version, server_time, epoch, capabilities, limits, links }` — CONSTANT SIZE, no catalogue, no defaults, no sessions (`src/server/api.ts:1643-1670`). CORRECTED IN PLACE 2026-11-11: this row was "Service only: bootstrap `{ rootPath, presets, agents, tools, defaults, sessions }`" — both the fat `{ rootPath, presets, … }` payload and the "service only" asymmetry are gone |
 
-`/api/presets` and `/v1/harness/presets` are aliases of `/harnesses` and accept only
-`GET`; create/patch live on the canonical `/harnesses` mount. The `/api` root stays
-a 404 (no bootstrap document) — that legacy contract is unchanged. `rootPath` in
-the canonical document is the API URL (`/v1/harness`), not a filesystem path.
+There is ONE mount and no alias left. CORRECTED IN PLACE 2026-11-11: this paragraph
+still described `/api` as a live second root with `/presets` aliases. The `/presets`,
+`/views`, `/tools/bootstrap`, `/tools/:name/call` and `/sessions/:id/messages` aliases
+were deleted rather than kept behind a flag, and so was the second mount:
+`STANDALONE_MOUNT = SERVICE_MOUNT = HARNESS_API_ROOT = '/v1/harness'`
+(`src/server/api.ts:307-308`, `src/shared/harness-api.ts:39`). A request under any other
+mount answers a 404 that NAMES the root — `This server serves /v1/harness; "/api" is not
+mounted.` (`src/server/api.ts:4845-4846`). The bare `/v1/harness` answers the boot
+document on BOTH hosts; the dispatcher's `bootstrapRoot` flag is kept for source
+compatibility only and no longer changes behaviour (`src/server/api.ts:394-396`). The
+root URL in that document is `api_root` on the wire
+(`src/server/api.ts:1662`, mapped to the client's `rootPath` at
+`src/frontend/api.ts:1650`) and it is the API URL `/v1/harness`, not a filesystem path.
 
-**Body policy (both mounts).** Action endpoints require a JSON object; `null`,
-arrays, and primitives are `400`. `POST /tools/:name` requires a `parameters`
-property, so an empty body cannot run a tool — `{ "parameters": {} }` is the
-explicit argument-less call (it is unwrapped to "no arguments", the documented
-default, rather than being rejected). An unknown name is `404` whatever the body
-looks like. Bounds: the Node adapter stops a streamed body over
-1,000,000 bytes with `413`; the service adapter checks declared `content-length`
+**Body policy (the one mount).** Action endpoints require a JSON object; `null`,
+arrays, and primitives are `400`. An execution body is a wrapper object and
+`parameters` is its only accepted field (`requireKnownFields`,
+`src/server/api.ts:2273`, `:3955`) — an unknown field is a `400`, while an ABSENT
+`parameters` is the same empty argument box as `{ "parameters": {} }`
+(`src/server/api.ts:2284-2288`). CORRECTED IN PLACE 2026-11-11: this paragraph used to
+say `POST /tools/:name` *requires* a `parameters` property, "so an empty body cannot run
+a tool" — that was the deleted route's rule. An unknown tool name is `404` whatever the
+body looks like. Bounds: the Node adapter stops a streamed body over
+1,000,000 bytes with `413` (`MAX_API_BODY_BYTES`, `src/server/api.ts:297-300`); the
+service adapter checks declared `content-length`
 and the serialized parsed body before dispatch. The service loader parses JSON
 before the endpoint runs, so it cannot prevent that upstream allocation and a
 parse failure arrives as `{}` — a documented residual, not something this package
@@ -3032,44 +3502,74 @@ wrapper (`{ "ops": [{ op: 'list', path: 'src' }] }`) - and a wrong type is a `{ 
   envelope and NEVER drops one, because a request must answer every `tool_calls[]` entry.
   A manual call has no turn, so the per-result cap is all it applies.
 - A tool that exists only in ONE session's registry (created by `toolCreate`, or
-  added by a plugin to that session's harness) is not in the static catalogue. With a
-  `sessionId`, an unknown name is resolved against THAT session's registry; without
-  one it stays `Unknown tool "<name>"`. A sibling session answers
-  `Tool "<name>" is not available in this session.` — one session's tools are never
-  listed or callable through another session's id. Listing surface: a created tool is
-  registered and enabled at once, so `GET /sessions/:id` reports its name in
-  `discoveredTools`; `GET /tools` remains the static catalogue.
+  added by a plugin to that session's harness) is not in the static catalogue, so it is
+  callable only through the SESSION route. There, a name the session's own listing does
+  not carry is `Unknown tool "<name>" in session "<id>"`
+  (`src/server/api.ts:3957-3959` + `missing`, `:631-632`); asked of the global catalogue
+  route it stays `Unknown tool "<name>"`. A tool that belongs to a SIBLING session is
+  refused either by the store (`Tool "<name>" is not available in this session.`,
+  `src/server/sessions.ts:3808`) or by that listing check — one session's tools are
+  never listed or callable through another session's id. Listing surface: a created tool
+  is registered and enabled at once, so `GET /v1/harness/sessions/:id/definition` reports
+  its name in `discovered_tools` (`src/server/api-reads.ts:1564-1566`);
+  `GET /v1/harness/tools` remains the static catalogue. CORRECTED IN PLACE 2026-11-11:
+  this bullet reached the same lookup through a `sessionId` BODY field on the deleted
+  `/api/tools/:name` route and read the discovery list off `GET /sessions/:id`.
 
-**Core tools in the catalogue (R8/N4).** `src/harnesses/core.ts` adds eight entries -
-`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`,
-`locationManage`, `agentManage`, `agentResult` - plus `delegate`, `actionRequest`, and `threadFork` to every
-listing (`GET /tools`, its `/tools/bootstrap` alias, and the root bootstrap
-document). The last two are conditional in a session's harness (`interaction`
-configured / `forks.enabled`), but the host-wide catalogue always lists them with
-generic metadata; a session without the capability answers a clear 404 rather than
-inventing it. All are `group: 'Core tools'`, `visibility: 'core'`, and
-`sessionBound: true`, and they deliberately have **no** `tool` implementation:
+**Core tools in the catalogue (R8/N4).** `src/server/harnesses/core.ts` DERIVES its
+entries (T21 — CORRECTED IN PLACE 2026-11-11: the old text named a hand-written list of
+eight entries and the dead `task`/`profileManage`/`chapterManage`/`locationManage` names,
+and cited the path without its `server/` segment). The rows are every
+`RUNTIME_DESCRIPTORS` row — `group === 'runtime'` and `listed !== false`,
+`src/tools/descriptors.ts:326-327`, which today is `toolRegistry`, `toolRequest`,
+`toolList`, `toolManage`, `toolCreate`, `tasks`, `records`, `profiles`, `chapters`,
+`locations`, `agentManage`, `agentResult`, `delegate`, `threadFork` and `actionRequest`;
+`search`/`fetch`/`toolCancel`/`threadList`/`threadRead`/`threadSend` set
+`listed: false` and stay out of the host-wide list) — added to the host-wide listing
+(`GET /v1/harness/tools`), in the kernel's registration order. CORRECTED IN PLACE
+2026-11-11: that list used to name the `/tools/bootstrap` alias and the root bootstrap
+document — the alias was deleted with the legacy mount (`src/server/api.ts:12-15`) and
+the boot document is constant-size with no catalogue at all
+(`src/server/api.ts:1643-1645`), so the catalogue is its own bounded page. `delegate`, `actionRequest` and
+`threadFork` are conditional in a session's harness (`subagents` present / `interaction`
+configured / `forks.enabled`), but the host-wide catalogue always lists them; a session
+without the capability answers a clear 404 rather than inventing them. Every row is
+`group: 'Core tools'` and `sessionBound: true`, and its `visibility` is the
+DESCRIPTOR's (`?? 'core'`), so a searchable core tool stays searchable. They
+deliberately have **no** `tool` implementation:
 there is one implementation of each (the session's harness). `SessionStore.callTool(id, name, parameters)` →
-`harness.executeTool` is therefore the only path: a missing/blank `sessionId` is
-`400`, an unknown session or a tool the session's harness does not register
-(delegate without subagents) is `404`, a session with ANY operation in flight
+`harness.executeTool` is therefore the only path, and the ONE route that reaches it is
+`POST /v1/harness/sessions/:id/tools/:toolId/executions` (`src/server/api.ts:3950-3979`,
+mounted at `:4815`). CORRECTED IN PLACE 2026-11-11: this paragraph described the deleted
+standalone `POST /api/tools/:name` route, which took `sessionId` in the BODY ("a
+missing/blank `sessionId` is `400`"); the session now lives in the PATH, `parameters` is
+the only accepted body field (`requireKnownFields`, `src/server/api.ts:2273`), and the
+GLOBAL route answers a session-bound name with a `403` naming the session route
+(`src/server/api.ts:2278-2281`). An unknown session or a tool the session's harness does not register
+(delegate without subagents) is `404`, a name that is not callable manually is `403`
+(`Tool "x" is not callable manually.`), a session with ANY operation in flight
 (a streaming run, a reset, another manual call - the store's private `busy`
 single-flight flag) or with queued work pending is `409`, a throwing tool is
-`{ ok: false, error }`, and
-success is `{ ok: true, result, durationMs }`. `PATCH /sessions/:id` is the one
+`{ ok: false, error, duration_ms }`, and
+success is `{ ok: true, result, duration_ms }` (plus optional `panels`/`media`,
+`src/server/api.ts:616-626`). `PATCH /sessions/:id` is the one
 exception to that gate: a model change is not a harness mutation, so it is applied
 while a run streams and aborts nothing (see the route table above). Directly
-callable entries keep their old session-less runner; they
-accept and ignore `sessionId` so one request shape serves the whole Tools tab. The
-metadata comes from `src/core/metadata.ts`, the copy the harness registers, so a
-descriptor cannot advertise a schema the runtime does not use.
+callable entries keep their session-less runner, on the global route
+`POST /v1/harness/tools/:toolId/executions` (`src/server/api.ts:2265-2310`); it takes no
+`sessionId` at all, because a session that owns the tool moves into the PATH. The
+metadata comes from the same discovered descriptors the runtime registration reads —
+a live scan on Node, falling back to the generated `src/core/tool-manifest.ts` only in a
+browser or scanner-less build (`src/tools/descriptors.ts`) —
+so a descriptor cannot advertise a schema the runtime does not use.
 
 **R18: core file/search/download tools are NOT session-bound.** `read`, `write`,
 `edit`, `glob`, `grep`, `download`, and a configured `search` have
 `visibility: 'core'` but
 keep their real `tool` implementation and appear in the direct-call catalogue
-(groups `Package presets` / `Web search`), so `POST /api/tools/read` works
-without a `sessionId`; `POST /api/tools/download` returns the summary plus
+(groups `Package presets` / `Web search`), so
+`POST /v1/harness/tools/read/executions` works with no session at all;
+`POST /v1/harness/tools/download/executions` returns the summary plus
 `media` **descriptors**, never the base64. `sessionBound: true` remains exclusive to the eight
 harness-owned entries above plus `delegate`, `actionRequest`, and `threadFork`
 (the last two are still refused by the manual call path because they need the
@@ -3079,33 +3579,59 @@ therefore includes the file tools, adds `search` only when this host resolved a
 key, omits `files` (and the other searchable tools), and matches the harness's
 actual core declarations.
 
-Every standalone request requires `X-Harness-Client: ui`. A browser on another
-origin cannot set that header without a CORS preflight, and the server answers
-none, so a malicious page cannot read transcripts or POST a command to localhost.
-The UI sends it; `curl` must add it. The service mount does **not** use that
-header (its loader allows any header); it uses the Origin gate described above.
+No request header is required anywhere. CORRECTED IN PLACE 2026-11-11: this paragraph
+used to read "Every standalone request requires `X-Harness-Client: ui`" and "`curl` must
+add it". That gate is REMOVED (T15, `src/server/handler.ts:8-13`): the header decides
+nothing, a header-less `GET /v1/harness/health` is answered `200`
+(`src/server/stream/standalone-stream.test.ts:130-133`),
+and the requirement's absence is pinned by `src/server/models.test.ts:21` and `:337`.
+The browser still SENDS the header as an inert marker (`src/frontend/api.ts:601`,
+`:730`). What protects the standalone listener is that it sends no CORS headers at all
+and binds loopback by default, so a foreign page has nothing to read; the service mount
+applies the Origin policy to REST (`isAllowedOrigin`, `src/server/service.ts:165`) and
+the stream upgrade applies the same rule (`src/server/stream/mount.ts:46`) — a policy
+rule, not authentication, exactly as described above.
 
-Every SSE `data:` frame is `{ type: 'turn', turn }`, `{ type: 'event', turnId, event,
-at, usage? }`, `{ type: 'snapshot', session }`, or `{ type: 'failed', error, session }`.
-The two streams mean different things:
+**The live plane is a WebSocket, not a stream of SSE frames.** CORRECTED IN PLACE
+2026-11-11: this section described SSE as the current transport. Both SSE routes — the
+run-owning `POST …/messages` and the watching `GET …/events` — are DELETED rather than
+aliased (`src/server/api.ts:12-15`), and nothing streams over REST any more
+("REST routes never stream", `src/server/api.ts:399`). The one live channel is
+`GET /v1/harness/stream`, upgraded on the `harness.v1` subprotocol
+(`HARNESS_WS_SUBPROTOCOL`, `src/shared/harness-api.ts:42`); a plain `GET` there is a
+`400` naming the upgrade (`src/server/api.ts:4759`). Both frame vocabularies are CLOSED
+and generated in `src/shared/harness-stream.ts`: client → server `hello` · `subscribe` ·
+`unsubscribe` · `ack` · `ping` · `bye` (`:56`), server → client `welcome` ·
+`subscription_state` · `update` · `resync_required` · `error` · `heartbeat` · `pong`
+(`:59`). An `update` names one of sixteen kinds — the successors of the old frames are
+`turn.upsert` (turn rows), `run.event` (opt-in raw events), `usage.updated` (the
+server-summed figures) and `session.updated` — and no kind carries a session tree, so a
+client reconciles rows instead of applying a snapshot.
 
-- `POST /messages` (legacy) opens with `turn`, then events, and ends with `snapshot`
-  on success or `failed` on error/cancel. The response owns the run: its close
-  aborts the harness, so a disconnected client does not keep spending provider time.
-- `GET /sessions/:id/events` (watch) is NOT an owner. It opens with one `snapshot`,
-  sends each `turn` as an UPSERT on the same id (queued → running → terminal), then
-  event frames, and sends one `snapshot` when the queue drains; a reset also sends
-  a snapshot (it deletes rows, so no upsert can express it). A disconnect
-  only unsubscribes; the pump keeps executing for nobody.
-
-`at` is the server's epoch-ms stamp for that
-record and is identical to the matching entry in `turn.eventTimes`, so a live view
-and a reload agree on elapsed time. `usage` is the turn's running token tally as the
-SERVER summed it (`{ input, output, total, cached? }`): it is repeated on every frame
-once it exists, so a client prints the server's figure instead of accumulating one
-of its own, and a poll/reload (`SessionTurn.usage`) shows exactly the same number.
+The record-level facts those frames used to carry still hold, because they were never
+transport facts: `at` is the server's epoch-ms stamp for a
+record and is identical to the matching entry in `turn.eventTimes`
+(`src/server/protocol.ts:207`), so a live view and a reload agree on elapsed time. The
+turn's running token tally is summed by the SERVER (`{ input, output, total, cached? }`)
+and published as the `usage.updated` figure (`src/server/api.ts:1309-1322`), so a client
+prints the server's figure instead of accumulating one of its own, and a poll/reload
+(`SessionTurn.usage`) shows exactly the same number.
 `tool_result` events also carry the `callId` of the `tool_call` they answer, which
 pairs same-name calls exactly.
+
+Retired SSE frames (history only — these routes answer `404` now):
+
+- Every SSE `data:` frame was `{ type: 'turn', turn }`, `{ type: 'event', turnId, event,
+  at, usage? }`, `{ type: 'snapshot', session }`, or `{ type: 'failed', error, session }`.
+  The two streams meant different things:
+- `POST /messages` (legacy) opened with `turn`, then events, and ended with `snapshot`
+  on success or `failed` on error/cancel. The response owned the run: its close
+  aborted the harness, so a disconnected client did not keep spending provider time.
+- `GET /sessions/:id/events` (watch) was NOT an owner. It opened with one `snapshot`,
+  sent each `turn` as an UPSERT on the same id (queued → running → terminal), then
+  event frames, and sent one `snapshot` when the queue drained; a reset also sent
+  a snapshot (it deletes rows, so no upsert can express it). A disconnect
+  only unsubscribed; the pump kept executing for nobody.
 
 ### Task queue and presentation (R4/R5)
 
@@ -3144,9 +3670,16 @@ pairs same-name calls exactly.
   `PATCH /sessions/:id` stays the exception: it is accepted while
   busy, aborts nothing, and applies to the next request of that agent — including a
   queued task's request, which reads the model when it starts.
-- **Recovery.** The UI keeps one `GET /events` observer for the selected session
-  while it has pending work; losing it falls back to `GET /sessions/:id` polling
-  (1 s, ~120 attempts) and a reconnect after 1 s. Reload re-reads the snapshot,
+- **Recovery.** The UI keeps one live observer for the selected session
+  while it has pending work. CORRECTED IN PLACE 2026-11-11: this bullet named it
+  "one `GET /events` observer" — that SSE route is deleted, and the observer is today a
+  `session` subscription on the page's single `harness.v1` WebSocket,
+  `GET /v1/harness/stream` (`src/frontend/stream.ts`; the frame vocabulary is the
+  README's "Live updates (the WebSocket stream)" section). Losing it still falls back to
+  `GET /sessions/:id` polling (1 s, ~120 attempts — `POLL_INTERVAL_MS`/`POLL_MAX_ATTEMPTS`,
+  `src/frontend/main.ts:11548`, `:11551`; the poll is what runs when the plane reports
+  `closed`/`reconnecting`, `src/frontend/main.ts:11956-11975`) and a reconnect after 1 s
+  (`RECONNECT_DELAY_MS`, `src/frontend/main.ts:11554`). Reload re-reads the snapshot,
   calls `view.reconcile()` (merge by id, never rebuild), and reopens the observer
   when work is still pending. Settled history never re-lights an agent ring; only a
   `running` turn does.
@@ -3299,7 +3832,9 @@ memory (tasks/profiles/chapters/locations), and not a result a connected thread
   full snapshot; applying it drops the turns and the roster row. Deletion is recorded
   in `Instance.threadTombstones`/`turnTombstones` BEFORE the answer is applied, with
   descendants and the removed turns. Every inbound record is filtered through them:
-  late SSE `turn`/`event` frames and late GET answers cannot resurrect the thread or
+  late stream frames (`turn.upsert`/`run.event` on the `harness.v1` socket — CORRECTED
+  IN PLACE 2026-11-11: this read "late SSE `turn`/`event` frames", and the SSE routes
+  that produced them are deleted) and late GET answers cannot resurrect the thread or
   re-focus it. The sets are session-scoped: `openSession` (switch), `ensureSession`
   and `newSession` clear them, and `applySnapshot` REFUSES a snapshot whose id is not
   the instance's current session (a late answer cannot re-point the card). A switch
@@ -3307,7 +3842,7 @@ memory (tasks/profiles/chapters/locations), and not a result a connected thread
   new snapshot, so deletion learning cannot compare one session's roster with the
   next one's ids (N1). A snapshot older than the applied watermark is ignored
   ENTIRELY — it can neither learn a deletion nor replace records/reconcile an older
-  turn list and delete a live SSE row (N2). Equal stamps are not stale: every new
+  turn list and delete a live streamed row (N2). Equal stamps are not stale: every new
   turn bumps `updatedAt`, so only a strictly older snapshot can be missing one.
   `purgeStaleReferences` removes any `#` chip whose turn is gone (it would 400 the
   whole submit) on authoritative snapshots and again after a failed submit restores
@@ -3405,7 +3940,8 @@ stop-all with a draft), `thread-session-scope.test.ts` (N1 cross-session
 tombstones, N2 stale snapshot vs live turn, N3 failed-submit reference restore),
 `src/harness.thread-runtime.test.ts` (the C4 `setThreadMessages` contract: order,
 running refusal, stopped-thread repair, in-place replacement),
-`src/server/transcript.test.ts` (transcript read/write on both mounts, an invalid
+`src/server/transcript.test.ts` (transcript read/write on both ADAPTERS — the Node
+handler and the `@underload/service` route, one `/v1/harness` mount on each — an invalid
 value as a 200, the 400/404/405/409 matrix, restart round-trips, tolerant restore and
 stale-entry dropping, and document corruption that still aborts startup),
 `ui/thread-transcript.test.ts` + `ui/thread-transcript-edit.test.ts` (the lossless
@@ -3641,7 +4177,8 @@ The lane workers isolate a turn's CPU; the IO worker isolates **durability**. On
 thread per database root owns the write side of `harness/state.json` and
 `harness/sessions/<id>/events.jsonl`, so the whole-document stringify plus
 mkdir/open/write/fsync/rename no longer block the loop that serves every other session
-and every SSE stream. The flag is independent of `threadExecution`: a deployment may
+and every open stream (the `harness.v1` WebSocket — there is no SSE route left, see
+[API](#api)). The flag is independent of `threadExecution`: a deployment may
 want either, both, or neither, and the default for both is `inline` (today's behavior).
 
 Layout (`src/server/workers/`, same subsystem barrel as the lane workers):
@@ -3715,7 +4252,7 @@ DEFAULT only: with an explicit `instructionOverride` (T6) `agentInstruction()` r
 stored text verbatim as the complete prompt, so the guidelines never double up under an
 operator's edited box. Nothing in a profile is secret, and a client cannot supply one.
 
-`src/harnesses/registry.ts` is the in-memory harness registry shared by the store and
+`src/server/harnesses/registry.ts` is the in-memory harness registry shared by the store and
 the dispatcher:
 
 - `list()` → shipped templates (preset order) then user-created harnesses; each entry
@@ -3842,9 +4379,12 @@ the exception a saved chat exposes directly.
   sessions, queues, and core state; without one the store is in memory and a
   restart is a clean slate (the default for direct unit tests).
 - **The queue belongs to the server, not to a response.** `/tasks` answers `202`
-  because a task accepted with a socket would die with that socket. Only the legacy
-  `/messages` route keeps the old "close cancels" contract, and `/events` watches
-  without owning, so reload/hidden tabs/switching sessions never stop work. STOP is
+  because a task accepted with a socket would die with that socket. CORRECTED IN PLACE
+  2026-11-11: this bullet still named the legacy `/messages` route as the one holder of
+  the "close cancels" contract and `/events` as a non-owning watcher — both SSE routes
+  are DELETED (`src/server/api.ts:12-15`), so NOTHING on the wire owns a run through a
+  response any more: the `harness.v1` socket only observes, and a dropped socket (like a
+  reload, a hidden tab or a session switch) never stops work. STOP is
   an explicit `{ all: true }` cancel rather than an implicit disconnect.
 - **Queue and transcript are one record.** A queued turn is a real `SessionTurn`
   from acceptance (stable id/index, no `startedAt`), and every frame is an upsert by
@@ -3855,12 +4395,21 @@ the exception a saved chat exposes directly.
   never look busy. Markdown/HTML is untrusted: every rendered response goes through
   DOMPurify, and highlighting is a fixed registered language subset to keep the
   bundle small.
-- **No CORS, explicit client header (standalone).** Dev proxies `/api` to the
-  standalone server; production serves the UI and API from one origin. Every
-  standalone request must carry `X-Harness-Client: ui`, which a foreign page
-  cannot set without a preflight the server never answers. The service host is
-  the opposite trade: permissive CORS from the loader, so the boundary is an
-  Origin gate (own host or loopback) and not authentication.
+- **No CORS, and no request header (standalone).** CORRECTED IN PLACE 2026-11-11:
+  this record read "explicit client header" and required `X-Harness-Client: ui` on
+  every standalone request. That gate is GONE (T15): the header decides nothing any
+  more (`src/server/handler.ts:8-13`), while the browser still sends it as an inert
+  marker (`src/frontend/api.ts:601`, `:730`). What survives of its rationale is the
+  weaker fact that the standalone listener sends NO CORS headers at all, so a
+  cross-origin browser cannot read it and dials the service mount instead of `:5181`.
+  The service host is the opposite trade: permissive CORS from the loader, so the
+  boundary is an Origin gate (own host or loopback, `src/shared/origin.ts`) and not
+  authentication — the SAME rule guards the `harness.v1` stream handshake
+  (`isStreamOriginAllowed`, `src/server/stream/mount.ts:46`, deliberately identical to
+  the HTTP rule). Dev proxies forward
+  `/v1/harness` and stamp the target origin so Host and Origin agree
+  (`src/frontend/vite-proxy.ts:31-38`); production serves the UI and API from one
+  origin.
 - **The server key follows the configured provider, never the client's URL.** A
   single `mergeSettings` (`src/server/config.ts`) serves `POST /models` and
   `POST /sessions`: an omitted/blank key falls back to the configured key only
@@ -3868,7 +4417,11 @@ the exception a saved chat exposes directly.
   (trailing slashes normalized); a foreign host/port/path gets no key unless the
   client supplies one. This is what stops `POST /models` or a session from being
   used to exfiltrate `HARNESS_API_KEY`.
-- **The bootstrap `rootPath` is the API URL.** It is `/v1/harness`, not a
+- **The boot document's root is an API URL.** CORRECTED IN PLACE 2026-11-11: this
+  record named the bootstrap's `rootPath`; the generated document calls the field
+  `api_root` (`src/server/api.ts:1662`), and only the browser client keeps a `rootPath`
+  member (`src/frontend/api.ts:175`, mapped from `api_root` at `:1650`). Either way the
+  value is `/v1/harness`, not a
   filesystem root. File tools use the process cwd and are unsandboxed, so no
   workspace-root option exists or is advertised.
 - **Loopback by default (standalone).** `127.0.0.1:5181`. Direct tool calls and
@@ -3911,9 +4464,9 @@ yarn cli "task"           # one-shot as the live default preset (instruct)
 yarn cli --preset planner # any of the seven shipped presets (all need a provider)
 yarn cli                  # interactive Instruct session
 yarn cli --serve          # explicit standalone API + built UI on :5181 (CLI opt-in)
-yarn dev:frontend         # Vite UI on :5180, dual-stack wildcard (localhost + LAN); /api proxies to the service on :5000
-yarn dev:server           # separate standalone API on :5181 (no Vite/UI)
-yarn preview:frontend     # built UI on :5180, proxies /api to the service on :5000
+yarn dev:frontend         # Vite UI on :5180, dual-stack wildcard (localhost + LAN); /v1/harness proxies to the service on :5000
+yarn dev:server           # separate standalone API on :5181 (no Vite/UI), on the same /v1/harness mount
+yarn preview:frontend     # built UI on :5180, proxies /v1/harness to the service on :5000
 yarn test                 # library + server + shared tests
 yarn test:frontend        # jsdom client tests
 yarn start-service        # repo root: builds UI for /harness/, serves it + /v1/harness on :5000
@@ -3923,7 +4476,16 @@ yarn start-service        # repo root: builds UI for /harness/, serves it + /v1/
 and never calls `startHarnessServer`; the second is the standalone API only and
 starts no UI. `HARNESS_DEV_API` (default
 `http://127.0.0.1:5000/v1/harness`) selects the Vite proxy target, so the UI can
-be pointed at the standalone `/api` mount when that is the server being run.
+be pointed at the standalone launcher when that is the server being run — at its own
+`http://127.0.0.1:5181/v1/harness`. CORRECTED IN PLACE 2026-11-11: this sentence
+named "the standalone `/api` mount"; T13 removed that second mount
+(`STANDALONE_MOUNT = HARNESS_API_ROOT`, `src/server/api.ts:307`, and
+`src/server/dev.ts:45` prints `mount /v1/harness`), and an `/api` request on the
+standalone listener is now the dispatcher's 404. The browser always dials
+`/v1/harness/...`; the proxy rewrites the prefix only when `HARNESS_DEV_API` names an
+upstream mount path of its own (`src/frontend/vite-proxy.ts:109-115`), and it carries
+`ws: true` so the `harness.v1` socket is proxied with the REST reads
+(`src/frontend/vite-proxy.ts:90-93`).
 There is no generic `start`/`serve`/`server` script: normal hosting is owned by
 `@underload/service` (`yarn start-service`), and `startHarnessServer()` is an
 explicit API. The root launcher builds the UI with `PLAYGROUND_BASE=/harness/`
@@ -3934,8 +4496,12 @@ no UI build. The opted-in gateway serves the page at `/harness/` as well as
 `/v1/harness`, so a device on the same LAN can open `http://<LAN-IP>:5000/harness/`
 (no auth, trusted LAN only). `src/server/server.test.ts` drives the real HTTP server with the
 inline scripted `demo` FIXTURE (injected through `PRODUCTION_WITH_FIXTURES`, since no
-example card ships any more): create a session, stream a task, continue it, reset it,
-call a tool directly, and check the error statuses. `src/server/service-start.test.ts` runs an
+example card ships any more): create a session, submit a task (`POST …/tasks` → `202 TaskReceipt`),
+continue it, reset it, call a tool directly (`POST /tools/{tool_id}/executions`), and check the
+error statuses. CORRECTED IN PLACE 2026-11-11: this line said "stream a task" — the streamed submit
+was the deleted `POST /api/sessions/:id/messages` SSE route; the test now posts the durable task and
+awaits the record (its own comment at `src/server/server.test.ts:19` names those legacy spellings as
+exactly what was removed). `src/server/service-start.test.ts` runs an
 actual `vite-node` service gateway that discovers
 `src/server/endpoint/harness/service-route*.ts` and answers `/v1/harness`. The UI
 build no longer needs a package alias, so `src/frontend/dist` is a plain client
@@ -3968,11 +4534,21 @@ In the order they are expected:
    whose `note` names the call (T5.1) — rather than by re-reading a stored copy, because the
    full text lives only in canonical history, not anywhere addressable.
 3. **per-agent tool scoping** — searchable tools are catalogued once; every agent
-   can discover every searchable tool (only `delegate` is primary-only).
+   can discover every searchable tool (only `delegate` is primary-only). What DOES
+   exist is narrower than per-agent configuration: a per-RUN allowlist (the delegation
+   `scope.tools`, `src/types/index.ts:1008`, carried into `ctx.run`'s `options.tools`,
+   `:1902`, and read back by a tool as `ToolContext.toolScope`, `:1923`) and one
+   host-WIDE switch (`toolSettings`, `:3256`). Nothing keys a tool set to an agent
+   PROFILE.
 4. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant
    would be the natural next step.
-5. **more presets** — a patch/multi-edit tool is the obvious remaining gap. The
+5. **more presets** — the multi-edit gap is CLOSED, so this item is no longer a
+   "patch/multi-edit" gap: `edit` already replaces text in one or more existing files
+   in a single call — one `edits` array of `{ path, oldString, newString, replaceAll? }`
+   entries (`src/tools/files/edit.tool.ts:1-8,124-136`). What is genuinely still
+   missing is a DIFF-shaped tool: nothing applies a unified diff, there is no `patch`
+   entry in the catalogue, and `gitDiff` only reads a diff back. The
    former `fetchUrl` idea is built: `fetch` (text) and `download` (bytes) cover
    the read-a-URL surface.
 6. **slash-command UX in the browser UI** — the composer's mention popup triggers on

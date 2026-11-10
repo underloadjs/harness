@@ -24,22 +24,24 @@ budget and says so.
 
 ## Why it is the way it is
 
-Not a rule, an asymmetry. `stalePayloadOf` (`:1200-1223`) exists precisely so that
+Not a rule, an asymmetry. `stalePayloadOf` (`:1200-1228`) exists precisely so that
 returning the current record cannot flood the result: it drops to the projected shape when
-the full entry exceeds `RECORD_STALE_PAYLOAD_BUDGET_BYTES` (8 KiB, `:169-173`), and the
-header comment states the intent — "a conflict into a second flood" is what it avoids, and
-"the degradation the caller can read, never a silent truncation". That mechanism is
+the full entry exceeds `RECORD_STALE_PAYLOAD_BUDGET_BYTES` (8 KiB, `:174-179`, the constant at `:179`), and the
+header comments state the intent — "a conflict into a second flood" is what it
+avoids (`:176-177`, `:1202`), and
+"the degradation the caller can read, never a silent truncation"
+(`:177-178`). That mechanism is
 already general; it is simply wired into one of the two conflict errors.
 
 ## Evidence
 
 | Fact | Source |
 |---|---|
-| The guard applies to every agent-identified write | `src/core/records.ts:1759-1762` ("A call with an agent identity … may only patch or remove a record it has read: the token is the proof") |
-| `guarded-write` details carry the id only | `src/core/records.ts:1765-1769` (patch site) and `:1775-1779` (removal site); both pass `{ id }` at `:1768` and `:1778` |
-| `stale-record` details carry the full current entry | `src/core/records.ts:1295-1311` (`entry: copyEntry(definition, entry, payload.projected === false)`) |
-| The payload is budgeted, so including it is bounded work | `src/core/records.ts:171-176` (`RECORD_STALE_PAYLOAD_BUDGET_BYTES = 8 * 1024`), `:1200-1223` (`stalePayloadOf`) |
-| The message itself instructs a read | `src/core/records.ts:1767`, `:1777` (`… (read it first).`) |
+| The guard applies to every agent-identified write | `src/core/records.ts:1765-1767` (the identity test itself is `:1768`) ("A call with an agent identity … may only patch or remove a record it has read: the token is the proof") |
+| `guarded-write` details carry the id only | `src/core/records.ts:1771-1775` (patch site) and `:1781-1785` (removal site); both pass `{ id }` at `:1774` and `:1784` |
+| `stale-record` details carry the full current entry | `src/core/records.ts:1306-1318` (`entry: copyEntry(definition, entry, payload.projected === false)` at `:1317`) |
+| The payload is budgeted, so including it is bounded work | `src/core/records.ts:174-179` (`RECORD_STALE_PAYLOAD_BUDGET_BYTES = 8 * 1024` at `:179`), `:1200-1228` (`stalePayloadOf`, reached from `staleRecordError` at `:1259`) |
+| The message itself instructs a read | `src/core/records.ts:1773`, `:1783` (`… (read it first).`) |
 | Runtime, 2026-11-09: `records { collection: "probes", entries: [{ id: "12", label: "three" }] }` with no `expects` → refusal text ends at "(read it first)", no `current:` payload; the same patch with `expects: [{id:"12",rev:99}]` → refusal ends `current: {"id":"12",…}` | live session store |
 
 ## Proposal
@@ -78,3 +80,19 @@ read".
 - Locks, claims, or a lease on records (the store's model is explicitly unlocked).
 - Changing when a write is guarded.
 - Adding `changed fields` to the refusal (the change feed already carries `fields`).
+
+## Update (2026-11-11)
+
+- **Re-anchored** — the guarded-write block sits ~15 lines lower than when this was filed,
+  and the budget constant ~3 lines lower. Current ranges: the guard comment is
+  `src/core/records.ts:1765-1767` (the `store.by !== undefined` identity test at `:1768`),
+  the patch refusal is `:1771-1775` (message `:1773`, details `{ id }` at `:1774`), the
+  removal refusal is `:1781-1785` (message `:1783`, details `{ id }` at `:1784`);
+  `stale-record`'s details object is `:1306-1318` with the `entry` field at `:1317`;
+  `stalePayloadOf` is `:1200-1228` and its only caller is `staleRecordError` at `:1259`;
+  `RECORD_STALE_PAYLOAD_BUDGET_BYTES = 8 * 1024` is `:179`, under its header at `:174-178`.
+- **Gap still open**: both refusal sites still pass `{ id }` and nothing else, while
+  `stale-record` inlines the entry — the asymmetry the issue describes is exactly what the
+  current code does, and the helper is still wired into one error out of two.
+- The runtime row is left **as recorded** (live session store, 2026-11-09).
+- Status stays **Open**.

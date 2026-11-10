@@ -47,8 +47,8 @@ reason the tool cannot multiply spend, and `search` states the same policy at
 
 | Fact | Source |
 |---|---|
-| The single generic sentence | `src/tools/webfetch/request.ts:577-579` (`networkFailure`) |
-| Only the abort/timeout branch is distinguished | `src/tools/webfetch/request.ts:578` (`controller.signal.aborted ? timed out : network error`) |
+| The single generic sentence | `src/tools/webfetch/request.ts:576-579` (`networkFailure`; the generic sentence is `:579`) |
+| Only the abort/timeout branch is distinguished | `src/tools/webfetch/request.ts:576-579` (`controller.signal.aborted` is the whole discriminator, at `:577`) |
 | The deliberate-sanitization rule | `src/tools/webfetch/request.ts:37-40` |
 | The no-retry rule and its rationale | `src/tools/webfetch/request.ts:39-40`, `:51` |
 | Status classification works on a reachable host | runtime 2026-11-10: `example.com/definitely-missing-abc` → `fetch could not find the page (HTTP 404).` |
@@ -66,7 +66,10 @@ the raw body:
 1. Distinguish `ENOTFOUND`/`EAI_AGAIN` (name does not resolve — "check the hostname, retrying
    will not help") from `ECONNREFUSED`/`ECONNRESET`/`EPIPE` (host reachable, connection dropped
    — "a retry or `provider: \"exa\"` may work") from a TLS error. Node exposes these as
-   `error.cause.code`, so the classification costs a `switch`, not a redesign.
+   `error.cause.code`, so the classification costs a `switch`, not a redesign. Note the
+   shape at `:602-604`: the send helper catches with a **binding-less** `catch { throw
+   networkFailure(); }`, so the error object is discarded today and step 1 starts by
+   binding it (`catch (error)`).
 2. Name the working fallback in the reachable-but-failing case, since it is verified: switching
    provider resolved the httpbin failure in testing.
 
@@ -102,3 +105,22 @@ the raw body:
 - Adding a general retry policy (would need the no-retry rule at `:39-40` revisited first).
 - Status-code classification, which already works.
 - The oversize page surfacing as a network error — tracked in 0014's out-of-scope note.
+
+## Update (2026-11-11)
+
+- **Re-anchored** (two rows, one line each): `networkFailure` is `src/tools/webfetch/request.ts:576-579`
+  — the collapsed sentence is `:579` and the abort test that separates a timeout from a network
+  failure is `:577`.
+- **Re-verified exact, no edit needed**: the sanitization rule quoted in "Why it is the way it
+  is" is verbatim at `:37-40`, the no-retry rule at `:39-40` and `:51`, the same policy on the
+  search side at `src/tools/websearch/index.ts:39`, and the two generic-string assertions at
+  `src/tools/webfetch/webfetch.test.ts:767` and `src/tools/websearch/websearch.test.ts:892`.
+- **New implementation detail recorded**: the send helper's catch is binding-less
+  (`} catch { throw networkFailure(); }`, `:602-604`), so the transport error — and with it
+  `error.cause.code`, the only thing that can classify the cause — is thrown away before the
+  helper runs. Proposal step 1 has to bind the error first; that is a two-character change in
+  the `catch`, and the sanitizer rule (`:37-40`) is unaffected because the classification names
+  a class, not the message.
+- The runtime rows are left **as recorded** (live 2026-11-10); the collapse they describe is
+  still what the code does.
+- Status stays **Open**.

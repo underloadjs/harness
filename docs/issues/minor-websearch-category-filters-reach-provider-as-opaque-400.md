@@ -32,7 +32,7 @@ message that names the offending field and says what to drop.
 ## Why it is the way it is
 
 It is not a trade-off — it is an unfinished application of a rule this file already states.
-The domain validator argues the exact principle at `index.ts:238-245`:
+The domain validator argues the exact principle at `index.ts:236-243` (the two quoted sentences are `:241-243`):
 
 > *"…the provider answers it with a bare `HTTP 400` that names no field, because the response
 > body is deliberately never surfaced (it can echo the key). Catching it here costs nothing and
@@ -51,7 +51,7 @@ Two constraints that shape the fix:
   contain the request (and therefore the key)"*), with `cancelBody(response)` at `:441`. "Pass
   through a better upstream message" would regress a documented security property.
 - **Silently dropping the filter is wrong for the same reason the category echo is criticized**
-  at `index.ts:458-461`: a caller that "cannot name a domain or a date range has to over-fetch
+  at `index.ts:457-460`: a caller that "cannot name a domain or a date range has to over-fetch
   and post-filter in its own context." Dropping `since` for `people` would return results the
   caller believes are date-filtered.
 
@@ -61,9 +61,9 @@ Two constraints that shape the fix:
 |---|---|
 | The description states the constraint | `src/tools/websearch/index.ts:462` |
 | `readCategory` validates type and length only — no combination check | `src/tools/websearch/index.ts:271-279` |
-| All four filters are passed to the adapter unconditionally | `src/tools/websearch/index.ts:530-538` |
+| All four filters are passed to the adapter unconditionally | `src/tools/websearch/index.ts:528-539` (the five filter keys are handed over at `:533-537`) |
 | The opaque fallback message | `src/tools/websearch/request.ts:300` (`${label} search failed (HTTP ${status}).`) |
-| The stated local-validation policy | `src/tools/websearch/index.ts:238-245` |
+| The stated local-validation policy | `src/tools/websearch/index.ts:236-243` |
 | The test suite states the same policy | `src/tools/websearch/websearch.test.ts:1039-1040` |
 | Sibling validations that already work | `index.ts:265` (ISO date), `:334` (non-empty query), `:341` (inverted range); asserted at `websearch.test.ts:792-793`, `:1051-1053` |
 | Runtime 2026-11-10: all four combinations above → `Exa search failed (HTTP 400).`, deterministic across two query texts | live provider |
@@ -91,14 +91,14 @@ if (category === 'people' && exclude !== undefined) {
 Three traps for the implementer:
 
 1. Gate on the **validated** `readDomains` result, not raw input — `excludeDomains: []` already
-   throws `/array of 1-20 domains/` (`websearch.test.ts:1053`) and that ordering must not change.
+   throws `/array of 1-20 domains/` (`websearch.test.ts:1055`) and that ordering must not change.
 2. `company` + `excludeDomains` must still pass; it is verified working.
 3. Cover **both** `since` and `until`. Testing only `since` leaves the defect half-fixed.
 
 **Alternatives considered.**
 
 - *Silently drop the unsupported filter.* Rejected: it returns results the caller believes are
-  filtered, which is the failure mode `:458-461` already rejects.
+  filtered, which is the failure mode `:457-460` already rejects.
 - *Surface the provider's 400 body.* Rejected: regresses the deliberate body suppression that
   protects the API key.
 - *Leave it as a documentation-only rule.* Rejected: the same file already decided that
@@ -114,7 +114,7 @@ Three traps for the implementer:
 ## Tests to add
 
 - `src/tools/websearch/websearch.test.ts` — beside the existing `rejects a malformed filter
-  before paying for the request` (`:1039`): assert each of the four combinations throws its
+  before paying for the request` (`websearch.test.ts:1038`): assert each of the four combinations throws its
   message **and** that the request counter stays at 0, so the local guarantee is proven, not
   assumed.
 - `src/tools/websearch/websearch.test.ts` — the four still-valid combinations above resolve
@@ -124,5 +124,28 @@ Three traps for the implementer:
 
 - Surfacing provider response bodies.
 - Validating `category` against a closed enum — the description deliberately keeps it open
-  (`index.ts:456-461`).
+  (`index.ts:457-462`).
 - Tavily/Linkup adapter filter support (unverified; only Exa was exercised).
+
+## Update (2026-11-11)
+
+- **Re-anchored** (five cites moved, none by much): the local-validation policy comment is
+  `src/tools/websearch/index.ts:236-243` — the two sentences this issue quotes are `:241-243`;
+  the open-set category comment is `:457-460` (the issue cited `458-461`, and its
+  out-of-scope cite `456-461` is now `457-462`); the adapter hand-off is `:528-539`, with the
+  five filter keys passed unconditionally at `:533-537`; and two test cites were one line
+  short — the `/array of 1-20 domains/` assertion is `src/tools/websearch/websearch.test.ts:1055`
+  (not `1053`) and the test name `rejects a malformed filter before paying for the request`
+  is `:1038` (its explanatory comment, which the issue quotes, is `:1039-1040`).
+- **Re-verified exact, no edit needed**: the description sentence that already states the rule
+  (`index.ts:462`, verbatim), `readCategory` at `:271-279`, the date rationale at `:256-258`
+  and its throw at `:265`, the non-empty-query check at `:334`, the inverted-range check at
+  `:341`, the assertions at `websearch.test.ts:792-793` and `:1051-1053`, and the
+  body-suppression evidence in `src/tools/websearch/request.ts` (`:32-36`, `:280-281`,
+  `cancelBody` at `:441`, the opaque message at `:300`).
+- **Gap still open**: `grep -n 'does not support' src/tools/websearch/index.ts` matches only
+  the description string at `:462`, so nothing enforces the combination; the proposal's
+  placement (after the per-field validators) still matches the file's shape.
+- The three live-provider rows are left **as recorded** (2026-11-10): re-running them costs
+  provider spend and nothing in the tree suggests the provider's behaviour changed.
+- Status stays **Open**.

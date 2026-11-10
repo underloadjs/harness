@@ -37,7 +37,7 @@ first constructing a harness, and cannot reuse a compilation:
 ## Why it is the way it is
 
 The single compile/load/validate/register operation is deliberately the only
-publish path, and the harness owns it: `src/types/index.ts:3006-3015`
+publish path, and the harness owns it: `src/types/index.ts:3282-3291`
 ("`registerTool` … Publication is therefore a completion barrier"),
 `src/core/index.ts:75-77` ("Exported for focused tests and for a host that wants
 to validate a candidate **without publishing it**; the harness owns the only
@@ -54,14 +54,14 @@ naming its limits, which the code already does.
 |---|---|
 | `prepareToolCandidate` and `supportsToolCompilation` are exported from the core barrel, with the stated "validate without publishing" intent | `src/core/index.ts:74-90` |
 | The read-only result type already exists and is documented as "a compiled candidate that has NOT been published" | `src/core/tool-source.ts:181-189` (`PreparedTool`) |
-| The root barrel re-exports only `compileToolSource` and `createDynamicTool` from core | `src/harness.ts:11403-11419` |
+| The root barrel re-exports only `compileToolSource` and `createDynamicTool` from core | `src/harness.ts:11988-12004` (`compileToolSource` `:11993`, `createDynamicTool` `:11994`) |
 | `compileToolSource` / `createDynamicTool` compile a **function body** (`Function` constructor), not a module | `src/core/creation.ts:96` (`new AsyncFunction`), `:110` (`createDynamicTool`) |
 | Module compilation + candidate preparation live in the Node-only source module | `src/core/tool-source.ts` (`prepareToolCandidate`, `supportsToolCompilation`) |
-| Accepted module export shapes (so a wrapper is trivial): named tool, default export, named `tool`, or `metadata` + `execute` | `src/core/tool-source.ts:1425-1430` (`selectToolExport`) |
+| Accepted module export shapes (so a wrapper is trivial): named tool, default export, named `tool`, or `metadata` + `execute` | `src/core/tool-source.ts:1426-1432` (`selectToolExport`) |
 | Published entry points are only `.`, `./server`, `./worker`, `./io-worker`, `./frontend`, `./shared`, `./package.json` | `package.json:9-58` |
-| Host-side registration surface: `toolCreate` (legacy body) and `registerTool` (candidate, publishes) | `src/types/index.ts:3004-3017` |
-| A revision is already content-addressed over the entry plus its local helpers | `src/types/index.ts:775-787` |
-| Compilation needs `typescript` and Node built-ins; the browser has no source compiler | `src/core/tool-source.ts:14-16`, `:240`; `src/types/index.ts:2906-2907` |
+| Host-side registration surface: `toolCreate` (legacy body) and `registerTool` (candidate, publishes) | `src/types/index.ts:3277-3294` |
+| A revision is already content-addressed over the entry plus its local helpers | `src/types/index.ts:839-851` |
+| Compilation needs `typescript` and Node built-ins; the browser has no source compiler | `src/core/tool-source.ts:14-16`, `:240`; `src/types/index.ts:3166-3169` |
 
 ## Proposal
 
@@ -80,7 +80,7 @@ compileToolSourceModule(candidate, options?) => {
 Rules:
 
 - the returned `checks` list stays the honesty mechanism (`checks: readonly
-  string[]`, `src/types/index.ts:784-786`); the doc must repeat that it never
+  string[]`, `src/types/index.ts:848-850`); the doc must repeat that it never
   claims semantic type checking;
 - evaluating candidate top-level code must be **opt-out**: a
   `evaluate: 'syntax' | 'load'` (or `dryRun`) mode so a validation endpoint can
@@ -115,7 +115,7 @@ failed".
 3. `supportsToolCompilation` is importable from the package root.
 4. Enabling the compile cache changes no observable registration semantics
    (replacements still change `revision`; `toolSource()`/`toolSources()` still
-   report the installed revision — `src/types/index.ts:3018-3023`).
+   report the installed revision — `src/types/index.ts:3295-3300`).
 5. `README.md` "External tool folders and `*.tool.ts`" and `docs/runtime-tools.md`
    name the published entry and restate the syntax-only limit.
 
@@ -127,7 +127,7 @@ failed".
   and does not re-evaluate (assert with a side-effecting probe).
 - `src/core/tool.test.ts` / `src/harness.ts` structure test — the new names are
   present in the root barrel, and the browser declaration graph still never
-  reaches the Node compiler (`README.md:271-285`, `README.md:298-305`,
+  reaches the Node compiler (`README.md:276-287`, `README.md:305-320`,
   `scripts/check-package-types.mjs`).
 - `scripts/test:package:files` fixture — the new export ships in `dist`.
 
@@ -137,4 +137,23 @@ failed".
   diagnostics surface.
 - Sandboxing/isolation (tracked separately, `docs/runtime-tools.md:52-53`).
 - Any change to what `registerTool` publishes.
+
+## Update (2026-11-11)
+
+- **Anchors re-grounded** against the current tree; the gap and every claim are
+  unchanged, and status stays **Open** (no reduction).
+- Re-checked anchors: the root public-surface block is now
+  `src/harness.ts:11988-12004` (`compileToolSource` `:11993`,
+  `createDynamicTool` `:11994`), the registration surface is
+  `src/types/index.ts:3277-3294`, the content-addressed source record is
+  `:839-851`, `selectToolExport` is `src/core/tool-source.ts:1426-1432`, and the
+  Node-only-compilation note in configuration is `src/types/index.ts:3166-3169`.
+- README cites follow the 2026-11-11 README realignment (`:276-287` runtime
+  import split, `:305-320` the declaration split and the `check-package-types`
+  guarantee).
+- Still true on re-check: `prepareToolCandidate` and `supportsToolCompilation`
+  are exported only from the internal core barrel (`src/core/index.ts:74-90`)
+  with the "validate without publishing" intent stated there, and the published
+  entry points are still `.`, `./server`, `./worker`, `./io-worker`,
+  `./frontend`, `./shared`, `./package.json` (`package.json:9-58`) — no `./core`.
 

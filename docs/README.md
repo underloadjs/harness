@@ -9,7 +9,7 @@ narrower reader with a narrower job.
 | Document | Reader | One line |
 |---|---|---|
 | [plugins.md](./plugins.md) | a plugin author | The authoring guide for the plugin surface: subscription semantics (wildcard `'*'`, `priority`, `timeoutMs`, the synchronous fast path), the `turn.before` merge/precedence rules and what each `HarnessTurnDecision` does to a run, the `context.edit`/`setIncluded` role rules, `api.snapshot()` / `settings.setOwn` / `report.diagnostic`, `host.state_change`, teardown via `harness.dispose`, and the stated prohibitions. |
-| [runtime-tools.md](./runtime-tools.md) | a runtime-tools integrator | The self-modifying tool runtime: compiled sources in `.code/`, activation, rollback. Integration documentation — it asserts no passing production verification run on its own. |
+| [runtime-tools.md](./runtime-tools.md) | a runtime-tools integrator | The self-modifying tool runtime: entries compiled from the editable `src/` sources shipped beside `dist/`, activation, rollback. Integration documentation — it asserts no passing production verification run on its own. |
 | [issues/](./issues/README.md) | the package owner | The **issue log**: verified gaps between what a consumer needs and what the published surface provides, one file per issue, with the evidence to re-check each claim and rules for how an entry may shrink. |
 | [tasks/](./tasks/README.md) | an implementing agent | The **task log**: actionable work items found while exercising the package from inside live sessions — each entry names the change, the file it touches, and the check that closes it, and a landed entry keeps its corrected findings auditable. |
 

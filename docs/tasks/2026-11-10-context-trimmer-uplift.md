@@ -1119,3 +1119,42 @@ What the columns actually say (this part is a finding, not a fixture artefact):
   it). None of those four was observable from a scripted provider, so none is claimed above.
 
 
+## Update (2026-11-11)
+
+Anchor re-pointing only: T1–T9 plus T3b are landed, the Measurements section stands, and no code was
+touched in this pass. What follows is where the anchors quoted by Parts B, G and J now sit — each
+line below was re-read on this date, and the wording those anchors support is unchanged.
+
+* **The plugin (`src/plugins/context-trimmer.plugin.ts`).** The twelve declared settings are
+  `:281-394`; `ENABLED_DEFAULT` `:408`; the pure planner `planTrimmedUnits` `:971`; the guard chain
+  `guardPasses` `:1206`; the writer `applyTrimPlan` `:1384-1513`, whose two writes are
+  `setIncluded(entry, false)` at `:1404` and `setReasoningIncluded(entry, false)` at `:1418`;
+  `executeTrimming` `:1517`; and the handler factory's park/trim/unpark triple at `:1547-1561`
+  (`pause()` `:1556`, `resume()` `:1561`). T9's F7 re-audit quotes `:1403`, `:1417`, `:1555` and
+  `:1560` — those four are the numbers above now.
+* **The compactor's F7 header (Part J's `sed -n '196,228p'`).** It is
+  `src/plugins/context-compaction.plugin.ts:211-224` today, and it names **both** writers —
+  `setIncluded(entry, false)` and `setReasoningIncluded(entry, false)` — each stated as
+  withhold-only. T9's closing caveat ("the sentence names only `setIncluded` … the enumeration is
+  not exhaustive any more") is therefore **superseded as of 2026-11-11**: the header was corrected,
+  which is what that caveat asked for. The two compaction writes T9's grep lists are now `:825`
+  (the exclude prune) and `:1261` (the summarize finalize), where it recorded `:801` and `:1116`.
+* **The thinking flag's home.** `setReasoningIncluded` is implemented at
+  `src/harness.ts:8885-8925`; its shared target resolution and the refusal sentences T9's grep
+  returns are `:8779-8825`; the control is handed to the handler on the context object at `:9175`.
+  The snapshot allowlist Parts B5/B6 ask about is `src/core/snapshot.ts:427-429` (read back at
+  `:260-263`, unchanged); the branch copy's whitelist is `src/core/branch.ts:600` with its reader at
+  `:467-474` (both unchanged); `withIncluded` in `src/core/agent.ts` is now `:203` (B5 quoted
+  `:196-219`).
+* **F8's wording (Part J's projector sed).** The projector mints the static `inPrompt: false` for a
+  `reasoning` segment at `src/server/turn-projector.ts:2215` (Part J quoted `:2141-2158`); the
+  contract sentence that now carries the per-policy caveat is the `ContextBlock.inPrompt` doc at
+  `src/shared/turn-display.ts:547-566`, beside the `included` verdict at `:595-600`; the chip that
+  stopped being absolute is `src/frontend/ui/context-detail.ts:274-313` (Part J quoted `:275-292`).
+* **F3's transport half (Part J's `sed -n '295,315p' src/transport/openai.ts`).** That range now
+  falls inside the comment stating the echo rule (`:311` is a line of it); the echo itself is
+  `wire.reasoning_content = message.reasoning` at `:349-350`, scoped by the comment at `:363`.
+  `src/core/context-estimate.ts:34` still says `reasoning` is never counted, so F6's provider half
+  is unchanged.
+
+
