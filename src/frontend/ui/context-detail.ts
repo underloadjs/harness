@@ -39,8 +39,26 @@
 //      construction, so a call that was still running when the reader peeked at it can never
 //      be served as a finished one. A running block is not cached at all.
 //
+// THE ONE CONTROL, AND THE COLOUR THAT GOES WITH IT (T5: R5/R6)
+// --------------------------------------------------------------
+// Everything above this line is READ-ONLY by design; the dialog has exactly one write, the
+// inclusion chip. Two facts on the meta line carry a STATE — the kind chip (the only fact
+// that carries `state`) and the inclusion chip — and those two, and only those two, get a
+// tone token and a glyph, because the report this answers is "a wall of identical grey pills"
+// (R8: the panes, the copy buttons and every other chip stay exactly as they were). The
+// heading keeps the state in WORDS regardless: the modal covers the segment the colour came
+// from, and a screen reader never sees a glyph.
+//
+// The inclusion chip is a `<button aria-pressed>` and its own row of behaviour: click, await
+// the route, repaint from the RECEIPT (never from the click — a tool unit can move under the
+// dialog while the request is out), and on a refusal state the failure IN the body using the
+// note vocabulary the payload failure already uses, with the persisted chip untouched.
+//
 // Cross-references:
-//   - ../view-api.ts `getBlockDetail`  — the route this is the only caller of
+//   - ../view-api.ts `readBlockDetail` — the lazy read the tile injects for this dialog
+//   - ../api.ts `patchBlockInclusion` — the inclusion write, when the tile injects none;
+//     ../view-api.ts `writeBlockInclusion` is the same call for a caller that goes through the
+//     facade instead of the transport
 //   - ../view-detail.ts                — `blockDetailPayloadOf` / `isBlockDetail` (the unwrap)
 //   - ../view-context.ts               — the segment model and the shared duration/char rules
 //   - ./context-bar.ts                 — the widget whose click opens this
@@ -48,7 +66,12 @@
 //   - ./dialog.ts / ./dialog.css       — the modal shell
 //   - ./tools.ts                       — `createCodeBlock`, the line-numbered payload viewer
 
-import type { ContextBlock, TurnBlockDetail } from '../../shared/turn-display';
+import type { ContextBlock, StepDisplayState, TurnBlockDetail } from '../../shared/turn-display';
+// T7: the segment dialog is the ONE surface where a reader switches a segment in or out of
+// the prompt, and `./tools.ts:107` is the precedent for a `ui/` module holding its own
+// transport call: the tile may still INJECT a writer (the way it injects `loadBlockDetail`),
+// and a standalone embed then reaches the route itself instead of silently doing nothing.
+import { patchBlockInclusion } from '../api';
 import { contextBlockDurationOf, contextBlockIsRunning, formatContextCharCount } from '../view-context';
 import { blockDetailPayloadOf, isBlockDetail } from '../view-detail';
 import type { BlockDetailPayload } from '../view-detail';
@@ -69,6 +92,33 @@ export type BlockDetailLoader = (input: BlockDetailLoadInput) => Promise<TurnBlo
 
 export type BlockDetailStatus = 'cached' | 'loading' | 'full' | 'error' | 'unwired';
 
+/**
+ * T7: the inclusion write (../api.ts `patchBlockInclusion`, route
+ * `PATCH .../turns/{t}/blocks/{b}`). It resolves the state the server PERSISTED — the whole
+ * tool-call unit's verdict — never the value it was handed, because the dialog paints from
+ * the answer rather than from the click.
+ */
+export type BlockInclusionWriteInput = {
+    turnId: string;
+    blockId: string;
+    sessionId?: string;
+    included: boolean;
+};
+
+export type BlockInclusionWriter = (input: BlockInclusionWriteInput) => Promise<boolean>;
+
+// The transport this module falls back to when the tile injects none. `ui/tools.ts` calls
+// `../api` directly for the same reason (a dialog opened outside the shell still works), and
+// a board with NO session id cannot address a session-scoped route at all, so that case is
+// a stated refusal rather than a request to `/sessions//…`.
+const defaultInclusionWriter: BlockInclusionWriter = ({ sessionId, turnId, blockId, included }) => {
+    if (sessionId === undefined || sessionId.length === 0) {
+        return Promise.reject(new Error('this board has no session, so no segment can be switched'));
+    }
+
+    return patchBlockInclusion(sessionId, turnId, blockId, included).then((receipt) => receipt.included);
+};
+
 export type BlockDetailOptions = {
     /** The segment the reader clicked: identity, timing and counts for the header. */
     block: ContextBlock;
@@ -76,6 +126,12 @@ export type BlockDetailOptions = {
     sessionId?: string;
     /** The lazy route. Absent => the dialog reports it is unwired and asks for nothing. */
     load?: BlockDetailLoader;
+    /**
+     * T7: the inclusion toggle's transport. Absent => `defaultInclusionWriter` above, which
+     * is why the chip is a control only when the SERVER published an inclusion verdict —
+     * a segment nobody can switch never grows a button that does nothing.
+     */
+    write?: BlockInclusionWriter;
     /** Explicit focus return on close; omitted => whatever opened it. */
     returnFocus?: HTMLElement | null;
 };
@@ -117,6 +173,14 @@ export const blockDetailCacheKeyOf = (sessionId: string | undefined, turnId: str
  * `eventTo` extends while a prose window is still receiving deltas, and `endedAt`/`durationMs`
  * arrive with the result. A block that matches on every one of them IS the same recorded bytes,
  * which is the only thing the cache may serve twice.
+ *
+ * T7 adds `included`, and it is not optional to include: the inclusion is part of what this
+ * segment IS (an excluded call answers "excluded from context"), the reader changes it from
+ * inside the dialog, and nothing else in the metadata moves when it does. Without it, a
+ * toggle would leave the cached answer — chip text and all — looking untouched on the next
+ * open, which is exactly the stale-serve this fingerprint exists to prevent. The value is
+ * spelled out (`included`/`excluded`/absent) so an ABSENT verdict — the bar's own segment
+ * model, which never carries the field — cannot collide with either published state.
  */
 export const blockDetailFingerprintOf = (block: ContextBlock): string =>
     [
@@ -131,7 +195,8 @@ export const blockDetailFingerprintOf = (block: ContextBlock): string =>
         block.at ?? '',
         block.endedAt ?? '',
         contextBlockDurationOf(block) ?? '',
-        block.inPrompt === true ? 'prompt' : 'streamed'
+        block.inPrompt === true ? 'prompt' : 'streamed',
+        block.included === undefined ? '' : block.included ? 'included' : 'excluded'
     ].join(':');
 
 /** A running call's bytes are still arriving, so its answer is never cacheable. */
@@ -168,7 +233,68 @@ export const blockDetailCacheSize = (): number => blockDetails.size;
 // ---------------------------------------------------------------------------
 
 /** One labelled fact on the dialog's meta line. */
-export type BlockDetailFact = { fact: string; text: string };
+export type BlockDetailFact = {
+    fact: string;
+    text: string;
+    /**
+     * R5: the state tone, painted by `styles.css` off `[data-tone]`. ONLY the two
+     * state-bearing facts ever set it — the kind chip and the inclusion chip — because the
+     * complaint this answers is "a wall of identical grey pills": recolouring the character
+     * counts too would put the reader back to square one, just in a louder palette.
+     */
+    tone?: BlockDetailTone;
+    /** R5: the glyph that goes with the tone, painted in an `aria-hidden` span — the WORD
+     *  beside it stays the meaning, exactly as `./tools.ts:307-315` rules for a tool card. */
+    glyph?: string;
+};
+
+/** The four tones the dialog can paint, named after the tokens `styles.css` maps them to. */
+export type BlockDetailTone = 'ok' | 'danger' | 'warn' | 'muted';
+
+// The kind chip's tone and glyph per settled state: the same four characters and the same
+// colour assignment `./tools.ts:307-315` uses on a tool card, so a call reads identically in
+// the strip, on its card, and here. Green for a settled success, red for a tool FAILURE,
+// warn for bytes that are still arriving (nothing failed), and a MUTED `⊘` for a call that
+// was cut off — a control outcome, so it borrows neither the green nor the red. `running`
+// keeps an arrow so the chip never reflows when the call settles, and a block with NO state
+// (a prompt, an instruction set, a thinking window) paints no glyph at all: there is no
+// state to signal, and R8 says this dialog stays quiet everywhere the state is not the story.
+const STATE_FACTS: Readonly<Record<StepDisplayState, { tone: BlockDetailTone; glyph: string }>> = {
+    running: { tone: 'warn', glyph: '→' },
+    ok: { tone: 'ok', glyph: '✓' },
+    error: { tone: 'danger', glyph: '✕' },
+    cancelled: { tone: 'muted', glyph: '⊘' }
+};
+
+/**
+ * T7/R6: the inclusion chip, which answers three different questions and must not blur them.
+ *
+ *   - `included === false` — the reader's OWN exclusion: the transcript unit is withheld from
+ *     the requests that follow, and this verdict WINS over any per-kind reading, because it
+ *     is the one state a human set (../shared/turn-display.ts:541 documents the tri-state);
+ *   - `included === true` — the same control switched the other way, phrased as the positive
+ *     "in the prompt" so the pair reads as one switch rather than as two different questions;
+ *   - ABSENT — a different question again: the server could not name ONE transcript entry
+ *     behind this segment (a thinking window streams several entries, an instruction block
+ *     joins several messages, a legacy record has no call id), so there is nothing to switch
+ *     and the chip states what the PROJECTOR knows — the static per-kind `inPrompt` verdict,
+ *     the same words it carried before this control existed.
+ */
+const inclusionFactOf = (block: ContextBlock): BlockDetailFact => {
+    if (block.included === false) {
+        return { fact: 'prompt', text: 'excluded from context', tone: 'danger', glyph: '✕' };
+    }
+
+    if (block.included === true) return { fact: 'prompt', text: 'in the prompt', tone: 'ok', glyph: '✓' };
+
+    return { fact: 'prompt', text: block.inPrompt === true ? 'in the prompt' : 'not replayed into the prompt' };
+};
+
+/**
+ * True exactly when the inclusion chip is a CONTROL rather than a statement: the server
+ * published a verdict, so there is a transcript entry behind this segment to switch.
+ */
+export const blockInclusionIsSwitchable = (block: ContextBlock): boolean => block.included !== undefined;
 
 /**
  * The facts line, one entry per claim (exact strings, pinned by ./context-detail.test.ts).
@@ -181,8 +307,12 @@ export type BlockDetailFact = { fact: string; text: string };
  * Every figure is the server's. The unit is always CHARACTERS, never tokens.
  */
 export const blockDetailFactsOf = (block: ContextBlock, payload?: BlockDetailPayload): BlockDetailFact[] => {
+    // R5: the state rides on the kind chip — the ONE fact that carries it — as a tone plus a
+    // glyph. An UNSET state (every non-tool kind) contributes neither.
+    const state = block.state === undefined ? {} : STATE_FACTS[block.state];
+
     const facts: BlockDetailFact[] = [
-        { fact: 'kind', text: `${block.kind}${block.state !== undefined ? ` · ${block.state}` : ''}` },
+        { fact: 'kind', text: `${block.kind}${block.state !== undefined ? ` · ${block.state}` : ''}`, ...state },
         { fact: 'chars', text: `${formatContextCharCount(block.chars)} characters recorded` }
     ];
 
@@ -209,7 +339,7 @@ export const blockDetailFactsOf = (block: ContextBlock, payload?: BlockDetailPay
     else if (block.eventFrom !== undefined) facts.push({ fact: 'events', text: `event ${block.eventFrom}` });
     else facts.push({ fact: 'events', text: 'from the turn record' });
 
-    facts.push({ fact: 'prompt', text: block.inPrompt === true ? 'in the prompt' : 'not replayed into the prompt' });
+    facts.push(inclusionFactOf(block));
     facts.push({ fact: 'section', text: `section ${block.sectionId}` });
     facts.push({ fact: 'block', text: `block ${block.id}` });
 
@@ -377,6 +507,11 @@ export const blockDetailCopyTextOf = (payload: BlockDetailPayload): string => {
 export const openBlockDetail = (options: BlockDetailOptions): BlockDetailDialog => {
     const { turnId, sessionId, load, returnFocus } = options;
 
+    // T7: injected by the tile when it has one, otherwise this module's own transport. The
+    // chip is only ever a button when the server published a verdict, so an unwired board
+    // never shows a control that would reject on click.
+    const write = options.write ?? defaultInclusionWriter;
+
     // The route's answer replaces this (see `request`): the facts are the SERVER's figures,
     // and the block the segment carried is only the pre-response copy of them.
     let block = options.block;
@@ -397,28 +532,150 @@ export const openBlockDetail = (options: BlockDetailOptions): BlockDetailDialog 
 
     body.append(meta, panes);
 
+    // The toggle's failure surface: the SAME note vocabulary a failed payload uses
+    // (`data-detail='error'`, and the same text-copying child), but appended AFTER the panes
+    // instead of replacing them — a reader who cannot switch a segment still needs the
+    // arguments and the result on screen to know what they were looking at. Added and removed
+    // rather than `hidden`, because `styles.css` gives `.block-detail-note` a `display: flex`,
+    // which outranks the attribute default.
+    const inclusionNote = document.createElement('p');
+
+    inclusionNote.className = 'block-detail-note';
+    inclusionNote.dataset.detail = 'error';
+    inclusionNote.dataset.note = 'inclusion';
+
+    /** Show (or clear) the toggle's own error line. */
+    const syncInclusionNote = (): void => {
+        if (inclusionError.length === 0) {
+            if (inclusionNote.parentElement === body) body.removeChild(inclusionNote);
+
+            return;
+        }
+
+        inclusionNote.textContent = `the inclusion could not be switched: ${inclusionError}`;
+
+        if (inclusionNote.parentElement !== body) body.append(inclusionNote);
+    };
+
     let status: BlockDetailStatus = 'loading';
     let message = '';
     let payload: BlockDetailPayload | undefined;
     // Stale-response ticket: one increment per attempt, so only the LATEST answer paints.
     let ticket = 0;
     let destroyed = false;
-    let handle: DialogHandle | undefined;
+    // One inclusion write at a time: a double click would otherwise queue two writes of the
+    // SAME flipped value and the second would land as a no-op against the first's receipt.
+    let busy = false;
+    let inclusionError = '';
 
     const paintMeta = (): void => {
-        meta.replaceChildren(
-            ...blockDetailFactsOf(block, payload).map(({ fact, text }) => {
-                const node = document.createElement('span');
-                node.className = 'block-detail-fact';
-                node.dataset.fact = fact;
-                node.textContent = text;
-
-                return node;
-            })
-        );
+        meta.replaceChildren(...blockDetailFactsOf(block, payload).map(createFact));
 
         body.dataset.kind = block.kind;
         body.dataset.status = status;
+    };
+
+    /**
+     * T7: the toggle itself. Await the server, THEN paint — no optimistic state, because the
+     * unit this click addresses may already have moved (a plugin's `setIncluded`, another
+     * tab, a run that committed the result in between), and the receipt is the verdict the
+     * transcript actually holds.
+     */
+    const toggleInclusion = async (): Promise<void> => {
+        if (busy) return;
+
+        const wanted = block.included !== true;
+
+        busy = true;
+        inclusionError = '';
+        // Repaint FIRST: the chip is the button that is disabled while the request is out,
+        // which is the only honest answer a click can have before the receipt lands.
+        paintMeta();
+        syncInclusionNote();
+
+        try {
+            const persisted = await write({
+                ...(sessionId === undefined ? {} : { sessionId }),
+                turnId,
+                blockId: block.id,
+                included: wanted
+            });
+
+            block = { ...block, included: persisted };
+            // R4: the fingerprint now covers the inclusion, so the entry cached under the old
+            // one is stale by construction. Drop it explicitly as well: this dialog may have
+            // served from it, and the next open must ask the route rather than re-serve the
+            // state this click just replaced.
+            invalidateBlockDetail(blockDetailCacheKeyOf(sessionId, turnId, block.id));
+        } catch (error) {
+            // Nothing moved and nothing was painted ahead: the chip keeps stating the state
+            // the server holds, and the refusal is stated beside the panes.
+            inclusionError = error instanceof Error ? error.message : String(error);
+        } finally {
+            busy = false;
+            // Only the meta line, not the panes: a reader mid-scroll through a 200k-character
+            // result must not lose their place because they toggled a chip.
+            paintMeta();
+            syncInclusionNote();
+        }
+    };
+
+    /**
+     * One chip on the facts line.
+     *
+     * A plain `<span>` for every fact but one: R8 keeps this dialog quiet, so colour and
+     * glyph appear only where a STATE is the claim (the kind chip, the inclusion chip), and
+     * the character counts, stamps and ids stay the neutral pills they always were.
+     *
+     * The inclusion fact is a real `<button>` with `aria-pressed` (R6), never a clickable
+     * looking like a control: this is the one claim on the line a reader can CHANGE, and a
+     * span would leave a screen reader with no state to announce and no action to take.
+     */
+    const createFact = (fact: BlockDetailFact): HTMLElement => {
+        const switchable = fact.fact === 'prompt' && blockInclusionIsSwitchable(block);
+        const node = document.createElement(switchable ? 'button' : 'span');
+
+        node.className = 'block-detail-fact';
+        node.dataset.fact = fact.fact;
+
+        if (fact.tone !== undefined) node.dataset.tone = fact.tone;
+
+        if (fact.glyph !== undefined) {
+            // `aria-hidden`, because the text beside it already says `ok` / `error` /
+            // `excluded from context`: the glyph is for the eye, not the announcement
+            // (./tools.ts:307-315, same rule for the same characters).
+            const glyph = document.createElement('span');
+
+            glyph.className = 'block-detail-fact-glyph';
+            glyph.setAttribute('aria-hidden', 'true');
+            glyph.textContent = fact.glyph;
+            node.append(glyph);
+        }
+
+        // The words of the fact in their OWN element: the glyph above is a sibling, so a
+        // consumer that wants the CLAIM (`tool · ok`, `in the prompt`) reads one node rather
+        // than subtracting a decoration from the chip's text.
+        const text = document.createElement('span');
+
+        text.className = 'block-detail-fact-text';
+        text.textContent = fact.text;
+        node.append(text);
+
+        if (!switchable) return node;
+
+        const button = node as HTMLButtonElement;
+
+        button.type = 'button';
+        // `aria-pressed` states which way the switch is set: PRESSED means this segment IS
+        // in the prompt, which is the affirmative reading of the chip's own label.
+        button.setAttribute('aria-pressed', block.included === true ? 'true' : 'false');
+        button.title = block.included === true
+            ? 'Exclude this segment from the requests that follow'
+            : 'Include this segment in the requests that follow';
+        button.disabled = busy;
+        button.addEventListener('click', () => void toggleInclusion());
+
+        return node;
     };
 
     const paintPanes = (): void => {
@@ -508,7 +765,10 @@ export const openBlockDetail = (options: BlockDetailOptions): BlockDetailDialog 
         }
     };
 
-    handle = openDialog({
+    // The dialog itself, opened once and held for the dialog's whole life: `paint` and the
+    // handle's own methods close over it, and every paint happens after this line — the first
+    // one is below, once the payload is known or the route has been asked.
+    const handle: DialogHandle = openDialog({
         title: detailTitleOf(block),
         content: body,
         ...(returnFocus === undefined ? {} : { returnFocus }),
@@ -548,7 +808,15 @@ export const openBlockDetail = (options: BlockDetailOptions): BlockDetailDialog 
         refresh: (next: ContextBlock) => {
             const wasPartial = contextBlockIsRunning(block);
 
-            block = next;
+            // T7: the bar's segment model is compiled from the turn's EVENTS and never
+            // carries `included` — the detail route is the only producer (../server/api.ts
+            // `getSessionTurnBlock`) — so a metadata refresh must not silently un-exclude a
+            // segment the reader switched off a moment ago. A published value on the incoming
+            // block always wins; absence means "no news", not "back on".
+            block = next.included === undefined && block.included !== undefined
+                ? { ...next, included: block.included }
+                : next;
+
             invalidateBlockDetail(blockDetailCacheKeyOf(sessionId, turnId, next.id));
 
             if (wasPartial || contextBlockIsRunning(next)) {

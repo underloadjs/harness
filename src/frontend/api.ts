@@ -141,7 +141,10 @@ import type {
     UpdateSessionAgentRequest,
     UpdateSessionRequest,
     UpdateSessionToolRequest,
-    UpdateThreadTranscriptRequest
+    UpdateThreadTranscriptRequest,
+    // T7: the context segment's one writable field, and the receipt that write answers with.
+    PatchTurnBlockRequest,
+    TurnBlockWriteReceipt
 } from '../shared/harness-api';
 import type { HarnessEvent, HarnessUsage } from '../types';
 // The display subtree uses the GENERATED aliases in ../shared/harness-api (they ARE
@@ -1290,6 +1293,31 @@ export const getBlockDetail = (id: string, turnId: string, blockId: string): Pro
             encodeURIComponent(blockId)
         )
     ).then((body) => body.block);
+
+// `PATCH .../turns/{t}/blocks/{b}` (T7) — the ONE write the segment dialog makes: switch
+// this segment's transcript unit into, or out of, the requests that follow. It is NOT the
+// whole-document transcript PUT: a dialog holds a segment, not a document, and sending a
+// document back would re-write every entry the conversation committed since the dialog was
+// opened. The route reads the transcript itself, moves ONE flag on ONE unit (the call plus
+// every result answering it — provider pairing is why the cascade exists), and answers the
+// state it PERSISTED, so the caller repaints from the server rather than from its click.
+export const patchBlockInclusion = (
+    id: string,
+    turnId: string,
+    blockId: string,
+    included: boolean
+): Promise<TurnBlockWriteReceipt> => {
+    const body: PatchTurnBlockRequest = { included };
+
+    return request<TurnBlockWriteReceipt>(
+        HARNESS_ROUTES.sessionsBySessionIdTurnsByTurnIdBlocksByBlockId(
+            encodeURIComponent(id),
+            encodeURIComponent(turnId),
+            encodeURIComponent(blockId)
+        ),
+        { method: 'PATCH', body: JSON.stringify(body) }
+    );
+};
 
 // `GET .../turns/{t}/attachments/{a}` — ONE attachment's bytes, on demand. Rows and
 // trees carry descriptors (identity, marker, size, `has_bytes`) only.

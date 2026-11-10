@@ -3428,9 +3428,11 @@ service gateway below.
 The scratch board mounts two first-party panels over the session's record store:
 `harness.tasks` (title **Tasks**) above `harness.records` (title **Records**). Both
 are `scratch`-slot, `requiresSession: true`, and **display-only** — their controls are
-view-side only: a task row's "Show N changes" disclosure, the records panel's collection
-filter chips, the "N new" follow pill, and a Retry where a read failed. Nothing writes:
-the agent owns the store, so a checkbox that looks clickable but is not would be a lie.
+view-side only: a task row opening its own detail (the collapsed row is a tick-or-cross
+mark plus its text, and pressing it reveals the full text, the meta line and the
+record's history), the records panel's collection filter chips, the "N new" follow pill,
+and a Retry where a read failed. Nothing writes: the agent owns the store, so a checkbox
+that looks clickable but is not would be a lie.
 
 - **Data, once, then deltas.** Each panel reads the two bounded REST reads
   (`GET …/records` for the snapshot, `GET …/records?since=` for the delta). The

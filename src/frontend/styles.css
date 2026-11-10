@@ -7993,6 +7993,84 @@ body.is-resizing-rail {
     color: var(--text);
 }
 
+/* R5 (T5): the two facts that carry a STATE stop being decoration and become signals.
+   `[data-tone]` is set by `context-detail.ts` for the KIND chip (the only fact that carries
+   `block.state`) and the INCLUSION chip — and for nothing else, which is the whole point:
+   the character counts, the stamps, the event range and the ids keep the neutral pill above,
+   so the eye lands on the state instead of on a rainbow.
+
+   The four tones are the SAME colours the two existing state surfaces use, so one theme
+   change moves all three together: `--ok` / `--danger` / `--warn` as `.tool[data-state=…]`
+   paints them (:4886-4896) and as `.context-bar-segment[data-tone=…]` paints them
+   (:7545-7566). `cancelled` is MUTED, not red — an interrupted call is a control outcome,
+   the rule `.tool[data-state='cancelled']` already states at :4880 — and `running` is WARN,
+   because nothing failed, the bytes are simply still arriving. */
+.block-detail-fact[data-tone] {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    /* A coloured pill needs its own edge or it reads as a swatch, not a chip. */
+    border-color: var(--border-strong);
+}
+
+/* The glyph is in FLOW, so the chip never reserves room for a mark it may not paint — the
+   same no-reservation rule the tool chip states for its duration label (:4799). It is
+   `aria-hidden` in the DOM (the words beside it carry the meaning), and `::before` was the
+   alternative; a real element won, because `./tools.ts:307-315` already ships these exact
+   four characters as elements and one vocabulary is worth keeping. */
+.block-detail-fact-glyph {
+    font-weight: 700;
+    line-height: 1;
+}
+
+.block-detail-fact[data-tone='ok'] {
+    border-color: var(--ok-line);
+    background: var(--ok-wash);
+    color: var(--ok);
+}
+
+/* The washes below are literal rgba of the `--danger` / `--warn` hexes, matching
+   `.tool[data-state='error']`'s literal border at :4777 — those two tokens have no `-wash`
+   / `-line` siblings to borrow, and inventing two here would leave the tool card on a
+   slightly different red for no reason. */
+.block-detail-fact[data-tone='danger'] {
+    border-color: rgba(248, 113, 113, 0.45);
+    background: rgba(248, 113, 113, 0.12);
+    color: var(--danger);
+}
+
+.block-detail-fact[data-tone='warn'] {
+    border-color: rgba(251, 191, 36, 0.4);
+    background: rgba(251, 191, 36, 0.12);
+    color: var(--warn);
+}
+
+.block-detail-fact[data-tone='muted'] {
+    border-color: var(--border);
+    color: var(--muted);
+}
+
+/* R6 (T5): the inclusion chip is the one CLAIM on this line a reader can CHANGE, so it is a
+   `<button aria-pressed>` — and a control has to say so in three ways the pill never had to:
+   a pointer, a focus ring, and a disabled look while the write is in flight. Everything else
+   stays the pill it replaced (same padding, radius, mono type), because the STATE is what
+   changes here, not the row's layout (R8). */
+.block-detail-fact[data-fact='prompt'][data-tone] {
+    cursor: pointer;
+}
+
+.block-detail-fact[data-fact='prompt'][data-tone]:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+.block-detail-fact[data-fact='prompt'][data-tone]:disabled {
+    /* The write is out and its answer is the only thing that may change this chip's face, so
+       the click is refused rather than queued — a second press would otherwise ask for the
+       SAME flipped state twice. */
+    opacity: 0.45;
+    cursor: progress;
+}
+
 .block-detail-panes {
     display: flex;
     flex-direction: column;
@@ -8100,6 +8178,14 @@ body.is-resizing-rail {
     flex-direction: column;
     gap: 6px;
     min-width: 0;
+}
+
+/* The records panel ships COLLAPSED (./records-panels.ts): the body starts
+   `hidden`, and this rule is what makes that stick — the `display: flex` above
+   would otherwise beat the UA's `[hidden]` rule, for the same reason
+   `.panel-new-pill[hidden]` exists below. */
+.panel-records-body[hidden] {
+    display: none;
 }
 
 .panel-tasks-scroller,
@@ -8315,6 +8401,28 @@ body.is-resizing-rail {
     border-left: 2px solid transparent;
 }
 
+/* THE STATUS EDGE AND GROUND. A task row says which state it is in THREE ways at once
+   — the glyph's shape (a tick vs a cross), the group heading above the list, and this
+   edge-and-wash pair drawn from the row's own `data-completed` — so the tint is the
+   fast signal and never the only one, and there is no word and no strike anywhere in
+   the row. Completed borrows the enabled greens (`--ok-wash` / `--ok-line`, the same
+   pairing the catalogue's enabled tile uses); open borrows the amber the chrome
+   already uses for "not settled yet", and it is deliberately NOT the danger red: an
+   open task is unfinished, not wrong.
+
+   These rules come BEFORE the "just landed" rule below on purpose. Equal specificity
+   means the later rule wins, and for the ~1.5s a row is fresh, "this one just
+   arrived" outranks "which group it belongs to". */
+.panel-tasks-row[data-completed='false'] {
+    border-left-color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+.panel-tasks-row[data-completed='true'] {
+    border-left-color: var(--ok-line);
+    background: var(--ok-wash);
+}
+
 /* THE "just landed" highlight. ~1.5s, then the attribute is dropped by the fresh
    marker (./records-dom.ts `createRecordsFreshMarker`), so the panel never keeps
    a row painted as new. The border is the marker; the tint is decoration. */
@@ -8352,14 +8460,35 @@ body.is-resizing-rail {
     min-width: 0;
 }
 
-/* The completion glyph: a WORD in a box, never a tick and never a strike. The
-   row also carries `data-completed` and the state word beside it, so completion
-   survives a colour-blind reader, a forced-colors mode and a screen reader. */
+/* THE TASKS ROW IS ITS OWN CONTROL: a `<button>` wrapping the mark and the text, so the
+   whole collapsed row answers a click, Enter or Space, and `aria-expanded` on it tells
+   the reader (and assistive tech) what the detail area under the row is doing. Every
+   control here is the same box: the reset is explicit because a UA button would otherwise
+   draw its own chrome, centre the text and shrink to its content. The row is a flex
+   COLUMN, so the button already fills its width — `width: 100%` is the same fact stated,
+   and it keeps the click target honest if the row's layout ever changes. */
+.panel-tasks-row-head {
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+/* The state as a SHAPE, not a word: `✓` completed, `✕` open — the pair
+   ./ui/tools.ts:307-315 uses for a tool call's outcome, so one shape means one thing
+   across the shell. `aria-hidden` (./records-panels.ts): the clipped word beside it is
+   what a screen reader reads, so nobody hears "tick". The glyph is never the only
+   carrier of the state and the row never carries a strike. */
 .panel-tasks-glyph {
     flex: 0 0 auto;
-    color: var(--muted);
+    color: var(--warn);
     font-family: var(--mono);
-    font-size: 10px;
+    font-size: 11px;
     letter-spacing: 0.02em;
 }
 
@@ -8384,18 +8513,20 @@ body.is-resizing-rail {
     font-style: italic;
 }
 
-/* The completion word. It is visible on the task rail — a 12px word costs
-   nothing and a strike would have cost a reader. */
-.panel-tasks-state {
-    flex: 0 0 auto;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10px;
-    text-transform: uppercase;
-}
-
-.panel-tasks-row[data-completed='true'] .panel-tasks-state {
-    color: var(--ok);
+/* The state in WORDS, clipped out of the layout but inside the button's accessible
+   name. The row is a mark and a sentence — an icon is identified faster than a label
+   is read — and this span is what a screen reader, a colour-blind reader and a
+   forced-colours mode all still get told. Same clip recipe as `.panel-live` above. */
+.panel-tasks-row-state {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
 }
 
 /* A completed row dims its TEXT, and the row's `data-completed` says why. No
@@ -8404,6 +8535,62 @@ body.is-resizing-rail {
 .panel-tasks-row[data-completed='true'] .panel-tasks-row-text {
     color: var(--muted);
     opacity: 0.82;
+}
+
+/* The row says "press me" the way the rest of the shell does: the text takes the
+   accent on hover. After the dim rule above on purpose — equal specificity, and a
+   completed row still has to lighten up when the pointer is on it. */
+.panel-tasks-row-head:hover .panel-tasks-row-text {
+    color: var(--accent);
+    opacity: 1;
+}
+
+/* Keyboard focus only: a mouse press gets no ring it did not ask for. */
+.panel-tasks-row-head:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* --------------------------------------------------------------------------
+   The task detail: what a collapsed row leaves out
+   --------------------------------------------------------------------------
+   The row is a mark and a sentence; everything else about the record — the text
+   the 220-char preview cut off, the actor / id / rev / stamp line, and the
+   record's change history — appears only while the reader holds the row open.
+   `hidden` is the fact the button toggles (`aria-expanded` is its mirror), and it
+   has to beat the `display: flex` below for the same reason
+   `.panel-new-pill[hidden]` does. */
+.panel-tasks-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 2px 0 2px 10px;
+    padding: 3px 0 3px 8px;
+    border-left: 1px solid var(--border);
+}
+
+.panel-tasks-detail[hidden] {
+    display: none;
+}
+
+/* The whole task text (the row shows `RECORDS_TEXT_PREVIEW` of it). A task is up to
+   4000 characters, so this is the one place on the rail that wraps on purpose. */
+.panel-tasks-detail-text {
+    margin: 0;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* The chips that used to sit in the row: actor, `#id`, `r{rev}`, relative stamp.
+   They are furniture, so they keep the muted mono of the chrome lines. */
+.panel-tasks-detail-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 5px;
 }
 
 /* --------------------------------------------------------------------------
@@ -8637,8 +8824,8 @@ body.is-resizing-rail {
     color: var(--accent);
 }
 
-/* The locally accumulated history of one record. */
-.panel-tasks-disclosure,
+/* The locally accumulated history of one feed record. (Tasks no longer has this
+   wrapper: its history lives inside the row's own `.panel-tasks-detail`.) */
 .panel-records-disclosure {
     display: flex;
     flex-direction: column;
@@ -8753,6 +8940,20 @@ body.is-resizing-rail {
 /* Forced colours: the framework drops my background tints, so the state has to
    survive on borders and text alone — which is how the markup was written. */
 @media (forced-colors: active) {
+    /* Every task row now carries a status tint, so every task row is listed here:
+       the wash is what forced colours takes away, and the EDGE is what survives, one
+       system colour per state. The glyph's shape and the clipped state word say the
+       same thing either way, which is why the two edges need not be clever. */
+    .panel-tasks-row[data-completed='false'] {
+        border-left-color: CanvasText;
+        background: Canvas;
+    }
+
+    .panel-tasks-row[data-completed='true'] {
+        border-left-color: Highlight;
+        background: Canvas;
+    }
+
     .panel-tasks-row[data-fresh='true'],
     .panel-records-row[data-fresh='true'] {
         border-left-color: Highlight;

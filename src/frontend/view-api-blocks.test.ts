@@ -18,11 +18,16 @@
 // The legacy `/api/views/:id/turns/:tid/blocks/:bid` mirror is gone, and with it the
 // `getBlockDetail` export — the facade now answers the PROJECTED detail, not the record.
 //
+// T5 adds the WRITE on the same route, and the same rule applies to it: `PATCH` with ONE field
+// (`included`), answered by the state the server persisted. The whole-document transcript PUT is
+// not part of this surface — a dialog holds a segment, not a conversation — and the strict stub
+// below is what proves no second request happens.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts view-api-blocks.test.ts
 
 import type { TurnBlockDetail } from '../shared/harness-api';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readBlockDetail } from './view-api';
+import { readBlockDetail, writeBlockInclusion } from './view-api';
 
 const T = 1_700_000_000_000;
 
@@ -141,5 +146,66 @@ describe('readBlockDetail', () => {
             '/v1/harness/sessions/s1/turns/t1/blocks/0-tool-7',
             '/v1/harness/sessions/s1/turns/t1/blocks/0-tool-9'
         ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T5/R6: the inclusion switch — ONE PATCH, ONE field, the segment's own route
+// ---------------------------------------------------------------------------
+
+describe('writeBlockInclusion', () => {
+    it('switches one segment with a single PATCH on its own route, and answers the state it persisted', async () => {
+        // The receipt is the server's PERSISTED verdict — including the unit cascade — and the
+        // dialog paints from it rather than from the click (./ui/context-detail.ts
+        // `toggleInclusion`). The ids are encoded exactly as the read above encodes them, and the
+        // body carries one field: this is a fact write. `serve` throws for any route it does not
+        // declare, so the second request a whole-document transcript write would need
+        // (`PUT /sessions/{id}/threads/{thread}/transcript/document`) fails this test rather than
+        // passing quietly — which is the whole reason the segment got its own verb.
+        const receipt = {
+            session_id: 's 1',
+            turn_id: 't 1',
+            block_id: '0-tool-7',
+            included: false,
+            thread_id: 'thread-1',
+            revision: 3,
+            links: {
+                block: '/v1/harness/sessions/s 1/turns/t 1/blocks/0-tool-7',
+                transcript: '/v1/harness/sessions/s 1/threads/thread-1/transcript'
+            }
+        };
+
+        serve({ 'PATCH /v1/harness/sessions/s%201/turns/t%201/blocks/0-tool-7': receipt });
+
+        expect(await writeBlockInclusion('s 1', 't 1', '0-tool-7', false)).toEqual(receipt);
+        expect(calls).toEqual([
+            {
+                method: 'PATCH',
+                url: '/v1/harness/sessions/s%201/turns/t%201/blocks/0-tool-7',
+                body: JSON.stringify({ included: false }),
+                keepalive: false
+            }
+        ]);
+    });
+
+    it('hands back the server\u2019s refusal untouched, because the dialog states the reason', async () => {
+        // A 409 here has two honest causes the reader can act on differently — the segment has no
+        // transcript entry to switch, or the run owns the transcript right now — and the transport
+        // must not flatten either into a generic failure or swallow it into a fake receipt.
+        serve(
+            {
+                'PATCH /v1/harness/sessions/s1/turns/t1/blocks/0-system-instructions': {
+                    error: {
+                        message: `Context segment "0-system-instructions" has no transcript entry to switch: the call it recorded is not in this conversation's transcript.`
+                    }
+                }
+            },
+            { 'PATCH /v1/harness/sessions/s1/turns/t1/blocks/0-system-instructions': 409 }
+        );
+
+        await expect(writeBlockInclusion('s1', 't1', '0-system-instructions', false)).rejects.toThrow(
+            'Context segment "0-system-instructions" has no transcript entry to switch'
+        );
+        expect(calls).toHaveLength(1);
     });
 });

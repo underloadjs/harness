@@ -539,6 +539,32 @@ export type ContextBlock = {
      * so a bar never assumes every counted segment is prompt text.
      */
     inPrompt: boolean;
+    /**
+     * T7 (docs/tasks/2026-11-09-context-inclusion-followups.md): the READER-facing
+     * inclusion axis — is this segment's transcript entry switched into the requests
+     * that follow. Deliberately NOT folded into `inPrompt`: `inPrompt` is the projector's
+     * static per-kind verdict (a `reasoning` window is never replayed whatever a reader
+     * does), while this is the state the reader controls from the segment dialog and the
+     * state `turn.before setIncluded` writes from a plugin (src/harness.ts:8528-8567).
+     *
+     * Tri-state, mirroring core's storage rule (`src/core/agent.ts:161-207` persists only
+     * a literal `false` and drops the key otherwise):
+     *   - `false`  — the owning transcript unit IS excluded; `projectTranscript` drops the
+     *     whole tool-call unit around it (src/harness.ts:6421-6460), so this states the
+     *     EFFECT of the cascade, not one message's flag;
+     *   - `true`   — the unit resolves and is switched on, which is what lets the dialog
+     *     offer the toggle BACK rather than showing a dead end;
+     *   - ABSENT   — this server could not name the transcript entry behind the segment
+     *     (a `reasoning`/answer window spans many entries, a system block joins several
+     *     messages, or the opening event carries no call id), so a renderer keeps its
+     *     `inPrompt` verdict and offers no control.
+     *
+     * Published by the block detail route (src/server/api.ts `getSessionTurnBlock`), the
+     * one read that has BOTH the recorded event and the live transcript in hand; the
+     * display tree carries it when a producer states it, and `display-project.ts` copies
+     * it only when the wire stated it (never a local guess).
+     */
+    included?: boolean;
     /** `tool` only: the settled state, verbatim `StepDisplayState`. Absent until the
      *  call settles, and never re-derived by the renderer from `isError` (the same
      *  authority rule as `DisplayStep.outcome`, line 572). */

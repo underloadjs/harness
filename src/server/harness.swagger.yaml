@@ -2777,6 +2777,47 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Turns]
+      operationId: patchTurnBlockInclusion
+      summary: Switch one context segment in or out of the prompt
+      description: >-
+        The ONE write the segment dialog makes: it switches this segment's transcript entry into, or out of, the
+        requests that follow. This is the HTTP face of the shipped `turn.before setIncluded` control
+        (src/harness.ts `setIncluded`), so the semantics are the core's, not a second mechanism: the target is the
+        transcript UNIT — an assistant call plus every result answering it — because provider tool-call pairing
+        breaks if one half travels without the other, and a segment whose opening event names no live call, or a
+        window spanning several entries, has no single unit to switch and is refused 409. Only the flag moves: no
+        text, no ordering, no entry is added or removed, so the transcript keeps its length and its addresses.
+        The write goes through the conversation's shipped transcript write (validation, the running refusal, the
+        durable-before-response rule and the `transcript.updated` signal), which is why a RUNNING conversation is
+        409 — a mid-run flag change would be rewritten by the run itself. The receipt states the resulting
+        unit-level state rather than echoing the document, so the dialog repaints from what the server PERSISTED,
+        never from what it asked for; the client re-reads the segment only if it wants the bytes again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchTurnBlockRequest'
+            examples:
+              exclude:
+                summary: Drop this call's unit from the following requests
+                value:
+                  included: false
+      responses:
+        '200':
+          description: Write receipt carrying the state that was persisted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TurnBlockWriteReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
   /v1/harness/sessions/{session_id}/turns/{turn_id}/attachments/{attachment_id}:
     parameters:
       - $ref: '#/components/parameters/SessionId'
@@ -8132,6 +8173,16 @@ components:
             (including failed or cancelled) result or only the arguments of a call still running. False for a
             `reasoning` block, which is streamed and recorded but NEVER replayed into the next request. Stated
             explicitly so a bar never assumes every counted segment is prompt text.
+        included:
+          type: boolean
+          description: >-
+            T7: the READER-facing inclusion axis, distinct from `inPrompt`. `true`/`false` state the transcript
+            unit this segment is built from as switched ON or OFF for the requests that follow (a tool unit is
+            excluded as a whole - the assistant call plus every result answering it, src/harness.ts:6421-6460),
+            and ABSENT means this server could not name that unit: a `reasoning` or answer window spans several
+            entries, a system block joins several instruction messages, or the opening event carries no call id.
+            The block detail route states it, because that read holds BOTH the recorded event and the live
+            transcript; `PATCH` on this same path writes it. A client never derives it.
         eventFrom:
           type: integer
           minimum: 0
@@ -8323,6 +8374,61 @@ components:
       properties:
         block:
           $ref: '#/components/schemas/TurnBlockDetail'
+    PatchTurnBlockRequest:
+      type: object
+      description: >-
+        The one field a context segment has: whether its transcript unit travels in the requests that follow. There
+        is deliberately no `if_revision` here — the write names the ENTRY, not a document, so it cannot carry a
+        stale copy of anything a concurrent writer moved, and the whole-document PUT stays the only resource with
+        an optimistic lock.
+      required: [included]
+      additionalProperties: false
+      properties:
+        included:
+          type: boolean
+          description: >-
+            The state to persist for the WHOLE unit this segment belongs to. `false` stores the flag core keeps
+            only as a literal `false` (src/core/agent.ts `withIncluded`), and `true` removes it, which is how a
+            reader switches a segment back on.
+    TurnBlockWriteReceipt:
+      type: object
+      description: >-
+        Receipt of the segment inclusion write. It answers the unit-level state the server PERSISTED, which is what
+        lets the dialog repaint from the write rather than from what it asked for — a plugin or another tab may
+        have moved the same unit, and the receipt is the truth either way.
+      required: [session_id, turn_id, block_id, included]
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+        turn_id:
+          type: string
+        block_id:
+          type: string
+          description: The segment the write was addressed to, echoed so a late answer can be matched to its click.
+        included:
+          type: boolean
+          description: >-
+            The unit's state now, read back AFTER the write: `false` only when the unit is excluded. A tool unit
+            reports one verdict for the call and every result answering it, because that is what the exclusion
+            switched.
+        thread_id:
+          type: string
+          description: The conversation whose transcript changed — the route a reader checks the document on.
+        revision:
+          type: integer
+          minimum: 0
+          description: The transcript revision this write landed at, in the conversation's own counter domain.
+        links:
+          type: object
+          description: The reads that show the result, so a client never receives a tree back.
+          additionalProperties: false
+          properties:
+            block:
+              type: string
+            transcript:
+              type: string
+
     RecordedEventRef:
       type: object
       description: One recorded event with its ordinal and recorded time, so the two travel together.

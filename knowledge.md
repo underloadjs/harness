@@ -3412,8 +3412,10 @@ and re-exported by `extensions/index.ts` — hands them to the runtime, and
 (`extensions/runtime.ts`) owns their mount, session scoping and teardown exactly as it
 owns a plugin panel's. Nothing in `src/server/**`, `src/shared/**` or
 `src/core/records.ts` knows they exist, and they are display-only — their controls are
-view-side only: a task row's "Show N changes" history disclosure, the collection filter
-chips, the "N new" follow pill, and a Retry where a read failed.
+view-side only: a task row opening its own detail (the collapsed row is a tick-or-cross
+mark plus its text, and pressing it reveals the full text, the meta line and the
+record's history), the collection filter chips, the "N new" follow pill, and a Retry
+where a read failed.
 
 - **Reads.** `src/frontend/api.ts` adds the two bounded REST reads (`getSessionRecords` =
   `GET …/records`, `getSessionRecordsDelta` = `GET …/records?since=`). They are wrapped as

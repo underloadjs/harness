@@ -2123,6 +2123,7 @@ export interface ContextBlock {
     argsChars?: number;
     resultChars?: number;
     inPrompt?: boolean;
+    included?: boolean;
     eventFrom?: number;
     eventTo?: number;
     callId?: string;
@@ -2208,6 +2209,36 @@ export type TurnBlockDetail = ContextBlock
  */
 export interface TurnBlockDetailResponse {
     block: TurnBlockDetail;
+}
+
+/**
+ * The one field a context segment has: whether its transcript unit travels in the requests that follow. There
+ * is deliberately no `if_revision` here — the write names the ENTRY, not a document, so it cannot carry a stale
+ * copy of anything a concurrent writer moved, and the whole-document PUT stays the only resource with an
+ * optimistic lock.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface PatchTurnBlockRequest {
+    included: boolean;
+}
+
+/**
+ * Receipt of the segment inclusion write. It answers the unit-level state the server PERSISTED, which is what
+ * lets the dialog repaint from the write rather than from what it asked for — a plugin or another tab may have
+ * moved the same unit, and the receipt is the truth either way.
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface TurnBlockWriteReceipt {
+    session_id: string;
+    turn_id: string;
+    block_id: string;
+    included: boolean;
+    thread_id?: string;
+    revision?: number;
+    links?: {
+      block?: string;
+      transcript?: string;
+      };
 }
 
 /**

@@ -321,7 +321,14 @@ export const projectBlock = (block: WireContextBlock): ContextBlock => {
         ...(block.resultChars === undefined ? {} : { resultChars: block.resultChars }),
         ...(block.eventFrom === undefined ? {} : { eventFrom: block.eventFrom }),
         ...(block.eventTo === undefined ? {} : { eventTo: block.eventTo }),
-        ...(block.callId === undefined ? {} : { callId: block.callId })
+        ...(block.callId === undefined ? {} : { callId: block.callId }),
+        // T7: the reader-facing inclusion, copied when a producer published it and left
+        // ABSENT otherwise. Absent is not "included": it means "no transcript entry behind
+        // this segment" (../shared/turn-display.ts:541), and a client that defaulted it to
+        // `true` would hand every segment a toggle for a flag nothing can write. The bar
+        // itself ignores this field; the segment dialog is what acts on it
+        // (./ui/context-detail.ts), and today the block detail route is the only producer.
+        ...(block.included === undefined ? {} : { included: block.included })
     };
 };
 

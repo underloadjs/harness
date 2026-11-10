@@ -29,6 +29,15 @@
 // panel in a try/catch and disposes the half-built instance — a broken panel is one
 // card, not a dead page).
 //
+// THE COLLAPSE GATE (records only)
+// --------------------------------
+// The Records panel ships COLLAPSED and builds its engine only while it is open. A
+// card the reader has not opened must cost the conversation nothing: no snapshot
+// read, no delta, no registration on the realtime plane. Expanding the card is what
+// mounts the engine; collapsing it again releases the wake and the client and clears
+// the surface, so every expansion is a fresh boot rather than a stale view kept
+// "live" by nothing.
+//
 // HOW A ROW ARRIVES ON SCREEN
 // ---------------------------
 //   1. the WS plane says `records.updated` (identity only, never content)
@@ -609,9 +618,11 @@ const historyListOf = (
     return list;
 };
 
-// The disclosure button: a real `<button>` with `aria-expanded` (the panel's rows are
-// already `<li>`s inside a list, so a `<details>` inside a list item would fight the
-// list semantics a screen reader is navigating).
+// The records feed's disclosure: a real `<button>` with `aria-expanded` (the feed's rows
+// are already `<li>`s inside a list, so a `<details>` inside a list item would fight the
+// list semantics a screen reader is navigating). The Tasks panel no longer uses it —
+// there the whole row is the control — but the feed's rows are not a control: a whole
+// change row would be a button wrapping a button, since each of its rows expands too.
 const expandButtonOf = (node: HTMLElement, repaint: () => void, expanded: boolean, count: number): HTMLButtonElement => {
     let button = node.querySelector<HTMLButtonElement>('.panel-expand');
 
@@ -671,6 +682,21 @@ const retryActionOf = (client: RecordsClient): { label: string; run: () => void 
 // Tasks — `harness.tasks`
 // ---------------------------------------------------------------------------
 
+// THE TWO MARKS a row is drawn with: a tick for completed, a cross for open — the same
+// pair ../ui/tools.ts:307-315 uses for a tool call that succeeded and one that failed,
+// so a shape means one thing across the whole shell. Both are `aria-hidden` in the row:
+// the clipped state word beside them is what an assistive technology reads, so a screen
+// reader never hears "tick" or "cross".
+const TASKS_GLYPH_COMPLETED = '✓';
+const TASKS_GLYPH_OPEN = '✕';
+
+// The element id behind a row's `aria-controls`. A task id is unique inside its
+// COLLECTION, not inside the document, and two Tasks panels can be mounted at once (a
+// host that renders the board twice, or a test fixture with a broken card beside a
+// working one), so a sequence this module owns is what makes `aria-controls` resolve to
+// THIS row's detail area rather than to whichever panel appended first.
+let tasksDetailSequence = 0;
+
 // The session's shared task list: the `tasks` collection, whose fields are `text`
 // (≤4000 chars), `completed` and `rev` (../shared/harness-api.ts; the store caps the
 // collection at 200 entries — src/core/records.ts). The list has no owner and no claim
@@ -685,10 +711,24 @@ const retryActionOf = (client: RecordsClient): { label: string; run: () => void 
 // rows oldest-id-first, so a row that finishes moves to the far end of a short list
 // instead of jumping onto the reader's rest position.
 //
-// IT IS DISPLAY-ONLY. The only control is "show changes": a box that looks like a
-// checkbox but does not write would be a lie, and the agent owns the store. Completion
-// is spelled out three ways — the `[done]` glyph, `data-completed` on the row, and the
-// group it sits in — never by a strike or a colour alone.
+// IT IS DISPLAY-ONLY. A box that looks like a checkbox but does not write would be a
+// lie, and the agent owns the store — a reader who wants a task ticked ticks it with a
+// tool call, and the row moves a moment later.
+//
+// THE ROW IS THE CONTROL THOUGH. Pressing a row (mouse, Enter or Space — the collapsed
+// row is a real `<button>`) opens the detail area with everything the tidy row left out:
+// the full text, the actor / id / rev / stamp line, and this record's change history.
+//
+// A ROW IS A MARK AND A SENTENCE. A tick means completed and a cross means open — the
+// same two glyphs ../ui/tools.ts:307-315 uses for a tool call that succeeded and one
+// that failed, so a shape means one thing across the shell. The same fact is painted
+// twice more (a green edge and wash for a completed row, an amber ones for an open one,
+// both from `data-completed`), because the reader scans this rail rather than reading
+// it. Colour is never the ONLY signal and there is never a strike: the glyph's SHAPE
+// differs, the row carries `data-completed`, the group heading names the state, and the
+// button's accessible name carries the word "completed"/"open" in a clipped span. Words
+// are what the collapsed row gives up — an icon is identified faster than a label is
+// read, and every word removed is a row the reader can see without scrolling.
 export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions): void => {
     // `onNotice` is the panel's announcement hook: the engine calls it after every
     // state change (./records-panels.ts `createPanelMount`), which is the only place a
@@ -806,88 +846,135 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
     globalThis.addEventListener?.('resize', () => controller.sync(), { signal: ctx.signal });
 
     // --- the row -------------------------------------------------------------
+    // Built ONCE per task and never replaced by a repaint: the button and the detail
+    // area are the two nodes that keep the reader's place (focus, text selection, an
+    // open detail), while everything they CONTAIN is rewritten from the latest read on
+    // every frame. A stream frame rebuilds the button's children — three spans — and
+    // neither of them is focusable, so the reader's focus on the button survives it.
     const createRow = (task: RecordsTask): HTMLElement => {
         const row = recordsElement('li', 'panel-tasks-row');
 
         row.dataset.id = task.id;
 
+        // A real `<button>`, not a click handler on a `<div>`: Enter and Space, the
+        // focus ring and `aria-expanded` all come from the element the browser already
+        // knows how to operate, and the whole collapsed row is its box.
+        const head = recordsElement('button', 'panel-tasks-row-head');
+
+        head.type = 'button';
+        head.setAttribute('aria-expanded', 'false');
+
+        const detail = recordsElement('div', 'panel-tasks-detail');
+
+        tasksDetailSequence += 1;
+        detail.id = `panel-tasks-detail-${tasksDetailSequence}`;
+        // `hidden` is the fact; `aria-expanded` on the button is its mirror. Both are
+        // repainted from the panel's `expanded` set, never from a click's own guess.
+        detail.hidden = true;
+        head.setAttribute('aria-controls', detail.id);
+
+        // ONE listener for the life of the row. `reconcile` never rebuilds this node
+        // (it moves it between the two groups and between repaints), so the target the
+        // reader aims at cannot drift out from under the handler, and a frame that
+        // re-renders this row re-arms nothing.
+        head.addEventListener('click', () => toggleEvents(task.id));
+
+        row.append(head, detail);
+
         return row;
     };
 
     const renderRow = (row: HTMLElement, task: RecordsTask): void => {
-        const glyph = recordsElement('span', 'panel-tasks-glyph', task.completed ? '[done]' : '[open]');
+        // `createRow` above is the only producer of these two elements, so the casts
+        // state the panel's invariant rather than a hope (same shape as the records
+        // feed's `renderRow`, which reaches for its own persistent nodes).
+        const head = row.querySelector<HTMLButtonElement>('.panel-tasks-row-head') as HTMLButtonElement;
+        const detail = row.querySelector<HTMLElement>('.panel-tasks-detail') as HTMLElement;
         const preview = recordsTruncate(task.text);
-        const textNode = recordsElement('span', 'panel-tasks-row-text', preview.text);
-        // The completion state in WORDS as well as in the glyph: a coloured box, a
-        // strike and a check shape are all conventions this surface refuses to lean on
-        // alone, and a screen reader should not have to infer "done" from a symbol.
-        const stateWord = recordsElement('span', 'panel-tasks-state', task.completed ? 'completed' : 'open');
+        const isOpen = expanded.has(task.id);
+
+        // The state as a SHAPE, and the state as a WORD. The shape is what a reader
+        // identifies at a glance; the word is clipped out of the layout but sits inside
+        // the button's accessible name, so a colour-blind reader, a forced-colours
+        // mode and a screen reader all get the same fact without a single visible
+        // label taking the row's space.
+        const glyph = recordsElement('span', 'panel-tasks-glyph', task.completed ? TASKS_GLYPH_COMPLETED : TASKS_GLYPH_OPEN);
 
         glyph.setAttribute('aria-hidden', 'true');
         glyph.dataset.completed = String(task.completed);
-        row.dataset.completed = String(task.completed);
+
+        const stateWord = recordsElement('span', 'panel-tasks-row-state', task.completed ? 'completed' : 'open');
+        const textNode = recordsElement('span', 'panel-tasks-row-text', preview.text);
 
         if (preview.truncated) textNode.title = task.text;
 
         if (task.text.length === 0) {
             // Nothing to show: an empty title, or a body this read never published. The
-            // id chip below is then the only handle on the row, and the panel says so.
+            // id in the detail area is then the only handle on the row, and the panel
+            // says so where a sighted reader can see it too.
             textNode.dataset.missing = 'true';
             textNode.setAttribute('aria-label', `Task ${task.id}: no text in the last read`);
         }
 
-        const parts: HTMLElement[] = [
-            glyph,
-            textNode,
-            stateWord,
+        // The row's one fact, in one attribute: the stylesheet draws the glyph colour,
+        // the edge and the wash from it, `reconcile` and the tests read it, and the
+        // group heading above the list says the same thing in words.
+        row.dataset.completed = String(task.completed);
+        head.setAttribute('aria-expanded', String(isOpen));
+        head.replaceChildren(glyph, stateWord, textNode);
+
+        // --- the detail area: everything the collapsed row leaves out ---------
+        detail.hidden = !isOpen;
+
+        if (!isOpen) {
+            // A closed detail carries nothing: the panel stays as light as it looks, and
+            // the `aria-controls` target still exists for assistive tech to inspect.
+            detail.replaceChildren();
+
+            return;
+        }
+
+        const parts: HTMLElement[] = [];
+
+        // The full text. The row shows a `RECORDS_TEXT_PREVIEW` preview, so the tail is
+        // the reason the reader pressed; a row whose text already fits has nothing to
+        // add, and repeating it would be the second line of the same sentence.
+        if (preview.truncated) parts.push(recordsElement('p', 'panel-tasks-detail-text', task.text));
+        else if (task.text.length === 0) parts.push(recordsElement('p', 'panel-tasks-detail-text', 'No text in the last read.'));
+
+        // The facts that used to sit in the row itself: who last changed it, which
+        // record it is, which revision, and when.
+        const meta: HTMLElement[] = [
             recordsActorBadgeOf(recordsActorOf(task), 'panel-tasks-actor'),
             recordsElement('span', 'panel-tasks-id', `#${task.id}`),
             recordsElement('span', 'panel-tasks-rev', `r${task.rev}`)
         ];
 
-        if (task.at !== undefined) parts.push(recordsStampOf(task.at, now(), 'panel-tasks-stamp'));
+        if (task.at !== undefined) meta.push(recordsStampOf(task.at, now(), 'panel-tasks-stamp'));
 
-        // Only the HEAD is rebuilt — that is where the data lives. The disclosure button
-        // is kept as the same node: replacing it on every frame would steal the reader's
-        // focus the instant they press it, and re-arm the click listener for nothing. The
-        // open history below is re-created (it carries rows the store may have appended).
-        const head = recordsElement('div', 'panel-tasks-row-head', undefined, parts);
-        const keptButton = row.querySelector('.panel-expand');
+        parts.push(recordsElement('div', 'panel-tasks-detail-meta', undefined, meta));
 
-        row.replaceChildren(head, ...(keptButton === null ? [] : [keptButton]));
-
-        // --- the one control: this record's locally accumulated history ------
+        // What happened to this record — the body the "Show N changes" button used to
+        // open, now part of opening the row. Read through `historyFor` (the client on
+        // screen), so a click-driven repaint and a frame-driven repaint draw the same
+        // history. A single event (its add) is not a history, and the row already says
+        // everything it knows.
         const events = historyFor(TASKS_COLLECTION, task.id);
 
-        if (events.items.length <= 1) {
-            // A single event (its add) is not a history, and the row already says
-            // everything it knows. No disclosure, no noise.
-            return;
+        if (events.items.length > 1) {
+            parts.push(
+                historyListOf(events.items, events.truncated, now(), {
+                    list: 'panel-tasks-history',
+                    truncated: 'panel-tasks-history-truncated'
+                })
+            );
         }
 
-        const isOpen = expanded.has(task.id);
-
-        expandButtonOf(row, () => toggleEvents(task.id), isOpen, events.items.length);
-
-        if (!isOpen) return;
-
-        row.append(
-            recordsElement(
-                'div',
-                'panel-tasks-disclosure',
-                undefined,
-                [
-                    historyListOf(events.items, events.truncated, now(), {
-                        list: 'panel-tasks-history',
-                        truncated: 'panel-tasks-history-truncated'
-                    })
-                ]
-            )
-        );
+        detail.replaceChildren(...parts);
     };
 
     // The toggle writes the panel's own set FIRST and then repaints, so a stream frame
-    // that re-renders this row in the same tick cannot resurrect a closed disclosure.
+    // that re-renders this row in the same tick cannot resurrect a closed detail.
     const toggleEvents = (id: string): void => {
         if (expanded.has(id)) expanded.delete(id);
         else expanded.add(id);
@@ -1203,6 +1290,15 @@ const compareIds = (left: string, right: string): number => (left < right ? -1 :
 // the value AFTER for the newest row of that record only. An intermediate value in a
 // mid-burst row is not knowable, and this panel says `—` rather than inventing one
 // (./records-client.ts `RecordsFieldChange`).
+//
+// THE PANEL SHIPS COLLAPSED. The card mounts with its body hidden and its engine
+// UNBUILT: no snapshot read, no wake registration, no clock work — a panel the reader
+// has not opened holds no plane slot and pays for no read. The toggle below is the
+// only thing that starts the engine; collapsing releases the wake and the client and
+// clears the surface, so a re-opening is a fresh boot. The open/closed choice belongs
+// to the reader: it survives a session change delivered to a mounted card, while the
+// runtime's own path for this session-scoped panel — a dispose and re-mount per
+// conversation — starts every conversation collapsed again.
 export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptions): void => {
     const mount = createPanelMount(ctx, options, (notice) => {
         // Every row a live apply added is an arrival: this panel IS the event log, so a
@@ -1238,6 +1334,9 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
     const footer = recordsElement('p', 'panel-records-footer');
 
     stateArea.hidden = true;
+    // COLLAPSED BY DEFAULT: the body starts hidden and stays that way until the
+    // reader opens the card (the toggle block below). Nothing is read while it is.
+    body.hidden = true;
     body.append(filters, chrome, scroller, pill, footer);
     scroller.append(stateArea, feed);
     ctx.element.append(mount.region, body);
@@ -1249,6 +1348,10 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
     const expanded = new Set<string>();
     const fresh = new Set<string>();
     let current: RecordsClient | undefined;
+    // The panel-level gate. `false` is the shipped default (collapsed): no engine,
+    // no reads, no registration on the plane. This is a different dimension from the
+    // row-level `expanded` set above, which says which records show their history.
+    let panelExpanded = false;
 
     const historyFor = (collection: string, id: string): { items: RecordsFeedRow[]; truncated: boolean } =>
         current?.historyOf(collection, id) ?? { items: [], truncated: false };
@@ -1583,6 +1686,11 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
     let skeletonArmed = false;
 
     paintNow = (): void => {
+        // Collapsed: there is no engine to read from and nothing on screen to paint
+        // into. This guard is what keeps a late notice and the clock tick inert
+        // while the card is closed.
+        if (!panelExpanded) return;
+
         const client = mount.engine();
 
         if (client !== undefined) paint(client);
@@ -1640,20 +1748,74 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         if (notice.rows.length > 1) mount.announcer.say(`${notice.rows.length} changes applied.`);
     };
 
+    // --- the collapse gate ---------------------------------------------------
+    // The card ships CLOSED (the body above starts `hidden`). While it is closed the
+    // conversation's record store costs the page nothing: no snapshot read, no delta,
+    // no registration on the plane — the engine is simply never built. Opening the
+    // card is what builds it; closing it again releases the wake and the client
+    // (`stopEngine`, the same order a session switch uses) and clears the surface, so
+    // a re-opening is a fresh boot rather than a resurrection of rows nothing is
+    // reading anymore. The control is the row disclosure's voice (`.panel-expand`):
+    // a real button whose `aria-expanded` is the one state claim.
+    const toggle = recordsElement('button', 'panel-expand') as HTMLButtonElement;
+
+    toggle.type = 'button';
+    toggle.dataset.panelToggle = 'records';
+    body.before(toggle);
+
+    const paintToggle = (): void => {
+        toggle.dataset.expanded = String(panelExpanded);
+        toggle.setAttribute('aria-expanded', String(panelExpanded));
+        toggle.textContent = panelExpanded ? 'Hide records' : 'Show records';
+    };
+
+    paintToggle();
+
+    const collapsePanel = (): void => {
+        panelExpanded = false;
+        paintToggle();
+        body.hidden = true;
+        mount.stopEngine();
+        expanded.clear();
+        fresh.clear();
+        current = undefined;
+        filter = null;
+        freshMarker.clearAll();
+        flip.reset();
+        clearSurface();
+    };
+
+    const expandPanel = (): void => {
+        panelExpanded = true;
+        paintToggle();
+        body.hidden = false;
+
+        // No conversation: the card opens onto the cleared surface and waits, exactly
+        // as a mount with no session draws.
+        if (ctx.sessionId !== null) {
+            mount.retarget(ctx.sessionId, paintNow);
+            paintNow();
+        }
+    };
+
+    toggle.addEventListener('click', () => {
+        if (ctx.disposed) return;
+
+        if (panelExpanded) collapsePanel();
+        else expandPanel();
+    });
+
     // --- the engine ----------------------------------------------------------
     const clock = globalThis.setInterval(() => {
-        if (ctx.disposed) return;
+        // A closed card has nothing to re-age and no engine to repaint; the tick must
+        // not be the thing that keeps a collapsed panel "working".
+        if (ctx.disposed || !panelExpanded) return;
 
         refreshRecordsStamps(ctx.element, now());
         paintNow();
     }, options?.tickMs ?? RECORDS_CLOCK_TICK_MS);
 
     ctx.onDispose(() => globalThis.clearInterval(clock));
-
-    if (ctx.sessionId !== null) {
-        mount.retarget(ctx.sessionId, paintNow);
-        paintNow();
-    }
 
     ctx.onSessionChange(() => {
         // A fresh conversation is a fresh store: the window, the filter and every open
@@ -1666,12 +1828,16 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         freshMarker.clearAll();
         flip.reset();
 
-        if (ctx.sessionId === null) {
+        if (ctx.sessionId === null || !panelExpanded) {
             clearSurface();
 
             return;
         }
 
+        // The reader had the card open: the open state is the reader's choice, so the
+        // conversation that arrived is read at once. The runtime's own path for this
+        // session-scoped panel is a dispose and re-mount — a fresh card starts
+        // collapsed again.
         mount.retarget(ctx.sessionId, paintNow);
     });
 };

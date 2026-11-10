@@ -16,6 +16,9 @@
 //     server-assigned id (R8 — the full detail is the click's answer, not a hover, and not
 //     the lazy STEP route the tool card used);
 //   - the answer carries the recorded text in full, which is the only place it appears;
+//   - T5: the chip that states the call's outcome carries the state as a colour and a glyph,
+//     while its CLAIM stays the same words, and a record that says nothing about inclusion
+//     grows no switch (the fallback a saved session needs);
 //   - a second click is served from the detail cache and a different segment costs its own
 //     request, because the cache is keyed per block (R7 — hundreds of segments stay cheap).
 //
@@ -237,14 +240,32 @@ it('costs no detail request to paint, and exactly one to open a segment', async 
     expect(document.querySelector<HTMLElement>('[data-pane="args"]')?.textContent).toContain(ARGS);
     expect(document.querySelector<HTMLElement>('[data-pane="result"]')?.textContent).toContain(RESULT);
     // The metadata line states the figures the strip was built from, plus the answer's size.
+    // A chip's CLAIM is its own element (./ui/context-detail.ts `createFact`): the state glyph
+    // that paints beside it is an `aria-hidden` sibling, so the words a reader — or this test —
+    // checks are still exactly the words the strip was built from, through the real transport.
     const fact = (name: string): string | undefined =>
-        document.querySelector<HTMLElement>(`.block-detail-fact[data-fact='${name}']`)?.textContent;
+        document.querySelector<HTMLElement>(`.block-detail-fact[data-fact='${name}'] .block-detail-fact-text`)?.textContent;
+    const factChip = (name: string): HTMLElement | null =>
+        document.querySelector<HTMLElement>(`.block-detail-fact[data-fact='${name}']`);
 
     expect(fact('kind')).toBe('tool · ok');
     expect(fact('chars')).toBe(`${ARGS.length + RESULT.length} characters recorded`);
     expect(fact('split')).toBe(`args ${ARGS.length} + result ${RESULT.length}`);
     expect(fact('answer')).toBe(`answer ${ARGS.length + RESULT.length} characters`);
     expect(fact('time')).toBe('time taken 1.0s');
+
+    // T5/R5: the settled call's outcome also arrives as a colour and a glyph, through this same
+    // wired path — the compiled state carried `state: 'ok'`, and the chip that states it is the
+    // one chip that carries the tone.
+    expect(factChip('kind')?.dataset.tone).toBe('ok');
+    expect(factChip('kind')?.querySelector('.block-detail-fact-glyph')?.textContent).toBe('✓');
+    expect(factChip('kind')?.querySelector('.block-detail-fact-glyph')?.getAttribute('aria-hidden')).toBe('true');
+    expect(factChip('chars')?.dataset.tone).toBeUndefined();
+    // T5/R7: nothing on this record says the call is out of the prompt, so the inclusion chip is
+    // the plain fact it always was — the fallback a saved session needs, rather than a button
+    // that would switch nothing (./ui/context-detail.ts `blockInclusionIsSwitchable`).
+    expect(factChip('prompt')?.tagName).toBe('SPAN');
+    expect(fact('prompt')).toBe('in the prompt');
 
     // A second click is the cache, not the network.
     callSegment.click();

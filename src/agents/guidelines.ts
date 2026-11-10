@@ -22,19 +22,28 @@
 //     (src/tools/webfetch/index.ts + the `webfetch: true` every live factory passes),
 //     and `download` is searchable. Its absence is therefore a real answer that must
 //     produce an honest statement, not invented sources.
-//   - DELEGATION — `delegate` is declared to a PRIMARY only when the harness has
-//     subagents, and delegation is one level deep (src/harness.ts
-//     `primaryOnlyDefinitions`). One sentence therefore has to be correct for a primary,
-//     a subagent, and a lone agent, which is the wording
-//     ../server/harnesses/presets.test.ts pins. The valid target ids need no prose: they
-//     are the `agent` enum of the declaration itself.
+//   - DELEGATION — the declaration already states the GATE ("only the primary agent can
+//     delegate, subagents cannot delegate further, registered only when the harness has
+//     subagents" — src/tools/runtime/delegate.tool.ts, and src/harness.ts
+//     `primaryOnlyDefinitions` + the `subagents` activation), and the valid target ids are
+//     the `agent` enum of the declaration itself. So this line carries only what the
+//     schema cannot say: self-contained briefs, caller-owned verification, and follow-up
+//     delegations continuing the same child conversation. It is still one sentence that
+//     has to read correctly for a primary, a subagent, and a lone agent, and
+//     ../server/harnesses/presets.test.ts pins that wording.
 //   - PERMISSIONS / TOOL_CREATE — facts no schema states: nothing is sandboxed, and a
 //     missing capability can be authored.
+//   - READ_ONLY — `AgentConfiguration` has no tool list, so no profile can DENY
+//     write/edit (src/types/index.ts); "change nothing" is a policy the agent follows, and
+//     it must say how a change stays honest when a brief does authorise one.
 //
 // A profile composes these with `agentInstruction()` (./index.ts) into its ONE system
-// prompt, so one edit reaches all five real roles and the wording cannot drift. Every
-// tool named below must match the visibility in src/core/tool-manifest.ts: a line that
-// claims a tool is (or is not) declared is only trustworthy while the manifest says so.
+// prompt, so one edit reaches every role that uses the line and the wording cannot drift.
+// Not every role composes every line — ./general.ts has no delegation line because that
+// harness configures no subagents at all, and ./research.ts + ./reviewer.ts carry
+// READ_ONLY while the build roles do not — and every tool named below must match the
+// visibility in src/core/tool-manifest.ts: a line that claims a tool is (or is not)
+// declared is only trustworthy while the manifest says so.
 //
 // Cross-references:
 //   - ./types.ts        — AgentProfile (instruction + guidelines)
@@ -59,13 +68,44 @@ export const DISCOVERY_GUIDELINE =
 export const WEB_SEARCH_GUIDELINE =
     'search is declared only when the host configured a web-search key; when it is not declared, say so instead of inventing sources. fetch is declared without a key, and download is searchable under "web" or "url".';
 
-// One wording for all five real roles: correct for a primary, a subagent, and a lone agent.
+// One wording for every role that MAY delegate. The gate itself is already declared:
+// `delegate`'s own description states "Only the primary agent can delegate, subagents
+// cannot delegate further, and a harness registers this tool only when it has subagents"
+// (src/tools/runtime/delegate.tool.ts), and its `agent` enum IS the session allowlist
+// (src/harness.ts:2962-2976). What no schema can say is the three policies below, so this
+// line now carries ONLY those:
+//   1. a brief must be SELF-CONTAINED, because the child starts with no knowledge of the
+//      parent conversation (src/core/thread.ts — the agent thread accumulates per target);
+//   2. the caller OWNS the verification — a child's "done" is a claim (see
+//      ./planner.ts, which turns this into a per-step review);
+//   3. a FOLLOW-UP delegation continues the same child conversation, so a vague first
+//      brief is not fatal — asking again is cheaper than guessing.
+// It reads correctly for a primary (it has the tool), a subagent (it never does), and a
+// lone agent (`subagents: []` means the row is not even registered, src/harness.ts:1101-1103).
 export const DELEGATION_GUIDELINE =
-    'If you are the primary agent and this harness configures subagents, delegate is declared to you: give ONE target a self-contained brief (a subagent never sees this conversation) and verify its answer. A subagent never receives delegate and cannot delegate further; otherwise do the work yourself. Talk to a subagent instead of guessing: a follow-up delegation continues its conversation.';
+    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation, verify its answer before relying on it, and follow up with the same target instead of guessing: a later delegation continues that subagent\'s conversation.';
 
 // No sandbox: side effects land on the machine running the harness.
 export const PERMISSIONS_GUIDELINE =
     'File and command tools run unsandboxed with the server process permissions, so inspect before you change anything.';
+
+// READ-ONLY POLICY — shared by the two roles whose OUTPUT is a report, not a diff
+// (explore ./research.ts and reviewer ./reviewer.ts).
+//
+// WHY THIS IS PROSE AND NOT A DENIAL: `AgentConfiguration` carries no tool list
+// (src/types/index.ts) — no profile can refuse `write`/`edit`, and every live harness
+// registers the identical toolbox (src/server/harnesses/toolbox.ts
+// `createToolboxHarness`). The per-run `scope.tools` allowlist belongs to the CALLER of
+// `delegate` (src/tools/runtime/delegate.tool.ts), not to the profile. So "do not change
+// anything" can only be a policy line the agent follows, and one line has to cover both
+// the primary case (it chooses not to write) and the subagent case (a caller may still
+// hand it a scoped toolbox).
+//
+// The authorisation clause is what keeps the line honest: a brief that DOES ask for a
+// fix must produce the fix, not a refusal, so the ban lifts and the change must then be
+// reported.
+export const READ_ONLY_GUIDELINE =
+    'You are read-only unless the brief authorises a change: create nothing, edit nothing, delete nothing, run no command that changes state. When a change IS authorised, keep it minimal and say what you changed.';
 
 // The self-extending escape hatch, one line rather than a tool manual. `toolCreate`
 // is itself searchable (src/core/tool-manifest.ts), so the line states the order:

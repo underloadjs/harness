@@ -153,6 +153,8 @@ import type {
     ModelDiscoveryRequest,
     ModelIndex,
     PendingActionListResponse,
+    // T7: the segment inclusion write's body (the one field a context segment has).
+    PatchTurnBlockRequest,
     PluginDetailResponse,
     PluginSetting,
     PluginSettingsUpdate,
@@ -184,6 +186,8 @@ import type {
     TranscriptMetadataResponse,
     TranscriptWriteReceipt,
     TurnBlockDetailResponse,
+    // T7: the receipt the segment inclusion write answers with.
+    TurnBlockWriteReceipt,
     TurnDisplayResponse,
     TurnEventPage,
     TurnResponse,
@@ -197,7 +201,7 @@ import type {
     UsageByThread
 } from '../shared/harness-api';
 import type { StreamResourceKind, WsUpdateKind } from '../shared/harness-stream';
-import type { HarnessAttachment } from '../harness';
+import type { HarnessAttachment, HarnessMessage } from '../harness';
 // T5 (R2/R3): the plugin catalogue types (domain models, re-exported by the library root) and
 // the status-carrying error the settings store throws at the write edge.
 import type { HarnessPluginMetadata, HarnessPluginSettingDescriptor } from '../harness';
@@ -238,7 +242,7 @@ import { HarnessPluginSettingsError } from './plugins';
 // its plugin sibling below. Every listed tool — core tools included — is switchable, so the
 // store never refuses a name for being harness-owned.
 import { HarnessToolSettingsError } from './tool-settings';
-import type { HarnessIndex, SessionStreamItem, SessionViewStreamItem } from './protocol';
+import type { HarnessIndex, SessionStreamItem, SessionTurn, SessionViewStreamItem } from './protocol';
 import { HttpError, capabilityDenied } from './api-errors';
 import { HARNESS_RUNTIME_EPOCH, createHarnessEventHub, resourceKeyOf } from './api-events';
 import type { HarnessEventHub } from './api-events';
@@ -741,6 +745,120 @@ export const bodyLimitFor = (method: string, pathname: string, mount: string): n
     }
 
     return MAX_BODY_BYTES;
+};
+
+// ---------------------------------------------------------------------------
+// CONTEXT INCLUSION (T7): one context-bar segment -> the transcript entry it came from
+// ---------------------------------------------------------------------------
+//
+// WHY THIS JOIN LIVES HERE. `included` is a fact about a CONVERSATION: it sits on a
+// `HarnessMessage` in a thread's transcript (src/types/index.ts:173-270), and
+// `projectTranscript` drops the whole flagged tool unit when a request is built
+// (src/harness.ts:6421-6460). A context-bar SEGMENT is a fact about a TURN: the projector
+// compiled it out of that turn's recorded events (src/server/turn-projector.ts:2160 and
+// :2322) and never sees a transcript. Neither record names the other, so the block detail
+// route — the one read holding BOTH — does the mapping, at read time. Read time matters:
+// the projector's compiled display is a CACHE, and a flag moved by a plugin's
+// `turn.before setIncluded` (src/harness.ts:8528) or by another browser tab moves no
+// event, so a cached bar would keep answering with yesterday's inclusion forever.
+//
+// THE ONE RULE. A segment is addressable exactly when the event that OPENS it names a
+// tool-call id that a live transcript still carries. That single rule states every case
+// without a per-kind table:
+//   - a `tool` segment opens on its `tool_call` (or, for a result-only record, its
+//     `tool_result`), and the call id is exactly what pairs the assistant entry with its
+//     results, so the exclusion unit resolves;
+//   - a `reasoning` or answer window streams several assistant entries and its opening
+//     delta carries prose, not an id — switching "this thinking block" off would mean
+//     guessing which entries the reader meant, so the server states NOTHING and the client
+//     keeps its per-kind `inPrompt` verdict (src/frontend/display-project.ts);
+//   - a `system` block joins N instruction entries into ONE segment, and a `user` prompt
+//     block has no opening event at all ("from the turn record"), for the same reason.
+//
+// The unit is built by the rule `transcriptUnits` already states (src/harness.ts:625-665):
+// the assistant entry owning the call, plus EVERY `tool` entry answering one of that
+// entry's calls. Exclusion is per unit because provider tool-call pairing breaks if one
+// half travels without the other — the same reason the core resolver cascades.
+
+/** The tool-call id recorded on the event that OPENS one segment, or undefined when the
+ *  record cannot name one. */
+export const blockCallIdOf = (
+    events: readonly unknown[],
+    block: { kind?: string; eventFrom?: number }
+): string | undefined => {
+    if (block.kind !== 'tool' || block.eventFrom === undefined) return undefined;
+
+    // ONLY the opening event, never the whole `eventFrom..eventTo` range: a settled tool
+    // block's range runs over its `tool_result`, and a parallel call recorded in between
+    // would otherwise lend this segment somebody else's id. The projector mints the segment
+    // FROM this index, so the event here IS the opening one, and both spellings of the id
+    // are evidence — `call.id` on a `tool_call` (src/server/turn-projector.ts:2113),
+    // `callId` on a `tool_result` (src/types/index.ts:2525-2532).
+    const event = events[block.eventFrom] as { call?: { id?: unknown }; callId?: unknown } | undefined;
+
+    if (typeof event?.call?.id === 'string' && event.call.id.length > 0) return event.call.id;
+    if (typeof event?.callId === 'string' && event.callId.length > 0) return event.callId;
+
+    return undefined;
+};
+
+/**
+ * The transcript UNIT one call id belongs to, or undefined when this transcript has no
+ * entry for it. `transcriptUnits` (src/harness.ts:625-665) for a single address: call ids
+ * are conversation-unique (`assertToolCallIds`), so the first owning assistant entry IS
+ * the only one, and an orphan result — its owner is gone, e.g. a host edit — keeps its own
+ * single-entry unit exactly as the core resolver leaves it.
+ */
+export const transcriptUnitOfCall = (
+    messages: readonly HarnessMessage[],
+    callId: string
+): readonly HarnessMessage[] | undefined => {
+    // A type PREDICATE, not a cast: the assistant member is the only one of the
+    // `HarnessMessage` union carrying `toolCalls`, and the predicate is what keeps the
+    // compiler inside that member instead of widening `owner` back to the union.
+    const owner = messages.find(
+        (message): message is Extract<HarnessMessage, { role: 'assistant' }> =>
+            message.role === 'assistant' && (message.toolCalls ?? []).some((call) => call.id === callId)
+    );
+
+    if (owner === undefined) {
+        const orphan = messages.find((message) => message.role === 'tool' && message.toolCallId === callId);
+
+        return orphan === undefined ? undefined : [orphan];
+    }
+
+    const callIds = new Set((owner.toolCalls ?? []).map((call) => call.id));
+
+    return [
+        owner,
+        ...messages.filter((message) => message.role === 'tool' && callIds.has(message.toolCallId))
+    ];
+};
+
+/** A structural COPY of `messages` with one unit's flag written; the input is never
+ *  mutated, so the caller's live transcript stays untouched until the store installs it. */
+export const messagesWithUnitInclusion = (
+    messages: readonly HarnessMessage[],
+    unit: readonly HarnessMessage[],
+    included: boolean
+): HarnessMessage[] => {
+    const members = new Set(unit);
+
+    return messages.map((message) => {
+        const copy = { ...message } as HarnessMessage & { included?: boolean };
+
+        if (!members.has(message)) return copy;
+
+        // Core's storage rule, mirrored from `writeIncluded` (src/harness.ts:8366-8378) and
+        // `withIncluded` (src/core/agent.ts:194): a literal `false` is the ONLY stored value,
+        // and switching a unit back on REMOVES the key. Writing `included: true` would put a
+        // value on the wire that the snapshot reader drops, and a document diff would show a
+        // change that never happened.
+        if (included) delete copy.included;
+        else copy.included = false;
+
+        return copy;
+    });
 };
 
 // ---------------------------------------------------------------------------
@@ -1343,6 +1461,55 @@ export const createHarnessApi = ({
 
     /** Every label the store has for a conversation (the one user-facing name, `#RR3`). */
     const labelOf = (record: SessionRecord, threadId: string): string | undefined => record.threadLabels.get(threadId);
+
+    /**
+     * T7: the conversation and the transcript unit ONE context segment's text is built from
+     * (`blockCallIdOf` + `transcriptUnitOfCall` above), or undefined when no live entry
+     * answers the recorded call id.
+     *
+     * Search order is a claim, not a hunt: the conversation the TURN belongs to first — that
+     * is where a delegated section's call lives, and `SessionTurn.threadId` is the store's
+     * own join (./protocol.ts:137) — then every other conversation this session owns. The
+     * fallback exists for one shape only: a record whose turn row carries no thread join
+     * (a legacy document). A candidate is accepted only when its transcript really holds the
+     * id, so a fallback can never switch an identically-named call in the wrong conversation.
+     */
+    const blockUnitOf = (
+        record: SessionRecord,
+        turn: SessionTurn,
+        block: { kind?: string; eventFrom?: number }
+    ): { threadId: string; callId: string; messages: HarnessMessage[]; unit: readonly HarnessMessage[] } | undefined => {
+        const callId = blockCallIdOf(turn.events, block);
+
+        if (callId === undefined) return undefined;
+
+        const candidates = [
+            ...(turn.threadId === undefined ? [] : [turn.threadId]),
+            ...record.harness.threads()
+                .map((thread) => thread.id)
+                .filter((id) => id !== turn.threadId)
+        ];
+
+        for (const threadId of candidates) {
+            // An unreadable transcript has no live entries to address (`transcriptMessagesOf`
+            // answers []), so it is passed over rather than reported as "this call is not in
+            // the transcript" — the reader's problem there is the broken document, and the
+            // transcript routes say so.
+            if (record.invalidThreads.has(threadId)) continue;
+
+            const messages = transcriptMessagesOf(record, threadId);
+            const unit = transcriptUnitOfCall(messages, callId);
+
+            if (unit !== undefined) return { threadId, callId, messages, unit };
+        }
+
+        return undefined;
+    };
+
+    /** The unit's effective inclusion, spelled the way the plugin API spells
+     *  `HarnessContextEntry.included` (src/harness.ts:8350): every member on, or it is off. */
+    const unitIncludedOf = (unit: readonly HarnessMessage[]): boolean =>
+        unit.every((message) => message.included !== false);
 
     // ---- root / health / config -------------------------------------------------
 
@@ -4231,8 +4398,7 @@ export const createHarnessApi = ({
 
     const getSessionTurnBlock: Handler = (ctx) => {
         const record = requireSession(ctx.params.session_id);
-
-        requireTurn(record, ctx.params.turn_id);
+        const turn = requireTurn(record, ctx.params.turn_id);
 
         // Same projection delta as the display read: the store answers the internal union
         // member, the wire record is the closed superset. The bytes are identical.
@@ -4242,9 +4408,113 @@ export const createHarnessApi = ({
             ctx.params.block_id
         ) as unknown as TurnBlockDetailResponse['block'];
 
-        const response: TurnBlockDetailResponse = { block };
+        // T7: the reader-facing inclusion state, published here and nowhere else. The
+        // projector cannot carry it — the flag is a fact about the CONVERSATION's transcript
+        // while the compiled bar is a fold of one TURN's events — so it is joined at read
+        // time, which is also what makes a plugin's `setIncluded` (or another tab's toggle)
+        // visible on the next click instead of hiding behind a stale compiled cache. ABSENT
+        // when the segment resolves to no single entry: the client then keeps its per-kind
+        // `inPrompt` verdict and shows no control (../shared/turn-display.ts `included`).
+        const target = blockUnitOf(record, turn, block);
+
+        const response: TurnBlockDetailResponse = {
+            block: target === undefined ? block : { ...block, included: unitIncludedOf(target.unit) }
+        };
 
         return json(200, response, events.getRevision('turn', turnKey(record.id, ctx.params.turn_id)));
+    };
+
+    // T7 (R6/R7): the ONE write the segment dialog makes — switch this segment's transcript
+    // unit into, or out of, the requests that follow.
+    //
+    // WHY ITS OWN ROUTE AND NOT THE WHOLE-DOCUMENT PUT. `PUT .../transcript` replaces every
+    // entry from a document the CLIENT read earlier, so a toggle would be a cross-modal
+    // read-modify-write: a run committing a result, or a plugin's own `setIncluded`, landing
+    // in between would be silently rewritten by the client's stale copy (a tool result
+    // committed mid-dialog is exactly that). This route names the ENTRY, reads the transcript
+    // itself at the moment of the write, and moves ONE flag on ONE unit, so there is no
+    // window to lose anything in. The shipped semantics still apply end to end: the flag is
+    // installed through `updateThreadTranscript` — the same validation, the same running
+    // refusal, the same durable-before-response rule, the same `transcript.updated` signal —
+    // and written exactly the way core's `writeIncluded` writes it (src/harness.ts:8366).
+    const patchSessionTurnBlock: Handler = async (ctx) => {
+        const record = requireSession(ctx.params.session_id);
+        const turn = requireTurn(record, ctx.params.turn_id);
+        const body = requireObjectBody<PatchTurnBlockRequest>(await ctx.body());
+
+        requireKnownFields(body, ['included']);
+
+        // Strictly a boolean, which is the check `setIncluded` itself makes of its `included`
+        // argument (src/harness.ts:8542): `'false'` and `0` are typos on this surface, not
+        // values to coerce.
+        if (typeof body.included !== 'boolean') {
+            throw new HttpError(400, 'A context segment inclusion write requires a boolean "included" value.');
+        }
+
+        // The same resolver the read uses, so an unknown segment is 404 and a blank id is 400
+        // HERE exactly as they are there, and the metadata the unit rule reads (kind,
+        // `eventFrom`) comes from the record rather than from the client.
+        const block = store.blockDetail(record.id, ctx.params.turn_id, ctx.params.block_id);
+        const target = blockUnitOf(record, turn, block);
+
+        if (target === undefined) {
+            // The segment exists and its bytes are readable; only its inclusion is not
+            // addressable — no recorded call id, no live entry carrying it, or an unreadable
+            // transcript. 409, because the reader is looking at a real segment whose one
+            // writable field cannot be written to it, and 404 would claim the segment is gone.
+            throw new HttpError(
+                409,
+                `Context segment "${block.id}" has no transcript entry to switch: the call it recorded is not in this conversation's transcript.`
+            );
+        }
+
+        const patched = messagesWithUnitInclusion(target.messages, target.unit, body.included);
+
+        // THE WRITE. Async because it is durable before the response (./sessions.ts
+        // `updateThreadTranscript`); a RUNNING conversation refuses from inside it with 409,
+        // which is the honest answer — the run owns the transcript it is appending to, and a
+        // mid-run flag change would be rewritten by the run itself.
+        await store.updateThreadTranscript(record.id, target.threadId, patched);
+
+        // Read the state BACK instead of echoing the request: the receipt is then the unit's
+        // PERSISTED verdict, so the dialog paints what the server holds (R6: no optimistic
+        // state), even if the unit moved between the click and the write.
+        const live = store.liveSession(record.id);
+        const after = transcriptUnitOfCall(transcriptMessagesOf(live, target.threadId), target.callId);
+        const included = unitIncludedOf(after ?? target.unit);
+        const key = threadKey(record.id, target.threadId);
+        const revision = events.getRevision('transcript', key);
+
+        // T16 counter domains, same as the transcript PUT: the store's own `transcript.updated`
+        // signal already moved `transcript` and `transcript_messages`, so the receipt quotes
+        // that figure; the conversation row is the REST-owned counter for a content change,
+        // and which entries the model reads IS content.
+        events.bumpRevision('thread', key);
+
+        const messages = transcriptMessagesOf(live, target.threadId);
+        const unreadable = live.invalidThreads.has(target.threadId);
+
+        publish('transcript.updated', [{ resource: 'transcript', id: key }], {
+            thread_id: target.threadId,
+            revision,
+            message_count: messages.length,
+            transcript_state: unreadable ? 'unreadable' : 'ok'
+        });
+
+        const receipt: TurnBlockWriteReceipt = {
+            session_id: record.id,
+            turn_id: turn.id,
+            block_id: block.id,
+            included,
+            thread_id: target.threadId,
+            revision,
+            links: {
+                block: `${ctx.mount}/sessions/${record.id}/turns/${turn.id}/blocks/${encodeURIComponent(block.id)}`,
+                transcript: `${ctx.mount}/sessions/${record.id}/threads/${target.threadId}/transcript`
+            }
+        };
+
+        return json(200, receipt, revision);
     };
 
     const getSessionTurnAttachment: Handler = (ctx) => {
@@ -4344,7 +4614,7 @@ export const createHarnessApi = ({
         sessionsBySessionIdTurnsByTurnIdDisplay: { GET: getSessionTurnDisplay },
         sessionsBySessionIdTurnsByTurnIdEvents: { GET: getSessionTurnEvents },
         sessionsBySessionIdTurnsByTurnIdStepsByStepId: { GET: getSessionTurnStep },
-        sessionsBySessionIdTurnsByTurnIdBlocksByBlockId: { GET: getSessionTurnBlock },
+        sessionsBySessionIdTurnsByTurnIdBlocksByBlockId: { GET: getSessionTurnBlock, PATCH: patchSessionTurnBlock },
         sessionsBySessionIdTurnsByTurnIdAttachmentsByAttachmentId: { GET: getSessionTurnAttachment },
         stream: { GET: streamRoute }
     };

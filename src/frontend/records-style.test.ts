@@ -8,6 +8,12 @@
  *   - drop a `data-phase` rule, leaving one of the five states visually identical to
  *     another (R1);
  *   - make `line-through` the only mark of a completed task (R3);
+ *   - turn the task row back into a list of words: the collapsed row is a tick-or-cross
+ *     mark and its text, the state's colour comes from the same `data-completed` the
+ *     glyph shape comes from, and the only word left is the clipped one that carries
+ *     the button's accessible name;
+ *   - hide the row's detail area (or the state word) with `display: none` in a way that
+ *     costs the disclosure or the accessible name;
  *   - leave an animation running under `prefers-reduced-motion` (R3);
  *   - style a class the panels no longer paint, or paint a class nobody styles, which is
  *     how a skeleton quietly becomes invisible;
@@ -368,13 +374,76 @@ describe('the accessibility furniture', () => {
     it('never makes a strike the only mark of a completed task', () => {
         expect(section).not.toContain('line-through');
 
-        // The row dims its text and colours its state word; the glyph is a WORD, and the
-        // row itself carries `data-completed` for the tests and the CSS alike.
+        // The row dims its text; the glyph is a MARK (a tick or a cross) and the state
+        // word is clipped rather than shown. The row itself carries `data-completed` for
+        // the tests and the CSS alike, and the group heading says the same thing in
+        // words, so nothing here leans on colour alone.
         const completed = blockOf("[data-completed='true'] .panel-tasks-row-text {");
         expect(completed).toContain('color: var(--muted)');
         expect(completed).toContain('opacity: 0.82');
 
         expect(blockOf('.panel-tasks-glyph[data-completed')).toContain('color: var(--ok)');
+    });
+
+    it('draws the row state from one attribute, in a shape and in a colour', () => {
+        // Both facts about a row's state come from the SAME `data-completed` the TS sets
+        // (./records-panels.ts `renderRow`), so the mark, the edge and the wash cannot
+        // drift apart from the row they describe.
+        const done = blockOf(".panel-tasks-row[data-completed='true'] {");
+
+        expect(done).toContain('border-left-color: var(--ok-line)');
+        expect(done).toContain('background: var(--ok-wash)');
+
+        const open = blockOf(".panel-tasks-row[data-completed='false'] {");
+
+        expect(open).toContain('border-left-color: var(--warn)');
+        expect(open).toContain('color-mix(in srgb, var(--warn) 10%, transparent)');
+        // An open task is unfinished, not wrong: the row never borrows the danger red.
+        expect(open).not.toContain('--danger');
+        expect(blockOf('.panel-tasks-glyph {')).toContain('color: var(--warn)');
+        expect(blockOf('.panel-tasks-glyph {')).not.toContain('--danger');
+
+        // The fresh marker is the one exception, and it is an ORDER fact: the accent
+        // edge rule is written after the two status rules, at equal specificity.
+        const status = section.indexOf(".panel-tasks-row[data-completed='true'] {");
+        const fresh = section.indexOf("[data-fresh='true'],");
+
+        expect(status).toBeLessThan(fresh);
+    });
+
+    it('makes the whole collapsed row the control, and hides its detail with `hidden`', () => {
+        // The row is a real `<button>`, so the browser supplies Enter, Space and the
+        // focus ring; the reset is what stops it drawing its own chrome and centreing a
+        // sentence. `.panel-tasks-detail[hidden]` has to win over the flex rule below it,
+        // for the same reason `.panel-new-pill[hidden]` does.
+        const head = blockOf('.panel-tasks-row-head {');
+
+        expect(head).toContain('cursor: pointer');
+        expect(head).toContain('text-align: left');
+        expect(head).toContain('background: none');
+        expect(head).toContain('border: 0');
+        expect(head).toContain('width: 100%');
+        expect(blockOf('.panel-tasks-row-head:focus-visible')).toContain('outline: 1px solid var(--accent)');
+
+        const detail = blockOf('.panel-tasks-detail {');
+
+        expect(detail).toContain('display: flex');
+        expect(detail).toContain('flex-direction: column');
+        expect(blockOf('.panel-tasks-detail[hidden]')).toContain('display: none');
+        expect(blockOf('.panel-tasks-detail-text')).toContain('overflow-wrap: anywhere');
+        expect(blockOf('.panel-tasks-detail-meta')).toContain('flex-wrap: wrap');
+    });
+
+    it('keeps the state word in the accessible name, clipped rather than hidden', () => {
+        // `display: none` would take "completed"/"open" out of the button's accessible
+        // name, and a tick is not a word: the row would then say its state in shape and
+        // colour only. Same clip recipe as `.panel-live`.
+        const state = blockOf('.panel-tasks-row-state {');
+
+        expect(state).toContain('clip-path: inset(50%)');
+        expect(state).toContain('overflow: hidden');
+        expect(state).not.toContain('display: none');
+        expect(state).not.toContain('visibility: hidden');
     });
 
     it('draws the progress bar from the same figure the accessibility tree reads', () => {
@@ -394,6 +463,17 @@ describe('the accessibility furniture', () => {
         expect(forced).toContain(".panel-tasks-row[data-fresh='true']");
         expect(forced).toContain(".panel-records-row[data-fresh='true']");
         expect(forced).toContain(".panel-records-chip[data-active='true']");
+
+        // Both task states are listed by name, so losing the wash still leaves an edge
+        // per state — and the glyph's shape and the clipped word say it regardless.
+        expect(forced).toContain(".panel-tasks-row[data-completed='true']");
+        expect(forced).toContain(".panel-tasks-row[data-completed='false']");
+
+        // The status edges are written BEFORE the fresh rule, again so "just landed"
+        // outranks "which group" for its ~1.5s in this mode too.
+        expect(forced.indexOf(".panel-tasks-row[data-completed='true']")).toBeLessThan(
+            forced.indexOf(".panel-tasks-row[data-fresh='true']")
+        );
     });
 
     it('labels the feed filter group so the chips are not a mystery row', () => {

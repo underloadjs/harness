@@ -3,12 +3,14 @@
  *
  * Mounts `harness.tasks` and `harness.records` against a panel host whose REST reads and
  * realtime plane are doubles, and pins what the reader and an assistive technology
- * actually get: the five states on `data-phase`, the exact row and feed markup, the
+ * actually get: the five states on `data-phase`, the exact row and feed markup (a task
+ * row is a tick-or-cross mark, its text, and a button that opens the rest), the
  * shared ONE session registration, live add/complete/reopen/remove arriving over the
  * wake, the "just landed" and FLIP bookkeeping, the frozen reading position with its
- * "N new" pill, the collection chips and their footer honesty, the per-record history
- * disclosure, the batched announcements, and a teardown that leaves no registration, no
- * timer and no paint behind.
+ * "N new" pill, the collection chips and their footer honesty, the row-opened detail
+ * (full text, meta line and per-record history), the batched announcements, the records panel's collapse gate (closed by
+ * default, no read and no registration while closed), and a teardown that leaves no
+ * registration, no timer and no paint behind.
  *
  * Run: npx vitest run --config src/frontend/vitest.config.ts
  */
@@ -396,6 +398,19 @@ const tasksHost = (options: Omit<HostOptions, 'mount'> = {}): Host =>
 const recordsHost = (options: Omit<HostOptions, 'mount'> = {}): Host =>
     createHost({ mount: (ctx, opts) => mountRecordsPanel(ctx, opts), id: HARNESS_RECORDS_PANEL_ID, ...options });
 
+// The records panel ships COLLAPSED (./records-panels.ts): every test below that pins
+// feed behaviour opens the card first, the way a reader does. A plain `.click()` — the
+// same dispatch the chip tests use — is the whole gesture; `settle` drains the boot
+// the expansion starts.
+const expandRecords = async (host: Host): Promise<void> => {
+    const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="records"]');
+
+    if (toggle === null) throw new Error('the records panel has no collapse toggle');
+
+    toggle.click();
+    await host.settle();
+};
+
 // Fakes for the two pure derivations: a client is a bag of getters, so the RULES are
 // what these tests pin, not the store they normally read from.
 const fakeClient = (over: { phase?: string; stale?: boolean; error?: string; link?: string; lastSync?: number } = {}): RecordsClient => ({
@@ -485,7 +500,7 @@ describe('harness.tasks — the five states', () => {
         expect(host.query<HTMLElement>('.panel-tasks-sync')?.hidden).toBe(true);
     });
 
-    it('paints the progress bar, the two groups and a row with its exact chrome', async () => {
+    it('paints the progress bar, the two groups and a row that is a mark, a sentence and a control', async () => {
         const host = tasksHost();
         await host.settle();
 
@@ -516,45 +531,138 @@ describe('harness.tasks — the five states', () => {
         expect(row?.dataset.id).toBe('rec_b');
         expect(row?.dataset.rowKey).toBe('rec_b');
         expect(row?.dataset.completed).toBe('false');
-        expect(row?.querySelectorAll<HTMLElement>('.panel-tasks-row-head > *').length).toBe(7);
-        expect([...(row?.querySelectorAll<HTMLElement>('.panel-tasks-row-head > *') ?? [])].map((node) => node.className)).toEqual([
-            'panel-tasks-glyph',
-            'panel-tasks-row-text',
-            'panel-tasks-state',
-            'panel-tasks-actor',
-            'panel-tasks-id',
-            'panel-tasks-rev',
-            'panel-tasks-stamp'
+
+        // THE COLLAPSED ROW IS TWO NODES: the control, and the detail area it opens
+        // (empty while it is closed). The row itself carries no actor, no `#id`, no
+        // `r{rev}`, no stamp and no state WORD — those are what pressing it buys.
+        expect([...(row?.children ?? [])].map((node) => (node as HTMLElement).className)).toEqual([
+            'panel-tasks-row-head',
+            'panel-tasks-detail'
         ]);
-        // Completion is spelled three ways — the glyph, `data-completed` and the group —
-        // and the glyph is decorative, so the WORD carries it.
-        expect(host.query('.panel-tasks-glyph')?.textContent).toBe('[open]');
-        expect(host.query('.panel-tasks-glyph')?.getAttribute('aria-hidden')).toBe('true');
-        expect(host.text('.panel-tasks-state')).toBe('open');
-        expect(host.text('.panel-tasks-row-text')).toBe('Write the tests');
-        expect(host.text('.panel-tasks-id')).toBe('#rec_b');
-        expect(host.text('.panel-tasks-rev')).toBe('r0');
+
+        const head = row?.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+        const detail = row?.querySelector('div.panel-tasks-detail') as HTMLElement;
+
+        expect([...(head?.querySelectorAll<HTMLElement>(':scope > *') ?? [])].map((node) => node.className)).toEqual([
+            'panel-tasks-glyph',
+            'panel-tasks-row-state',
+            'panel-tasks-row-text'
+        ]);
+        // A real `<button>`: Enter and Space arrive as a click with no key handler of
+        // our own, and `aria-expanded` is the disclosure's own state.
+        expect(head?.tagName).toBe('BUTTON');
+        expect(head?.type).toBe('button');
+        expect(head?.getAttribute('aria-expanded')).toBe('false');
+        // `aria-controls` names THIS row's detail, and the id is unique in the document
+        // (./records-panels.ts `tasksDetailSequence`) even with two panels mounted.
+        expect(head?.getAttribute('aria-controls')).toBe(detail?.id);
+        expect(detail?.id.length).toBeGreaterThan(0);
+        expect(document.getElementById(detail?.id as string)).toBe(detail);
+        expect(detail?.hidden).toBe(true);
+        expect(detail?.children).toHaveLength(0);
+        // One control per row, and none of it looks like a checkbox it cannot press.
+        expect(row?.querySelectorAll('button')).toHaveLength(1);
+        expect(row?.querySelectorAll('input, [role="checkbox"]')).toHaveLength(0);
+
+        // The cross: open is "not done", not an error, and the glyph is decorative.
+        expect(head.querySelector('.panel-tasks-glyph')?.textContent).toBe('✕');
+        expect(head.querySelector('.panel-tasks-glyph')?.getAttribute('aria-hidden')).toBe('true');
+        expect(head.querySelector('.panel-tasks-glyph')?.dataset.completed).toBe('false');
+        // The WORD is gone from the row and still in the accessible name: clipped, in
+        // the button, so the state never rides on colour or shape alone.
+        expect(head.querySelector('.panel-tasks-row-state')?.textContent).toBe('open');
+        expect(head.querySelector('.panel-tasks-row-text')?.textContent).toBe('Write the tests');
+        expect(row?.textContent).not.toContain('[open]');
+        expect(row?.querySelector('.panel-tasks-state')).toBeNull();
+        expect(row?.querySelector('.panel-tasks-id')).toBeNull();
+        expect(row?.querySelector('.panel-tasks-actor')).toBeNull();
+        expect(row?.querySelector('time')).toBeNull();
+
+        // --- the detail a press buys -----------------------------------------
+        // `.click()` is the whole gesture; in a browser an Enter or Space keypress on
+        // the focused button performs this same activation.
+        head.click();
+
+        expect(head.getAttribute('aria-expanded')).toBe('true');
+        expect(detail.hidden).toBe(false);
+        // No word-glyph appeared with it either — the row's own text is still a mark
+        // and a sentence, and the meta below is the only thing that changed.
+        expect(detail.querySelector('.panel-tasks-id')?.textContent).toBe('#rec_b');
+        expect(detail.querySelector('.panel-tasks-rev')?.textContent).toBe('r0');
+        expect(detail.querySelector('.panel-tasks-detail-text')).toBeNull();
 
         // No attribution in the store means the neutral actor, never an invented name.
-        expect(host.query('.panel-tasks-actor')?.textContent).toBe('system');
-        expect(host.query('.panel-tasks-actor')?.dataset.actor).toBe('system');
+        const actor = detail.querySelector('.panel-tasks-actor') as HTMLElement;
 
-        const stamp = host.query('ol[data-group="pending"] time');
+        expect(actor.textContent).toBe('system');
+        expect(actor.dataset.actor).toBe('system');
 
-        expect(stamp?.tagName).toBe('TIME');
-        expect(stamp?.getAttribute('datetime')).toBe(AT);
-        expect(stamp?.title).toBe(AT);
-        expect(stamp?.textContent).toBe('5m');
+        const stamp = detail.querySelector('time') as HTMLElement;
+
+        expect(stamp.tagName).toBe('TIME');
+        expect(stamp.getAttribute('datetime')).toBe(AT);
+        expect(stamp.title).toBe(AT);
+        expect(stamp.textContent).toBe('5m');
+
+        head.click();
+
+        // Closing takes the content with it: the rail is exactly as tall as it was.
+        expect(head.getAttribute('aria-expanded')).toBe('false');
+        expect(detail.hidden).toBe(true);
+        expect(detail.children).toHaveLength(0);
+        expect(row.querySelector('.panel-tasks-id')).toBeNull();
 
         const doneRow = done?.querySelector<HTMLElement>('li.panel-tasks-row');
 
         expect(doneRow?.dataset.id).toBe('rec_a');
         expect(doneRow?.dataset.completed).toBe('true');
-        expect(doneRow?.querySelector('.panel-tasks-glyph')?.textContent).toBe('[done]');
-        expect(doneRow?.querySelector('.panel-tasks-state')?.textContent).toBe('completed');
+        expect(doneRow?.querySelector('.panel-tasks-glyph')?.textContent).toBe('✓');
+        expect(doneRow?.querySelector('.panel-tasks-row-state')?.textContent).toBe('completed');
+        expect(doneRow?.textContent).not.toContain('[done]');
+        expect(doneRow?.querySelector('div.panel-tasks-detail')?.hidden).toBe(true);
+
+        (doneRow?.querySelector('button.panel-tasks-row-head') as HTMLButtonElement).click();
+
         expect(doneRow?.querySelector('.panel-tasks-actor')?.textContent).toBe('agent');
         expect(doneRow?.querySelector('.panel-tasks-actor')?.dataset.actor).toBe('agent');
         expect(doneRow?.querySelector('.panel-tasks-rev')?.textContent).toBe('r1');
+
+        host.dispose();
+    });
+
+    it('opens a row for the whole text the collapsed preview had to cut short', async () => {
+        // 376 characters: a task is allowed 4000 (../shared/harness-api.ts), and the
+        // rail shows `RECORDS_TEXT_PREVIEW` of them. The tail is the reason the reader
+        // presses, so it is exactly what the detail area owes them.
+        const longText = 'Draft the migration notes for the record store. '.repeat(8);
+        const backend = createBackend({
+            ...SNAPSHOT,
+            collections: [
+                {
+                    ...(SNAPSHOT.collections[0] as (typeof SNAPSHOT.collections)[number]),
+                    count: 1,
+                    entries: [{ id: 'rec_e', rev: 0, text: longText, completed: false, updated_at: AT }]
+                },
+                SNAPSHOT.collections[1] as (typeof SNAPSHOT.collections)[number]
+            ]
+        });
+        const host = tasksHost({ backend });
+
+        await host.settle();
+
+        const row = taskRowOf(host, 'rec_e') as HTMLElement;
+        const preview = row.querySelector('.panel-tasks-row-text') as HTMLElement;
+
+        expect(preview.textContent).toBe(`${longText.slice(0, 220)}…`);
+        expect(preview.title).toBe(longText);
+
+        const head = row.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+
+        head.click();
+
+        // The full text, untruncated and un-titled, beside the meta line.
+        expect(row.querySelector('.panel-tasks-detail-text')?.textContent).toBe(longText);
+        expect(row.querySelector('.panel-tasks-detail-meta')?.textContent).toBe('system#rec_er05m');
 
         host.dispose();
     });
@@ -642,7 +750,8 @@ describe('harness.tasks — the five states', () => {
 describe('harness.records — the five states', () => {
     it('paints the feed newest-first with the values it can vouch for, and an em-dash for the rest', async () => {
         const host = recordsHost();
-        await host.settle();
+
+        await expandRecords(host);
 
         const feed = host.query<HTMLElement>('ol.panel-records-feed');
 
@@ -712,10 +821,10 @@ describe('harness.records — the five states', () => {
 
     it('shimmers only a feed that is actually slow to read, and says so in the footer', async () => {
         const backend = createBackend();
+        const host = recordsHost({ backend });
 
         backend.holdSnapshots(true);
-        const host = recordsHost({ backend });
-        await host.settle();
+        await expandRecords(host);
 
         expect(host.phase()).toBe('loading');
         expect(host.query('ol.panel-records-feed')?.hasAttribute('hidden')).toBe(true);
@@ -738,7 +847,8 @@ describe('harness.records — the five states', () => {
 
     it('states an empty store, and states a failed read with a retry', async () => {
         const empty = recordsHost({ backend: createBackend(EMPTY_SNAPSHOT) });
-        await empty.settle();
+
+        await expandRecords(empty);
 
         expect(empty.phase()).toBe('empty');
         expect(empty.text('.panel-records-empty')).toBe('No record changes yet. The store fills as agents write — a task created, a chapter saved.');
@@ -749,7 +859,8 @@ describe('harness.records — the five states', () => {
 
         backend.failSnapshots(1);
         const failed = recordsHost({ backend });
-        await failed.settle();
+
+        await expandRecords(failed);
 
         expect(failed.phase()).toBe('error');
         expect(failed.text('.panel-records-error')).toBe('The record store could not be read: the record store is not readable right now.Retry');
@@ -767,10 +878,127 @@ describe('harness.records — the five states', () => {
                 readRecordsDelta: () => Promise.resolve(deltaOf([]))
             }
         });
-        await host.settle();
+
+        await expandRecords(host);
 
         expect(host.text('.panel-records-error')).toBe('The record store could not be read: session 3f2a9c1b has no readable record store.Retry');
         expect(host.element.textContent).not.toContain('3f2a9c1b-7788');
+
+        host.dispose();
+    });
+});
+
+// -----------------------------------------------------------------------------
+// The collapse gate: a card the reader has not opened costs the conversation nothing
+// -----------------------------------------------------------------------------
+
+describe('harness.records — the collapse gate', () => {
+    it('mounts collapsed by default: no read, no registration, body hidden', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = recordsHost({ backend, seam });
+        await host.settle();
+
+        const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="records"]');
+
+        expect(toggle?.getAttribute('type')).toBe('button');
+        expect(toggle?.getAttribute('aria-expanded')).toBe('false');
+        expect(toggle?.dataset.expanded).toBe('false');
+        expect(toggle?.textContent).toBe('Show records');
+        expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(true);
+        // The gate is the whole point: not one request, not one plane slot.
+        expect(backend.reads).toEqual([]);
+        expect(seam.specs).toEqual([]);
+
+        host.dispose();
+    });
+
+    it('opening the card is what boots the engine and registers the wake', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = recordsHost({ backend, seam });
+
+        await expandRecords(host);
+
+        expect(host.phase()).toBe('ready');
+        expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(false);
+        expect(host.query('button[data-panel-toggle="records"]')?.getAttribute('aria-expanded')).toBe('true');
+        expect(host.text('button[data-panel-toggle="records"]')).toBe('Hide records');
+        expect(backend.snapshotReads()).toBe(1);
+        expect(seam.specs).toHaveLength(1);
+        expect(host.queryAll('ol.panel-records-feed > li')).toHaveLength(2);
+
+        host.dispose();
+    });
+
+    it('closing the card releases the wake, and a wake while closed reads nothing', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = recordsHost({ backend, seam });
+
+        await expandRecords(host);
+
+        host.query<HTMLButtonElement>('button[data-panel-toggle="records"]')?.click();
+        await host.settle();
+
+        // The last listener let go, so the registration went with the card.
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(true);
+        expect(host.text('button[data-panel-toggle="records"]')).toBe('Show records');
+        expect(host.queryAll('li.panel-records-row')).toHaveLength(0);
+        expect(host.phase()).toBeUndefined();
+
+        // The store keeps moving while the card is closed: not one read answers it.
+        const readsBefore = backend.reads.length;
+
+        backend.push({
+            seq: 3,
+            collection: 'tasks',
+            rev: 1,
+            id: 'rec_b',
+            op: 'update',
+            fields: ['completed'],
+            item_rev: 1,
+            at: LATER,
+            by: 'agent'
+        });
+        host.seam.wake(3);
+        await host.settle();
+
+        expect(backend.reads).toHaveLength(readsBefore);
+
+        // Re-opening is a fresh boot, not a resurrection of the rows it dropped.
+        host.query<HTMLButtonElement>('button[data-panel-toggle="records"]')?.click();
+        await host.settle();
+
+        expect(backend.snapshotReads()).toBe(2);
+        expect(host.phase()).toBe('ready');
+        expect(host.queryAll('ol.panel-records-feed > li')).toHaveLength(2);
+
+        host.dispose();
+    });
+
+    it('opens onto an empty surface with no conversation, and reads the one that arrives', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = recordsHost({ backend, seam, sessionId: null });
+
+        await expandRecords(host);
+
+        // Open but conversationless: the surface is the cleared one, and nothing reads.
+        expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(false);
+        expect(backend.reads).toEqual([]);
+        expect(seam.specs).toEqual([]);
+
+        host.setSession('sess_a');
+        host.controller.notifySessionChange('sess_a');
+        await host.settle();
+
+        // The open choice is the reader's: a conversation arriving to an OPEN card is
+        // read at once, not held back for a second press.
+        expect(backend.snapshotReads()).toBe(1);
+        expect(seam.specs).toHaveLength(1);
+        expect(host.phase()).toBe('ready');
 
         host.dispose();
     });
@@ -786,7 +1014,9 @@ describe('the two panels on one conversation', () => {
         const seam = createSeam();
         const tasks = tasksHost({ backend, seam });
         const records = recordsHost({ backend, seam });
+
         await tasks.settle();
+        await expandRecords(records);
 
         // Both panels are attached and the plane holds one registration for the pair.
         expect(seam.specs).toHaveLength(1);
@@ -824,7 +1054,7 @@ describe('the two panels on one conversation', () => {
         const healthy = recordsHost({ backend, seam });
 
         await broken.settle();
-        await healthy.settle();
+        await expandRecords(healthy);
 
         // A missing read is a rejected read, not a TypeError from inside the client's
         // retry loop: the panel explains itself instead of going blank.
@@ -965,7 +1195,8 @@ const TASK_REOPENED: RecordChangeRow = {
     by: 'agent'
 };
 
-// A record with TWO events behind it, which is what makes a history disclosure appear.
+// A record with TWO events behind it, which is what makes an OPENED row carry a
+// history (a task with one event has nothing to say beyond the row itself).
 const WITH_HISTORY: RecordsSnapshotResponse = {
     ...WINDOWED_SNAPSHOT,
     store_rev: 7,
@@ -1016,6 +1247,11 @@ describe('harness.tasks — live updates', () => {
         await host.settle();
 
         const rowB = taskRowOf(host, 'rec_b') as HTMLElement;
+        const headB = rowB.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+
+        // The reader has this row open before it finishes.
+        headB.click();
+        expect(headB.getAttribute('aria-expanded')).toBe('true');
 
         backend.push(TASK_ADDED, TASK_DONE);
         backend.setSnapshot(AFTER_TASKS);
@@ -1050,13 +1286,19 @@ describe('harness.tasks — live updates', () => {
             [...(host.query('ol[data-group="done"]')?.children ?? [])].map((row) => (row as HTMLElement).dataset.id)
         ).toEqual(['rec_a', 'rec_b']);
 
-        // THE SAME ELEMENT travels between the two groups: focus, selection and an open
-        // disclosure belong to the row the reader was looking at, not to the group.
+        // THE SAME ELEMENT travels between the two groups: focus, selection and an
+        // open detail belong to the row the reader was looking at, not to the group.
         expect(taskRowOf(host, 'rec_b')).toBe(rowB);
         expect(rowB.parentElement?.dataset.group).toBe('done');
         expect(rowB.dataset.completed).toBe('true');
-        expect(rowB.querySelector('.panel-tasks-glyph')?.textContent).toBe('[done]');
-        expect(rowB.querySelector('.panel-tasks-state')?.textContent).toBe('completed');
+        expect(rowB.querySelector('.panel-tasks-glyph')?.textContent).toBe('✓');
+        expect(rowB.querySelector('.panel-tasks-row-state')?.textContent).toBe('completed');
+        // And it is STILL open: the open-set is keyed by the task id, and a repaint in
+        // the other group re-renders the detail rather than closing it.
+        expect(rowB.querySelector('button.panel-tasks-row-head')).toBe(headB);
+        expect(headB.getAttribute('aria-expanded')).toBe('true');
+        expect(rowB.querySelector('div.panel-tasks-detail')?.hidden).toBe(false);
+        expect(rowB.querySelector('.panel-tasks-id')?.textContent).toBe('#rec_b');
 
         // The re-read fills the new row in and does NOT cut its highlight short: the
         // freshness marker's own timer owns the expiry, and 150ms is inside 1500ms.
@@ -1157,6 +1399,102 @@ describe('harness.tasks — live updates', () => {
         host.dispose();
     });
 
+    it('keeps an open row open across a group move, and forgets it when the task or the conversation goes', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = tasksHost({ backend, seam, bodyRefreshMs: 150 });
+
+        await host.settle();
+
+        const rowA = taskRowOf(host, 'rec_a') as HTMLElement;
+        const headA = rowA.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+
+        headA.click();
+        expect(headA.getAttribute('aria-expanded')).toBe('true');
+
+        // The store drops it. The row, its detail and its entry in the panel's own
+        // open-set leave together — the prune at the end of `paint`, not the one per
+        // group, because a row on its way to the other list is invisible to one pass.
+        backend.push({
+            seq: 3,
+            collection: 'tasks',
+            rev: 1,
+            id: 'rec_a',
+            op: 'remove',
+            fields: [],
+            item_rev: 1,
+            at: LATER,
+            by: 'agent'
+        });
+        host.seam.wake(3);
+        await host.settle();
+
+        expect(taskRowOf(host, 'rec_a')).toBeNull();
+        expect(host.queryAll('div.panel-tasks-detail')).toHaveLength(1);
+
+        // The same id comes back, and it comes back CLOSED: an open detail belongs to
+        // the row that was thrown away with it, never to an id that is reused.
+        backend.push({
+            seq: 4,
+            collection: 'tasks',
+            rev: 3,
+            id: 'rec_a',
+            op: 'add',
+            fields: ['text', 'completed'],
+            item_rev: 3,
+            at: LATER,
+            by: 'agent'
+        });
+        backend.setSnapshot({
+            ...SNAPSHOT,
+            store_rev: 4,
+            collections: [
+                {
+                    ...(SNAPSHOT.collections[0] as (typeof SNAPSHOT.collections)[number]),
+                    store_rev: 4,
+                    entries: [
+                        { id: 'rec_b', rev: 0, text: 'Write the tests', completed: false, updated_at: AT },
+                        { id: 'rec_a', rev: 3, text: 'Ship it, twice', completed: true, updated_by: 'agent', updated_at: LATER }
+                    ]
+                },
+                SNAPSHOT.collections[1] as (typeof SNAPSHOT.collections)[number]
+            ]
+        });
+        host.seam.wake(4);
+        await host.settle();
+        host.timers.fire(150);
+        await host.settle();
+
+        const reborn = taskRowOf(host, 'rec_a') as HTMLElement;
+
+        expect(reborn.dataset.completed).toBe('true');
+        expect(reborn.querySelector('button.panel-tasks-row-head')?.getAttribute('aria-expanded')).toBe('false');
+        expect(reborn.querySelector('div.panel-tasks-detail')?.hidden).toBe(true);
+
+        // A conversation ending takes its open rows with it (`onSessionChange` clears the
+        // set): the next store is a different store, and a row left open from the last
+        // one would be a claim about a record this panel has never read.
+        const rowB = taskRowOf(host, 'rec_b') as HTMLElement;
+
+        (rowB.querySelector('button.panel-tasks-row-head') as HTMLButtonElement).click();
+        expect(rowB.querySelector('button.panel-tasks-row-head')?.getAttribute('aria-expanded')).toBe('true');
+
+        host.setSession('sess_b');
+        host.controller.notifySessionChange('sess_b');
+        await host.settle();
+
+        expect(host.queryAll('button.panel-tasks-row-head').map((node) => node.getAttribute('aria-expanded'))).toEqual([
+            'false',
+            'false'
+        ]);
+        expect(host.queryAll('div.panel-tasks-detail[hidden]')).toHaveLength(2);
+
+        host.dispose();
+        // Two conversations were on screen, so the switch retired `sub_1` and the
+        // teardown retires `sub_2` — no slot on the plane is left held.
+        expect(seam.unsubscribed).toEqual(['sub_1', 'sub_2']);
+    });
+
     it('retires a removed task, hides a group that empties out, and says the row is gone', async () => {
         const backend = createBackend();
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
@@ -1203,7 +1541,7 @@ describe('harness.records — live updates', () => {
         const backend = createBackend();
         const host = recordsHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandRecords(host);
 
         backend.push({
             seq: 3,
@@ -1279,7 +1617,7 @@ describe('harness.records — live updates', () => {
         const backend = createBackend();
         const host = recordsHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandRecords(host);
 
         const scroller = host.query('.panel-records-scroller') as HTMLElement;
         const pill = host.query('.panel-new-pill') as HTMLButtonElement;
@@ -1325,7 +1663,7 @@ describe('harness.records — live updates', () => {
     it('narrows the feed with a chip, and the All chip is the way back', async () => {
         const host = recordsHost();
 
-        await host.settle();
+        await expandRecords(host);
 
         chipOf(host, 'tasks').click();
 
@@ -1357,8 +1695,13 @@ describe('harness.records — live updates', () => {
 
         await host.settle();
 
-        // One event behind a task is not a history, so there is nothing to disclose.
-        expect(taskRowOf(host, 'rec_a')?.querySelector('.panel-expand')).toBeNull();
+        // One event behind a task is not a history, and there is no separate disclosure
+        // button left to find: the row is the only control it has.
+        const closedRow = taskRowOf(host, 'rec_a') as HTMLElement;
+
+        expect(closedRow.querySelectorAll('button')).toHaveLength(1);
+        expect(closedRow.querySelector('.panel-expand')).toBeNull();
+        expect(closedRow.querySelector('ol.panel-tasks-history')).toBeNull();
 
         backend.push(TASK_REOPENED);
         backend.setSnapshot(WITH_HISTORY);
@@ -1367,19 +1710,24 @@ describe('harness.records — live updates', () => {
         host.timers.fire(150);
         await host.settle();
 
-        const button = taskRowOf(host, 'rec_a')?.querySelector('.panel-expand') as HTMLButtonElement;
+        const rowA = taskRowOf(host, 'rec_a') as HTMLElement;
+        const headA = rowA.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+        const detailA = rowA.querySelector('div.panel-tasks-detail') as HTMLElement;
 
-        expect(button.textContent).toBe('Show 2 changes');
-        expect(button.getAttribute('aria-expanded')).toBe('false');
-        expect(taskRowOf(host, 'rec_a')?.querySelector('.panel-tasks-history')).toBeNull();
+        // The history arrived and the row grew no button for it — no "Show 2 changes"
+        // label, no word about changes at all, and the mark and sentence are unchanged.
+        expect(rowA.querySelectorAll('button')).toHaveLength(1);
+        expect(rowA.textContent).not.toContain('changes');
+        expect(headA.getAttribute('aria-expanded')).toBe('false');
+        expect(detailA.hidden).toBe(true);
+        expect(rowA.querySelector('ol.panel-tasks-history')).toBeNull();
 
-        button.click();
+        headA.click();
 
-        expect(button.getAttribute('aria-expanded')).toBe('true');
-        expect(button.dataset.expanded).toBe('true');
-        expect(button.textContent).toBe('Hide changes');
+        expect(headA.getAttribute('aria-expanded')).toBe('true');
+        expect(detailA.hidden).toBe(false);
 
-        const history = taskRowOf(host, 'rec_a')?.querySelectorAll('ol.panel-tasks-history > li') as NodeListOf<HTMLElement>;
+        const history = rowA.querySelectorAll('ol.panel-tasks-history > li') as NodeListOf<HTMLElement>;
 
         // Newest first, and the honest note: the store keeps 200 events and this record's
         // rev says more happened than that.
@@ -1388,10 +1736,11 @@ describe('harness.records — live updates', () => {
         expect(history[1]?.textContent).toBe('agentupdatecompleted5m');
         expect(history[2]?.textContent).toBe('Older changes were not kept by the store.');
 
-        button.click();
+        headA.click();
 
-        expect(button.getAttribute('aria-expanded')).toBe('false');
-        expect(taskRowOf(host, 'rec_a')?.querySelector('.panel-tasks-history')).toBeNull();
+        expect(headA.getAttribute('aria-expanded')).toBe('false');
+        expect(rowA.querySelector('ol.panel-tasks-history')).toBeNull();
+        expect(rowA.querySelectorAll('div.panel-tasks-detail')).toHaveLength(1);
 
         host.dispose();
     });
@@ -1452,7 +1801,7 @@ describe('the plane, the conversation and the way out', () => {
         const backend = createBackend();
         const host = recordsHost({ backend });
 
-        await host.settle();
+        await expandRecords(host);
 
         const kept = host.query('li[data-row-key="2"]') as HTMLElement;
 
@@ -1484,7 +1833,7 @@ describe('the plane, the conversation and the way out', () => {
         const seam = createSeam();
         const host = recordsHost({ backend, seam });
 
-        await host.settle();
+        await expandRecords(host);
 
         chipOf(host, 'tasks').click();
         expect(feedKeysOf(host)).toEqual(['1']);

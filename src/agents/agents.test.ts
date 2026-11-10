@@ -5,12 +5,26 @@
 // the source of the system prompt, so adding a guideline cannot silently become
 // documentation that never reaches a model.
 //
-// T3 roster: the five real roles (instruct, research, workspace, reviewer,
-// planner) come first in picker order, then the delegated summarizer, then the two
-// fixtures. Order is pinned so a new profile is an explicit addition.
+// ROSTER (seven real roles + the delegated summarizer + two fixtures), in picker order:
+//   general, instruct, research, workspace, reviewer, planner, debugger, summarizer,
+//   demo, flaky
+// `general` leads because it is the DEFAULT entry point. Order is pinned so a new profile
+// is an explicit addition, and so the frontend colour palette (which assigns tones by this
+// order) only shifts on purpose.
 //
-// The later blocks pin what the model-visible text may contain: the policy a tool
-// declaration cannot express, never a copy of the declaration list itself.
+// IDS ARE STABLE, TITLES ARE NOT (regression pin). `research` → Explore, `workspace` →
+// Analyst and `planner` → Manager keep their registry ids, because the id is persisted in
+// harness records, the per-harness agentModels/agentInstructions/agentColors maps, the
+// global agents.json overlay and every frozen session record, and `agentProfile()` has no
+// alias fallback — a renamed id would abort server startup over an old row. The prompt
+// prose therefore routes by ID, never by title, and the `delegate` target enum holds ids.
+//
+// `debugger` is an ECMAScript reserved word, so its module exports `debuggerAgent`; the
+// registry id is still `debugger` (the key in AGENT_PROFILES and the profile's `name`).
+//
+// The later blocks pin what the model-visible text may contain: the POLICY a tool
+// declaration cannot express (routing stance, read-only policy, verification ownership),
+// never a copy of the declaration list itself.
 //
 // WHY `agentInstruction` RETURNS ONE STRING (regression pin)
 // ----------------------------------------------------------
@@ -22,12 +36,13 @@
 // (src/agents/index.ts), which is what the `agentInstruction` block below pins: one
 // string, one `Guidelines:` section, a blank line as the identity/rules split.
 //
-// T6 NARROWS THAT RULE TO THE TRUSTED DEFAULT: an explicit `instructionOverride` is
-// the complete prompt and is returned verbatim, with no guideline block appended, so
-// the box the operator edits (one textarea holding the full effective instruction)
-// round-trips without duplicating the guidelines.
+// A NARROWER RULE THAN AN OVERRIDE IS THE COMPLETE PROMPT: an explicit
+// `instructionOverride` is the whole prompt and is returned verbatim, with no guideline
+// block appended, so the box the operator edits (one textarea holding the full effective
+// instruction) round-trips without duplicating the guidelines.
 
 import { describe, expect, it } from 'vitest';
+import type { AgentProfile } from './index';
 import {
     AGENT_PROFILES,
     AGENT_PROFILE_NAMES,
@@ -36,48 +51,157 @@ import {
     agentProfiles,
     isAgentProfileName
 } from './index';
+import { general } from './general';
 import { summarizer } from './summarizer';
 import { instruct } from './instruct';
 import { reviewer } from './reviewer';
 import { planner } from './planner';
 import { research } from './research';
 import { workspace } from './workspace';
+// Reserved word: the export is `debuggerAgent`, the registry id is `debugger`.
+import { debuggerAgent } from './debugger';
 import {
     DELEGATION_GUIDELINE,
     DISCOVERY_GUIDELINE,
     PERMISSIONS_GUIDELINE,
+    READ_ONLY_GUIDELINE,
     TOOL_CREATE_GUIDELINE,
     WEB_SEARCH_GUIDELINE
 } from './guidelines';
 import { BUILTIN_TOOL_DESCRIPTORS } from '../core/tool-manifest';
+// The one place that decides whether a role actually HAS a team: `delegate` registers only
+// when the harness's allowlist is non-empty (src/harness.ts `activation: 'subagents'`), so a
+// prompt line about delegating is only true while the matching preset agrees.
+import { presets } from '../server/harnesses/presets';
 
 // The exact error text a client sees for a bad id: the message lists the known set
 // in picker order, so this is also a roster pin.
-const KNOWN = 'instruct, research, workspace, reviewer, planner, summarizer, demo, flaky';
+const KNOWN =
+    'general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky';
+
+// The seven roles a picker offers as usable work, in roster order (the summarizer and the
+// two fixtures are not selectable entry points for a real task).
+const REAL_ROLES = [general, instruct, research, workspace, reviewer, planner, debuggerAgent];
 
 // The exact identity sentence of each real role. `agentInstruction` puts this first,
 // above the guideline block, so a reworded role is a deliberate edit, not drift.
 const IDENTITY = {
-    instruct: 'You are the Instruct agent. Follow the brief exactly, answer directly, and do only what was asked.',
-    research: 'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',
-    workspace: 'You are the Coder agent. Read, edit, and verify files in the server workspace, and keep every change as small as the task allows.',
-    reviewer: 'You are the Reviewer agent. Find real defects in the work you are given, and report only what you can point to.',
-    planner: 'You are the Planner agent. Plan before you build, route each step to the narrowest configured specialist, and verify the result yourself.'
+    general:
+        'You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent.',
+    instruct:
+        'You are the Instruct agent. Do the work yourself, and delegate only a step that would cost more context than it is worth to perform.',
+    research:
+        'You are the Explore agent. Establish what is actually there and how it works, and report only what you can point to.',
+    workspace:
+        'You are the Analyst agent. Implement the work in the codebase at the standard its surrounding code already sets, and prove it works.',
+    reviewer:
+        'You are the Reviewer agent, a strict judge. Test the work against what it claims, and report only what you can point to.',
+    planner:
+        'You are the Manager agent. Hold the whole goal, plan it, and steer specialists through every step; you delegate the work and never do it yourself.',
+    debugger:
+        'You are the Debugger agent. Exercise the whole system until something breaks, then prove how it breaks.'
 };
 
-// Measured length of the ONE composed system prompt, per profile, in registry order.
-// Exact equality (not a range): growth has to be intentional, so adding a bullet to a
-// shared guideline line is a visible diff here. 1500 characters is room for a policy
-// bullet, not for a tool manual — the ceiling below is the budget that keeps it true.
+// The one contract bullet each role exists to carry, copied verbatim out of its profile.
+// These are the sentences that separate the seven roles: without them the roster collapses
+// into three near-identical "use your tools" briefs. Pinned as whole strings, so a reword
+// is a visible diff and the policy cannot be quietly softened.
+const CONTRACT = {
+    // General: alone by contract, and the `threadFork` loophole is closed too (a lone agent
+    // could otherwise spawn a branch and offload a step; threadFork IS searchable).
+    generalWorksAlone:
+        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork either.',
+    // Instruct: the worker stance — only context-burning, non-mutating steps leave it.
+    instructDelegatesOnlyReads:
+        'Delegate only context-burning steps that change nothing: research, exploration, a long read, a review. Anything you would then have to write, edit, or run, you do yourself.',
+    // A Manager refuses to run as a delegate, so routing to it is a wasted child run.
+    instructNeverManager:
+        'Never delegate to a Manager: it does not run as a delegate. Send an investigation to research and a challenge to reviewer, and keep the build.',
+    // Manager rule 1: no team, no Manager — and it must not degrade into a worker.
+    plannerStopsWithoutATeam:
+        'If `delegate` is not declared to you, stop and say why: with no one to delegate to a Manager cannot manage, and it must not quietly become a worker.',
+    // Manager rule 2: a Manager that was delegated to returns the reason, not the work.
+    plannerRefusesToBeADelegate:
+        'If this brief reached you because another agent delegated to you, reply that a Manager does not run as a delegate, and stop without starting the task.',
+    // Manager routing: registry IDS, because the delegate `agent` enum holds ids.
+    plannerRoutesByIds:
+        'Delegate every step to the narrowest id that fits: research to investigate, workspace to implement, reviewer to challenge, debugger to stress-test, general for a whole self-contained job, summarizer to condense.',
+    // Manager acceptance: author and judge are never the same agent.
+    plannerNeedsAnIndependentReview:
+        "Accept nothing on its author's word: after each step, delegate the result to reviewer for an independent check against the acceptance criteria, and re-delegate until it passes or you can state what remains wrong.",
+    // Debugger: scope, not an inventory — nothing is off-limits.
+    debuggerEverythingInScope:
+        'Nothing is off-limits here: unlock any searchable tool you need, read any path, run any command, and delegate to any configured role.',
+    debuggerStressesEdges:
+        'Test the edges, not the happy path: empty input, oversized input, a missing path, a wrong type, a repeated call, a cancelled call, a target that refuses.',
+    // A finding without a reproduction is an anecdote.
+    debuggerReproducesFailures:
+        'Reduce every failure to the smallest call sequence that triggers it again, and quote the exact tool, input, and error text.',
+    // Scratch files are fine; silently editing the subject hides the result.
+    debuggerDoesNotTouchTheSubject:
+        'Write scratch files when a probe needs them, but never change the code under test unless the brief asks for a fix.'
+};
+
+// Measured length of the ONE composed system prompt, per profile, in registry order
+// (`npx tsx Temp/opencode/prompt-size.ts` prints this table). Exact equality (not a range):
+// growth has to be intentional, so adding a bullet to a shared guideline line is a visible
+// diff here. The seven real roles get their own, higher ceiling below.
 const PROMPT_LENGTHS = [
-    { name: 'instruct', length: 1458 },
-    { name: 'research', length: 1482 },
-    { name: 'workspace', length: 1439 },
-    { name: 'reviewer', length: 1463 },
-    { name: 'planner', length: 1464 },
+    { name: 'general', length: 1168 },
+    { name: 'instruct', length: 1516 },
+    { name: 'research', length: 1587 },
+    { name: 'workspace', length: 1521 },
+    { name: 'reviewer', length: 1475 },
+    { name: 'planner', length: 1634 },
+    { name: 'debugger', length: 1477 },
     { name: 'summarizer', length: 141 },
     { name: 'demo', length: 294 },
     { name: 'flaky', length: 344 }
+];
+
+// Labels for the shared guideline lines (./guidelines.ts), keyed by the exact string so the
+// composition below is measured against the real constant, not against a copy of its text.
+const SHARED_LABELS = new Map<string, string>([
+    [DELEGATION_GUIDELINE, 'DELEGATION'],
+    [DISCOVERY_GUIDELINE, 'DISCOVERY'],
+    [WEB_SEARCH_GUIDELINE, 'WEB_SEARCH'],
+    [PERMISSIONS_GUIDELINE, 'PERMISSIONS'],
+    [READ_ONLY_GUIDELINE, 'READ_ONLY'],
+    [TOOL_CREATE_GUIDELINE, 'TOOL_CREATE']
+]);
+
+// The shared lines a profile composes, in its own declared order. An empty array means the
+// profile composes none of them (the summarizer and the fixtures are self-contained).
+const sharedLinesOf = (profile: AgentProfile): string[] =>
+    profile.guidelines
+        .map((line) => SHARED_LABELS.get(line))
+        .filter((label): label is string => label !== undefined);
+
+// THE DELEGATION-STANCE MATRIX. One row per roster entry, exactly which shared policy lines
+// it composes. This is the roster's design made executable:
+//   general   — no DELEGATION at all: its preset passes `subagents: []`, so `delegate` is
+//               never registered and a delegation line would describe a tool it cannot call.
+//   instruct  — a worker: DELEGATION plus the full discovery/web/permissions block.
+//   research  — read-only investigator (READ_ONLY), delegating because a sub-agent may still
+//               be handed a scoped toolbox.
+//   workspace — the implementor: NO generic DISCOVERY (it names the four searchable tools it
+//               actually reaches for, same policy at a fraction of the length) and NO
+//               READ_ONLY (writing is the job).
+//   reviewer  — read-only judge.
+//   planner   — DELEGATION ONLY: it executes nothing, so discovery/web/permissions prose
+//               would be context it never spends.
+//   debugger  — everything, including TOOL_CREATE (it authors its own probes).
+const SHARED_COMPOSITION = [
+    { name: 'general', shared: ['DISCOVERY', 'WEB_SEARCH', 'PERMISSIONS'] },
+    { name: 'instruct', shared: ['DELEGATION', 'DISCOVERY', 'WEB_SEARCH', 'PERMISSIONS'] },
+    { name: 'research', shared: ['READ_ONLY', 'DELEGATION', 'DISCOVERY', 'WEB_SEARCH'] },
+    { name: 'workspace', shared: ['DELEGATION', 'PERMISSIONS'] },
+    { name: 'reviewer', shared: ['READ_ONLY', 'DELEGATION', 'DISCOVERY'] },
+    { name: 'planner', shared: ['DELEGATION'] },
+    { name: 'debugger', shared: ['DELEGATION', 'DISCOVERY', 'TOOL_CREATE', 'PERMISSIONS'] },
+    { name: 'summarizer', shared: [] },
+    { name: 'demo', shared: [] },
+    { name: 'flaky', shared: [] }
 ];
 
 // The shared guideline block a profile composes, exactly as `agentInstruction` renders
@@ -86,14 +210,20 @@ const PROMPT_LENGTHS = [
 const guidelinesBlock = (guidelines: readonly string[]) =>
     `Guidelines:\n${guidelines.map((line) => `- ${line}`).join('\n')}`;
 
+// One descriptor lookup, so the manifest cross-checks below read as data, not search code.
+const descriptorOf = (name: string) =>
+    BUILTIN_TOOL_DESCRIPTORS.find((descriptor) => descriptor.name === name);
+
 describe('agent profiles', () => {
-    it('lists the trusted agents with the real roles first', () => {
+    it('lists the trusted agents with the seven real roles first', () => {
         expect([...AGENT_PROFILE_NAMES]).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
             'planner',
+            'debugger',
             'summarizer',
             'demo',
             'flaky'
@@ -101,7 +231,7 @@ describe('agent profiles', () => {
         expect(agentProfiles().map((profile) => profile.name)).toEqual([...AGENT_PROFILE_NAMES]);
     });
 
-    it('gives every profile a complete, non-empty definition', () => {
+    it('gives every profile a complete, non-empty definition keyed by its own id', () => {
         expect(
             agentProfiles().map((profile) => ({
                 name: profile.name,
@@ -122,20 +252,24 @@ describe('agent profiles', () => {
                 guidelines: true
             }))
         );
+
+        // The reserved-word profile is the one entry whose export name differs from its id:
+        // `debuggerAgent` under the key (and the `name` field) `debugger`.
+        expect(debuggerAgent.name).toBe('debugger');
+        expect(AGENT_PROFILES.debugger).toBe(debuggerAgent);
     });
 
-    it('gives the visible roles the requested titles and ids', () => {
-        expect(
-            [instruct, research, workspace, reviewer, planner].map((profile) => ({
-                name: profile.name,
-                title: profile.title
-            }))
-        ).toEqual([
+    // The id is the persisted identity, the title is the label. Three roles were retitled and
+    // deliberately kept their ids (see the header), so BOTH halves are pinned together.
+    it('pins each real role id to its display title', () => {
+        expect(REAL_ROLES.map((profile) => ({ name: profile.name, title: profile.title }))).toEqual([
+            { name: 'general', title: 'General' },
             { name: 'instruct', title: 'Instruct' },
-            { name: 'research', title: 'Researcher' },
-            { name: 'workspace', title: 'Coder' },
+            { name: 'research', title: 'Explore' },
+            { name: 'workspace', title: 'Analyst' },
             { name: 'reviewer', title: 'Reviewer' },
-            { name: 'planner', title: 'Planner' }
+            { name: 'planner', title: 'Manager' },
+            { name: 'debugger', title: 'Debugger' }
         ]);
     });
 
@@ -144,28 +278,147 @@ describe('agent profiles', () => {
     // persisted harness/protocol identity, not a display string.
     it('keeps every profile display title a single word', () => {
         expect(agentProfiles().map((profile) => profile.title)).toEqual([
+            'General',
             'Instruct',
-            'Researcher',
-            'Coder',
+            'Explore',
+            'Analyst',
             'Reviewer',
-            'Planner',
+            'Manager',
+            'Debugger',
             'Summarizer',
             'Demo',
             'Flaky'
         ]);
         // One word = exactly one whitespace-separated token per title.
         expect(agentProfiles().map((profile) => profile.title.trim().split(/\s+/).length)).toEqual([
-            1, 1, 1, 1, 1, 1, 1, 1
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1
         ]);
     });
 
     it('resolves ids and rejects unknown ones', () => {
+        expect(agentProfile('general')).toBe(general);
         expect(agentProfile('summarizer')).toBe(summarizer);
         expect(agentProfile('reviewer')).toBe(reviewer);
         expect(agentProfile('planner')).toBe(planner);
+        expect(agentProfile('debugger')).toBe(debuggerAgent);
         expect(isAgentProfileName('workspace')).toBe(true);
+        expect(isAgentProfileName('Explore')).toBe(false);
         expect(isAgentProfileName('critic')).toBe(false);
         expect(() => agentProfile('critic')).toThrow(`Unknown agent "critic". Known agents: ${KNOWN}.`);
+    });
+});
+
+// The delegation stance is the axis the roster is organised around, and each end of it is
+// enforced by the RUNTIME in a way the prompt alone cannot fake: `delegate` is registered
+// only when the harness has subagents (src/harness.ts `activation: 'subagents'` + the empty
+// allowlist refusal) and it is primary-only (src/tools/runtime/delegate.tool.ts
+// `registration.primaryOnly`). The profile text has to match that reality for each role.
+describe('delegation stance per role', () => {
+    it('gives the default role no delegation line and no team at all', () => {
+        const prompt = agentInstruction(general);
+
+        // `subagents: []` means `delegate` is never registered here, so the prompt must not
+        // describe a tool that does not exist — and `toolRequest` cannot surface it either.
+        expect(general.guidelines).not.toContain(DELEGATION_GUIDELINE);
+        expect(prompt).not.toContain(DELEGATION_GUIDELINE);
+        expect(prompt.toLowerCase()).not.toContain('delegate');
+
+        // The rule is stated positively, and closes the loophole the runtime does not:
+        // threadFork IS reachable for a lone agent, so it is banned by name.
+        expect(general.guidelines).toContain(CONTRACT.generalWorksAlone);
+        expect(prompt).toContain('threadFork');
+
+        // The preset side of the same contract (src/server/harnesses/presets.ts): a lone
+        // card, so the runtime never registers `delegate` for it.
+        const generalPreset = presets.find((preset) => preset.name === 'general');
+        expect(generalPreset?.primary).toBe('general');
+        expect(generalPreset?.subagents).toEqual([]);
+        expect(generalPreset?.agents).toEqual(['general']);
+    });
+
+    it('keeps Instruct a worker that hands out only context-burning, non-mutating steps', () => {
+        const prompt = agentInstruction(instruct);
+
+        expect(instruct.guidelines).toContain(DELEGATION_GUIDELINE);
+        expect(instruct.guidelines).toContain(CONTRACT.instructDelegatesOnlyReads);
+        expect(instruct.guidelines).toContain(CONTRACT.instructNeverManager);
+
+        // The targets it names are REGISTRY IDS, never display titles: the `delegate` target
+        // enum holds ids, so "send it to Explore" would be an unresolvable target.
+        expect(prompt).toContain('to research');
+        expect(prompt).toContain('to reviewer');
+        expect(prompt).not.toContain('Explore');
+        expect(prompt).not.toContain('Analyst');
+    });
+
+    it('makes the Manager orchestrate, refuse to work, and refuse to be a delegate', () => {
+        const prompt = agentInstruction(planner);
+
+        // Rule 1 and rule 2: both are prompt-level, because the runtime only ever shows the
+        // agent one observable fact — whether `delegate` is declared.
+        expect(planner.guidelines).toContain(CONTRACT.plannerStopsWithoutATeam);
+        expect(planner.guidelines).toContain(CONTRACT.plannerRefusesToBeADelegate);
+
+        // Acceptance is never the author's own word: every step goes to reviewer.
+        expect(planner.guidelines).toContain(CONTRACT.plannerNeedsAnIndependentReview);
+
+        // Routing names ids, and every id it names is a real registry entry.
+        expect(planner.guidelines).toContain(CONTRACT.plannerRoutesByIds);
+        for (const id of ['research', 'workspace', 'reviewer', 'debugger', 'general', 'summarizer']) {
+            expect(isAgentProfileName(id)).toBe(true);
+        }
+
+        // It executes nothing, so it carries no discovery/permissions/web prose.
+        expect(sharedLinesOf(planner)).toEqual(['DELEGATION']);
+        expect(prompt).not.toContain(DISCOVERY_GUIDELINE);
+        expect(prompt).not.toContain(PERMISSIONS_GUIDELINE);
+        expect(prompt).not.toContain(WEB_SEARCH_GUIDELINE);
+    });
+
+    // No built-in team can name the Manager: a Manager running as a subagent has no
+    // `delegate` (it is primary-only), so its own rule would fire and burn a child run. The
+    // string form keeps this one exact assertion over all seven presets.
+    it('keeps the Manager out of every built-in team', () => {
+        expect(
+            presets.map((preset) => `${preset.name}:${preset.primary}:${preset.subagents.join('+')}`)
+        ).toEqual([
+            'general:general:',
+            'instruct:instruct:general+research+workspace+reviewer+debugger+summarizer',
+            'research:research:general+instruct+workspace+reviewer+debugger+summarizer',
+            'workspace:workspace:general+instruct+research+reviewer+debugger+summarizer',
+            'reviewer:reviewer:general+instruct+research+workspace+debugger+summarizer',
+            'planner:planner:general+instruct+research+workspace+reviewer+debugger+summarizer',
+            'debugger:debugger:general+instruct+research+workspace+reviewer+summarizer'
+        ]);
+    });
+
+    it('makes the two report-producing roles read-only and the two build roles not', () => {
+        // READ_ONLY is policy, not enforcement — no profile can deny write/edit — so the line
+        // only works while the two report roles carry it and the lift clause stays in it.
+        expect(research.guidelines).toContain(READ_ONLY_GUIDELINE);
+        expect(reviewer.guidelines).toContain(READ_ONLY_GUIDELINE);
+        expect(agentInstruction(research)).toContain(
+            'You are read-only unless the brief authorises a change'
+        );
+        expect(agentInstruction(reviewer)).toContain(
+            'You are read-only unless the brief authorises a change'
+        );
+
+        // The implementor and the stress-tester legitimately write, so they must not inherit
+        // a blanket ban: workspace edits the codebase, the debugger writes probe scratch.
+        expect(workspace.guidelines).not.toContain(READ_ONLY_GUIDELINE);
+        expect(debuggerAgent.guidelines).not.toContain(READ_ONLY_GUIDELINE);
+        expect(debuggerAgent.guidelines).toContain(CONTRACT.debuggerDoesNotTouchTheSubject);
+    });
+
+    it('makes the Debugger stress everything in scope without editing the subject', () => {
+        expect(debuggerAgent.guidelines).toContain(CONTRACT.debuggerEverythingInScope);
+        expect(debuggerAgent.guidelines).toContain(CONTRACT.debuggerStressesEdges);
+        expect(debuggerAgent.guidelines).toContain(CONTRACT.debuggerReproducesFailures);
+        expect(debuggerAgent.guidelines).toContain(CONTRACT.debuggerDoesNotTouchTheSubject);
+
+        // It authors its own probes, so it is the one role that composes the toolCreate line.
+        expect(debuggerAgent.guidelines).toContain(TOOL_CREATE_GUIDELINE);
     });
 });
 
@@ -175,25 +428,19 @@ describe('agent profiles', () => {
 // hundreds of characters restating which tools exist and how the discovery selector
 // works. That contract now lives ONCE, in toolRequest's own metadata, and the profiles
 // carry only the policy a schema cannot say. These tests pin the boundary — and keep the
-// stale claims the rewrite removed from ever coming back.
+// stale claims the rewrite removed from ever coming back, for EVERY roster entry.
 describe('profile guidance stays policy, not a tool inventory', () => {
-    const REAL_ROLES = [instruct, research, workspace, reviewer, planner];
-
     it('composes the shared policy lines instead of copying them per profile', () => {
-        for (const profile of REAL_ROLES) {
-            expect(profile.guidelines).toContain(DELEGATION_GUIDELINE);
-            expect(profile.guidelines).toContain(DISCOVERY_GUIDELINE);
-        }
-
-        expect(instruct.guidelines).toContain(WEB_SEARCH_GUIDELINE);
-        expect(instruct.guidelines).toContain(TOOL_CREATE_GUIDELINE);
-        expect(research.guidelines).toContain(WEB_SEARCH_GUIDELINE);
-        expect(workspace.guidelines).toContain(PERMISSIONS_GUIDELINE);
-        expect(planner.guidelines).toContain(PERMISSIONS_GUIDELINE);
+        expect(
+            agentProfiles().map((profile) => ({
+                name: profile.name,
+                shared: sharedLinesOf(profile)
+            }))
+        ).toEqual(SHARED_COMPOSITION);
     });
 
     it('never re-lists declared tools or re-states the discovery selector', () => {
-        for (const profile of REAL_ROLES) {
+        for (const profile of agentProfiles()) {
             // The prompt is already ONE string, so no join: this is verbatim what the
             // model reads as its single system message.
             const prompt = agentInstruction(profile);
@@ -213,8 +460,7 @@ describe('profile guidance stays policy, not a tool inventory', () => {
 
         // The accurate contract is still advertised — where the model reads it as part of
         // the declaration, so no profile has to repeat it.
-        const toolRequest = BUILTIN_TOOL_DESCRIPTORS.find((descriptor) => descriptor.name === 'toolRequest');
-        const description = toolRequest?.metadata.description ?? '';
+        const description = descriptorOf('toolRequest')?.metadata.description ?? '';
 
         expect(description).toContain('maxEnabledTools');
         expect(description).toContain('newest request takes precedence');
@@ -225,18 +471,42 @@ describe('profile guidance stays policy, not a tool inventory', () => {
     // only ACTIVATED by a configured key, `download` is searchable. The old text called
     // fetch searchable, which sent the model hunting for a tool already in front of it.
     it('states the web trio the way the manifest actually declares it', () => {
-        for (const profile of [instruct, research]) {
-            const prompt = agentInstruction(profile);
-
-            expect(prompt).toContain('search is declared only when the host configured a web-search key');
-            expect(prompt).toContain('fetch is declared without a key');
-            expect(prompt).toContain('download is searchable under "web" or "url"');
+        // Only the three roles that can reach the web carry the line, and they carry the
+        // shared constant verbatim rather than a per-profile paraphrase of it.
+        for (const profile of [general, instruct, research]) {
+            expect(agentInstruction(profile)).toContain(WEB_SEARCH_GUIDELINE);
         }
+
+        expect(descriptorOf('search')?.metadata.visibility).toBe('core');
+        expect(descriptorOf('fetch')?.metadata.visibility).toBe('core');
+        expect(descriptorOf('download')?.metadata.visibility).toBe('searchable');
 
         // The removed bug must stay removed, in every profile's prompt.
         for (const profile of agentProfiles()) {
             expect(agentInstruction(profile)).not.toMatch(/fetch is searchable/i);
         }
+    });
+
+    // Every tool the profile prose calls searchable really is, and every one it calls
+    // declared really is — otherwise a bullet sends the model searching for a tool that is
+    // already in front of it, or waiting for a tool that never arrives. A missing
+    // `visibility` field is the manifest's way of saying "the runtime default applies", and
+    // that default is `searchable` (src/harness.ts treats an entry with no visibility as
+    // searchable), which is what the Analyst's and Debugger's bullets rely on.
+    it('names each tool the way the manifest classifies it', () => {
+        expect(
+            ['download', 'toolCreate', 'threadFork'].map(
+                (name) => `${name}:${descriptorOf(name)?.metadata.visibility}`
+            )
+        ).toEqual(['download:searchable', 'toolCreate:searchable', 'threadFork:searchable']);
+
+        // The four the Analyst bullet names as "searchable, not declared".
+        expect(
+            ['shell', 'gitDiff', 'syntax', 'files'].map((name) => descriptorOf(name)?.metadata.visibility)
+        ).toEqual([undefined, undefined, undefined, undefined]);
+
+        // The toolCreate line is only true because toolCreate is NOT declared.
+        expect(agentInstruction(debuggerAgent)).toContain(TOOL_CREATE_GUIDELINE);
     });
 
     it('keeps each profile at its measured prompt size, inside the budget', () => {
@@ -248,9 +518,13 @@ describe('profile guidance stays policy, not a tool inventory', () => {
             }))
         ).toEqual(PROMPT_LENGTHS);
 
-        // ...and the five real roles stay well under the 1500-character ceiling.
+        // ...and the seven real roles stay under the ceiling. It moved from 1500 to 1800
+        // because the seven-role roster gives each role ONE explicit delegation-stance
+        // contract line more than the five-role roster had (general works alone, Instruct
+        // delegates only reads, the Manager refuses both ways). The budget is still a policy
+        // brief, not a tool manual — that guard is the regex block above, which stays.
         for (const profile of REAL_ROLES) {
-            expect(agentInstruction(profile).length).toBeLessThan(1500);
+            expect(agentInstruction(profile).length).toBeLessThan(1800);
         }
     });
 });
@@ -309,17 +583,28 @@ describe('agentInstruction', () => {
     });
 
     it('opens every real profile with its exact identity sentence', () => {
-        expect(
-            [instruct, research, workspace, reviewer, planner].map(
-                (profile) => agentInstruction(profile).split('\n\n')[0]
-            )
-        ).toEqual([
+        expect(REAL_ROLES.map((profile) => agentInstruction(profile).split('\n\n')[0])).toEqual([
+            IDENTITY.general,
             IDENTITY.instruct,
             IDENTITY.research,
             IDENTITY.workspace,
             IDENTITY.reviewer,
-            IDENTITY.planner
+            IDENTITY.planner,
+            IDENTITY.debugger
         ]);
+    });
+
+    // The retitled roles must read as their TITLE inside the prompt, while every routing
+    // line and the delegate enum keep the ID — otherwise a model told it is "Explore" would
+    // try to delegate to "Explore" and get an unknown-target error.
+    it('retitles the prompt identity without retitling the routing ids', () => {
+        expect(agentInstruction(research)).toContain('You are the Explore agent.');
+        expect(agentInstruction(workspace)).toContain('You are the Analyst agent.');
+        expect(agentInstruction(planner)).toContain('You are the Manager agent.');
+
+        expect(
+            [research, workspace, planner].map((profile) => profile.name)
+        ).toEqual(['research', 'workspace', 'planner']);
     });
 
     it('returns only the instruction when a profile has no guidelines', () => {
@@ -336,9 +621,9 @@ describe('agentInstruction', () => {
         ).toBe('You are bare.');
     });
 
-    // T6 EDITABLE CONFIGURATION — AN OVERRIDE IS THE COMPLETE PROMPT. The text an
+    // EDITABLE CONFIGURATION — AN OVERRIDE IS THE COMPLETE PROMPT. The text an
     // operator saves comes back out of the one instruction box that displays the FULL
-    // effective prompt, so it already holds every line the agent is meant to read.
+    // effective instruction, so it already holds every line the agent is meant to read.
     // Appending `profile.guidelines` underneath it rendered them twice (and rendered an
     // edited bullet two ways). A profile's guidelines are therefore the DEFAULT an
     // un-overridden member runs on, not policy that survives an override.
@@ -349,7 +634,7 @@ describe('agentInstruction', () => {
         // Surrounding whitespace and a trailing newline are the only things removed.
         expect(agentInstruction(summarizer, '  Condense to one line.\n ')).toBe('Condense to one line.');
 
-        // The same rule for a role whose shipped prompt is 1.3kB of shared policy: the
+        // The same rule for a role whose shipped prompt is 1.5kB of shared policy: the
         // override replaces all of it, so no trusted bullet survives into the prompt.
         expect(agentInstruction(instruct, 'Lead with the answer.')).toBe('Lead with the answer.');
         expect(agentInstruction(instruct, 'Lead with the answer.')).not.toContain('Guidelines:');

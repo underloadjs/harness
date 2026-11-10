@@ -6,12 +6,12 @@
 //
 // TWO KINDS OF PRESET (T5: only the first kind SHIPS)
 // ---------------------------------------------------
-//   live  — instruct, research, workspace, reviewer, planner. All built from
-//           TRUSTED agent profiles in src/agents through `createProfiledHarness`
+//   live  — general, instruct, research, workspace, reviewer, planner, debugger. All
+//           built from TRUSTED agent profiles in src/agents through `createProfiledHarness`
 //           (./toolbox.ts), so they register the SAME toolbox: package coding
 //           tools, the app tools, environment-backed search, and the harness core
 //           tools. Only the agents differ: names, instructions, guidelines,
-//           primary, and subagents. These five are `presets`, the default
+//           primary, and subagents. These seven are `presets`, the default
 //           catalogue every registry and every `GET /harnesses` listing starts from.
 //   fixture — demo (a scripted offline run with timeNow only) and flaky (the
 //           recoverable-failure example with `testFlaky`). They are NOT in
@@ -27,21 +27,31 @@
 //           fixture: a deletion is a durable operator decision (a tombstone in the
 //           database), while un-shipping is this module no longer listing a row.
 //
-// THE FIVE REAL ROLES (T3)
-// ------------------------
-//   instruct  — general instruction-following
-//   research  — investigator/cross-checker (visible title "Researcher")
-//   workspace — coder (visible title "Coder"; the id is legacy for compatibility)
-//   reviewer  — skeptical bug/inconsistency hunt
-//   planner   — plan, then route the steps to specialists
+// THE SEVEN REAL ROLES
+// --------------------
+//   general   — DEFAULT. Does the whole task alone; `subagents: []`, so `delegate` is
+//               never even registered for it (src/harness.ts `activation: 'subagents'`).
+//   instruct  — a worker that delegates ONLY the steps that would burn its context
+//               (research, a long read, a review) and keeps every step it must build.
+//   research  — read-only investigator (visible title "Explore").
+//   workspace — the implementor (visible title "Analyst"; the id is legacy for compatibility).
+//   reviewer  — strict independent judge of plans, code, documents, and claims.
+//   planner   — the orchestrator (visible title "Manager"): delegates every step and
+//               independently reviews each result before accepting it.
+//   debugger  — stress-tests the whole system; widest allowlist, nothing off-limits.
 //
-// TEAMS ARE SYMMETRIC ON PURPOSE. Every real preset offers every OTHER real role
-// plus `summarizer` as a direct subagent, so switching the entry role never removes
-// a specialist from the team and the Planner's `coder`/`researcher`/`reviewer`
-// targets exist by id. `teamOf()` derives the allowlist from one list, so the five
-// presets cannot drift. The one-level delegation rule is a harness property (a
-// subagent never receives delegate), so none of these prompts may ask a
-// subagent to delegate again.
+// HOW A TEAM IS DERIVED, AND THE ONE EXCEPTION. `teamOf()` builds every live preset's
+// allowlist from ONE list, so the presets cannot drift. Two ids are excluded: the primary
+// (a harness has exactly one primary and the registry rejects a subagent that names it) and
+// `planner`/Manager, because a Manager refuses to run as a delegate (src/agents/planner.ts
+// states the refusal) — offering a member that answers "I do not run as a subagent" is a
+// wasted run. A USER-created team may still select the Manager; the refusal is what makes
+// that honest. `summarizer` stays everywhere so the `textSummarize` delegated path keeps
+// working (it condenses locally when absent).
+//
+// The one-level delegation rule is a harness property (a subagent never receives delegate,
+// src/harness.ts `primaryOnlyDefinitions`), so none of these prompts may ask a subagent to
+// delegate again.
 //
 // EDITABLE TEMPLATES (R20.1)
 // --------------------------
@@ -72,11 +82,15 @@
 // Backward compatibility: `writer` and `assistant` are aliases of `instruct`,
 // and `researcher` is an alias of `research` (see ./registry.ts PRESET_ALIASES +
 // findPreset). They resolve to the canonical preset, so an old CLI invocation or
-// bookmarked session request still runs; they are not listed a second time. No
-// alias was added for the visible title "Coder": `workspace` is the id, and a new
-// reserved name could collide with an existing user-created harness on restore. The
-// harness ids themselves are unchanged by the T3 roster change — only titles,
-// descriptions and subagent allowlists moved, so a saved session keeps restoring.
+// bookmarked session request still runs; they are not listed a second time. No alias
+// was added for a visible title ("Coder"/"Researcher"/"Planner" and their successors
+// "Analyst"/"Explore"/"Manager" are TITLES, not names): the harness and agent ids stay
+// `workspace`, `research` and `planner`, and a new reserved name could collide with an
+// existing user-created harness on restore. The harness ids themselves are unchanged by
+// the roster change — only titles, descriptions and subagent allowlists moved, so a
+// saved session keeps restoring. Renaming an AGENT id is a different matter entirely: an
+// id is persisted in every record and there is no agent-level alias, so it is not done
+// here (see the matching note in ../../agents/index.ts).
 // `LEGACY_PRESET_DEFINITIONS` below records the previous shipped executable
 // definitions so ./registry.ts can refresh a built-in row that was never
 // customised.
@@ -113,26 +127,39 @@ export { PRESET_MAX_ITERATIONS };
 // shared toolbox).
 const EXAMPLE_TOOL_NAMES: readonly string[] = Object.keys(EXAMPLE_APP_TOOL_SOURCES);
 
-// The real specialist roles, in catalogue/descriptor order. This is the ONE list
-// the teams are derived from: changing a role's usefulness here changes every
-// preset's allowlist at once.
+// The real roles, in catalogue/descriptor order, DEFAULT FIRST. This is the ONE list
+// the teams and the delegate enums are derived from: adding a role here adds it to every
+// built-in team (except where `teamOf` excludes it) with no other edit here.
 export const SPECIALIST_AGENT_NAMES = [
+    'general',
     'instruct',
     'research',
     'workspace',
     'reviewer',
-    'planner'
+    'planner',
+    'debugger'
 ] as const;
 
 // `summarizer` stays a subagent everywhere so the `textSummarize` delegated path
 // keeps working in the real presets (it condenses locally when absent).
 const SUMMARIZER_AGENT_NAME = 'summarizer';
 
-// The subagent allowlist for one primary: every OTHER real role, then the
-// summarizer. The primary is excluded because a harness has exactly one primary
-// and the registry rejects a subagent that names it.
+// The Manager id, named here because it is excluded from every built-in team.
+// A Manager refuses to run as a delegate (../../agents/planner.ts states the rule), so
+// offering it as a target would only burn a child run. The refusal still applies to a
+// user-created team that selects it — this exclusion just keeps the shipped teams honest.
+const MANAGER_AGENT_NAME = 'planner';
+
+// The subagent allowlist for one primary: every OTHER real role except the Manager, then
+// the summarizer. The primary is excluded because a harness has exactly one primary and the
+// registry rejects a subagent that names it.
+//
+// The `general` role is a legal target for the other primaries (it takes a whole
+// self-contained job), but its OWN preset passes `subagents: []` rather than this list, so
+// it never receives `delegate` at all — that is the contract of the default card, and the
+// runtime enforces it by not registering the tool (src/harness.ts `activation: 'subagents'`).
 export const teamOf = (primary: string): string[] => [
-    ...SPECIALIST_AGENT_NAMES.filter((name) => name !== primary),
+    ...SPECIALIST_AGENT_NAMES.filter((name) => name !== primary && name !== MANAGER_AGENT_NAME),
     SUMMARIZER_AGENT_NAME
 ];
 
@@ -140,30 +167,48 @@ export const teamOf = (primary: string): string[] => [
 // Live harnesses: same toolbox, different selected agents
 // ---------------------------------------------------------------------------
 
-// The general-purpose choice and the first card in the UI. Its profile's
-// guidelines are about *behaviour* and discovery, not about which capabilities
-// exist: the four core file tools and a configured search are always declared;
-// files, commands, git, syntax and the app tools are searchable.
-// The allowlist is computed once per preset so the metadata and the factory
-// closure cannot see two different lists.
+// General: THE DEFAULT CARD, and the only live preset with no team. `subagents: []` is a
+// deliberate, load-bearing choice rather than an omission: `delegate` registers only when
+// the allowlist is non-empty (src/harness.ts `activation: 'subagents'`), so this harness
+// never declares the tool and `toolRequest` cannot surface it. The agent therefore cannot
+// split work out even by accident, which is exactly the contract of the default role.
+// Its `environmentTools` line is the same reasoning as every other live preset below: the
+// shared factory opts into `websearch` AND `webfetch`, `search` appears only when a key
+// resolves, and `fetch` registers either way because its native provider needs no key.
+const general: HarnessPreset = {
+    name: 'general',
+    title: 'General',
+    description:
+        'The default general-purpose agent, with the full shared toolbox and NO subagents: it does every step itself, so `delegate` is not registered and cannot be enabled. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes.',
+    requiresEndpoint: true,
+    primary: 'general',
+    // Empty on purpose — see the note above. `teamOf('general')` is what a delegating
+    // variant would use; this card must not.
+    subagents: [],
+    agents: ['general'],
+    tools: SHARED_TOOL_NAMES,
+    environmentTools: ['search', 'fetch'],
+    builtin: true,
+    editable: true,
+    template: 'live',
+    create: createProfiledHarness('general', [])
+};
+
+// Instruct: the worker posture between General and the Manager. Same toolbox; the profile
+// decides WHO does each step — it keeps anything it would have to write or run afterwards
+// and delegates only context-burning reading (an investigation, a long document, a review).
 const instructTeam = teamOf('instruct');
 
 const instruct: HarnessPreset = {
     name: 'instruct',
     title: 'Instruct',
     description:
-        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
+        'General worker with the full shared toolbox and the other roles as direct subagents. It does its own building and editing, and delegates only the steps that would burn its context: research, exploration, a long read, a review. Unlike the Manager, it never hands out work it must still finish itself.',
     requiresEndpoint: true,
     primary: 'instruct',
     subagents: instructTeam,
     agents: ['instruct', ...instructTeam],
     tools: SHARED_TOOL_NAMES,
-    // Same environment-backed declarations as every live preset: this factory builds
-    // its toolbox with `websearch: true` AND `webfetch: true`, so both names belong
-    // here. A keyless host simply does not append search (it stays listed as
-    // unconfigured in the global tool catalogue); fetch registers either way because
-    // the native provider needs no key. Both are declared core when registered
-    // (R9-R11), so this list is what lets the card advertise what it will declare.
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
@@ -171,17 +216,17 @@ const instruct: HarnessPreset = {
     create: createProfiledHarness('instruct', instructTeam)
 };
 
-// Research (visible title "Researcher"): investigate and cross-check. Same
-// toolbox as Instruct; the difference is the profile, which demands evidence and
-// citation, and the team, which lets it hand code verification or a second opinion
-// to the coding agent or the reviewer.
+// Research (visible title "Explore"): the read-only investigator. Same toolbox as every
+// live harness — nothing can deny it `write`/`edit`, so the read-only contract lives in the
+// profile. Its team is the ordinary one so a standalone Explore card can still ask the
+// Analyst to run something or the Reviewer to challenge a conclusion.
 const researchTeam = teamOf('research');
 
 const research: HarnessPreset = {
     name: 'research',
-    title: 'Researcher',
+    title: 'Explore',
     description:
-        'Researcher with the same full toolbox as every live harness and the other roles as direct subagents. read and glob are always available; search joins the toolbox when the host configured a key. Investigates, cross-checks sources, and cites what it used.',
+        'Read-only investigator with the same full toolbox as every live harness and the other roles as direct subagents. Maps files, symbols, configuration and the web, cross-checks what decides the answer, and cites file, line, tool, or URL. Changes nothing on disk unless the brief authorises a change.',
     requiresEndpoint: true,
     primary: 'research',
     subagents: researchTeam,
@@ -194,18 +239,17 @@ const research: HarnessPreset = {
     create: createProfiledHarness('research', researchTeam)
 };
 
-// Workspace (visible title "Coder"): the coding-focused live harness. The id stays
-// `workspace` for every saved session, bookmark and script; only the title says
-// Coder. Same toolbox as Instruct; the profile is what makes it a coding agent,
-// which is exactly the product rule ("the only difference is the agents
-// configuration").
+// Workspace (visible title "Analyst"): the implementor. The id stays `workspace` for every
+// saved session, bookmark and script; only the title moved. Same toolbox as every live
+// harness — the profile is what makes it an engineering role, which is exactly the product
+// rule ("the only difference is the agents configuration").
 const workspaceTeam = teamOf('workspace');
 
 const workspace: HarnessPreset = {
     name: 'workspace',
-    title: 'Coder',
+    title: 'Analyst',
     description:
-        'Coding agent with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. Everything runs on the server host.',
+        'The implementor, with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Writes the change in the existing style of the codebase, keeps it minimal and efficient, and verifies it with a real check.',
     requiresEndpoint: true,
     primary: 'workspace',
     subagents: workspaceTeam,
@@ -218,16 +262,17 @@ const workspace: HarnessPreset = {
     create: createProfiledHarness('workspace', workspaceTeam)
 };
 
-// Reviewer: a skeptical pass over a change, plan, or claim. The team is the same
-// symmetric set, so it can ask the coder to verify a code path or the researchers
-// to confirm a fact, but its own default is read-only.
+// Reviewer: a strict pass over a change, a plan, a document, or a claim. Its team is the
+// ordinary one, so it can ask the Analyst to verify a code path or Explore to confirm a
+// fact, but its own default is read-only — the Manager depends on that when it sends work
+// here for an independent check.
 const reviewerTeam = teamOf('reviewer');
 
 const reviewer: HarnessPreset = {
     name: 'reviewer',
     title: 'Reviewer',
     description:
-        'Skeptical review agent with the full shared toolbox and the other roles as direct subagents. Looks for small bugs and inconsistencies, reports each with file/line evidence, and says plainly when there is nothing to find. Reads and verifies by default; edits only when asked.',
+        'Strict, independent reviewer with the full shared toolbox and the other roles as direct subagents. Judges plans, code, documents, and claims against their own acceptance criteria, reports each finding with file/line or quote evidence plus the smallest fix, and says plainly when there is nothing to find. Reads and verifies by default; edits only when asked.',
     requiresEndpoint: true,
     primary: 'reviewer',
     subagents: reviewerTeam,
@@ -240,16 +285,18 @@ const reviewer: HarnessPreset = {
     create: createProfiledHarness('reviewer', reviewerTeam)
 };
 
-// Planner: plan, then route each step to the specialist that owns it. It is the
-// preset that exists FOR delegation, and its team deliberately contains the other
-// four real roles by id, so `delegate` targets really exist.
+// Planner (visible title "Manager"): the orchestrator, the preset that exists FOR
+// delegation. Its team deliberately contains every other role by id (the Manager itself is
+// excluded from every OTHER team, because it refuses to be a delegate), so `delegate`
+// targets really exist — and it accepts no step on its author's word without a reviewer's
+// independent check.
 const plannerTeam = teamOf('planner');
 
 const planner: HarnessPreset = {
     name: 'planner',
-    title: 'Planner',
+    title: 'Manager',
     description:
-        'Planning lead with the full shared toolbox and every other role as a direct subagent. Restates the goal and acceptance criteria, writes an explicit plan, hands each step to the specialist who owns it (researcher, coder, reviewer, instruct), and verifies the evidence before answering.',
+        'Planning and orchestration lead with the full shared toolbox and every other role as a direct subagent. Holds the whole goal, writes an explicit plan, delegates every step (research, workspace, reviewer, debugger, general, instruct), and accepts each result only after an independent review. It never executes a step itself, and refuses to run as a delegate.',
     requiresEndpoint: true,
     primary: 'planner',
     subagents: plannerTeam,
@@ -260,6 +307,29 @@ const planner: HarnessPreset = {
     editable: true,
     template: 'live',
     create: createProfiledHarness('planner', plannerTeam)
+};
+
+// Debugger: the stress-test harness. Same toolbox as every live preset (no profile can add
+// a tool), so "access to everything" is expressed as the widest TEAM plus a profile that
+// tells it nothing is off-limits — it is expected to unlock the searchable half itself and
+// to drive the system into a failure rather than route around one.
+const debuggerTeam = teamOf('debugger');
+
+const debuggerPreset: HarnessPreset = {
+    name: 'debugger',
+    title: 'Debugger',
+    description:
+        'Stress-test harness with the full shared toolbox and every other role as a direct subagent. Nothing is off-limits: it enables any searchable tool, runs any command, exercises each capability at its edges, reproduces what breaks, and reports the exact input and error.',
+    requiresEndpoint: true,
+    primary: 'debugger',
+    subagents: debuggerTeam,
+    agents: ['debugger', ...debuggerTeam],
+    tools: SHARED_TOOL_NAMES,
+    environmentTools: ['search', 'fetch'],
+    builtin: true,
+    editable: true,
+    template: 'live',
+    create: createProfiledHarness('debugger', debuggerTeam)
 };
 
 // ---------------------------------------------------------------------------
@@ -403,17 +473,24 @@ const failure: HarnessPreset = {
 // Catalogue exports (T5)
 // ---------------------------------------------------------------------------
 
-// The PRODUCTION catalogue, in UI/CLI order (instruct is the default/first card).
-// Every entry is a real, usable configuration: a live agent team on the shared
-// toolbox that runs against the configured provider. The scripted demo and the
-// failure example are deliberately absent — a catalogue a user picks from should
-// not contain a card that never calls a model, or one whose tool throws on purpose.
+// The PRODUCTION catalogue, in UI/CLI order (general is the default/first card, which is
+// also what `DEFAULT_CLI_PRESET` in ../cli/options.ts selects). Every entry is a real,
+// usable configuration: a live agent team on the shared toolbox that runs against the
+// configured provider. The scripted demo and the failure example are deliberately absent —
+// a catalogue a user picks from should not contain a card that never calls a model, or one
+// whose tool throws on purpose.
+//
+// ORDER IS A CONTRACT, NOT A PREFERENCE: it is the order `GET /harnesses` returns, the order
+// a picker renders, and the order the frontend palette assigns tones by. A new role is added
+// here on purpose, and it must match `AGENT_PROFILE_NAMES` in ../../agents/index.ts.
 export const presets: readonly HarnessPreset[] = [
+    general,
     instruct,
     research,
     workspace,
     reviewer,
-    planner
+    planner,
+    debuggerPreset
 ];
 
 // The offline/example fixtures, kept as first-class presets so a host or a test
@@ -450,6 +527,17 @@ export const ALL_PRESET_TEMPLATES: readonly HarnessPreset[] = [...presets, ...FI
 // the CURRENT template is already skipped by `presetRecordEquals` in restore.
 // Title/description are recorded too, only so an operator's prose edit can be
 // identified and preserved across the refresh.
+//
+// WHY THIS TABLE WAS NOT EXTENDED BY THE ROSTER/ROLE-CONTRACT PASS. The table holds ONE
+// snapshot per preset id, and the three entries below are the pre-T3 shapes. The roster
+// change (new `general` + `debugger` cards, `planner` excluded from every team, new titles
+// Explore/Analyst/Manager) moves the shipped default AGAIN, so an install holding the
+// pre-T3 row refreshes to the new template, while an install holding the T3 row no longer
+// matches its single legacy snapshot and is replayed as a customisation: its team is rebuilt
+// from its own saved ids, every one of which is still a known profile, so restore cannot
+// fail. Recording the T3 shape instead would have traded one refresh path for the other
+// rather than keeping both; a future migration that wants both should widen this type to a
+// list of accepted historical shapes rather than replacing an entry.
 export type LegacyPresetDefinition = {
     title: string;
     description: string;

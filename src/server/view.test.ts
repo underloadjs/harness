@@ -999,7 +999,9 @@ describe('the canonical session surface (R3)', () => {
 
         expect(wrongMethod.status).toBe(405);
         expect(wrongMethod.json).toEqual({
-            error: { message: `Use GET for /v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/0-user-prompt.` }
+            error: {
+                message: `Use GET, PATCH for /v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/0-user-prompt.`
+            }
         });
 
         // R3: an instruction OVERRIDE is per-agent system-prompt text, so the compact
@@ -1009,6 +1011,187 @@ describe('the canonical session surface (R3)', () => {
         // ...while the RAW surface still reports the frozen descriptor verbatim (the
         // raw contract is unchanged, and a saved session's dialog reads it there).
         expect(store.get(created.id).harnessDefinition?.agentInstructions).toEqual(preset.agentInstructions);
+    });
+
+    // -----------------------------------------------------------------------
+    // The inclusion toggle (T5): one segment, one control, and the write goes through
+    // the SEGMENT's own route. No whole-transcript document PUT is issued for it, so the
+    // context bar never races the live transcript (docs/tasks R5-R8).
+    // -----------------------------------------------------------------------
+
+    it('switches one tool round out of the prompt through its own segment route', async () => {
+        const store = storeOf([toolRoundPreset()]);
+        const api = apiOf(store);
+        const created = await store.create('worker');
+        const turn = await runTurn(store, created.id, 'do the work');
+        // The LIVE record, not the snapshot: the assertions below read the transcript through
+        // the harness seam the route itself writes through (./api.ts `blockUnitOf` +
+        // `updateThreadTranscript`), which is the seam the NEXT model request is built from.
+        const record = store.liveSession(created.id);
+        const events = record.turns[0].events;
+        const argsIndex = events.findIndex((event) => event.type === 'tool_call');
+        const resultIndex = events.findIndex((event) => event.type === 'tool_result');
+        const textIndex = events.findIndex((event) => event.type === 'text');
+        const args = (events[argsIndex] as { call: { arguments: string } }).call.arguments;
+        const result = (events[resultIndex] as { content: string }).content;
+        // The recorded ledger, compared verbatim at the end: the toggle moves a transcript
+        // FLAG, so none of the bytes the bar counts may move with it.
+        const ledger = JSON.stringify(events);
+        // The conversation the turn belongs to. The route takes this id from the turn's own
+        // join (./protocol.ts `SessionTurn.threadId`), never from the client, so pinning it
+        // here is what makes the receipt's `thread_id` an assertion rather than a tautology.
+        const threadId = turn.threadId as string;
+
+        expect(threadId).toBe('thread-1');
+
+        const route = (blockId: string) => `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${blockId}`;
+        const toolId = `0-tool-${argsIndex}`;
+        const toolRoute = route(toolId);
+        const displayRoute = `/v1/harness/sessions/${created.id}/turns/${turn.id}/display`;
+
+        /**
+         * What one segment says about inclusion: the published boolean, or `unaddressable`
+         * when the property is ABSENT. Absent is the load-bearing case — the instruction and
+         * the prompt are seeded by the core, and an ANSWER has no single transcript entry of
+         * its own (it is the text half of an assistant leader split across two events), so the
+         * bar mints segments whose inclusion nobody can switch. The dialog renders no control
+         * for them, which is why `true` and "absent" may not be conflated.
+         */
+        const publishedInclusion = async (blockId: string) => {
+            const read = await call(api, 'GET', route(blockId));
+
+            expect(read.status).toBe(200);
+
+            const block = read.json.block as Record<string, unknown>;
+
+            return Object.hasOwn(block, 'included') ? block.included : 'unaddressable';
+        };
+
+        expect(await publishedInclusion('0-system-instructions')).toBe('unaddressable');
+        expect(await publishedInclusion('0-user-prompt')).toBe('unaddressable');
+        expect(await publishedInclusion(`0-assistant-${textIndex}`)).toBe('unaddressable');
+        expect(await publishedInclusion(toolId)).toBe(true);
+
+        // OFF, and the receipt is the write's own verdict read BACK off the record: the dialog
+        // repaints from THIS body rather than guessing, so a refusal leaves the chip exactly
+        // where it was (R6: no optimistic state).
+        const off = await call(api, 'PATCH', toolRoute, { included: false });
+
+        expect(off.status).toBe(200);
+        expect(off.json).toEqual({
+            session_id: created.id,
+            turn_id: turn.id,
+            block_id: toolId,
+            included: false,
+            thread_id: threadId,
+            revision: 1,
+            links: {
+                block: toolRoute,
+                transcript: `/v1/harness/sessions/${created.id}/threads/${threadId}/transcript`
+            }
+        });
+
+        // The durable consequence, at the seam the core folds into the next request: the
+        // round's LEADER and the result that answers its call are flagged together, and nothing
+        // else moves — same entries, same ids, same text, `included: false` as the only
+        // difference. `false` is the only value ever stored, the way core's own `turn.before`
+        // control writes it (../harness.ts `writeIncluded`).
+        expect(record.harness.threadMessages(threadId)).toStrictEqual([
+            { role: 'system', content: WORKER_INSTRUCTION, messageId: 'msg-1' },
+            { role: 'user', content: 'do the work', messageId: 'msg-2' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'call-1', name: 'tasks', arguments: args }], included: false, messageId: 'msg-3' },
+            { role: 'tool', content: result, toolCallId: 'call-1', name: 'tasks', included: false, messageId: 'msg-4' },
+            { role: 'assistant', content: 'finished', messageId: 'msg-5' }
+        ]);
+
+        // ON again, read back the same way — and ON REMOVES the flag rather than writing
+        // `included: true`, so the durable document keeps the shape every other writer expects.
+        const on = await call(api, 'PATCH', toolRoute, { included: true });
+
+        expect(on.status).toBe(200);
+        expect(on.json).toEqual({
+            session_id: created.id,
+            turn_id: turn.id,
+            block_id: toolId,
+            included: true,
+            thread_id: threadId,
+            revision: 2,
+            links: {
+                block: toolRoute,
+                transcript: `/v1/harness/sessions/${created.id}/threads/${threadId}/transcript`
+            }
+        });
+        expect(record.harness.threadMessages(threadId)).toStrictEqual([
+            { role: 'system', content: WORKER_INSTRUCTION, messageId: 'msg-1' },
+            { role: 'user', content: 'do the work', messageId: 'msg-2' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'call-1', name: 'tasks', arguments: args }], messageId: 'msg-3' },
+            { role: 'tool', content: result, toolCallId: 'call-1', name: 'tasks', messageId: 'msg-4' },
+            { role: 'assistant', content: 'finished', messageId: 'msg-5' }
+        ]);
+
+        // OFF once more, for the two reads the dialog and the bar actually make.
+        expect((await call(api, 'PATCH', toolRoute, { included: false })).json).toMatchObject({ included: false, revision: 3 });
+
+        // R7 on the detail surface: the segment is still the SAME segment — same recorded
+        // bytes, same state — with one extra fact. `inPrompt` stays true on purpose: that is
+        // the projector's claim about the run that already happened, while `included` is the
+        // reader-facing axis for the requests that FOLLOW (../shared/turn-display.ts:542-560).
+        expect((await call(api, 'GET', toolRoute)).json.block).toMatchObject({
+            kind: 'tool',
+            id: toolId,
+            name: 'tasks',
+            state: 'ok',
+            chars: args.length + result.length,
+            inPrompt: true,
+            included: false,
+            args,
+            result
+        });
+
+        // The compact surface keeps every figure it had, flagless. The bar counts the recorded
+        // ledger, which this write does not touch; a segment that stopped riding in the prompt
+        // is still the same number of recorded characters, and the dialog is where the switch
+        // shows up.
+        const context = ((await call(api, 'GET', displayRoute)).json.display as { sections: { context: Record<string, unknown>[] }[] })
+            .sections[0].context;
+
+        expect(context.map((segment) => [segment.id, segment.chars, segment.inPrompt, segment.included])).toEqual([
+            ['0-system-instructions', WORKER_INSTRUCTION.length, true, undefined],
+            ['0-user-prompt', 11, true, undefined],
+            [toolId, args.length + result.length, true, undefined],
+            [`0-assistant-${textIndex}`, 8, true, undefined]
+        ]);
+        expect(JSON.stringify(record.turns[0].events)).toBe(ledger);
+
+        // A segment with no addressable entry REFUSES rather than answering a quiet no-op —
+        // the alternative is a chip that looks like it worked and changed nothing.
+        for (const blockId of ['0-system-instructions', '0-user-prompt', `0-assistant-${textIndex}`]) {
+            const refusal = await call(api, 'PATCH', route(blockId), { included: false });
+
+            expect(refusal.status).toBe(409);
+            expect(refusal.json).toEqual({
+                error: {
+                    message: `Context segment "${blockId}" has no transcript entry to switch: the call it recorded is not in this conversation's transcript.`
+                }
+            });
+        }
+
+        // A block the bar never minted and a turn that does not exist stay 404s, and the body
+        // gate is the GENERATED one: only `included` rides, and only as a real boolean — the
+        // same strictness `setIncluded` applies to its own argument.
+        expect((await call(api, 'PATCH', route('0-tool-9999'), { included: false })).status).toBe(404);
+        expect(
+            (await call(api, 'PATCH', `/v1/harness/sessions/${created.id}/turns/nope/blocks/${toolId}`, { included: false })).status
+        ).toBe(404);
+        expect((await call(api, 'PATCH', toolRoute, {})).json).toEqual({
+            error: { message: 'A context segment inclusion write requires a boolean "included" value.' }
+        });
+        expect((await call(api, 'PATCH', toolRoute, { included: 'no' })).json).toEqual({
+            error: { message: 'A context segment inclusion write requires a boolean "included" value.' }
+        });
+        expect((await call(api, 'PATCH', toolRoute, { nope: true })).json).toEqual({
+            error: { message: 'Unknown field "nope". Allowed fields: included.' }
+        });
     });
 });
 

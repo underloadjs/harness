@@ -1,29 +1,41 @@
 // Harness preset architecture: one shared toolbox, agents as the only difference.
 //
-// These tests pin the product rule that replaced the old writer/assistant/
-// researcher tool subsets, plus the T3 roster:
-//   - five REAL roles (instruct, research, workspace, reviewer, planner) are the
-//     WHOLE shipped catalogue, with the visible titles Instruct/Researcher/Coder/
-//     Reviewer/Planner; the scripted demo and the flaky example are presets too, but
-//     T5 un-shipped them — they stay available through FIXTURE_PRESETS/
+// These tests pin the product rule that replaced the old writer/assistant/researcher
+// tool subsets, plus the current roster (T3 + the role-contract pass):
+//   - seven REAL roles (general, instruct, research, workspace, reviewer, planner,
+//     debugger) are the WHOLE shipped catalogue, in that order, with the visible titles
+//     General/Instruct/Explore/Analyst/Reviewer/Manager/Debugger; `research`,
+//     `workspace` and `planner` keep their persisted ids while only their TITLES moved,
+//     because an id is written into every saved record and has no alias fallback
+//     (../../agents/index.ts). The scripted demo and the flaky example are presets too,
+//     but T5 un-shipped them — they stay available through FIXTURE_PRESETS/
 //     ALL_PRESET_TEMPLATES so a host or a test injects them explicitly;
+//   - `general` is the DEFAULT card (it is `presets[0]` and `DEFAULT_CLI_PRESET`) and the
+//     ONLY live preset with no team: `subagents: []`, which means `delegate` is never
+//     even REGISTERED for it (src/harness.ts `activation: 'subagents'`), so it is absent
+//     from the registry, from the declarations, and from the descriptor's coreTools;
 //   - every real preset registers the exact same tool keys, configured and keyless —
 //     package coding tools, the app tools, search when a key resolves, then the
-//     harness core tools;
-//   - every real preset declares EVERY other real role plus `summarizer` as a direct
-//     subagent, so `delegate` exists on all five and the Planner's researcher/
-//     coder/reviewer targets exist by id;
-//   - the profiles' delegation wording is conditional and one level deep: a subagent
-//     is never asked to delegate again;
+//     harness core tools; the only difference is `delegate`, which the default card lacks;
+//   - `teamOf()` derives every built-in allowlist from ONE list, minus the primary and
+//     minus `planner`/Manager — a Manager refuses to run as a delegate
+//     (../../agents/planner.ts), so a shipped team never offers a member that would
+//     refuse it — then adds `summarizer` so the `textSummarize` delegated path keeps working;
+//   - the delegation wording lives in ONE shared guideline line (../../agents/guidelines.ts)
+//     that the six team roles compose verbatim, and the default profile carries no
+//     delegation line at all because it has no subagents;
 //   - every profile-built agent is seeded with exactly ONE system message: the
 //     identity sentence and the guidelines joined into a single prompt by
 //     `agentInstruction()` (../../agents/index.ts), because two seeded `system`
 //     messages lose the guidelines on gateways that accept only one system turn;
 //   - `testFlaky` is not part of the shared set (it is an example-only extra);
 //   - the scripted demo is a documented fixture exception;
-//   - the legacy preset ids still resolve as aliases (`coder` → `workspace`);
-//   - `textSummarize` delegates to `summarizer` in every real preset and condenses
-//     locally where that agent is absent (the fixtures).
+//   - the legacy preset ids still resolve as aliases (`writer`/`assistant` → `instruct`,
+//     `researcher` → `research`), and the new TITLES are deliberately not names;
+//   - `LEGACY_PRESET_DEFINITIONS` stays at its three pre-T3 snapshots on purpose (the
+//     roster pass did not extend it — see the note in ./presets.ts);
+//   - `textSummarize` delegates to `summarizer` in every TEAM preset and condenses
+//     locally where that agent is absent (the default card and the fixtures).
 //
 // No network: constructing a preset never calls the provider (the transport is
 // only used when a turn runs), and the search factory resolves its key at
@@ -40,6 +52,7 @@ import {
     describeHarness,
     findPreset,
     FIXTURE_PRESETS,
+    LEGACY_PRESET_DEFINITIONS,
     presets,
     PRESET_ALIASES,
     PRESET_MAX_ITERATIONS,
@@ -48,6 +61,7 @@ import {
     teamOf
 } from './index';
 import { AGENT_PROFILES, agentInstruction } from '../../agents';
+import { DEFAULT_CLI_PRESET } from '../cli/options';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -147,37 +161,77 @@ const CORE = [
     'agentResult'
 ];
 
-// The five real primaries, in catalogue order.
-const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
+// The seven real primaries, in catalogue order, DEFAULT FIRST.
+const REAL = ['general', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'] as const;
+
+// The six that get a built-in team. `general` is deliberately NOT here: its card passes
+// `subagents: []`, so `delegate` is not registered for it at all — every assertion about
+// `delegate` and about the delegated `summarizer` applies to this list only.
+const TEAMED = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'] as const;
+
+// One live card, spelled out from the metadata the descriptor publishes. `team` is the
+// literal allowlist (pinned independently against `teamOf` in the team test), so this
+// helper cannot paper over a card that drifted from the derivation.
+const card = (name: string, team: readonly string[]) => ({
+    name,
+    primary: name,
+    subagents: [...team],
+    agents: [name, ...team],
+    tools: TOOLBOX,
+    environmentTools: ['search', 'fetch']
+});
+
+// The ONE delegation line the six team roles compose verbatim (../../agents/guidelines.ts
+// `DELEGATION_GUIDELINE`). The gate itself — primary-only, one level deep, registered only
+// with subagents — is carried by the tool declaration, so this line only carries the three
+// policies no schema can say. It is pinned as a literal so a rewording in the source is a
+// visible diff here instead of a silent pass.
+const DELEGATION_LINE =
+    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation, verify its answer before relying on it, and follow up with the same target instead of guessing: a later delegation continues that subagent\'s conversation.';
+
+// The default card's replacement for that line (../../agents/general.ts): alone by
+// contract, and the `threadFork` loophole closed in the same breath.
+const LONE_LINE =
+    'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork either.';
 
 afterEach(() => {
     vi.unstubAllEnvs();
 });
 
 describe('preset catalogue', () => {
-    it('ships the five real roles and keeps the two examples as explicit fixtures (T5)', () => {
+    it('ships the seven real roles and keeps the two examples as explicit fixtures (T5)', () => {
         // The shipped catalogue is exactly the real roles: every card is a live
         // harness a user can actually run. The scripted demo and the failure example
         // are presets, but they are no longer product configurations.
         expect(presets.map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
-        ]);
-        expect(presets.map((preset) => preset.title)).toEqual([
-            'Instruct',
-            'Researcher',
-            'Coder',
-            'Reviewer',
-            'Planner'
+            'planner',
+            'debugger'
         ]);
 
-        // The UI selects the first descriptor at boot, so the first card must be a
-        // real harness rather than the scripted demo.
-        expect(presets[0].name).toBe('instruct');
+        // ORDER IS A CONTRACT: this is the order `GET /harnesses` returns, the order a
+        // picker renders, and the order the frontend palette assigns tones by. It must
+        // match `AGENT_PROFILE_NAMES` (../../agents/index.ts) minus summarizer/fixtures.
+        expect(presets.map((preset) => preset.title)).toEqual([
+            'General',
+            'Instruct',
+            'Explore',
+            'Analyst',
+            'Reviewer',
+            'Manager',
+            'Debugger'
+        ]);
+
+        // The UI selects the first descriptor at boot and the CLI uses it with no
+        // `--preset`, so the first card must be the default real harness — the two
+        // values are one product decision pinned from both sides.
+        expect(presets[0].name).toBe('general');
         expect(presets[0].requiresEndpoint).toBe(true);
+        expect(DEFAULT_CLI_PRESET).toBe('general');
 
         // The review the removal came with: nothing in the shipped catalogue is
         // offline, scripted, or registers a tool that fails on purpose.
@@ -202,19 +256,52 @@ describe('preset catalogue', () => {
         expect(PRESET_MAX_ITERATIONS).toBe(1000);
     });
 
-    it('derives one symmetric team per primary: the other real roles, then the summarizer', () => {
-        expect([...SPECIALIST_AGENT_NAMES]).toEqual([...REAL]);
-
-        expect(REAL.map((primary) => [primary, teamOf(primary)])).toEqual([
-            ['instruct', ['research', 'workspace', 'reviewer', 'planner', 'summarizer']],
-            ['research', ['instruct', 'workspace', 'reviewer', 'planner', 'summarizer']],
-            ['workspace', ['instruct', 'research', 'reviewer', 'planner', 'summarizer']],
-            ['reviewer', ['instruct', 'research', 'workspace', 'planner', 'summarizer']],
-            ['planner', ['instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
+    it('derives one team per primary: every other real role except the Manager, then the summarizer', () => {
+        // The ONE list every team is derived from, in catalogue order (default first).
+        expect([...SPECIALIST_AGENT_NAMES]).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger'
         ]);
+
+        // Exact expansion per primary: SPECIALIST order minus the primary minus
+        // `planner`/Manager, then `summarizer` last. `planner` is excluded from every
+        // built-in team because it refuses to run as a delegate (../../agents/planner.ts
+        // and the note above each card in ./presets.ts); `general` IS a legal target for
+        // the other primaries even though its OWN card has no team.
+        expect(REAL.map((primary) => [primary, teamOf(primary)])).toEqual([
+            ['general', ['instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
+            ['reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
+            ['planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
+        ]);
+
+        // The exclusion, stated twice so a one-sided edit cannot pass: no built-in team
+        // offers the Manager, and a primary is never inside its own team.
+        expect(REAL.map((primary) => teamOf(primary).includes('planner'))).toEqual(
+            REAL.map(() => false)
+        );
+        expect(REAL.map((primary) => teamOf(primary).includes(primary))).toEqual(
+            REAL.map(() => false)
+        );
+
+        // `summarizer` is in every derived team — the `textSummarize` delegated path
+        // looks that id up at call time.
+        expect(REAL.map((primary) => teamOf(primary).at(-1))).toEqual(
+            REAL.map(() => 'summarizer')
+        );
     });
 
     it('declares explicit primary/subagents and the shared tool list on real presets', () => {
+        // Cards are spelled out from literals, not from `teamOf`, so a card that stops
+        // agreeing with the derivation fails HERE as well as in the team test.
         expect(
             presets.map((preset) => ({
                 name: preset.name,
@@ -225,51 +312,20 @@ describe('preset catalogue', () => {
                 environmentTools: preset.environmentTools
             }))
         ).toEqual([
-            {
-                name: 'instruct',
-                primary: 'instruct',
-                subagents: teamOf('instruct'),
-                agents: ['instruct', ...teamOf('instruct')],
-                tools: TOOLBOX,
-                environmentTools: ['search', 'fetch']
-            },
-            {
-                name: 'research',
-                primary: 'research',
-                subagents: teamOf('research'),
-                agents: ['research', ...teamOf('research')],
-                tools: TOOLBOX,
-                environmentTools: ['search', 'fetch']
-            },
-            {
-                name: 'workspace',
-                primary: 'workspace',
-                subagents: teamOf('workspace'),
-                agents: ['workspace', ...teamOf('workspace')],
-                tools: TOOLBOX,
-                environmentTools: ['search', 'fetch']
-            },
-            {
-                name: 'reviewer',
-                primary: 'reviewer',
-                subagents: teamOf('reviewer'),
-                agents: ['reviewer', ...teamOf('reviewer')],
-                tools: TOOLBOX,
-                environmentTools: ['search', 'fetch']
-            },
-            {
-                name: 'planner',
-                primary: 'planner',
-                subagents: teamOf('planner'),
-                agents: ['planner', ...teamOf('planner')],
-                tools: TOOLBOX,
-                environmentTools: ['search', 'fetch']
-            }
+            // THE DEFAULT CARD: the only live preset with an empty allowlist. That is a
+            // load-bearing choice, not an omission — `delegate` registers only when the
+            // allowlist is non-empty, so this harness never declares the tool.
+            card('general', []),
+            card('instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']),
+            card('research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']),
+            card('workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']),
+            card('reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']),
+            card('planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']),
+            card('debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'])
         ]);
 
-        // T5: the fixture exceptions are still declared honestly — demo is offline
-        // with timeNow only, flaky adds its example tool — they are simply not part
-        // of what the product ships.
+        // The fixtures are unchanged by the roster pass, and still declared honestly:
+        // demo is offline with timeNow only, flaky adds its example tool.
         expect(
             FIXTURE_PRESETS.map((preset) => ({
                 name: preset.name,
@@ -325,24 +381,105 @@ describe('preset catalogue', () => {
         expect(findPreset('researcher')).toBe(findPreset('research'));
         expect(findPreset('nope')).toBeUndefined();
 
-        // The visible title "Coder" keeps the `workspace` id (T3): no new reserved
-        // name is introduced, so a user-created harness named "coder" stays legal.
-        expect(findPreset('workspace')?.title).toBe('Coder');
+        // TITLES are not NAMES (T3, and again for Explore/Analyst/Manager): the ids stay
+        // `workspace`/`research`/`planner` so saved sessions and the agents.json overlay
+        // keep resolving, and no new reserved name collides with a user harness. The
+        // roster renames are therefore only visible in the `title` field.
+        expect(findPreset('workspace')?.title).toBe('Analyst');
+        expect(findPreset('research')?.title).toBe('Explore');
+        expect(findPreset('planner')?.title).toBe('Manager');
         expect(findPreset('coder')).toBeUndefined();
+        expect(findPreset('explore')).toBeUndefined();
+        expect(findPreset('analyst')).toBeUndefined();
+        expect(findPreset('manager')).toBeUndefined();
+
+        // `general` and `debugger` are real ids, not aliases — the alias table above is
+        // still exactly the three legacy names.
+        expect(findPreset('general')?.title).toBe('General');
+        expect(findPreset('debugger')?.title).toBe('Debugger');
+    });
+
+    it('keeps LEGACY_PRESET_DEFINITIONS at its three pre-T3 snapshots (deliberately not extended)', () => {
+        // ./presets.ts records WHY this table was not touched by the roster pass: it holds
+        // ONE snapshot per id, so an install holding the pre-T3 row refreshes to the new
+        // template, while an install holding the T3 row is replayed as a customisation.
+        // Pinning the exact shape here is what makes "not extended" an assertion rather
+        // than an accident.
+        expect(Object.keys(LEGACY_PRESET_DEFINITIONS)).toEqual(['instruct', 'research', 'workspace']);
+
+        expect(
+            Object.entries(LEGACY_PRESET_DEFINITIONS).map(([name, definition]) => ({
+                name,
+                title: definition.title,
+                requiresEndpoint: definition.requiresEndpoint,
+                primary: definition.primary,
+                subagents: definition.subagents,
+                agents: definition.agents,
+                environmentTools: definition.environmentTools,
+                template: definition.template
+            }))
+        ).toEqual([
+            {
+                name: 'instruct',
+                title: 'Instruct',
+                requiresEndpoint: true,
+                primary: 'instruct',
+                subagents: [],
+                agents: ['instruct'],
+                environmentTools: ['search'],
+                template: 'live'
+            },
+            {
+                name: 'research',
+                title: 'Research',
+                requiresEndpoint: true,
+                primary: 'research',
+                subagents: ['summarizer'],
+                agents: ['research', 'summarizer'],
+                environmentTools: ['search'],
+                template: 'live'
+            },
+            {
+                name: 'workspace',
+                title: 'Workspace (coding)',
+                requiresEndpoint: true,
+                primary: 'workspace',
+                subagents: [],
+                agents: ['workspace'],
+                environmentTools: ['search'],
+                template: 'live'
+            }
+        ]);
+
+        // The legacy rows keep the OLD titles, which is the whole point: the refresh
+        // compares a saved record against these, and a record whose executable fields
+        // match is a shipped default rather than an operator decision. Only two of the
+        // three rows had a title to move (`instruct` was never renamed), so the contrast
+        // with the current cards is pinned where a rename actually happened.
+        expect(LEGACY_PRESET_DEFINITIONS.instruct.title).toBe(findPreset('instruct')?.title);
+        expect(LEGACY_PRESET_DEFINITIONS.research.title).toBe('Research');
+        expect(LEGACY_PRESET_DEFINITIONS.workspace.title).toBe('Workspace (coding)');
+        expect(findPreset('research')?.title).toBe('Explore');
+        expect(findPreset('workspace')?.title).toBe('Analyst');
+        // The legacy rows also predate the environment `fetch` declaration, so a saved
+        // record that still says `['search']` is recognisably a pre-T3 default.
+        expect(
+            Object.values(LEGACY_PRESET_DEFINITIONS).map((definition) => definition.environmentTools)
+        ).toEqual([['search'], ['search'], ['search']]);
     });
 });
 
 describe('one toolbox, different agents', () => {
-    it('registers the identical shared toolbox on every real preset when search is configured', () => {
+    it('registers the identical shared toolbox on every team preset when search is configured', () => {
         vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        // Identical by construction: preset.tools is the same table, every real
-        // preset declares subagents (so delegate exists on all five), and the
-        // only other difference is the example's testFlaky. W4: the toolbox factory
-        // also opts into webfetch, so fetch is registered right after the
-        // configured search and stays SEARCHABLE (it is not in CORE).
-        for (const name of REAL) {
+        // Identical by construction: preset.tools is the same table, every TEAMED preset
+        // declares subagents (so delegate exists), and the only other difference is the
+        // example's testFlaky. W4: the toolbox factory also opts into webfetch, so fetch
+        // is registered right after the configured search and stays SEARCHABLE (it is not
+        // in CORE).
+        for (const name of TEAMED) {
             expect(registeredTools(name)).toEqual([
                 ...CORE,
                 'delegate',
@@ -374,13 +511,66 @@ describe('one toolbox, different agents', () => {
         ]);
     });
 
-    it('registers the identical toolbox on every real preset when the host is keyless', () => {
+    it('omits delegate from the default card while every other row stays identical', () => {
+        // THE load-bearing difference, pinned in both key states: `subagents: []` means
+        // the kernel never registers `delegate` (src/harness.ts `activation: 'subagents'`),
+        // so the row is absent from the registry rather than merely undeclared —
+        // `toolRequest` cannot surface it either, because discovery only lists rows.
+        vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        expect(registeredTools('general')).toEqual([
+            ...CORE,
+            'threadFork',
+            'toolCancel',
+            ...TOOLBOX,
+            'search',
+            'fetch'
+        ]);
+
+        vi.stubEnv('EXA_API_KEY', '');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        expect(registeredTools('general')).toEqual([
+            ...CORE,
+            'threadFork',
+            'toolCancel',
+            ...TOOLBOX,
+            'fetch'
+        ]);
+
+        // One agent, no subagent map, and therefore no summarizer to delegate to either.
+        const harness = presetOf('general').create(SETTINGS, progress);
+        expect(Object.keys(harness.agents)).toEqual(['general']);
+        expect(Object.keys(harness.subagents)).toEqual([]);
+        expect(harness.tools.delegate).toBeUndefined();
+        expect(harness.agents.summarizer).toBeUndefined();
+
+        // The descriptor agrees with the runtime: a picker must not advertise a
+        // delegation capability this card does not have.
+        const configured = createToolCatalogue({
+            websearch: createWebSearchCatalogueEntry({
+                configuration: { env: { EXA_API_KEY: 'configured-exa-key' } }
+            })
+        });
+        expect(describeHarness(presetOf('general'), configured).coreTools).toEqual([
+            'toolRequest',
+            'tasks',
+            'read',
+            'write',
+            'edit',
+            'glob',
+            'grep',
+            'search',
+            'fetch'
+        ]);
+    });
+
+    it('registers the identical toolbox on every team preset when the host is keyless', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
         // W4: fetch needs no credential, so unlike search it is still here on
         // a keyless host; it lands after the shared table and before the core set.
-        for (const name of REAL) {
+        for (const name of TEAMED) {
             expect(registeredTools(name)).toEqual([
                 ...CORE,
                 'delegate',
@@ -489,7 +679,7 @@ describe('one toolbox, different agents', () => {
         }
 
         // Configured: search is core exactly on the presets that registered it
-        // (the five real roles and flaky; not the scripted demo).
+        // (the seven real roles and flaky; not the scripted demo).
         vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
         const configured = createToolCatalogue({
@@ -539,12 +729,16 @@ describe('one toolbox, different agents', () => {
         // The identity sentence, quoted exactly, is the text ABOVE the joined
         // `Guidelines:` block. Splitting on the literal separator pins both the
         // sentence and the `\n\nGuidelines:\n` structure the runtime must produce.
+        // Titles moved for three ids (Explore/Analyst/Manager) while the ids behind
+        // them did not, so the sentence is the only place the rename is visible.
         expect(instructions.map((prompt) => prompt.split('\n\nGuidelines:\n')[0])).toEqual([
-            'You are the Instruct agent. Follow the brief exactly, answer directly, and do only what was asked.',
-            'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',
-            'You are the Coder agent. Read, edit, and verify files in the server workspace, and keep every change as small as the task allows.',
-            'You are the Reviewer agent. Find real defects in the work you are given, and report only what you can point to.',
-            'You are the Planner agent. Plan before you build, route each step to the narrowest configured specialist, and verify the result yourself.'
+            'You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent.',
+            'You are the Instruct agent. Do the work yourself, and delegate only a step that would cost more context than it is worth to perform.',
+            'You are the Explore agent. Establish what is actually there and how it works, and report only what you can point to.',
+            'You are the Analyst agent. Implement the work in the codebase at the standard its surrounding code already sets, and prove it works.',
+            'You are the Reviewer agent, a strict judge. Test the work against what it claims, and report only what you can point to.',
+            'You are the Manager agent. Hold the whole goal, plan it, and steer specialists through every step; you delegate the work and never do it yourself.',
+            'You are the Debugger agent. Exercise the whole system until something breaks, then prove how it breaks.'
         ]);
 
         // The delegated summarizer is a profile too: same composition, one string.
@@ -552,63 +746,102 @@ describe('one toolbox, different agents', () => {
             'You compress technical notes into at most two sentences.\n\nGuidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
         );
 
-        // Every real preset has exactly its team; the primary is never a subagent.
+        // Every preset has exactly its team; the primary is never a subagent. The
+        // default card's entry is the contract, not an omission: empty team, one agent.
         expect(
             REAL.map((name) => {
                 const harness = presetOf(name).create(SETTINGS, progress);
                 return [name, Object.keys(harness.subagents), Object.keys(harness.agents)];
             })
-        ).toEqual(
-            REAL.map((name) => [name, [...teamOf(name)], [name, ...teamOf(name)]])
-        );
+        ).toEqual([
+            ['general', [], ['general']],
+            ['instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'], ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'], ['research', 'general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'], ['workspace', 'general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
+            ['reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'], ['reviewer', 'general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
+            ['planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'], ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'], ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
+        ]);
     });
 
-    it('asks each real profile to delegate conditionally, one level deep', () => {
-        // Every real profile must describe `delegate` as declared only to a
-        // PRIMARY when the harness configures targets AND state that a subagent
-        // cannot delegate further. That combination is what makes the same text
-        // correct for a primary and for a lone/subagent profile, which must do the
-        // work itself rather than wait for a tool it never receives.
-        for (const name of REAL) {
+    it('composes one shared delegation line for the team roles, and none on the default card', () => {
+        // The six roles that may delegate all compose the SAME line (no per-role
+        // paraphrase that can drift), and that line reads correctly for a primary (it has
+        // the tool) and for a subagent (it never does — `primaryOnlyDefinitions` in
+        // src/harness.ts). The GATE itself — primary-only, one level deep, registered only
+        // with subagents — is declared by the tool, not repeated here.
+        for (const name of TEAMED) {
             const block = AGENT_PROFILES[name].guidelines.join('\n');
 
-            expect(block).toContain('delegate');
-            expect(block).toContain('If you are the primary agent and this harness configures subagents');
-            expect(block).toContain('declared to you');
-            expect(block).toContain('cannot delegate further');
+            expect(block).toContain(DELEGATION_LINE);
         }
 
-        // The Planner names the specialist ids it routes to, so the
-        // researcher/coder/reviewer targets are discoverable in words — and it defers
-        // to the delegate `agent` enum for the authoritative list. That indirection is
-        // the fix for a real contradiction: the SAME profile is the primary of the
-        // `instruct` team, where `instruct` is excluded from the allowlist (a team's
-        // allowlist is every member except its primary), so a prompt that promised
-        // "instruct for general work" instructed the planner to route to an id it
-        // structurally could not reach.
+        // The default card carries no delegation wording at all, because its harness has
+        // no subagents and therefore no `delegate` row to describe. Instead it states the
+        // rule the runtime enforces, plus the fork loophole the runtime leaves open.
+        const loneBlock = AGENT_PROFILES.general.guidelines.join('\n');
+
+        expect(loneBlock).toContain(LONE_LINE);
+        expect(loneBlock).not.toContain('delegate');
+        expect(loneBlock).not.toContain(DELEGATION_LINE);
+
+        // The roles that DO delegate must not promise the lone card's contract, either.
+        expect(AGENT_PROFILES.instruct.guidelines.join('\n')).not.toContain(LONE_LINE);
+    });
+
+    it('makes the Manager refuse to work alone or as a delegate, and name only reachable ids', () => {
+        // Both refusal rules are prompt-level, because `AgentConfiguration` has no tool
+        // list to deny with (../../agents/planner.ts). Rule 1 covers a harness with no
+        // team; rule 2 covers the Manager running as someone's subagent — the same
+        // observable signal (no declared `delegate`) decides both.
         const plannerPlan = AGENT_PROFILES.planner.guidelines.join('\n');
-        for (const target of ['research', 'workspace', 'reviewer']) {
-            expect(plannerPlan).toContain(target);
-        }
-        expect(plannerPlan).toContain('delegate `agent` enum');
-        expect(plannerPlan).toContain('do the step yourself');
-        // The unreachable-id promise is gone: no guideline may name `instruct` as a
-        // routing target.
+
+        expect(plannerPlan).toContain(
+            'If `delegate` is not declared to you, stop and say why: with no one to delegate to a Manager cannot manage, and it must not quietly become a worker.'
+        );
+        expect(plannerPlan).toContain(
+            'If this brief reached you because another agent delegated to you, reply that a Manager does not run as a delegate, and stop without starting the task.'
+        );
+        expect(plannerPlan).toContain('never do a step yourself');
+
+        // ROUTING NAMES NO UNREACHABLE ID. The delegate `agent` enum IS the session
+        // allowlist (src/harness.ts), so every id the prompt offers has to be a member of
+        // the Manager's own built-in team — and `planner` itself never is, which is what
+        // the exclusion in `teamOf` guarantees.
+        const routingIds = ['research', 'workspace', 'reviewer', 'debugger', 'general', 'summarizer'];
+
+        expect(plannerPlan).toContain(
+            'Delegate every step to the narrowest id that fits: research to investigate, workspace to implement, reviewer to challenge, debugger to stress-test, general for a whole self-contained job, summarizer to condense.'
+        );
+        expect(routingIds.map((id) => teamOf('planner').includes(id))).toEqual(
+            routingIds.map(() => true)
+        );
+        expect(teamOf('planner').includes('planner')).toBe(false);
+
+        // The stale promise from the five-role roster stays gone: the Manager must not
+        // tell its caller to route to an id its team cannot reach.
         expect(plannerPlan).not.toContain('instruct for general work');
     });
 
-    it('exposes each real preset team as the valid delegation ids', () => {
-        // The runtime declaration's `agent` enum IS the allowlist, so a Planner can
-        // only name agents that exist in its team; this is the id-level proof that
-        // researcher/coder/reviewer are callable there.
-        const enums = REAL.map((name) => {
+    it('exposes each team preset team as the valid delegation ids', () => {
+        // The runtime declaration's `agent` enum IS the allowlist, so a Manager can only
+        // name agents that exist in its team. The default card is not in this loop
+        // because it has no `delegate` tool to inspect — asserted right below.
+        const enums = TEAMED.map((name) => {
             const parameters = presetOf(name).create(SETTINGS, progress).tools.delegate
                 .parameters as { properties: { agent: { enum?: readonly string[] } } };
             return [name, parameters.properties.agent.enum];
         });
 
-        expect(enums).toEqual(REAL.map((name) => [name, teamOf(name)]));
-        expect(enums[4][1]).toEqual(['instruct', 'research', 'workspace', 'reviewer', 'summarizer']);
+        expect(enums).toEqual(TEAMED.map((name) => [name, teamOf(name)]));
+
+        // Widest allowlist in the product: the Manager is the only primary whose team
+        // holds all six other roles, because it is excluded from every OTHER team.
+        expect(enums[4][1]).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']);
+        // A peer team never offers the Manager back.
+        expect(enums[5][1]).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']);
+
+        expect(presetOf('general').create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
 
     it('seeds the trusted profile instruction and guidelines into the runtime', () => {
@@ -638,7 +871,7 @@ describe('one toolbox, different agents', () => {
         expect(withoutIds(research.agents.research.messages[0])).toEqual({
             role: 'system',
             content: [
-                'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',
+                'You are the Explore agent. Establish what is actually there and how it works, and report only what you can point to.',
                 '',
                 'Guidelines:',
                 ...AGENT_PROFILES.research.guidelines.map((line) => `- ${line}`)
@@ -648,7 +881,7 @@ describe('one toolbox, different agents', () => {
         // The exact identity sentence, not just a substring: the profile is the
         // source and the harness must not append or rewrite it.
         expect(research.agents.research.messages[0].content.split('\n\nGuidelines:\n')[0]).toBe(
-            'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.'
+            'You are the Explore agent. Establish what is actually there and how it works, and report only what you can point to.'
         );
     });
 
@@ -661,11 +894,13 @@ describe('one toolbox, different agents', () => {
                 template: preset.template
             }))
         ).toEqual([
+            { name: 'general', builtin: true, editable: true, template: 'live' },
             { name: 'instruct', builtin: true, editable: true, template: 'live' },
             { name: 'research', builtin: true, editable: true, template: 'live' },
             { name: 'workspace', builtin: true, editable: true, template: 'live' },
             { name: 'reviewer', builtin: true, editable: true, template: 'live' },
             { name: 'planner', builtin: true, editable: true, template: 'live' },
+            { name: 'debugger', builtin: true, editable: true, template: 'live' },
             // R20.1: there is no read-only template. `editable: true` is a wire
             // compatibility field; `template` is the registry's internal signal
             // for what a metadata-only vs executable patch must do.
@@ -678,7 +913,8 @@ describe('one toolbox, different agents', () => {
 describe('summarize under one shared toolbox', () => {
     it('condenses locally when the harness has no summarizer agent', async () => {
         // A user-created single-agent harness: the shared toolbox is there, but with
-        // no `summarizer` member (the shipped real presets always include one).
+        // no `summarizer` member (every shipped TEAMED preset includes one; the default
+        // card does not, because it has no team at all).
         const harness = createHarnessRegistry()
             .create({ name: 'solo', primary: 'instruct' })
             .create(SETTINGS, progress);
@@ -691,14 +927,18 @@ describe('summarize under one shared toolbox', () => {
         expect(await harness.tools.textSummarize('   ')).toBe('');
     });
 
-    it('has a summarizer to delegate to in every real preset', () => {
+    it('has a summarizer to delegate to in every team preset and none on the default card', () => {
         // The agent registry is the prerequisite the tool checks; the delegated
         // path itself would call the provider, so this suite stops at the wiring.
-        for (const name of REAL) {
+        for (const name of TEAMED) {
             expect(presetOf(name).create(SETTINGS, progress).agents.summarizer).toBeDefined();
         }
 
-        expect(presetOf('demo').create(SETTINGS, progress).agents.summarizer).toBeUndefined();
-        expect(presetOf('flaky').create(SETTINGS, progress).agents.summarizer).toBeUndefined();
+        // `subagents: []` on the default card also removes the summarizer, so its
+        // `textSummarize` call takes the local-condensation branch — the same branch the
+        // two fixtures take. Absence asserted exactly, not "may be undefined".
+        for (const name of ['general', 'demo', 'flaky']) {
+            expect(presetOf(name).create(SETTINGS, progress).agents.summarizer).toBeUndefined();
+        }
     });
 });

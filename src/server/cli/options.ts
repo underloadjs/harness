@@ -2,8 +2,8 @@
 //
 // WHY A MODULE: `index.ts` runs `main()` at import time (it IS the process), so a
 // test cannot import it to pin the preset default. The parser is pure, so the
-// product decision "no args means the real Instruct role, never the scripted
-// fixture" is asserted directly instead of by parsing help text.
+// product decision "no args means a real live role, never the scripted fixture" is
+// asserted directly instead of by parsing help text.
 //
 // The default is a LIVE role. `demo` remains available as an explicit
 // `--preset demo` for hosts without a provider; there is deliberately no silent
@@ -16,9 +16,12 @@
 
 import { parseArgs } from 'node:util';
 
-// The entry preset for `harness` with no `--preset`. Instruct is the general
-// role the catalogue lists first and the UI selects first; the CLI must agree.
-export const DEFAULT_CLI_PRESET = 'instruct';
+// The entry preset for `harness` with no `--preset`. `general` is the default role the
+// catalogue lists first and the UI selects first, so the CLI must agree — see `presets`
+// order in ../harnesses/presets.ts and AGENT_PROFILE_NAMES in ../../agents/index.ts.
+// `instruct` remains a live role one flag away for a run that should delegate its
+// reading; it is simply no longer the entry point.
+export const DEFAULT_CLI_PRESET = 'general';
 
 // Parse argv (without the node/script prefix). Every option keeps its original
 // short/long form and type; only the default preset changed, so callers that

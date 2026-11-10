@@ -63,6 +63,22 @@ The flag works and persists; nothing in the product shows it. After a compactor 
 units, the visible conversation tells you nothing, and the context bar's number moves with no
 explanation.
 
+> **Landed 2026-11-10 (the segment dialog half, and the write path it needed).** A context-bar
+> segment now states its state as a colour plus an `aria-hidden` glyph (`src/frontend/ui/context-detail.ts`
+> `blockDetailFactsOf`/`createFact`, styled off `[data-tone]` in `src/frontend/styles.css`), and its
+> inclusion is a real `<button aria-pressed>` that reads `in the prompt` / `excluded from context`.
+> The click goes to the segment's OWN route — `PATCH /v1/harness/sessions/{s}/turns/{t}/blocks/{b}`
+> with `{ included }`, handled by `patchSessionTurnBlock` in `src/server/api.ts` — which resolves the
+> transcript unit behind the recorded call id (`blockCallIdOf`, `transcriptUnitOfCall`,
+> `messagesWithUnitInclusion`) and installs the flag through `updateThreadTranscript`; no whole-document
+> transcript PUT is involved, and the dialog repaints from the receipt rather than from the click. The
+> read publishes `ContextBlock.included` (absent / `true` / `false`, `src/shared/turn-display.ts:542-560`)
+> on the block detail route only — the compact display tree keeps counting the recorded ledger — and the
+> detail cache's fingerprint covers it. Pinned in `src/server/view.test.ts`,
+> `src/frontend/ui/context-detail.test.ts` and `src/frontend/context-bar-block-route-main.test.ts`.
+> **Still open here:** the board-level marker and count (T7.1, the bar shows no inclusion state at all
+> today), the excluded-count/tokens-saved figures (T7.2), and the compactor diagnostic (T7.3).
+
 - **T7.1 — an "excluded from context" marker plus a count on the conversation board.** Zero
   consumers of `included` exist in `src/frontend/`: every `included` hit there is prose or an
   unrelated local (`src/frontend/main.ts:1655`). The board is event-driven and the progress

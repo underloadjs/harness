@@ -10,11 +10,20 @@
 // pin the order, so a new profile is an explicit addition rather than an accident
 // of object key ordering.
 //
-// ROSTER (T3): the five real roles are instruct (general), research (researcher),
-// workspace (coder), reviewer (skeptical bug hunt) and planner (plan + route to
-// specialists). `summarizer` stays as the delegated condenser the research
-// profile's `textSummarize` path uses, and `demo`/`flaky` stay as fixtures — they
-// are examples, never the headline choice.
+// ROSTER (T3 + the role-contract pass): the seven real roles are general (the DEFAULT,
+// works alone), instruct (worker that delegates only context-burning steps), research
+// (title Explore — read-only investigator), workspace (title Analyst — the implementor),
+// reviewer (strict independent judge), planner (title Manager — orchestrates, never works)
+// and debugger (stress-tests everything). `summarizer` stays as the delegated condenser the
+// `textSummarize` tool looks for by id, and `demo`/`flaky` stay as fixtures — they are
+// examples, never a headline choice.
+//
+// IDS ARE STABLE, TITLES ARE NOT. `research`/`workspace`/`planner` keep their registry ids
+// while their display titles moved to Explore/Analyst/Manager, because the id is persisted
+// (harness records, per-harness agentModels/agentInstructions/agentColors maps, the global
+// agents.json overlay, and every frozen session record) and `agentProfile()` has no alias
+// fallback — a renamed id would abort server startup over a user harness row and drop the
+// sessions that still name it. Routing prose therefore names IDS, never titles.
 //
 // Cross-references:
 //   - ./types.ts      — AgentProfile
@@ -24,12 +33,16 @@
 //   - ../../harnesses/registry.ts — user-created harnesses validated here
 
 import type { AgentProfile } from './types';
+import { general } from './general';
 import { instruct } from './instruct';
 import { research } from './research';
-import { summarizer } from './summarizer';
 import { workspace } from './workspace';
 import { reviewer } from './reviewer';
 import { planner } from './planner';
+// `debugger` is an ECMAScript reserved word, so the profile cannot be exported under its
+// registry id; the id lives in the profile's `name` field and in the key below.
+import { debuggerAgent } from './debugger';
+import { summarizer } from './summarizer';
 import { demo } from './demo';
 import { flaky } from './flaky';
 
@@ -38,11 +51,13 @@ export type { AgentProfile } from './types';
 // The registry, keyed by the id a harness selects. `satisfies` keeps the literal
 // keys while proving every value is a complete profile.
 export const AGENT_PROFILES = {
+    general,
     instruct,
     research,
     workspace,
     reviewer,
     planner,
+    debugger: debuggerAgent,
     summarizer,
     demo,
     flaky
@@ -52,14 +67,22 @@ export type AgentProfileName = keyof typeof AGENT_PROFILES;
 
 // Display/selection order. Kept separate from the object so a reordering never
 // changes ids, and so a caller can iterate without relying on insertion order.
-// Real roles first (in preset order), then the summarizer/fixtures: a picker that
-// renders this list therefore offers the five usable roles before the examples.
+// Real roles first (in preset order, DEFAULT FIRST), then the summarizer/fixtures: a
+// picker that renders this list therefore offers the seven usable roles before the
+// examples. `general` leads because it is the default entry point (see
+// DEFAULT_CLI_PRESET in ../server/cli/options.ts and the card order in
+// ../server/harnesses/presets.ts).
+//
+// The frontend palette assigns tones by THIS order (../frontend/ui/agent-color.ts), so
+// inserting a role repaints the later ones — an expected, cosmetic diff, not a drift.
 export const AGENT_PROFILE_NAMES: readonly AgentProfileName[] = [
+    'general',
     'instruct',
     'research',
     'workspace',
     'reviewer',
     'planner',
+    'debugger',
     'summarizer',
     'demo',
     'flaky'
@@ -104,6 +127,16 @@ export const isAgentProfileName = (name: string): name is AgentProfileName =>
 // same complete prompt as one system message.
 //
 // Empty guidelines produce the instruction alone, so a minimal profile is valid.
+//
+// THE PROMPT BUDGET. Two different ceilings apply and only one is runtime-enforced:
+// an OPERATOR-saved override is capped at 8000 characters (../server/harnesses/agent-state.ts
+// and ../server/sessions.ts), while the SHIPPED profiles are held by a test-only budget —
+// exact measured length per profile plus a 1800-character ceiling (./agents.test.ts). The
+// ceiling exists to keep a profile a policy brief rather than a tool manual, which is why
+// the sibling block there bans inventory phrasing outright; the roster of seven roles each
+// carries one more contract line than the five-role roster did (an explicit delegation
+// stance per role), which is what moved 1500 to 1800. Growth must still be a visible diff,
+// never a drift.
 //
 // T3 EDITABLE CONFIGURATION — `instructionOverride` is the harness-level
 // per-agent instruction the operator saved (`HarnessPreset.agentInstructions`,

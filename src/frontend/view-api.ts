@@ -113,6 +113,8 @@ import {
     listTurns,
     listTurnEvents,
     listSessions,
+    // T7: the segment dialog's inclusion write (the block route's one verb).
+    patchBlockInclusion,
     putTranscriptDocument,
     getAttachment,
     getTurn,
@@ -1069,12 +1071,23 @@ export const readBlockDetail = async (
     // `inPrompt` keeps the wire verdict when published, with the projector's total rule
     // (./display-project.ts:312 — reasoning is never replayed) as the only fallback, so a
     // thinking segment still answers "not replayed into the prompt" (./ui/context-detail.ts:212).
+    // `included` (T7) is copied by SPREAD and left alone: it is the READER's axis, published
+    // by the route only when the segment resolves to a transcript entry, and a client that
+    // synthesized it would offer a toggle for a segment that has nothing to switch.
     return {
         ...block,
         name: block.name ?? block.label ?? block.kind,
         inPrompt: block.inPrompt ?? block.kind !== 'reasoning'
     } as InternalTurnBlockDetail;
 };
+
+// T7: the ONE write the segment dialog makes — switch this segment's transcript unit into,
+// or out of, the requests that follow. A receipt, not a document (the rule `writeTranscript`
+// below follows, and the reason this is not that PUT): the answer is the state the server
+// PERSISTED for the whole unit, which is what the dialog repaints from. A rejected write
+// leaves the flag where it was, and the caller says so (./ui/context-detail.ts).
+export const writeBlockInclusion = (sessionId: string, turnId: string, blockId: string, included: boolean) =>
+    patchBlockInclusion(sessionId, turnId, blockId, included);
 
 // One attachment's bytes, on demand. The descriptor (id, kind, marker, name, mime,
 // size, `has_bytes`) already rides the row, so a chip renders without this read.
