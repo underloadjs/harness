@@ -2417,10 +2417,15 @@ export type HarnessThreadOrigin = 'agent' | 'host';
 // boundary, not a suspension of the process. A plugin that pauses and never resumes
 // leaves the thread parked: the run's finally-block only clears 'running', and the
 // next explicit host `sendThreadInput` revives a parked conversation exactly like a
-// stopped one — and an agent's `threadSend` lifts the park through that same
-// `resumeThreadState` path before starting a turn in it (delegate-stress T3.2),
-// which is the difference from `stopped`: a park is not the host's intent, so a
-// message may clear it and a stop may not. 'paused' is NEVER persisted — snapshot()
+// stopped one. A model-driven `threadSend`/`steer` does NOT — it QUEUES into the park
+// (context T8), because the holder parked for ITS OWN next turn and a message that only
+// arrives must not steal it. Context T11 (D1) narrows who may lift it at all: a park
+// taken by a `turn.before` payload belongs to THAT plugin, and only the same plugin's
+// payload pair — or an ownerless lift (a host `sendThreadInput`, or `api.threads.resume`)
+// — frees it, so a second plugin's `pause()`/`resume()` wrapper in the same round can
+// neither steal the park nor strand it. That is the difference from `stopped`: a park is
+// not the host's intent, so its holder (or the host) may clear it and a stop may not.
+// 'paused' is NEVER persisted — snapshot()
 // maps it to 'idle' (a parked thread has no live run after a restart), which is why
 // HarnessThreadSnapshot keeps its narrower 'idle' | 'stopped' union.
 export type HarnessThreadStatus = 'idle' | 'running' | 'paused' | 'stopped';
@@ -3541,8 +3546,9 @@ export type Harness = {
     // Queue text for the next safe model boundary of a RUNNING thread. Steering
     // never interrupts an in-flight request: the run appends it as a user message
     // before its next request, so the ordering inside the transcript is the
-    // ordering of the returned receipts. Returns `queued: false` with a reason for
-    // an idle or stopped thread.
+    // ordering of the returned receipts. A thread a PLUGIN parked (`paused`, T8) also
+    // accepts the text — it queues, and the park is left intact. Returns
+    // `queued: false` with a reason for an idle or stopped thread.
     //
     // If that run then FAILS (transport error, iteration cap), the drained
     // steering is rolled back with the transcript and re-queued in its original
@@ -4238,9 +4244,19 @@ export type HarnessTurnBeforeContext = {
     // 'paused' and emits `thread.paused`. Await it — the run continues immediately
     // afterwards, so a plugin that wants a real pause awaits the work that unblocks
     // it and then calls resume().
+    //
+    // OWNED PARK (context T11/D1). The park is attributed to THIS plugin, so `resume()`
+    // below is the pair that lifts it and another plugin's `resume()` in the SAME
+    // `turn.before` round cannot. Parking a conversation somebody else already parked
+    // is a no-op that does NOT transfer ownership — the first holder keeps it.
     pause: () => Promise<void>;
     // Undo pause(): the record returns to 'running' when a run is still attached
     // (the normal case), to 'idle' otherwise, and emits `thread.resumed`.
+    //
+    // A no-op when the conversation is not parked at all, and (context T11/D1) a no-op
+    // when it is parked BY ANOTHER PLUGIN — the wrapper a later pass runs around its own
+    // work cannot strand or steal the holder's park. `api.threads.resume` and a host
+    // `sendThreadInput` stay ownerless and still lift a park taken here.
     resume: () => Promise<void>;
 };
 
@@ -4422,6 +4438,29 @@ export type HarnessPluginApi = {
         replaceMessages: (threadId: string, messages: readonly HarnessMessage[]) => void;
         // Move the roster state of a conversation that is NOT running here.
         setStatus: (threadId: string, status: HarnessThreadStatus) => HarnessThreadRecord;
+        // Park a conversation at a turn boundary (T8 — the compaction contract). This
+        // is the plugin-facing form of the `turn.before` payload's `pause()`: the
+        // roster goes 'paused' and `thread.paused` fires; a thread already parked is
+        // an untouched no-op that still returns the record. Throws for an unknown
+        // thread, and refuses a `stopped` one (the host owns stopping and reviving).
+        // While a thread is parked, `send`/`steer` QUEUE into it and never lift the
+        // park, so the holder keeps sole control of when the conversation moves.
+        //
+        // OWNERLESS (context T11/D1): a park taken HERE names no holder, so this member
+        // and `resume` below are the escape-hatch spelling of the pair.
+        pause: (threadId: string) => HarnessThreadRecord;
+        // Undo `pause` (T8). The roster returns to 'running' when a run is still
+        // attached (the normal case, because the run is inside the hook that parked
+        // it) or to 'idle' when the park outlived its run, and `thread.resumed` fires.
+        // Anything that is not parked — including a `stopped` conversation, which only
+        // a host `sendThreadInput` revives — is an untouched no-op that returns the
+        // record. Queued messages are NOT drained here; the next boundary is.
+        //
+        // OWNERLESS (context T11/D1): unlike the `turn.before` payload's `resume()`, this
+        // lift is not restricted to the plugin that parked the thread — it also frees a
+        // park that payload's `pause()` owns, which is what stops a stranded park from
+        // hiding a conversation from its host.
+        resume: (threadId: string) => HarnessThreadRecord;
     };
 
     // The harness's persisted state, read-only (T3.5). This is the SAME value the host's

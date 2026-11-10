@@ -104,13 +104,24 @@ import {
 // still run. Aliases resolve to the canonical harness and are never listed a
 // second time; they are also reserved so a user-created harness cannot shadow
 // one. `writer`/`assistant` both meant "one agent" and map to Instruct;
-// `researcher` maps to Research.
+// `researcher` maps to the `research` card, whose title is now "Explore".
 //
-// T3 deliberately does NOT alias the visible title "Coder": `workspace` is the id
-// every saved session, bookmark and script uses, and reserving a new name could
-// collide with a user-created harness of that name on a restart (the row would be
-// rejected and the database restore would fail). The card title says Coder, and the
-// CLI listing shows the pair, which is enough discovery.
+// TITLES ARE NEVER NAMES, and that is deliberate. `workspace`, `research` and
+// `planner` keep their ids while their visible titles moved to Analyst / Explore /
+// Manager. No alias was added for any title — old ("Coder") or new — because
+// reserving a name could collide with a user-created harness of that name on a
+// restart (the row would be rejected and the database restore would fail), and
+// because the id, not the title, is what a URL path and a session record carry. The
+// picker shows the title and the CLI listing shows the pair, which is the discovery
+// path.
+//
+// WHY `general` AND `debugger` ARE NOT ALIASES EITHER: they are shipped TEMPLATES,
+// so their names are taken by `nameTaken` above rather than reserved here. An
+// installation that already has a user harness called `general` does not fail to
+// restore: the saved row's name matches this build's template, so
+// `restoreHarnessRegistry` takes its update branch and replays the operator's fields
+// onto the shipped entry (`update` below, with the matching note above
+// `LEGACY_PRESET_DEFINITIONS` in ./presets.ts).
 export const PRESET_ALIASES: Readonly<Record<string, string>> = {
     writer: 'instruct',
     assistant: 'instruct',
@@ -127,9 +138,10 @@ const MAX_TITLE_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 2_000;
 
 // A harness with a huge allowlist is almost certainly a mistake (and every name
-// is a trusted id, so the useful ceiling is tiny). The agent registry has eight
-// profiles today (five real roles, the summarizer, two fixtures); 16 leaves room
-// without allowing an unbounded array.
+// is a trusted id, so the useful ceiling is tiny). The agent registry has ten
+// profiles today (seven real roles, the summarizer, two fixtures), so the largest
+// team a user can even name is nine; 16 leaves room for one more role without
+// allowing an unbounded array.
 const MAX_SUBAGENTS = 16;
 
 // Bounds on a client-supplied model id (R9). Generous for the workspace's

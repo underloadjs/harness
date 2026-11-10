@@ -432,7 +432,7 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
         expect(plugins.values('async-ping')).toEqual({ intervalMs: 600000 });
         // The third built-in declares ONLY `enabled` — the key the framework owns — so its
@@ -458,7 +458,7 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
         expect(plugins.provider.get('context-compaction', 'contextLimit')).toBe(250000);
         expect(plugins.snapshot()).toEqual({ 'context-compaction': { contextLimit: 250000 } });

@@ -26,7 +26,7 @@ import type {
     TurnSection
 } from '../shared/turn-display';
 import type { SessionTurn } from './protocol';
-import { createTurnProjector, formatDuration, previewText, previewTextTail, projectTurn, refoldTurn, steerSubmitList } from './turn-projector';
+import { createTurnProjector, DISPLAY_NO_TIMESTAMP, formatDuration, previewText, previewTextTail, projectTurn, refoldTurn, steerSubmitList } from './turn-projector';
 
 const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     id: 'turn-1',
@@ -118,6 +118,11 @@ describe('rows and sections', () => {
                     // The bar is always present: `[]` is the server's authoritative
                     // "nothing yet", and the prompt segment joins in the SAME frame.
                     context: [],
+                    // R9: the frame that mints a section IS its recorded start, and the
+                    // stamp rides the `section:open` payload (no extra op). Without it the
+                    // row's elapsed label stays hidden — the reported "no time on delegate
+                    // rows" bug.
+                    startedAt: 1_000,
                     state: 'open'
                 }
             },
@@ -294,8 +299,115 @@ describe('rows and sections', () => {
         expect(result.ops[1][0]).toEqual({
             op: 'section:open',
             turnId: 'turn-1',
-            section: { id: 'turn-1:1', role: 'subagent', agent: 'two', agentLabel: '', nodes: [], context: [], state: 'open' }
+            // R9: `startedAt` is THIS frame's stamp (event 1 of 10 ms spacing) — the first
+            // frame routed to a flow is the earliest recorded evidence that it ran.
+            section: { id: 'turn-1:1', role: 'subagent', agent: 'two', agentLabel: '', nodes: [], context: [], startedAt: 1_010, state: 'open' }
         });
+    });
+});
+
+// R9 (user-reported: "Time for subagent/delegates is missing completely", with the
+// screenshot of delegate rows reading `35,736 (319,929)` and nothing else).
+//
+// The renderer is complete: `createBlockMeta.paint` prints
+// `formatDuration(elapsedBetween(startedAt, endedAt))`, and the `' | '` separator is CSS
+// content keyed on BOTH labels being visible (../frontend/ui/turns.ts:937-950,
+// styles.css:3094-3096). The compiled path settles a row's span ONLY from the SECTION's
+// pair (turns.ts:7169-7177), and the fold only ever wrote `endedAt` — so every delegate
+// row settled with `startedAt: undefined` and hid the label. These assertions pin the
+// field that was missing, at the frame that owns it.
+describe('section timing (R9)', () => {
+    // The child's identity on every frame after its own `start` (../harness.ts:4094).
+    const childThread = { id: 'inv-child', parentId: 'inv-root', callId: 'call-1' };
+    const rootThread = { id: 'inv-root' };
+
+    // Stamps come from `timeOf` (1_000 + index * 10), so every expectation below is an
+    // event index the reader can count.
+    const DELEGATION: HarnessEvent[] = [
+        { type: 'start', agent: 'one', model: 'gpt-x', thread: rootThread }, // 0 -> 1_000
+        toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })), // 1 -> 1_010
+        { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread }, // 2 -> 1_020
+        { type: 'text', agent: 'two', delta: 'child says', thread: childThread }, // 3 -> 1_030
+        {
+            type: 'done',
+            agent: 'two',
+            message: { role: 'assistant', content: 'child says', reasoning: '', toolCalls: [], model: 'gpt-y', stopReason: 'stop' },
+            thread: childThread
+        } // 4 -> 1_040
+    ];
+
+    const patchesFor = (ops: TurnDisplayOp[][], sectionId: string): TurnSectionPatch[] =>
+        flatten(ops)
+            .filter((op): op is Extract<TurnDisplayOp, { op: 'section:set' }> => op.op === 'section:set' && op.sectionId === sectionId)
+            .map((op) => op.patch);
+
+    it('stamps a delegated section with its own start and keeps its own end', () => {
+        const result = fold(DELEGATION);
+        const child = result.display().sections[1];
+
+        expect(child.id).toBe('turn-1:1');
+        // START = the frame that ADOPTED the placeholder (event 2). Not the parent's
+        // `delegate` call (event 1: the row was only QUEUED then) and not the child's
+        // first text delta (event 3: two frames late).
+        expect(child.startedAt).toBe(1_020);
+        // END semantics are UNCHANGED: the child's own terminal frame.
+        expect(child.endedAt).toBe(1_040);
+        // The exact figure the row now prints — the shared formatter, not a re-derivation.
+        expect(formatDuration((child.endedAt ?? 0) - (child.startedAt ?? 0))).toBe('20ms');
+        // The root section keeps its own span: 1_000 is the ROOT's start frame, so a
+        // child's stamp can never leak into the parent's row.
+        expect(result.display().sections[0].startedAt).toBe(1_000);
+    });
+
+    it('sends the start on the adoption patch, exactly once per section', () => {
+        const result = fold(DELEGATION);
+        const patches = patchesFor(result.ops, 'turn-1:1');
+
+        // The live frame a watcher sees when the child starts: identity, state and clock
+        // in ONE patch, so there is no window where a running row has no baseline.
+        expect(patches[0]).toMatchObject({ startedAt: 1_020, state: 'streaming', invocationId: 'inv-child' });
+        // FIRST WRITE wins: the later text and terminal frames must not move the baseline,
+        // or the row would print a span the reader never watched.
+        expect(patches.filter((patch) => patch.startedAt !== undefined)).toHaveLength(1);
+    });
+
+    it('ends an unfinished section at the settle stamp while keeping its recorded start', () => {
+        const result = fold(DELEGATION.slice(0, 4));
+        const settled = result.settle('done');
+
+        // `fold`'s settle is stamped 5_000. The settle frame closes the span and touches
+        // NOTHING else: the start stays the RECORDED one, so a settle can never
+        // re-baseline a run it can only bring to an end.
+        expect(
+            settled.filter(
+                (op) =>
+                    op.op === 'section:set' &&
+                    op.sectionId === 'turn-1:1' &&
+                    op.patch.endedAt === 5_000 &&
+                    op.patch.startedAt === undefined
+            )
+        ).toHaveLength(1);
+
+        const sections = result.display().sections;
+
+        expect([sections[0].startedAt, sections[0].endedAt]).toEqual([1_000, 5_000]);
+        expect([sections[1].startedAt, sections[1].endedAt]).toEqual([1_020, 5_000]);
+        expect(formatDuration(5_000 - 1_020)).toBe('4.0s');
+    });
+
+    it('writes no timing at all for a record with no event times', () => {
+        // A cold fold of a legacy record: `at` is `DISPLAY_NO_TIMESTAMP` (0), read as
+        // "unknown". NOTHING is written, so the client hides the label instead of printing
+        // the record's wall-clock age as a duration (../frontend/ui/time.ts).
+        const legacy = turnOf({ eventTimes: undefined });
+        const projector = createTurnProjector(legacy, CONTEXT);
+
+        DELEGATION.forEach((event, index) => projector.apply(event, DISPLAY_NO_TIMESTAMP, index));
+
+        for (const section of projector.display().sections) {
+            expect(Object.prototype.hasOwnProperty.call(section, 'startedAt')).toBe(false);
+            expect(Object.prototype.hasOwnProperty.call(section, 'endedAt')).toBe(false);
+        }
     });
 });
 

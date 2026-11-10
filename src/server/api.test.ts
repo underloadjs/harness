@@ -61,6 +61,7 @@ import {
     DELEGATION_GUIDELINE,
     DISCOVERY_GUIDELINE,
     PERMISSIONS_GUIDELINE,
+    READ_ONLY_GUIDELINE,
     TOOL_CREATE_GUIDELINE,
     WEB_SEARCH_GUIDELINE
 } from '../agents/guidelines';
@@ -104,10 +105,27 @@ const SETTINGS: RunnerSettings = {
 
 const DEFAULTS = { baseURL: 'http://provider.test/v1', model: 'demo-model', hasApiKey: true };
 
-// The seven cards this file sees: the five shipped production templates PLUS the two scripted
-// fixtures injected by `createRuntime`. A runtime built without an injection lists only the first
-// five - pinned by 'ships only the production cards without an injected registry'.
-const CARD_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
+// The nine cards this file sees: the seven shipped production templates PLUS the two scripted
+// fixtures injected by `createRuntime`. `general` is FIRST because it is the default card
+// (DEFAULT_CLI_PRESET), and the live order mirrors `AGENT_PROFILE_NAMES` in ../agents/index.ts.
+// A runtime built without an injection lists only the first seven - pinned by 'ships only the
+// production cards without an injected registry'.
+const CARD_NAMES = [
+    'general',
+    'instruct',
+    'research',
+    'workspace',
+    'reviewer',
+    'planner',
+    'debugger',
+    'demo',
+    'flaky'
+];
+
+// The head of `CARD_NAMES`: the seven shipped production templates, i.e. what a runtime with NO
+// injected registry lists (`presets` in src/server/harnesses/presets.ts). The two fixtures are the
+// tail and only reachable through the explicit injection `createRuntime` performs.
+const LIVE_CARD_NAMES = CARD_NAMES.slice(0, 7);
 
 // The exact card row `GET /harnesses` answers (`HarnessCard` in ../shared/harness-api.ts). Pinned
 // once at module scope so a projection change is a visible diff, not a renamed field nobody
@@ -125,8 +143,21 @@ const CARD_KEY_SET = [
     'tools'
 ];
 
-// The trusted agent registry (src/agents): five roles plus summarizer, then the two fixtures.
-const AGENT_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer', 'demo', 'flaky'];
+// The trusted agent registry (src/agents): seven roles, then the delegated summarizer, then the
+// two fixtures. This is `AGENT_PROFILE_NAMES` verbatim, and the registry also renders it into the
+// `Known agents: ...` validation messages asserted below, so one list pins both.
+const AGENT_NAMES = [
+    'general',
+    'instruct',
+    'research',
+    'workspace',
+    'reviewer',
+    'planner',
+    'debugger',
+    'summarizer',
+    'demo',
+    'flaky'
+];
 
 // The whole catalogue, in the order the route emits it: the fourteen harness-owned core rows,
 // then the package/app tools, then the two environment-backed rows (search, fetch).
@@ -192,6 +223,12 @@ const TOOLBOX = [
 // session plan, delegation, the five file tools, and the credential-free fetch row.
 const LIVE_CORE_TOOLS = ['toolRequest', 'tasks', 'delegate', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
+// The `general` card is the one live card with NO team (`subagents: []`), and the runtime therefore
+// never registers `delegate` for it (src/harness.ts `activation: 'subagents'`). Pinning the whole
+// core list rather than "does not include delegate" is what makes the omission a contract: adding a
+// team to the default card, or registering the tool anyway, fails here.
+const GENERAL_CORE_TOOLS = ['toolRequest', 'tasks', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
+
 // ---------------------------------------------------------------------------
 // The trusted prompt text (src/agents), as it reaches the wire.
 //
@@ -200,25 +237,79 @@ const LIVE_CORE_TOOLS = ['toolRequest', 'tasks', 'delegate', 'read', 'write', 'e
 // (src/agents/index.ts `agentInstruction()`) joins them into ONE system message, and that joined
 // text is what the session-scoped instruction read answers - both shapes are pinned below,
 // because a client renders the raw halves and the model receives the join.
+//
+// IDS ARE STABLE, TITLES ARE NOT. `research`/`workspace`/`planner` keep their registry ids while
+// their titles read Explore/Analyst/Manager (src/agents/index.ts explains why: the id is
+// persisted and `agentProfile()` has no alias fallback), so every assertion below addresses an
+// agent by its id and never by its display title.
 // ---------------------------------------------------------------------------
 
 // Mirrors the single documented join rule in src/agents/index.ts `agentInstruction()`.
 const joinedPrompt = (identity: string, guidelines: readonly string[]): string =>
     [identity, '', 'Guidelines:', ...guidelines.map((line) => `- ${line}`)].join('\n');
 
-const INSTRUCT_IDENTITY = 'You are the Instruct agent. Follow the brief exactly, answer directly, and do only what was asked.';
-const INSTRUCT_GUIDELINES = [
-    'Treat the request as the specification: keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.',
+// General: the DEFAULT profile, and the only one whose guidelines forbid handing work out at all
+// (no delegation line, because its harness configures no subagents and the tool is unregistered).
+// The lone-agent bullet names the two ways a step could still escape WITHOUT `delegate` —
+// `threadFork` and `threadSend` — so it is pinned as one literal, exactly as src/agents/general.ts ships it.
+const GENERAL_IDENTITY = 'You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent.';
+const GENERAL_GUIDELINES = [
+    'Treat the brief as the specification: do exactly what it asks, keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.',
+    'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
     DISCOVERY_GUIDELINE,
     WEB_SEARCH_GUIDELINE,
-    DELEGATION_GUIDELINE,
     'Prefer a tool result over memory when a declared tool can answer more accurately, and name the tool you used.',
     PERMISSIONS_GUIDELINE,
-    TOOL_CREATE_GUIDELINE,
     'Be concise: no preamble, no restating the question.'
 ];
 
-const RESEARCH_IDENTITY = 'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.';
+// Instruct: a worker that delegates ONLY the context-burning steps, which is the one sentence
+// separating it from the Manager (delegates everything) and from General (delegates nothing).
+const INSTRUCT_IDENTITY = 'You are the Instruct agent. Do the work yourself, and delegate only a step that would cost more context than it is worth to perform.';
+const INSTRUCT_GUIDELINES = [
+    'Treat the brief as the specification: keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.',
+    'Delegate only context-burning steps that change nothing: research, exploration, a long read, a review. Anything you would then have to write, edit, or run, you do yourself.',
+    'Never delegate to a Manager: it does not run as a delegate. Send an investigation to research and a challenge to reviewer, and keep the build.',
+    DELEGATION_GUIDELINE,
+    'Verify a delegated result before relying on it; the final answer stays yours.',
+    DISCOVERY_GUIDELINE,
+    WEB_SEARCH_GUIDELINE,
+    PERMISSIONS_GUIDELINE,
+    'Be concise: no preamble, no restating the question.'
+];
+
+// Research, titled Explore: the read-only investigator. The read-only rule is policy, not a tool
+// denial, so it reaches the prompt through READ_ONLY_GUIDELINE (src/agents/guidelines.ts).
+const RESEARCH_IDENTITY = 'You are the Explore agent. Establish what is actually there and how it works, and report only what you can point to.';
+const RESEARCH_GUIDELINES = [
+    READ_ONLY_GUIDELINE,
+    'Survey before you read: glob returns paths, grep({ pattern, patterns, paths }) returns lines with file and line numbers, so sweep the whole tree before quoting one file.',
+    'Answer from the repository when it can; use the web only for what it cannot hold — current behaviour, an external API — and cite the URL.',
+    'Cross-check any claim that decides the answer against a second source — another file, a test, another search result — and say when only one supports it.',
+    DELEGATION_GUIDELINE,
+    DISCOVERY_GUIDELINE,
+    WEB_SEARCH_GUIDELINE,
+    'Finish with the answer: cite the file and line, tool, or URL behind each claim, and label what you could not verify.'
+];
+
+// Debugger: the newest role, and the only shipped profile that carries TOOL_CREATE_GUIDELINE (it is
+// the role expected to author a probe the catalogue has no entry for). It also carries WEB_SEARCH,
+// immediately above DELEGATION: the web trio is part of what it stresses, so the wire array below
+// has to keep that position (src/agents/debugger.ts).
+const DEBUGGER_IDENTITY = 'You are the Debugger agent. Exercise the whole system until something breaks, then prove how it breaks.';
+const DEBUGGER_GUIDELINES = [
+    'Nothing is off-limits here: unlock any searchable tool you need, read any path, run any command, and delegate to any configured role.',
+    'Test the edges, not the happy path: empty input, oversized input, a missing path, a wrong type, a repeated call, a cancelled call, a target that refuses.',
+    'Reduce every failure to the smallest call sequence that triggers it again, and quote the exact tool, input, and error text.',
+    'Write scratch files when a probe needs them, but never change the code under test unless the brief asks for a fix.',
+    WEB_SEARCH_GUIDELINE,
+    DELEGATION_GUIDELINE,
+    DISCOVERY_GUIDELINE,
+    TOOL_CREATE_GUIDELINE,
+    PERMISSIONS_GUIDELINE,
+    'Report what you exercised, what held, what broke, and what you did not get to. Never invent a failure and never bury one.'
+];
+
 const DEMO_IDENTITY = 'You are the offline demo agent. The transport is scripted; nothing is sent to a model.';
 const DEMO_GUIDELINES = [
     'Narrate the loop the transport demonstrates: a toolRequest discovery round, one tool call, then the answer.',
@@ -902,8 +993,12 @@ describe('service origin gate', () => {
 // A card no longer carries `coreTools`, `agentModels`, `agentInstructions`, or `editable`: those
 // are definition/instruction reads now, and the write field list names what a client may send.
 describe('harness catalogue reads', () => {
+    // The default card's own description text (`HarnessPreset.description`, NOT the agent
+    // profile's shorter picker sentence - both are pinned, here and in the agents read below).
+    const GENERAL_DESCRIPTION =
+        'The default general-purpose agent, with the full shared toolbox and NO subagents: it does every step itself, so `delegate` is not registered and cannot be enabled. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes.';
     const INSTRUCT_DESCRIPTION =
-        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.';
+        'General worker with the full shared toolbox and the other roles as direct subagents. It does its own building and editing, and delegates only the steps that would burn its context: research, exploration, a long read, a review. Unlike the Manager, it never hands out work it must still finish itself.';
 
     it('pages the cards as identity + tool names, with no definition text', async () => {
         const runtime = createRuntime();
@@ -912,6 +1007,21 @@ describe('harness catalogue reads', () => {
         expect(page.status).toBe(200);
         expect(Object.keys(page.body).sort()).toEqual(['items', 'limit', 'next_cursor', 'observed_at', 'revision']);
         expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
+        // The catalogue order is a contract (presets.ts: it is what a picker renders and what the
+        // frontend palette assigns tones by), and the TITLES moved with the role pass while the
+        // ids did not: `research` is Explore, `workspace` is Analyst, `planner` is Manager. Pinned
+        // as one pair list so a renamed card or a reordered row fails instead of renumbering below.
+        expect(page.body.items.map((card: any) => [card.name, card.title])).toEqual([
+            ['general', 'General'],
+            ['instruct', 'Instruct'],
+            ['research', 'Explore'],
+            ['workspace', 'Analyst'],
+            ['reviewer', 'Reviewer'],
+            ['planner', 'Manager'],
+            ['debugger', 'Debugger'],
+            ['demo', 'Scripted demo'],
+            ['flaky', 'Recoverable failures (example)']
+        ]);
         // `limit` echoes the RETURNED row count (./api-paging.ts:148), and a page that is not full
         // carries no cursor.
         expect(page.body.limit).toBe(CARD_NAMES.length);
@@ -920,24 +1030,54 @@ describe('harness catalogue reads', () => {
 
         for (const card of page.body.items) expect(Object.keys(card).sort()).toEqual(CARD_KEY_SET);
 
-        // The first card, byte for byte. `requires_endpoint` is the snake_case spelling of the old
-        // `requiresEndpoint`, and `editable` is gone: every template is patchable now.
+        // The first card, byte for byte: the DEFAULT. `requires_endpoint` is the snake_case
+        // spelling of the old `requiresEndpoint`, and `editable` is gone: every template is
+        // patchable now. `subagents: []` and `agents: ['general']` are load-bearing (see
+        // presets.ts) - the default card has no team, so it has nothing to delegate to.
         expect(page.body.items[0]).toEqual({
-            name: 'instruct',
-            title: 'Instruct',
-            description: INSTRUCT_DESCRIPTION,
+            name: 'general',
+            title: 'General',
+            description: GENERAL_DESCRIPTION,
             requires_endpoint: true,
-            primary: 'instruct',
-            subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer'],
-            agents: ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer'],
+            primary: 'general',
+            subagents: [],
+            agents: ['general'],
             tools: [...TOOLBOX, 'fetch'],
             builtin: true,
             definition_revision: 0
         });
 
+        // The first delegating card, byte for byte. Its team is every OTHER role except the
+        // Manager - `planner` is excluded from every built-in team because a Manager refuses to run
+        // as a delegate (src/agents/planner.ts) - plus the summarizer.
+        expect(page.body.items[1]).toEqual({
+            name: 'instruct',
+            title: 'Instruct',
+            description: INSTRUCT_DESCRIPTION,
+            requires_endpoint: true,
+            primary: 'instruct',
+            subagents: ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            agents: ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            tools: [...TOOLBOX, 'fetch'],
+            builtin: true,
+            definition_revision: 0
+        });
+
+        // The Manager card is the mirror image: its team holds every other role by id, because it
+        // delegates everything and never works.
+        expect(page.body.items[5].subagents).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+
         // The offline fixture stays described, just not first, and its registry is still
         // timeNow-only (no package toolbox).
-        expect(page.body.items[5]).toEqual({
+        expect(page.body.items[7]).toEqual({
             name: 'demo',
             title: 'Scripted demo',
             description:
@@ -958,7 +1098,7 @@ describe('harness catalogue reads', () => {
         const first = await call(runtime, 'GET', HARNESS_ROUTES.harnesses(), {}, { limit: '2' });
 
         expect(first.status).toBe(200);
-        expect(first.body.items.map((card: any) => card.name)).toEqual(['instruct', 'research']);
+        expect(first.body.items.map((card: any) => card.name)).toEqual(['general', 'instruct']);
         // A page that returns exactly its limit ALWAYS carries a cursor, even when the collection
         // ends after the next row (./api-paging.ts:7).
         expect(first.body.next_cursor).toEqual(expect.any(String));
@@ -970,7 +1110,7 @@ describe('harness catalogue reads', () => {
             {},
             { limit: '2', cursor: first.body.next_cursor as string }
         );
-        expect(second.body.items.map((card: any) => card.name)).toEqual(['workspace', 'reviewer']);
+        expect(second.body.items.map((card: any) => card.name)).toEqual(['research', 'workspace']);
 
         expect(await call(runtime, 'GET', HARNESS_ROUTES.harnesses(), {}, { limit: '0' })).toEqual({
             status: 400,
@@ -1000,13 +1140,31 @@ describe('harness catalogue reads', () => {
         // delegation (this card has subagents), the five file tools, and the credential-free fetch.
         expect(card.core_tools).toEqual(LIVE_CORE_TOOLS);
         // Summary rows carry sizes, never text: the instruction routes below are where text lives.
+        // One row per team member, in `preset.agents` order (primary first). `chars` is the identity
+        // sentence length, and the roster moved every figure: seven members now that the instruct
+        // team carries `general` and `debugger` and no longer `planner`.
+        // NOTE (regression pin): `chars` is `profile.instruction.length` (api-reads.ts:1289), NOT
+        // the composed prompt, so adding a shared guideline to a profile — e.g. WEB_SEARCH to
+        // `debugger`, which grew its system prompt to 1690 — must leave these figures alone.
         expect(card.instruction_summary).toEqual([
-            { agent: 'instruct', source: 'catalogue', overridden: false, chars: 98 },
-            { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
-            { agent: 'workspace', source: 'catalogue', overridden: false, chars: 129 },
-            { agent: 'reviewer', source: 'catalogue', overridden: false, chars: 111 },
-            { agent: 'planner', source: 'catalogue', overridden: false, chars: 137 },
+            { agent: 'instruct', source: 'catalogue', overridden: false, chars: 132 },
+            { agent: 'general', source: 'catalogue', overridden: false, chars: 135 },
+            { agent: 'research', source: 'catalogue', overridden: false, chars: 116 },
+            { agent: 'workspace', source: 'catalogue', overridden: false, chars: 132 },
+            { agent: 'reviewer', source: 'catalogue', overridden: false, chars: 120 },
+            { agent: 'debugger', source: 'catalogue', overridden: false, chars: 103 },
             { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
+        ]);
+
+        // The DEFAULT card, same read. One summary row because it has no team, and `delegate` is
+        // absent from its declared core - the runtime never registers it for `subagents: []`
+        // (src/harness.ts `activation: 'subagents'`), so the default agent cannot split work out.
+        const generalDefinition = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('general'));
+        expect(generalDefinition.body.harness.subagents).toEqual([]);
+        expect(generalDefinition.body.harness.agents).toEqual(['general']);
+        expect(generalDefinition.body.harness.core_tools).toEqual(GENERAL_CORE_TOOLS);
+        expect(generalDefinition.body.harness.instruction_summary).toEqual([
+            { agent: 'general', source: 'catalogue', overridden: false, chars: 135 }
         ]);
 
         // The scripted fixture declares only what its own registry can run.
@@ -1028,6 +1186,17 @@ describe('harness catalogue reads', () => {
         expect(alias.status).toBe(200);
         expect(alias.body.harness.name).toBe('instruct');
         expect(alias.body.harness).toEqual(definition.body.harness);
+
+        // A TITLE is not a NAME. The roster pass renamed only display titles, and deliberately added
+        // no alias for one (src/server/harnesses/presets.ts header: a new reserved name could
+        // collide with a user-created harness on restore), so none of the five card titles resolves
+        // as a harness id — not even `General`, the default card, whose id is `general`.
+        for (const title of ['General', 'Explore', 'Analyst', 'Manager', 'Debugger']) {
+            expect(await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName(title))).toEqual({
+                status: 404,
+                body: { error: { message: `Unknown harness "${title}".` } }
+            });
+        }
     });
 
     it('summaries and instruction text agree with the trusted profile', async () => {
@@ -1037,7 +1206,9 @@ describe('harness catalogue reads', () => {
 
         expect(list.status).toBe(200);
         expect(Object.keys(list.body).sort()).toEqual(['harness_name', 'items', 'total']);
-        expect(list.body.total).toBe(6);
+        // Seven members: the instruct team is every other role except the Manager, plus the
+        // summarizer (src/server/harnesses/presets.ts `teamOf`).
+        expect(list.body.total).toBe(7);
         // The rows are exactly the `instruction_summary` the definition read carries.
         expect(list.body.items).toEqual((await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('instruct'))).body.harness.instruction_summary);
 
@@ -1077,13 +1248,51 @@ describe('harness catalogue reads', () => {
             expect(Object.keys(row).sort()).toEqual(['description', 'has_global_override', 'has_instruction_override', 'name', 'title']);
         }
         expect(page.body.items[0]).toEqual({
-            name: 'instruct',
-            title: 'Instruct',
+            name: 'general',
+            title: 'General',
             description:
-                'General instruction-following agent. Answers directly and concisely with the tools it is given; every other role is available to it as a subagent.',
+                'The default general-purpose agent. It does the whole task itself, start to finish: this harness configures no subagents, so delegate is not even registered and it never splits work out.',
             has_instruction_override: false,
             has_global_override: false
         });
+        // The picker rows carry the DISPLAY title, which is the half of an agent's identity that
+        // moves freely; the row's `name` stays the persisted registry id (src/agents/index.ts
+        // explains why an id cannot move). One exact list, so Explore/Analyst/Manager cannot leak
+        // into a `name` and a retitle is a visible diff.
+        expect(page.body.items.map((row: any) => [row.name, row.title])).toEqual([
+            ['general', 'General'],
+            ['instruct', 'Instruct'],
+            ['research', 'Explore'],
+            ['workspace', 'Analyst'],
+            ['reviewer', 'Reviewer'],
+            ['planner', 'Manager'],
+            ['debugger', 'Debugger'],
+            ['summarizer', 'Summarizer'],
+            ['demo', 'Demo'],
+            ['flaky', 'Flaky']
+        ]);
+
+        // The DEFAULT profile, read whole: id, title, and the two prompt halves. Its guidelines are
+        // the only set with NO delegation line, because its harness configures no subagents and the
+        // runtime never registers `delegate` (src/agents/general.ts). `referenced_by` shows the
+        // other half of the roster contract: every OTHER live card CAN delegate to `general`.
+        const generalProfile = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('general'));
+
+        expect(generalProfile.status).toBe(200);
+        expect(generalProfile.body.agent.name).toBe('general');
+        expect(generalProfile.body.agent.title).toBe('General');
+        expect(generalProfile.body.agent.instruction).toBe(GENERAL_IDENTITY);
+        expect(generalProfile.body.agent.guidelines).toEqual(GENERAL_GUIDELINES);
+        expect(generalProfile.body.agent.instruction_source).toBe('catalogue');
+        expect(generalProfile.body.agent.referenced_by).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger'
+        ]);
 
         const profile = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('instruct'));
 
@@ -1103,7 +1312,42 @@ describe('harness catalogue reads', () => {
         expect(profile.body.agent.guidelines).toEqual(INSTRUCT_GUIDELINES);
         expect(profile.body.agent.instruction_source).toBe('catalogue');
         // `referenced_by` is derived from the live registry, so a removal impact list cannot drift.
-        expect(profile.body.agent.referenced_by).toEqual(['instruct', 'research', 'workspace', 'reviewer', 'planner']);
+        // Every live card EXCEPT `general` (which has no team) and the two fixtures selects instruct.
+        expect(profile.body.agent.referenced_by).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger'
+        ]);
+
+        // The renamed titles, read by their UNCHANGED ids. A saved record naming `research` still
+        // resolves, and the text that reaches the model is the new Explore brief.
+        const renamed = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('research'));
+        expect(renamed.body.agent.name).toBe('research');
+        expect(renamed.body.agent.title).toBe('Explore');
+        expect(renamed.body.agent.instruction).toBe(RESEARCH_IDENTITY);
+        expect(renamed.body.agent.guidelines).toEqual(RESEARCH_GUIDELINES);
+
+        expect((await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('workspace'))).body.agent.title).toBe('Analyst');
+        expect((await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('planner'))).body.agent.title).toBe('Manager');
+
+        // The new role, pinned on the wire rather than by a count: id, title, and the full trusted
+        // prompt halves.
+        const debuggerProfile = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('debugger'));
+        expect(debuggerProfile.status).toBe(200);
+        expect(debuggerProfile.body.agent.name).toBe('debugger');
+        expect(debuggerProfile.body.agent.title).toBe('Debugger');
+        expect(debuggerProfile.body.agent.instruction).toBe(DEBUGGER_IDENTITY);
+        expect(debuggerProfile.body.agent.guidelines).toEqual(DEBUGGER_GUIDELINES);
+        expect(debuggerProfile.body.agent.instruction_source).toBe('catalogue');
+
+        // A TITLE is not a name: the routes resolve ids, and nothing aliases a title.
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('Explore'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown agent "Explore".' } }
+        });
 
         expect(await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('ghost'))).toEqual({
             status: 404,
@@ -1299,7 +1543,7 @@ describe('harness catalogue reads', () => {
         // R9-R11: keyless still registers `fetch` (the native provider needs no credential), so
         // every live card's registered list ends with it; only `search` is absent. No real card
         // gets a subset any more - the toolbox is not part of what a harness choice changes.
-        for (const name of ['instruct', 'research', 'workspace', 'reviewer', 'planner']) {
+        for (const name of LIVE_CARD_NAMES) {
             expect(keylessTools.get(name)).toEqual([...TOOLBOX, 'fetch']);
         }
         expect(keylessTools.get('demo')).toEqual(['timeNow']);
@@ -1310,7 +1554,7 @@ describe('harness catalogue reads', () => {
         const configuredCards = (await call(configured, 'GET', HARNESS_ROUTES.harnesses())).body.items;
         const configuredTools = new Map(configuredCards.map((card: any) => [card.name, card.tools]));
 
-        for (const name of ['instruct', 'research', 'workspace', 'reviewer', 'planner']) {
+        for (const name of LIVE_CARD_NAMES) {
             expect(configuredTools.get(name)).toEqual([...TOOLBOX, 'search', 'fetch']);
         }
         expect(configuredTools.get('demo')).toEqual(['timeNow']);
@@ -1337,11 +1581,10 @@ describe('harness catalogue reads', () => {
             loadEnvironment: false
         });
 
-        const PRODUCTION = ['instruct', 'research', 'workspace', 'reviewer', 'planner'];
         const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
 
-        expect(page.body.items.map((card: any) => card.name)).toEqual(PRODUCTION);
-        expect(page.body.items.map((card: any) => card.requires_endpoint)).toEqual([true, true, true, true, true]);
+        expect(page.body.items.map((card: any) => card.name)).toEqual(LIVE_CARD_NAMES);
+        expect(page.body.items.map((card: any) => card.requires_endpoint)).toEqual([true, true, true, true, true, true, true]);
         expect(page.body.items.every((card: any) => card.tools.includes('testFlaky'))).toBe(false);
 
         // The fixtures are not runnable by accident: the offline demo is a template this build
@@ -2269,6 +2512,14 @@ describe('task submit and recorded history', () => {
             'model',
             'nodes',
             'role',
+            // R9: the compiled tree now also states WHEN the flow started (a field the
+            // contract already declared — see `TurnSection.startedAt`). Without it every
+            // delegate row hides its elapsed label, because the client settles a row's
+            // span from this pair only. The exact stamps are pinned in
+            // ./turn-projector.test.ts (`section timing (R9)`); the canonical flow records
+            // with a wall clock, so all this route-level probe can state is that BOTH
+            // endpoints are on the wire and ordered.
+            'startedAt',
             'state',
             'tail',
             'threadId',
@@ -2277,6 +2528,7 @@ describe('task submit and recorded history', () => {
         expect(section.agent).toBe('demo');
         expect(section.role).toBe('primary');
         expect(section.state).toBe('done');
+        expect(section.startedAt).toBeLessThan(section.endedAt);
         expect(section.model).toBe('demo-model');
         expect(section.threadLabel).toBe('DO1');
         expect(section.id).toBe(`${state.turnId}:0`);
@@ -3254,15 +3506,6 @@ describe('body policy and bounds', () => {
 // template is patchable), and the per-agent instruction TEXT is answerable on its own routes
 // instead of being smuggled through a fat card.
 describe('harness registry writes over HTTP', () => {
-    const RESEARCH_GUIDELINES = [
-        'Search the repository before reasoning about it: grep({ pattern, patterns, paths }) returns matching lines with file and line numbers; glob returns paths only.',
-        'Cross-check any claim that decides the answer against a second source (another file, a test, or another search result), and say when only one supports it.',
-        DISCOVERY_GUIDELINE,
-        WEB_SEARCH_GUIDELINE,
-        DELEGATION_GUIDELINE,
-        'Delegate narrow follow-ups: summarizer condenses notes, workspace verifies a code path, reviewer challenges a conclusion.',
-        'Finish with the answer, cite the file and line, tool, or URL behind each claim, and label anything you could not verify.'
-    ];
     const SUMMARIZER_GUIDELINES = ['Keep names, numbers, and conclusions.', 'Drop preamble and repetition.'];
 
     it('creates a harness, lists it, and reads its definition back', async () => {
@@ -3293,7 +3536,7 @@ describe('harness registry writes over HTTP', () => {
             definition_revision: 1,
             core_tools: LIVE_CORE_TOOLS,
             instruction_summary: [
-                { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+                { agent: 'research', source: 'catalogue', overridden: false, chars: 116 },
                 { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
             ]
         });
@@ -3598,7 +3841,7 @@ describe('harness registry writes over HTTP', () => {
         expect(created.status).toBe(201);
         // The summary states WHICH member is overridden and how long its text is - never the text.
         expect(created.body.harness.instruction_summary).toEqual([
-            { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+            { agent: 'research', source: 'catalogue', overridden: false, chars: 116 },
             { agent: 'summarizer', source: 'harness', overridden: true, chars: 21 }
         ]);
 
@@ -3664,7 +3907,7 @@ describe('harness registry writes over HTTP', () => {
             agent_instructions: {}
         });
         expect(cleared.body.harness.instruction_summary).toEqual([
-            { agent: 'research', source: 'catalogue', overridden: false, chars: 115 },
+            { agent: 'research', source: 'catalogue', overridden: false, chars: 116 },
             { agent: 'summarizer', source: 'catalogue', overridden: false, chars: 56 }
         ]);
     });
@@ -3796,7 +4039,7 @@ describe('harness registry writes over HTTP', () => {
             body: {
                 error: {
                     message:
-                        '`agentModels` names "demo", which is not a member of this harness. Members: instruct, research, workspace, reviewer, planner, summarizer.'
+                        '`agentModels` names "demo", which is not a member of this harness. Members: instruct, general, research, workspace, reviewer, debugger, summarizer.'
                 }
             }
         });

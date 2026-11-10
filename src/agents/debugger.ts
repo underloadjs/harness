@@ -29,7 +29,8 @@ import {
     DELEGATION_GUIDELINE,
     DISCOVERY_GUIDELINE,
     PERMISSIONS_GUIDELINE,
-    TOOL_CREATE_GUIDELINE
+    TOOL_CREATE_GUIDELINE,
+    WEB_SEARCH_GUIDELINE
 } from './guidelines';
 
 export const debuggerAgent: AgentProfile = {
@@ -48,6 +49,9 @@ export const debuggerAgent: AgentProfile = {
         'Reduce every failure to the smallest call sequence that triggers it again, and quote the exact tool, input, and error text.',
         // Scratch is fine; editing the subject is not, unless asked.
         'Write scratch files when a probe needs them, but never change the code under test unless the brief asks for a fix.',
+        // The web trio is part of what gets stressed, and an absent `search` on a keyless
+        // host is a correct finding, not a missing capability to invent a source for.
+        WEB_SEARCH_GUIDELINE,
         DELEGATION_GUIDELINE,
         DISCOVERY_GUIDELINE,
         TOOL_CREATE_GUIDELINE,

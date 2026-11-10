@@ -190,9 +190,11 @@ const DELEGATION_LINE =
     'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation, verify its answer before relying on it, and follow up with the same target instead of guessing: a later delegation continues that subagent\'s conversation.';
 
 // The default card's replacement for that line (../../agents/general.ts): alone by
-// contract, and the `threadFork` loophole closed in the same breath.
+// contract, with BOTH loopholes a lone agent could still use to hand a step away closed
+// in the same breath — `threadFork` (spawns a branch) and `threadSend` (posts the step
+// into another conversation the host happens to have open).
 const LONE_LINE =
-    'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork either.';
+    'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.';
 
 afterEach(() => {
     vi.unstubAllEnvs();

@@ -319,11 +319,14 @@ describe('delegated conversation identity (R18)', () => {
             }
         ]);
 
-        // Adoption is ONE patch carrying identity and state together, so a watcher never
-        // sees a row addressable by invocation but not by conversation.
+        // Adoption is ONE patch carrying identity, state and the row's START together, so
+        // a watcher never sees a row addressable by invocation but not by conversation, nor
+        // a running row whose elapsed label has no baseline (R9). `1_020` is this frame's
+        // stamp (`childStart` is event index 2 of the 10 ms-spaced fold).
         expect(patchesFor(result.ops, 'turn-1:1')[0]).toEqual({
             invocationId: '2',
             state: 'streaming',
+            startedAt: 1_020,
             threadId: 'thread-2',
             agentLabel: 'RR1',
             threadLabel: 'RR1'
@@ -335,6 +338,10 @@ describe('delegated conversation identity (R18)', () => {
 
         expect(placeholder).toMatchObject({ id: 'turn-1:1', agent: 'helper' });
         expect(Object.prototype.hasOwnProperty.call(placeholder, 'threadId')).toBe(false);
+        // R9: and it has no clock either. A QUEUED delegation opened before the child ran
+        // states no `startedAt`; the field arrives with the adoption patch above, which is
+        // exactly when the row starts running.
+        expect(Object.prototype.hasOwnProperty.call(placeholder, 'startedAt')).toBe(false);
 
         // One bar per conversation: every segment names the row that owns it, and the
         // delegated answer is its OWN segment, not the parent's.

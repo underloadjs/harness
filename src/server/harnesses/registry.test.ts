@@ -14,6 +14,22 @@
 //     flaky as the live toolbox with testFlaky retained.
 //
 // No provider and no network: constructing a preset never calls the transport.
+//
+// AGENT ROSTER / ROLE-CONTRACT PASS (what the assertions below re-pinned)
+// ----------------------------------------------------------------------
+//   - the trusted roster is 10 ids in order: general, instruct, research, workspace,
+//     reviewer, planner, debugger, summarizer, demo, flaky. `research`/`workspace`/
+//     `planner` keep their ids (an agent id is persisted and has no alias fallback) and
+//     only their TITLES moved to Explore / Analyst / Manager;
+//   - the shipped catalogue is 7 live cards, general first (the default); its order is
+//     exactly what `GET /harnesses` returns;
+//   - a built-in team is `teamOf(primary)`: every other live role MINUS the Manager
+//     (`planner` refuses to run as a delegate, ../../agents/planner.ts) PLUS the
+//     summarizer, so the Manager appears only as a primary, never in another card's
+//     allowlist;
+//   - the harness-level aliases are UNCHANGED (writer/assistant -> instruct,
+//     researcher -> research) because they map HARNESS names, not agent titles — and the
+//     titles General/Explore/Analyst/Manager/Debugger are not names and do not resolve.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent } from '../../harness';
@@ -36,10 +52,13 @@ import {
     presets
 } from './presets';
 import { SHARED_TOOL_NAMES } from './toolbox';
+// `AGENT_PROFILE_NAMES` is deliberately NOT imported: the roster assertions below are written
+// as literal id lists, so renaming/adding a profile is a visible test edit rather than a
+// change that re-derives the expectation from the same source it checks.
 // `agentInstruction` is imported rather than re-typed here: a no-override member must
 // equal exactly what the trusted catalogue composes, and duplicating the prose (or the
 // join rule) in this file is how a pin silently drifts from the shipped prompt.
-import { AGENT_PROFILE_NAMES, AGENT_PROFILES, agentInstruction } from '../../agents';
+import { AGENT_PROFILES, agentInstruction } from '../../agents';
 
 // The exact tool-order assertions below assume a KEYLESS host: search is
 // registered only when EXA_API_KEY/TAVILY_API_KEY resolves (harness.ts:728-738),
@@ -86,52 +105,93 @@ describe('the shipped registry', () => {
     it('lists every template as an independent, editable copy', () => {
         const registry = createHarnessRegistry();
 
+        // Seven live cards, DEFAULT FIRST, with the titles the roster/role pass shipped
+        // (presets.ts:486-494).
+        // `research`/`workspace`/`planner` keep their ids and carry the new visible titles
+        // Explore/Analyst/Manager; `general` and `debugger` are the two new profiles.
         expect(
             registry.list().map((preset) => ({
                 name: preset.name,
+                title: preset.title,
                 builtin: preset.builtin,
                 editable: preset.editable
             }))
         ).toEqual([
-            { name: 'instruct', builtin: true, editable: true },
-            { name: 'research', builtin: true, editable: true },
-            { name: 'workspace', builtin: true, editable: true },
-            { name: 'reviewer', builtin: true, editable: true },
-            { name: 'planner', builtin: true, editable: true }
+            { name: 'general', title: 'General', builtin: true, editable: true },
+            { name: 'instruct', title: 'Instruct', builtin: true, editable: true },
+            { name: 'research', title: 'Explore', builtin: true, editable: true },
+            { name: 'workspace', title: 'Analyst', builtin: true, editable: true },
+            { name: 'reviewer', title: 'Reviewer', builtin: true, editable: true },
+            { name: 'planner', title: 'Manager', builtin: true, editable: true },
+            { name: 'debugger', title: 'Debugger', builtin: true, editable: true }
         ]);
 
         // R20.1: independent copies. No registry entry aliases a shipped template
         // object or its mutable arrays, so editing one registry cannot leak into
         // another (or into the module constants).
+        // The catalogue index moved with the roster: `presets[0]` is now `general`, so the
+        // copy guard below runs against instruct at its CURRENT index (1).
         const instruct = registry.find('instruct')!;
-        expect(instruct).not.toBe(presets[0]);
-        expect(instruct.tools).not.toBe(presets[0].tools);
-        expect(instruct.subagents).not.toBe(presets[0].subagents);
+        expect(presets[0].name).toBe('general');
+        expect(presets[1].name).toBe('instruct');
+        expect(instruct).not.toBe(presets[1]);
+        expect(instruct.tools).not.toBe(presets[1].tools);
+        expect(instruct.subagents).not.toBe(presets[1].subagents);
 
         const other = createHarnessRegistry();
         registry.update('instruct', { title: 'Edited' });
         expect(other.find('instruct')?.title).toBe('Instruct');
-        expect(presets[0].title).toBe('Instruct');
+        expect(presets[1].title).toBe('Instruct');
     });
 
     it('ships only real production configurations and keeps the fixtures explicit (T5)', () => {
-        // The default catalogue is exactly the five live roles: nothing scripted,
-        // nothing that fails on purpose. A user picking a card gets a harness that
-        // talks to the configured provider with the shared toolbox.
+        // The default catalogue is exactly the seven live roles: nothing scripted, nothing
+        // that fails on purpose. A user picking a card gets a harness that talks to the
+        // configured provider with the shared toolbox. The two new profiles from the roster
+        // pass (`general`, `debugger`) join it, `general` first because it is the default
+        // entry point (DEFAULT_CLI_PRESET in ../cli/options.ts).
         expect(createHarnessRegistry().list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(presets.map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
+        // The catalogue ORDER is the `GET /harnesses` order, the picker order, and the order
+        // the frontend palette assigns tones by, so the titles travel with it (presets.ts:483-494).
+        expect(presets.map((preset) => preset.title)).toEqual([
+            'General',
+            'Instruct',
+            'Explore',
+            'Analyst',
+            'Reviewer',
+            'Manager',
+            'Debugger'
+        ]);
+
+        // The DEFAULT card's contract (presets.ts:178-195): `general` is the only live preset
+        // with no allowlist, so the runtime never even registers `delegate` for it — the
+        // default agent cannot split work out, not even by accident.
+        const general = presets[0];
+        expect([general.primary, general.subagents, general.agents]).toEqual([
+            'general',
+            [],
+            ['general']
+        ]);
+        const generalHarness = general.create(SETTINGS, progress);
+        expect(Object.keys(generalHarness.subagents)).toEqual([]);
+        expect(generalHarness.tools.delegate).toBeUndefined();
 
         // The fixtures still exist as presets — they are just not shipped. Their
         // behaviour is unchanged (demo stays offline/scripted, flaky keeps its
@@ -145,11 +205,13 @@ describe('the shipped registry', () => {
         const injected = createHarnessRegistry(ALL_PRESET_TEMPLATES);
 
         expect(injected.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
             'planner',
+            'debugger',
             'demo',
             'flaky'
         ]);
@@ -158,24 +220,82 @@ describe('the shipped registry', () => {
         // session frozen on the scripted demo rebuilds even though demo left the
         // catalogue (see ./restore.test.ts and ./registry.ts presetFromRecord).
         expect(ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
-            ...presets.map((preset) => preset.name),
-            ...FIXTURE_PRESETS.map((preset) => preset.name)
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger',
+            'demo',
+            'flaky'
         ]);
     });
 
-    it('exposes the trusted agent profiles', () => {
+    it('exposes the trusted agent profiles in catalogue order', () => {
         const registry = createHarnessRegistry();
 
-        expect(registry.agents().map((profile) => profile.name)).toEqual([...AGENT_PROFILE_NAMES]);
+        // The exact roster (src/agents/index.ts:78-89). The ids `research`, `workspace` and
+        // `planner` are UNCHANGED on purpose — an agent id is persisted in every record and
+        // there is no agent-id alias fallback — while their visible titles moved to Explore /
+        // Analyst / Manager, and two new profiles (`general`, `debugger`) joined the roster.
+        expect(registry.agents().map((profile) => profile.name)).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger',
+            'summarizer',
+            'demo',
+            'flaky'
+        ]);
+        // Titles are catalogue data too, and they are the pair the card/picker renders.
+        expect(registry.agents().map((profile) => profile.title)).toEqual([
+            'General',
+            'Instruct',
+            'Explore',
+            'Analyst',
+            'Reviewer',
+            'Manager',
+            'Debugger',
+            'Summarizer',
+            'Demo',
+            'Flaky'
+        ]);
     });
 
     it('resolves legacy aliases for lookup but not for update', () => {
         const registry = createHarnessRegistry();
 
+        // The aliases map HARNESS names, not agent titles, so the roster pass left it
+        // exactly as it was (registry.ts:114-118): writer/assistant -> instruct,
+        // researcher -> research.
         expect(registry.find('writer')?.name).toBe('instruct');
         expect(registry.find('assistant')?.name).toBe('instruct');
         expect(registry.find('researcher')?.name).toBe('research');
         expect(registry.find('nope')).toBeUndefined();
+
+        // The new/moved VISIBLE TITLES are titles, not names: no alias was added for them
+        // (presets.ts:82-93), and lookup is exact-key + alias-map only (registry.ts:1187-1193).
+        // `General`/`Debugger` are titles whose id is lowercase-shipped, and a lookup is
+        // case-sensitive, so the capitalized form resolves to nothing.
+        expect(registry.find('General')).toBeUndefined();
+        expect(registry.find('Explore')).toBeUndefined();
+        expect(registry.find('Analyst')).toBeUndefined();
+        expect(registry.find('Manager')).toBeUndefined();
+        expect(registry.find('Debugger')).toBeUndefined();
+        // The new ids themselves are real names: both are shipped cards.
+        expect(registry.find('general')?.title).toBe('General');
+        expect(registry.find('debugger')?.title).toBe('Debugger');
+        // A title reserves nothing (an `Explore` harness is still free to create), while a
+        // shipped id stays taken case-insensitively, so `General` cannot shadow `general`.
+        expect(registry.create({ name: 'Explore', primary: 'research' }).name).toBe('Explore');
+        expect(registryError(() => registry.create({ name: 'General', primary: 'instruct' }))).toEqual({
+            status: 409,
+            message: 'Harness "General" already exists.'
+        });
 
         expect(registryError(() => registry.update('writer', { title: 'Writer' }))).toEqual({
             status: 404,
@@ -258,11 +378,13 @@ describe('creating a harness', () => {
 
         // The registry lists it after the built-ins.
         expect(registry.list().map((entry) => entry.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
             'planner',
+            'debugger',
             'my-review'
         ]);
     });
@@ -307,7 +429,11 @@ describe('creating a harness', () => {
 
         expect(registryError(() => registry.create({ name: 'x', primary: 'nobody' }))).toEqual({
             status: 400,
-            message: `\`primary\` names unknown agent "nobody". Known agents: ${AGENT_PROFILE_NAMES.join(', ')}.`
+            // The refusal names the whole trusted roster, in `AGENT_PROFILE_NAMES` order
+            // (src/agents/index.ts:78-89) — pinned as literal prose so a renamed or added
+            // profile is a deliberate test edit rather than a silent message change.
+            message:
+                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky.'
         });
     });
 
@@ -338,7 +464,9 @@ describe('creating a harness', () => {
             )
         ).toEqual({
             status: 400,
-            message: `\`subagents\` names unknown agent "critic". Known agents: ${AGENT_PROFILE_NAMES.join(', ')}.`
+            // Same roster prose as the `primary` refusal above (registry.ts:362).
+            message:
+                '`subagents` names unknown agent "critic". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky.'
         });
 
         expect(
@@ -421,11 +549,13 @@ describe('updating a harness', () => {
             title: 'Instruct',
             // The shipped description, byte-for-byte: the patch replaced the
             // registry entry, not the object the old session captured.
-            description: presets[0].description,
+            description: presets[1].description,
             primary: 'instruct',
-            // The shipped team (T3): every other real role plus the summarizer.
-            subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer'],
-            agents: ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer']
+            // The shipped team (`teamOf('instruct')`, presets.ts:161-164): every OTHER live
+            // role except the Manager (`planner`, which refuses to run as a delegate), plus
+            // the summarizer. The two new profiles `general` and `debugger` are now members.
+            subagents: ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            agents: ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']
         });
         expect(before).not.toBe(after);
         expect(registry.find('instruct')).toBe(after);
@@ -441,19 +571,21 @@ describe('updating a harness', () => {
     it('drops the new primary from the old allowlist when subagents are not restated', () => {
         const registry = createHarnessRegistry();
 
-        // Research starts with the symmetric team (T3): instruct, workspace,
-        // reviewer, planner, summarizer. Promoting one member must remove it from
-        // the allowlist and keep the rest in order.
+        // Explore starts with the shipped team (`teamOf('research')`, presets.ts:223):
+        // general, instruct, workspace, reviewer, debugger, summarizer — note the Manager is
+        // absent from every built-in team but its own. Promoting one member must remove it
+        // from the allowlist and keep the rest in order.
         const after = registry.update('research', { primary: 'summarizer' });
 
         expect(after.primary).toBe('summarizer');
-        expect(after.subagents).toEqual(['instruct', 'workspace', 'reviewer', 'planner']);
+        expect(after.subagents).toEqual(['general', 'instruct', 'workspace', 'reviewer', 'debugger']);
         expect(after.agents).toEqual([
             'summarizer',
+            'general',
             'instruct',
             'workspace',
             'reviewer',
-            'planner'
+            'debugger'
         ]);
         expect(after.create(SETTINGS, progress).tools.delegate.visibility).toBe('core');
     });
@@ -472,7 +604,8 @@ describe('updating a harness', () => {
             registryError(() => registry.update('research', { primary: 'nobody' }))
         ).toEqual({
             status: 400,
-            message: `\`primary\` names unknown agent "nobody". Known agents: ${AGENT_PROFILE_NAMES.join(', ')}.`
+            message:
+                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer, demo, flaky.'
         });
     });
 
@@ -613,11 +746,13 @@ describe('deleting a harness', () => {
 
         expect(registry.find('temp')).toBeUndefined();
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
 
         // No tombstone: a user harness is absent from the saved document as soon as
@@ -634,10 +769,12 @@ describe('deleting a harness', () => {
 
         expect(registry.remove('instruct')).toBe(instruct);
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(registry.find('instruct')).toBeUndefined();
 
@@ -708,10 +845,12 @@ describe('deleting a harness', () => {
         // A re-created name appends: it does not return to the shipped position,
         // because listing order is creation order for anything not shipped.
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'research',
             'workspace',
             'reviewer',
             'planner',
+            'debugger',
             'instruct'
         ]);
     });
@@ -719,7 +858,13 @@ describe('deleting a harness', () => {
     it('seeds tombstones at construction, including for a name this build does not ship', () => {
         const registry = createHarnessRegistry(presets, { deletedBuiltins: ['instruct', 'workspace'] });
 
-        expect(registry.list().map((preset) => preset.name)).toEqual(['research', 'reviewer', 'planner']);
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
+            'research',
+            'reviewer',
+            'planner',
+            'debugger'
+        ]);
         expect(registry.deletedBuiltins()).toEqual(['instruct', 'workspace']);
         expect(registry.find('writer')).toBeUndefined();
 
@@ -728,11 +873,13 @@ describe('deleting a harness', () => {
         // already deleted rather than resurrected.
         const unmatched = createHarnessRegistry(presets, { deletedBuiltins: ['retired-default'] });
         expect(unmatched.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(unmatched.deletedBuiltins()).toEqual(['retired-default']);
     });
@@ -752,11 +899,13 @@ describe('deleting a harness', () => {
         registry.restoreDeletedBuiltins(['demo']);
         expect(registry.deletedBuiltins()).toEqual(['demo', 'retired-default']);
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
             'planner',
+            'debugger',
             'flaky'
         ]);
 
@@ -777,10 +926,12 @@ describe('deleting a harness', () => {
         registry.remove('planner');
 
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
+            'debugger',
             'extra'
         ]);
         expect(registry.deletedBuiltins()).toEqual(['planner']);
@@ -789,13 +940,17 @@ describe('deleting a harness', () => {
         registry.restore(captured);
 
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
-        expect(registry.find('research')?.title).toBe('Researcher');
+        // The restored row carries this build's shipped title: `research` is the id, and
+        // Explore is what the roster pass renamed it to on the card.
+        expect(registry.find('research')?.title).toBe('Explore');
         expect(registry.find('extra')).toBeUndefined();
         expect(registry.find('planner')).toBeDefined();
         expect(registry.deletedBuiltins()).toEqual([]);
@@ -1376,7 +1531,20 @@ describe('an injected registry', () => {
         expect(registry.find('scripted')).not.toBe(scripted);
         expect(registry.find('scripted')).toEqual(scripted);
         expect(registry.find('instruct')).toBeUndefined();
-        expect(registry.agents().map((profile) => profile.name)).toEqual([...AGENT_PROFILE_NAMES]);
+        // The trusted roster is independent of the injected catalogue: the same 10 ids,
+        // in `AGENT_PROFILE_NAMES` order (src/agents/index.ts:78-89).
+        expect(registry.agents().map((profile) => profile.name)).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger',
+            'summarizer',
+            'demo',
+            'flaky'
+        ]);
 
         // Creating into an injected registry is still validated and works.
         const created = registry.create({ name: 'fresh', primary: 'instruct' });

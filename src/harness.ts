@@ -1505,7 +1505,57 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             messages: (threadId) => threadMessages(threadId),
             replaceMessages: (threadId, messages) =>
                 setThreadMessages(threadId, [...messages]),
-            setStatus: (threadId, status) => setThreadStatus(threadId, status)
+            setStatus: (threadId, status) => setThreadStatus(threadId, status),
+            // T8 — the plugin-facing park/unpark pair (the compaction contract). Each
+            // is an ARROW over the thread-state helper, both for the temporal-dead-zone
+            // rule the rest of this block follows and to add the api-level guards the
+            // helpers deliberately omit (they take a live `ThreadState`; a plugin only
+            // has an id).
+            //
+            // `pauseThreadState` is already an idempotent no-op when the record is
+            // parked, and `resumeThreadState`'s twin guard is `status !== 'paused'`, so
+            // BOTH directions are no-ops that still return the record — a plugin that
+            // re-parks or un-parks a thread it does not own is never an error, and never
+            // a duplicate `thread.paused`/`thread.resumed`.
+            //
+            // T11/D1 — these two are the OWNERLESS form of the pair (a plugin has only an
+            // id here, so there is no per-handler identity to attribute): the park they
+            // take names no holder and the park they lift is whatever is there. That is
+            // deliberate — it is what keeps `api.threads.resume` able to free a
+            // conversation an earlier hook stranded — and it is why the compaction plugin
+            // un-parks through THIS member (`unpark()` in
+            // src/plugins/context-compaction.plugin.ts) after parking through its payload
+            // `pause()`: payload parks are the private, owner-checked pair, api parks are
+            // the host-shaped escape hatch.
+            //
+            // Guards added here:
+            //   - unknown id → throws through `threadStateOf` (the same message every
+            //     other thread member gives), so a plugin cannot park a stale id;
+            //   - `stopped` → REFUSED for pause. Stopping is the host's, and reviving
+            //     a stopped conversation is the host's (`sendThreadInput`); a plugin
+            //     parking one would bury a stop under a park nothing but the host can
+            //     lift. `resume` deliberately keeps its plain no-op for `stopped`:
+            //     a parked-then-stopped thread must not be un-stopped by a plugin.
+            pause: (threadId) => {
+                const state = threadStateOf(threadId);
+
+                if (state.record.status === 'stopped') {
+                    throw new HarnessError(
+                        `Thread "${threadId}" is stopped; a plugin cannot park it — only a host turn can revive a stopped conversation.`
+                    );
+                }
+
+                pauseThreadState(state);
+
+                return threadRecordCopy(state.record);
+            },
+            resume: (threadId) => {
+                const state = threadStateOf(threadId);
+
+                resumeThreadState(state);
+
+                return threadRecordCopy(state.record);
+            }
         },
         // T3.5 — the host's persisted-state read, exposed read-only to a plugin. An
         // ARROW, not a reference: `snapshot` is declared far below (the same
@@ -4604,6 +4654,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // active request). A NEW host send after the stop captures the new epoch
         // and is therefore the one legal revival path.
         generation: number;
+        // PARK OWNERSHIP (T11/D1). Written ONLY on the transition into 'paused' by
+        // `pauseThreadState` (an explicit owner = the plugin whose `turn.before`
+        // payload parked it; `undefined` = an ownerless park taken by a host path or
+        // the decision channel) and cleared when the park is lifted.
+        //
+        // `resumeThreadState` reads it ONLY while the record is actually 'paused', and
+        // every transition INTO 'paused' rewrites it, so a value left behind by a stop,
+        // a purge, or a host `setStatus` can never be consulted — no cleanup path has to
+        // know this field exists.
+        parkOwner?: string;
     };
 
     const threadStates = new Map<string, ThreadState>();
@@ -4782,9 +4842,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // merged, not the handle methods).
     //
     //   running  → STEER  (queue + wake; drained before the next request is built)
-    //   paused   → RESUME through the same path `sendThreadInput` uses, then START
-    //              a turn — exactly what the server does for a submit to a parked
-    //              thread, and what the finding's `paused` gap asked for.
+    //   paused   → QUEUE into the park (T8). The park SURVIVES the message: the
+    //              plugin that parked the conversation owns the only `resume` (the
+    //              compaction holder drains this queue at the boundary it controls),
+    //              and a host `sendThreadInput` stays the explicit revival escape.
+    //              Revision of delegate-stress T3.2's "resume, then start" reading.
     //   idle     → START a turn whose prompt is the attributed message.
     //   stopped  → REFUSE. T3.3, ratified: the host owns stopping and reviving, and
     //              `threadSend` is not the host ("stopped must mean stopped for
@@ -4812,13 +4874,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
-        // R2/R3: a plugin park is not a stop. Lifting it is what makes the parked
-        // conversation addressable again — the SAME call `sendThreadInput` makes for
-        // a host submit, so `thread.resumed` fires for the plugin that parked it and
-        // no second revival path is invented.
-        if (target.record.status === 'paused') {
-            resumeThreadState(target);
-        }
+        // T8: a plugin park used to be lifted HERE (delegate-stress T3.2). It is not
+        // lifted anywhere in this function any more — see the `paused` branch below,
+        // after the receipt helper — because a message that merely ARRIVES at a
+        // parked conversation is not the work the holder parked for.
 
         const content = `from agent "${sender.agent}"${
             sender.threadId === undefined ? '' : ` (thread ${sender.threadId})`
@@ -4835,6 +4894,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(sender.threadId === undefined ? {} : { senderThreadId: sender.threadId })
         });
 
+        // T8 — THE PARK IS NOT A STOP AND NOT A REVIVAL. A delegate or tool speaking
+        // into a conversation a plugin parked gets the same next-boundary queue a
+        // running steer uses, and the park is left exactly as it was: no
+        // `resumeThreadState`, no `thread.resumed`, no run. Why: the holder of the
+        // park (the compaction plugin) is waiting for its OWN turn to finish the job
+        // it parked for, and a message that only ARRIVED would silently steal that
+        // turn by starting a run. The holder never has to read `state.queue`: a park
+        // taken inside a run drains at that run's own next boundary (`drainThreadQueue`
+        // in `runAgentCore`), and a park that outlived its run drains at the first
+        // boundary of the next run anything starts. A host `sendThreadInput` remains
+        // the only path that lifts a park from outside (see the note above it).
+        if (target.record.status === 'paused') {
+            target.queue.push(content);
+            notifyStateChange('thread');
+            // A park taken INSIDE a run (`turn.before`/`turn.after` returning
+            // `{ action: 'pause' }`) leaves the run ATTACHED, and that run must be
+            // woken to reach the boundary where the queue drains. A park that
+            // outlived its run has nothing to wake — the queue simply waits for the
+            // next run, which drains it at its first boundary.
+            if (target.run !== undefined) markRunDirty(target.run);
+
+            return receipt('queued');
+        }
+
         if (target.record.status === 'running' && target.run !== undefined) {
             // Running: land at the next model boundary, never inside the request
             // that is already in flight (R5 ordering guarantee).
@@ -4844,7 +4927,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return receipt('queued');
         }
 
-        // Dormant: `idle`, or a `paused` record the resume above just cleared. A
+        // Dormant: `idle` and nothing else. `stopped` threw at the top, `paused`
+        // queued above without lifting the park (T8), and a live run steered above. A
         // `running` record with NO run attached would land here too; the pair is
         // written and cleared together in `runAgent` (`resolvedThread.run = run` beside
         // `status = 'running'`, both released in its `finally`), so that combination is
@@ -5187,15 +5271,44 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // 'paused' is the ONE thread status a plugin owns. A lifecycle hook runs at a turn
     // boundary with the run parked inside it, so a plugin that needs the conversation
     // to stop moving (compaction, a budget gate, a human review) marks the record and
-    // resumes it before returning. The run itself is NOT suspended — this is an
+    // resumes it when its own work is done — through this pair, exposed to a plugin as
+    // `api.threads.pause`/`api.threads.resume` (T8), or through the `turn.before`
+    // payload's `pause()`/`resume()`. The run itself is NOT suspended — this is an
     // observable status at a boundary, and a hook that wants a real pause awaits its
     // own work.
+    //
+    // T8: while a thread is parked, model-driven submissions QUEUE (see
+    // `steerThread`/`postThreadMessage`) instead of clearing the park, so a park may
+    // outlive the run that took it and the queue survives until the next boundary.
     //
     // Both helpers notify persistence exactly like a status change already does
     // (`thread`), so a snapshot of a parked thread is a snapshot of an idle one
     // (snapshot() maps anything not 'stopped' to 'idle').
-    const pauseThreadState = (state: ThreadState): void => {
+    //
+    // T11/D1 — OWNERSHIP. A park may name the plugin that took it, and only that plugin
+    // may lift it. Without this, two `turn.before` context passes on ONE boundary fight
+    // over the signal: `context-compaction` (registered first, src/plugin/manifest.ts)
+    // parks for a summarize pass, and `context-trimmer` (registered after it, and only
+    // ever writes `setIncluded` flags) runs its own `pause()`/`resume()` wrapper around a
+    // trim in the SAME round (src/plugins/context-trimmer.plugin.ts ~421) — a lift of a
+    // park it never took, which erased the observable paused-during-compaction window
+    // and turned the holder's `['paused','resumed']` pair into `['paused','resumed',
+    // 'resumed']`. Ownership is the smallest thing that fixes that without touching the
+    // escape hatches:
+    //   ownerless park   → anyone may lift it (host `sendThreadInput` revival,
+    //                      `api.threads.pause`/`resume`, a decision-channel pause);
+    //   owned park       → only that owner's payload controls lift it, and a submission
+    //                      that merely arrives still only queues (T8).
+    const pauseThreadState = (state: ThreadState, owner?: string): void => {
+        // Already parked: an idempotent no-op, and NOT an ownership transfer. A plugin
+        // that parks defensively on top of somebody else's park must not take the park
+        // over — otherwise its matching `resume()` would lift the earlier holder's park,
+        // which is the exact bug this change removes.
         if (state.record.status === 'paused') return;
+
+        // Recorded on the TRANSITION, and only here: `undefined` is a real value here
+        // meaning "an ownerless park anyone may lift".
+        state.parkOwner = owner;
 
         state.record.status = 'paused';
         notifyStateChange('thread', { agent: state.agent.name });
@@ -5208,9 +5321,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // it in: 'running' while a run is still attached (the normal case, because the run
     // is inside the very hook that paused), 'idle' when the run has already ended and
     // the park outlived it.
-    const resumeThreadState = (state: ThreadState): void => {
+    const resumeThreadState = (state: ThreadState, owner?: string): void => {
         if (state.record.status !== 'paused') return;
 
+        // THE OWNERSHIP RULE, exactly once. A park that names its holder survives anyone
+        // else's lift; an ownerless park (holder `undefined`) and an ownerless caller
+        // (`owner === undefined`) both pass, so every host path and every api-level
+        // unpark keeps lifting whatever is there — the `sendThreadInput` revival escape
+        // hatch and the decision-channel pause are unchanged by this.
+        const holder = state.parkOwner;
+
+        if (holder !== undefined && owner !== undefined && holder !== owner) return;
+
+        state.parkOwner = undefined;
         state.record.status = state.run === undefined ? 'idle' : 'running';
         notifyStateChange('thread', { agent: state.agent.name });
         if (hookBus.has('thread.resumed')) {
@@ -5218,6 +5341,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // Steer one conversation with guidance for its NEXT safe boundary. Two states
+    // accept the text, and both only ever QUEUE it (R5: nothing interrupts a request
+    // that is already in flight):
+    //
+    //   running (run attached) → queued, and the run is marked dirty so a run that
+    //      is parked on background work still reaches its boundary;
+    //   paused (T8)            → queued into the SAME queue, and the park is left
+    //      untouched. A delegate steering a parked thread is speaking to the plugin
+    //      that owns the park, not starting a turn of its own; the park is lifted by
+    //      that plugin's `api.threads.resume` (or its `turn.before` payload's
+    //      `resume()`), never by a submission that merely arrives.
+    //
+    // Refused, with a reason and no mutation: `stopped` (the host owns stopping and
+    // reviving) and `idle` (nothing is running, so guidance has no next boundary —
+    // `sendThreadInput` is the call that starts a turn).
     const steerThread = (threadId: string, input: string): HarnessThreadSteerReceipt => {
         const state = threadStateOf(threadId);
 
@@ -5231,6 +5369,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 queued: false,
                 reason: `Thread "${threadId}" is stopped; a host must resume it before steering.`
             };
+        }
+
+        // T8: a parked conversation accepts guidance and keeps its park — the queue
+        // push is identical to the running branch, the difference is only what is NOT
+        // done here (no `resumeThreadState`, so no `thread.resumed` for the holder).
+        if (state.record.status === 'paused') {
+            state.queue.push(input);
+            notifyStateChange('thread');
+            // Parked INSIDE a run: wake it so it reaches the boundary that drains
+            // the queue. Parked with no run: the queue waits for the next one.
+            if (state.run !== undefined) markRunDirty(state.run);
+
+            return { threadId, queued: true };
         }
 
         if (state.record.status !== 'running' || state.run === undefined) {
@@ -5271,9 +5422,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // R2: an explicit host turn is ALSO the revival path for a conversation a
         // plugin parked and never resumed. Without this a 'paused' record would sit
-        // unreachable, since nothing else writes that status. `resumeThreadState`
-        // emits `thread.resumed`, so a plugin that parked the thread sees its own park
-        // being lifted by the host.
+        // unreachable for the HOST, since T8 made model-driven paths stop lifting it:
+        // `postThreadMessage`/`threadSend` and `steerThread` now QUEUE into a park
+        // instead of clearing it, so the only other way out is the plugin that parked
+        // it calling `api.threads.resume` (or its `turn.before` payload's `resume()`).
+        // `resumeThreadState` emits `thread.resumed`, so a plugin that parked the
+        // thread sees its own park being lifted by the host. T11/D1 keeps that true by
+        // construction: this call passes NO owner, and an ownerless lift reaches a park
+        // a plugin's payload `pause()` owns — otherwise a parked conversation would be
+        // unreachable for the very host that is allowed to revive it.
         if (state.record.status === 'paused') {
             resumeThreadState(state);
         }
@@ -8670,8 +8827,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // The factory runs once per handler, so `messages`, `entries` and
         // `estimatedTokens` always describe what THIS handler is being asked about.
         // The factory receives the bus's context object (which carries the owning
-        // plugin's api), not the api itself.
-        const context = ({ api }: { api?: HarnessPluginApi }): HarnessTurnBeforeContext => {
+        // plugin's api AND its registration owner, plugin/hooks.ts `payloadFor`), not the
+        // api itself.
+        const context = ({
+            api,
+            owner
+        }: {
+            api?: HarnessPluginApi;
+            owner?: string;
+        }): HarnessTurnBeforeContext => {
             // WHAT THIS HANDLER WAS ENTERED WITH. `messages` keeps its long-standing
             // contract (harness.plugin.test.ts "the hook sees EXACTLY what the provider
             // was about to receive … before any rewrite"): it is the projection (or the
@@ -8827,11 +8991,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // Awaited so a plugin can do real work between park and unpark. Both are
                 // no-ops for a run without a conversation (a branch), which cannot be
                 // parked because nothing can address it.
+                //
+                // THE PARK OWNER (T11/D1): the name of the plugin THIS context belongs to,
+                // bound here so the pair is a private lock for that one handler. `pause()`
+                // records it; `resume()` lifts only a park it holds. The externally visible
+                // signature stays `() => Promise<void>` (types, `HarnessTurnBeforeContext`),
+                // because a plugin must not be able to name somebody else's owner and
+                // un-park them. `owner` is absent for a subscription with no plugin
+                // identity, which degrades to the old ownerless (lift-any) park.
                 pause: async (): Promise<void> => {
-                    if (threadState !== undefined) pauseThreadState(threadState);
+                    if (threadState !== undefined) pauseThreadState(threadState, owner);
                 },
                 resume: async (): Promise<void> => {
-                    if (threadState !== undefined) resumeThreadState(threadState);
+                    if (threadState !== undefined) resumeThreadState(threadState, owner);
                 }
             };
         };
@@ -8962,6 +9134,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (decision.action === 'pause') {
             // A branch has no persistent conversation to park (nothing can address it),
             // so the decision is a no-op there — the same answer `context.pause()` gives.
+            //
+            // T11/D1 — no owner is passed: the decision channel is the RUN's, not one
+            // handler's, so it takes an ownerless park that the same plugin's payload
+            // `resume()`, its `api.threads.resume`, or a host turn may all lift.
             if (run.threadState !== undefined) pauseThreadState(run.threadState);
             return;
         }

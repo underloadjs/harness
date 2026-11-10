@@ -13,8 +13,18 @@
 // What still has to hold, and what this file owns:
 //   - DISTINCT UNTIL EXHAUSTED: the hashed slot is probed FORWARD to a free slot, so the
 //     first `PALETTE.length` identities get pairwise different tones;
-//   - A STABLE REPEAT PAST THAT: the 9th identity reuses its own hashed slot, so a tone
-//     never drifts when some other agent shows up;
+//   - A STABLE REPEAT PAST THAT: a beyond-palette identity reuses its OWN hashed slot, so
+//     a tone never drifts when some other agent shows up;
+//   - THE EIGHT TONES COVER EVERY SESSION, AND THE CATALOGUE MAY EXCEED THEM: what a
+//     reader SEES is one view's roster (the active harness's members), never the whole
+//     catalogue. The largest live team — the Manager's — is its primary plus its
+//     `teamOf()` allowlist = 8 members, exactly the palette, and every other live team is
+//     7, so no live session ever has two members in one tone. The 10-id CATALOGUE
+//     (src/agents/index.ts `AGENT_PROFILE_NAMES`, the `demo`/`flaky` fixtures included) is
+//     deliberately NOT the constraint: widening the palette would re-derive the hash
+//     modulus (`PALETTE_SIZE`) and repaint EVERY agent to make room for two cards a live
+//     session can never contain, so the repeat rule above is what covers the surplus
+//     (see ui/agent-color.ts, the `EIGHT TONES IS ENOUGH` block);
 //   - ONE IDENTITY, ONE SLOT: `Writer` / `writer` / ` writer ` are one agent and must not
 //     mint a second colour or burn a second slot;
 //   - NO FLICKER: one canonical id maps to one tone for the whole page lifetime, so no
@@ -29,14 +39,21 @@
 //
 // Every expectation below is an EXACT value. The slot vectors are what the documented
 // algorithm produces (FNV-1a 32-bit `hash % 8`, then a forward probe for a free slot);
-// they were captured once and hardcoded, so a hash edit, a palette edit or a probe edit
-// lands here as a deliberate diff rather than a silent recolour. The palette hexes stay
-// hardcoded too: they are what a user learns.
+// they were captured once with a scratch probe against the real module and hardcoded, so
+// a hash edit, a palette edit, a probe edit or a roster edit lands here as a deliberate
+// diff rather than a silent recolour. The palette hexes stay hardcoded too: they are what
+// a user learns.
+//
+// The catalogue is read from src/agents (a read-only import: the shipped browser bundle
+// never imports server profiles) and the live teams from
+// src/server/harnesses/presets.ts, so a new role or a changed allowlist shows up here as
+// a failing exact-vector assertion instead of a comment that quietly went stale.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/agent-color.test.ts
 
 import type { AgentColor } from './agent-color';
 import { AGENT_PROFILE_NAMES } from '../../agents';
+import { presets, teamOf } from '../../server/harnesses/presets';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
     AGENT_PALETTE,
@@ -63,14 +80,30 @@ const PALETTE = [
     { slot: 7, color: '#facc15', line: 'rgba(250, 204, 21, 0.6)' }
 ];
 
-// The roster the harness ships (src/agents/index.ts `AGENT_PROFILE_NAMES`), in roster
-// order — the order `configureAgentColors` resolves collisions in.
-const ROSTER = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer', 'demo', 'flaky'];
+// The catalogue the harness ships (src/agents/index.ts `AGENT_PROFILE_NAMES`), in
+// catalogue order — the order `configureAgentColors` resolves collisions in when a caller
+// seeds the whole catalogue. TEN ids for EIGHT tones: the seven real roles, the
+// summarizer, and the two fixtures.
+const CATALOGUE = [
+    'general',
+    'instruct',
+    'research',
+    'workspace',
+    'reviewer',
+    'planner',
+    'debugger',
+    'summarizer',
+    'demo',
+    'flaky'
+];
 
-// The slots that roster lands on: three of its keys hash onto an already-owned slot
-// (`planner`, `demo`, `flaky`) and walk forward, which is why the vector is not simply
-// the raw hash residues [3,4,6,2,3,0,6,6].
-const ROSTER_SLOTS = [3, 4, 6, 2, 5, 0, 7, 1];
+// The slots that catalogue lands on. Four of its keys hash onto an already-owned slot
+// (`instruct` 3, `planner` 3, `debugger` 6, `summarizer` 0 collide) and walk forward,
+// which is why the vector is not simply the raw residues
+// [3, 3, 4, 6, 2, 3, 6, 0, 6, 6]. The first eight ids take all eight slots, one each; the
+// two fixtures then find nothing free and keep their own residue (6), sharing
+// `workspace`'s violet — the documented repeat, not a drift.
+const CATALOGUE_SLOTS = [3, 4, 5, 6, 2, 7, 0, 1, 6, 6];
 
 // Eight throwaway identities `a`..`h`: none of them collides, so their slots are exactly
 // their hash residues — the smallest vector that pins the hash itself.
@@ -87,6 +120,59 @@ const EXHAUSTED_SLOTS = [4, 5];
 // An explicit colour outside the palette, and the outline the module must derive from it.
 const CUSTOM_HEX = '#ff6600';
 const CUSTOM_TONE: AgentColor = { slot: -1, color: CUSTOM_HEX, line: 'rgba(255, 102, 0, 0.6)' };
+
+// The seven LIVE harnesses (`presets` in src/server/harnesses/presets.ts) and the exact
+// set each one paints: primary first, then its `teamOf()` allowlist, and the exact slot
+// each member lands on when THAT roster is configured on an empty page. The member sets
+// and slots are measured off the module, not derived in the assertion; the live test
+// re-derives the members from production `teamOf` and requires this literal.
+//
+// `planner` (the Manager) is the largest team there is: `teamOf()` drops the primary and
+// the Manager from every OTHER team, so its own allowlist keeps all six remaining
+// specialists plus the summarizer = 7 subagents + the primary = 8 members, EXACTLY the
+// palette. Every other live team is 7. That is the real "the roster fits the palette"
+// guarantee — the largest live team fits (the Manager's fills it), and the catalogue may
+// exceed it and repeats stably. `general`'s shipped preset passes `subagents: []`, so what
+// that card really paints is one member; the 7-member set below is its upper bound.
+const LIVE_TEAMS: { primary: string; members: readonly string[]; slots: readonly number[] }[] = [
+    {
+        primary: 'general',
+        members: ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+        slots: [3, 4, 5, 6, 2, 7, 0]
+    },
+    {
+        primary: 'instruct',
+        members: ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+        slots: [3, 4, 5, 6, 2, 7, 0]
+    },
+    {
+        primary: 'research',
+        members: ['research', 'general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+        slots: [4, 3, 5, 6, 2, 7, 0]
+    },
+    {
+        primary: 'workspace',
+        members: ['workspace', 'general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'],
+        slots: [6, 3, 4, 5, 2, 7, 0]
+    },
+    {
+        primary: 'reviewer',
+        members: ['reviewer', 'general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'],
+        slots: [2, 3, 4, 5, 6, 7, 0]
+    },
+    {
+        // The Manager: eight members, so the palette is exactly used up — no spare slot,
+        // and still no shared tone.
+        primary: 'planner',
+        members: ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+        slots: [3, 4, 5, 6, 7, 2, 0, 1]
+    },
+    {
+        primary: 'debugger',
+        members: ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'],
+        slots: [6, 3, 4, 5, 7, 2, 0]
+    }
+];
 
 const slotsOf = (agents: readonly (string | undefined)[]): number[] => agents.map((agent) => agentColorOf(agent).slot);
 const tonesOf = (agents: readonly string[]): AgentColor[] => agents.map((agent) => agentColorOf(agent));
@@ -112,37 +198,37 @@ describe('deterministic assignment (R1: stable across reload)', () => {
     });
 
     it('repeats the identical tones after a reload (reset + the same roster)', () => {
-        configureAgentColors({ roster: ROSTER });
-        const before = tonesOf(ROSTER);
-        expect(slotsOf(ROSTER)).toEqual(ROSTER_SLOTS);
+        configureAgentColors({ roster: CATALOGUE });
+        const before = tonesOf(CATALOGUE);
+        expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
 
         // A reload forgets the map but not the rule: the same roster produces the same
-        // eight tones, in the same order. This is the R1 requirement — the old shuffle
+        // ten tones, in the same order. This is the R1 requirement — the old shuffle
         // failed exactly here.
         resetAgentColors();
-        configureAgentColors({ roster: ROSTER });
-        expect(tonesOf(ROSTER)).toEqual(before);
+        configureAgentColors({ roster: CATALOGUE });
+        expect(tonesOf(CATALOGUE)).toEqual(before);
 
         // 25 more simulated reloads, with the real (unstubbed) `Math.random` available:
         // not one of them may vary the vector.
         for (let run = 0; run < 25; run += 1) {
             resetAgentColors();
-            configureAgentColors({ roster: ROSTER });
-            expect(tonesOf(ROSTER)).toEqual(before);
+            configureAgentColors({ roster: CATALOGUE });
+            expect(tonesOf(CATALOGUE)).toEqual(before);
         }
 
         // The roster is not what makes a tone a fact about an identity either: reading
         // the same names with an empty map re-derives the same vector.
         resetAgentColors();
-        expect(slotsOf(ROSTER)).toEqual(ROSTER_SLOTS);
+        expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
     });
 
     it('answers the same whatever order the surfaces ask in', () => {
-        configureAgentColors({ roster: ROSTER });
+        configureAgentColors({ roster: CATALOGUE });
 
         // The composer may ask before the transcript, or after the dialog: only the
         // roster order decides a collision, never which component painted first.
-        expect(slotsOf([...ROSTER].reverse())).toEqual([...ROSTER_SLOTS].reverse());
+        expect(slotsOf([...CATALOGUE].reverse())).toEqual([...CATALOGUE_SLOTS].reverse());
     });
 
     it('never touches the source of randomness', () => {
@@ -158,8 +244,8 @@ describe('deterministic assignment (R1: stable across reload)', () => {
                 return 0.5;
             };
 
-            configureAgentColors({ roster: ROSTER });
-            expect(slotsOf(ROSTER)).toEqual(ROSTER_SLOTS);
+            configureAgentColors({ roster: CATALOGUE });
+            expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
 
             resetAgentColors();
             configureAgentColors({ roster: LETTERS });
@@ -219,20 +305,20 @@ describe('configureAgentColors (roster order + explicit colours)', () => {
         // One name at a time (the worst case of a chatty live roster) still lands on the
         // same vector as one full configure.
         resetAgentColors();
-        for (const name of ROSTER) configureAgentColors({ roster: [name] });
-        expect(slotsOf(ROSTER)).toEqual(ROSTER_SLOTS);
+        for (const name of CATALOGUE) configureAgentColors({ roster: [name] });
+        expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
     });
 
     it('is idempotent: re-configuring the same roster changes nothing', () => {
-        configureAgentColors({ roster: ROSTER });
-        const first = tonesOf(ROSTER);
+        configureAgentColors({ roster: CATALOGUE });
+        const first = tonesOf(CATALOGUE);
 
-        configureAgentColors({ roster: ROSTER });
-        configureAgentColors({ roster: ROSTER, colors: { ghost: CUSTOM_HEX } });
+        configureAgentColors({ roster: CATALOGUE });
+        configureAgentColors({ roster: CATALOGUE, colors: { ghost: CUSTOM_HEX } });
         configureAgentColors({});
 
-        expect(tonesOf(ROSTER)).toEqual(first);
-        expect(first.map((tone) => tone.slot)).toEqual(ROSTER_SLOTS);
+        expect(tonesOf(CATALOGUE)).toEqual(first);
+        expect(first.map((tone) => tone.slot)).toEqual(CATALOGUE_SLOTS);
     });
 
     it('ignores blank and placeholder roster entries so they consume no slot', () => {
@@ -436,22 +522,116 @@ describe('stability (no flicker on re-render)', () => {
     });
 });
 
-describe('palette shape', () => {
-    it('publishes eight distinct tones and fits the real roster', () => {
+describe('palette shape (the largest live team fits; the catalogue may exceed it and repeats stably)', () => {
+    it('publishes exactly eight distinct tones, and no more', () => {
         expect(AGENT_PALETTE).toEqual(PALETTE);
+        expect(AGENT_PALETTE.length).toBe(8);
+        expect(AGENT_PALETTE.map((tone) => tone.slot)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
         expect(new Set(AGENT_PALETTE.map((tone) => tone.color)).size).toBe(8);
         expect(new Set(AGENT_PALETTE.map((tone) => tone.line)).size).toBe(8);
 
-        // The roster the harness ships must still fit inside one palette, or two built-in
-        // profiles would share a colour on every page. A new profile that overflows fails
-        // here and says exactly what to widen.
-        expect(AGENT_PROFILE_NAMES).toEqual(ROSTER);
+        // Eight slots is the modulus the probe walks (ui/agent-color.ts `PALETTE_SIZE`).
+        // Widening the array re-derives every automatic mapping, so the size is pinned:
+        // the decision to keep eight must be a deliberate edit here.
+        expect(CATALOGUE.length - AGENT_PALETTE.length).toBe(2);
+    });
+
+    it('pins the ten-id catalogue slot for slot, and the two surplus ids on their own residues', () => {
+        // The catalogue the harness ships, in catalogue order: ten ids for eight tones.
+        // Exceeding the palette is ALLOWED (the surplus is `demo`/`flaky`, fixtures a live
+        // session can never contain), so this asserts the exact repeat rather than demanding
+        // a tone per id.
+        expect(AGENT_PROFILE_NAMES).toEqual(CATALOGUE);
+        expect(AGENT_PROFILE_NAMES.length).toBe(10);
 
         configureAgentColors({ roster: AGENT_PROFILE_NAMES });
-        const tones = tonesOf(AGENT_PROFILE_NAMES);
-        expect(tones.map((tone) => tone.slot)).toEqual(ROSTER_SLOTS);
-        expect(new Set(tones.map((tone) => tone.color)).size).toBe(8);
-        expect(tones.some((tone) => tone.slot === UNKNOWN_AGENT_COLOR.slot)).toBe(false);
+
+        // One exact slot per id — the whole vector, in catalogue order.
+        expect(slotsOf(AGENT_PROFILE_NAMES)).toEqual(CATALOGUE_SLOTS);
+        expect(tonesOf(AGENT_PROFILE_NAMES)).toEqual(CATALOGUE_SLOTS.map(toneAt));
+
+        // The first eight ids fill the palette exactly once each, so a live view that
+        // offers the real roles has no shared tone.
+        expect([...new Set(CATALOGUE_SLOTS.slice(0, 8))].sort()).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // The surplus: both fixtures hash to residue 6 and every slot is already owned,
+        // so each keeps its OWN residue instead of walking — the repeat rule, spelled out
+        // as the tone the reader sees (the same violet as `workspace`).
+        expect(slotsOf(CATALOGUE.slice(8))).toEqual([6, 6]);
+        expect(agentColorOf('demo')).toEqual(toneAt(6));
+        expect(agentColorOf('flaky')).toEqual(toneAt(6));
+        expect(agentColorOf('demo')).toEqual(agentColorOf('workspace'));
+
+        // Ten ids, eight tones: exactly eight distinct colours, and none of them is the
+        // neutral fallback — every real id gets a real tone.
+        expect(new Set(tonesOf(AGENT_PROFILE_NAMES).map((tone) => tone.color)).size).toBe(8);
+        expect(CATALOGUE_SLOTS.filter((slot) => slot === UNKNOWN_AGENT_COLOR.slot).length).toBe(0);
+    });
+
+    it('repeats the surplus stably instead of drifting a tone a reader is already using', () => {
+        // The eight real roles join first and take all eight slots, one each — `planner`
+        // (residue 3) and `debugger` (residue 6) only reach 7 and 0 because the probe
+        // walked forward.
+        configureAgentColors({ roster: CATALOGUE.slice(0, 8) });
+        expect(slotsOf(CATALOGUE.slice(0, 8))).toEqual([3, 4, 5, 6, 2, 7, 0, 1]);
+        expect(new Set(slotsOf(CATALOGUE.slice(0, 8))).size).toBe(8);
+
+        // The surplus joins on a later, incremental configure (the way a live roster
+        // grows): nothing free, so both fixtures land on their own residue 6.
+        configureAgentColors({ roster: CATALOGUE.slice(8) });
+        expect(slotsOf(CATALOGUE.slice(8))).toEqual([6, 6]);
+        expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
+
+        // No drift: identities discovered AFTER the surplus cannot move the surplus, the
+        // first eight, or each other — the repeat is a fact about the key, never a slot
+        // handed out round-robin.
+        configureAgentColors({ roster: ['i', 'j', 'k', 'l', 'm', ...COLLIDERS] });
+        expect(slotsOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS);
+
+        // And the identical map again from an empty page (a reload, or the ACTIVE view
+        // being re-selected): id by id, the same ten tones.
+        resetAgentColors();
+        configureAgentColors({ roster: CATALOGUE });
+        expect(tonesOf(CATALOGUE)).toEqual(CATALOGUE_SLOTS.map(toneAt));
+    });
+
+    it('keeps every live harness team pairwise distinct inside the eight slots', () => {
+        // The seven live cards (`presets`), in catalogue order — the fixtures are absent
+        // here, which is exactly why the catalogue is not the constraint.
+        expect(presets.map((preset) => preset.primary)).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger'
+        ]);
+
+        // Member counts, per card: the Manager's team is the largest there is and lands
+        // exactly on the palette size, every other live team is smaller. A new specialist
+        // role (or a summarizer that joins twice) pushes this vector past 8 and fails.
+        expect(LIVE_TEAMS.map((team) => team.members.length)).toEqual([7, 7, 7, 7, 7, 8, 7]);
+        expect(Math.max(...LIVE_TEAMS.map((team) => team.members.length))).toBe(8);
+
+        for (const team of LIVE_TEAMS) {
+            resetAgentColors();
+
+            // The members the module is configured with: the primary plus the production
+            // allowlist (`teamOf`), so a changed rule shows up here instead of in a stale
+            // copy of the list.
+            expect([team.primary, ...teamOf(team.primary)]).toEqual(team.members);
+
+            configureAgentColors({ roster: team.members });
+
+            // Exact slots for that roster, and pairwise distinct by construction: one
+            // distinct slot and one distinct colour per member.
+            const slots = slotsOf(team.members);
+            expect(slots).toEqual(team.slots);
+            expect(new Set(slots).size).toBe(team.members.length);
+            expect(tonesOf(team.members)).toEqual(team.slots.map(toneAt));
+            expect(new Set(tonesOf(team.members).map((tone) => tone.color)).size).toBe(team.members.length);
+        }
     });
 });
 

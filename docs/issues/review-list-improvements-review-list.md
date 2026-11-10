@@ -1,9 +1,11 @@
 # 0007 — Improvements review list (not gaps)
 
-> **Status:** Open — extended on 2026-11-09 with the records-store stress-test findings
-> that are doc fixes or wording, not gaps (the four that are gaps became 0008-0011);
-> reduced earlier the same day (closed parts deleted; the Security-P2 `.env` item trimmed
-> to the escape hatch that is still undocumented); for the package owner to triage
+> **Status:** Open — extended on 2026-11-10 with the web-tools stress test (search / fetch /
+> download): five items became 0012-0016 and the rest are below; extended on 2026-11-09 with the
+> records-store stress-test findings that are doc fixes or wording, not gaps (the four that are
+> gaps became 0008-0011); reduced earlier the same day (closed parts deleted; the Security-P2
+> `.env` item trimmed to the escape hatch that is still undocumented); for the package owner to
+> triage
 > **Severity:** Review list
 > **Area:** cross-cutting
 > **Date opened:** 2026-11-02
@@ -72,6 +74,34 @@ Priority vocabulary: **P1** = cheap and prevents a consumer making a wrong assum
 | P3 | `ids` is mapped without deduplication, so a repeated id is returned twice — and the `tasks` wrapper's own description promises the opposite ("one id may appear in only ONE of `tasks`/`remove`/`ids` per call", which reads as a uniqueness rule for `ids` itself). `entries` and `remove` both reject a repeated id; `ids` silently duplicates. | `src/core/records.ts:2582-2586` (`ids.map(…)` — no set, no refusal) vs `:1743`/`:1750` (the duplicate-id refusals for the other two keys) and `src/tools/runtime/tasks.tool.ts:38` (the sentence); runtime 2026-11-09: `tasks {ids:["1","1"]}` returned id 1 twice, `records {ids:["1","1"]}` returned it twice | Deduplicate, or refuse a repeated id the way `entries`/`remove` do, and align the wrapper sentence. |
 | P3 | `frontend/index.ts` publishes ~15.9k lines of imperative DOM panels (the 14 `ui/*` modules it re-exports) alongside the two parts a non-DOM (e.g. React) host can actually reuse. The barrel header lists the panels and marks `main.ts` as not exported, and README calls it "the reusable client: api + contract + ui panels", but neither states that `ui/*` owns the DOM and a React host should take `api` + `contract` only. | `src/frontend/index.ts:26-48`; `README.md:242` | Say so in the barrel header and README ("reusable client: `api` + `contract`; `ui/*` owns the DOM"), or split the panels out. |
 
+## Web tools — search, fetch, download
+
+Found 2026-11-10 by stress-testing the three web tools (~40 calls), then independently re-checked
+by six reviewers who each reproduced what they could. Several items as first filed were **refuted
+or re-scoped**; the refutations are recorded here so the same claim is not re-filed. The five that
+are gaps became 0012-0016.
+
+| P | Item | Evidence | Suggested action |
+|---|---|---|---|
+| P1 | The `webfetch/request.ts` module header states bounds that are **10× stale**: it says "100 KiB of response body" and "24,000 characters of returned content", but the constants are 1 MiB and 240,000. The header is the prose a contributor reads first, and it is the file that argues why the bound is deliberate — so the reasoning is attached to numbers the code no longer uses. | `src/tools/webfetch/request.ts:16` ("100 KiB of response body"), `:19` ("24,000 characters"), `:24-25` ("100 KiB … is deliberate") vs `:71` (`MAX_RESPONSE_BYTES = 1024 * 1024`), `:75` (`MAX_CONTENT_CHARS = 240_000`); `:70` and `:76` admit in passing that they are "10x" the old figures | Rewrite the header block against the current constants, and say which of the three bounds (body / content / serialized result) each paragraph is about. |
+| P2 | `download`'s `declaredBytes` is **misnamed**: it is the `content-length` header, which for a `content-encoding: gzip` response is the *compressed* wire length, while `bytes` is the decoded size. A caller comparing them sees a false mismatch and suspects truncation on a complete file. | runtime 2026-11-10: `google.com/favicon.ico` → `bytes: 5430, declaredBytes: 1494`; curl shows `content-length: 1494` **with** `content-encoding: gzip` and `original size modulo 2^32 5430` — the file is byte-exact at 5,430; `src/tools/webdownload/download.tool.ts:697-698` (reads the header), `:761` (echoes it as `declaredBytes`) | Rename to `contentLengthBytes` and add `contentEncoding`, or emit a `note` when the two differ **and** no `content-encoding` is present. |
+| P2 | `download`'s filename extension policy is content-type-driven and three-valued, and it **appends** rather than replaces: `name="hasext.ico"` served as `text/html` becomes `hasext.ico.html`, so the suffix on disk contradicts the caller's own suffix buried mid-name. The same input name produced two different outputs depending on MIME. | `src/tools/webdownload/download.tool.ts:396-406` (`resolveName`: `if (extension.length === 0 \|\| chosen.toLowerCase().endsWith(extension)) return chosen;` else append); runtime 2026-11-10: `name="weird name!! .txt"` → `weird name!! .txt.html` for `text/html` but `weird name!! .txt` for `image/x-icon` | One rule: strip any existing extension, then append the content-type extension only when a mapping exists; return a `note` when the name was altered. |
+| P2 | `fetch` truncates at 60,314 characters where its own content budget is 63,488 **bytes**, because the shrink loop takes one 5% geometric step and stops — so 3,174 bytes (5%) of the declared budget are discarded on **every** truncation, and the reported `characters` is neither the byte length nor the cap. The result also carries no `bytes`/`contentBudget`, unlike every sibling content tool. | `src/tools/webfetch/request.ts:85` (`MAX_RESULT_BYTES = 64 * 1024`), `:93` (`RESULT_OVERHEAD_BYTES = 2_048`), `:95-96` (the budget is bytes "on purpose"); the fit loop yields `63,488 − floor(63,488 × 0.05) = 60,314`; siblings report bytes at `src/tools/files/read.tool.ts:445`, `glob.tool.ts:170`, `grep.tool.ts:291`, `files.tool.ts:229`; runtime: two different pages both cut at exactly `characters: 60314` | Refine by 1 byte after the geometric step to recover the 5%, and add `bytes: utf8ByteLength(output)` + `contentBudget: MAX_RESULT_CONTENT_BYTES` so the caller can see which bound it met. |
+| P3 | `search` returns no `note` when a filter produces zero results, so "domain is not indexed" and "nothing matched" look identical. Unlike `glob`/`grep`, `search` has no local ground truth (it is a thin proxy for a third-party API), so it cannot honestly emit `searched`/`excluded` — but it can name the active filters as the likely cause. | runtime 2026-11-10: `includeDomains:["example.invalid"]` → `{"results": [], "includeDomains":["example.invalid"]}`, no `note`; `src/tools/websearch/index.ts:551-561` (filters are echoed, no diagnostic field exists); contrast `src/tools/files/glob.tool.ts:140` / `grep.tool.ts:250` (`note`, `stopReason`) | When `results.length === 0`, add a `note` naming any active filters as the likely cause. |
+| P3 | `search` reports no `returned` count and no signal when `maxResults` was clamped. `requested` is **not** missing — `maxResults` is already echoed at `:551` — and `returned` is just `results.length`, so the valuable half is the clamp note. Behaviour **above** the documented clamp of 20 is unverified by both claimant and reviewer. | `src/tools/websearch/index.ts:419-423` (`maximum: 20`, "larger values are clamped to 20"), `:296` (the reject message), `:551` (echo); runtime: 2→2, 3→3, 5→5, 12→12, 20→20 verified; `maxResults: 50` never transmitted cleanly in either session | Add `returned: results.length` and a `note` when the input exceeded the clamp; pin the >20 case with a test so the doc claim stops being unverified. |
+| P3 | `download`'s `mediaId` is always `dl-1`. Deterministic and per-invocation by design, and **not** a costing collision: each call carries a distinct call id and the harness names every attachment separately, and the tool description points at `path` as the handle. It is a misleading field, nothing more. | `src/tools/webdownload/download.tool.ts:718-722` (`id: 'dl-1'`, with the comment "the transport re-suffixes it only when one tool block aggregates several downloads whose ids would otherwise collide"), `:556` (description names `path`); runtime 2026-11-10: 8 downloads across 7 turns, all `dl-1`, including 3 in one turn — all individually addressable by call id and by `path` | Drop the field, or make it session-monotonic. Low value either way. |
+
+### Refuted as filed — do not re-file without new evidence
+
+| Claim | Why it fails |
+|---|---|
+| `search` echoes un-normalized domains, so you cannot tell whether the filter was honored. | **False.** `index.ts:230` normalizes: `.replace(/^https?:\/\//, '').replace(/\/$/, '')`. Runtime 2026-11-10: `includeDomains:["https://arxiv.org", "arxiv.org/"]` echoes `["arxiv.org","arxiv.org"]` and every result is on arxiv.org. Filtering works in both directions (an `excludeDomains` list visibly displaced its targets). No fix needed. |
+| `fetch` has no retry, so a transient blip becomes a terminal failure. | **Re-scoped, and the flagship evidence did not reproduce.** The claimed Wikipedia fail-then-succeed reproduced only intermittently; the deterministic failures were one host (`httpbin.org`) reachable by curl and unreachable by `fetch` 5/5 times, including its **HTTP 200** endpoints — so "HTTP status codes are swallowed" is confounded by host unreachability, and status classification demonstrably works elsewhere (`example.com/<missing>` → `could not find the page (HTTP 404)`). The transport-cause collapse is real and became 0015; a general retry contradicts the deliberate no-retry rule at `request.ts:39-40`. |
+| `fetch` mis-served a `.png` as a network error instead of the clean binary refusal. | **Wrong.** It returns exactly the documented refusal: `fetch does not read .png files: use the \`download\` tool for binary content.` (`request.ts:583-586`). |
+| `download` silently accepted a 3.6× truncation / lying proxy. | **Wrong mechanism.** The file is complete and byte-exact; the "mismatch" is gzip compressed-vs-decoded length (see the P2 row above). Genuine truncation already hard-errors (`download could not read the response body.`). One real silent case remains unproven either way: a server declaring *less* than it sends is truncated to the declared size and reported as success. |
+| `fetch` `query` mode should exclude References / External links / See also by default. | **Would break correct answers.** The contract is "the sections whose heading or text contain it" and it is met; `query="Bibcode"` returns exactly those sections as its entire correct answer, so blanket exclusion becomes a "no section matching" error. The payload-bloat and unresumable-truncation halves are real and became 0016. |
+| `fetch` reported `pageCharacters: 123456` — suspiciously round, likely a placeholder bug. | **Correct value.** That wikitext file is 185,358 **bytes** but exactly 123,456 **characters** (verified twice with curl + `python3 len()`). The field is genuinely character-based, as documented. |
+
 ## Requests against other packages (out of this repo's hands)
 
 | P | Item | Evidence | Suggested action |
@@ -80,7 +110,7 @@ Priority vocabulary: **P1** = cheap and prevents a consumer making a wrong assum
 
 ## Out of scope
 
-- The capability changes argued in issues 0001-0006.
+- The capability changes argued in issues 0001-0006 and 0012-0016.
 - Any product decision about which surfaces of the package should be published at all
   (splitting `server`/`frontend` into separate packages is a bigger call than this list).
 

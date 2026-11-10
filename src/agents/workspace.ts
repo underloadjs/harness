@@ -23,7 +23,10 @@
 //
 // WHY NO GENERIC DISCOVERY LINE: the searchable-tools bullet below names the four tools
 // this role actually reaches for, which is the same policy at a fraction of the length —
-// ./guidelines.ts DISCOVERY_GUIDELINE is for roles that have no such short list.
+// ./guidelines.ts DISCOVERY_GUIDELINE is for roles that have no such short list. The
+// WEB_SEARCH line is not composed here either: an implementor answers from the workspace,
+// and ./research.ts + ./general.ts + ./instruct.ts are the roles that report on sources,
+// which is where "do not invent a source when search is undeclared" actually bites.
 import type { AgentProfile } from './types';
 import { DELEGATION_GUIDELINE, PERMISSIONS_GUIDELINE } from './guidelines';
 

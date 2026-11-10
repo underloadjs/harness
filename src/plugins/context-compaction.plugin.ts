@@ -1,25 +1,29 @@
-// Context Compaction — the shipped preset plugin (R3).
+// Context Compaction — the shipped preset plugin (R3, summarize flow T9).
 //
 // WHAT THIS FILE DOES NOW
 // -----------------------
-// The TRIGGER, the PAUSE lifecycle, and the PRUNING POLICY. Every conversation has a
-// context limit; when one reaches it, this plugin parks the thread at the turn boundary,
-// runs the compaction action, and un-parks it. The action is no longer blank: it prunes
-// superseded tool failures — a `failed`/`rejected` unit that a LATER unit already answered
-// (same tool, same canonical argument fingerprint, answered `completed`) stops being sent,
-// through the shipped `setIncluded` flag, so the transcript keeps it and a host can switch
-// it back. Nothing is deleted, nothing is summarized, and the summarize-and-reinitialize
-// checkpoint stays T6 of ../docs/tasks/2026-11-09-progressive-compaction.md.
+// The TRIGGER, the PAUSE lifecycle, and TWO writers. Every conversation has a context
+// limit; when one reaches it, this plugin parks the thread at the turn boundary and runs
+// the compaction. In the DEFAULT mode (`summarize`) the compaction is performed BY THE
+// CONVERSATION ITSELF: the next model turn is handed an instruction the plugin commits
+// into the transcript, the agent answers with its own compacted knowledge, and everything
+// the summary replaced stops being sent — through the shipped `setIncluded` flag, so
+// nothing is deleted and a host can switch a turn back. In `exclude` mode (the R3
+// behaviour, unchanged) the pass instead prunes superseded tool failures — a
+// `failed`/`rejected` unit that a LATER unit already answered (same tool, same canonical
+// argument fingerprint, answered `completed`) stops being sent, reversibly.
 //
 // THE POLICY LIVES ELSEWHERE ON PURPOSE
 // -------------------------------------
-// `executeCompaction` below is the WRITER. The decision is a pure function in
+// `executeCompaction` below is the `exclude` WRITER. The decision is a pure function in
 // ../core/context-pruning.ts (`planContextPruning`), so the rule can be pinned by a table
 // without a harness, a transport or a clock, and so a future `annotate` mode (T0 Q1) is a
 // second writer over the SAME plan rather than a second policy. The order of the action is
 // therefore fixed: read settings → build the plan → write the flags → report. A plan that
 // clears none of its guards writes NOTHING, which also means no persistence notification and
-// no save.
+// no save. The `summarize` writer is `createContextCompactionPasses` further down: its
+// decision is the agent's own, so all this file owns is the machine that gets the
+// instruction in and the range out (see "THE SUMMARIZE FLOW").
 //
 // PRE-OUTCOME TRANSCRIPTS: a conversation saved before the tool outcome was persisted
 // (compaction T1 — `outcome` on a tool message, core/tool-outcome.ts) reads as all
@@ -89,6 +93,138 @@
 //      A real compactor will hand the summary to a summarizer thread; if this plugin
 //      then compacted THAT conversation, the summarizer would re-trigger itself.
 //
+// THE SUMMARIZE FLOW — THE AGENT COMPACTS ITSELF (T9, the 2026-11-10 ruling)
+// ---------------------------------------------------------------------------
+// `mode: 'summarize'` (the DEFAULT now — an operator-approved behaviour change) does not
+// guess at what is stale. It asks the conversation: at the turn boundary the plugin
+// parks the thread, commits its own instruction into the CANONICAL transcript, and lets
+// the NEXT model turn of that same conversation answer it. The turn carries the full
+// context — the provider's prefix cache is still warm, because nothing before the
+// instruction moved — and the answer is the compacted knowledge: what is done and still
+// relevant, what the current task is and exactly where it left off, and what is pending.
+//
+// Then everything the summary replaced stops being SENT: every entry BEFORE the
+// instruction, and the intermediate turns BETWEEN the instruction and that final answer,
+// are flagged `included: false` (never deleted, never a system entry — the agent's
+// instruction blocks stay). What the next request carries is the retained head
+// `[instruction, summary]` plus whatever arrived after, which is the whole point: the
+// context is small again and the agent still knows what it was doing.
+//
+// THE PHASE MAP — WHY FIVE HOOKS AND NOT ONE
+// ------------------------------------------
+// The pass cannot finish inside `turn.before`: the answer it is waiting for is the one
+// the request this hook is about to release will produce. So one in-memory phase per
+// thread (`compacting` -> `finishing`) walks the pass across the run, and every hook
+// below owns one edge of that machine. Branches never enter it (they have no durable
+// conversation to compact, and `replaceHistory` refuses them), and neither does a run
+// with no thread at all — for those `pause()`/`resume()` are no-ops and the committed
+// instruction would be rolled back with the run, so the guard refuses the whole flow.
+//
+//   `turn.before`  — the trigger (Rules 0-5 + the phase guards), and the LAZY finalize:
+//                    a run that kept going (steering or a tool round raced the answer)
+//                    reaches the next boundary with `finishing` set, where `setIncluded`
+//                    shrinks THIS request.
+//   `turn.after`   — the answer arrived. A tool-free assistant turn is the summary, so
+//                    the phase becomes `finishing` and the thread is un-parked here.
+//                    That resume is load-bearing, not cosmetic: `thread.idle` fires only
+//                    on a real transition to idle (src/harness.ts ~10227), so a thread
+//                    left 'paused' would never reach the finalize below.
+//   `thread.idle`  — the run ENDED on the summary, which is the common case. The
+//                    transcript is rewritten through `api.threads.replaceMessages`
+//                    (allowed exactly here: the run has detached and the record is
+//                    idle), the phase clears, and a CONTINUATION NUDGE is sent so the
+//                    conversation picks its task back up. The nudge's run queues behind
+//                    the dying run's actor lock (`acquireAgent`) and projects the
+//                    compacted context when it starts.
+//   `run.finished` — the safety net for a compaction whose answer never reached
+//                    `turn.after`: the thread is un-parked for ANY active phase, and the
+//                    phase clears when it was still `compacting` (a `finishing` pass is
+//                    finalized by the `thread.idle` that follows in the same `finally`).
+//   `run.failed`   — same net on the failure path. The run's own rollback
+//                    (`brain.messages.splice(commitIndex)`, src/harness.ts ~9677) has
+//                    already removed the committed instruction and summary, so nothing
+//                    is left to disable; only the park is. `finishing` survives on
+//                    purpose — a later turn re-derives it — but a paused thread never
+//                    does, because a stranded park hides the conversation from its host.
+//
+// WHY THE INTERMEDIATE TURNS GO TOO
+// ---------------------------------
+// A model that disobeys "do not call tools" answers with a tool round first, and the
+// turns between the instruction and the real summary are exactly the ones the summary
+// replaced: leaving them in the context would keep the noise and pay for it every turn.
+// So the disable range is [0, final answer), excluding system entries and the
+// instruction itself — which also covers the plain case, where the final answer is the
+// message right after the instruction and the range adds nothing.
+//
+// THE COROLLARY A READER WILL ASK ABOUT (context T11/D3): guidance that DRAINS into that
+// range — a steer or a queued `threadSend` that lands after the instruction was committed
+// and before the summary — is withheld with the turns around it. That is the ratified rule
+// ("disable all the turns between the instruction and the final answer") and it is not a
+// lost message: a drain always happens BEFORE a request (`drainThreadQueue` runs ahead of
+// `requestTurn`), so the model saw the text on the turn that produced the summary, and the
+// summary is its durable record. What the rule does cost is that the text stops being sent
+// from the NEXT request on, so an unrelated later turn cannot quote it back — the one
+// consequence to know when reading a transcript whose entries are flagged off. A
+// submission that arrives after the answer is retained: it is the next pass's history, not
+// this one's. Pinned by the D3 case in src/plugin/context-compaction.test.ts.
+//
+// WHY THE CONTINUATION NUDGE IS A SEND AND NOT A RETURN VALUE
+// -----------------------------------------------------------
+// `turn.before` can rewrite THIS request; it cannot make the run continue after it
+// resolved on the summary. The nudge is one more host-shaped turn on the same thread,
+// fire-and-forget (`void ... .catch()`), so a conversation that compacted itself never
+// silently stops mid-task. Its text names the summary as the source of the next step,
+// which is what makes the retained head usable without the model having to ask.
+//
+// KNOWN LIMITATION (T11/D4, ratified as accepted 2026-11-10): that nudge run has NO
+// server-side turn record. The server's focused-submit path steers a thread it sees as
+// 'running' and then looks for the turn that owns it, and a run the RUNTIME started
+// (`src/server/sessions.ts` `steerIntoThread` → `owningTurnOf`, ~7156-7170) has none for a
+// top-level thread — so a submit racing the nudge's first moments is refused with 409
+// "Thread … is running but no recorded turn owns it; stop it before submitting". This is
+// NOT a compaction invention: every runtime-driven run has that shape (a delegate's
+// `threadSend` waking an idle conversation is the pre-existing one, documented at
+// src/server/workers/lane-worker-correctness.test.ts ~160-172, where the test's own
+// `waitAuthorityIdle` exists because a submit into that window is refused). It is a brief
+// refusal the client re-sends, not a lost message — the nudge's own run queues and drains
+// normally — and a server-level test of it would be a race (a gated plugin run racing an
+// HTTP submit), so it stays a documented limitation rather than a timing-flaky case.
+//
+// WHY THE OTHER SHIPPED `turn.before` PASS (`context-trimmer`) IS SAFE IN THIS ROUND
+// ----------------------------------------------------------------------------------
+// The trimmer is registered AFTER this pass (src/plugin/manifest.ts:42-58) and hook
+// dispatch is sequential in registration order (src/plugin/hooks.ts), so on a round where
+// both fire, the trimmer runs INSIDE the window this pass opened. Two separate things
+// about it had to be checked, and they have different answers:
+//
+//   1. ITS WRITER (the one that used to be considered the whole question) is compatible by
+//      construction: it writes ONLY `included: false` flags through `setIncluded`
+//      (src/plugins/context-trimmer.plugin.ts ~351) — no `setTranscript`, no
+//      `replaceHistory`, nothing that re-ENABLES an entry. Anything it withholds in this
+//      round rides along on the entries this pass commits back through `replaceHistory`,
+//      and anything it withholds AFTER the finalize only makes the retained head smaller.
+//      A pass that re-ENABLED entries would be the first thing needing a phase check here.
+//
+//   2. ITS HANDLER WRAPPER is NOT compatible, and that is what context T11 (D1) fixed.
+//      On a round with candidates the trimmer runs `await context.pause(); try { writer }
+//      finally { await context.resume(); }` (src/plugins/context-trimmer.plugin.ts
+//      ~421-427) around a flag write. Before T11 that `resume()` lifted ANY 'paused'
+//      record — including the park THIS pass took moments earlier on the same boundary —
+//      so the trigger turn lost its observable paused-during-compaction window and the
+//      `thread.paused`/`thread.resumed` pair an operator watches became `paused` +
+//      `resumed` + `resumed`, on a turn where the compaction was still outstanding.
+//
+// THE RULE THAT MAKES IT SAFE: parks are OWNED. `context.pause()` attributes the park to
+// the plugin whose payload it came from, and `context.resume()` lifts only a park that
+// same plugin holds (src/harness.ts `pauseThreadState`/`resumeThreadState`). The trimmer's
+// wrapper therefore pauses as a no-op on top of this pass's park (no ownership transfer)
+// and its `finally` declines to lift it — the park survives the round and goes away only
+// through this pass's own unpark (`turn.after` / the run-terminal nets, both via
+// `api.threads.resume`, which is deliberately OWNERLESS and still lifts anything, so a
+// stranded park can always be freed). No phase check in the trimmer is needed for this,
+// and none was added: the ordering stops mattering, which is a better guarantee than the
+// one a phase check would buy.
+//
 // WHY PAUSE/RESUME AROUND THE ACTION
 // ----------------------------------
 // Compaction is slow (an LLM call) and rewrites the conversation, so the roster a host
@@ -108,12 +244,14 @@
 // written to yield as little as the contract allows. Only a real trigger returns a
 // promise, and that is the turn where the delay is the whole point.
 //
-// WHY THE HANDLER LIVES IN A FACTORY (`createContextCompactionHandler`)
-// --------------------------------------------------------------------
-// `setup` stays a two-line wiring function, and the per-thread cooldown map plus the
-// action become injectable: a test (or a host that swaps the action but wants the same
-// lifecycle) builds the same guard with its own action without re-implementing the
-// rules. The shipped plugin always uses `executeCompaction`.
+// WHY THE HANDLERS LIVE IN ONE FACTORY (`createContextCompactionPasses`)
+// ---------------------------------------------------------------------
+// `setup` stays a five-line wiring function, and the per-thread cooldown map, the phase
+// map and the action become injectable: a test (or a host that swaps the action but wants
+// the same lifecycle) builds the same guard with its own action without re-implementing
+// the rules. The shipped plugin always uses `executeCompaction`. `createContextCompaction
+// Handler` remains as the single-hook spelling, because that is the shape a host reusing
+// the `exclude` pass already had.
 //
 // WHY THE COOLDOWN MAP IS NEVER PRUNED
 // -----------------------------------
@@ -133,9 +271,13 @@
 //
 // STATE
 // -----
-// The plugin is per-harness: `setup` runs once, so the cooldown map dies with the
-// harness. Nothing is persisted — a restarted process re-triggers on the next crossing,
-// which is correct because the context limit is a runtime fact, not durable state.
+// The plugin is per-harness: `setup` runs once, so the cooldown map and the phase map die
+// with the harness. Neither is persisted — a restarted process re-triggers on the next
+// crossing, which is correct because the context limit is a runtime fact, not durable
+// state. What IS durable is what a finished pass wrote: the withheld flags, the committed
+// instruction and its summary are ordinary canonical transcript entries, so a restart
+// resumes on the compacted context (pinned by the snapshot/restore case in
+// src/plugin/context-compaction.test.ts).
 //
 // Cross-references:
 //   - ../core/context-pruning.ts    — THE POLICY (`planContextPruning`), pure and table-tested
@@ -148,7 +290,18 @@
 //   - ../harness.ts                 — the `turn.before` emission (requestTurn → emitTurnBefore),
 //                                     the pause/resume implementations (pauseThreadState),
 //                                     `setIncluded` (the flag write) and the coalesced
-//                                     per-round `agent_message` report (closeRoundObservations)
+//                                     per-round `agent_message` report (closeRoundObservations);
+//                                     also `turn.after` (post-commit, ~9488), `run.finished` /
+//                                     `run.failed` (~10171/~10184), the failure rollback
+//                                     (~9677) that un-commits a compaction whose run failed,
+//                                     and `thread.idle` (~10227), which fires ONLY on a real
+//                                     transition to idle — the reason the summarize flow
+//                                     un-parks at `turn.after` instead of at the finalize
+//   - ../types (`HarnessPluginApi.threads`) — the T8 park/unpark pair the summarize flow drives
+//                                     from OUTSIDE a hook (`pause`/`resume`), plus
+//                                     `messages`/`replaceMessages` (the idle-path rewrite,
+//                                     refused while a run is attached) and `send` (the
+//                                     continuation nudge)
 //   - ../plugin/hooks.ts            — sequential, fail-open dispatch of hook handlers
 //   - ../plugin/host.ts             — how this built-in is applied (and replaced by a host),
 //                                     and where `api.report.diagnostic` gets its `owner`
@@ -172,6 +325,7 @@ import { planContextPruning } from '../core/context-pruning';
 import type {
     Agent,
     HarnessLifecycleHandler,
+    HarnessMessage,
     HarnessPlugin,
     HarnessPluginApi,
     HarnessPluginMetadata,
@@ -185,11 +339,15 @@ export const metadata = {
     name: 'context-compaction',
     title: 'Context Compaction',
     description:
-        'Watches each agent conversation against a context limit and, when the limit is reached, prunes the tool units a later success already answered at the turn boundary before the next model request is sent. Nothing is deleted: a pruned unit keeps its place in history and can be switched back on. The limit is the firing point: compaction starts as soon as the estimate reaches the effective limit, which is the per-model override for the model the conversation is running, capped by that model\'s declared context window when one is declared.',
+        'Watches each agent conversation against a context limit and, when the limit is reached, compacts the conversation at the turn boundary before the next model request is sent. In the default "summarize" mode the conversation does the work: the thread is parked, an instruction the plugin commits into the transcript is answered by this same agent with a summary of what is done, what it is working on and where it left off, and everything before that instruction (and the turns between it and the answer) stops being sent. The thread resumes with a nudge to continue, and the context is small again: the instruction plus the agent\'s own summary. The older "exclude" mode prunes only the tool units a later success already answered. Neither mode deletes anything: a withheld unit keeps its place in history and can be switched back on. The limit is the firing point: compaction starts as soon as the estimate reaches the effective limit, which is the per-model override for the model the conversation is running, capped by that model\'s declared context window when one is declared.',
     version: '1.0.0',
     tags: ['context', 'compaction', 'lifecycle'],
     builtin: true,
-    hooks: ['turn.before'],
+    // The summarize machine spans one run: `turn.before` starts it (trigger, and the lazy
+    // finalize when the run kept going), `turn.after` recognises the summary, `thread.idle`
+    // finalizes when the run ended on it, and the two run-terminal hooks are the safety net
+    // that never leaves a thread parked. See "THE PHASE MAP" in the header memo.
+    hooks: ['turn.before', 'turn.after', 'thread.idle', 'run.finished', 'run.failed'],
     settings: [
         {
             key: 'contextLimit',
@@ -215,7 +373,7 @@ export const metadata = {
             type: 'boolean',
             default: true,
             description:
-                'Runs the pruning pass on or off. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in.'
+                'Runs compaction on or off, in either mode. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in.'
         },
         {
             key: 'minTokens',
@@ -225,7 +383,7 @@ export const metadata = {
             min: 0,
             step: 50,
             description:
-                'A pass must withhold at least this many estimated tokens, or it does nothing at all — no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count.'
+                'A pass must withhold at least this many estimated tokens, or it does nothing at all — no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count. In "summarize" mode the same number is read the other way round, as a trivial floor on the LIVE estimate: a conversation smaller than this is never worth a compaction round trip, so the pass refuses rather than paying for a summary of a handful of turns. Set it to 0 to remove the floor, which a small per-model limit needs: a floor above that limit would never be crossed.'
         },
         {
             key: 'safetyTurns',
@@ -235,15 +393,15 @@ export const metadata = {
             min: 0,
             step: 1,
             description:
-                'How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon.'
+                'How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon. It belongs to "exclude" mode; "summarize" mode needs no horizon because the recent tail is exactly what the agent is summarizing.'
         },
         {
             key: 'mode',
             label: 'Compaction mode',
             type: 'string',
-            default: 'exclude',
+            default: 'summarize',
             description:
-                'What a compaction does with a unit it removes. Only "exclude" is implemented today: the unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours. "annotate" — replace the result with a one-line handle back to the full text — is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than "exclude" (including that one) behaves as "exclude" until it lands. The value actually used is reported in the pass diagnostic.'
+                'Which compaction runs when the limit is reached. "summarize" — the default since the 2026-11-10 context-compaction ruling — parks the conversation at the turn boundary and lets its NEXT model turn write the summary: the agent condenses what is done, what it is working on and where it left off, everything before that instruction stops being sent, and the conversation resumes with a nudge. "exclude" is the earlier behaviour: a superseded tool unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours and the cheaper one — no extra model turn. "annotate" — replace the result with a one-line handle back to the full text — is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than these two (including that one) behaves as "exclude", the flow that cannot spend a model turn by accident. The value actually used is reported in the pass diagnostic.'
         }
     ]
 } satisfies HarnessPluginMetadata;
@@ -267,7 +425,13 @@ const CONTEXT_LIMIT_DEFAULT = 200000;
 const ENABLED_DEFAULT = true;
 const MIN_TOKENS_DEFAULT = 200;
 const SAFETY_TURNS_DEFAULT = 6;
-const MODE_DEFAULT = 'exclude';
+
+// The two writers. `MODE_SUMMARIZE` is the declared default (the 2026-11-10 ruling);
+// `MODE_EXCLUDE` is R3's pruning pass and stays byte-for-byte what it was, for an operator
+// who wants the cheap flow or a host that reuses `executeCompaction` directly.
+const MODE_SUMMARIZE = 'summarize';
+const MODE_EXCLUDE = 'exclude';
+const MODE_DEFAULT = MODE_SUMMARIZE;
 
 // R4's remaining trigger setting, duplicated from its descriptor by the same rule.
 // An empty map: no per-model knowledge, so every model uses the global ceiling. A JSON
@@ -279,8 +443,41 @@ const MODEL_LIMITS_DEFAULT = '{}';
 // operator who stores it today gets `exclude` (the candidate list is already computed
 // before any write, which is the seam T0 Q1 asked to keep), and the pass diagnostic reports
 // both the value stored and the value used. Exported so a future writer and the UI extend
-// ONE list rather than re-spelling the union.
-export const COMPACTION_MODES: readonly string[] = [MODE_DEFAULT];
+// ONE list rather than re-spelling the union. Order is the UI's: the default first.
+export const COMPACTION_MODES: readonly string[] = [MODE_SUMMARIZE, MODE_EXCLUDE];
+
+// ---------------------------------------------------------------------------
+// THE SUMMARIZE SCRIPT — the three strings that ARE the protocol
+// ---------------------------------------------------------------------------
+//
+// All three are exported and their FIRST LINE is the detection anchor: the finalize step
+// finds its own instruction by scanning for `COMPACTION_MARKER` at the start of a user
+// entry, so the marker must stay byte-stable even if the body is reworded. It is also the
+// only thing telling the model (and a human reading the transcript) that this "user" turn
+// is plumbing rather than something a person typed — the role has to be `user`, because
+// the instruction arrives at a boundary where a `system` entry mid-transcript would be a
+// shape the transports are not promised (types/index.ts, `HarnessMessage`).
+const COMPACTION_MARKER = '[context compaction]';
+
+// The instruction the plugin commits into the transcript at the trigger. It asks for the
+// three things the compacted context has to survive on — done-and-relevant, current task
+// and where it stopped, pending work — and explicitly drops completed work that serves
+// neither, which is what keeps the summary small instead of a transcript in prose. The
+// tool ban is the agent's own guard rail: a compaction that stops to read a file spends
+// another turn and re-enters the phase machine for nothing (still handled, see
+// `turn.after`, but the summary is what this turn was for).
+// Exported (not a private constant) because the finalize range and every test that names
+// the committed turn need the exact text, not a copy that can drift from it.
+export const COMPACTION_INSTRUCTION = `${COMPACTION_MARKER} Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with a single compact summary and nothing else:
+1. DONE — work completed so far that is still relevant to your current or pending tasks. Omit completed work that is irrelevant to both.
+2. CURRENT TASK — what you are working on right now and exactly where you left off, with the concrete details needed to resume (paths, ids, decisions, open questions, blockers).
+3. PENDING — all remaining tasks, in order.
+This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.`;
+
+// The turn that restarts the conversation once the range is disabled. It points at the
+// summary as the source of the next step, because after the finalize that is the ONLY
+// memory of the work still standing — an imperative with no anchor reads as a new task.
+export const CONTINUATION_NUDGE = `${COMPACTION_MARKER} Your context was just compacted; your summary above lists the current task, where you left off, and pending work. Continue your current task now.`;
 
 // Not a setting (T4.6 declares exactly the four above, and a knob nobody asked for is a knob
 // nobody reads): the bound on how many units ONE pass may disable, so the first pass over an
@@ -538,8 +735,14 @@ export async function executeCompaction(
 
     // `annotate` is accepted by the UI and not implemented, so it degrades to the one writer
     // that exists rather than failing the turn. Both values are reported below, so the
-    // fallback is never invisible to the operator who set it.
-    const mode = COMPACTION_MODES.indexOf(requestedMode) === -1 ? MODE_DEFAULT : requestedMode;
+    // fallback is never invisible to the operator who set it. The fallback is `exclude` and
+    // NOT `MODE_DEFAULT`: this function IS the exclude writer, and summarize has its own
+    // machine (`createContextCompactionPasses`), so a mode this function cannot honour means
+    // "run the pass I was called for" — reporting `summarize` here would claim a flow that
+    // did not happen.
+    const mode = COMPACTION_MODES.indexOf(requestedMode) === -1 || requestedMode === MODE_SUMMARIZE
+        ? MODE_EXCLUDE
+        : requestedMode;
 
     // ONE read of the canonical list. `entries` is built on first access and cached for this
     // handler, and the entry objects stay valid across flag writes (only a `replaceHistory()`
@@ -628,20 +831,164 @@ export async function executeCompaction(
     });
 }
 
-// Builds the `turn.before` handler: the trigger check, the per-thread cooldown, and the
-// pause/action/resume sequence.
+// ---------------------------------------------------------------------------
+// THE SUMMARIZE RANGE — pure, exported, and table-testable without a harness
+// ---------------------------------------------------------------------------
+
+// Where one conversation's self-compaction stands. In memory only, per harness: like the
+// cooldown map it dies with the process, and a restart does not need it — a compaction
+// that was interrupted leaves at most a parked thread, which `run.failed`/`run.finished`
+// and the next `turn.before` both recover from.
+export type HarnessCompactionPhase = 'compacting' | 'finishing';
+
+// The range a finalize writes, as indices into the list it was handed.
+export type HarnessCompactionRetention = {
+    // The committed instruction entry, or -1 when the list carries none (a rolled-back or
+    // host-edited transcript — there is nothing to disable then).
+    instructionIndex: number;
+    // The compaction ANSWER — the last tool-free assistant entry after the instruction —
+    // or -1 when the list stops before one.
+    answerIndex: number;
+    // Every entry to withhold: the history the summary replaced, and the intermediate
+    // turns between the instruction and the answer. System entries and the instruction
+    // itself are never in here.
+    disabled: number[];
+};
+
+// True for the entry that IS the committed compaction instruction. Detection is by the
+// marker prefix on a `user` entry, which is why the first line of the instruction is the
+// protocol: rewording the body is safe, changing the marker is not.
+const isInstructionMessage = (message: HarnessMessage): boolean =>
+    message.role === 'user' &&
+    String((message as { content?: unknown }).content ?? '').startsWith(COMPACTION_MARKER);
+
+// True for the compaction answer. "Tool-free assistant turn" is the same test `turn.after`
+// uses to recognise the summary, so the two cannot disagree about which turn ended the
+// compaction — and the intermediate turns the model spent on tools are exactly the ones
+// between the instruction and this entry.
+const isAnswerMessage = (message: HarnessMessage): boolean =>
+    message.role === 'assistant' &&
+    !((message as { toolCalls?: unknown[] }).toolCalls?.length ?? 0);
+
+// The disable rule BOTH finalize paths share (`setIncluded` on a live run, a canonical
+// rewrite on an idle one). Everything before the instruction goes, because the summary
+// replaced it; everything strictly between the instruction and the final answer goes too,
+// because those are the turns a disobedient model spent after the instruction; and the
+// instruction plus the answer plus anything that arrived afterwards is the retained head
+// the next request is built from.
 //
-// The limit is read INSIDE the handler, not once at setup, because `api.settings` is
-// re-read on every access by contract (plugin/settings.ts): an operator changing the
-// value from the UI takes effect on the next turn, with no restart. That applies to
-// `modelLimits` exactly as much as to `contextLimit`.
-export const createContextCompactionHandler = (
+// A `system` entry is never disabled, for two reasons: an agent's leading instruction
+// blocks are re-prepended by the transport rather than stored as transcript entries
+// (src/harness.ts `projectTranscript` never emits one), so on the shipped path this guard
+// is a no-op — and a host that DOES seed a system entry into a transcript is stating a
+// standing instruction that no compaction may silence.
+export const planCompactionRetention = (
+    messages: readonly HarnessMessage[]
+): HarnessCompactionRetention => {
+    let instructionIndex = -1;
+
+    // LAST match, not first: a transcript that still carries an older, already-compacted
+    // instruction must resolve against the one this pass committed.
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (isInstructionMessage(messages[index])) {
+            instructionIndex = index;
+            break;
+        }
+    }
+
+    if (instructionIndex === -1) return { instructionIndex: -1, answerIndex: -1, disabled: [] };
+
+    let answerIndex = -1;
+
+    for (let index = messages.length - 1; index > instructionIndex; index -= 1) {
+        if (isAnswerMessage(messages[index])) {
+            answerIndex = index;
+            break;
+        }
+    }
+
+    const disabled: number[] = [];
+
+    for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
+
+        if (message.role === 'system' || index === instructionIndex) continue;
+
+        if (index < instructionIndex) {
+            disabled.push(index);
+            continue;
+        }
+
+        // Strictly between the instruction and the answer. When no answer entry exists
+        // (a host edited it away) nothing after the instruction is touched.
+        if (answerIndex !== -1 && index < answerIndex) disabled.push(index);
+    }
+
+    return { instructionIndex, answerIndex, disabled };
+};
+
+// True when this round belongs to a durable conversation the plugin may park, commit to
+// and rewrite. A BRANCH round is refused earlier (Rule 5). What is left is a run with NO
+// thread at all — a `writer('go')` turn on a registered agent — which reports the same
+// string in both identity fields, because `threadId` is `run.threadId ?? run.actorKey`
+// (src/harness.ts ~8833). For a real conversation the scheduling key is namespaced
+// (`thread:<id>`), so the two fields never agree. A threadless round cannot hold a phase:
+// its `pause()`/`resume()` are no-ops and `replaceHistory` refuses it outright.
+const hasPersistentThread = (context: HarnessTurnBeforeContext): boolean =>
+    context.branchId === undefined && context.actorKey !== context.threadId;
+
+// The estimate a summarize pass measures with: `currentEstimatedTokens()` — the projection
+// AS IT IS NOW — falling back to the entry-time number for a host stub that does not
+// implement the accessor. The live view is the one that must be compared against the limit:
+// `estimatedTokens` is frozen at handler ENTRY (types, `HarnessTurnBeforeContext`), so on
+// the turn a compaction just landed it still reports the pre-compaction size, which would
+// re-trigger the pass on the next turn forever.
+const liveEstimate = (context: HarnessTurnBeforeContext): number => {
+    try {
+        const value: unknown = context.currentEstimatedTokens();
+
+        return typeof value === 'number' && Number.isFinite(value) ? value : context.estimatedTokens;
+    } catch {
+        return context.estimatedTokens;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// THE MACHINE — the five hooks one summarize pass walks across
+// ---------------------------------------------------------------------------
+//
+// One factory owns the whole state machine — the cooldown map AND the phase map — because
+// the edges cross hook boundaries: `turn.before` starts the pass, `turn.after` ends the
+// `compacting` phase, `thread.idle` writes the range when the run ended on the answer, and
+// the two run-terminal hooks make sure no thread is ever left parked. A host that wants
+// only the `turn.before` half can still take it (`createContextCompactionHandler`), and
+// then `exclude` mode is complete on its own while `summarize` relies on the built-in
+// `setup` below to wire the rest of the machine.
+export type HarnessCompactionPasses = {
+    turnBefore: HarnessLifecycleHandler<'turn.before'>;
+    turnAfter: HarnessLifecycleHandler<'turn.after'>;
+    threadIdle: HarnessLifecycleHandler<'thread.idle'>;
+    runFinished: HarnessLifecycleHandler<'run.finished'>;
+    runFailed: HarnessLifecycleHandler<'run.failed'>;
+};
+
+// Builds every handler. The limit is read INSIDE the handler, not once at setup, because
+// `api.settings` is re-read on every access by contract (plugin/settings.ts): an operator
+// changing the value from the UI takes effect on the next turn, with no restart. That
+// applies to `modelLimits` and `mode` exactly as much as to `contextLimit`.
+export const createContextCompactionPasses = (
     api: HarnessPluginApi,
     action: HarnessCompactionAction = executeCompaction
-): HarnessLifecycleHandler<'turn.before'> => {
+): HarnessCompactionPasses => {
     // threadId -> the estimate that last fired for it. The per-thread key matters: two
     // long-running conversations must not share one cooldown.
     const triggered = new Map<string, number>();
+
+    // threadId -> the in-flight pass. Bounded by the number of conversations a harness
+    // ever had, exactly like the cooldown map above: the only way an entry outlives its
+    // thread is a thread purged mid-pass, which leaves one stale key in a map nothing
+    // prunes (see "WHY THE COOLDOWN MAP IS NEVER PRUNED").
+    const phases = new Map<string, HarnessCompactionPhase>();
 
     // `modelLimits` is free text an operator edits rarely, and this handler runs on
     // EVERY turn, so parsing it per turn is waste. Keyed by the exact stored string: the
@@ -651,7 +998,8 @@ export const createContextCompactionHandler = (
     let limitsRaw: string | undefined;
     let limitsMap: Record<string, HarnessContextModelLimits> = {};
 
-    // The park/act/unpark pass. Extracted so the fast path below can stay synchronous.
+    // The park/act/unpark pass (`exclude` mode). Extracted so the fast path below can stay
+    // synchronous.
     const pass = async (context: HarnessTurnBeforeContext): Promise<void> => {
         // Park, act, always unpark. `pause()` is outside the try because a pause that
         // failed has nothing to undo; the throw itself is left to the bus (fail-open),
@@ -665,6 +1013,188 @@ export const createContextCompactionHandler = (
         }
     };
 
+    // The one way this plugin ever lifts a park it did not need to hold: `api.threads.resume`
+    // answers 'running' while a run is attached and 'idle' when the park outlived it, and is
+    // a no-op for a thread that is not parked — including one a host deleted, which throws
+    // through `threadStateOf` and is exactly the case with nothing left to un-park.
+    const unpark = (threadId: string): void => {
+        try {
+            api.threads.resume(threadId);
+        } catch {
+            // Unknown thread: there is no record left to strand.
+        }
+    };
+
+    // The trigger half of a summarize pass: park the conversation, commit the instruction
+    // into the CANONICAL transcript, and hand THIS request the projection plus that
+    // instruction. The answer arrives on the model turn this returns into, which is why the
+    // pass cannot finish here (see "THE PHASE MAP").
+    const beginSummarize = async (
+        context: HarnessTurnBeforeContext,
+        effective: number,
+        tokens: number
+    ): Promise<void> => {
+        const threadId = context.threadId;
+
+        // Set BEFORE anything can fail: a phase that is set and then abandoned is cleared by
+        // the `catch` below or by the run-terminal net; a phase that is never set would let
+        // the next boundary trigger a second compaction on top of this one.
+        phases.set(threadId, 'compacting');
+
+        try {
+            await context.pause();
+
+            // ALL entries — the whole committed transcript in canonical order, each entry's
+            // own `included` flag riding inside its message. `replaceHistory` re-states the
+            // transcript through `writeThreadTranscript`, whose snapshot reader carries
+            // `included: false` and the durable `messageId` for every role
+            // (src/core/snapshot.ts ~345/369/398/434), so an entry an EARLIER pass withheld
+            // is still withheld after this write; the flag case pinned in
+            // src/plugin/context-compaction.test.ts is what proves it rather than assumes it.
+            // Building the array from `entries` is also what keeps a leading `system` entry
+            // (a host seed) from being dropped by the rewrite.
+            const canonical = context.entries.map((entry) => entry.message);
+
+            context.replaceHistory([
+                ...canonical,
+                { role: 'user', content: COMPACTION_INSTRUCTION }
+            ]);
+
+            // THIS request: the projection exactly as measured, plus the instruction. The
+            // committed history and the request are written by two different calls on
+            // purpose — `setTranscript` is request-only and wins over the round's
+            // re-projection (src/harness.ts `requestOf`), while `replaceHistory` alone would
+            // leave this request re-projected from the pre-commit list.
+            context.setTranscript([
+                ...context.messages,
+                { role: 'user', content: COMPACTION_INSTRUCTION }
+            ]);
+
+            api.report.diagnostic({
+                message:
+                    `context-compaction parked thread ${threadId} and asked it to compact itself: ` +
+                    `~${tokens} estimated tokens against an effective limit of ${effective} (mode summarize). ` +
+                    `The next model turn carries the compaction instruction.`,
+                data: { mode: MODE_SUMMARIZE, threadId, tokens, effective, entries: canonical.length + 1 }
+            });
+        } catch (error) {
+            // A commit that failed has nothing to finalize. Drop the phase and lift the
+            // park — a stranded park is the one failure this plugin may never cause — and
+            // let the error reach the bus, the single fail-open authority (plugin/hooks.ts
+            // rule 2). `resume()` is a no-op when the pause itself never landed.
+            phases.delete(threadId);
+            await context.resume();
+            throw error;
+        }
+    };
+
+    // Writes the range on a LIVE run (the run kept going after the answer, so there is no
+    // idle moment to rewrite the transcript in). `setIncluded` is the only writer that also
+    // re-projects THIS request (types, `setIncluded`: "THE SAME REQUEST SEEPS IT").
+    const finalizeInRequest = (context: HarnessTurnBeforeContext): void => {
+        const threadId = context.threadId;
+        const entries = context.entries;
+        const range = planCompactionRetention(entries.map((entry) => entry.message));
+
+        if (range.instructionIndex === -1) {
+            // The instruction is gone: the run that committed it rolled it back
+            // (`brain.messages.splice(commitIndex)`, src/harness.ts ~9677) or a host rewrote
+            // the transcript. Either way the pass is over — with nothing left to disable.
+            phases.delete(threadId);
+            return;
+        }
+
+        for (const index of range.disabled) {
+            // Located by index rather than reused from the range, so an entry the transcript
+            // no longer carries is skipped instead of addressing the wrong turn — the same
+            // guard `executeCompaction` follows.
+            const entry = entries.find((candidate) => candidate.index === index);
+
+            if (entry === undefined) continue;
+
+            // One write per unit; the cascade widens a tool-call block to its results.
+            context.setIncluded(entry, false);
+        }
+
+        phases.delete(threadId);
+
+        reportFinalize(threadId, range, 'turn.before', entries.length);
+    };
+
+    // The pass report, from either path. The indices are in it because "why is THAT turn
+    // missing from the model's context" has to be answerable from the log alone (T4.5's
+    // reasoning, which applies just as hard to a range this large).
+    const reportFinalize = (
+        threadId: string,
+        range: HarnessCompactionRetention,
+        path: string,
+        total: number
+    ): void => {
+        api.report.diagnostic({
+            message:
+                `context-compaction compacted thread ${threadId} itself: ${range.disabled.length} of ${total} ` +
+                `entry(ies) stop being sent, the retained head is the instruction at #${range.instructionIndex} ` +
+                `${range.answerIndex === -1 ? 'with no answer entry' : `and the answer at #${range.answerIndex}`} (finalized at ${path}).`,
+            data: {
+                mode: MODE_SUMMARIZE,
+                threadId,
+                path,
+                instructionIndex: range.instructionIndex,
+                answerIndex: range.answerIndex,
+                disabled: range.disabled,
+                total
+            }
+        });
+    };
+
+    // How the idle-path finalize landed, because the three answers drive different follow-ups.
+    type IdleFinalize = 'compacted' | 'refused' | 'nothing';
+
+    // The idle path: the run ENDED on the compaction answer, so the transcript can be
+    // rewritten wholesale (`api.threads.replaceMessages` is `setThreadMessages`, refused
+    // while a run is attached and legal exactly here). Returns `refused` with the phase
+    // INTACT so the next `turn.before` retries through `finalizeInRequest`, and `nothing`
+    // when the instruction is no longer there at all.
+    const finalizeOnIdle = (threadId: string): IdleFinalize => {
+        let messages: HarnessMessage[];
+
+        try {
+            messages = api.threads.messages(threadId);
+        } catch {
+            // Unknown or already purged: nothing to rewrite, and no conversation left to
+            // resume. The phase dies with the thread in every practical case.
+            phases.delete(threadId);
+            return 'nothing';
+        }
+
+        const range = planCompactionRetention(messages);
+
+        if (range.instructionIndex === -1) {
+            phases.delete(threadId);
+            return 'nothing';
+        }
+
+        const withheld = new Set(range.disabled);
+        const replacement = messages.map((message, index) =>
+            withheld.has(index) ? { ...message, included: false } : message
+        );
+
+        try {
+            api.threads.replaceMessages(threadId, replacement);
+        } catch {
+            // A run attached between the idle hook and this write (a host turn raced the
+            // nudge), or the document refused the shape. Keep `finishing`: the next
+            // `turn.before` writes the same range through the flags instead.
+            return 'refused';
+        }
+
+        phases.delete(threadId);
+
+        reportFinalize(threadId, range, 'thread.idle', messages.length);
+
+        return 'compacted';
+    };
+
     // SYNC fast path, deliberately not an `async` function: the bus does
     // `await handler(payload)`, so returning `undefined` costs one microtask, while an
     // `async` handler layers its own promise on top of that await. Almost every turn is
@@ -672,7 +1202,7 @@ export const createContextCompactionHandler = (
     // its parent's on exactly those boundaries (plugin/hooks.ts rule 5) — so the path that
     // runs most often yields as little as the contract allows, and only a real trigger
     // returns a promise.
-    return (context) => {
+    const turnBefore: HarnessLifecycleHandler<'turn.before'> = (context) => {
         // Rule 0 — the whole-plugin switch, read first so a disabled plugin costs one setting
         // read and no transcript work at all. It is re-read every turn like the rest
         // (`api.settings` is live by contract), which is what lets an operator flip it from
@@ -708,6 +1238,33 @@ export const createContextCompactionHandler = (
             limitsMap = parseModelLimits(rawLimits);
         }
 
+        // Which writer this turn belongs to. The DECLARED default is `summarize`, so an unset
+        // value lands there; any value that is neither implemented mode (including the
+        // planned `annotate`) lands on `exclude`, the conservative flow that existed before
+        // and cannot spend a model turn by accident.
+        const summarize = api.settings.string('mode', MODE_DEFAULT) === MODE_SUMMARIZE;
+
+        if (summarize) {
+            // A round with no durable conversation is outside the machine: it cannot be
+            // parked and `replaceHistory` refuses it, so the pass would cost a model turn
+            // and keep nothing.
+            if (!hasPersistentThread(context)) return undefined;
+
+            const phase = phases.get(context.threadId);
+
+            // A pass is in flight. `compacting` means the instruction is out for its answer:
+            // no second instruction and no re-trigger. `finishing` means the answer is
+            // committed and the run kept going, so THIS boundary writes the range — before
+            // any threshold check, or a still-over-limit conversation would start a fresh
+            // compaction on top of the one that just finished.
+            if (phase === 'compacting') return undefined;
+
+            if (phase === 'finishing') {
+                finalizeInRequest(context);
+                return undefined;
+            }
+        }
+
         const { effective } = resolveContextTrigger({
             contextLimit: limit,
             modelLimits: limitsMap,
@@ -715,10 +1272,23 @@ export const createContextCompactionHandler = (
         });
 
         // Rule 2: under the limit — clear the cooldown so the next crossing is fresh, and
-        // return without touching the thread.
-        if (context.estimatedTokens < effective) {
+        // return without touching the thread. `exclude` measures the entry-time estimate it
+        // always measured; `summarize` measures the live one (see `liveEstimate`).
+        const tokens = summarize ? liveEstimate(context) : context.estimatedTokens;
+
+        if (tokens < effective) {
             triggered.delete(context.threadId);
             return undefined;
+        }
+
+        // The summarize floor (documented in the `minTokens` descriptor): below this size a
+        // round trip costs more than the context it saves. Read only on a turn that is
+        // already over the limit, so the hot path never pays for it — and NOT recorded in
+        // the cooldown, so raising the floor back down re-arms the pass on the next turn.
+        if (summarize) {
+            const floor = api.settings.number('minTokens', MIN_TOKENS_DEFAULT);
+
+            if (Number.isFinite(floor) && tokens < floor) return undefined;
         }
 
         // Rule 3: at or above the limit. Fire on a fresh crossing, or once the conversation
@@ -728,20 +1298,180 @@ export const createContextCompactionHandler = (
         const previous = triggered.get(context.threadId);
         const margin = Math.max(1, Math.floor(effective * REGROWTH_RATIO));
 
-        if (previous !== undefined && context.estimatedTokens < previous + margin) {
+        if (previous !== undefined && tokens < previous + margin) {
             return undefined;
         }
 
         // Recorded BEFORE the action: a failing action must not be retried on the very
         // next turn, and the value stored is the size this pass was asked about.
-        triggered.set(context.threadId, context.estimatedTokens);
+        triggered.set(context.threadId, tokens);
 
-        return pass(context);
+        return summarize
+            ? beginSummarize(context, effective, tokens)
+            : pass(context);
     };
+
+    // The edge that ends `compacting`: a tool-free assistant turn IS the compaction answer
+    // (the instruction asked for exactly one). A disobedient model that answered with a
+    // tool call keeps the phase — the pass stays open until it does answer in prose, and
+    // the turns it spent in between are disabled by the range anyway
+    // (`planCompactionRetention`).
+    const turnAfter: HarnessLifecycleHandler<'turn.after'> = (payload) => {
+        const threadId = payload.threadId;
+
+        if (threadId === undefined) return undefined;
+        if (phases.get(threadId) !== 'compacting') return undefined;
+        if (!isAnswerMessage(payload.message)) return undefined;
+
+        phases.set(threadId, 'finishing');
+
+        // Load-bearing, not cosmetic: `thread.idle` fires only on a real transition to idle
+        // (src/harness.ts ~10227), and the idle-path finalize below needs that transition.
+        // The record goes back to 'running' here because this run is still attached.
+        unpark(threadId);
+
+        api.report.diagnostic({
+            message:
+                `context-compaction thread ${threadId} answered its compaction instruction on turn ` +
+                `${payload.iteration}; the conversation is un-parked and the superseded range is withheld at the ` +
+                `next boundary (or now, if this was the run's last turn).`,
+            data: { mode: MODE_SUMMARIZE, threadId, iteration: payload.iteration }
+        });
+
+        return undefined;
+    };
+
+    // The run ended ON the compaction answer — the normal case, and the only moment the
+    // committed transcript may be rewritten wholesale.
+    const threadIdle: HarnessLifecycleHandler<'thread.idle'> = (payload) => {
+        const threadId = payload?.id;
+
+        if (typeof threadId !== 'string') return undefined;
+        if (phases.get(threadId) !== 'finishing') return undefined;
+
+        const outcome = finalizeOnIdle(threadId);
+
+        // Whatever the rewrite did, the park must not survive the pass.
+        unpark(threadId);
+
+        if (outcome === 'nothing') return undefined;
+
+        // The continuation. The run that just ended resolved on the SUMMARY, so without
+        // this the conversation would sit idle mid-task. `send` is the host-shaped turn
+        // (a parked record would even be revived by it), the promise is deliberately
+        // dropped, and the run queues behind the dying one's actor lock
+        // (`acquireAgent`, src/harness.ts ~9700) — which is what lets its first request
+        // project the compacted transcript rather than the pre-finalize one.
+        try {
+            void Promise.resolve(api.threads.send(threadId, CONTINUATION_NUDGE)).catch(() => undefined);
+        } catch {
+            // A send that refuses synchronously (a purged thread, a stopped conversation)
+            // leaves the conversation idle with its context compacted — an idle thread the
+            // host can wake, which is strictly better than a plugin that retried forever.
+        }
+
+        return undefined;
+    };
+
+    // The safety nets. A summarize pass that never reached its answer must still leave a
+    // conversation the host can use: the park is the only durable thing it touched.
+    const runFinished: HarnessLifecycleHandler<'run.finished'> = (payload) => {
+        const threadId = payload.threadId;
+
+        if (threadId === undefined) return undefined;
+
+        const phase = phases.get(threadId);
+
+        if (phase === undefined) return undefined;
+
+        // T11/D2 — the UNPARK covers any active phase, matching `runFailed`'s
+        // unconditional one. The asymmetry it closes: this hook used to bail out unless the
+        // phase was `compacting`, so a pass sitting in `finishing` with the park still held
+        // would strand the record — `thread.idle` fires only on a real transition to idle
+        // (src/harness.ts ~10298), and a 'paused' record never makes one, so neither the
+        // finalize nor the continuation nudge would ever run. That combination is only
+        // reachable pathologically (`turn.after` unparks in the same handler that sets
+        // `finishing`, so it needs a throw between the two), and lifting here is what turns
+        // it into a recoverable one: the run's own terminal `finally` then moves the record
+        // 'running' → 'idle', `thread.idle` fires with the phase intact, and the idle-path
+        // finalize below does the rest.
+        //
+        // `finishing` itself still survives this hook (only `compacting` clears): the
+        // `thread.idle` that follows it in the same `finally` is where the range is written,
+        // and that path needs the phase.
+        if (phase === 'compacting') phases.delete(threadId);
+
+        // A no-op in the ordinary `finishing` case — `turn.after` un-parked two hooks
+        // earlier — which is also why no report is emitted for it: the pass is not
+        // abandoned there, and the finalize report below already covers it.
+        unpark(threadId);
+
+        if (phase !== 'compacting') return undefined;
+
+        api.report.diagnostic({
+            message:
+                `context-compaction abandoned its summarize pass on thread ${threadId}: the run ended ` +
+                `without a compaction answer. The park was lifted; nothing was withheld.`,
+            data: { mode: MODE_SUMMARIZE, threadId, hook: 'run.finished' }
+        });
+
+        return undefined;
+    };
+
+    const runFailed: HarnessLifecycleHandler<'run.failed'> = (payload) => {
+        const threadId = payload.threadId;
+
+        if (threadId === undefined) return undefined;
+
+        const phase = phases.get(threadId);
+
+        if (phase === undefined) return undefined;
+
+        // A failed run has ALREADY rolled back everything this pass committed — the failure
+        // catch truncates the transcript to where the run started (src/harness.ts ~9677),
+        // instruction and summary included — so a `compacting` pass has nothing left to
+        // write and its phase goes with it. A `finishing` pass keeps its phase on purpose:
+        // if the summary survived (the failure came later), the next `turn.before` writes
+        // the range from the surviving entries, and if it did not, that boundary finds no
+        // instruction and clears the phase itself. What never survives is the park: a
+        // thread left 'paused' is a conversation its host cannot reach.
+        if (phase === 'compacting') phases.delete(threadId);
+
+        unpark(threadId);
+
+        api.report.diagnostic({
+            message:
+                `context-compaction lifted its park on thread ${threadId} after a failed run ` +
+                `(phase ${phase}); the run's own rollback removed anything the pass had committed.`,
+            data: { mode: MODE_SUMMARIZE, threadId, phase, hook: 'run.failed' }
+        });
+
+        return undefined;
+    };
+
+    return { turnBefore, turnAfter, threadIdle, runFinished, runFailed };
 };
 
+// The `turn.before` half on its own: the trigger check, the per-thread cooldown, and the
+// pause/action/resume sequence. Kept as the public shape a host uses to reuse the shipped
+// guard with its own action (`exclude` mode is complete inside it); a host that wants the
+// summarize flow wires all five passes, which is what `setup` below does.
+export const createContextCompactionHandler = (
+    api: HarnessPluginApi,
+    action: HarnessCompactionAction = executeCompaction
+): HarnessLifecycleHandler<'turn.before'> =>
+    createContextCompactionPasses(api, action).turnBefore;
+
 // Wiring only: the framework hands the scoped api, the guard owns the behaviour. The
-// arrow form (not a reference) is what the manifest scanner's `setup` regex requires.
+// five subscriptions are the phase machine — one handler per edge, and the declared
+// `metadata.hooks` list is exactly this list (the server shows that list to the operator).
+// The arrow form (not a reference) is what the manifest scanner's `setup` regex requires.
 export const setup: NonNullable<HarnessPlugin['setup']> = (api: HarnessPluginApi) => {
-    api.on('turn.before', createContextCompactionHandler(api));
+    const passes = createContextCompactionPasses(api);
+
+    api.on('turn.before', passes.turnBefore);
+    api.on('turn.after', passes.turnAfter);
+    api.on('thread.idle', passes.threadIdle);
+    api.on('run.finished', passes.runFinished);
+    api.on('run.failed', passes.runFailed);
 };

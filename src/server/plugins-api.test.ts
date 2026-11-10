@@ -446,7 +446,7 @@ describe('GET /v1/harness/plugins', () => {
                     key: 'mode',
                     label: 'Compaction mode',
                     type: 'string',
-                    default: 'exclude',
+                    default: 'summarize',
                     description: COMPACTION.settings?.find((setting) => setting.key === 'mode')?.description
                 }
             ],
@@ -456,7 +456,7 @@ describe('GET /v1/harness/plugins', () => {
                 enabled: true,
                 minTokens: 200,
                 safetyTurns: 6,
-                mode: 'exclude'
+                mode: 'summarize'
             }
         });
 
@@ -565,7 +565,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
 
         // The declared descriptor is unchanged by a write: the row still carries the reset target.
@@ -587,7 +587,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
 
         // The other plugins are untouched, and only the changed plugin is stored.
@@ -619,7 +619,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
         expect(pluginsOf(runtime).get('context-compaction', 'contextLimit')).toBe(150000);
     });
@@ -637,7 +637,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
         expect(reset.body.plugin.settings[0].default).toBe(200000);
         expect(pluginsOf(runtime).snapshot()).toEqual({});
@@ -1057,7 +1057,7 @@ describe('plugin settings survive a restart', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
 
         // The revision counter is epoch-local, so it restarts at 0 while the VALUE does not.
@@ -1070,7 +1070,7 @@ describe('plugin settings survive a restart', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
 
         // The restored store is still the LIVE one: an edit after the restart moves the same
@@ -1116,7 +1116,7 @@ describe('plugin settings survive a restart', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
         expect(second.store.pluginSettings.snapshot()).toEqual({
             'async-ping': { intervalMs: 9000 },
@@ -1160,7 +1160,7 @@ describe('plugin settings survive a restart', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
         expect((await call(fourth, 'GET', `${MOUNT}/plugins`)).body.items[1].values).toEqual({
             // Back on every declared default — and "declared" now means all six settings
@@ -1171,7 +1171,7 @@ describe('plugin settings survive a restart', () => {
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
-            mode: 'exclude'
+            mode: 'summarize'
         });
     });
 });

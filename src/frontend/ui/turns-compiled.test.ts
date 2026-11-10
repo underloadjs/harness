@@ -947,3 +947,122 @@ describe('the latest-request context through a document paint', () => {
         expect(tile.tokens()).toBe('200,000 (330,000)');
     });
 });
+
+// ---------------------------------------------------------------------------
+// R9 — the delegated row's elapsed figure (user-reported: "Time for
+// subagent/delegates is missing completely", with a screenshot of five delegate rows
+// that each printed `35,736 (319,929)` and no duration).
+//
+// The row's measurement line is `[elapsed | tokens]` (turns.ts:4858-4888), and the `|`
+// is NOT text: styles.css:3094-3096 emits `content: ' | '` from
+// `.thread-elapsed:not([hidden]) + .thread-tokens:not([hidden])::before`, so the
+// separator exists exactly while BOTH labels are visible. jsdom never loads that
+// stylesheet, so the `hidden` attribute below is the observable that arms it, and the
+// text is what the reader actually sees on the line (`1.8s | 35,736 (319,929)`).
+// ---------------------------------------------------------------------------
+
+describe('the delegated row clock (R9)', () => {
+    const rowOf = (board: TurnBoard, sectionId: string): HTMLElement | null =>
+        board.element.querySelector<HTMLElement>(`.thread-row[data-thread-id="${sectionId}"]`);
+
+    // The whole measurement line in one EXACT tuple: elapsed text + hidden, then the
+    // tally + hidden. A row that shows one figure and hides the other is the reported
+    // bug, so both halves are pinned together.
+    const lineOf = (row: HTMLElement | null): [string, boolean, string, boolean] => [
+        row?.querySelector<HTMLElement>('.thread-elapsed')?.textContent ?? '',
+        row?.querySelector<HTMLElement>('.thread-elapsed')?.hidden ?? true,
+        row?.querySelector<HTMLElement>('.thread-tokens')?.textContent ?? '',
+        row?.querySelector<HTMLElement>('.thread-tokens')?.hidden ?? true
+    ];
+
+    it('shows the recorded span on a settled delegated row, beside its own tally', () => {
+        // Exactly the screenshot's row: a delegated task that ran 1.8s, spent 35,736 on
+        // its latest request and 319,929 cached. The server stamps BOTH endpoints on the
+        // section (`bindSectionStart` in ../server/turn-projector.ts, then the terminal
+        // patch) and `paintCompiledSection` settles the row's meta with the pair.
+        const reloaded = documentOf([summary({ status: 'done', state: 'done', updatedAt: T + 1_800 })], {
+            t1: [
+                rootSection({ state: 'done' }),
+                childSection({
+                    state: 'done',
+                    startedAt: T,
+                    endedAt: T + 1_800,
+                    latestInput: 35_736,
+                    cachedInput: 319_929,
+                    nodes: [{ kind: 'text', id: 'n5', text: 'delegated answer', committed: true }]
+                })
+            ]
+        });
+        const { board } = mount();
+        const [tile] = board.hydrateView(reloaded);
+
+        tile.flush();
+
+        expect(lineOf(rowOf(board, 't1:1'))).toEqual(['1.8s', false, '35,736 (319,929)', false]);
+    });
+
+    it('hides the clock for a section with no recorded start, and for an end-only section', () => {
+        const doneRow = summary({ status: 'done', state: 'done', updatedAt: T + 1_800 });
+
+        // (a) No endpoints at all (an imported/legacy compiled document): the tally is
+        // still the recorded pair — that half was never broken — while the clock has
+        // nothing honest to say, so the label AND the generated separator stay hidden.
+        const unstamped = documentOf([doneRow], {
+            t1: [rootSection({ state: 'done' }), childSection({ state: 'done', latestInput: 35_736, cachedInput: 319_929 })]
+        });
+        const first = mount();
+        const [firstTile] = first.board.hydrateView(unstamped);
+        firstTile.flush();
+
+        expect(lineOf(rowOf(first.board, 't1:1'))).toEqual(['', true, '35,736 (319,929)', false]);
+
+        // (b) An END with no START: `elapsedBetween` refuses one-ended arithmetic
+        // (ui/time.ts:36), so nothing prints — in particular NOT a fabricated `0ms` and
+        // NOT the record's wall-clock age, the replay rule the raw path pins at
+        // turns-threads.test.ts:1216-1247 and that stays untouched here.
+        const endOnly = documentOf([doneRow], {
+            t1: [rootSection({ state: 'done' }), childSection({ state: 'done', endedAt: T + 1_800, latestInput: 35_736, cachedInput: 319_929 })]
+        });
+        const second = mount();
+        const [secondTile] = second.board.hydrateView(endOnly);
+        secondTile.flush();
+
+        expect(lineOf(rowOf(second.board, 't1:1'))).toEqual(['', true, '35,736 (319,929)', false]);
+    });
+
+    it('counts a running delegated row from the server start and freezes it at the terminal patch', () => {
+        // R11: the compiled path already runs through `settle`, which starts the 250 ms
+        // tick whenever an end is missing (turns.ts:1014), so a stamped running row is
+        // live exactly as the raw path's `bindStart` row is — no new tick machinery, and
+        // the injected clock keeps the assertion exact.
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T + 2_500));
+
+        try {
+            const document = documentOf([summary()], { t1: [rootSection()] });
+            const { board } = mount();
+            const tile = board.upsertView(summary(), document);
+
+            frame(board, document, 't1', [{ op: 'section:open', turnId: 't1', section: childSection({ startedAt: T }) }]);
+
+            const row = rowOf(board, 't1:1');
+
+            expect(row?.querySelector<HTMLElement>('.thread-elapsed')?.hidden).toBe(false);
+            // 2.5s = the injected now minus the recorded start.
+            expect(row?.querySelector('.thread-elapsed')?.textContent).toBe('2.5s');
+
+            // The terminal patch carries the RECORDED end: the live reading is replaced,
+            // and the start the row already bound survives an end-only patch.
+            frame(board, document, 't1', [
+                { op: 'section:set', turnId: 't1', sectionId: 't1:1', patch: { state: 'done', endedAt: T + 4_000 } }
+            ]);
+
+            expect(row?.querySelector('.thread-elapsed')?.textContent).toBe('4.0s');
+            expect(row?.querySelector<HTMLElement>('.thread-status')?.dataset.state).toBe('done');
+            // The delegated row's state never travels up to the turn tile.
+            expect(tile.element.dataset.state).toBe('streaming');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});

@@ -107,10 +107,13 @@ const IDENTITY = {
 // into three near-identical "use your tools" briefs. Pinned as whole strings, so a reword
 // is a visible diff and the policy cannot be quietly softened.
 const CONTRACT = {
-    // General: alone by contract, and the `threadFork` loophole is closed too (a lone agent
-    // could otherwise spawn a branch and offload a step; threadFork IS searchable).
+    // General: alone by contract, and BOTH loopholes the runtime does not close are named here.
+    // A lone agent can still hand a step away without `delegate`, two ways: `threadFork`
+    // (searchable; activation 'forks' is on by default) or `threadSend` (core, lazily registered
+    // once the host has a second conversation — a server session always does). The bullet bans
+    // each by name, so the prompt matches the rule the profile exists to state.
     generalWorksAlone:
-        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork either.',
+        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
     // Instruct: the worker stance — only context-burning, non-mutating steps leave it.
     instructDelegatesOnlyReads:
         'Delegate only context-burning steps that change nothing: research, exploration, a long read, a review. Anything you would then have to write, edit, or run, you do yourself.',
@@ -147,13 +150,17 @@ const CONTRACT = {
 // growth has to be intentional, so adding a bullet to a shared guideline line is a visible
 // diff here. The seven real roles get their own, higher ceiling below.
 const PROMPT_LENGTHS = [
-    { name: 'general', length: 1168 },
+    // 1227: grew from 1168 because the "works alone" bullet now names BOTH ways a lone agent
+    // could still offload a step (`threadFork` and `threadSend`) instead of only the fork.
+    { name: 'general', length: 1227 },
     { name: 'instruct', length: 1516 },
     { name: 'research', length: 1587 },
     { name: 'workspace', length: 1521 },
     { name: 'reviewer', length: 1475 },
     { name: 'planner', length: 1634 },
-    { name: 'debugger', length: 1477 },
+    // 1690: the widest prompt on the roster, because the debugger composes every shared line
+    // (web + delegation + discovery + toolCreate + permissions) on top of its own five bullets.
+    { name: 'debugger', length: 1690 },
     { name: 'summarizer', length: 141 },
     { name: 'demo', length: 294 },
     { name: 'flaky', length: 344 }
@@ -190,7 +197,9 @@ const sharedLinesOf = (profile: AgentProfile): string[] =>
 //   reviewer  — read-only judge.
 //   planner   — DELEGATION ONLY: it executes nothing, so discovery/web/permissions prose
 //               would be context it never spends.
-//   debugger  — everything, including TOOL_CREATE (it authors its own probes).
+//   debugger  — everything, including TOOL_CREATE (it authors its own probes) and WEB_SEARCH
+//               (the web trio is part of what it stresses; an absent `search` on a keyless host is
+//               a finding to report, not a source to invent).
 const SHARED_COMPOSITION = [
     { name: 'general', shared: ['DISCOVERY', 'WEB_SEARCH', 'PERMISSIONS'] },
     { name: 'instruct', shared: ['DELEGATION', 'DISCOVERY', 'WEB_SEARCH', 'PERMISSIONS'] },
@@ -198,7 +207,9 @@ const SHARED_COMPOSITION = [
     { name: 'workspace', shared: ['DELEGATION', 'PERMISSIONS'] },
     { name: 'reviewer', shared: ['READ_ONLY', 'DELEGATION', 'DISCOVERY'] },
     { name: 'planner', shared: ['DELEGATION'] },
-    { name: 'debugger', shared: ['DELEGATION', 'DISCOVERY', 'TOOL_CREATE', 'PERMISSIONS'] },
+    // Order is the profile's own declared order, so this also pins that WEB_SEARCH sits ABOVE
+    // DELEGATION for the debugger (it reads the web before it reads the team).
+    { name: 'debugger', shared: ['WEB_SEARCH', 'DELEGATION', 'DISCOVERY', 'TOOL_CREATE', 'PERMISSIONS'] },
     { name: 'summarizer', shared: [] },
     { name: 'demo', shared: [] },
     { name: 'flaky', shared: [] }
@@ -323,10 +334,11 @@ describe('delegation stance per role', () => {
         expect(prompt).not.toContain(DELEGATION_GUIDELINE);
         expect(prompt.toLowerCase()).not.toContain('delegate');
 
-        // The rule is stated positively, and closes the loophole the runtime does not:
-        // threadFork IS reachable for a lone agent, so it is banned by name.
+        // The rule is stated positively, and closes the loopholes the runtime does not, by name.
+        // Pinned as the WHOLE rendered bullet rather than as a bare tool-name check: the one
+        // string below is what the model reads, and it contains `threadFork` and `threadSend`.
         expect(general.guidelines).toContain(CONTRACT.generalWorksAlone);
-        expect(prompt).toContain('threadFork');
+        expect(prompt).toContain(`- ${CONTRACT.generalWorksAlone}`);
 
         // The preset side of the same contract (src/server/harnesses/presets.ts): a lone
         // card, so the runtime never registers `delegate` for it.
@@ -419,6 +431,18 @@ describe('delegation stance per role', () => {
 
         // It authors its own probes, so it is the one role that composes the toolCreate line.
         expect(debuggerAgent.guidelines).toContain(TOOL_CREATE_GUIDELINE);
+
+        // And it composes the web line immediately above DELEGATION: the web trio is in scope for
+        // a stress run, and the position is what keeps the ordering pin in SHARED_COMPOSITION (and
+        // the measured 1690 in PROMPT_LENGTHS) honest about WHY the prompt grew.
+        expect(debuggerAgent.guidelines).toContain(WEB_SEARCH_GUIDELINE);
+        expect(sharedLinesOf(debuggerAgent)).toEqual([
+            'WEB_SEARCH',
+            'DELEGATION',
+            'DISCOVERY',
+            'TOOL_CREATE',
+            'PERMISSIONS'
+        ]);
     });
 });
 
@@ -471,11 +495,15 @@ describe('profile guidance stays policy, not a tool inventory', () => {
     // only ACTIVATED by a configured key, `download` is searchable. The old text called
     // fetch searchable, which sent the model hunting for a tool already in front of it.
     it('states the web trio the way the manifest actually declares it', () => {
-        // Only the three roles that can reach the web carry the line, and they carry the
-        // shared constant verbatim rather than a per-profile paraphrase of it.
-        for (const profile of [general, instruct, research]) {
-            expect(agentInstruction(profile)).toContain(WEB_SEARCH_GUIDELINE);
-        }
+        // EXACTLY these four roles carry the line, in roster order, and each carries the shared
+        // constant verbatim rather than a per-profile paraphrase of it: the three roles that can
+        // reach the web, plus `debugger`, for whom the trio is part of what gets stressed (an
+        // absent `search` on a keyless host is a finding to report, not a source to invent).
+        expect(
+            agentProfiles()
+                .filter((profile) => agentInstruction(profile).includes(WEB_SEARCH_GUIDELINE))
+                .map((profile) => profile.name)
+        ).toEqual(['general', 'instruct', 'research', 'debugger']);
 
         expect(descriptorOf('search')?.metadata.visibility).toBe('core');
         expect(descriptorOf('fetch')?.metadata.visibility).toBe('core');

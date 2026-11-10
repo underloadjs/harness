@@ -877,25 +877,54 @@ describe('import safety', () => {
         expect(typeof root.createHarnessRuntime).toBe('function');
         expect(typeof root.createHarnessServiceHandler).toBe('function');
         expect(typeof root.SessionStore).toBe('function');
-        // T5: the published catalogue is exactly the real production
-        // configurations. The scripted demo and the failure example are still
-        // exported (FIXTURE_PRESETS / ALL_PRESET_TEMPLATES) so a host can inject
-        // them and an older session can still be rebuilt, but the shipped list a UI
-        // or CLI offers must not contain them.
+        // T5 + the roster/role-contract pass: the published catalogue is exactly the
+        // real production configurations — SEVEN live cards, DEFAULT FIRST. The
+        // scripted demo and the failure example are still exported (FIXTURE_PRESETS /
+        // ALL_PRESET_TEMPLATES) so a host can inject them and an older session can
+        // still be rebuilt, but the shipped list a UI or CLI offers must not contain
+        // them. Order is a contract, not a preference (../server/harnesses/presets.ts
+        // :486-494): it is what `GET /harnesses` returns, what a picker renders, and
+        // the order the frontend palette assigns tones by.
         expect(root.presets.map((preset) => preset.name)).toEqual([
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'planner'
-        ]);
-        expect(root.FIXTURE_PRESETS.map((preset) => preset.name)).toEqual(['demo', 'flaky']);
-        expect(root.ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
             'planner',
+            'debugger'
+        ]);
+        // TITLES MOVED, IDS DID NOT. `research`/`workspace`/`planner` keep their
+        // persisted ids while the visible titles became Explore/Analyst/Manager,
+        // because the id is stored in every record and `agentProfile()` has no alias
+        // (../agents/index.ts:21-26). Pinning both columns is what keeps that
+        // decoupling from silently becoming a rename.
+        expect(root.presets.map((preset) => preset.title)).toEqual([
+            'General',
+            'Instruct',
+            'Explore',
+            'Analyst',
+            'Reviewer',
+            'Manager',
+            'Debugger'
+        ]);
+        // The default card is also the ONLY live card with no team: `subagents: []`
+        // means the runtime never registers `delegate` for it (src/harness.ts
+        // `activation: 'subagents'`), so the exact empty-allowlist set is ['general'].
+        expect(
+            root.presets.filter((preset) => preset.subagents.length === 0).map((preset) => preset.name)
+        ).toEqual(['general']);
+        expect(root.FIXTURE_PRESETS.map((preset) => preset.name)).toEqual(['demo', 'flaky']);
+        // Catalogue-first, fixtures last: an injected registry lists the real presets
+        // before the examples, exactly as the UI used to (../harnesses/presets.ts:513).
+        expect(root.ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger',
             'demo',
             'flaky'
         ]);

@@ -19,6 +19,14 @@ concurrency contract **held**: no lost updates under a same-`rev` race,
 (no partial write on a rejected call). Those four issues are the ergonomics and
 consistency gaps that surfaced around that core, not defects in it.
 
+The web-tool entries (0012-0016) came from a stress test of `search`, `fetch`
+and `download` — 40+ calls against live providers — then re-checked reviewer by
+reviewer. Several claims as first filed were **refuted** (a "mismatch" that was
+gzip compressed-vs-decoded length, a `pageCharacters` figure that was correct,
+a `query`-mode exclusion that would have broken correct answers); the refutations
+are recorded in 0007 so the same claim is not re-filed. What survived as a gap
+is below; the rest of that pass is the web-tools section of 0007.
+
 ## Index
 
 | Issue | Area | Severity | One line |
@@ -34,6 +42,11 @@ consistency gaps that surfaced around that core, not defects in it.
 | [0009](./minor-guarded-write-refusal-omits-the-record.md) | records store | Minor | The `guarded-write` refusal says "read it first" but returns only the id, while `stale-record` on the same record returns the whole entry — so the error that needs the `rev` is the one that omits it. |
 | [0010](./minor-define-plus-collection-two-paths-disagree.md) | records store | Minor | `define` beside `collection` is refused by the engine as "ambiguous" but silently consumed by the tool entry point, which registers the collection and echoes a different name. |
 | [0011](./minor-change-feed-has-no-floor-watermark.md) | records store | Minor | The change feed reports that a gap was lost (`changesTruncated`) but never exposes the oldest retained revision, so a poller cannot size its lag and one refusal must guess between two causes. |
+| [0012](./significant-webfetch-markdown-converter-mangles-math-and-attributes.md) | web tools | Significant | The markdown converter flattens `<sup>`/`<sub>` and math into juxtaposition — `10<sup>12</sup>` reads as `1012`, `ℏ/2` as `ℏ2` — with no `note` to disclose it, and leaks Parsoid `data-mw`/`{{cite}}` metadata into prose. |
+| [0013](./minor-websearch-category-filters-reach-provider-as-opaque-400.md) | web tools | Minor | The four `category` + date/domain combinations the description already calls invalid are accepted locally and rejected remotely, so the caller gets `Exa search failed (HTTP 400)` naming no field. |
+| [0014](./minor-webfetch-oversized-response-advice-names-remedies-that-cannot-work.md) | web tools | Minor | The oversized-response error offers three remedies and two cannot work in the state that triggers it: `query` runs after the size check, and `grep` skips files over the 1 MiB that caused the error — silently, `matches: []`. |
+| [0015](./minor-webfetch-network-error-collapses-distinct-causes.md) | web tools | Minor | DNS failure, a refused connection and an unreachable host all collapse into one `could not be reached (network error)` sentence, so a caller cannot tell a permanent condition from a retryable one. |
+| [0016](./minor-webfetch-query-mode-reports-truncated-without-nextoffset.md) | web tools | Minor | `query` mode reports `truncated: true` while carrying neither `offset` nor `nextOffset`, and one flag conflates the byte budget with the 20-section cap — two causes needing opposite responses. |
 
 ## Format
 

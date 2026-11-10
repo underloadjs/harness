@@ -40,6 +40,14 @@
 // the target is `general` (./general.ts), the one role designed to take a whole
 // self-contained job; the Manager still never takes the step itself.
 //
+// WHY `instruct` IS NOT IN THE ROUTING TABLE (it IS often in the team). A delegate never
+// receives `delegate` (primary-only, src/harness.ts `primaryOnlyDefinitions`), so an
+// Instruct running as someone's subagent cannot use its own context-burning delegation
+// licence — in that seat it behaves exactly like `general`. Naming it as a separate route
+// would promise a capability the seat does not have, so the table names the role that OWNS
+// each kind of step instead of enumerating every reachable id; a call to `instruct` is
+// still legal, it is simply not a distinct capability.
+//
 // The task-tracking line names `tasks` because that tool IS declared (visibility core,
 // alwaysDeclared — src/core/tool-manifest.ts) and is the session-shared list every agent in
 // this harness reads. Its keys are the real ones: `tasks` entries add with `text` or patch

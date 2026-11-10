@@ -17,6 +17,21 @@
 //
 // Assertions are exact: registry rows are compared as complete records, not by
 // individual fields, so an accidental extra change is a failure.
+//
+// AGENT ROSTER / ROLE-CONTRACT PASS (what the assertions below re-pinned)
+// ----------------------------------------------------------------------
+// `LEGACY_PRESET_DEFINITIONS` was deliberately NOT extended for this pass: it still
+// holds the three pre-T3 snapshots (`instruct`, `research`, `workspace`) with their OLD
+// titles (Instruct / Research / Workspace (coding)) and `environmentTools: ['search']`.
+// Consequences pinned here:
+//   - an install holding a pre-T3 row still matches its snapshot, so it refreshes to the
+//     CURRENT template — which now carries the new roster (the Manager is out of every
+//     built-in team) and the new titles (Explore / Analyst / Manager);
+//   - an install holding the T3 row matches neither its single legacy snapshot nor the
+//     current template, so it is an operator customisation and replays verbatim — legal,
+//     because every id in that old 5-role team is still a known profile;
+//   - an edited title/description survives a refresh;
+//   - an older document has no rows for the two new cards, and they ship anyway.
 
 import { describe, expect, it } from 'vitest';
 import type { HarnessProgress } from '../../harness';
@@ -84,12 +99,74 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(presetToRecord(refreshed!)).toEqual(presetToRecord(shipped('instruct')));
 
         // The concrete point of the refresh: the wider team is live, so delegation
-        // works in the restored entry.
-        expect(refreshed?.subagents).toEqual(teamOf('instruct'));
+        // works in the restored entry. This is `teamOf('instruct')` as the roster pass
+        // ships it — every OTHER live role (now including the two new profiles, `general`
+        // and `debugger`) minus the Manager, plus the summarizer.
+        expect(refreshed?.subagents).toEqual([
+            'general',
+            'research',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+        expect(refreshed?.agents).toEqual([
+            'instruct',
+            'general',
+            'research',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+        // `instruct` kept its title across the pass, so the refresh has no prose to carry.
         expect(refreshed?.title).toBe('Instruct');
         expect(
             Object.keys(refreshed!.create(SETTINGS, progress).tools)
         ).toContain('delegate');
+    });
+
+    it('derives every built-in team from the 7 live roles, excluding the Manager', () => {
+        // `teamOf` is the ONE list the shipped teams come from (presets.ts:133-164). Two
+        // ids never appear in another card's allowlist: the primary itself, and `planner`
+        // — the Manager refuses to run as a delegate, so offering it would burn a child
+        // run. `summarizer` is appended everywhere so the `textSummarize` path works.
+        expect([
+            teamOf('general'),
+            teamOf('instruct'),
+            teamOf('research'),
+            teamOf('workspace'),
+            teamOf('reviewer'),
+            teamOf('planner'),
+            teamOf('debugger')
+        ]).toEqual([
+            ['instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']
+        ]);
+
+        // The shipped rows agree with it, and the default card is the one deliberate
+        // exception: `general` runs alone, so `delegate` is never registered for it.
+        const registry = createHarnessRegistry();
+        expect(
+            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'].map(
+                (name) => registry.find(name)!.subagents
+            )
+        ).toEqual([
+            [],
+            ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']
+        ]);
+        expect(Object.keys(registry.find('general')!.create(SETTINGS, progress).subagents)).toEqual([]);
+        expect(registry.find('general')!.create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
 
     it('refreshes every real preset whose saved row is an unmodified shipped default', () => {
@@ -106,6 +183,60 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         ).toEqual(
             ['instruct', 'research', 'workspace'].map((name) => presetToRecord(shipped(name)))
         );
+
+        // THE title consequence of the roster pass: a row still holding the OLD shipped
+        // title (`Research`, `Workspace (coding)`) is shipped text, not operator prose, so
+        // the refresh adopts the new card titles while the ids stay as saved.
+        expect(
+            ['instruct', 'research', 'workspace'].map((name) => registry.find(name)!.title)
+        ).toEqual(['Instruct', 'Explore', 'Analyst']);
+        expect(LEGACY_PRESET_DEFINITIONS.research.title).toBe('Research');
+        expect(LEGACY_PRESET_DEFINITIONS.workspace.title).toBe('Workspace (coding)');
+
+        // The refreshed rows run the current roster, and the Manager is nowhere in another
+        // card's allowlist.
+        expect(registry.find('research')!.subagents).toEqual([
+            'general',
+            'instruct',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+        expect(registry.find('workspace')!.subagents).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+    });
+
+    it('adds the two new cards to an installation whose saved document predates them', () => {
+        const registry = createHarnessRegistry();
+
+        // An old document holds rows only for the cards it shipped. Nothing tombstones
+        // `general` or `debugger`, so both new defaults are simply present next to the
+        // refreshed rows.
+        restoreHarnessRegistry(registry, [
+            legacyRecord('instruct'),
+            legacyRecord('research'),
+            legacyRecord('workspace')
+        ]);
+
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'debugger'
+        ]);
+        expect(registry.deletedBuiltins()).toEqual([]);
+        expect(registry.find('general')).toBeDefined();
+        expect(registry.find('debugger')).toBeDefined();
     });
 
     it('does not touch an entry whose saved row already equals the current template', () => {
@@ -152,9 +283,87 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         // Prose the operator wrote survives...
         expect(current.title).toBe('My coder');
         expect(current.description).toBe('House coding harness.');
-        // ...while the shipped executable default (the wider team) is adopted.
-        expect(current.subagents).toEqual(teamOf('workspace'));
-        expect(current.agents).toEqual(['workspace', ...teamOf('workspace')]);
+        // ...while the shipped executable default is adopted: the current team, which is
+        // every other live role except the Manager plus the summarizer.
+        expect(current.subagents).toEqual([
+            'general',
+            'instruct',
+            'research',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+        expect(current.agents).toEqual([
+            'workspace',
+            'general',
+            'instruct',
+            'research',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+    });
+
+    it('carries only prose the operator actually wrote, and adopts the rest', () => {
+        // A saved field that still EQUALS the legacy shipped text is the shipped text, so the
+        // new template's wording wins (registry.ts:1063-1065). A saved field that matches
+        // neither snapshot is operator prose and is re-applied over the refreshed row.
+        const editedTitleOnly = createHarnessRegistry();
+        restoreHarnessRegistry(editedTitleOnly, [legacyRecord('workspace', { title: 'My coder' })]);
+
+        expect(editedTitleOnly.find('workspace')!.title).toBe('My coder');
+        // The description in that row is still `LEGACY_PRESET_DEFINITIONS.workspace.description`,
+        // so the refresh replaces it with the current card's text.
+        expect(editedTitleOnly.find('workspace')!.description).toBe(
+            shipped('workspace').description
+        );
+        expect(editedTitleOnly.find('workspace')!.description).not.toBe(
+            LEGACY_PRESET_DEFINITIONS.workspace.description
+        );
+
+        // Nothing edited: both fields follow the new template — including the retitled card.
+        const untouched = createHarnessRegistry();
+        restoreHarnessRegistry(untouched, [legacyRecord('workspace')]);
+        expect(untouched.find('workspace')!.title).toBe('Analyst');
+        expect(untouched.find('workspace')!.description).toBe(shipped('workspace').description);
+    });
+
+    it('replays a T3-era row (the old 5-role team) verbatim instead of refreshing it', () => {
+        // The T3 row no longer matches its single legacy snapshot (`subagents` moved) and it
+        // is not the current template either, so the policy treats it as a customisation and
+        // replays it exactly. That is SAFE because every id in that team is still a known
+        // profile — the roster pass changed titles and added profiles, never renamed one.
+        const OLD_TEAM = ['research', 'workspace', 'reviewer', 'planner', 'summarizer'];
+        const t3Row: HarnessPresetRecord = {
+            ...presetToRecord(shipped('instruct')),
+            title: 'Instruct',
+            subagents: [...OLD_TEAM],
+            agents: ['instruct', ...OLD_TEAM]
+        };
+
+        const registry = createHarnessRegistry();
+        restoreHarnessRegistry(registry, [t3Row]);
+
+        const current = registry.find('instruct')!;
+        expect(current.title).toBe('Instruct');
+        expect(current.subagents).toEqual(OLD_TEAM);
+        expect(current.agents).toEqual(['instruct', ...OLD_TEAM]);
+        // The saved row is reproduced exactly, so the next save cannot drift it.
+        expect(presetRecordEquals(presetToRecord(current), t3Row)).toBe(true);
+
+        // Restore did not merely keep the metadata: the rebuilt harness really runs that
+        // roster, Manager included, because each id still resolves to a trusted profile.
+        const harness = current.create(SETTINGS, progress);
+        expect(Object.keys(harness.agents)).toEqual(['instruct', ...OLD_TEAM]);
+        expect(Object.keys(harness.subagents)).toEqual(OLD_TEAM);
+        expect(harness.tools.delegate.visibility).toBe('core');
+        expect(OLD_TEAM.filter((id) => !registry.agents().some((p) => p.name === id))).toEqual([]);
+
+        // The same guarantee on the session side: a frozen record from that build rebuilds
+        // through `presetFromRecord` with the team it started with.
+        const frozen = presetFromRecord(t3Row).create(SETTINGS, progress);
+        expect(Object.keys(frozen.agents)).toEqual(['instruct', ...OLD_TEAM]);
+        expect(Object.keys(frozen.subagents)).toEqual(OLD_TEAM);
     });
 
     it('treats a per-agent model map as a customisation, not a shipped default', () => {
@@ -226,10 +435,18 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(Object.keys(harness.subagents)).toEqual([]);
         expect(harness.tools.delegate).toBeUndefined();
 
-        // The registry, meanwhile, has moved on (the refresh above).
+        // The registry, meanwhile, has moved on (the refresh above): the current shipped
+        // team, Manager excluded.
         const registry = createHarnessRegistry();
         restoreHarnessRegistry(registry, [record]);
-        expect(registry.find('instruct')?.subagents).toEqual(teamOf('instruct'));
+        expect(registry.find('instruct')?.subagents).toEqual([
+            'general',
+            'research',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
     });
 });
 
@@ -244,10 +461,12 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
         restoreHarnessRegistry(registry, [], ['workspace']);
 
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(registry.find('workspace')).toBeUndefined();
 
@@ -273,14 +492,25 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
 
         // The unmodified shipped default is refreshed (T3 policy, untouched by this),
         // while the deleted one is gone.
-        expect(registry.find('instruct')?.subagents).toEqual(teamOf('instruct'));
+        expect(registry.find('instruct')?.subagents).toEqual([
+            'general',
+            'research',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
         expect(registry.find('research')).toBeUndefined();
+        // The alias follows its target, so `researcher` is gone with it.
         expect(registry.find('researcher')).toBeUndefined();
+        // The remaining catalogue, in shipped order, with the tombstoned Explore absent.
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
     });
 
@@ -305,10 +535,12 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
         expect(restored?.title).toBe('My coder');
         expect(registry.deletedBuiltins()).toEqual([]);
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'reviewer',
             'planner',
+            'debugger',
             'workspace'
         ]);
     });
@@ -323,11 +555,13 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
 
         expect(registry.find('demo')).toBeUndefined();
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(registry.deletedBuiltins()).toEqual([]);
     });

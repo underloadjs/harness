@@ -151,21 +151,25 @@ describe('standalone server launcher', () => {
                 expect(stdout).not.toContain('VITE');
                 expect(stdout).not.toContain('Local:');
 
-                // The catalogue the launcher ships is the production one: five real,
-                // runnable configurations, no scripted demo and no card that fails on
-                // purpose (T5). This is the whole point of the removal, so it is
-                // asserted against a REAL launched server, not only against the store.
+                // The catalogue the launcher ships is the production one: SEVEN real,
+                // runnable configurations (T5 + the roster/role-contract pass), no
+                // scripted demo and no card that fails on purpose. This is the whole
+                // point of the removal, so it is asserted against a REAL launched
+                // server, not only against the store. The order is the contract: the
+                // default card first, `debugger` last (../harnesses/presets.ts:486-494).
                 // T18: the read is the contract's `HarnessCardPage` (`items` plus `PageMeta`), not the
                 // legacy `{ harnesses }` index, and the route comes from the generated builders.
                 const catalogue = await fetch(`${url}${HARNESS_ROUTES.harnesses()}`, { headers: CLIENT });
                 expect(catalogue.status).toBe(200);
                 const index = (await catalogue.json()) as HarnessCardPage;
                 expect(index.items.map((harness) => harness.name)).toEqual([
+                    'general',
                     'instruct',
                     'research',
                     'workspace',
                     'reviewer',
-                    'planner'
+                    'planner',
+                    'debugger'
                 ]);
 
                 // --database-root reached startHarnessServer: a session persists.

@@ -2192,7 +2192,8 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
 //
 //   running → STEER  (`delivered: 'queued'`)  — drained into the live run
 //   idle    → START  (`delivered: 'started'`) — the message is the new prompt
-//   paused  → RESUME through the host's own path, then START
+//   paused  → QUEUE  (`delivered: 'queued'`)  — the park SURVIVES the message (T8: the
+//             holder owns `resume`; only a host `sendThreadInput` lifts a park)
 //   stopped → the same throw (T3.3 — the host owns stopping and reviving)
 //
 // The rest of the finding's checks are pinned where they already live:
@@ -2356,11 +2357,13 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
         expect(writer.thread(target.id)?.status).toBe('idle');
     });
 
-    // T3.2 — the `paused` gap. Reachable in a unit test (it was only ever unreachable
-    // in the live session, which had no plugin park): a `turn.before` hook parks the
-    // conversation and never resumes it, so the park outlives the run exactly as
-    // src/harness.plugin.test.ts pins.
-    it('lifts a plugin park and starts a turn in the parked conversation (T3.2)', async () => {
+    // T3.2 — the `paused` gap, REVISED by compaction T8 (2026-11-10). This case used to
+    // pin "lift the park, then start a turn"; T8 retired that because a message that
+    // merely ARRIVES at a parked conversation was stealing the turn of whoever parked it
+    // (the compaction holder). A `turn.before` hook still parks the conversation and
+    // never resumes it, so the park outlives the run exactly as
+    // src/harness.plugin.test.ts pins — and the send now queues.
+    it('queues into a plugin park and leaves the parked conversation alone (T3.2, T8)', async () => {
         const observed: string[] = [];
         let parkOnce = true;
 
@@ -2397,21 +2400,32 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
             writer.executeTool('threadSend', { thread: target.id, message: 'carry on' })
         ).resolves.toEqual({
             threadId: target.id,
-            delivered: 'started',
+            delivered: 'queued',
             sender: 'writer'
         });
 
-        // THE PARK IS LIFTED through the host's own path (`resumeThreadState`), and
-        // the plugin that parked it sees its own park cleared. The status in the
-        // payload is `idle`, not `running`: the parked run had already ended, so the
-        // resume returns the record to whatever status the run loop would give it.
+        // THE PARK IS NOT LIFTED: no `thread.resumed` for the plugin that parked it, the
+        // record is still `paused`, and the attributed text has not reached the
+        // transcript — it sits in the thread's queue until a boundary drains it.
+        expect(observed).toEqual([]);
+        expect(writer.thread(target.id)?.status).toBe('paused');
+        expect(withoutIds(writer.threadMessages(target.id))).toEqual([
+            { role: 'user', content: 'first turn' },
+            { role: 'assistant', content: 'first answer' }
+        ]);
+
+        // A HOST turn remains the revival path (unchanged; pinned from the plugin side in
+        // src/harness.thread-park-queue.test.ts). Un-parking returns the record to the
+        // status the run loop would give it — `idle`, because the parked run had already
+        // ended — and the queued message then becomes a user turn at the new run's FIRST
+        // boundary, after that run's own prompt (`drainThreadQueue`).
+        await writer.sendThreadInput(target.id, 'host turn');
+
         expect(observed).toEqual(['resumed:idle']);
-
-        await settleThread(writer, target.id);
-
         expect(withoutIds(writer.threadMessages(target.id))).toEqual([
             { role: 'user', content: 'first turn' },
             { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'host turn' },
             { role: 'user', content: 'from agent "writer":\ncarry on' },
             { role: 'assistant', content: 'second answer' }
         ]);

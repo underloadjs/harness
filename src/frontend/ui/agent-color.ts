@@ -58,13 +58,30 @@
 // function of identity, and the reload reset it. A hash restores the reload-stability
 // for free (no persistence, no backend colour field — the schema still has none), while
 // the forward probe keeps the property the shuffle was bought for: distinct tones for
-// the first eight identities without anyone maintaining a table. With 8 palette slots
-// and 8 built-in profiles, the whole roster still gets eight different tones.
+// the first `AGENT_PALETTE.length` identities without anyone maintaining a table.
+//
+// EIGHT TONES IS ENOUGH FOR EVERY SESSION, AND THE CATALOGUE IS ALLOWED TO EXCEED IT.
+// What a reader actually SEES is one view's roster (the active harness's members), never
+// the whole catalogue. The largest live member set is the Manager card: `teamOf('planner')`
+// keeps all six other specialists plus `summarizer` = 7 subagents, plus its primary = **8
+// members**, which is exactly the palette; every other live card is 6 subagents + primary
+// = 7 (`teamOf()` in src/server/harnesses/presets.ts = SPECIALIST minus the primary minus
+// `planner`, then `summarizer` — and for the Manager the two exclusions collapse into one,
+// because it IS `planner`). So every live session is pairwise-distinct inside 8 slots, with
+// ZERO headroom: an eighth live role would put 9 members on the Manager card and two of
+// them would share a tone. That is a deliberate trade, not an oversight — see the next
+// paragraph. The 10-id CATALOGUE (`AGENT_PROFILE_NAMES`, fixtures included) is deliberately
+// NOT the constraint: growing the palette to cover it would re-derive the hash modulus
+// (`PALETTE_SIZE`) and repaint EVERY agent for two cards a session can never contain
+// (`demo`, `flaky`), so the documented repeat rule (a beyond-palette identity reuses its
+// OWN hashed slot, stably) covers the surplus instead.
 //
 // Cross-references:
-//   - src/agents/index.ts `AGENT_PROFILE_NAMES` — the roster; ui/agent-color.test.ts
-//     asserts it never outgrows the palette (read-only here: the browser bundle must
-//     not import server profiles);
+//   - src/agents/index.ts `AGENT_PROFILE_NAMES` — the catalogue; ui/agent-color.test.ts
+//     pins the real guarantee: every live team (max 8 members, the Manager card) is
+//     pairwise distinct, and a catalogue that exceeds the palette still maps each id to one
+//     stable tone with a stable repeat (read-only here: the browser bundle must not import
+//     server profiles);
 //   - src/frontend/main.ts — the PRODUCTION caller, wired in T4: `configureBaselineAgentColors`
 //     seeds the boot roster the app booted with, and `configureAgentColorsFor` re-derives the
 //     mapping for the ACTIVE view (that roster plus the team, and the `agent_colors` map the

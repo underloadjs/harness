@@ -822,15 +822,18 @@ describe('R3b durable harness database', () => {
         const restored = second.store.get(created.id);
         expect(restored.harnessDefinition).toEqual(frozen);
         expect(restored.harnessDefinition?.primary).toBe('instruct');
-        // Every member of the FROZEN team reports its effective model (T3: the
-        // shipped instruct team is six agents), so the restored conversation renders
-        // the same dropdowns it had before the restart.
+        // Every member of the FROZEN team reports its effective model, so the restored
+        // conversation renders the same dropdowns it had before the restart. The frozen instruct
+        // team is SEVEN agents: every other role except the Manager (`planner` is excluded from
+        // every built-in team because it refuses to run as a delegate) plus the summarizer
+        // (src/server/harnesses/presets.ts `teamOf`).
         expect(restored.agentModels).toEqual({
             instruct: SETTINGS.model,
+            general: SETTINGS.model,
             research: SETTINGS.model,
             workspace: SETTINGS.model,
             reviewer: SETTINGS.model,
-            planner: SETTINGS.model,
+            debugger: SETTINGS.model,
             summarizer: SETTINGS.model
         });
         // The frozen harness was rebuilt (not the patched registry entry), and its
@@ -1603,11 +1606,15 @@ describe('T5 durable harness deletion', () => {
 
         const document = readState(root);
         expect(document.deleted).toEqual(['instruct']);
+        // The rest of the shipped catalogue, in template order: the DEFAULT card `general` leads,
+        // and `debugger` trails the live roles (src/server/harnesses/presets.ts `presets`).
         expect(document.registry.map((entry) => entry.name)).toEqual([
+            'general',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(document.sessions.map((session) => session.harness)).toEqual(['instruct']);
 
@@ -1624,10 +1631,12 @@ describe('T5 durable harness deletion', () => {
         });
 
         expect(second.registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(second.registry.find('instruct')).toBeUndefined();
 
@@ -1682,11 +1691,13 @@ describe('T5 durable harness deletion', () => {
 
         expect(second.registry.find('demo')).toBeUndefined();
         expect(second.registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(second.store.restoreErrors).toEqual([]);
 
@@ -1765,15 +1776,19 @@ describe('T5 durable harness deletion', () => {
         expect(failure.message).toContain('Could not save the harness database');
 
         // In-memory state matches the (unchanged) disk: nothing was removed and no
-        // tombstone was left behind, in the original listing order.
-        expect(registry.find('research')?.title).toBe('Researcher');
+        // tombstone was left behind, in the original listing order. The titles here are
+        // the ones the roster pass shipped — the `research` id carries the Explore title,
+        // and the Manager id stays `planner` — and the DEFAULT card leads the listing.
+        expect(registry.find('research')?.title).toBe('Explore');
         expect(registry.deletedBuiltins()).toEqual([]);
         expect(registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
 
         // The same guarantee for a create: no phantom card.
@@ -1790,7 +1805,9 @@ describe('T5 durable harness deletion', () => {
         expect(
             (await failureOf(async () => await store.mutateRegistry(() => registry.update('planner', { title: 'Renamed' })))).status
         ).toBe(500);
-        expect(registry.find('planner')?.title).toBe('Planner');
+        // The rollback restores the shipped row, title included — `planner` is the id and
+        // Manager is its current title (src/agents/planner.ts).
+        expect(registry.find('planner')?.title).toBe('Manager');
     });
 
     it('keeps an earlier tombstone when a later mutation fails', async () => {
@@ -1870,11 +1887,13 @@ describe('T5 durable harness deletion', () => {
 
         expect(second.registry.find('instruct')?.title).toBe('Edited default');
         expect(second.registry.list().map((preset) => preset.name)).toEqual([
+            'general',
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner'
+            'planner',
+            'debugger'
         ]);
         expect(second.registry.deletedBuiltins()).toEqual([]);
     });
@@ -2500,10 +2519,16 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
     // the operator's 2026-11-10 one-number ruling removed it — so the 100-token limit IS the
     // firing point, and this fixture still crosses it on the very first turn, exactly as it
     // did before the headroom existed.
-    const OPERATOR_SETTINGS: Record<string, number> = {
+    // `mode: 'exclude'` is part of the operator's numbers here because this case measures the
+    // PRUNE pass's durability — the flag writes a shared store turns into document saves. The
+    // default moved to `summarize` with the 2026-11-10 context-compaction ruling, so a fixture
+    // that wants the old writer has to say so; the summarize flow's own persistence is pinned
+    // in src/plugin/context-compaction.test.ts (restart case).
+    const OPERATOR_SETTINGS: Record<string, number | string> = {
         contextLimit: 100,
         minTokens: 10,
-        safetyTurns: 0
+        safetyTurns: 0,
+        mode: 'exclude'
     };
 
     const compactionPreset = (

@@ -96,7 +96,7 @@ target.listen = function (this: http.Server, ...args: unknown[]) {
     return originalListen.apply(this, args);
 };
 
-// T5: the production service catalogue is the five real roles, none of which run
+// T5: the production service catalogue is the seven real roles, none of which run
 // without a provider. This suite's end-to-end assertions (a streamed turn, a reset,
 // a persisted session under the loader's variables.root) need an OFFLINE harness, so
 // the driver pre-seeds the root-keyed runtime with the shipped catalogue plus the
@@ -135,10 +135,22 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 `;
 
-// The catalogue the driver-injected runtime serves (T5): the five shipped production
-// presets plus the two fixtures the driver registers so this suite can run a real
-// turn offline. An un-injected runtime lists only the first five.
-const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
+// The catalogue the driver-injected runtime serves (T5 + the roster/role-contract
+// pass): the SEVEN shipped production presets plus the two fixtures the driver
+// registers so this suite can run a real turn offline. An un-injected runtime lists
+// only the first seven. Order is the shipped catalogue order, fixtures last
+// (../harnesses/presets.ts:486-494 + ALL_PRESET_TEMPLATES at :513).
+const PRESET_NAMES = [
+    'general',
+    'instruct',
+    'research',
+    'workspace',
+    'reviewer',
+    'planner',
+    'debugger',
+    'demo',
+    'flaky'
+];
 
 // Core tools lead the catalogue (R8) in every listing surface, including the
 // bootstrap document the service loader serves at GET /v1/harness. R9-R11 changed

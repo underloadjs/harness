@@ -670,9 +670,15 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     let lastError: string | undefined;
     let settledStatus: TurnRecordStatus | undefined;
     let settledAt: number | undefined;
-    // The timestamp of the most recently folded event (undefined for a record with no
+    // The timestamp of the event being folded (undefined for a record with no
     // `eventTimes`). Reads use it as the steer-adoption gate so a poll and a live
     // watcher adopt a steered submit at the same point of the stream.
+    //
+    // R9: `apply` assigns this BEFORE `route`, not after it, because routing can MINT a
+    // section (a first frame for an invocation) and minting is where that section's
+    // `startedAt` is bound — the frame's own stamp is the earliest recorded evidence of
+    // the invocation. After the frame completes the same variable is, as before, the
+    // last applied stamp.
     let lastAppliedStamp: number | undefined;
 
     // Memoization: `listViews()`/`getView()` ask for the same row on every render,
@@ -766,7 +772,48 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     const conversationThreadIdOf = (invocationId: string | undefined): string | undefined =>
         invocationId === undefined ? undefined : context.invocationThreadIds?.get(invocationId);
 
+    // R9 (user-reported: "Time for subagent/delegates is missing completely"): the row's
+    // elapsed label reads the section's START, and the fold never wrote one. `endedAt`
+    // already arrived at every terminal patch (:2548 done / :2647 error / :2914 settle),
+    // so the client settled with `startedAt: undefined`, `elapsedBetween` returned
+    // undefined, and `createBlockMeta.paint` hid the label — leaving a delegate row that
+    // reads `35,736 (319,929)` with no duration (../frontend/ui/turns.ts:937-950 and
+    // :7169-7177). The wire ALREADY declares the field (../shared/turn-display.ts
+    // `TurnSection.startedAt`/`TurnSectionPatch.startedAt`, mirrored verbatim by
+    // ../shared/harness-api.ts `TurnSection.startedAt`), so this only populates an
+    // existing contract; nothing new is sent and no shape changes.
+    //
+    // Rules, each one load-bearing:
+    //   - FIRST WRITE wins: a span the reader has already seen never moves, so a retry,
+    //     a later frame of the same flow, or a re-`start` cannot stretch or shrink it;
+    //   - the value is the FRAME's stamp (`lastAppliedStamp`, assigned by `apply` before
+    //     it routes), never `Date.now()` — a cold fold of a stored record therefore
+    //     replays the identical span a live run streamed, and a replay can never print
+    //     the record's wall-clock AGE as a duration;
+    //   - `undefined` (a legacy record with no `eventTimes`, i.e. `DISPLAY_NO_TIMESTAMP`)
+    //     writes NOTHING, so the row stays hidden instead of fabricating `0ms`.
+    //
+    // Returns the value that was NEWLY bound (undefined when the section already had a
+    // start), so a caller that is about to patch never re-sends an unchanged field.
+    const bindSectionStart = (record: SectionRecord): number | undefined => {
+        if (record.section.startedAt !== undefined || lastAppliedStamp === undefined) return undefined;
+
+        record.section.startedAt = lastAppliedStamp;
+
+        return lastAppliedStamp;
+    };
+
     const openSection = (record: SectionRecord, ops: TurnDisplayOp[]): void => {
+        // A section minted by a REAL frame is born running (`record.started` is set in
+        // `newSection` for every non-placeholder mint), so its start is this frame. A
+        // delegation PLACEHOLDER is opened before the child has run — queued rows keep no
+        // start and stay clock-less until the frame that actually starts them (adoption,
+        // `start`, or `branch_start`) supplies one.
+        //
+        // Written before the copy below, so the stamp rides the existing `section:open`
+        // payload and costs no extra op.
+        if (record.started) bindSectionStart(record);
+
         ops.push({ op: 'section:open', turnId: turn.id, section: { ...copyValue(record.section), nodes: [] } });
         invalidate();
     };
@@ -842,9 +889,16 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
         if (threadId !== undefined) record.section.threadId = threadId;
 
+        // R9: this is the frame where a queued delegation row starts RUNNING (the
+        // child's own identity arrived), so it is also that row's first honest start
+        // stamp. `undefined` when this frame carries no timestamp, which keeps the
+        // field absent exactly as before.
+        const startedAt = bindSectionStart(record);
+
         patchSection(
             record,
             {
+                ...(startedAt === undefined ? {} : { startedAt }),
                 invocationId: meta.id,
                 ...(meta.branchId === undefined ? {} : { branchId: meta.branchId }),
                 ...(record.terminal ? {} : { state: 'streaming' }),
@@ -1020,7 +1074,20 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 placeholder.placeholder = false;
                 placeholder.started = true;
                 placeholder.section.state = 'streaming';
-                patchSection(placeholder, { state: 'streaming' }, ops);
+
+                // R9: a threadless legacy child adopted by FIFO `start` gets the same
+                // start stamp as a thread-named one (see `adoptPlaceholder`); the row's
+                // clock starts here rather than at the first text delta.
+                const startedAt = bindSectionStart(placeholder);
+
+                patchSection(
+                    placeholder,
+                    {
+                        ...(startedAt === undefined ? {} : { startedAt }),
+                        state: 'streaming'
+                    },
+                    ops
+                );
 
                 return placeholder;
             }
@@ -1940,9 +2007,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // `at: number`, so 0 is the documented "no timestamp" sentinel and NO timing
         // is written anywhere (the tile must not invent a duration).
         const stamp = finiteNumber(at) && at > 0 ? at : undefined;
-        const record = route(event, ops);
 
+        // R9: assigned BEFORE `route` (see the declaration at the top of this closure) so
+        // a section minted while routing can bind this frame's stamp as its `startedAt`.
         lastAppliedStamp = stamp;
+
+        const record = route(event, ops);
 
         // The non-event segments of the bar (this section's system block, the turn's
         // prompt block) and any steer recorded since the last stored event, so the bar
@@ -1976,9 +2046,17 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     }
                 }
 
+                // R9: backstop for a section that was minted on a frame with no recorded
+                // timestamp (a legacy fold) and later saw a stamped `start`, and for a
+                // `start` that arrives at an already-open row through a route branch that
+                // does not mint. First-write-wins, so a re-`start` of a retry never
+                // re-baselines a span the reader already watched.
+                const startedAt = bindSectionStart(record);
+
                 patchSection(
                     record,
                     {
+                        ...(startedAt === undefined ? {} : { startedAt }),
                         model: typeof event.model === 'string' ? event.model : undefined,
                         role: record.key === ROOT_KEY ? (event.agent === context.primary ? 'primary' : 'subagent') : record.section.role,
                         agentLabel: record.section.agentLabel,
@@ -2670,9 +2748,15 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 if (existing !== undefined) {
                     existing.placeholder = false;
                     existing.started = true;
+
+                    // R9: same rule as `adoptPlaceholder` — the frame that turns a queued
+                    // row into a running one is the row's start.
+                    const startedAt = bindSectionStart(existing);
+
                     patchSection(
                         existing,
                         {
+                            ...(startedAt === undefined ? {} : { startedAt }),
                             ...(existing.terminal ? {} : { state: 'streaming' }),
                             ...(typeof branch.model === 'string' ? { model: branch.model } : {}),
                             ...(branch.threadId === undefined ? {} : { threadId: branch.threadId })

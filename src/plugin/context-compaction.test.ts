@@ -2,10 +2,13 @@
 //
 // WHAT THIS FILE PINS
 // -------------------
-// The TRIGGER, the PAUSE lifecycle, and the ACTION as a writer over the pure policy
-// (../core/context-pruning.ts — whose own rule table is pinned in
+// The TRIGGER, the PAUSE lifecycle, and BOTH writers: the `exclude` pass (a pure policy in
+// ../core/context-pruning.ts — whose own rule table is pinned in
 // src/core/context-pruning.test.ts; this file pins the PLUGIN half: settings, guards,
-// writes, reports, and behaviour through a real harness):
+// writes, reports, and behaviour through a real harness) and the `summarize` flow (T9),
+// where the conversation compacts itself. Which half a case measures is named by the
+// `mode` it stores — the fake api seeds `exclude` because most of the guard cases below
+// pin the pruning lifecycle, and every summarize case names its mode explicitly.
 //
 //   1. BELOW the trigger: nothing happens at all (no park, no action, no transcript
 //      change); and the TRIGGER itself — the effective limit, `min(resolved limit, model
@@ -22,12 +25,19 @@
 //   4. the internal `summarizer` conversation is never compacted (recursion guard), and a
 //      BRANCH round never triggers a pass at all (ratified 2026-11-09: its flag writes are
 //      ephemeral and its cooldown key could never be cleared);
-//   5. the ACTION: it prunes exactly the superseded failure and nothing else, re-reads
-//      `enabled`/`minTokens`/`safetyTurns`/`mode` every pass, degrades an unimplemented
-//      `mode` to `exclude` while REPORTING both, never rewrites history, and says what it
-//      did on `api.report.diagnostic` (T4.5). Through a real harness the flag is canonical
-//      state, ONE `agent_message` reports a multi-unit pass (T4.4), and a second pass
-//      changes and notifies nothing.
+//   5. the `exclude` ACTION: it prunes exactly the superseded failure and nothing else,
+//      re-reads `enabled`/`minTokens`/`safetyTurns`/`mode` every pass, degrades an
+//      unimplemented `mode` to `exclude` while REPORTING both, never rewrites history, and
+//      says what it did on `api.report.diagnostic` (T4.5). Through a real harness the flag
+//      is canonical state, ONE `agent_message` reports a multi-unit pass (T4.4), and a
+//      second pass changes and notifies nothing;
+//   6. the `summarize` FLOW end to end: the trigger parks the thread and commits its
+//      instruction into the canonical transcript AND into that request, the agent's own
+//      answer is the compaction, everything before the instruction (and the intermediate
+//      turns) stops being sent, the thread is un-parked, and a continuation nudge restarts
+//      the conversation on the compacted head — plus both finalize paths, the disobedient
+//      model, the failed-run rollback, the flag that survives the commit, the phase guard,
+//      and the restart persistence of everything the pass wrote.
 //
 // Two levels of test, deliberately: the guard factory is exercised with fakes, where the
 // token estimates are exact inputs and every control is observable; the shipped built-in
@@ -39,11 +49,13 @@
 //
 // Cross-references:
 //   - ../plugins/context-compaction.plugin.ts — the implementation under test
-//   - ../core/context-pruning.ts              — THE POLICY, pure and table-tested elsewhere
+//   - ../core/context-pruning.ts              — THE `exclude` POLICY, pure and table-tested elsewhere
 //   - ../core/context-estimate.ts             — the estimate the integration numbers use
 //   - ../harness.ts (`emitTurnBefore`)        — the real pause/resume + token estimate, the
 //                                               `setIncluded` write, and the per-round
-//                                               notification coalescing (T4.4)
+//                                               notification coalescing (T4.4); also
+//                                               `turn.after`, `thread.idle`, `run.failed` and
+//                                               the failure rollback the summarize cases pin
 //   - ./hooks.ts                              — fail-open dispatch of a throwing handler
 //   - ../core/agent.ts                        — `registerAgentThreader` and the thread model
 //                                               sync that make `api.agents[name].model()`
@@ -56,7 +68,7 @@
 //   - ../harness.plugin.test.ts               — the transport helpers mirrored below
 
 import { describe, expect, it } from 'vitest';
-import { agent, harness } from '@underload/harness';
+import { agent, harness, tool } from '@underload/harness';
 import type {
     Agent,
     Harness,
@@ -77,12 +89,16 @@ import type {
     HarnessTurnBeforeContext
 } from '@underload/harness';
 import {
+    COMPACTION_INSTRUCTION,
     COMPACTION_MODES,
+    CONTINUATION_NUDGE,
     createContextCompactionHandler,
+    createContextCompactionPasses,
     executeCompaction,
     isInternalAgent,
     metadata,
     parseModelLimits,
+    planCompactionRetention,
     resolveContextTrigger,
     setup
 } from '../plugins/context-compaction.plugin';
@@ -160,7 +176,13 @@ const createFakeApi = (
 ): FakeApi => {
     const touches: string[] = [];
     const diagnostics: HarnessPluginDiagnosticReport[] = [];
-    const values: Record<string, unknown> = { contextLimit: limit, ...stored };
+
+    // `mode: 'exclude'` is seeded because nearly every case in the guard/action blocks below
+    // pins the PRUNING lifecycle — the park/action/resume triple, the flag writes, the pass
+    // report — and that pass only runs in `exclude` mode now that `summarize` is the declared
+    // default. A case that wants the summarize flow stores the mode explicitly, so the two
+    // flows never measure each other.
+    const values: Record<string, unknown> = { mode: 'exclude', contextLimit: limit, ...stored };
 
     const skip = (name: string): never => {
         touches.push(name);
@@ -223,7 +245,13 @@ const createFakeApi = (
             steer: () => skip('threads.steer'),
             messages: () => skip('threads.messages'),
             replaceMessages: () => skip('threads.replaceMessages'),
-            setStatus: () => skip('threads.setStatus')
+            setStatus: () => skip('threads.setStatus'),
+            // T8 — the park/unpark pair is part of this api too, and the compactor's `unpark`
+            // reaches for `resume` on every run-terminal edge. Recorded like every other
+            // control: `unpark` swallows the throw (an unknown thread is not an error), so the
+            // touch is the observable half of the call.
+            pause: () => skip('threads.pause'),
+            resume: () => skip('threads.resume')
         },
         enableTool: () => skip('enableTool'),
         disableTool: () => skip('disableTool'),
@@ -395,10 +423,17 @@ const TRIPLE = ['pause', 'action', 'resume'];
 // internal-agent and branch guards run BEFORE the trigger is resolved: those rounds stop
 // after `contextLimit` and never pay for the map parse (the branch test below pins the
 // two-read sequence).
+//
+// `mode` is part of the sequence because the trigger has to know WHICH machine to hand the
+// turn to (summarize or exclude) before it can decide, and it is read after `modelLimits`
+// so a skipped round still stops at two reads. `minTokens` is deliberately NOT here: in
+// summarize mode it is a floor consulted only on a turn that is already over the limit, so
+// an under-limit turn never pays for it (pinned by the floor case below).
 const TRIGGER_READS = [
     'settings.boolean:enabled',
     'settings.number:contextLimit',
-    'settings.string:modelLimits'
+    'settings.string:modelLimits',
+    'settings.string:mode'
 ];
 
 // `count` triples, built with a plain loop (no `Array.prototype.flat`, which the package's
@@ -467,6 +502,14 @@ const settingsOf = (values: Record<string, number | string | boolean>): HarnessP
 // The one-key spelling: just the limit.
 const limitAt = (value: number): HarnessPluginSettingsProvider => settingsOf({ contextLimit: value });
 
+// The same, pinned to the OLD writer. Everything in this file that measures the prune
+// lifecycle (park -> `executeCompaction` -> un-park, the flag writes, the pass report) has to
+// say `mode: 'exclude'` now that `summarize` is the declared default; without it those cases
+// would silently drive the summarize machine and pin nothing. `limitAt` stays for the cases
+// that never reach a mode decision (under the limit, limit 0, internal agent, branch).
+const excludeAt = (value: number): HarnessPluginSettingsProvider =>
+    settingsOf({ contextLimit: value, mode: 'exclude' });
+
 // A HOST plugin (applied after the built-ins), so its `turn.before` observer sees the same
 // estimate the compactor saw, and its `thread.paused` / `thread.resumed` handlers record
 // the park the built-in produced.
@@ -489,9 +532,11 @@ describe('context-compaction metadata', () => {
     it('declares exactly the knobs the ratified answers name', () => {
         expect(metadata.name).toBe('context-compaction');
         expect(metadata.title).toBe('Context Compaction');
-        // The trigger point this plugin needs, and nothing else, so the live hook surface
-        // and the declared intent stay identical.
-        expect(metadata.hooks).toEqual(['turn.before']);
+        // The trigger points this plugin needs, and nothing else, so the live hook surface
+        // and the declared intent stay identical. The summarize machine spans one run, so it
+        // declares all five edges — and `setup` below subscribes exactly this list, which is
+        // what keeps the operator-facing declaration honest.
+        expect(metadata.hooks).toEqual(['turn.before', 'turn.after', 'thread.idle', 'run.finished', 'run.failed']);
 
         // T4.6: `enabled`, the limit, the savings floor, the horizon, and the mode, plus
         // R4's per-model map beside the limit it modifies. The numbers below ARE the
@@ -513,7 +558,7 @@ describe('context-compaction metadata', () => {
             ['enabled', 'boolean', true, undefined, undefined],
             ['minTokens', 'number', 200, 0, 50],
             ['safetyTurns', 'number', 6, 0, 1],
-            ['mode', 'string', 'exclude', undefined, undefined]
+            ['mode', 'string', 'summarize', undefined, undefined]
         ]);
 
         // Every knob has to explain itself to the operator who is about to type a number
@@ -533,6 +578,12 @@ describe('context-compaction metadata', () => {
         expect(descriptionOf('mode')).toContain('"annotate"');
         expect(descriptionOf('mode')).toContain('behaves as "exclude"');
 
+        // T9: the floor's text now has to explain that the SAME number means a different
+        // thing in the new mode, or an operator with a small per-model limit sets a floor
+        // that quietly refuses every summarize pass.
+        expect(descriptionOf('minTokens')).toContain('summarize');
+        expect(descriptionOf('mode')).toContain('summarize');
+
         // The texts that tell an operator WHERE the firing point actually is. The limit's
         // own description has to state that it IS the firing point with no headroom beside
         // it (the opposite disclaimer the removed gap scheme needed), and the map has to
@@ -545,8 +596,14 @@ describe('context-compaction metadata', () => {
         expect(String(metadata.description)).toContain('The limit is the firing point');
 
         // `mode` enumerates ONLY what this build implements, so the UI cannot offer a value
-        // that does nothing, and the list the plugin falls back to is that one value.
-        expect(COMPACTION_MODES).toEqual(['exclude']);
+        // that does nothing. T9 added the second writer, and the order is the UI's: the
+        // DEFAULT first, which is the same value `MODE_DEFAULT` falls back to (a drift
+        // between the descriptor above and this list means the UI offers a mode the plugin
+        // does not actually run when nothing is stored).
+        expect(COMPACTION_MODES).toEqual(['summarize', 'exclude']);
+        expect(COMPACTION_MODES).toContain(
+            String((metadata.settings ?? []).find((setting) => setting.key === 'mode')?.default)
+        );
     });
 });
 
@@ -1580,7 +1637,12 @@ describe('context-compaction action (executeCompaction)', () => {
         expect(diagnostics).toEqual([]);
     });
 
-    it('setup registers one turn.before handler whose default action IS the policy', async () => {
+    it('setup wires exactly the declared hooks, and its turn.before default action IS the policy', async () => {
+        // `mode: 'exclude'` is what the fake api seeds, and this case wants the PRUNE writer:
+        // `executeCompaction` is the default action of the pass factory, so it is only
+        // observable as the shipped behaviour when the turn is routed to that machine. The
+        // summarize half is measured through a real harness in the `summarize flow` block,
+        // where its phase machine actually exists.
         const { api, touches } = createFakeApi(100, { minTokens: 10, safetyTurns: 0 });
         const registered: Array<{
             event: string;
@@ -1597,7 +1659,12 @@ describe('context-compaction action (executeCompaction)', () => {
         };
 
         setup(api);
-        expect(registered.map((entry) => entry.event)).toEqual(['turn.before']);
+
+        // ONE subscription per declared hook, in the declared order — and nothing else. This
+        // is the assertion that keeps `metadata.hooks` (what the server shows the operator)
+        // identical to what the plugin really touches: a hook wired without being declared, or
+        // declared and never wired, fails right here.
+        expect(registered.map((entry) => entry.event)).toEqual([...metadata.hooks]);
 
         const calls: string[] = [];
         await registered[0].handler(
@@ -1607,13 +1674,7 @@ describe('context-compaction action (executeCompaction)', () => {
         // park -> prune -> un-park, in that order: `executeCompaction` is the DEFAULT action,
         // so the shipped built-in changes the transcript inside the pause window.
         expect(calls).toEqual(['pause', 'setIncluded:1:false', 'resume']);
-        expect(touches).toEqual([
-            'settings.boolean:enabled',
-            'settings.number:contextLimit',
-            'settings.string:modelLimits',
-            ...POLICY_READS,
-            'report.diagnostic'
-        ]);
+        expect(touches).toEqual([...TRIGGER_READS, ...POLICY_READS, 'report.diagnostic']);
     });
 
     // The estimate is ceil(content chars / 4) (core/context-estimate.ts), and the agent
@@ -1659,7 +1720,7 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const writer = harness({
             agents: { writer: brain(scripted([answer('ok'), answer('fine'), answer('done')], seen)) },
-            pluginSettings: limitAt(100),
+            pluginSettings: excludeAt(100),
             plugins: [probe(events, estimates)]
         });
 
@@ -1765,7 +1826,7 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const writer = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
-            pluginSettings: limitAt(100),
+            pluginSettings: excludeAt(100),
             plugins: [failing, probe(events, estimates)]
         });
 
@@ -1880,7 +1941,7 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const { writer, threadId } = await compactRun({
             transcript: supersededTranscript(600),
-            settings: { contextLimit: 100, minTokens: 10, safetyTurns: 0 },
+            settings: { contextLimit: 100, minTokens: 10, safetyTurns: 0, mode: 'exclude' },
             stateChanges,
             diagnostics,
             seen
@@ -1906,7 +1967,7 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const disabled = await compactRun({
             transcript: supersededTranscript(600),
-            settings: { contextLimit: 100, minTokens: 10, safetyTurns: 0 },
+            settings: { contextLimit: 100, minTokens: 10, safetyTurns: 0, mode: 'exclude' },
             stateChanges: disabledChanges,
             diagnostics: [],
             seen: [],
@@ -2018,7 +2079,7 @@ describe('context-compaction action (executeCompaction)', () => {
                 { role: 'user', content: 'p'.repeat(500) },
                 ...supersededTranscript(20).slice(1)
             ],
-            settings: { contextLimit: 100 },
+            settings: { contextLimit: 100, mode: 'exclude' },
             stateChanges,
             diagnostics,
             seen
@@ -2054,7 +2115,7 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const { writer, threadId } = await compactRun({
             transcript: supersededTranscript(600),
-            settings: { contextLimit: 100, minTokens: 10, safetyTurns: 0 },
+            settings: { contextLimit: 100, minTokens: 10, safetyTurns: 0, mode: 'exclude' },
             stateChanges,
             diagnostics,
             seen,
@@ -2144,7 +2205,12 @@ describe('context-compaction action (executeCompaction)', () => {
                 // effective = min(1000, 100) = 100 — the declared window caps the ceiling, and
                 // with no headroom the cap IS the firing point — so this 100-token turn
                 // crosses it.
-                modelLimits: '{"merge/ds4-flash": {"window": 100}}'
+                modelLimits: '{"merge/ds4-flash": {"window": 100}}',
+                // The pass this case watches is the prune (the events are the park of the
+                // `exclude` lifecycle), so the mode is named rather than inherited; the
+                // control arm below names the same mode so the two differ ONLY by the model
+                // id the map keys.
+                mode: 'exclude'
             }),
             plugins: [probe(events, estimates)]
         });
@@ -2166,7 +2232,8 @@ describe('context-compaction action (executeCompaction)', () => {
             agents: { writer: brain(scripted([answer('ok')])) },
             pluginSettings: settingsOf({
                 contextLimit: 1000,
-                modelLimits: '{"other/model": {"window": 100}}'
+                modelLimits: '{"other/model": {"window": 100}}',
+                mode: 'exclude'
             }),
             plugins: [probe(uncappedEvents, uncappedEstimates)]
         });
@@ -2196,5 +2263,1470 @@ describe('context-compaction action (executeCompaction)', () => {
         expect(estimates).toEqual([100]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T9 — THE SUMMARIZE FLOW, end to end, through a real harness.
+//
+// Every number here is derived, never read back: the transcript is seeded with 1200
+// characters of one user turn (300 tokens) and the prompt `go` adds one more, so the live
+// projection at the first boundary is 301 against an effective limit of 250 — over, and
+// `minTokens: 0` so the floor cannot refuse the pass. After a successful compaction the
+// retained head (the instruction ~186 tokens, the answer, the nudge) measures ~189, i.e.
+// under 250, which is what makes "the context is small again" an assertion rather than a
+// hope. The instruction and the nudge are the EXPORTED strings, because a case that pasted
+// its own copy would keep passing after the protocol changed.
+//
+// The continuation run is fire-and-forget from inside `thread.idle` (see the plugin's "WHY
+// THE NUDGE IS A SEND"), so it is still queued when the submission resolves; `settle` below
+// waits for it. That is the one place a poll is honest: the plugin deliberately does not
+// hand back a promise for the continuation, and neither does the host.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction summarize flow (T9)', () => {
+    const SEED = 'x'.repeat(1200);
+    const PROMPT = 'go';
+    const LIMIT = 250;
+
+    // Scripted transport with a window INTO the request: `on` runs while the model turn is
+    // in flight, which is the only moment a case can observe the roster status mid-pass, the
+    // committed transcript BEFORE the answer, or steer the conversation from inside it.
+    const flowStream = (
+        turns: HarnessStreamEvent[][],
+        seen: HarnessStreamRequest[],
+        on?: (index: number, request: HarnessStreamRequest) => void
+    ): HarnessStream => {
+        let index = 0;
+
+        return async function* (request) {
+            seen.push(request);
+            on?.(index, request);
+
+            const frames = turns[index] ?? turns[turns.length - 1];
+            index += 1;
+
+            for (const frame of frames) yield frame;
+        };
+    };
+
+    // The summarize settings: the mode spelled out (it IS the default, and a case that names
+    // what it measures stays readable after the default moves again), the limit at 250, and
+    // `minTokens: 0` so the summarize floor never refuses the pass by accident.
+    const summarizeSettings = (
+        extra: Record<string, number | string | boolean> = {}
+    ): HarnessPluginSettingsProvider =>
+        settingsOf({ contextLimit: LIMIT, minTokens: 0, mode: 'summarize', ...extra });
+
+    // Waits for the fire-and-forget continuation. Resolves true once the nudge's answer has
+    // landed and the conversation is idle again, false if that never happens within 1s — the
+    // caller asserts `true`, so a missing continuation is a failure rather than a skip.
+    const settle = async (writer: Harness, threadId: string, messages: number): Promise<boolean> => {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+            if (
+                writer.threadMessages(threadId).length >= messages &&
+                writer.thread(threadId)?.status === 'idle'
+            ) {
+                return true;
+            }
+
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+
+        return false;
+    };
+
+    // A tool the disobedient model can waste a turn on: it answers immediately, so the tool
+    // round is over inside the run and the pass stays open exactly as long as the model keeps
+    // refusing to answer in prose.
+    const alphaTool = () =>
+        tool({ description: 'Echo tool alpha.', tags: ['test'], visibility: 'core', execute: () => 'A' });
+
+    // One tool round: prose plus a call, which is NOT a compaction answer (the answer test is
+    // "assistant turn with no tool calls", shared by `turn.after` and the finalize range).
+    const toolRound = (id: string, name: string): HarnessStreamEvent[] => [
+        { type: 'text', delta: 'working' },
+        { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: '{}' }] }
+    ];
+
+    it('compacts the conversation itself: park, instruction, answer, withhold, resume, nudge', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const statuses: string[] = [];
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        // Captured from INSIDE the compaction request: the committed transcript at the moment
+        // the instruction is already in it and the answer has not been written yet.
+        let midPass: readonly HarnessMessage[] | undefined;
+
+        let handle: Harness | undefined;
+        let threadId = '';
+
+        const stream = flowStream(
+            [answer('SUMMARY'), answer('resumed')],
+            seen,
+            (index) => {
+                statuses.push(String(handle?.thread(threadId)?.status));
+
+                if (index === 0) midPass = handle?.threadMessages(threadId);
+            }
+        );
+
+        handle = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates)],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const writer = handle;
+        const thread = writer.createThread('writer', { label: 'Summarize' });
+
+        threadId = thread.id;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        const reply = await writer.sendThreadInput(thread.id, PROMPT);
+
+        // THE SUBMISSION RESOLVES ON THE SUMMARY. The caller asked `go` and got the
+        // compaction back — accepted behaviour for this design (the continuation run is the
+        // host's next turn), and the reason the nudge below is load-bearing.
+        expect(reply.content).toBe('SUMMARY');
+        expect(await settle(writer, threadId, 6)).toBe(true);
+
+        // TWO model requests: the compaction turn, then the continuation.
+        expect(seen).toHaveLength(2);
+
+        // Request 1 is the projection exactly as measured, plus the committed instruction at
+        // the end — the seeded turn and the prompt are still in front of it, because THIS
+        // request is the one being answered.
+        expect(seen[0].messages.map((message) => String(message.content))).toEqual([
+            SEED,
+            PROMPT,
+            COMPACTION_INSTRUCTION
+        ]);
+
+        // Request 2 — THE PROOF THE CONTEXT IS SMALL AGAIN. The provider sees the instruction,
+        // the agent's own summary, and the nudge: 3 messages, ~189 tokens, and neither the
+        // 1200-character seed nor the prompt anywhere in it.
+        expect(withoutIds(seen[1].messages)).toEqual([
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' },
+            { role: 'user', content: CONTINUATION_NUDGE }
+        ]);
+
+        // The park is real and it is lifted — and the SECOND request went out while the
+        // thread was 'running' again, which is the ordering the whole design hangs on:
+        // `thread.idle` only fires on a real transition, so `turn.after` has to un-park the
+        // conversation for the continuation to be schedulable at all.
+        expect(statuses).toEqual(['paused', 'running']);
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(writer.thread(threadId)?.status).toBe('idle');
+
+        // What the run had committed when the instruction was handed to the model: the
+        // instruction as the LAST entry, and NO `included` flag anywhere. The commit does not
+        // quietly rewrite the transcript's visibility before the answer exists — the range is
+        // written after the summary, by the finalize, and not before.
+        expect(withoutIds(midPass)).toEqual([
+            { role: 'user', content: SEED },
+            { role: 'user', content: PROMPT },
+            { role: 'user', content: COMPACTION_INSTRUCTION }
+        ]);
+
+        // THE FINAL CANONICAL TRANSCRIPT. Nothing is deleted: the two superseded turns are
+        // still in their original positions, flagged off, and the retained head (instruction,
+        // summary, nudge, answer) follows them in order.
+        expect(withoutIds(writer.threadMessages(threadId))).toEqual([
+            { role: 'user', content: SEED, included: false },
+            { role: 'user', content: PROMPT, included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' },
+            { role: 'user', content: CONTINUATION_NUDGE },
+            { role: 'assistant', content: 'resumed' }
+        ]);
+
+        // THREE reports, one per edge of the pass, with the numbers an operator would ask for.
+        expect(diagnostics).toHaveLength(3);
+        expect(diagnostics.map((report) => report.owner)).toEqual([
+            'context-compaction',
+            'context-compaction',
+            'context-compaction'
+        ]);
+
+        // The trigger: the LIVE projection beside the effective limit. Those two numbers are
+        // the whole firing decision, and an operator reading the log has to be able to see WHY
+        // the pass ran. `currentEstimatedTokens()` rather than `estimatedTokens` because the
+        // latter is frozen at handler entry — a boundary that lands right after a compaction
+        // would otherwise still see the pre-compaction size and fire the pass again.
+        expect(diagnostics[0].message).toContain('~301 estimated tokens against an effective limit of 250');
+        expect(diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId,
+            tokens: 301,
+            effective: 250,
+            entries: 3
+        });
+
+        expect(diagnostics[1].message).toContain('answered its compaction instruction on turn 1');
+        expect(diagnostics[1].data).toEqual({ mode: 'summarize', threadId, iteration: 1 });
+
+        // The finalize: which range stopped being sent, and which two entries are now the
+        // conversation's memory. `path` says idle because the run ENDED on the answer — the
+        // wholesale rewrite is legal exactly there.
+        expect(diagnostics[2].kind).toBe('policy');
+        expect(diagnostics[2].message).toContain('2 of 4 entry(ies) stop being sent');
+        expect(diagnostics[2].message).toContain('the instruction at #2 and the answer at #3');
+        expect(diagnostics[2].message).toContain('finalized at thread.idle');
+        expect(diagnostics[2].data).toEqual({
+            mode: 'summarize',
+            threadId,
+            path: 'thread.idle',
+            instructionIndex: 2,
+            answerIndex: 3,
+            disabled: [0, 1],
+            total: 4
+        });
+    });
+
+    it('writes the range lazily when the run kept going, and then sends no nudge at all', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const statuses: string[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        let handle: Harness | undefined;
+        let threadId = '';
+
+        // Steered from inside the compaction request, so the run has a second iteration
+        // waiting after the summary — no idle moment between the answer and the next boundary.
+        const stream = flowStream([answer('SUMMARY'), answer('kept going')], seen, (index) => {
+            statuses.push(String(handle?.thread(threadId)?.status));
+            if (index === 0) void handle?.steerThread(threadId, 'also this');
+        });
+
+        handle = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            pluginSettings: summarizeSettings(),
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const writer = handle;
+        const thread = writer.createThread('writer', { label: 'Steer race' });
+
+        threadId = thread.id;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        const reply = await writer.sendThreadInput(thread.id, PROMPT);
+
+        // The steered input is what the submission resolves on, not the summary.
+        expect(reply.content).toBe('kept going');
+        expect(writer.thread(threadId)?.status).toBe('idle');
+        expect(seen).toHaveLength(2);
+
+        // THE LAZY FINALIZE, proven on the request it re-projected: the second request of the
+        // SAME run carries the compacted head plus the steered input. `setIncluded` is the
+        // only control that both writes the range and re-projects the live request, and this
+        // is the case that pins it (the idle path rewrites the transcript instead).
+        expect(seen[1].messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'SUMMARY',
+            'also this'
+        ]);
+
+        // No nudge anywhere: the conversation was never interrupted, so there is nothing to
+        // continue. The second turn of the run IS the continuation.
+        expect(withoutIds(writer.threadMessages(threadId))).toEqual([
+            { role: 'user', content: SEED, included: false },
+            { role: 'user', content: PROMPT, included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' },
+            { role: 'user', content: 'also this' },
+            { role: 'assistant', content: 'kept going' }
+        ]);
+
+        expect(diagnostics).toHaveLength(3);
+        expect(diagnostics[2].message).toContain('finalized at turn.before');
+        expect(diagnostics[2].data).toMatchObject({ path: 'turn.before', disabled: [0, 1] });
+        expect(statuses).toEqual(['paused', 'running']);
+    });
+
+    it('answers the instruction with a tool call, and still withholds the turns it wasted', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const stream = flowStream(
+            [toolRound('t1', 'alpha'), answer('FINALLY'), answer('resumed')],
+            seen
+        );
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            tools: { alpha: alphaTool() },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates)],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Disobedient' });
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        const reply = await writer.sendThreadInput(thread.id, PROMPT);
+
+        expect(reply.content).toBe('FINALLY');
+        expect(await settle(writer, thread.id, 8)).toBe(true);
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+
+        // ONE park for the whole thing, even though the model spent three turns: the phase
+        // guard is a per-pass guard, not a per-turn one.
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(seen).toHaveLength(3);
+
+        // While the pass was still OPEN (the tool round's second request) nothing was
+        // withheld — the intermediate turns are only known to be wasted once the prose answer
+        // exists, and until then the model needs them.
+        expect(seen[1].messages.map((message) => String(message.content))).toEqual([
+            SEED,
+            PROMPT,
+            COMPACTION_INSTRUCTION,
+            'working',
+            'A'
+        ]);
+
+        // Then the compacted head, and the continuation on top of it.
+        expect(seen[2].messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'FINALLY',
+            CONTINUATION_NUDGE
+        ]);
+
+        // The disobedient block is withheld exactly like the old history: the call and its
+        // result go, the instruction and the eventual summary stay.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: SEED, included: false },
+            { role: 'user', content: PROMPT, included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            {
+                role: 'assistant',
+                content: 'working',
+                included: false,
+                toolCalls: [{ id: 't1', name: 'alpha', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: 'A',
+                included: false,
+                toolCallId: 't1',
+                name: 'alpha'
+            },
+            { role: 'assistant', content: 'FINALLY' },
+            { role: 'user', content: CONTINUATION_NUDGE },
+            { role: 'assistant', content: 'resumed' }
+        ]);
+
+        // The answer edge names the turn it actually landed on (2), not the boundary the pass
+        // started at, and the range counts the wasted block.
+        expect(diagnostics[1].message).toContain('answered its compaction instruction on turn 2');
+        expect(diagnostics[2].message).toContain('4 of 6 entry(ies) stop being sent');
+        expect(diagnostics[2].data).toEqual({
+            mode: 'summarize',
+            threadId: thread.id,
+            path: 'thread.idle',
+            instructionIndex: 2,
+            answerIndex: 5,
+            disabled: [0, 1, 3, 4],
+            total: 6
+        });
+    });
+
+    it('lifts the park and rolls the pass back when the compaction request fails', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        // `retry: false` — the agent is the one retry owner (core/agent.ts R1), so without the
+        // opt-out a transport error is a retry sequence rather than a failed run, and the
+        // phase machine would never see `run.failed`.
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'merge/ds4-flash',
+                    retry: false,
+                    stream: flowStream(
+                        [[{ type: 'error', message: 'provider down' }] as HarnessStreamEvent[], answer('later')],
+                        seen
+                    )
+                })
+            },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates)],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Provider down' });
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        await expect(writer.sendThreadInput(thread.id, PROMPT)).rejects.toThrow('provider down');
+
+        // THE CONTRACT OF THE FAILURE PATH: a failed compaction costs the conversation
+        // nothing. The run's own rollback (`brain.messages.splice(commitIndex)`) removed the
+        // instruction it committed, `run.failed` lifted the park, and the thread is usable.
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(seen).toHaveLength(1);
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([{ role: 'user', content: SEED }]);
+
+        expect(diagnostics).toHaveLength(2);
+        expect(diagnostics[1].message).toContain('lifted its park on thread');
+        expect(diagnostics[1].message).toContain('after a failed run (phase compacting)');
+        expect(diagnostics[1].data).toEqual({
+            mode: 'summarize',
+            threadId: thread.id,
+            phase: 'compacting',
+            hook: 'run.failed'
+        });
+
+        // Usable means USABLE: the next turn runs on the untouched transcript. It does not
+        // re-fire the pass, because the cooldown still holds the size the failed pass recorded
+        // — the same re-trigger protection the `exclude` lifecycle pins, from the other side.
+        const next = await writer.sendThreadInput(thread.id, 'retry now');
+
+        expect(next.content).toBe('later');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: SEED },
+            { role: 'user', content: 'retry now' },
+            { role: 'assistant', content: 'later' }
+        ]);
+    });
+
+    it('never re-sends a turn an earlier pass already withheld, through both wholesale writes', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        // A turn a HOST (or an earlier `exclude` pass) had already switched off, big enough to
+        // flip the trigger on its own if the estimate started counting it again.
+        const withheld = `pre-withheld ${'w'.repeat(1200)}`;
+
+        const stream = flowStream([answer('SUMMARY'), answer('resumed')], seen);
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            pluginSettings: summarizeSettings(),
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Already withheld' });
+
+        writer.setThreadMessages(thread.id, [
+            { role: 'user', content: withheld, included: false },
+            { role: 'user', content: SEED }
+        ]);
+
+        expect((await writer.sendThreadInput(thread.id, PROMPT)).content).toBe('SUMMARY');
+        expect(await settle(writer, thread.id, 7)).toBe(true);
+
+        // The trigger measured the PROJECTION, not the transcript: ~301 (the seed and the
+        // prompt), not ~601 with the already-withheld turn counted. A live estimate that read
+        // canonical history would fire compaction on conversations that are already compacted.
+        expect(diagnostics[0].data).toMatchObject({ tokens: 301, effective: 250 });
+
+        // And it stayed off: no request this pass produced — the compaction turn, the
+        // continuation, or the follow-up — ever carried that text again.
+        const carries = (messages: readonly HarnessMessage[]): boolean =>
+            messages.some((message) => String(message.content).startsWith('pre-withheld'));
+
+        expect(seen.map((request) => carries(request.messages))).toEqual([false, false]);
+        expect(
+            writer.threadMessages(thread.id).slice(0, 2).map((message) => message.included)
+        ).toEqual([false, false]);
+
+        // The flag survived BOTH wholesale writes — `replaceHistory` (the commit) and
+        // `replaceMessages` (the idle rewrite). Read as "is this entry withheld", the answer
+        // is yes for the three turns the summary replaced (the pre-existing one, the seed, the
+        // prompt) and no for the retained head (the instruction, the summary, the nudge, the
+        // continuation's answer).
+        expect(
+            writer
+                .threadMessages(thread.id)
+                .map((message, index) => ({ index, withheld: message.included === false }))
+        ).toEqual([
+            { index: 0, withheld: true },
+            { index: 1, withheld: true },
+            { index: 2, withheld: true },
+            { index: 3, withheld: false },
+            { index: 4, withheld: false },
+            { index: 5, withheld: false },
+            { index: 6, withheld: false }
+        ]);
+    });
+
+    it('runs one pass per crossing: one park, one instruction, and a second pass that reclaims the first', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        let handle: Harness | undefined;
+        let threadId = '';
+
+        const stream = flowStream([answer('SUMMARY'), answer('first'), answer('second')], seen);
+
+        // How many instructions each request carried. A second one inside the FIRST
+        // submission's requests would mean the phase guard leaked and a boundary re-triggered
+        // on top of a pass that was already running; two in pass two's request is correct and
+        // expected — the older instruction is still in the transcript, merely withheld.
+        const instructions = (request: HarnessStreamRequest): number =>
+            request.messages.filter((message) =>
+                String(message.content).startsWith(COMPACTION_INSTRUCTION)
+            ).length;
+
+        handle = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates)],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const writer = handle;
+        const thread = writer.createThread('writer', { label: 'Phase guard' });
+
+        threadId = thread.id;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        expect((await writer.sendThreadInput(thread.id, PROMPT)).content).toBe('SUMMARY');
+        expect(await settle(writer, threadId, 6)).toBe(true);
+
+        // ONE park and ONE un-park for a submission that ran two model turns, and exactly the
+        // three reports of a single pass.
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(diagnostics).toHaveLength(3);
+        expect(seen.map(instructions)).toEqual([1, 1]);
+
+        // The next submission grows the conversation past the trigger again (~299 against
+        // 250). The cooldown does NOT hold it back, because the turn that ran on the compacted
+        // head measured ~189 — under the limit — and cleared it. So the second pass is a real
+        // crossing, and its finalize reclaims the FIRST pass's turns as well: after this, the
+        // only retained memory is the second instruction and the second summary.
+        expect((await writer.sendThreadInput(threadId, 'y'.repeat(300))).content).toBe('second');
+        expect(await settle(writer, threadId, 11)).toBe(true);
+
+        expect(events).toEqual(['paused', 'resumed', 'paused', 'resumed']);
+        expect(diagnostics).toHaveLength(6);
+
+        // The request the SECOND compaction went out on: the compacted head from pass one
+        // (instruction, summary, nudge, answer), the new prompt, and the new instruction —
+        // 6 messages, no 1200-character seed anywhere.
+        expect(seen[2].messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'SUMMARY',
+            CONTINUATION_NUDGE,
+            'first',
+            'y'.repeat(300),
+            COMPACTION_INSTRUCTION
+        ]);
+        expect(seen.map(instructions)).toEqual([1, 1, 2, 1]);
+
+        // Seven of nine withheld: everything up to and including pass one's answer, because
+        // pass two's summary replaces all of it.
+        expect(diagnostics[5].data).toEqual({
+            mode: 'summarize',
+            threadId,
+            path: 'thread.idle',
+            instructionIndex: 7,
+            answerIndex: 8,
+            disabled: [0, 1, 2, 3, 4, 5, 6],
+            total: 9
+        });
+
+        // The continuation after pass two runs on the new head alone: the older instruction is
+        // now ordinary superseded history, withheld like everything else before the new one.
+        expect(seen[3]?.messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'second',
+            CONTINUATION_NUDGE
+        ]);
+    });
+
+    it('persists the compacted head across a restart, and the restored harness sends only it', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        let handle: Harness | undefined;
+        let threadId = '';
+
+        const stream = flowStream([answer('SUMMARY'), answer('resumed')], seen);
+
+        handle = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            pluginSettings: summarizeSettings()
+        });
+
+        const writer = handle;
+        const thread = writer.createThread('writer', { label: 'Restart' });
+
+        threadId = thread.id;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        await writer.sendThreadInput(thread.id, PROMPT);
+        expect(await settle(writer, threadId, 6)).toBe(true);
+
+        // The document a store would have written: the flags are plain message fields, so the
+        // compaction survives JSON the way every other canonical write does.
+        const snapshot = JSON.parse(JSON.stringify(writer.snapshot())) as HarnessSnapshot;
+        const before = withoutIds(writer.threadMessages(threadId));
+
+        const restartSeen: HarnessStreamRequest[] = [];
+        const fresh = harness({
+            agents: {
+                writer: agent({
+                    model: 'merge/ds4-flash',
+                    stream: flowStream([answer('after restart')], restartSeen)
+                })
+            },
+            // Generous on purpose: this case is about what the restored transcript projects,
+            // not about the restart firing another pass.
+            pluginSettings: settingsOf({ contextLimit: 100000, minTokens: 0, mode: 'summarize' })
+        });
+
+        fresh.restore(snapshot);
+
+        // Restored exactly as persisted — including a conversation that is NOT parked, which
+        // is the other half of "no thread stranded paused": the park never outlives the pass,
+        // so there is no paused state to restore.
+        expect(fresh.thread(threadId)?.status).toBe('idle');
+        expect(withoutIds(fresh.threadMessages(threadId))).toEqual(before);
+
+        expect((await fresh.sendThreadInput(threadId, 'still there?')).content).toBe('after restart');
+
+        // THE WHOLE POINT OF THE PERSISTENCE: a process that restarted with an empty plugin
+        // state still talks to the model through the compacted head — the 1200-character seed
+        // and the original prompt are gone from the request, and no plugin decision was
+        // needed to keep them gone.
+        expect(restartSeen[0].messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'SUMMARY',
+            CONTINUATION_NUDGE,
+            'resumed',
+            'still there?'
+        ]);
+    });
+
+    it('refuses the summarize pass below minTokens, and re-arms the moment the floor comes down', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        // Mutable on purpose: the point of the last third of this case is that a REFUSE
+        // records nothing (no cooldown, no park, no turn), so an operator who lowers the floor
+        // gets the pass on the very next turn rather than waiting for the 5% regrowth margin.
+        // `mode` names the flow explicitly rather than inheriting the declared default: an
+        // unimplemented mode would degrade to `exclude`, whose floor means something else
+        // entirely (a minimum SAVING, not a minimum conversation size), and this case would
+        // then pass for the wrong reason.
+        const stored: Record<string, number | string | boolean> = {
+            contextLimit: 100,
+            minTokens: 200,
+            mode: 'summarize'
+        };
+
+        const provider: HarnessPluginSettingsProvider = {
+            get: (plugin, key) => {
+                if (plugin === 'context-trimmer' && key === 'enabled') return false;
+
+                return plugin === 'context-compaction' ? stored[key] : undefined;
+            }
+        };
+
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([answer('ok'), answer('fine'), answer('summarised'), answer('after')], seen))
+            },
+            pluginSettings: provider
+        });
+
+        const thread = writer.createThread('writer', { label: 'Tiny' });
+
+        // A request that carries no instruction at all IS the refusal: the park, the commit
+        // and the model turn all hang off the same branch, so "no instruction in the provider
+        // request" proves nothing was spent.
+        const noInstruction = (request: HarnessStreamRequest): boolean =>
+            request.messages.every((message) => {
+                const content = String(message.content);
+
+                return !content.startsWith(COMPACTION_INSTRUCTION) && !content.startsWith(CONTINUATION_NUDGE);
+            });
+
+        // 412 chars = 103 tokens: over the 100 limit, so the trigger fires, and far under the
+        // 200 floor, so the round trip is refused as too small to be worth a summary.
+        expect((await writer.sendThreadInput(thread.id, 'x'.repeat(412))).content).toBe('ok');
+        expect(seen).toHaveLength(1);
+        expect(noInstruction(seen[0])).toBe(true);
+
+        // Same conversation, one and a half tokens larger, still refused. A RECORDED cooldown
+        // would have suppressed this turn on the margin alone, and the next turn proves
+        // nothing was recorded at all.
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: 'x'.repeat(420) }]);
+        expect((await writer.sendThreadInput(thread.id, 'again')).content).toBe('fine');
+        expect(seen).toHaveLength(2);
+        expect(seen.map(noInstruction)).toEqual([true, true]);
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+
+        // The floor goes to 0 — the same live re-read every other setting gets — and the very
+        // next turn compacts. The size (107 → 108) is inside the 5% margin, so a cooldown
+        // recorded by either refusal would have held this turn back.
+        stored.minTokens = 0;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: 'x'.repeat(424) }]);
+
+        expect((await writer.sendThreadInput(thread.id, 'now')).content).toBe('summarised');
+        expect(String(seen[2].messages[seen[2].messages.length - 1].content)).toBe(COMPACTION_INSTRUCTION);
+
+        // Out of the way for the continuation run: at this scale (the retained head alone is
+        // ~217 tokens against a limit of 100) the next boundary would compact again, which is
+        // correct behaviour but not what this case is measuring.
+        stored.contextLimit = 100000;
+        expect(await settle(writer, thread.id, 6)).toBe(true);
+
+        // The one pass this conversation got: instruction, answer, nudge, continuation — and
+        // the two superseded turns behind them, withheld.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'x'.repeat(424), included: false },
+            { role: 'user', content: 'now', included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'summarised' },
+            { role: 'user', content: CONTINUATION_NUDGE },
+            { role: 'assistant', content: 'after' }
+        ]);
+    });
+
+    // -----------------------------------------------------------------------
+    // T11 — the three edges the independent review found untested or wrong.
+    // -----------------------------------------------------------------------
+
+    // A gate the SCRIPTED TRANSPORT awaits. An async generator may await between requests
+    // (src/harness.ts streams whatever the transport yields), so holding the model turn open
+    // is deterministic rather than a race — the compaction park is observably held while
+    // something else speaks, and the case releases it when it is done looking.
+    const gate = (): { promise: Promise<void>; open: () => void } => {
+        let open!: () => void;
+
+        const promise = new Promise<void>((resolve) => {
+            open = resolve;
+        });
+
+        return { promise, open };
+    };
+
+    // Wait for a status the harness writes from INSIDE a run, bounded so a missing
+    // transition fails this case instead of hanging it (mirrors the helper in
+    // src/harness.thread-park-queue.test.ts).
+    const waitStatus = async (writer: Harness, threadId: string, status: string): Promise<void> => {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+            if (writer.thread(threadId)?.status === status) return;
+
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+
+        throw new Error(
+            `Thread "${threadId}" never reached "${status}" (last: ${
+                writer.thread(threadId)?.status ?? 'missing'
+            }).`
+        );
+    };
+
+    // The same settings WITHOUT the trimmer switch `settingsOf` turns off: an unset
+    // `enabled` lands on the trimmer's declared default (true), so both shipped
+    // `turn.before` passes share the round the way they do in a real server.
+    const summarizeWithTrimmer = (): HarnessPluginSettingsProvider => {
+        const stored: Record<string, number | string | boolean> = {
+            contextLimit: LIMIT,
+            minTokens: 0,
+            mode: 'summarize'
+        };
+
+        return {
+            get: (plugin, key) => (plugin === 'context-compaction' ? stored[key] : undefined)
+        };
+    };
+
+    // D3 — the retention rule's sharp edge, pinned as the limitation it is.
+    //
+    // A steer that drains AFTER the instruction was committed and BEFORE the prose summary
+    // lands inside the withheld range [instruction, answer), so it stops being sent even
+    // though it is a brand-new fact rather than the history the summary replaced. That is
+    // the ratified design ("disable all the turns between the instruction and the final
+    // answer"), and it is not a lost message: the drain happens before a request, so the
+    // model read it on the very turn that produced the summary — the summary is its record.
+    // What the case pins is the cost: the retained head is the summary, not the transcript.
+    it('withholds guidance that drains between the instruction and the summary (T11/D3 limitation)', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const STEER = 'steered mid-compaction';
+
+        let handle: Harness | undefined;
+        let threadId = '';
+
+        // The steer lands inside the FIRST (parked) request: the conversation is 'paused',
+        // so steering QUEUES (context T8) and drains at the run's next boundary — after the
+        // tool round, before the prose answer.
+        const stream = flowStream(
+            [toolRound('t1', 'alpha'), answer('SUMMARIZED'), answer('resumed')],
+            seen,
+            (index) => {
+                if (index === 0) handle?.steerThread(threadId, STEER);
+            }
+        );
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            tools: { alpha: alphaTool() },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates)],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        handle = writer;
+
+        const thread = writer.createThread('writer', { label: 'Mid-pass steer' });
+        threadId = thread.id;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        const reply = await writer.sendThreadInput(thread.id, PROMPT);
+
+        expect(reply.content).toBe('SUMMARIZED');
+        expect(await settle(writer, thread.id, 9)).toBe(true);
+
+        // ONE park for the whole pass, and no extra resume from the steered drain.
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(seen).toHaveLength(3);
+
+        // The request that answered the instruction carried the steered turn: the drain
+        // happened before the request went out, which is why the withholding below is a
+        // retention decision and never a lost message.
+        expect(seen[1].messages.map((message) => String(message.content))).toEqual([
+            SEED,
+            PROMPT,
+            COMPACTION_INSTRUCTION,
+            'working',
+            'A',
+            STEER
+        ]);
+
+        // THE WITHHOLDING. The continuation request carries the instruction, the summary, and
+        // the nudge — and not the steered turn, which sits strictly between the instruction
+        // and the answer.
+        expect(seen[2].messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'SUMMARIZED',
+            CONTINUATION_NUDGE
+        ]);
+
+        // Canonical history keeps every entry in place; the flags are the whole story. Entry 5
+        // is the steered turn that drained mid-pass: withheld with its neighbours.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: SEED, included: false },
+            { role: 'user', content: PROMPT, included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            {
+                role: 'assistant',
+                content: 'working',
+                included: false,
+                toolCalls: [{ id: 't1', name: 'alpha', arguments: '{}' }]
+            },
+            { role: 'tool', content: 'A', included: false, toolCallId: 't1', name: 'alpha' },
+            { role: 'user', content: STEER, included: false },
+            { role: 'assistant', content: 'SUMMARIZED' },
+            { role: 'user', content: CONTINUATION_NUDGE },
+            { role: 'assistant', content: 'resumed' }
+        ]);
+
+        // The range says so in numbers: five entries stop being sent, the mid-pass steer
+        // (index 5) among them, and the retained head is the instruction at #2 and the answer
+        // at #6.
+        expect(diagnostics[2].data).toEqual({
+            mode: 'summarize',
+            threadId: thread.id,
+            path: 'thread.idle',
+            instructionIndex: 2,
+            answerIndex: 6,
+            disabled: [0, 1, 3, 4, 5],
+            total: 7
+        });
+    });
+
+    // D5 — end to end through the SHIPPED plugin: a delegate's `threadSend` arriving while
+    // the summarize park is held must QUEUE, must not start a second run on the compacting
+    // conversation, and must drain afterwards as a RETAINED entry (it landed after the
+    // instruction and the answer, so the retention range does not reach it).
+    it('queues a delegate threadSend that lands during the shipped park, and keeps it after the summary', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const scoutSeen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const statuses: string[] = [];
+        const scoutEvents: string[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const hold = gate();
+
+        let handle: Harness | undefined;
+        let threadId = '';
+        let scoutThreadId = '';
+
+        // The compacting conversation: the transport WAITS inside the compaction request, so
+        // the park is held for exactly as long as the delegate needs to speak into it.
+        const writerStream: HarnessStream = async function* (request) {
+            seen.push(request);
+            statuses.push(String(handle?.thread(threadId)?.status));
+
+            // THE WINDOW: one awaited gate inside the parked model turn. An async generator
+            // may await (the harness consumes whatever the transport yields), so the park is
+            // held deterministically while the delegate's run speaks.
+            if (seen.length === 1) await hold.promise;
+
+            const frames =
+                seen.length === 1
+                    ? answer('SUMMARY')
+                    : seen.length === 2
+                        ? answer('the finding was read')
+                        : answer('resumed');
+
+            for (const frame of frames) yield frame;
+        };
+
+        // THE DELEGATE. Its FIRST turn is a real tool round on the shipped cross-thread tool,
+        // so the sender identity is the runtime's (the calling run's agent and thread), not
+        // something the test passed in. `threadId`/`scoutThreadId` are only known after
+        // `harness(...)`, which is why the frames are built here rather than in a list.
+        const scoutStream: HarnessStream = async function* (request) {
+            scoutSeen.push(request);
+
+            if (scoutSeen.length === 1) {
+                for (const frame of [
+                    { type: 'text', delta: 'reporting' },
+                    {
+                        type: 'done',
+                        stopReason: 'tool_calls',
+                        toolCalls: [
+                            {
+                                id: 's1',
+                                name: 'threadSend',
+                                arguments: JSON.stringify({ thread: threadId, message: 'the finding' })
+                            }
+                        ]
+                    }
+                ] as HarnessStreamEvent[]) {
+                    yield frame;
+                }
+
+                return;
+            }
+
+            for (const frame of answer('noted')) yield frame;
+        };
+
+        handle = harness({
+            agents: {
+                writer: agent({ model: 'merge/ds4-flash', stream: writerStream }),
+                scout: agent({ model: 'merge/ds4-flash', stream: scoutStream })
+            },
+            pluginSettings: summarizeSettings(),
+            plugins: [
+                {
+                    name: 'scout-probe',
+                    setup: (api) => {
+                        api.on('run.started', (payload) => void scoutEvents.push(`run:${payload.input}`));
+                    }
+                },
+                probe(events, [])
+            ],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const writer = handle;
+        const thread = writer.createThread('writer', { label: 'Parked compaction' });
+        const scoutThread = writer.createThread('scout', { label: 'Delegate' });
+
+        threadId = thread.id;
+        scoutThreadId = scoutThread.id;
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: SEED }]);
+
+        const turn = writer.sendThreadInput(thread.id, PROMPT);
+
+        // The park is live BEFORE the delegate may speak.
+        await waitStatus(writer, threadId, 'paused');
+
+        // The delegate runs its own conversation (its tool round performs the send) and
+        // finishes, while the compacting conversation sits parked.
+        expect((await writer.sendThreadInput(scoutThread.id, 'report the finding')).content).toBe(
+            'noted'
+        );
+
+        // THE WINDOW, read while the parked request is still awaiting its gate: the roster
+        // says `paused`, the compacting conversation has made exactly ONE provider request,
+        // and the only run this harness started is the delegate's own.
+        expect(writer.thread(threadId)?.status).toBe('paused');
+        expect(seen).toHaveLength(1);
+        // TWO runs in the whole harness at this point: the compaction run ('go') and the
+        // delegate's own. The parked conversation got NO second run — a message that merely
+        // arrives does not steal the holder's turn (context T8), which is the half of D5 the
+        // reviewer asked for.
+        expect(scoutEvents).toEqual(['run:go', 'run:report the finding']);
+
+        // The finding is NOT in the compacting transcript yet — a park is a queue, not a turn.
+        expect(writer.threadMessages(thread.id).map((message) => String(message.content))).toEqual([
+            SEED,
+            PROMPT,
+            COMPACTION_INSTRUCTION
+        ]);
+
+        // THE RECEIPT, as the delegate's own conversation recorded it: the tool result is the
+        // runtime's receipt, and it says `queued` — not `started`, which is what the same send
+        // does to a conversation nobody parked.
+        expect(JSON.parse(String(writer.threadMessages(scoutThread.id)[2].content))).toEqual({
+            threadId,
+            delivered: 'queued',
+            sender: 'scout',
+            senderThreadId: scoutThreadId
+        });
+
+        // Release the gate: the summary lands, `turn.after` lifts the park, and the run's OWN
+        // next boundary drains the finding (context T8 — a park taken inside a run is applied
+        // by that run, never by a second one). So one run answers both the instruction and the
+        // finding, and the lazy `turn.before` finalize is the pass's writer.
+        hold.open();
+
+        expect((await turn).content).toBe('the finding was read');
+
+        // One park, one lift, and STILL only two runs in the harness: the compacting run and the
+        // delegate's. The drained finding bought one more turn of the parked run; it did not
+        // start a conversation of its own.
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(scoutEvents).toEqual(['run:go', 'run:report the finding']);
+        expect(seen).toHaveLength(2);
+        expect(statuses).toEqual(['paused', 'running']);
+
+        // THE RETAINED FINDING. The finalize ran with the finding already in the transcript, and
+        // it sits AFTER the instruction and after the summary, so the retention range stops in
+        // front of it: the next request carries the instruction, the summary, and the finding —
+        // attributed by the runtime to the delegate that sent it.
+        expect(seen[1].messages.map((message) => String(message.content))).toEqual([
+            COMPACTION_INSTRUCTION,
+            'SUMMARY',
+            `from agent "scout" (thread ${scoutThreadId}):\nthe finding`
+        ]);
+
+        // Canonical history: the two superseded turns withheld, and everything the pass retained
+        // — the summary, the finding, and the answer that read it — still sent.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: SEED, included: false },
+            { role: 'user', content: PROMPT, included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' },
+            { role: 'user', content: `from agent "scout" (thread ${scoutThreadId}):\nthe finding` },
+            { role: 'assistant', content: 'the finding was read' }
+        ]);
+
+        // THREE reports, all on the compacting conversation — the delegate's own run is not a
+        // pass and produces none. The finalize names the LAZY path (`turn.before`, because the
+        // run kept going) and the range it withheld: the two turns the summary replaced, out of
+        // the five entries that existed at that boundary.
+        expect(diagnostics.map((report) => report.owner)).toEqual([
+            'context-compaction',
+            'context-compaction',
+            'context-compaction'
+        ]);
+        expect(diagnostics[2].message).toContain('finalized at turn.before');
+        expect(diagnostics[2].data).toEqual({
+            mode: 'summarize',
+            threadId,
+            path: 'turn.before',
+            instructionIndex: 2,
+            answerIndex: 3,
+            disabled: [0, 1],
+            total: 5
+        });
+    });
+
+    // The same-round interaction the review's D1 defect is about, through BOTH shipped
+    // passes: the trimmer has candidates on the trigger round, runs its
+    // `pause -> write -> resume` wrapper inside the compaction park, and must leave that park
+    // exactly where it found it.
+    it('keeps its park held when context-trimmer writes in the same round (T11/D1 interaction)', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const statuses: string[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        let handle: Harness | undefined;
+        let threadId = '';
+
+        const stream = flowStream([answer('SUMMARY'), answer('resumed')], seen, () => {
+            statuses.push(String(handle?.thread(threadId)?.status));
+        });
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream }) },
+            pluginSettings: summarizeWithTrimmer(),
+            plugins: [probe(events, [])],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        handle = writer;
+
+        const thread = writer.createThread('writer', { label: 'Both passes' });
+        threadId = thread.id;
+
+        // A conversation that trips BOTH passes on the first boundary: a `read` that failed
+        // and was answered by a later `read` (a trim candidate), and enough text to cross the
+        // limit. The trimmer has never seen this transcript, so its plan is non-empty exactly
+        // on the round the compactor parks.
+        writer.setThreadMessages(thread.id, [
+            { role: 'user', content: 'open both' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'read', arguments: '{"path":"a.ts"}' }]
+            },
+            {
+                role: 'tool',
+                content: `Tool "read" failed: ${'E'.repeat(1200)}`,
+                toolCallId: 'c1',
+                name: 'read',
+                outcome: 'failed'
+            },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c2', name: 'read', arguments: '{"path":"b.ts"}' }]
+            },
+            { role: 'tool', content: 'export const b = 2;', toolCallId: 'c2', name: 'read' }
+        ]);
+
+        const reply = await writer.sendThreadInput(thread.id, PROMPT);
+
+        expect(reply.content).toBe('SUMMARY');
+        expect(await settle(writer, threadId, 10)).toBe(true);
+
+        // THE CLAIM: the roster says 'paused' while the compaction request is in flight, even
+        // though the trimmer paused and un-parked inside that same round. Before T11 the first
+        // entry here was 'running' — the trimmer's `finally` had lifted the park on the turn
+        // that took it.
+        expect(statuses).toEqual(['paused', 'running']);
+        expect(events).toEqual(['paused', 'resumed']);
+
+        // And the trimmer really did write in that round (it is not a pass that skipped): the
+        // owners interleave inside ONE round, compaction's trigger first, the trimmer's pass
+        // report second, both after the answer the finalize report.
+        expect(diagnostics.map((report) => report.owner)).toEqual([
+            'context-compaction',
+            'context-trimmer',
+            'context-compaction',
+            'context-compaction'
+        ]);
+        expect(diagnostics[1].message).toContain('context-trimmer withheld 1 superseded tool unit');
+        expect(diagnostics[1].message).toContain('read');
+
+        // The provider saw the instruction plus the projection on the trigger turn, and the
+        // compacted head on the continuation — the trimmer's flags and the compaction's
+        // rewrite agree, because the trimmer only ever writes `included: false`.
+        expect(seen).toHaveLength(2);
+        expect(withoutIds(seen[1].messages)).toEqual([
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' },
+            { role: 'user', content: CONTINUATION_NUDGE }
+        ]);
+
+        // Nothing deleted: the failed unit the trimmer withheld, the answering unit and the
+        // prompt the summary replaced are all still in place, all withheld; the retained head
+        // is the instruction, the summary, the nudge and the continuation answer.
+        expect(
+            writer
+                .threadMessages(threadId)
+                .map((message, index) => ({ index, withheld: message.included === false }))
+        ).toEqual([
+            { index: 0, withheld: true },
+            { index: 1, withheld: true },
+            { index: 2, withheld: true },
+            { index: 3, withheld: true },
+            { index: 4, withheld: true },
+            { index: 5, withheld: true },
+            { index: 6, withheld: false },
+            { index: 7, withheld: false },
+            { index: 8, withheld: false },
+            { index: 9, withheld: false }
+        ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T11/D2 — THE RUN-TERMINAL NETS, on their own.
+//
+// `run.finished` used to un-park ONLY a `compacting` pass, while `run.failed` un-parks for
+// any phase. The asymmetry matters because `thread.idle` fires only on a REAL transition to
+// idle (src/harness.ts ~10298): a record left 'paused' produces no idle event at all, so a
+// 'finishing' pass holding a park would strand the conversation with no finalize and no
+// continuation. The combination is pathological (`turn.after` un-parks in the same handler
+// that sets the phase, so it needs a throw between the two), and both halves of the net are
+// pinned here at the handler level, where the fake api records every control the pass reaches
+// (`skip` in `createFakeApi` records the name and throws, and the plugin's `unpark` swallows
+// exactly that throw) — a real harness cannot produce the state on purpose.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction run-terminal nets (T11/D2)', () => {
+    const runLifecycle = { threadId: 'thread-1', agent: 'writer', depth: 1, input: 'go' };
+
+    it('un-parks on run.finished from the finishing phase, and keeps that phase for the idle finalize', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // The pass has to EXIST before any terminal edge means anything: a `turn.before` over
+        // the limit sets `compacting` and parks the conversation (the fake payload records the
+        // `pause`, exactly as the `compacting` case below does), so the state this case starts
+        // from is the shipped one rather than a hand-built map entry.
+        const calls: string[] = [];
+
+        await passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls,
+                threadId: 'thread-1'
+            })
+        );
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        // Everything below is about the two terminal edges, so the trigger's own reads and its
+        // 'entering' report are cleared out of the way here.
+        fake.touches.length = 0;
+
+        // The edge that ends `compacting`: a tool-free answer, so the phase becomes
+        // `finishing` and the ordinary unpark runs in the SAME handler — the lift first, then
+        // the report that names the turn it landed on.
+        passes.turnAfter({
+            ...runLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+        expect(fake.touches).toEqual(['threads.resume', 'report.diagnostic']);
+
+        // THE NET. The run ends with `finishing` STILL set (the state a throw between the
+        // phase set and that unpark would leave). Before T11/D2 this hook touched nothing at
+        // all and the park survived.
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+        passes.runFinished({
+            ...runLifecycle,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        // One control: the lift. And no report, because a `finishing` pass is not an
+        // abandoned one — the finalize below is its report.
+        expect(fake.touches).toEqual(['threads.resume']);
+        expect(fake.diagnostics).toHaveLength(0);
+
+        // THE PHASE SURVIVED THE NET: the `thread.idle` that follows in the same `finally`
+        // refuses to do anything without `finishing`, so reaching the transcript read here IS
+        // the proof. (The fake's `threads.messages` refuses, which is the plugin's `nothing`
+        // branch — the phase is cleared there, exactly as it is for a purged conversation.)
+        fake.touches.length = 0;
+        passes.threadIdle({
+            id: 'thread-1',
+            agent: 'writer',
+            origin: 'host',
+            sequence: 1,
+            status: 'idle'
+        });
+        expect(fake.touches).toEqual(['threads.messages', 'threads.resume']);
+    });
+
+    // The `compacting` net, unchanged by D2: the pass IS abandoned, so the phase clears and
+    // the operator gets the report that says so.
+    it('still reports and clears an abandoned compacting pass on run.finished', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // The trigger sets `compacting` without any answer: a `turn.before` over the limit,
+        // handed the persistent-thread shape the summarize flow needs.
+        const calls: string[] = [];
+
+        // Awaited because the summarize trigger IS the async begin (the phase itself is set
+        // synchronously, before its first await; the park and the two writes are not).
+        await passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls,
+                threadId: 'thread-1'
+            })
+        );
+
+        // The pass is open: parked, and the instruction committed into history AND this request.
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+
+        passes.runFinished({
+            ...runLifecycle,
+            message: { role: 'assistant', content: 'not a compaction answer' }
+        });
+
+        expect(fake.touches).toEqual(['threads.resume', 'report.diagnostic']);
+        expect(fake.diagnostics).toHaveLength(1);
+        expect(fake.diagnostics[0].message).toContain(
+            'abandoned its summarize pass on thread thread-1'
+        );
+        expect(fake.diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            hook: 'run.finished'
+        });
+
+        // And the phase went WITH the report: the idle edge that follows finds nothing to
+        // finalize and touches the thread not at all.
+        fake.touches.length = 0;
+        passes.threadIdle({
+            id: 'thread-1',
+            agent: 'writer',
+            origin: 'host',
+            sequence: 1,
+            status: 'idle'
+        });
+        expect(fake.touches).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T9 — THE RETENTION RANGE, as a table.
+//
+// `planCompactionRetention` is the single rule BOTH finalize paths write from, so the whole
+// "what stops being sent" decision is pinned here without a harness: the exact indices, for
+// the transcripts the flow actually produces. The fixtures use the exported instruction for
+// the committed turn and a SHORTER one with the same marker for the second pass, because
+// detection is by marker PREFIX — the body is free to change and this table stays valid.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction retention range (planCompactionRetention)', () => {
+    const INSTRUCTION = COMPACTION_INSTRUCTION;
+    const SHORT_INSTRUCTION = '[context compaction] do the same thing, shorter body';
+
+    const turn = (role: HarnessMessage['role'], content: string, extra: Partial<HarnessMessage> = {}): HarnessMessage =>
+        ({ role, content, ...extra }) as HarnessMessage;
+
+    it('finds nothing to disable when the transcript carries no instruction', () => {
+        expect(planCompactionRetention([turn('user', 'question'), turn('assistant', 'answer')])).toEqual({
+            instructionIndex: -1,
+            answerIndex: -1,
+            disabled: []
+        });
+
+        expect(planCompactionRetention([])).toEqual({ instructionIndex: -1, answerIndex: -1, disabled: [] });
+    });
+
+    it('withholds the history the summary replaced and nothing else', () => {
+        expect(
+            planCompactionRetention([
+                turn('user', 'old work'),
+                turn('assistant', 'old answer'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'the summary')
+            ])
+        ).toEqual({ instructionIndex: 2, answerIndex: 3, disabled: [0, 1] });
+    });
+
+    it('withholds the turns a disobedient model spent between the instruction and the answer', () => {
+        expect(
+            planCompactionRetention([
+                turn('user', 'old work'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'working', { toolCalls: [{ id: 't1', name: 'read', arguments: '{}' }] }),
+                turn('tool', 'A', { toolCallId: 't1', name: 'read' }),
+                turn('assistant', 'the summary'),
+                // Whatever arrived AFTER the answer is the conversation moving on, not
+                // something the summary replaced — so it stays.
+                turn('user', 'and now this')
+            ])
+        ).toEqual({ instructionIndex: 1, answerIndex: 4, disabled: [0, 2, 3] });
+    });
+
+    it('takes the LAST answer when the model answered twice, and the LAST instruction when there are two passes', () => {
+        // Two prose turns after the instruction (the second is the continuation's answer):
+        // the range still ends at the newest one, so nothing between the instruction and the
+        // newest answer is left sending.
+        expect(
+            planCompactionRetention([
+                turn('user', 'old'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'first summary'),
+                turn('user', 'nudge'),
+                turn('assistant', 'latest answer')
+            ])
+        ).toEqual({ instructionIndex: 1, answerIndex: 4, disabled: [0, 2, 3] });
+
+        // Pass two's instruction is the anchor; pass one's head is ordinary history again.
+        expect(
+            planCompactionRetention([
+                turn('user', 'old'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'summary one'),
+                turn('user', SHORT_INSTRUCTION),
+                turn('assistant', 'summary two')
+            ])
+        ).toEqual({ instructionIndex: 3, answerIndex: 4, disabled: [0, 1, 2] });
+    });
+
+    it('leaves a host-seeded system entry and an unanswered instruction alone', () => {
+        // A `system` entry is a standing instruction, never history: the shipped path stores
+        // instruction blocks outside the transcript, so this only ever fires for a host that
+        // seeds one — and no compaction may silence it.
+        expect(
+            planCompactionRetention([
+                turn('system', 'standings'),
+                turn('user', 'old work'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'the summary')
+            ])
+        ).toEqual({ instructionIndex: 2, answerIndex: 3, disabled: [1] });
+
+        // No answer yet (the model has not replied, or a host edited the answer away): the
+        // history before the instruction is still superseded, and nothing after it is touched.
+        expect(
+            planCompactionRetention([
+                turn('user', 'old work'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'a tool call', { toolCalls: [{ id: 't1', name: 'read', arguments: '{}' }] })
+            ])
+        ).toEqual({ instructionIndex: 1, answerIndex: -1, disabled: [0] });
+    });
+
+    it('anchors on the marker PREFIX of a user turn, not on the body or another role', () => {
+        // Reworded body: still the instruction, because the FIRST LINE is the protocol.
+        expect(
+            planCompactionRetention([turn('user', 'old'), turn('user', SHORT_INSTRUCTION), turn('assistant', 's')])
+        ).toEqual({ instructionIndex: 1, answerIndex: 2, disabled: [0] });
+
+        // The marker in the MIDDLE of a sentence is a human quoting the plugin, not the
+        // plugin; and an assistant turn that starts with the marker (a model parroting it)
+        // is not the committed instruction either.
+        expect(
+            planCompactionRetention([
+                turn('user', 'I saw "[context compaction]" in the log, what is it?'),
+                turn('assistant', '[context compaction] repeating the header back')
+            ])
+        ).toEqual({ instructionIndex: -1, answerIndex: -1, disabled: [] });
+    });
+
+    it('names the marker the protocol is built on', () => {
+        // Both exported strings start with the same marker, and it is the anchor every
+        // finalize and every restart detection uses. A rename here is a protocol change: an
+        // in-flight transcript's instruction stops being recognisable.
+        expect(COMPACTION_INSTRUCTION.startsWith('[context compaction]')).toBe(true);
+        expect(CONTINUATION_NUDGE.startsWith('[context compaction]')).toBe(true);
+        expect(COMPACTION_INSTRUCTION).toContain('Do not call tools');
+        expect(CONTINUATION_NUDGE).toContain('Your context was just compacted');
     });
 });

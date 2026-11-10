@@ -1632,14 +1632,18 @@ omits is still refused at launch, with the refusal as a readable result.
 What that means for the shipped roles:
 
 - **The primary delegates; a subagent never re-delegates.** Drop the `summarizer`
-  (or `workspace`, or `reviewer`) from a Planner's team and the Planner must do that
-  step itself — it cannot ask another subagent to do it.
+  (or `workspace`, or `reviewer`) from a Manager's team and that step has no target
+  left: a subagent cannot pick it up, and a Manager whose team is empty has no
+  `delegate` tool at all (the harness does not register it), which is exactly the
+  case its profile tells it to stop and report instead of quietly doing the work.
 - **Briefs must be self-contained.** A subagent starts from its own instruction and
   the `input` you give it, nothing else, so the primary must include the goal, the
   paths/areas, the constraints, and the evidence it wants back.
 - **Verification is the primary's job.** A delegate result is a claim: the shipped
   profiles tell the primary to check it (read the file, run the check, or send the
-  Reviewer) before answering.
+  Reviewer) before answering. The Manager goes further and is required to send every
+  step's result to `reviewer` for an INDEPENDENT check before accepting it, because
+  the agent that produced a result is not allowed to be the one that judges it.
 - **`textSummarize` is the tool-side exception.** It calls `ctx.run('summarizer', …)`
   when the harness has that agent and condenses the notes locally otherwise, so the
   tool works in every preset (the real teams include `summarizer`; the fixtures do
@@ -2396,23 +2400,25 @@ this package's source through the workspace script; the published package remain
 the library.
 
 ```bash
-yarn cli --list                                     # five real presets, then the examples
-yarn cli "Write an opening."                        # default preset: instruct (live)
+yarn cli --list                                     # seven real presets, then the examples
+yarn cli "Write an opening."                        # default preset: general (live)
 yarn cli --preset demo "What time is it?"           # explicit offline scripted fixture
 yarn cli --preset planner "Plan the release."       # plans, then delegates to its specialists
 yarn cli --preset workspace --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
 yarn cli --preset research --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
-yarn cli                                            # interactive Instruct session (TTY)
+yarn cli                                            # interactive General session (TTY)
 echo "Summarise this" | yarn cli                    # one task from stdin
 ```
 
-The Coder card is the `workspace` preset (the id is kept for saved sessions and
-bookmarks; `--list` shows the pair). The default is the real `instruct` role, not
-the demo: a scripted answer is not a useful general harness. `demo` remains the
-explicit endpoint-free fixture (`--preset demo`), and there is no silent fallback
-to it when a provider is unreachable. A live role uses `--base-url` /
-`HARNESS_BASE_URL` (plus `--api-key` / `HARNESS_API_KEY` when the provider needs
-one); if the run cannot reach the provider, it reports the failure rather than
+The Analyst card is the `workspace` preset and the Explore card is `research` (the
+ids are kept for saved sessions and bookmarks; `--list` shows each id with its
+title). The default is the real `general` role, not the demo: a scripted answer is
+not a useful general harness, and `general` is the one card the catalogue lists
+first. `demo` remains the explicit endpoint-free fixture (`--preset demo`), and
+there is no silent fallback to it when a provider is unreachable. A live role uses
+`--base-url` / `HARNESS_BASE_URL` (plus `--api-key` / `HARNESS_API_KEY` when the
+provider needs one); if the run cannot reach the provider, it reports the failure
+rather than
 inventing a demo transcript.
 
 | Flag | Meaning |
@@ -2613,25 +2619,29 @@ declared tools or outgrows its prompt budget. The discovery selector's own contr
 `matched`/`omitted`) lives in `toolRequest`'s description, which the model reads as
 part of that declaration.
 
-### The five real presets
+### The seven real presets
 
 | Preset | Visible title | Role |
 |---|---|---|
-| `instruct` | Instruct | **Default card.** General instruction-following with the full toolbox. |
-| `research` | Researcher | Investigates and cross-checks evidence; cites tools and URLs. |
-| `workspace` | Coder | Coding: reads, edits, runs checks, reviews its own diffs. |
-| `reviewer` | Reviewer | Skeptical pass for small bugs and inconsistencies; non-mutating by default. |
-| `planner` | Planner | Writes the plan and acceptance criteria, then routes each step to a specialist and verifies it. |
+| `general` | General | **Default card, and the only one with no team.** Does every step itself with the full toolbox; `delegate` is not even registered. |
+| `instruct` | Instruct | Worker with the full toolbox. Does its own building and editing, and delegates only the steps that would burn its context (an investigation, a long read, a review). |
+| `research` | Explore | Read-only investigator: maps files, symbols and the web, cross-checks what decides the answer, and cites file/line/tool/URL. Changes nothing unless the brief authorises it. |
+| `workspace` | Analyst | The implementor: writes the change in the codebase's existing style, keeps it minimal and efficient, and verifies it with a real check. |
+| `reviewer` | Reviewer | Strict, independent judge of plans, code, documents and claims; every finding carries evidence, and it is non-mutating by default. |
+| `planner` | Manager | Holds the goal, writes the plan, delegates EVERY step, and accepts a result only after `reviewer` has independently checked it. Never executes a step, and refuses to run as a delegate. |
+| `debugger` | Debugger | Stress-tests the system: unlocks any searchable tool, runs any command, exercises each capability at its edges, and reports a reproduction. |
 
-Every real preset's team is **symmetric**: each one lists every *other* real role
-plus the `summarizer` as a direct subagent (`teamOf()` in
-`src/server/harnesses/presets.ts`). So switching the entry role never removes a
-specialist, and the Planner's `research`/`workspace`/`reviewer` targets exist by id.
+Every real preset's team is derived from ONE list: each card lists every *other* real
+role plus the `summarizer` as a direct subagent (`teamOf()` in
+`src/server/harnesses/presets.ts`) — with two exclusions. The primary is never its own
+subagent, and `planner` (the Manager) is in nobody else's team because a Manager refuses
+to run as a delegate. `general`'s own team is empty on purpose, which is what makes
+`delegate` disappear from its declaration list rather than merely being discouraged.
 Delegation is **one level deep** and a subagent never receives `delegate`; the
 profiles say so, and none of them asks a subagent to delegate again.
 
 The two remaining presets are examples, and T5 un-shipped them: they are NOT in the
-catalogue a server lists (`GET /api/harnesses` returns only the five real roles). A
+catalogue a server lists (`GET /api/harnesses` returns only the seven real roles). A
 host or a test injects them explicitly (`createHarnessRegistry(ALL_PRESET_TEMPLATES)`
 or `FIXTURE_PRESETS`), and an older session recorded while they shipped still restores
 because the scripted factory is looked up in that superset:
@@ -2646,9 +2656,12 @@ toolbox because it fails on purpose and keeps attempt state. Every entry - shipp
 fixture - is a template the registry copies; there is no read-only category (R20.1). Legacy
 identifiers still resolve: `writer` and `assistant` → `instruct`, `researcher` →
 `research`. They are aliases, not extra cards, and a session created through one
-reports the canonical name. The visible title "Coder" keeps the `workspace` id —
-adding a new reserved alias could collide with an existing user-created harness on
-restart, so the title carries the name instead.
+reports the canonical name. Titles are never names: the visible titles `Explore`,
+`Analyst` and `Manager` keep the `research`, `workspace` and `planner` ids, because
+an id is what a URL, a session record and every per-agent map carry — and there is no
+agent-id alias fallback, so a renamed id would abort a restore. Adding a NEW reserved
+alias could also collide with an existing user-created harness on restart, so the
+title carries the rename instead.
 
 The server keeps one harness per session, so submitting a second task continues
 the same conversation. `POST /api/sessions/:id/tasks` accepts a task with

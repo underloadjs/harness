@@ -11,10 +11,12 @@
 // never REGISTERED here, never declared, and `toolRequest` cannot enable it either —
 // discovery only surfaces searchable rows, and delegate stays core-when-registered.
 // The prompt therefore states the rule the runtime already enforces, and adds the one
-// thing it does not: `threadFork` IS reachable (searchable, activation 'forks', which
-// resolveForks enables by default — src/harness.ts:928-1108), so a lone agent could
-// still quietly spawn a branch and offload a step. That is the loophole this line
-// closes: no delegate, no fork, no thread.
+// thing it does not: an agent CAN still hand a step away without `delegate`, through
+// `threadFork` (searchable; activation 'forks', which resolveForks enables by default —
+// src/harness.ts:928-1108) or `threadSend` (core, lazily registered once the host has any
+// second thread — src/harness.ts:1109-1113 + :4756). A server session DOES open
+// conversations, so "the default agent works alone" needs both named: no delegate, no
+// fork, no posting the step into another thread.
 //
 // WHY IT STILL CARRIES THE FULL DISCOVERY/WEB/PERMISSION BLOCK
 // ------------------------------------------------------------
@@ -50,8 +52,10 @@ export const general: AgentProfile = {
     guidelines: [
         // The brief is the specification — the rule every other role assumes.
         'Treat the brief as the specification: do exactly what it asks, keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.',
-        // The one rule unique to this profile: alone by contract, including the fork loophole.
-        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork either.',
+        // The one rule unique to this profile: alone by contract, including the two ways a
+        // lone agent could still hand work away — a forked branch, or posting the step into
+        // another conversation thread the host happens to have open.
+        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
         DISCOVERY_GUIDELINE,
         WEB_SEARCH_GUIDELINE,
         // Tool results beat recall, and naming the tool is what makes the answer checkable.

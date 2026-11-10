@@ -1,12 +1,13 @@
 # Progressive compaction — prune what a later success already answered
 
 Status: **trimmed 2026-11-09 — the stage landed, and per the task-log rule everything that
-landed has been REMOVED from this file rather than left as a done-marker.** What is left is
-the remaining work plus the decisions that gate it: **T5.3** — tool-result elision for
-superseded LARGE results (the `annotate` writer), blocked on Open decisions 2 and on nothing
-else; **T6** — the summarize-and-reinitialize checkpoint, deliberately unbuilt, whose design
-text is kept below because it IS the design for that work; and **T7's residue** — real-corpus
-and live-provider observations only. **T5.5** (provider overflow recovery) belongs to
+landed has been REMOVED from this file rather than left as a done-marker.** **Updated
+2026-11-10: T6 landed too**, as the `summarize` mode of the same plugin (now the default),
+and its shipped shape differs from the design text below — see the note on the T6 section.
+What is left is the remaining work plus the decisions that gate it: **T5.3** — tool-result
+elision for superseded LARGE results (the `annotate` writer), blocked on Open decisions 2 and
+on nothing else; and **T7's residue** — real-corpus and live-provider observations only.
+**T5.5** (provider overflow recovery) belongs to
 [../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
 and stays here as a pointer, not a task. The roadmap anchor is `knowledge.md:3861`
 ("Not built yet"), item 2 at `:3866-3882`, which names both T6 and the storage question that
@@ -122,7 +123,7 @@ contributed to it is a more honest estimate to guard against.
 
 *Check:* the one in issue 0004.
 
-### T6 — The full checkpoint (explicitly **not** this stage)
+### T6 — The full checkpoint — **built 2026-11-10 as `mode: 'summarize'`**
 
 Recorded so the design survives: a summarize-and-reinitialize pass would use
 `replaceHistory()` (`src/types/index.ts:3983`; the implementation throws when the run has no
@@ -152,8 +153,38 @@ model; `replaceHistory` is framework surface with no compaction caller
 unchanged by whatever fills the action, which is why a checkpoint can be added beside the
 pruner rather than instead of it.
 
-*Check:* this stays in this file (and in `knowledge.md:3861` "Not built yet", item 2 at
-`:3866-3882`) until a stage opens for it; no other task may quietly grow a summarizer call.
+**What shipped on 2026-11-10, and where it departs from the text above.** The checkpoint
+exists as the plugin's `summarize` mode — the default — in
+`src/plugins/context-compaction.plugin.ts`, and it is the *conversation* that performs it:
+
+- the pass parks the thread at the turn boundary, commits one `user` turn whose first line is
+  the marker `[context compaction]` into the canonical transcript (`replaceHistory` **and**
+  `setTranscript`, because the committed history and the in-flight request are two different
+  writes), and lets this same agent's next model turn answer it — so no helper model is
+  called and the point above about "no compaction caller" is what closed this item;
+- the summary replaces the whole earlier region by *withholding* it, not by rewriting it: the
+  retained head is the instruction plus the agent's own answer, and everything before the
+  instruction (plus any turn the model spent on tools after it) keeps its place in canonical
+  history with `included: false`. `replaceHistory` is used only to append the instruction, so
+  nothing is ever destroyed and a pass stays switchable back on;
+- **design point 2 (a verbatim recent tail sized by a setting) did not ship.** The tail is
+  whatever the agent decided to write down, which is the whole bet of the design — a summary
+  written by the model that has to live with it. `safetyTurns` belongs to `exclude` mode only;
+- **design point 3 (a constraint registry kept out of the summarized region) did not ship
+  either**: the instruction asks for DONE / CURRENT TASK / PENDING, and the side constraints
+  survive only if the agent writes them. That is the open risk the T7 list now carries;
+- design point 4 (head-anchored, cache-aware) shipped as *one* replacement per crossing,
+  behind the existing cooldown and its 5%-of-limit regrowth margin; design point 5 (re-state
+  the newest turn) is why the commit re-states the whole transcript rather than a slice.
+
+The machine spans five hooks (`turn.before` trigger, `turn.after` recognises the answer,
+`thread.idle` writes the range when the run ended on it, `run.finished`/`run.failed` are the
+nets that never leave a thread parked), and the flow is pinned end to end in
+`src/plugin/context-compaction.test.ts` under `context-compaction summarize flow (T9)`.
+
+*Check:* `mode: 'summarize'` is the declared default, and `annotate` is still absent from
+`COMPACTION_MODES` — T5.3 remains the only unbuilt writer here. `knowledge.md` "Not built yet",
+item 2 now names the third writer and its storage question, not the checkpoint.
 
 ### T7 — Observations still owed (real corpus, live provider)
 
@@ -287,21 +318,22 @@ setups, not from `@underload/harness`.
 cd packages/underload/harness
 git rev-parse --show-toplevel              # must be .../packages/underload/harness
 git log -1 --format='%h %s'
+grep -n "replaceHistory" src/plugins/context-compaction.plugin.ts     # T6: BUILT — the commit that appends the instruction
 grep -n "COMPACTION_MODES" src/plugins/context-compaction.plugin.ts   # T5.3: is `annotate` listed yet?
 grep -n "annotate" src/plugins/context-compaction.plugin.ts           # still a documented degradation?
 grep -n "candidates" src/core/context-pruning.ts                      # the seam an `annotate` writer plugs into
-grep -n "replaceHistory" src/plugins/context-compaction.plugin.ts     # T6: is a summarizer wired?
-grep -rn "summarizer\|compactContext\|summarize" src/plugins/ src/core/context-pruning.ts | grep -v test
-sed -n '3861,3882p' knowledge.md           # roadmap entry still says the checkpoint is not built?
+grep -rn "MODE_DEFAULT" src/plugins/context-compaction.plugin.ts      # which writer a fresh install gets
+sed -n '3934,3960p' knowledge.md           # roadmap entry still names the third writer, not the checkpoint?
 npm run plugins:manifest:check             # BASELINE green before any edit
 ```
 
 Stop-and-recheck conditions:
 
 1. **`annotate` is listed in `COMPACTION_MODES`** — T5.3 is done; Open decisions 2 has been
-   answered, and what is left here is T6 plus the observations.
-2. **`executeCompaction` (or a replacement) calls `replaceHistory`** — a summarization stage
-   has opened; the T6 design text above is the spec it should be measured against, not
+   answered, and what is left here is the observation list.
+2. **A second `replaceHistory` caller appears in the plugin** (anything beyond the summarize
+   commit's "re-state the transcript, append the instruction") — a rewrite-style checkpoint has
+   opened, and the design text above is the spec it should be measured against, not
    re-invented.
 3. **A provider-overflow classifier appeared** — issue 0004 has moved; re-read it before
    touching T5.5.
@@ -316,7 +348,12 @@ Stop-and-recheck conditions:
   cited from another system's evaluation. Nothing measured what **this** harness's configured
   model does when an answered failure is withheld, or whether it acts on the spill note that
   names the call to re-run.
-- **Full-summary quality** (T6) — untested by design: nothing in this tree writes a summary.
+- **Summary QUALITY, now that a summary is actually written** (T6, `mode: summarize`). The
+  plumbing is pinned end to end — park, instruction, answer, withheld range, resume, nudge —
+  against scripted transports, which always answer with `SUMMARY`. What has never been
+  measured is whether a real model's summary preserves enough of the dropped conversation to
+  continue the task: the design's own risk (no verbatim tail, no constraint registry) lives
+  exactly there.
 - **The `mode` fallback as an operator choice.** The degradation is pinned as behaviour; nobody
   has asked whether an operator who stores `annotate` should get a refusal instead.
 - **Per-call partial exclusion** — never exercised; the transport always sends every call of a

@@ -100,13 +100,19 @@ src/
   agents/
     index.ts            trusted AgentProfile registry + agentInstruction()
     types.ts            AgentProfile (name, title, description, instruction, guidelines)
-    guidelines.ts       the policy lines the five real roles share (discovery, search
-                        key, conditional delegation, no sandbox, toolCreate) — one source
-                        so the wording cannot drift; tool availability itself is the
-                        declaration list, never prompt prose
-    instruct.ts / research.ts / workspace.ts / reviewer.ts / planner.ts
-                        the five real roles (general, researcher, coder, reviewer, planner)
-    summarizer.ts       the delegated condenser (subagent in every real preset)
+    guidelines.ts       the policy lines the real roles share (discovery, search
+                        key, conditional delegation, read-only, no sandbox, toolCreate) —
+                        one source so the wording cannot drift; tool availability itself
+                        is the declaration list, never prompt prose, and a profile composes
+                        only the lines its own role needs
+    general.ts / instruct.ts / research.ts / workspace.ts / reviewer.ts /
+    planner.ts / debugger.ts
+                        the seven real roles: General (default, works alone), Instruct
+                        (delegates only context-burning steps), Explore (id `research`,
+                        read-only), Analyst (id `workspace`, the implementor), Reviewer,
+                        Manager (id `planner`, orchestrates + independent review), and
+                        Debugger (stress-tests everything)
+    summarizer.ts       the delegated condenser (subagent in every teamed preset)
     demo.ts / flaky.ts  fixture profiles (scripted demo; recoverable-failures example)
     agents.test.ts      pinned ids/instructions + guideline composition + the
                         policy-not-inventory and prompt-budget guards
@@ -3931,23 +3937,26 @@ bundle.
 In the order they are expected:
 
 1. **streaming tool output** — `execute` cannot report progress mid-call yet.
-2. **context summarization** — history *pruning* is built: the shipped
-   `context-compaction` plugin withholds tool units a later success already answered, at
-   the turn boundary, through the `included` flag (a pure rule in
+2. **context summarization** — pruning AND summarizing are both built, as the two modes of
+   the shipped `context-compaction` plugin. `exclude` withholds tool units a later success
+   already answered, at the turn boundary, through the `included` flag (a pure rule in
    `src/core/context-pruning.ts`, guarded by `minTokens`, a `safetyTurns` tail horizon and a
-   per-pass unit bound, and reported on `api.report.diagnostic`). What is still missing is
-   the **summarize-and-reinitialize checkpoint**: a structured summary plus a verbatim
-   recent tail, applied through `replaceHistory()` — the design is recorded in
-   `docs/tasks/2026-11-09-progressive-compaction.md` (T6). Nothing in the library calls a
-   model to condense history yet, and a pruned unit is never re-fetched: its full text
-   stays in canonical history and a host can switch it back. What the MODEL can act on is
-   now built (same entry, T5.1): an over-cap result arrives as a head/tail envelope whose
-   `note` names the call to re-run, so a withheld result is re-fetchable by RE-RUNNING it
-   rather than by re-reading a stored copy — the full text itself is not kept anywhere
-   addressable. That is the precondition T5.3 (eliding superseded LARGE results) was
-   waiting on; what still blocks T5.3 is the undecided storage question — whether an
-   annotated result keeps its original text or only a handle
-   (`docs/tasks/2026-11-09-progressive-compaction.md`, Open decisions 2).
+   per-pass unit bound, and reported on `api.report.diagnostic`). `summarize` — the DEFAULT
+   since the 2026-11-10 context-compaction ruling — makes the conversation compact ITSELF:
+   the thread is parked at the turn boundary, the plugin commits one instruction into the
+   canonical transcript, this same agent's next model turn answers it with a summary of what
+   is done, what it is working on and where it left off, everything before that instruction
+   (plus any turn a disobedient model spent on tools in between) stops being sent, and the
+   thread is un-parked and continued with a nudge. Neither mode deletes anything, and neither
+   spawns a helper model: the compaction rides the conversation's own turn, which is why it
+   costs one model turn and no new machinery (`src/plugins/context-compaction.plugin.ts`).
+   What is still open is the THIRD writer and the storage question behind it: T5.3 (eliding
+   superseded LARGE results into a one-line handle) waits on whether an annotated result
+   keeps its original text or only a handle
+   (`docs/tasks/2026-11-09-progressive-compaction.md`, Open decisions 2). A withheld result
+   stays re-fetchable by RE-RUNNING it — an over-cap result arrives as a head/tail envelope
+   whose `note` names the call (T5.1) — rather than by re-reading a stored copy, because the
+   full text lives only in canonical history, not anywhere addressable.
 3. **per-agent tool scoping** — searchable tools are catalogued once; every agent
    can discover every searchable tool (only `delegate` is primary-only).
 4. **sandboxed presets and created tools** — the file and command tools, and any

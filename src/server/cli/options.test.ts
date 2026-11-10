@@ -1,9 +1,9 @@
-// CLI preset default + explicit offline demo (T5).
+// CLI preset default + explicit offline demo (T5 + the roster/role-contract pass).
 //
 // `index.ts` is executable at import time, so the parser lives in ./options and
 // these assertions pin the product decision without booting a process:
-//   - no `--preset` selects the LIVE Instruct role (the useful harness), never
-//     the scripted fixture and never a silent demo fallback;
+//   - no `--preset` selects the LIVE General role (the default card the catalogue
+//     lists first), never the scripted fixture and never a silent demo fallback;
 //   - `--preset demo` still selects the offline fixture, which constructs and
 //     registers its tools with empty provider settings.
 
@@ -12,11 +12,14 @@ import { findPreset } from '../harnesses';
 import { DEFAULT_CLI_PRESET, parseCliOptions } from './options';
 
 describe('CLI preset selection', () => {
-    it('defaults to the live Instruct role instead of the demo', () => {
+    it('defaults to the live General role instead of the demo', () => {
         const parsed = parseCliOptions([]);
 
-        expect(DEFAULT_CLI_PRESET).toBe('instruct');
-        expect(parsed.values.preset).toBe('instruct');
+        // The CLI agrees with the catalogue: `general` is presets[0] and the card the
+        // UI selects first (../harnesses/presets.ts:486-494), so `DEFAULT_CLI_PRESET`
+        // in ./options.ts:24 names it — `instruct` is one flag away, not the entry.
+        expect(DEFAULT_CLI_PRESET).toBe('general');
+        expect(parsed.values.preset).toBe('general');
         expect(parsed.positionals).toEqual([]);
 
         const preset = findPreset(parsed.values.preset as string);
@@ -29,11 +32,14 @@ describe('CLI preset selection', () => {
             requiresEndpoint: preset!.requiresEndpoint,
             subagents: preset!.subagents
         }).toEqual({
-            name: 'instruct',
-            title: 'Instruct',
-            primary: 'instruct',
+            name: 'general',
+            title: 'General',
+            primary: 'general',
             requiresEndpoint: true,
-            subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer']
+            // Load-bearing, not an omission: the default card has no team, so the
+            // runtime never registers `delegate` for it (src/harness.ts
+            // `activation: 'subagents'`). A non-empty team here is a product change.
+            subagents: []
         });
     });
 

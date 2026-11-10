@@ -239,8 +239,18 @@ export type HarnessMaybeAsync<T> =
 //     what earlier ones did.
 // The factory receives the owning plugin's api (when the bus has one) so a context
 // object can be built with the right api baked in, rather than patched afterwards.
+//
+// `owner` is the SAME plugin name the registration carries (`HookEntry.owner`, used by
+// the failure reports and the hook-surface audit). It is here for the same reason `api`
+// is: a control the handler holds must be attributed to the handler, not to the round.
+// Compaction T11 (D1) is the consumer — `turn.before`'s `pause()`/`resume()` bind this
+// name as the PARK OWNER, so a later plugin in the same round cannot lift a park it
+// never took (src/harness.ts `pauseThreadState`/`resumeThreadState`). It is OPTIONAL
+// because an unsupplied registration owner is the empty string, which `payloadFor`
+// resolves to an ABSENT key: no identity must never look like a plugin named `''`.
 export type HarnessHookPayloadFactory<E extends HarnessLifecycleEvent> = (context: {
     api?: HarnessPluginApi;
+    owner?: string;
 }) => HarnessLifecyclePayloads[E];
 
 export type HarnessHookBus = {
@@ -656,7 +666,16 @@ export const createHookBus = (options: HarnessHookBusOptions = {}): HarnessHookB
         const resolved =
             typeof payload === 'function'
                 ? (payload as HarnessHookPayloadFactory<E>)(
-                      { ...(entry.api === undefined ? {} : { api: entry.api }) }
+                      {
+                          ...(entry.api === undefined ? {} : { api: entry.api }),
+                          // T11/D1 — the registration's owner travels with the payload so a
+                          // control the handler is handed (the `turn.before` park) can be
+                          // attributed to THAT handler. `''` is the bus default for an
+                          // unsupplied owner (`on`), and it means "no identity", so it is
+                          // spread as an ABSENT key rather than as an owner named `''` — a
+                          // consumer must never mistake it for a real plugin name.
+                          ...(entry.owner === '' ? {} : { owner: entry.owner })
+                      }
                   )
                 : payload;
 
