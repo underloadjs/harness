@@ -197,22 +197,30 @@
 // both fire, the trimmer runs INSIDE the window this pass opened. Two separate things
 // about it had to be checked, and they have different answers:
 //
-//   1. ITS WRITER (the one that used to be considered the whole question) is compatible by
-//      construction: it writes ONLY `included: false` flags through `setIncluded`
-//      (src/plugins/context-trimmer.plugin.ts ~351) — no `setTranscript`, no
-//      `replaceHistory`, nothing that re-ENABLES an entry. Anything it withholds in this
-//      round rides along on the entries this pass commits back through `replaceHistory`,
-//      and anything it withholds AFTER the finalize only makes the retained head smaller.
-//      A pass that re-ENABLED entries would be the first thing needing a phase check here.
+//   1. ITS WRITERS (there are now TWO of them, and the pair is what used to be considered the
+//      whole question) are compatible by construction: the trimmer mutates context through
+//      exactly two controls, both inside `applyTrimPlan` in
+//      src/plugins/context-trimmer.plugin.ts, and BOTH are called with the literal `false` —
+//      `setIncluded(entry, false)` withholds a tool unit (the first axis; the runtime cascades
+//      the leader's whole unit, ../types `HarnessTurnBeforeContext.setIncluded`) and
+//      `setReasoningIncluded(entry, false)` withholds one assistant entry's THINKING from its
+//      request copy (the second axis, uplift T6). Neither one re-ENABLES anything: `true` is
+//      never passed anywhere in that plugin, so this pass never sees an entry or a thought come
+//      BACK. There is no `setTranscript`, no `edit`, no `replaceHistory` and no `api.threads.*`
+//      write anywhere in that plugin (the pause/resume wrapper is item 2 below). Anything they
+//      withhold in this round rides along on the entries this pass commits back through
+//      `replaceHistory`, and anything they withhold AFTER the finalize only makes the retained
+//      head smaller. A pass that re-ENABLED entries would be the first thing needing a phase
+//      check here.
 //
 //   2. ITS HANDLER WRAPPER is NOT compatible, and that is what context T11 (D1) fixed.
 //      On a round with candidates the trimmer runs `await context.pause(); try { writer }
-//      finally { await context.resume(); }` (src/plugins/context-trimmer.plugin.ts
-//      ~421-427) around a flag write. Before T11 that `resume()` lifted ANY 'paused'
-//      record — including the park THIS pass took moments earlier on the same boundary —
-//      so the trigger turn lost its observable paused-during-compaction window and the
-//      `thread.paused`/`thread.resumed` pair an operator watches became `paused` +
-//      `resumed` + `resumed`, on a turn where the compaction was still outstanding.
+//      finally { await context.resume(); }` around a flag write; the wrapper is
+//      `createContextTrimmerHandler` in src/plugins/context-trimmer.plugin.ts. Before T11 that
+//      `resume()` lifted ANY 'paused' record — including the park THIS pass took moments earlier
+//      on the same boundary — so the trigger turn lost its observable paused-during-compaction
+//      window and the `thread.paused`/`thread.resumed` pair an operator watches became `paused`
+//      + `resumed` + `resumed`, on a turn where the compaction was still outstanding.
 //
 // THE RULE THAT MAKES IT SAFE: parks are OWNED. `context.pause()` attributes the park to
 // the plugin whose payload it came from, and `context.resume()` lifts only a park that

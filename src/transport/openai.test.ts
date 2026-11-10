@@ -141,7 +141,10 @@ describe('openAICompatible', () => {
         expect(body).not.toHaveProperty('tools');
     });
 
-    it('maps assistant tool calls and tool results onto the wire format', async () => {
+    // T8 changed what this mapping does with thinking: an entry that still carries
+    // `reasoning` after the projection ran is echoed back under the provider's
+    // spelling. The withheld case (no `reasoning` key) is the next block's subject.
+    it('maps assistant tool calls, tool results and the surviving thinking onto the wire format', async () => {
         const fetchMock = stubFetch(['data: [DONE]\n\n']);
 
         await collect(
@@ -167,6 +170,7 @@ describe('openAICompatible', () => {
             {
                 role: 'assistant',
                 content: '',
+                reasoning_content: 'let me look',
                 tool_calls: [
                     { id: 'c1', type: 'function', function: { name: 'websearch', arguments: '{"q":"news"}' } }
                 ]
@@ -174,8 +178,11 @@ describe('openAICompatible', () => {
             { role: 'tool', tool_call_id: 'c1', content: 'results' }
         ]);
 
-        // `reasoning` is local replay data and must never reach the provider.
-        expect(JSON.stringify(body)).not.toContain('let me look');
+        // T8 reversed the posture for THIS one field: thinking the projection left
+        // on an entry is echoed back under the provider's spelling, and NOTHING
+        // else about it travels — no `reasoning` key, no internal field names.
+        expect(JSON.stringify(body)).not.toContain('"reasoning"');
+        expect(JSON.stringify(body)).not.toContain('reasoningIncluded');
     });
 
     // Stage 1a: `included` is transcript/projection state, not provider state. The
@@ -285,6 +292,270 @@ describe('openAICompatible', () => {
         // Nothing but the result text distinguishes a failed call on the wire today.
         expect(JSON.stringify(body)).not.toContain('outcome');
         expect(JSON.stringify(body)).not.toContain('isError');
+    });
+
+    // ---------------------------------------------------------------------------
+    // Trimmer uplift T8 — the thoughts tiers made visible on the wire.
+    //
+    // NOT TESTED AGAINST REAL PROVIDERS (task brief Part K): no live DeepSeek, Kimi
+    // or Anthropic round-trip was observed for `reasoning_content`. Every case here
+    // drives the stubbed `fetch`, so what is pinned is the REQUEST SHAPE the policy
+    // produces — the vendors' acceptance of that shape is vendor documentation as
+    // read 2026-11-10, not a measurement.
+    //
+    // The tier DECISION is not the transport's: `dropOldThoughts` writes
+    // `reasoningIncluded: false` on canonical state (the `context-trimmer` built-in
+    // in `plugins/`) and `core/agent.ts` `withoutWithheldReasoning` resolves that
+    // flag OUT of the request copy, dropping the `reasoning` key entirely
+    // (`src/harness.inclusion.test.ts` §13 owns that contract). A projected entry
+    // therefore reaches this transport with either a non-empty `reasoning` string or
+    // no `reasoning` key at all, and each tier below is written as the projected
+    // shape it produces:
+    //   `turn` (default) — the open turn's entries carry `reasoning`, every closed
+    //       turn's entry carries none;
+    //   `all`            — no entry carries `reasoning`, which is the byte-identity
+    //       case against the pre-T8 wire;
+    //   `off`            — every entry carries its thinking.
+    // ---------------------------------------------------------------------------
+
+    // A first model step has no committed assistant entry in front of it, so the
+    // field must not appear at all — not on the system or user entry, and not as a
+    // key on any other message.
+    it('sends no reasoning_content at all on a first-step request', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages).toEqual([
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'user', content: 'Write' }
+        ]);
+        // The whole body is checked, so an accidental `reasoning_content: undefined`
+        // or an empty-string echo would still fail here.
+        expect(JSON.stringify(body)).not.toContain('reasoning');
+    });
+
+    // The `turn` tier's open-turn shape, mid tool loop: every assistant entry the
+    // loop has committed keeps its thinking, so every one of them is echoed, in
+    // place, with the text verbatim.
+    it('echoes every open-turn thinking block on a tool-loop continuation', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    { role: 'user', content: 'search' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        reasoning: 'first thought: call websearch',
+                        toolCalls: [{ id: 'c1', name: 'websearch', arguments: '{"q":"news"}' }]
+                    },
+                    { role: 'tool', content: 'results', toolCallId: 'c1', name: 'websearch' },
+                    {
+                        role: 'assistant',
+                        content: 'the news is x',
+                        reasoning: 'second thought: answer now',
+                        toolCalls: [{ id: 'c2', name: 'summarise', arguments: '{}' }]
+                    },
+                    { role: 'tool', content: 'ok', toolCallId: 'c2', name: 'summarise' }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages).toEqual([
+            { role: 'user', content: 'search' },
+            {
+                role: 'assistant',
+                content: '',
+                reasoning_content: 'first thought: call websearch',
+                tool_calls: [
+                    { id: 'c1', type: 'function', function: { name: 'websearch', arguments: '{"q":"news"}' } }
+                ]
+            },
+            { role: 'tool', tool_call_id: 'c1', content: 'results' },
+            {
+                role: 'assistant',
+                content: 'the news is x',
+                reasoning_content: 'second thought: answer now',
+                tool_calls: [{ id: 'c2', type: 'function', function: { name: 'summarise', arguments: '{}' } }]
+            },
+            { role: 'tool', tool_call_id: 'c2', content: 'ok' }
+        ]);
+    });
+
+    // The `turn` tier's closed-turn shape: the projection EMITS the entry — same
+    // slot, same `content`, same `tool_calls`, so pairing is untouched — with the
+    // `reasoning` key resolved out. The field must be ABSENT, never `""`.
+    it('omits reasoning_content for a closed turn whose thinking was withheld', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    // A closed turn: entry 1 is what a flagged entry's request copy
+                    // looks like — no `reasoning` key.
+                    { role: 'user', content: 'old question' },
+                    {
+                        role: 'assistant',
+                        content: 'old answer',
+                        toolCalls: [{ id: 'c0', name: 'alpha', arguments: '{}' }]
+                    },
+                    { role: 'tool', content: 'old result', toolCallId: 'c0', name: 'alpha' },
+                    // The open turn: still echoed, so the omission above is proven to
+                    // be a per-entry decision and not a whole-request one.
+                    { role: 'user', content: 'new question' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        reasoning: 'open turn thought',
+                        toolCalls: [{ id: 'c1', name: 'beta', arguments: '{}' }]
+                    }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages).toEqual([
+            { role: 'user', content: 'old question' },
+            {
+                role: 'assistant',
+                content: 'old answer',
+                tool_calls: [{ id: 'c0', type: 'function', function: { name: 'alpha', arguments: '{}' } }]
+            },
+            { role: 'tool', tool_call_id: 'c0', content: 'old result' },
+            { role: 'user', content: 'new question' },
+            {
+                role: 'assistant',
+                content: '',
+                reasoning_content: 'open turn thought',
+                tool_calls: [{ id: 'c1', type: 'function', function: { name: 'beta', arguments: '{}' } }]
+            }
+        ]);
+        // Absent, not empty: a strict provider reads `""` as a thinking block whose
+        // content is missing. The count proves the omission is per-entry — the open
+        // turn's entry above still got its field.
+        expect(body.messages[1]).not.toHaveProperty('reasoning_content');
+        expect(JSON.stringify(body).match(/reasoning_content/g)).toHaveLength(1);
+    });
+
+    // An empty string is the one value that must never become the field, even though
+    // the key is technically present on the entry. The runtime never commits one
+    // (`core/agent.ts` stores `reasoning` only when non-empty), so this is the
+    // hand-built/host-seeded transcript case.
+    it('omits reasoning_content rather than echoing an empty string', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    { role: 'user', content: 'search' },
+                    {
+                        role: 'assistant',
+                        content: 'an answer with no thinking',
+                        reasoning: ''
+                    }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages).toEqual([
+            { role: 'user', content: 'search' },
+            { role: 'assistant', content: 'an answer with no thinking' }
+        ]);
+        expect(body.messages[1]).not.toHaveProperty('reasoning_content');
+        expect(JSON.stringify(body)).not.toContain('reasoning');
+    });
+
+    // The `dropOldThoughts: 'all'` equivalence, stated as a byte comparison: with no
+    // thinking anywhere in the projected transcript the payload is exactly what this
+    // transport sent before the echo existed — same keys, same KEY ORDER. The
+    // expected payload is declared in wire key order, because `JSON.stringify` of
+    // both sides compares bytes, not just structure.
+    it('is byte-identical to the pre-echo wire when no message carries thinking', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    { role: 'system', content: 'ctx' },
+                    { role: 'user', content: 'search' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [{ id: 'c1', name: 'websearch', arguments: '{"q":"news"}' }]
+                    },
+                    { role: 'tool', content: 'results', toolCallId: 'c1', name: 'websearch' },
+                    { role: 'assistant', content: 'done' }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        const preEchoWire = [
+            { role: 'system', content: 'ctx' },
+            { role: 'user', content: 'search' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                    { id: 'c1', type: 'function', function: { name: 'websearch', arguments: '{"q":"news"}' } }
+                ]
+            },
+            { role: 'tool', tool_call_id: 'c1', content: 'results' },
+            { role: 'assistant', content: 'done' }
+        ];
+
+        expect(JSON.stringify(body.messages)).toBe(JSON.stringify(preEchoWire));
+    });
+
+    // The transport never reads the flag and never forwards it. That is a decision,
+    // not an accident: a canonical entry handed straight to a custom transport still
+    // echoes its thinking (the projection, not the transport, owns the withhold), and
+    // the flag key itself stays transcript state like `included` and `outcome` —
+    // strict gateways reject unknown message fields.
+    it('never puts the reasoningIncluded flag on the wire, and never reads it', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1' })({
+                model: 'm',
+                messages: [
+                    { role: 'user', content: 'search' },
+                    {
+                        role: 'assistant',
+                        content: '',
+                        reasoning: 'thought a host handed over directly',
+                        reasoningIncluded: false,
+                        toolCalls: [{ id: 'c1', name: 'websearch', arguments: '{"q":"news"}' }]
+                    }
+                ]
+            })
+        );
+
+        const body = JSON.parse(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body));
+
+        expect(body.messages[1]).toEqual({
+            role: 'assistant',
+            content: '',
+            reasoning_content: 'thought a host handed over directly',
+            tool_calls: [
+                { id: 'c1', type: 'function', function: { name: 'websearch', arguments: '{"q":"news"}' } }
+            ]
+        });
+        expect(JSON.stringify(body)).not.toContain('reasoningIncluded');
     });
 
     // The provider answers a non-object `function.arguments` with a bare

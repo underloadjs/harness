@@ -460,9 +460,9 @@ describe('GET /v1/harness/plugins', () => {
             }
         });
 
-        // The third row: `context-trimmer` (R5). Same closed key set, and `values` is the
-        // projection of ITS declared keys only — one boolean — which is the proof the route does
-        // not leak another plugin's settings onto a row.
+        // The third row: `context-trimmer` (R5, and the 2026-11-10 switch split). Same closed
+        // key set, and `values` is the projection of ITS declared keys — which is the whole
+        // switch surface, twelve keys — and still leaks nothing from the other two plugins.
         expect(page.body.items[2]).toEqual({
             name: 'context-trimmer',
             title: 'Context Trimmer',
@@ -474,16 +474,126 @@ describe('GET /v1/harness/plugins', () => {
             // Same reserved-switch rule as compaction: the plugin DECLARES `enabled`, so the row
             // field and `values.enabled` are one stored value read two ways.
             enabled: true,
+            // Declared order is the row order the pane renders, and EVERY number publishes its
+            // bounds: the PATCH edge only refuses an out-of-range value the plugin published a
+            // bound for, so a missing `max` is a hole in the write edge (T3b).
             settings: [
                 {
                     key: 'enabled',
-                    label: 'Trim superseded tool calls',
+                    label: 'Context trimming',
                     type: 'boolean',
                     default: true,
                     description: TRIMMER.settings?.find((setting) => setting.key === 'enabled')?.description
+                },
+                {
+                    key: 'dropSupersededToolCalls',
+                    label: 'Drop superseded tool calls',
+                    type: 'boolean',
+                    default: true,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropSupersededToolCalls')?.description
+                },
+                {
+                    key: 'dropInvalidToolCallsOnceAnswered',
+                    label: 'Drop invalid tool calls once answered',
+                    type: 'boolean',
+                    default: true,
+                    description: TRIMMER.settings?.find(
+                        (setting) => setting.key === 'dropInvalidToolCallsOnceAnswered'
+                    )?.description
+                },
+                {
+                    key: 'invalidOutcomes',
+                    label: 'Outcomes that count as invalid',
+                    type: 'string',
+                    default: 'failed,rejected',
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'invalidOutcomes')?.description
+                },
+                {
+                    key: 'dropOldThoughts',
+                    label: 'Drop old thinking',
+                    type: 'string',
+                    default: 'turn',
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropOldThoughts')?.description
+                },
+                {
+                    key: 'thoughtKeepUnits',
+                    label: 'Earlier units that keep thinking',
+                    type: 'number',
+                    default: 0,
+                    min: 0,
+                    max: 32,
+                    step: 1,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'thoughtKeepUnits')?.description
+                },
+                {
+                    key: 'supersedeMatch',
+                    label: 'Supersession match',
+                    type: 'string',
+                    default: 'name',
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'supersedeMatch')?.description
+                },
+                {
+                    key: 'dropDuplicateCalls',
+                    label: 'Drop duplicate tool calls',
+                    type: 'boolean',
+                    default: false,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropDuplicateCalls')?.description
+                },
+                {
+                    key: 'minTokens',
+                    label: 'Minimum saving per pass (tokens)',
+                    type: 'number',
+                    default: 0,
+                    min: 0,
+                    max: 1000000,
+                    step: 50,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'minTokens')?.description
+                },
+                {
+                    key: 'minThoughtChars',
+                    label: 'Minimum thinking saved per pass (characters)',
+                    type: 'number',
+                    default: 0,
+                    min: 0,
+                    max: 1000000,
+                    step: 50,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'minThoughtChars')?.description
+                },
+                {
+                    key: 'safetyUnits',
+                    label: 'Recent units to protect',
+                    type: 'number',
+                    default: 0,
+                    min: 0,
+                    max: 4096,
+                    step: 1,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'safetyUnits')?.description
+                },
+                {
+                    key: 'maxUnits',
+                    label: 'Maximum units per pass',
+                    type: 'number',
+                    default: 0,
+                    min: 0,
+                    max: 4096,
+                    step: 1,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'maxUnits')?.description
                 }
             ],
-            values: { enabled: true }
+            values: {
+                enabled: true,
+                dropSupersededToolCalls: true,
+                dropInvalidToolCallsOnceAnswered: true,
+                invalidOutcomes: 'failed,rejected',
+                dropOldThoughts: 'turn',
+                thoughtKeepUnits: 0,
+                supersedeMatch: 'name',
+                dropDuplicateCalls: false,
+                minTokens: 0,
+                minThoughtChars: 0,
+                safetyUnits: 0,
+                maxUnits: 0
+            }
         });
     });
 
@@ -713,6 +823,101 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         });
 
         // A refused write stored nothing and moved no counter.
+        expect(pluginsOf(runtime).snapshot()).toEqual({});
+        expect((await call(runtime, 'GET', `${MOUNT}/plugins`)).body.revision).toBe(0);
+    });
+
+    // T3b — the write edge does NOT own a `string` tier's closed set (it validates the declared
+    // type and the published numeric bounds, and nothing else: src/server/plugins.ts). So a
+    // garbage tier value must be ACCEPTED here — a 400 would strand an operator who edited the
+    // document by hand — and the plugin must then say which documented value it ran with. The
+    // acceptance half is here; the naming half is
+    // `src/plugin/context-trimmer.test.ts` › 'T3b: a garbage tier value is used as the
+    // documented fallback and named in the pass report', which drives the SAME three values
+    // through a live harness.
+    it('200s a garbage value for every trimmer tier, storing it verbatim', async () => {
+        const runtime = createRuntime();
+
+        const patched = await patchSettings(runtime, 'context-trimmer', {
+            invalidOutcomes: 'bogus',
+            dropOldThoughts: 'sometimes',
+            supersedeMatch: 'loose'
+        });
+
+        expect(patched.status).toBe(200);
+        // The row answers the EFFECTIVE map: the three submitted strings, every other key at its
+        // declared default. Nothing is normalised away — `string` means any string.
+        expect(patched.body.plugin.values).toEqual({
+            enabled: true,
+            dropSupersededToolCalls: true,
+            dropInvalidToolCallsOnceAnswered: true,
+            invalidOutcomes: 'bogus',
+            dropOldThoughts: 'sometimes',
+            thoughtKeepUnits: 0,
+            supersedeMatch: 'loose',
+            dropDuplicateCalls: false,
+            minTokens: 0,
+            minThoughtChars: 0,
+            safetyUnits: 0,
+            maxUnits: 0
+        });
+        expect(pluginsOf(runtime).snapshot()).toEqual({
+            'context-trimmer': {
+                invalidOutcomes: 'bogus',
+                dropOldThoughts: 'sometimes',
+                supersedeMatch: 'loose'
+            }
+        });
+
+        // The descriptors themselves still publish the documented defaults as reset targets.
+        expect(
+            patched.body.plugin.settings.map((setting: { key: string; default: unknown }) => [setting.key, setting.default])
+        ).toEqual([
+            ['enabled', true],
+            ['dropSupersededToolCalls', true],
+            ['dropInvalidToolCallsOnceAnswered', true],
+            ['invalidOutcomes', 'failed,rejected'],
+            ['dropOldThoughts', 'turn'],
+            ['thoughtKeepUnits', 0],
+            ['supersedeMatch', 'name'],
+            ['dropDuplicateCalls', false],
+            ['minTokens', 0],
+            ['minThoughtChars', 0],
+            ['safetyUnits', 0],
+            ['maxUnits', 0]
+        ]);
+    });
+
+    // ...while a NUMBER IS refused here, because every one of them publishes `min`/`max`. This
+    // is the whole point of publishing bounds on a new knob: nonsense never reaches a turn.
+    it("400s a trimmer number outside the bounds it published, before it can reach a turn's policy", async () => {
+        const runtime = createRuntime();
+
+        expect(await patchSettings(runtime, 'context-trimmer', { thoughtKeepUnits: 33 })).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message: '"thoughtKeepUnits" of plugin "context-trimmer" must be at most 32; 33 was submitted.'
+                }
+            },
+            headers: {}
+        });
+
+        expect(await patchSettings(runtime, 'context-trimmer', { maxUnits: 4097 })).toEqual({
+            status: 400,
+            body: {
+                error: { message: '"maxUnits" of plugin "context-trimmer" must be at most 4096; 4097 was submitted.' }
+            },
+            headers: {}
+        });
+
+        expect(await patchSettings(runtime, 'context-trimmer', { minTokens: -1 })).toEqual({
+            status: 400,
+            body: { error: { message: '"minTokens" of plugin "context-trimmer" must be at least 0; -1 was submitted.' } },
+            headers: {}
+        });
+
+        // Every refusal stored nothing and moved no counter.
         expect(pluginsOf(runtime).snapshot()).toEqual({});
         expect((await call(runtime, 'GET', `${MOUNT}/plugins`)).body.revision).toBe(0);
     });

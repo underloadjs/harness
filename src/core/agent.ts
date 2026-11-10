@@ -187,22 +187,67 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
 // payload is byte-identical with or without the key.
 //
 // The input object is never mutated — a new object is always returned, so a caller
-// may keep or reuse its own array. The same rule is applied to untyped records by
-// core/snapshot.ts (`applyIncluded`) and core/branch.ts (`copyIncluded`); this is
-// its typed-message form, used by `seed()` (caller-supplied history entering
-// canonical state) and by the harness's model-facing projection.
+// may keep or reuse its own object. The same rule is applied to untyped records by
+// core/snapshot.ts (`applyIncluded`/`applyReasoningIncluded`) and core/branch.ts
+// (`copyIncluded`/`copyReasoningIncluded`); this is its typed-message form, used by
+// `seed()` (caller-supplied history entering canonical state) and by the harness's
+// model-facing projection.
+//
+// `reasoningIncluded` (trimmer uplift T6) is the SECOND flag and follows the SAME rule,
+// with one difference that matters to this function: an entry flagged ONLY on thinking is
+// still EMITTED, so the request path strips that flag key too — see
+// `withoutWithheldReasoning` directly below, which the projection runs on top of this copy.
+// Here the rule is only "present ONLY when exactly `false`", so a host-seeded
+// `reasoningIncluded: true` is normalized away like `included: true`, and a flagged entry
+// re-emits the key so a seed, a fork baseline or a branch record keeps the decision.
 export const withIncluded = (message: HarnessMessage): HarnessMessage => {
-    // Both keys are read off in one pass for the unflagged case, so the surviving keys
-    // keep the order the caller used and the result can never alias the caller's object.
-    if (message.included !== false) {
-        const { included: _omitted, messageId: _omittedId, ...rest } = message;
+    // Neither flag says "withheld", so BOTH flag keys and the id are read off in one pass;
+    // the surviving keys keep the order the caller used and the result can never alias the
+    // caller's object. The cast is only about the union: `reasoningIncluded` exists on the
+    // assistant variant, and the other variants simply have nothing to strip.
+    // Narrowed through the role because the field exists on the assistant variant only — the
+    // other variants have no thinking to withhold, so their answer is always "not flagged".
+    const thinkingWithheld =
+        message.role === 'assistant' && message.reasoningIncluded === false;
+
+    if (message.included !== false && !thinkingWithheld) {
+        const {
+            included: _omitted,
+            messageId: _omittedId,
+            reasoningIncluded: _omittedThinking,
+            ...rest
+        } = message as HarnessMessage & { reasoningIncluded?: boolean };
+
         return rest as HarnessMessage;
     }
 
-    // The flagged case strips ONLY the id and leaves `included: false` where it already
-    // was, so the key order of a projection copy is bit-for-bit what it was before ids
-    // existed (the historical rule: `included` is the last key of a flagged message).
+    // At least one flag is exactly `false`: strip ONLY the id and leave the flags where they
+    // already were, so the key order of the copy is bit-for-bit what it was before the second
+    // flag existed (the historical rule: the flags are the last keys of a flagged message).
     const { messageId: _omittedId, ...rest } = message;
+
+    return rest as HarnessMessage;
+};
+
+// THE REQUEST-PATH HALF OF THE SECOND FLAG (trimmer uplift T6).
+//
+// An entry whose thinking is withheld is still SENT: same position, same `content`, same
+// `toolCalls`, so nothing about provider pairing changes. What the flag resolves OUT is the
+// thinking text itself — a projection copy of a flagged entry carries NO `reasoning` key, and
+// NO request object ever carries `reasoningIncluded`. That absence is the wire signal the
+// transport's echo decision reads (there is deliberately no new transport field), and it is why
+// this function exists beside `withIncluded` rather than inside it: the flagged case of
+// `withIncluded` is the canonical-re-emission case (seed, fork baseline, branch record), where
+// the key MUST survive, while the projection case must lose both the text and the key.
+//
+// Unflagged entries (and every non-assistant entry) are returned UNCHANGED, same reference, so
+// the default projection path allocates exactly what it allocated before this flag existed.
+export const withoutWithheldReasoning = (message: HarnessMessage): HarnessMessage => {
+    if (message.role !== 'assistant' || message.reasoningIncluded !== false) return message;
+
+    // Both keys go: the text because the flag says the model must not get it, the flag because
+    // a request object is flag-free data (`HarnessStream` consumers, transport/openai.ts).
+    const { reasoning: _omittedReasoning, reasoningIncluded: _omittedFlag, ...rest } = message;
 
     return rest as HarnessMessage;
 };
@@ -275,7 +320,13 @@ const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
                     ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) }
                     : {}),
                 ...(message.reasoning !== undefined ? { reasoning: message.reasoning } : {}),
-                included: message.included
+                included: message.included,
+                // Trimmer uplift T6 — a fork of a conversation whose thinking was withheld must
+                // keep it withheld: a branch that dropped this key would put the reasoning of an
+                // older turn straight back in front of the model on every branch request. Passed
+                // like `included` above, so `withIncluded` keeps ONLY the exact `false` spelling
+                // and an unflagged baseline grows no key.
+                reasoningIncluded: message.reasoningIncluded
             });
 
         default:

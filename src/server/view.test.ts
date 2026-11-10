@@ -1177,21 +1177,296 @@ describe('the canonical session surface (R3)', () => {
         }
 
         // A block the bar never minted and a turn that does not exist stay 404s, and the body
-        // gate is the GENERATED one: only `included` rides, and only as a real boolean — the
-        // same strictness `setIncluded` applies to its own argument.
+        // gate is the GENERATED one: only the two axis fields ride, and only as real booleans —
+        // the same strictness `setIncluded` and `setReasoningIncluded` apply to their own
+        // arguments. An empty body used to read "not a boolean `included`"; it now reads
+        // "neither axis named", which is the honest description of it.
         expect((await call(api, 'PATCH', route('0-tool-9999'), { included: false })).status).toBe(404);
         expect(
             (await call(api, 'PATCH', `/v1/harness/sessions/${created.id}/turns/nope/blocks/${toolId}`, { included: false })).status
         ).toBe(404);
         expect((await call(api, 'PATCH', toolRoute, {})).json).toEqual({
-            error: { message: 'A context segment inclusion write requires a boolean "included" value.' }
+            error: { message: 'A context segment write requires at least one of "included" and "reasoningIncluded".' }
         });
         expect((await call(api, 'PATCH', toolRoute, { included: 'no' })).json).toEqual({
             error: { message: 'A context segment inclusion write requires a boolean "included" value.' }
         });
         expect((await call(api, 'PATCH', toolRoute, { nope: true })).json).toEqual({
-            error: { message: 'Unknown field "nope". Allowed fields: included.' }
+            error: { message: 'Unknown field "nope". Allowed fields: included, reasoningIncluded.' }
         });
+    });
+
+    // -----------------------------------------------------------------------
+    // The thinking axis (trimmer uplift T7 / F8): a reasoning segment gets a REAL verdict,
+    // because the flag that decides whether a model's own prior thinking rides in the next
+    // request is a per-entry fact (`reasoningIncluded`, ../types/index.ts:213-236) and the
+    // block detail read is the one place that holds both the recorded thinking and the live
+    // transcript. Two joins, two axes: a call resolves through its recorded call id, thinking
+    // resolves through its recorded TEXT, which is the only identity a thinking window has
+    // (./turn-projector.ts mints its block from the opening event index, not from an entry).
+    // -----------------------------------------------------------------------
+
+    /** A one-request scripted thinker: thinking, an answer, done. Mirrors the fixture
+     *  ./view.test.ts:1277 uses for the bounded-preview rule, so the recorded window and the
+     *  committed entry's `reasoning` are the SAME bytes by construction. */
+    const thinkingPreset = (name: string, thinking: string): HarnessPreset =>
+        presetOf(name, (settings, progress) =>
+            harness({
+                agents: {
+                    [name]: agent({
+                        model: settings.model,
+                        instruction: 'Think first.',
+                        stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                            yield { type: 'reasoning', delta: thinking };
+                            yield { type: 'text', delta: 'answered' };
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        }
+                    })
+                },
+                primary: name,
+                presets: false,
+                report: { progress }
+            })
+        );
+
+    /** The reasoning segments one turn's bar mints, in mint order. */
+    const thinkingSegments = (store: SessionStore, sessionId: string, turnId: string) => {
+        const bar = store.getView(sessionId).displays[turnId].sections[0].context ?? [];
+        const segments = bar.filter((block) => block.kind === 'reasoning');
+
+        if (segments.length === 0) throw new Error('the think window minted no segment');
+
+        return segments;
+    };
+
+    it('publishes a real verdict for a thinking segment and switches only its thinking', async () => {
+        const THINKING = 'first the path, then the max';
+        const store = storeOf([thinkingPreset('thinker', THINKING)]);
+        const api = apiOf(store);
+        const created = await store.create('thinker');
+        const turn = await runTurn(store, created.id, 'ponder this');
+        const record = store.liveSession(created.id);
+        // The conversation the turn belongs to, pinned for the same reason the tool test pins
+        // it: the route takes the id from the turn's own join, never from the client.
+        const threadId = turn.threadId as string;
+        const block = thinkingSegments(store, created.id, turn.id)[0];
+        const route = (blockId: string) => `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${blockId}`;
+        const blockRoute = route(block.id);
+
+        expect(threadId).toBe('thread-1');
+
+        // THE VERDICT, PUBLISHED. This entry carries no `reasoningIncluded` key — the shipped
+        // `dropOldThoughts: 'turn'` default keeps the OPEN turn's thinking — and an absent flag
+        // means the thinking rides, so the segment states `true`. `inPrompt: false` is still
+        // there, untouched: it is the projector's static fallback for a server that cannot name
+        // the entry, not this server's answer (../shared/turn-display.ts `inPrompt`).
+        const before = await call(api, 'GET', blockRoute);
+
+        expect(before.status).toBe(200);
+        expect(before.json.block).toMatchObject({
+            kind: 'reasoning',
+            id: block.id,
+            chars: THINKING.length,
+            inPrompt: false,
+            included: true,
+            text: THINKING
+        });
+
+        // OFF, through the field the dialog already has: for a thinking segment the prompt axis
+        // IS its thinking, so `included` writes the thinking flag and the receipt states both
+        // spellings — `included` is what the next read publishes, `reasoning_included` names the
+        // axis that moved.
+        const off = await call(api, 'PATCH', blockRoute, { included: false });
+
+        expect(off.status).toBe(200);
+        expect(off.json).toEqual({
+            session_id: created.id,
+            turn_id: turn.id,
+            block_id: block.id,
+            included: false,
+            reasoning_included: false,
+            thread_id: threadId,
+            revision: 1,
+            links: {
+                block: blockRoute,
+                transcript: `/v1/harness/sessions/${created.id}/threads/${threadId}/transcript`
+            }
+        });
+
+        // THE WRITE, at the seam the next model request is built from. THREE things are true of
+        // this document and each one is the point of the mechanism: the thinking flag is the ONLY
+        // thing that moved; the entry is NOT excluded (no `included` key, so the answer text and
+        // its position in the request are untouched, and a tool round's pairing could never break
+        // on this axis); and the thinking TEXT is still here — T6 withholds it from the projection
+        // COPY only (../core/agent.ts `withoutWithheldReasoning`), so the switch is reversible and
+        // the reader keeps the prose they were reading. `false` is the only value stored, exactly
+        // as `turn.before setReasoningIncluded` stores it (../harness.ts:8839-8848).
+        expect(record.harness.threadMessages(threadId)).toStrictEqual([
+            { role: 'system', content: 'Think first.', messageId: 'msg-1' },
+            { role: 'user', content: 'ponder this', messageId: 'msg-2' },
+            { role: 'assistant', content: 'answered', reasoning: THINKING, reasoningIncluded: false, messageId: 'msg-3' }
+        ]);
+
+        // The read agrees with the write, which is what makes the chip a control rather than a
+        // guess, and the recorded window is byte-identical (the detail still answers with the
+        // whole thinking, flag or no flag).
+        const after = await call(api, 'GET', blockRoute);
+
+        expect(after.json.block).toMatchObject({ inPrompt: false, included: false, text: THINKING });
+
+        // ON, by the field that NAMES the axis. The explicit field is what decides when a body
+        // carries both, and ON REMOVES the key rather than writing `true`.
+        const on = await call(api, 'PATCH', blockRoute, { reasoningIncluded: true });
+
+        expect(on.status).toBe(200);
+        expect(on.json).toEqual({
+            session_id: created.id,
+            turn_id: turn.id,
+            block_id: block.id,
+            included: true,
+            reasoning_included: true,
+            thread_id: threadId,
+            revision: 2,
+            links: {
+                block: blockRoute,
+                transcript: `/v1/harness/sessions/${created.id}/threads/${threadId}/transcript`
+            }
+        });
+        expect(record.harness.threadMessages(threadId)).toStrictEqual([
+            { role: 'system', content: 'Think first.', messageId: 'msg-1' },
+            { role: 'user', content: 'ponder this', messageId: 'msg-2' },
+            { role: 'assistant', content: 'answered', reasoning: THINKING, messageId: 'msg-3' }
+        ]);
+        expect((await call(api, 'GET', blockRoute)).json.block).toMatchObject({ included: true });
+
+        // A body naming BOTH axes on a thinking segment resolves to one entry and one verdict,
+        // and the explicit field wins: `included: false` then `reasoningIncluded: true` leaves
+        // the thinking in the prompt, which is the only reading that is not a contradiction.
+        const both = await call(api, 'PATCH', blockRoute, { included: false, reasoningIncluded: true });
+
+        expect(both.status).toBe(200);
+        expect(both.json).toMatchObject({ included: true, reasoning_included: true, revision: 3 });
+        expect((await call(api, 'GET', blockRoute)).json.block).toMatchObject({ included: true });
+    });
+
+    it('states nothing when two entries could have streamed the recorded thinking', async () => {
+        // THE ABSENT CASE, and it is the load-bearing one for honesty: thinking has no id, so its
+        // recorded bytes ARE its identity, and an entry the server cannot single out gets NO
+        // verdict. Two requests in one turn, each streaming the SAME thinking, put that thinking
+        // on two assistant entries — so neither window can say which entry it came from.
+        const SHARED = 'the same thought, twice';
+        const store = storeOf([
+            presetOf('twice', (settings, progress) =>
+                harness({
+                    agents: {
+                        twice: agent({
+                            model: settings.model,
+                            instruction: 'Think first.',
+                            stream: requestStream([
+                                [
+                                    { type: 'reasoning', delta: SHARED },
+                                    {
+                                        type: 'done',
+                                        stopReason: 'tool_calls',
+                                        toolCalls: [{ id: 'call-1', name: 'tasks', arguments: JSON.stringify({ tasks: [{ text: 'one' }] }) }],
+                                        usage: { input: 10, output: 2, total: 12 }
+                                    }
+                                ],
+                                [
+                                    { type: 'reasoning', delta: SHARED },
+                                    { type: 'text', delta: 'finished' },
+                                    { type: 'done', stopReason: 'stop', toolCalls: [], usage: { input: 20, output: 3, total: 23 } }
+                                ]
+                            ]),
+                            tools: ['task']
+                        })
+                    },
+                    primary: 'twice',
+                    presets: false,
+                    report: { progress }
+                })
+            )
+        ]);
+        const api = apiOf(store);
+        const created = await store.create('twice');
+        const turn = await runTurn(store, created.id, 'ponder this');
+        const route = (blockId: string) => `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${blockId}`;
+        const blocks = thinkingSegments(store, created.id, turn.id);
+
+        expect(blocks).toHaveLength(2);
+
+        // Both windows are ambiguous, so BOTH stay silent on the axis: not `true`, not `false`.
+        for (const block of blocks) {
+            const read = await call(api, 'GET', route(block.id));
+
+            expect(read.status).toBe(200);
+            expect(read.json.block).toMatchObject({ kind: 'reasoning', inPrompt: false, text: SHARED });
+            expect(Object.hasOwn(read.json.block as object, 'included')).toBe(false);
+
+            // And a write to an axis that names no entry REFUSES rather than answering a quiet
+            // no-op, on either field — the alternative is a chip that looks like it worked.
+            for (const body of [{ included: false }, { reasoningIncluded: false }]) {
+                const refusal = await call(api, 'PATCH', route(block.id), body);
+
+                expect(refusal.status).toBe(409);
+                expect(refusal.json).toEqual({
+                    error: {
+                        message: `Context segment "${block.id}" has no thinking entry to switch: the recorded thinking is not the exact reasoning of one assistant entry in this conversation's transcript.`
+                    }
+                });
+            }
+        }
+
+        // The body gate is unchanged in kind and widened in name: at least one axis, each one a
+        // real boolean. An empty body used to mean "not a boolean `included`"; it now means
+        // "neither axis named", which is the honest description of it.
+        expect(await call(api, 'PATCH', route(blocks[0].id), {})).toEqual({
+            status: 400,
+            json: { error: { message: 'A context segment write requires at least one of "included" and "reasoningIncluded".' } }
+        });
+        expect(await call(api, 'PATCH', route(blocks[0].id), { reasoningIncluded: 'no' })).toEqual({
+            status: 400,
+            json: { error: { message: 'A context segment write requires a boolean "reasoningIncluded" value.' } }
+        });
+    });
+
+    it('refuses the thinking axis on a segment whose bytes are not thinking', async () => {
+        const store = storeOf([toolRoundPreset()]);
+        const api = apiOf(store);
+        const created = await store.create('worker');
+        const turn = await runTurn(store, created.id, 'do the work');
+        const events = store.liveSession(created.id).turns[0].events;
+        const argsIndex = events.findIndex((event) => event.type === 'tool_call');
+        const toolRoute = `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/0-tool-${argsIndex}`;
+
+        // The tool segment keeps its own axis exactly as it was — one verdict for the call and
+        // every result answering it — and a thinking flag written WHERE THERE IS NO RECORDED
+        // THINKING refuses instead of silently moving the unit. `reasoningIncluded` resolves only
+        // through the thought join, and this segment's bytes are an id plus a result.
+        expect((await call(api, 'GET', toolRoute)).json.block).toMatchObject({ kind: 'tool', inPrompt: true, included: true });
+
+        const refusal = await call(api, 'PATCH', toolRoute, { reasoningIncluded: false });
+
+        expect(refusal.status).toBe(409);
+        expect(refusal.json).toEqual({
+            error: {
+                message: `Context segment "0-tool-${argsIndex}" has no thinking entry to switch: the recorded thinking is not the exact reasoning of one assistant entry in this conversation's transcript.`
+            }
+        });
+
+        // A body that names BOTH axes on this segment still refuses: the unit write does not get
+        // to run alongside a field that cannot land, because half a receipt is a lie about what
+        // the click did.
+        expect((await call(api, 'PATCH', toolRoute, { included: false, reasoningIncluded: false })).status).toBe(409);
+        expect((await call(api, 'GET', toolRoute)).json.block).toMatchObject({ included: true });
+
+        // ...while the shipped axis, written alone, still works exactly as before (same receipt
+        // shape, no `reasoning_included` figure for a segment that names no thinking entry).
+        const off = await call(api, 'PATCH', toolRoute, { included: false });
+
+        expect(off.status).toBe(200);
+        expect(Object.hasOwn(off.json, 'reasoning_included')).toBe(false);
+        expect(off.json).toMatchObject({ block_id: `0-tool-${argsIndex}`, included: false });
     });
 });
 

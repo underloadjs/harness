@@ -300,6 +300,56 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
                 content: message.content
             };
 
+            // THE THINKING ECHO — trimmer uplift T8, the half of `dropOldThoughts`
+            // that makes the `turn` tier real on the wire.
+            //
+            // The POLICY is not here: the projection already ran it. An entry whose
+            // thinking was withheld is still emitted in the request, but its
+            // projection copy OMITS the `reasoning` key entirely
+            // (`core/agent.ts` `withoutWithheldReasoning`, run by `harness.ts`
+            // `projectTranscript`), and no request object carries the
+            // `reasoningIncluded` flag. So the transport's whole rule is "echo what
+            // is present": a projected entry that still has a non-empty `reasoning`
+            // string is, by construction, thinking the policy left eligible — the
+            // open turn's under the default `turn` tier, everything under `off`,
+            // nothing under `all` (which withholds every entry and therefore
+            // reproduces the pre-T8 wire byte-for-byte).
+            //
+            // `reasoning_content` is the DeepSeek-compatible spelling, the same one
+            // the read side accepts (chunk parsing, below:
+            // `delta.reasoning_content ?? delta.reasoning`). Spelling NARROWING, and
+            // deliberately not the brief's parenthetical: this emits
+            // `reasoning_content` ONLY and never a second `reasoning` field. Every
+            // strict provider that demands the echo back — DeepSeek thinking mode,
+            // Kimi/Moonshot, GLM/Z.ai, Qwen-with-`preserve_thinking` (task brief
+            // Part E, E2) — speaks this dialect, the transport has no per-model
+            // capability flag to pick a dialect with (F6; issue 0001,
+            // `docs/issues/blocking-provider-request-body-extension.md`, owns that
+            // surface), and dual-emitting a second non-standard field is exactly the
+            // unknown-field rejection this site's previous "drop reasoning entirely"
+            // posture existed to avoid. A backend that wants the other spelling is
+            // deferred to that capability surface rather than guessed at here.
+            //
+            // OMITTED, never `""`: a strict provider reads an empty string as a
+            // thinking block whose content is missing — both the DeepSeek 400 and the
+            // Kimi "reasoning_content is missing in assistant tool call message" are
+            // about presence, not length — and `core/agent.ts` commits `reasoning`
+            // only when non-empty anyway, so an empty string here can only be a
+            // hand-built/host-seeded transcript.
+            //
+            // Key ORDER is part of the contract the byte-identity tests pin: the
+            // field is written BEFORE `tool_calls` so an echoed entry reads in the
+            // order the model produced it (thinking, then the call), and an entry
+            // with no thinking to echo allocates exactly the keys it allocated before
+            // this existed — `role`, `content`, optional `tool_calls`, in that order.
+            //
+            // NOT TESTED AGAINST REAL PROVIDERS (task brief Part K): no live
+            // DeepSeek/Kimi/Anthropic round-trip was observed for this field — the
+            // coverage is the stubbed-fetch wire tests in `openai.test.ts`.
+            if (typeof message.reasoning === 'string' && message.reasoning.length > 0) {
+                wire.reasoning_content = message.reasoning;
+            }
+
             if (message.toolCalls && message.toolCalls.length > 0) {
                 wire.tool_calls = message.toolCalls.map((call) => ({
                     id: call.id,
@@ -308,8 +358,10 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
                 }));
             }
 
-            // `reasoning` is intentionally dropped: it is local replay data and
-            // several providers reject unknown message fields.
+            // Everything else on the assistant variant stays local replay data and is
+            // still dropped: several providers reject unknown message fields, and
+            // `reasoning_content` above is the ONLY exception, scoped to the one
+            // spelling the strict providers name.
             return wire;
         }
 

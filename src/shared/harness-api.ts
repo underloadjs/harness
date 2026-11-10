@@ -2212,27 +2212,51 @@ export interface TurnBlockDetailResponse {
 }
 
 /**
- * The one field a context segment has: whether its transcript unit travels in the requests that follow. There
- * is deliberately no `if_revision` here — the write names the ENTRY, not a document, so it cannot carry a stale
- * copy of anything a concurrent writer moved, and the whole-document PUT stays the only resource with an
- * optimistic lock.
+ * The fields a context segment has, on two independent axes; at least one of them must be present. There is
+ * deliberately no `if_revision` here — the write names the ENTRY, not a document, so it cannot carry a stale copy
+ * of anything a concurrent writer moved, and the whole-document PUT stays the only resource with an optimistic
+ * lock. A body that names neither is a 400.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PatchTurnBlockRequest {
-    included: boolean;
+    /**
+     * The segment's OWN prompt axis, resolved by the join that can name this segment's entry: the exclusion UNIT
+     * behind a recorded call for a tool segment, or the THINKING of the single assistant entry that streamed a
+     * `reasoning` window (for a thinking segment, what rides in the prompt IS its thinking — this is the same
+     * figure `GET` on this path publishes as `included`, so the write mirrors the read).
+     */
+    included?: boolean;
+    /**
+     * The thinking axis, named explicitly (trimmer uplift T7): the `reasoningIncluded` flag core's `turn.before
+     * setReasoningIncluded` writes on ONE assistant entry, with NO unit cascade. It resolves through the thought
+     * join only, so it is writable on a `reasoning` segment and refused 409 on any other segment, whose recorded
+     * bytes name no thinking text. When a body carries both fields on a thinking segment they address the same
+     * entry, and this field — the one that names the axis — decides.
+     */
+    reasoningIncluded?: boolean;
 }
 
 /**
- * Receipt of the segment inclusion write. It answers the unit-level state the server PERSISTED, which is what
- * lets the dialog repaint from the write rather than from what it asked for — a plugin or another tab may have
- * moved the same unit, and the receipt is the truth either way.
+ * Receipt of the segment inclusion write. It answers the state the server PERSISTED, which is what lets the
+ * dialog repaint from the write rather than from what it asked for — a plugin or another tab may have moved the
+ * same entry, and the receipt is the truth either way.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface TurnBlockWriteReceipt {
     session_id: string;
     turn_id: string;
     block_id: string;
+    /**
+     * The verdict the next block-detail read publishes for THIS segment: the exclusion unit's state for a call
+     * (`false` only when the whole unit is excluded), or the thinking axis for a `reasoning` segment.
+     */
     included: boolean;
+    /**
+     * The thinking axis itself, read back after the write — present exactly when this segment names a thinking
+     * entry (a `reasoning` segment), absent for every other kind. On a thinking segment it is the same figure as
+     * `included` by construction, because the two fields address that one entry.
+     */
+    reasoning_included?: boolean;
     thread_id?: string;
     revision?: number;
     links?: {

@@ -534,30 +534,45 @@ export type ContextBlock = {
      * model too) or only the arguments of a call still running (those travelled with
      * the committed assistant message that asked for the call).
      *
-     * False when it is not: a `reasoning` block, always — thinking is streamed and
-     * recorded but never replayed into the next request. This is tracked explicitly
-     * so a bar never assumes every counted segment is prompt text.
+     * False when it is not. This is the PROJECTOR'S STATIC, PER-KIND FALLBACK: it is
+     * minted from the segment's kind (src/server/turn-projector.ts mints a `reasoning`
+     * block with `inPrompt: false`), because a compiled bar folds one TURN's events and
+     * never sees a transcript. For a `reasoning` block it is therefore NOT a claim about
+     * whether this thinking rides in the next request — that is decided per entry, per
+     * policy, by the context trimmer's thinking policy (`dropOldThoughts`) and the
+     * `reasoningIncluded` flag it writes (trimmer uplift T6/T7). Where the server CAN
+     * name the entry behind the segment, `included` below is the verdict; `inPrompt` is
+     * what a client falls back to when it cannot. Tracked explicitly so a bar never
+     * assumes every counted segment is prompt text.
      */
     inPrompt: boolean;
     /**
-     * T7 (docs/tasks/2026-11-09-context-inclusion-followups.md): the READER-facing
-     * inclusion axis — is this segment's transcript entry switched into the requests
-     * that follow. Deliberately NOT folded into `inPrompt`: `inPrompt` is the projector's
-     * static per-kind verdict (a `reasoning` window is never replayed whatever a reader
-     * does), while this is the state the reader controls from the segment dialog and the
-     * state `turn.before setIncluded` writes from a plugin (src/harness.ts:8528-8567).
+     * T7 (docs/tasks/2026-11-09-context-inclusion-followups.md), extended by the trimmer
+     * uplift's T7: the READER-facing inclusion axis — does what this segment shows ride in
+     * the requests that follow. Deliberately NOT folded into `inPrompt`: `inPrompt` is the
+     * projector's static per-kind fallback verdict, while this is the state the reader
+     * controls from the segment dialog and the state `turn.before setIncluded` /
+     * `turn.before setReasoningIncluded` write from a plugin (src/harness.ts:8523-8567 and
+     * :8821-8861).
      *
      * Tri-state, mirroring core's storage rule (`src/core/agent.ts:161-207` persists only
      * a literal `false` and drops the key otherwise):
-     *   - `false`  — the owning transcript unit IS excluded; `projectTranscript` drops the
-     *     whole tool-call unit around it (src/harness.ts:6421-6460), so this states the
-     *     EFFECT of the cascade, not one message's flag;
-     *   - `true`   — the unit resolves and is switched on, which is what lets the dialog
+     *   - `false`  — the axis THIS segment resolves to is switched OFF. For a tool segment
+     *     that is the exclusion unit: `projectTranscript` drops the whole tool-call unit
+     *     around it (src/harness.ts:6576-6612), so this states the EFFECT of the cascade,
+     *     not one message's flag. For a `reasoning` segment it is the THINKING axis: the one
+     *     assistant entry that streamed this window carries `reasoningIncluded: false`, so its
+     *     entry still travels but its thinking is omitted from the projection copy
+     *     (src/core/agent.ts `withoutWithheldReasoning`) — the entry is not excluded and its
+     *     answer text is unaffected.
+     *   - `true`   — the axis resolves and is switched on, which is what lets the dialog
      *     offer the toggle BACK rather than showing a dead end;
      *   - ABSENT   — this server could not name the transcript entry behind the segment
-     *     (a `reasoning`/answer window spans many entries, a system block joins several
-     *     messages, or the opening event carries no call id), so a renderer keeps its
-     *     `inPrompt` verdict and offers no control.
+     *     (no live entry carries this exact recorded thinking, or two or more do — thinking
+     *     has no id of its own, so its recorded bytes ARE its identity and an ambiguous match
+     *     names nothing; an answer window spans many entries; a system block joins several
+     *     messages; or the opening event carries no call id), so a renderer states the policy
+     *     and offers no control.
      *
      * Published by the block detail route (src/server/api.ts `getSessionTurnBlock`), the
      * one read that has BOTH the recorded event and the live transcript in hand; the

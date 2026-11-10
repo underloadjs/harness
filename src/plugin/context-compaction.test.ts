@@ -57,6 +57,9 @@
 //                                               `turn.after`, `thread.idle`, `run.failed` and
 //                                               the failure rollback the summarize cases pin
 //   - ./hooks.ts                              — fail-open dispatch of a throwing handler
+//   - ../plugins/context-trimmer.plugin.ts    — the SECOND shipped `turn.before` context pass; the
+//                                               final block here pins the overlap task T9 ratified
+//                                               (exactly one pass withholds a superseded unit)
 //   - ../core/agent.ts                        — `registerAgentThreader` and the thread model
 //                                               sync that make `api.agents[name].model()`
 //                                               the model the run is about to send
@@ -102,6 +105,17 @@ import {
     resolveContextTrigger,
     setup
 } from '../plugins/context-compaction.plugin';
+// Uplift T9 — the OTHER shipped `turn.before` context pass. Imported only by the overlap block at
+// the end of this file, which is the one place a case measures BOTH passes at once.
+import {
+    TRIMMER_DEFAULT_SETTINGS,
+    executeTrimming,
+    planTrimmedUnits,
+    type TrimmerSettings
+} from '../plugins/context-trimmer.plugin';
+// The compactor's own policy (the pure mirror of its prune), so "the two rules name the same
+// unit" is an assertion about both policies rather than about two plugins.
+import { planContextPruning } from '../core/context-pruning';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -335,6 +349,24 @@ const createFakeTurn = (input: {
             const entry = entries[index] as { included?: boolean } | undefined;
 
             if (entry !== undefined) entry.included = included === true;
+        },
+        // Trimmer uplift T6 — the second canonical control `HarnessTurnBeforeContext` now
+        // requires. The compaction plugin never calls it, and this fake only exists so the
+        // context literal stays the shape the type promises; it records the call and flips the
+        // flag on the same entry object, exactly like `setIncluded` above does.
+        setReasoningIncluded: (target, included) => {
+            const index =
+                typeof target === 'number'
+                    ? target
+                    : typeof target === 'string'
+                        ? entries.findIndex((entry) => entry.messageId === target)
+                        : target.index;
+
+            input.calls.push(`setReasoningIncluded:${index}:${String(included)}`);
+
+            const entry = entries[index] as { reasoningIncluded?: boolean } | undefined;
+
+            if (entry !== undefined) entry.reasoningIncluded = included === true ? undefined : false;
         },
         currentMessages: () => TURN_MESSAGES,
         // Context T5 — the live view of the same number.
@@ -3728,5 +3760,299 @@ describe('context-compaction retention range (planCompactionRetention)', () => {
         expect(CONTINUATION_NUDGE.startsWith('[context compaction]')).toBe(true);
         expect(COMPACTION_INSTRUCTION).toContain('Do not call tools');
         expect(CONTINUATION_NUDGE).toContain('Your context was just compacted');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// UPLIFT T9 — THE OVERLAP, MEASURED: EXACTLY ONE PASS WITHHOLDS A SUPERSEDED UNIT.
+//
+// Until today this file only ever measured ONE pass at a time: `settingsOf` above seeds
+// `context-trimmer` OFF, because the trimmer's rule (superseded failed tool units) overlaps
+// compaction's failure-retry prune, and the fixtures wanted a single plugin's numbers. Task T9
+// of docs/tasks/2026-11-10-context-trimmer-uplift.md ratified what that overlap means now that
+// the trimmer has switches: compaction KEEPS its failure-retry pruning, and the trimmer's rule
+// becomes compaction's rule by construction at `supersedeMatch: 'fingerprint'`. The resolution
+// is not a phase check or a new priority — it is the fact that both passes are withhold-only and
+// idempotent, so the second one to run finds the unit already withheld and writes nothing.
+//
+// This block pins that sentence at both levels the file already uses:
+//
+//   1. THE ACTIONS, run in the order the bus dispatches them (compaction first —
+//      src/plugin/manifest.ts scans paths ascending, src/plugin/hooks.ts runs registrations in
+//      order at equal priority), against the shared fakes. There `calls` IS the write count, so
+//      "exactly one pass withholds it" is an assertion about one recorded
+//      `setIncluded:1:false`, not about a side effect that two passes could each have produced;
+//   2. THE BUILT-INS through a REAL harness with the trimmer left at its declared defaults,
+//      where the observables are the canonical flags, the provider request, the diagnostic
+//      OWNERS, and the round's persistence profile.
+//
+// Why it is load-bearing: src/plugins/context-compaction.plugin.ts ~196-228 skips any phase
+// check against the trimmer on the argument that the trimmer "writes ONLY `included: false`
+// flags … nothing that re-ENABLES an entry". With twelve settings, a thinking flag and a
+// fingerprint matcher, that is a claim about code rather than intent; the case below is where a
+// regression (a pass that re-enables, or a pass that ignores the live flag and writes twice)
+// stops being invisible.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
+    // The same transcript as `prunableEntries` above, in message form (that helper builds
+    // fake ENTRIES, and a real harness needs the messages). One failed `read`, the same call
+    // answered later with its arguments reordered — a fingerprint match, and trivially a name
+    // match, so BOTH rules see exactly the same candidate — with a turn on each side.
+    const supersededFixture = (): HarnessMessage[] => [
+        { role: 'user', content: 'open a' },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c1', name: 'read', arguments: '{"path":"a.ts"}' }]
+        },
+        {
+            role: 'tool',
+            content: `Tool "read" failed: ${'E'.repeat(900)}`,
+            toolCallId: 'c1',
+            name: 'read',
+            outcome: 'failed'
+        },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c2', name: 'read', arguments: '{ "path" : "a.ts" }' }]
+        },
+        { role: 'tool', content: 'export const a = 1;', toolCallId: 'c2', name: 'read' },
+        { role: 'assistant', content: 'done' }
+    ];
+
+    // The provider BOTH built-ins see: compaction's numbers are stored, and every trimmer key
+    // falls through as `undefined`, i.e. its DECLARED default (`enabled` true,
+    // `dropSupersededToolCalls` true, `dropInvalidToolCallsOnceAnswered` true,
+    // `invalidOutcomes` "failed,rejected", `supersedeMatch` "name", `dropDuplicateCalls` false,
+    // `dropOldThoughts` "turn", and every economy knob 0). That is precisely the fresh-install
+    // posture an operator gets from `GET /plugins`, which is what makes the numbers below the
+    // shipped behaviour rather than a fixture arrangement.
+    const bothPassesAt = (
+        values: Record<string, number | string | boolean>
+    ): HarnessPluginSettingsProvider => ({
+        get: (plugin, key) => (plugin === 'context-compaction' ? values[key] : undefined)
+    });
+
+    const overlapRun = async (input: {
+        provider: HarnessPluginSettingsProvider;
+        stateChanges: HarnessStateChangeEvent[];
+        diagnostics: HarnessDiagnosticEvent[];
+        seen: HarnessStreamRequest[];
+    }): Promise<{ writer: Harness; threadId: string }> => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('after')], input.seen)) },
+            pluginSettings: input.provider,
+            report: {
+                stateChange: (event) => void input.stateChanges.push(event),
+                diagnostic: (event) => void input.diagnostics.push(event)
+            }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Overlap fixture' });
+        writer.setThreadMessages(thread.id, supersededFixture());
+        await writer.sendThreadInput(thread.id, 'next');
+
+        return { writer, threadId: thread.id };
+    };
+
+    // The numbers, derived the way this file derives all of them (core/context-estimate.ts,
+    // ceil(chars / 4)): the failed unit is 944 characters — the 921-character result plus its
+    // 4-character tool name, and the leader's 19 (4 name + the 15 raw argument characters) — so
+    // 236 withheld tokens, the same figure the `executeCompaction` case above pins for this
+    // exact fixture. The whole transcript is ~256 tokens, far over the 100-token limit, so the
+    // compaction trigger fires on the first turn of both runs.
+    const BOTH_PASS_SETTINGS = { contextLimit: 100, minTokens: 10, safetyTurns: 0, mode: 'exclude' };
+
+    // THE PREMISE, pinned before the exactly-one cases: the two rules select the SAME unit, so
+    // the overlap is real and has to be resolved. `prunableEntries` is deliberately a fixture
+    // whose retry differs only in whitespace — it matches under BOTH matchers — which is the
+    // shipped evidence that `supersedeMatch: 'fingerprint'` makes the trimmer's rule
+    // compaction's rule by construction (`toolCallFingerprint(name, canonicalArguments)`,
+    // src/core/argument-fingerprint.ts), and that at the shipped `'name'` the trimmer's rule is
+    // the looser of the two, i.e. a superset. That is what makes compaction's prune
+    // redundant-but-harmless rather than a second eviction.
+    it('has both rules select the same unit, at either matcher', () => {
+        const entries = prunableEntries();
+        const fingerprint: TrimmerSettings = {
+            ...TRIMMER_DEFAULT_SETTINGS,
+            supersedeMatch: 'fingerprint'
+        };
+
+        const trimmerPlan = (settings: TrimmerSettings) =>
+            planTrimmedUnits(entries, settings).map((candidate) => ({
+                leaderIndex: candidate.leaderIndex,
+                resolverIndex: candidate.resolverIndex,
+                names: candidate.names,
+                firedBy: candidate.firedBy
+            }));
+
+        const SAME_TRIMMER_CANDIDATE = [
+            {
+                leaderIndex: 1,
+                resolverIndex: 3,
+                names: ['read'],
+                firedBy: 'dropSupersededToolCalls'
+            }
+        ];
+
+        expect(trimmerPlan(TRIMMER_DEFAULT_SETTINGS)).toEqual(SAME_TRIMMER_CANDIDATE);
+        expect(trimmerPlan(fingerprint)).toEqual(SAME_TRIMMER_CANDIDATE);
+
+        // Compaction's own policy over the same entries, with its gates opened to the fixture's
+        // numbers (no horizon, no floor, the shipped per-pass cap): the identical unit, nothing
+        // else — the two passes agree on WHICH unit and differ only about whether their own
+        // floor/horizon/cooldown lets them act at all.
+        expect(
+            planContextPruning(entries, { safetyUnits: 0, maxUnits: 8, minTokens: 0 })
+                .candidates
+                .map((candidate) => ({
+                    leaderIndex: candidate.leaderIndex,
+                    resolverIndex: candidate.resolverIndex,
+                    outcomes: candidate.outcomes
+                }))
+        ).toEqual([{ leaderIndex: 1, resolverIndex: 3, outcomes: ['failed'] }]);
+    });
+
+    it('withholds the unit through exactly one write when both actions run in one round', async () => {
+        // Both dispatch orders, because "exactly one pass" must not be an artefact of which hook
+        // the bus happens to run first. The shipped order is the first arm.
+        for (const order of ['compaction-first', 'trimmer-first'] as const) {
+            const { api, diagnostics } = createFakeApi(100, { minTokens: 10, safetyTurns: 0 });
+            const calls: string[] = [];
+            const entries = prunableEntries();
+            const context = createFakeTurn({ api, estimatedTokens: 500, calls, entries });
+
+            if (order === 'compaction-first') {
+                await executeCompaction(api, context);
+                await executeTrimming(api, context);
+            } else {
+                await executeTrimming(api, context);
+                await executeCompaction(api, context);
+            }
+
+            // EXACTLY ONE WRITE, from one pass. `calls` records every mutation control, so a
+            // second pass that planned the same unit again would append a second
+            // `setIncluded:1:false` here — and a pass that touched the thinking axis would add a
+            // `setReasoningIncluded:*`. Neither happens: each pass reads the LIVE unit flag
+            // (`context-pruning.groupUnits` → `unit.included`, and `planTrimmedUnits` step (1)),
+            // so the second one finds the unit withheld and proposes nothing.
+            expect(calls).toEqual(['setIncluded:1:false']);
+
+            // The unit is withheld (the leader here — the runtime's `writeIncluded` cascade takes
+            // the results, src/harness.ts ~8523), and its resolver is untouched.
+            expect(entries[1].included).toBe(false);
+            expect(entries[3].included).toBe(true);
+            expect(entries[4].included).toBe(true);
+
+            // EXACTLY ONE pass report, from the pass that acted, and no line at all from the
+            // other. A double report would be the visible half of a double write.
+            expect(diagnostics).toHaveLength(1);
+
+            if (order === 'compaction-first') {
+                // Byte-exact, and the `~236` figure is the one pinned for this fixture above.
+                expect(diagnostics[0].message).toBe(
+                    'context-compaction withheld 1 superseded tool unit(s), ' +
+                        '~236 estimated tokens (mode exclude): #1 msg-2 [failed] answered by msg-4'
+                );
+            } else {
+                // The trimmer's shipped line shape: the unit, its outcomes, the names it called
+                // and what answered them (src/plugins/context-trimmer.plugin.ts ~1443).
+                expect(diagnostics[0].message).toBe(
+                    'context-trimmer withheld 1 superseded tool unit(s): ' +
+                        '#1 msg-2 [failed] read answered by msg-4'
+                );
+            }
+        }
+    });
+
+    it('leaves exactly one withholding pass when both built-ins are active in a real round', async () => {
+        const stateChanges: HarnessStateChangeEvent[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+        const seen: HarnessStreamRequest[] = [];
+
+        const { writer, threadId } = await overlapRun({
+            provider: bothPassesAt(BOTH_PASS_SETTINGS),
+            stateChanges,
+            diagnostics,
+            seen
+        });
+
+        // ONE pass withheld anything, and it is the compactor's — dispatch order, not a contest.
+        const withheld = diagnostics.filter((event) =>
+            event.message.includes('superseded tool unit(s)')
+        );
+
+        expect(withheld).toHaveLength(1);
+        expect(withheld[0].owner).toBe('context-compaction');
+        expect(withheld[0].message).toContain('withheld 1 superseded tool unit(s)');
+        // The trimmer ran in the same round (it is ENABLED here, unlike every other case in this
+        // file) and reported nothing, because it had nothing to write.
+        expect(diagnostics.some((event) => event.owner === 'context-trimmer')).toBe(false);
+
+        // Canonical state: exactly the failed unit — leader plus the cascaded result — and
+        // nothing else.
+        const flagged = writer
+            .threadMessages(threadId)
+            .map((message, index) => ({ index, role: message.role, included: message.included }))
+            .filter((entry) => entry.included === false);
+
+        expect(flagged).toEqual([
+            { index: 1, role: 'assistant', included: false },
+            { index: 2, role: 'tool', included: false }
+        ]);
+
+        // And the request that went out is pair-clean with only the answer in it (the same
+        // T3.4-style oracle the three-unit case uses).
+        const request = seen[seen.length - 1].messages;
+        const offered: string[] = [];
+        const answered: string[] = [];
+
+        for (const message of request) {
+            if (message.role === 'assistant') {
+                for (const call of (message as { toolCalls?: { id: string }[] }).toolCalls ?? []) {
+                    offered.push(call.id);
+                }
+                continue;
+            }
+
+            if (message.role === 'tool') answered.push((message as { toolCallId: string }).toolCallId);
+        }
+
+        expect({ offered, answered }).toEqual({ offered: ['c2'], answered: ['c2'] });
+
+        // The persistence profile of ONE withholding pass: the host seed write, the run's user
+        // append, ONE coalesced `agent_message` for the round's writes, and the committed answer.
+        // A second pass that wrote flags would still batch into that same round, so this number
+        // is not the discriminator by itself — it is what proves the trimmer added no write of
+        // its own to a round that already had one.
+        expect(stateChanges.filter((event) => event.reason === 'agent_message')).toHaveLength(4);
+
+        // THE CONTROL: the identical conversation with the trimmer seeded off (the `settingsOf`
+        // posture every other case in this file uses). Flags and pass line are identical, which
+        // is the operational statement of the ratified answer: enabling the trimmer neither adds
+        // a second eviction nor changes which units the eviction lands on for this shape.
+        const controlChanges: HarnessStateChangeEvent[] = [];
+        const controlDiagnostics: HarnessDiagnosticEvent[] = [];
+
+        const control = await overlapRun({
+            provider: settingsOf(BOTH_PASS_SETTINGS),
+            stateChanges: controlChanges,
+            diagnostics: controlDiagnostics,
+            seen: []
+        });
+
+        expect(
+            control.writer
+                .threadMessages(control.threadId)
+                .map((message, index) => ({ index, role: message.role, included: message.included }))
+                .filter((entry) => entry.included === false)
+        ).toEqual(flagged);
+        expect(
+            controlDiagnostics.filter((event) => event.message.includes('superseded tool unit(s)'))
+                .map((event) => event.message)
+        ).toEqual(withheld.map((event) => event.message));
+        expect(controlChanges.filter((event) => event.reason === 'agent_message')).toHaveLength(4);
     });
 });

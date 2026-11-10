@@ -453,6 +453,28 @@ const copyIncluded = (
     if (raw.included === false) message.included = false;
 };
 
+// The persisted THINKING-inclusion flag (trimmer uplift T6). Same duty as `copyIncluded`
+// directly above, and the same reason: a fork of a conversation whose thinking was withheld must
+// keep it withheld, or the branch quietly puts that reasoning back in front of the model — and
+// because `assertExactKeys` below whitelists keys, a transcript that merely CONTAINS the flag
+// would refuse to fork at all until this list learns it. Only `false` is copied, `true` is
+// normalized away, and the field is assistant-only like `reasoning` itself.
+const copyReasoningIncluded = (
+    raw: Record<string, unknown>,
+    message: HarnessMessage,
+    field: string
+): void => {
+    if (raw.reasoningIncluded === undefined) return;
+
+    if (typeof raw.reasoningIncluded !== 'boolean') {
+        throw new HarnessError(`Branch history message ${field}.reasoningIncluded must be a boolean.`);
+    }
+
+    if (raw.reasoningIncluded === false) {
+        (message as Extract<HarnessMessage, { role: 'assistant' }>).reasoningIncluded = false;
+    }
+};
+
 // The stable transcript address (context T1.4): a branch COPIES ids, it never mints or
 // drops one. The fork's entry and the owner's entry are therefore two objects with ONE
 // identity, which is what lets `context.setIncluded(id, …)` name the same turn on the
@@ -572,7 +594,10 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
     if (role === 'assistant') {
         assertExactKeys(
             raw,
-            ['role', 'content', 'toolCalls', 'reasoning', 'included', 'messageId'],
+            // `reasoningIncluded` (trimmer uplift T6) joins the list beside `reasoning` and
+            // `included`: a fork must admit the flag it needs to carry, and a strict whitelist
+            // that does not know it refuses the whole fork.
+            ['role', 'content', 'toolCalls', 'reasoning', 'included', 'reasoningIncluded', 'messageId'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
@@ -620,6 +645,9 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
         }
 
         copyIncluded(raw, message, field);
+        // Assistant-only, and called after `copyIncluded` so the copied key order matches the
+        // order the runtime's control writes onto a canonical message.
+        copyReasoningIncluded(raw, message, field);
         copyMessageId(raw, message, field);
         return message;
     }

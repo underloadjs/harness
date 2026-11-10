@@ -29,6 +29,10 @@
 //   7. (Stage 1b) A branch run gets the same control surface on its EPHEMERAL
 //      copy: its own request is filtered, the source transcript and any snapshot
 //      stay flag-free, and no persistence notification is reported.
+//   8. (Uplift T1 / H1) With NO context policy applied and NO flag anywhere the
+//      projection IS the transcript — every recorded entry, canonical order, equal
+//      content (pair and `reasoning` included), no flag key, and no transcript write
+//      by the engine itself. Section 11 pins it as an executed contract.
 //
 // Deterministic values below come from the scripted turns and the committed
 // transcript (the same exactness src/harness.background.test.ts uses), never
@@ -46,12 +50,18 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, openAICompatible, tool } from '@underload/harness';
+// The generated auto-discovery wiring (src/plugins scanned at build time). Section 11 reads
+// it to name-replace EVERY auto-loaded plugin, so a new built-in cannot silently start
+// trimming inside the "no policy installed" fixture.
+import { BUILTIN_PLUGINS } from './plugin/manifest';
 import type {
     HarnessContextEditPatch,
     HarnessContextEntry,
     HarnessEvent,
     HarnessMessage,
+    HarnessPlugin,
     HarnessPluginApi,
+    HarnessPluginSettingsProvider,
     HarnessStateChangeEvent,
     HarnessSnapshot,
     HarnessStream,
@@ -3355,5 +3365,1276 @@ describe('context inclusion — one persistence report per plugin round (context
 
         expect(changesOf(changes)).toEqual([...baseline, 'agent_message:writer:-']);
         expect((writer.agent.messages[1] as { included?: boolean }).included).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 11 — uplift T1 / acceptance H1: the ENGINE CORE trims nothing.
+//
+// The claim "the engine does not trim anything; the trimmer does" is true of
+// src/harness.ts by construction and by comment (the projection note at
+// src/harness.ts:6543-6570: a `false` entry is skipped, everything else is emitted, and
+// "the default case (no flag anywhere) [is] byte-identical"). No test said so. This
+// section pins it as an EXECUTED contract, so a future engine-side window, eviction or
+// elision fails here rather than silently changing what a model sees.
+//
+// Two things have to be true at once, and the fixture has to make the first one
+// verifiable rather than assumed:
+//   * NO CONTEXT POLICY IS RUNNING. `harness()` ALWAYS auto-loads the built-ins
+//     (src/plugin/manifest.ts is applied before `configuration.plugins`,
+//     src/plugin/host.ts:18-27), so there is no plugin-less harness. The executable form
+//     of "no plugin installed" is therefore the operator's own escape hatch: name-replace
+//     every auto-loaded built-in with an inert stub of the same name, which host.ts does
+//     IN PLACE (host.ts:22, "later registration wins"). A stub is `{ name }` alone —
+//     metadata and setup are both optional (host.ts:6) — and `metadataOf` then synthesizes
+//     `{ name, title: name, builtin: false }` (host.ts:114-117). Asserting that synthesized
+//     shape is what PROVES no shipped descriptor, and with it no context-policy hook or
+//     setting, survived; a stub that registered a hook could not claim this.
+//   * NO FLAG ANYWHERE. The seed carries nothing flagged and no plugin writes, so the
+//     projection's skip filter has nothing to skip and identity is testable.
+//
+// The identity asserted is exactly the spec's sentence: the provider request contains
+// EVERY recorded entry, in CANONICAL ORDER, with equal content (pair intact, thinking
+// still attached), carries no flag key, and the engine reported no transcript write of
+// its own beyond the run's own append and commit. `messageId` is stripped from BOTH sides
+// because stripping it is itself the projection contract (core/agent.ts:194-208
+// `withIncluded` strips `included` and `messageId`).
+//
+// The closure half of T1 — `projectTranscript` has no consumer other than the two in
+// harness.ts (the projection rebuild at :8393 and the request path at :9199) — is a grep,
+// recorded in docs/tasks/2026-11-10-context-trimmer-uplift.md, not an assertion here.
+// ---------------------------------------------------------------------------
+
+describe('context inclusion — the engine core trims nothing (uplift T1 / H1)', () => {
+    // Every auto-loaded built-in, replaced by an inert stub of the SAME name. Derived from
+    // BUILTIN_PLUGINS rather than a literal list on purpose: if a fourth built-in ever ships,
+    // it is stubbed here too, so this fixture cannot drift into "the engine trims nothing except
+    // for whatever the new plugin does".
+    const inertBuiltins = (): HarnessPlugin[] => BUILTIN_PLUGINS.map((plugin) => ({ name: plugin.name }));
+
+    // The conversation the identity is asserted over — real shape, so identity is non-trivial:
+    // a completed tool unit (assistant `toolCalls` plus its `tool` result), a STANDALONE
+    // assistant entry carrying `reasoning`, and a second user turn. A pair has to survive as a
+    // pair, thinking has to survive as thinking, and two user turns have to survive as two.
+    const identitySeed = (): HarnessMessage[] => [
+        { role: 'user', content: 'first question' },
+        {
+            role: 'assistant',
+            content: '',
+            reasoning: 'planning the alpha call',
+            toolCalls: [call('c1', 'alpha', '{"path":"a.ts"}')]
+        },
+        { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+        { role: 'assistant', content: 'first answer', reasoning: 'summarising A' },
+        { role: 'user', content: 'second question' }
+    ];
+
+    // One settled run with no policy in the process: the scripted stream records the exact
+    // projection each request received (the `scripted`/`seen` pattern of section 1), and
+    // `report.stateChange` records every canonical write — "which writes notify" is how the
+    // rest of this file proves a write happened, so the ABSENCE of a third event is the
+    // evidence that the engine touched no recorded entry.
+    const unpolicedRun = async (prompt = 'third question') => {
+        const seen: HarnessMessage[][] = [];
+        const changes: HarnessStateChangeEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    messages: identitySeed(),
+                    stream: scripted([answer('settled')], seen)
+                })
+            },
+            tools: { alpha: echoTool('alpha', 'A') },
+            // `presets: false` keeps the transcript exactly the seed plus the run's own
+            // entries — no preset instruction can be mistaken for an engine-side write.
+            presets: false,
+            plugins: inertBuiltins(),
+            report: {
+                stateChange: (event: HarnessStateChangeEvent) => void changes.push(event)
+            }
+        });
+
+        await writer(prompt);
+
+        return { writer, seen, changes };
+    };
+
+    it('T1: with no context policy installed and no flags anywhere, the projection is the identity — the engine core trims nothing', async () => {
+        const { writer, seen, changes } = await unpolicedRun();
+        const request = seen[0];
+        const canonical = writer.agent.messages;
+
+        // --- PRECONDITION, verified not assumed: the three context policies are out. -------
+        // Applied names come from the manifest, so every built-in really was replaced rather
+        // than dropped or shadowed.
+        expect(writer.plugins).toEqual(BUILTIN_PLUGINS.map((plugin) => plugin.name));
+        // And each applied entry is the SYNTHESIZED metadata of a stub (`title === name`,
+        // `builtin: false`): the shipped descriptors — titles, `hooks`, `settings` — are gone,
+        // so no trim/compaction hook can fire and no setting can be read.
+        expect(
+            writer.pluginMetadata.map((entry) => ({
+                name: entry.name,
+                title: entry.title,
+                builtin: entry.builtin
+            }))
+        ).toEqual(
+            BUILTIN_PLUGINS.map((plugin) => ({ name: plugin.name, title: plugin.name, builtin: false }))
+        );
+
+        // --- THE REQUEST, entry for entry, hardcoded rather than read off the run. ---------
+        // One request for one prompt: the engine spent no extra round of its own.
+        expect(seen).toHaveLength(1);
+        expect(request).toHaveLength(6);
+        expect(request).toStrictEqual([
+            { role: 'user', content: 'first question' },
+            {
+                role: 'assistant',
+                content: '',
+                reasoning: 'planning the alpha call',
+                toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{"path":"a.ts"}' }]
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'first answer', reasoning: 'summarising A' },
+            { role: 'user', content: 'second question' },
+            { role: 'user', content: 'third question' }
+        ]);
+        // The same list in the failure-readable form this file uses everywhere: a dropped or
+        // moved entry shows up here as one changed line instead of a full-object diff.
+        expect(shape(request)).toEqual([
+            'user:first question',
+            'assistant::c1',
+            'tool:c1:A',
+            'assistant:first answer:',
+            'user:second question',
+            'user:third question'
+        ]);
+        // Nothing was reordered into a broken pair: the strict pairing oracle says the
+        // answered unit arrived as a unit.
+        expect(pairIssues(request)).toEqual([]);
+
+        // The two fields a context window or a "send the essentials" pass would drop first:
+        // `reasoning` on both assistant entries, and the `toolCalls` the result answers.
+        expect(
+            request.map((message) => ({
+                role: message.role,
+                reasoning: message.role === 'assistant' ? message.reasoning ?? null : null,
+                toolCalls: message.role === 'assistant' ? (message.toolCalls ?? []).map((entry) => entry.id) : []
+            }))
+        ).toEqual([
+            { role: 'user', reasoning: null, toolCalls: [] },
+            { role: 'assistant', reasoning: 'planning the alpha call', toolCalls: ['c1'] },
+            { role: 'tool', reasoning: null, toolCalls: [] },
+            { role: 'assistant', reasoning: 'summarising A', toolCalls: [] },
+            { role: 'user', reasoning: null, toolCalls: [] },
+            { role: 'user', reasoning: null, toolCalls: [] }
+        ]);
+
+        // --- THE IDENTITY, stated the way the task states it. ------------------------------
+        // Every RECORDED entry is in the request, in canonical order, with equal content: the
+        // request is the canonical prefix with `messageId` stripped, entry for entry. Six
+        // recorded entries at request time; the seventh is the answer committed AFTER the
+        // request, which is the only difference between the two lists.
+        expect(canonical).toHaveLength(7);
+        expect(withoutIds(canonical.slice(0, request.length))).toStrictEqual(request);
+
+        // No flag key reaches a request object — not `included`, and not the address
+        // `messageId`. `harness.ts:6566-6570` promises a custom `HarnessStream` flag-free
+        // data, so the keys must be ABSENT, not merely undefined.
+        expect(carriesFlag(request)).toBe(false);
+        expect(
+            request.map((message) =>
+                Object.keys(message).filter((key) => key === 'included' || key === 'messageId')
+            )
+        ).toEqual([[], [], [], [], [], []]);
+
+        // Nothing was flagged on the way in either, so "the filter skipped nothing" is a fact
+        // about the fixture rather than an inference: no canonical entry carries the key.
+        expect(canonical.filter((message) => message.included !== undefined)).toStrictEqual([]);
+        expect(JSON.stringify(canonical)).not.toContain('included');
+
+        // --- THE ENGINE WROTE NOTHING. ----------------------------------------------------
+        // Exactly two transcript notifications for the run: its own user append and its own
+        // committed answer — the identical baseline a read-only `turn.before` hook produces
+        // (this file:1643). A third `agent_message` would mean something in the engine edited
+        // or flagged a recorded entry on its own.
+        expect(changesOf(changes)).toEqual(['agent_message:writer:-', 'agent_message:writer:-']);
+
+        // --- AND IT STILL HOLDS A TURN LATER, with the run's own answer now recorded. ------
+        // Seven recorded entries plus the new prompt = an eight-message request. This is the
+        // shape an engine-side horizon ("send the last N turns") breaks first, and it is why
+        // the identity is asserted on the second turn as well as the first.
+        await writer('fourth question');
+
+        const second = seen[1];
+
+        expect(seen).toHaveLength(2);
+        expect(second).toHaveLength(8);
+        expect(shape(second)).toEqual([
+            'user:first question',
+            'assistant::c1',
+            'tool:c1:A',
+            'assistant:first answer:',
+            'user:second question',
+            'user:third question',
+            'assistant:settled:',
+            'user:fourth question'
+        ]);
+        expect(pairIssues(second)).toEqual([]);
+        expect(withoutIds(writer.agent.messages.slice(0, second.length))).toStrictEqual(second);
+        expect(
+            second.map((message) =>
+                Object.keys(message).filter((key) => key === 'included' || key === 'messageId')
+            )
+        ).toEqual([[], [], [], [], [], [], [], []]);
+        // Two turns, two appends, two commits, and still no engine-side history write.
+        expect(changesOf(changes)).toEqual([
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-'
+        ]);
+        expect(writer.agent.messages.filter((message) => message.included !== undefined)).toStrictEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 12 — the SHIPPED trimmer's write over a transcript that mixes a kept block with a
+//      withheld one (uplift T4 / Part F invariant 1: pair-atomicity)
+// ---------------------------------------------------------------------------
+// WHY THIS CASE EXISTS
+// --------------------
+// Sections 1-11 drive the flag by hand (a host mutation or a synthetic `turn.before` handler);
+// section 11 proves the opposite posture, that with NO policy installed the projection is the
+// identity. Neither of them runs the plugin that now owns trimming. Part F invariant 1 says a
+// tool unit leaves the context WHOLE or not at all, whatever switch admitted it, and asks for
+// that to be green on a block with one withheld and one kept call — through the REAL built-in,
+// in a REAL run, so the write path (`turn.before` -> `setIncluded(leader, false)` -> the
+// request built from the canonical projection) is what is under test, not a fake api's log.
+//
+// The transcript is deliberately the two shapes T4 makes adjacent:
+//   * a MIXED block (one `failed` answer and one healthy one) — a documented KEEP under every
+//     combination of the switches (F2), so it must still be in the request, pair intact; and
+//   * the all-`failed` unit right after it — the shape `dropSupersededToolCalls` (and, at the
+//     default outcome set, the generalisation too) withholds, because a later unit answered the
+//     same tool with a `completed` result.
+// That adjacency is the pairing hazard: the withheld unit's leader and its result sit between
+// two KEPT units, and a cascade that leaked one of them would produce either an orphan `tool`
+// message or an assistant block with a missing answer — both of which `pairIssues` catches.
+//
+// Settings are pinned through `pluginSettings` rather than trusted to ambient defaults, so the
+// switches that produce this request are part of the fixture (F5: settings are process-wide and
+// live, so a fixture that reads them implicitly is a fixture that can drift).
+// ---------------------------------------------------------------------------
+
+describe('context inclusion — the trimmer withholds a whole unit beside a kept one (uplift T4 / F1)', () => {
+    // Only the trimmer's keys are pinned; every other (plugin, key) returns `undefined`, which is
+    // the harness's signal to fall back to the DECLARED default
+    // (src/plugin/settings.ts reads through this provider). So the matcher, the duplicate switch
+    // and the economy knobs stay exactly as shipped, and the case is about the switches it names.
+    const trimmerSettings = (values: Record<string, boolean | string | number>): HarnessPluginSettingsProvider => ({
+        get: (plugin: string, key: string) => (plugin === 'context-trimmer' ? values[key] : undefined)
+    });
+
+    // The seed: user prompt, the MIXED unit (`a1` refused, `a2` answered), the all-`failed` unit
+    // (`a3`), the unit that ANSWERS it (`a4`, `completed`), and a closing assistant turn. The
+    // outcome keys are the stored spelling (core/tool-outcome.ts: only a NON-`completed` outcome
+    // is ever stored), so a restored transcript reads exactly like this one.
+    const adjacencySeed = (): HarnessMessage[] => [
+        { role: 'user', content: 'question' },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+                { id: 'a1', name: 'alpha', arguments: '{"path":"a.ts"}' },
+                { id: 'a2', name: 'alpha', arguments: '{"path":"b.ts"}' }
+            ]
+        },
+        { role: 'tool', content: 'Tool "alpha" failed: boom', toolCallId: 'a1', name: 'alpha', outcome: 'failed' },
+        { role: 'tool', content: 'A', toolCallId: 'a2', name: 'alpha' },
+        { role: 'assistant', content: '', toolCalls: [{ id: 'a3', name: 'alpha', arguments: '{"path":"c.ts"}' }] },
+        { role: 'tool', content: 'Tool "alpha" failed: nope', toolCallId: 'a3', name: 'alpha', outcome: 'failed' },
+        { role: 'assistant', content: '', toolCalls: [{ id: 'a4', name: 'alpha', arguments: '{"path":"d.ts"}' }] },
+        { role: 'tool', content: 'A', toolCallId: 'a4', name: 'alpha' },
+        { role: 'assistant', content: 'answered' }
+    ];
+
+    const runTrimmed = async (settings: Record<string, boolean | string | number>) => {
+        const seen: HarnessMessage[][] = [];
+        const changes: HarnessStateChangeEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    messages: adjacencySeed(),
+                    stream: scripted([answer('settled')], seen)
+                })
+            },
+            tools: { alpha: echoTool('alpha', 'A') },
+            presets: false,
+            // NO `plugins` key: the auto-discovered built-ins load, trimmer included — which is
+            // the point. The applied roster is asserted below so "the real plugin ran" is evidence
+            // rather than an assumption about auto-discovery.
+            pluginSettings: trimmerSettings(settings),
+            report: { stateChange: (event: HarnessStateChangeEvent) => void changes.push(event) }
+        });
+
+        await writer('go');
+
+        return { writer, seen, changes };
+    };
+
+    it('withholds the failed unit and only that unit: the kept pair, the mixed block and the answering block all stay, and the request is pair-clean', async () => {
+        const { writer, seen } = await runTrimmed({
+            enabled: true,
+            dropSupersededToolCalls: true,
+            dropInvalidToolCallsOnceAnswered: true,
+            invalidOutcomes: 'failed,rejected'
+        });
+
+        // The built-in really was the one installed (auto-discovery, not a stub of section 11).
+        expect(writer.plugins).toEqual(expect.arrayContaining(['context-trimmer']));
+        expect(seen).toHaveLength(1);
+
+        const request = seen[0];
+
+        // THE PAIRING ORACLE — the assertion Part F invariant 1 asks for. The withheld unit's
+        // leader and its result sat BETWEEN two kept units; nothing leaked and nothing orphaned.
+        expect(pairIssues(request)).toEqual([]);
+
+        // Entry for entry, hardcoded from the contract (kept mixed block, kept answering block,
+        // the withheld pair gone, the run's own user append last), not read back off the run.
+        expect(shape(request)).toEqual([
+            'user:question',
+            'assistant::a1|a2',
+            'tool:a1:Tool "alpha" failed: boom',
+            'tool:a2:A',
+            'assistant::a4',
+            'tool:a4:A',
+            'assistant:answered:',
+            'user:go'
+        ]);
+        // `a3` — the withheld call — appears nowhere in the request, and neither does its result.
+        expect(request.some((message) => JSON.stringify(message).includes('a3'))).toBe(false);
+        expect(request).toHaveLength(8);
+
+        // --- CANONICAL HISTORY IS UNTOUCHED, only flagged. ---------------------------------
+        const canonical = writer.agent.messages;
+
+        expect(canonical).toHaveLength(11);
+        expect(shape(canonical)).toEqual([
+            'user:question',
+            'assistant::a1|a2',
+            'tool:a1:Tool "alpha" failed: boom',
+            'tool:a2:A',
+            'assistant::a3',
+            'tool:a3:Tool "alpha" failed: nope',
+            'assistant::a4',
+            'tool:a4:A',
+            'assistant:answered:',
+            'user:go',
+            'assistant:settled:'
+        ]);
+        // Exactly the withheld unit carries the key — the leader AND its result, because the
+        // cascade is what keeps the request pair-clean — and `true` is never stored.
+        expect(
+            canonical
+                .map((message, index) => ({ index, included: message.included }))
+                .filter((entry) => entry.included !== undefined)
+        ).toEqual([
+            { index: 4, included: false },
+            { index: 5, included: false }
+        ]);
+    });
+
+    it('a second turn re-derives the same plan, writes nothing new, and cannot switch the unit back on', async () => {
+        const { writer, seen } = await runTrimmed({
+            enabled: true,
+            dropSupersededToolCalls: true,
+            dropInvalidToolCallsOnceAnswered: true,
+            invalidOutcomes: 'failed,rejected'
+        });
+
+        await writer('again');
+
+        expect(seen).toHaveLength(2);
+
+        const second = seen[1];
+
+        // Invariant 2 (withhold-only) and invariant 3 (idempotence), read off the second request:
+        // the withheld pair is still absent, the kept shapes are still present, and the pair is
+        // still clean — the plan was re-derived and found nothing new to do.
+        expect(pairIssues(second)).toEqual([]);
+        expect(shape(second)).toEqual([
+            'user:question',
+            'assistant::a1|a2',
+            'tool:a1:Tool "alpha" failed: boom',
+            'tool:a2:A',
+            'assistant::a4',
+            'tool:a4:A',
+            'assistant:answered:',
+            'user:go',
+            'assistant:settled:',
+            'user:again'
+        ]);
+
+        // Still exactly two flagged entries: a pass that wrote again would have flagged the same
+        // pair (no new entry) or re-enabled it, and both are visible here.
+        expect(
+            writer.agent.messages.filter((message) => message.included === false)
+        ).toHaveLength(2);
+    });
+
+    it('the SAME transcript with the tool switches off keeps every entry — the write is the switches, not the plugin existing', async () => {
+        const { seen } = await runTrimmed({
+            enabled: true,
+            dropSupersededToolCalls: false,
+            dropInvalidToolCallsOnceAnswered: false,
+            invalidOutcomes: 'failed,rejected'
+        });
+
+        expect(seen).toHaveLength(1);
+
+        const request = seen[0];
+
+        // The control for the two cases above: with both tool switches off, the identical
+        // transcript goes to the provider untouched, so the withholding below is provably the
+        // switch and not the plugin's presence.
+        expect(pairIssues(request)).toEqual([]);
+        expect(shape(request)).toEqual([
+            'user:question',
+            'assistant::a1|a2',
+            'tool:a1:Tool "alpha" failed: boom',
+            'tool:a2:A',
+            'assistant::a3',
+            'tool:a3:Tool "alpha" failed: nope',
+            'assistant::a4',
+            'tool:a4:A',
+            'assistant:answered:',
+            'user:go'
+        ]);
+        expect(request.some((message) => JSON.stringify(message).includes('a3'))).toBe(true);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 13 — THE SECOND AXIS: `reasoningIncluded` resolves OUT of the projection
+//      (trimmer uplift T6 / orchestrator decisions I1 and I2)
+// ---------------------------------------------------------------------------
+// WHAT THIS SECTION PINS, AND WHY IT IS A DIFFERENT SHAPE OF TEST
+// ---------------------------------------------------------------
+// Sections 1-12 are about the FIRST axis: `included === false` removes an entry (or a whole
+// tool unit) from the request. The second axis does not remove anything. `reasoningIncluded:
+// false` on one ASSISTANT entry keeps that entry in the request — same position, same `content`,
+// same `toolCalls` — and removes its THINKING from the copy the provider sees. Two consequences
+// make it a different contract to test:
+//
+//   1. THE FLAG NEVER REACHES A REQUEST. `core/agent.ts` `withoutWithheldReasoning` (run by
+//      `projectTranscript` through `requestCopyOf`) drops BOTH the `reasoning` key and the flag
+//      key, so a request object is flag-free on both axes and the transport needs no new field:
+//      the ABSENCE of `reasoning` is the wire signal the transport's echo decision reads. The
+//      assertions below therefore compare whole request objects with `toStrictEqual` — the one
+//      comparison that proves a key is genuinely absent rather than `undefined`.
+//   2. THE PAIRING ORACLE CANNOT SEE IT, which is the point: `pairIssues` stays empty for every
+//      case here precisely because nothing structural moved.
+//
+// Canonical state is the other half: the flag lives on the entry, the thinking TEXT survives
+// beside it, and `true` is the exact inverse (it deletes the key). Persistence is the fourth
+// case, because this field had to be whitelisted by the snapshot reader and the branch copier
+// (`core/snapshot.ts`, `core/branch.ts`) or a transcript with a withheld thought would have
+// stopped restoring.
+// ---------------------------------------------------------------------------
+
+describe('context inclusion — the thinking flag resolves out of the projection (uplift T6)', () => {
+    // A seed with two finished turns, both carrying thinking, so one entry can be flagged and its
+    // neighbour left alone: the projection must change ONE request copy and nothing else.
+    const thinkingSeed = (): HarnessMessage[] => [
+        { role: 'system', content: 'Write.' },
+        { role: 'user', content: 'question' },
+        { role: 'assistant', content: 'first answer', reasoning: 'the first thought' },
+        { role: 'user', content: 'second question' },
+        { role: 'assistant', content: 'second answer', reasoning: 'the second thought' }
+    ];
+
+    // The run that produces an OPEN turn: iteration 1 asks for a tool, so the request built for
+    // iteration 2 contains the run's OWN assistant entry — the entry a `turn` policy must never
+    // strip. Reasoning frames are scripted, so the committed entries carry thinking the assertions
+    // can name.
+    const TOOL_TURNS: HarnessStreamEvent[][] = [
+        [
+            { type: 'reasoning', delta: 'planning the c1 call' },
+            { type: 'done', stopReason: 'tool_calls', toolCalls: [call('c1', 'alpha')] }
+        ],
+        [{ type: 'reasoning', delta: 'the final thought' }, ...answer('settled')]
+    ];
+
+    // `controlRun` plus a settings provider, which a thinking fixture HERE cannot do without: the
+    // auto-discovered built-ins load in every case in this file (a host plugin only REPLACES a
+    // built-in it names, src/plugin/host.ts), so the shipped trimmer is live unless a provider
+    // turns it off — and its `dropOldThoughts` default is `turn`. A fixture that reads that
+    // implicitly is a fixture whose request was produced by a switch it never named (F5).
+    // Only the trimmer's keys are pinned; every other (plugin, key) returns `undefined`, which is the
+    // harness's signal to use the DECLARED default (src/plugin/settings.ts reads through this
+    // provider). Same builder as section 12's, for the same reason.
+    const trimmerProvider = (values: Record<string, boolean | string | number>): HarnessPluginSettingsProvider => ({
+        get: (plugin: string, key: string) => (plugin === 'context-trimmer' ? values[key] : undefined)
+    });
+
+    const thinkingRun = async (options: {
+        prompt?: string;
+        seed?: HarnessMessage[];
+        turns?: HarnessStreamEvent[][];
+        settings?: Record<string, boolean | string | number>;
+        hook?: (context: HarnessTurnBeforeContext) => void;
+        stateChanges?: HarnessStateChangeEvent[];
+    }) => {
+        const seen: HarnessMessage[][] = [];
+        const stateChanges = options.stateChanges;
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    ...(options.seed === undefined ? {} : { messages: options.seed }),
+                    stream: scripted(options.turns ?? [answer('settled')], seen)
+                })
+            },
+            tools: { alpha: echoTool('alpha', 'A') },
+            presets: false,
+            ...(options.settings === undefined ? {} : { pluginSettings: trimmerProvider(options.settings) }),
+            ...(options.hook === undefined
+                ? {}
+                : { plugins: [turnBeforePlugin('thinking-control', (context) => options.hook?.(context))] }),
+            ...(stateChanges === undefined
+                ? {}
+                : { report: { stateChange: (event: HarnessStateChangeEvent) => void stateChanges.push(event) } })
+        });
+
+        await writer(options.prompt ?? 'go');
+
+        return { writer, seen };
+    };
+
+    // A harness that restores a document and continues it, with the shipped trimmer OFF. The case
+    // below is about the RESTORED FLAG resolving out of the projection on its own — with no provider
+    // the auto-loaded built-in (default tier `turn`) would flag the other closed turns too, and the
+    // request would no longer name one decision.
+    const restoreTarget = (seen: HarnessMessage[][], reply: string) =>
+        harness({
+            agents: {
+                writer: agent({ model: 'test/model', stream: scripted([answer(reply)], seen) })
+            },
+            tools: { alpha: echoTool('alpha', 'A') },
+            presets: false,
+            pluginSettings: trimmerProvider({ enabled: false })
+        });
+
+    // The settings every control-surface case below runs under: the shipped trimmer OFF, so the ONLY
+    // thing that can withhold anything is the hook the case names.
+    const TRIMMER_OFF = { enabled: false };
+
+    it('withholds one entry\'s thinking from the request while its text, its neighbours and the pair all stay', async () => {
+        const changes: HarnessStateChangeEvent[] = [];
+        const quiet: HarnessStateChangeEvent[] = [];
+
+        // The control: a round that only reads. Whatever the writing round adds has to be the write.
+        const baseline = await thinkingRun({
+            seed: thinkingSeed(),
+            turns: TOOL_TURNS,
+            settings: TRIMMER_OFF,
+            hook: () => undefined,
+            stateChanges: quiet
+        });
+
+        expect(baseline.seen).toHaveLength(2);
+        // With the switch off, both seeded entries keep their thinking in the request.
+        expect(baseline.seen[0][2]).toStrictEqual({
+            role: 'assistant',
+            content: 'first answer',
+            reasoning: 'the first thought'
+        });
+
+        const { writer, seen } = await thinkingRun({
+            seed: thinkingSeed(),
+            turns: TOOL_TURNS,
+            settings: TRIMMER_OFF,
+            stateChanges: changes,
+            hook: (context) => {
+                // Iteration 1 only: the second round is what proves the write is transcript state
+                // and not a per-round decision.
+                if (context.iteration !== 1) return;
+
+                context.setReasoningIncluded(entryWith(context, 'first answer'), false);
+            }
+        });
+
+        // --- REQUEST 1. ---------------------------------------------------------------------
+        // Entry 2 is the flagged one: still here, same slot, same `content` — and NO `reasoning`
+        // key. Its neighbour, one entry later, keeps its thinking verbatim.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer', reasoning: 'the second thought' },
+            { role: 'user', content: 'go' }
+        ]);
+
+        // --- REQUEST 2, the round with an OPEN turn. ----------------------------------------
+        // The run's own assistant entry travels WITH its thinking, next to the flagged entry which
+        // travels WITHOUT it, and the tool result still answers its call.
+        expect(seen[1]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer', reasoning: 'the second thought' },
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [call('c1', 'alpha')],
+                reasoning: 'planning the c1 call'
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' }
+        ]);
+
+        // NEITHER flag key reaches a request object — `included` and `reasoningIncluded` both
+        // contain the word, so one substring check covers the two axes. The absence of the thinking
+        // is spelled by the missing key, never by a flag.
+        expect(seen.map(carriesFlag)).toEqual([false, false]);
+        // The pairing oracle cannot see this axis, and cannot be broken by it.
+        expect(seen.map(pairIssues)).toEqual([[], []]);
+
+        // --- CANONICAL: the flag is the write, and the text survives beside it. --------------
+        expect(withoutIds(writer.agent.messages)).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer', reasoning: 'the first thought', reasoningIncluded: false },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer', reasoning: 'the second thought' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')], reasoning: 'planning the c1 call' },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'settled', reasoning: 'the final thought' }
+        ]);
+        // The FIRST axis is untouched — a thinking write never sets `included` — and no thought was
+        // destroyed: FOUR assistant entries carry thinking (the two seeded answers, the run's own
+        // tool-call turn, and its final answer), and every one of them still has its `reasoning`
+        // text, including the flagged one. That is the whole point of the flag being a switch
+        // rather than an edit (I1).
+        expect(writer.agent.messages.some((message) => message.included === false)).toBe(false);
+        expect(
+            writer.agent.messages.filter(
+                (message) => message.role === 'assistant' && message.reasoning !== undefined
+            )
+        ).toHaveLength(4);
+
+        // --- DURABILITY CLASS: one transcript change, exactly like a flag write on axis one. --
+        // The quiet round's events are what the two iterations record: the prompt append, the tool
+        // turn, the tool result, the tool execution itself, and the final answer. The writing round
+        // inserts EXACTLY one more `agent_message` — the flag write, which lands inside iteration 1's
+        // `turn.before`, i.e. after the prompt and before that iteration's assistant entry — and that
+        // single notification is what a shared store turns into a save.
+        expect(changesOf(quiet)).toEqual([
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'tool_execute:writer:-',
+            'agent_message:writer:-'
+        ]);
+        expect(changesOf(changes)).toEqual([
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'agent_message:writer:-',
+            'tool_execute:writer:-',
+            'agent_message:writer:-'
+        ]);
+    });
+
+    it('addresses one entry by index, by messageId and by entry, refuses every other role, and never cascades', async () => {
+        // A tool unit whose LEADER carries thinking — the shape where a cascade would be visible,
+        // because `setIncluded` on this same entry would have taken the result with it.
+        const unitSeed = (): HarnessMessage[] => [
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')], reasoning: 'planning the c1 call' },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered', reasoning: 'summarising A' }
+        ];
+
+        const failures: string[] = [];
+
+        const { writer } = await thinkingRun({
+            seed: unitSeed(),
+            settings: TRIMMER_OFF,
+            hook: (context) => {
+                const attempt = (run: () => void): void => {
+                    try {
+                        run();
+                    } catch (error) {
+                        failures.push((error as Error).message);
+                    }
+                };
+
+                // Every refusal below was captured from a scratch probe driving this same control
+                // surface (Temp/T6) and then hardcoded, so changed wording fails loudly.
+                attempt(() => context.setReasoningIncluded(context.entries[0], false));
+                attempt(() => context.setReasoningIncluded(2, false));
+                attempt(() => context.setReasoningIncluded(context.entries[1], 'false'));
+                attempt(() => context.setReasoningIncluded(context.entries[1], undefined));
+                attempt(() => context.setReasoningIncluded(99, false));
+                attempt(() => context.setReasoningIncluded(Number.NaN, false));
+                attempt(() => context.setReasoningIncluded('msg-99', false));
+                attempt(() => context.setReasoningIncluded('', false));
+                attempt(() => context.setReasoningIncluded({} as never, false));
+
+                // The two non-entry targets, on an eligible entry: the index writes the flag, the
+                // `messageId` removes it again (the exact inverse), and the entry object then flags
+                // a DIFFERENT assistant entry — so exactly one flag survives.
+                context.setReasoningIncluded(1, false);
+                context.setReasoningIncluded(String(context.entries[1].messageId), true);
+                context.setReasoningIncluded(context.entries[3], false);
+            }
+        });
+
+        expect(failures).toEqual([
+            'turn.before setReasoningIncluded cannot switch thinking on a user message: only an assistant entry carries reasoning, so only an assistant entry can withhold it.',
+            'turn.before setReasoningIncluded cannot switch thinking on a tool message: only an assistant entry carries reasoning, so only an assistant entry can withhold it.',
+            'turn.before setReasoningIncluded needs a boolean for `reasoningIncluded`; received "false".',
+            'turn.before setReasoningIncluded needs a boolean for `reasoningIncluded`; received undefined.',
+            'turn.before setReasoningIncluded index 99 is outside this transcript (0-4).',
+            'turn.before setReasoningIncluded needs an integer transcript index; received NaN.',
+            'turn.before setReasoningIncluded received a stale messageId "msg-99": no entry with that id is in the transcript. Read `entries` again after `replaceHistory()`.',
+            'turn.before setReasoningIncluded needs a non-empty messageId; received an empty string.',
+            'turn.before setReasoningIncluded needs a transcript index, an entry from this turn, or a messageId.'
+        ]);
+
+        // THE CASCADE, or rather its absence: exactly ONE flagged entry — the last successful call's
+        // target — while the tool result of the same unit carries no key, although `setIncluded` on
+        // that leader would have withheld the result too.
+        expect(
+            writer.agent.messages.map((message, index) => ({
+                index,
+                messageId: (message as { messageId?: string }).messageId,
+                reasoningIncluded: (message as { reasoningIncluded?: boolean }).reasoningIncluded
+            }))
+        ).toEqual([
+            { index: 0, messageId: 'msg-1', reasoningIncluded: undefined },
+            { index: 1, messageId: 'msg-2', reasoningIncluded: undefined },
+            { index: 2, messageId: 'msg-3', reasoningIncluded: undefined },
+            { index: 3, messageId: 'msg-4', reasoningIncluded: false },
+            { index: 4, messageId: 'msg-5', reasoningIncluded: undefined },
+            { index: 5, messageId: 'msg-6', reasoningIncluded: undefined }
+        ]);
+
+        // `true` is never stored: the run's snapshot has no key except the one write that survived.
+        expect(JSON.stringify(writer.snapshot()).match(/reasoningIncluded/g)).toHaveLength(1);
+    });
+
+    it('treats `true` as the exact inverse, on a transcript that arrives already flagged', async () => {
+        const unitSeed = (): HarnessMessage[] => [
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')], reasoning: 'planning the c1 call' },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered', reasoning: 'summarising A' }
+        ];
+
+        // The withheld shape arriving from the outside (a host's JSON, or a restore), withheld again
+        // by nothing: the projection resolves the flag on its own.
+        const preFlagged = unitSeed();
+
+        preFlagged[1] = { ...preFlagged[1], reasoningIncluded: false };
+
+        const withheld = await thinkingRun({ seed: preFlagged, settings: TRIMMER_OFF });
+
+        expect(withheld.seen[0][1]).toStrictEqual({
+            role: 'assistant',
+            content: '',
+            toolCalls: [call('c1', 'alpha')]
+        });
+
+        // A later round re-enabling it is the exact inverse: the KEY is gone (not `true`), and the
+        // next request carries the thinking again.
+        const reenabled = await thinkingRun({
+            seed: preFlagged,
+            settings: TRIMMER_OFF,
+            hook: (context) => {
+                context.setReasoningIncluded(context.entries[1], true);
+            }
+        });
+
+        expect(reenabled.seen[0]).toStrictEqual([
+            { role: 'user', content: 'question' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [call('c1', 'alpha')],
+                reasoning: 'planning the c1 call'
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered', reasoning: 'summarising A' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(withoutIds(reenabled.writer.agent.messages[1])).toStrictEqual({
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }],
+            reasoning: 'planning the c1 call'
+        });
+        // `true` is nowhere in the durable document either.
+        expect(JSON.stringify(reenabled.writer.snapshot()).includes('reasoningIncluded')).toBe(false);
+    });
+
+    it('a snapshot carries the flag, a restore puts it back, and a plugin-free continue still omits the thinking', async () => {
+        const { writer } = await thinkingRun({
+            seed: thinkingSeed(),
+            settings: TRIMMER_OFF,
+            hook: (context) => {
+                context.setReasoningIncluded(entryWith(context, 'first answer'), false);
+            }
+        });
+
+        // THE PERSISTENCE CONTRACT — the whitelist warning in ../types made executable: a
+        // per-message field the snapshot reader does not list either refuses the transcript or
+        // restores it WITHOUT the flag, and this is the case that would catch both.
+        const snapshot = JSON.parse(JSON.stringify(writer.snapshot())) as HarnessSnapshot;
+
+        expect(withoutIds(snapshot.agents.writer.messages[2])).toStrictEqual({
+            role: 'assistant',
+            content: 'first answer',
+            reasoning: 'the first thought',
+            reasoningIncluded: false
+        });
+        expect(
+            snapshot.agents.writer.messages.filter(
+                (message) => (message as { reasoningIncluded?: boolean }).reasoningIncluded !== undefined
+            )
+        ).toHaveLength(1);
+
+        const restoredSeen: HarnessMessage[][] = [];
+        const target = restoreTarget(restoredSeen, 'restored');
+
+        target.restore(snapshot);
+
+        // `restore -> snapshot` is a fixed point: the reader accepts the key and writes it back
+        // verbatim, and never invents `reasoningIncluded: true`.
+        expect(target.snapshot()).toEqual(snapshot);
+        expect(JSON.stringify(target.snapshot()).match(/reasoningIncluded/g)).toHaveLength(1);
+
+        // The stable address survived too — the flag and the id name the same entry.
+        expect(withoutIds(target.agent.messages[2])).toStrictEqual({
+            role: 'assistant',
+            content: 'first answer',
+            reasoning: 'the first thought',
+            reasoningIncluded: false
+        });
+
+        await target('again');
+
+        // The decision survives the restart with NOTHING making the choice: no host plugin, and the
+        // auto-loaded built-in explicitly OFF (the provider above), so the ONLY reason this request
+        // omits the thinking is the restored flag resolving out of the projection. Every other
+        // thought is still sent.
+        expect(restoredSeen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer', reasoning: 'the second thought' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'settled' },
+            { role: 'user', content: 'again' }
+        ]);
+        expect(pairIssues(restoredSeen[0])).toEqual([]);
+        expect(carriesFlag(restoredSeen[0])).toBe(false);
+
+        // A hand-edited or host-round-tripped `reasoningIncluded: true` is accepted and NORMALIZED
+        // to the absent form — the same treatment `included: true` gets, and what keeps
+        // `restore -> snapshot` idempotent instead of re-adding a key the runtime never writes.
+        const edited = JSON.parse(JSON.stringify(writer.snapshot())) as HarnessSnapshot;
+
+        (edited.agents.writer.messages[4] as { reasoningIncluded?: boolean }).reasoningIncluded = true;
+
+        const normalizedSeen: HarnessMessage[][] = [];
+        const normalizer = restoreTarget(normalizedSeen, 'normal');
+
+        normalizer.restore(edited);
+
+        // The `true` is gone on the way IN — the reader writes the ABSENT form, never `true`, exactly
+        // as it does for `included: true`.
+        expect(normalizer.agent.messages[4]).toStrictEqual({
+            role: 'assistant',
+            content: 'second answer',
+            reasoning: 'the second thought',
+            messageId: 'msg-5'
+        });
+
+        await normalizer('more');
+
+        // ... and the next request sends that thinking: normalizing `true` to "absent" means
+        // "included", so a host round-tripping its own JSON cannot accidentally lose a thought.
+        expect(normalizedSeen[0][4]).toStrictEqual({
+            role: 'assistant',
+            content: 'second answer',
+            reasoning: 'the second thought'
+        });
+        // Nothing was written by this run either: the document still carries the ONE flag it arrived
+        // with, and `true` appears nowhere.
+        expect(JSON.stringify(normalizer.snapshot()).match(/reasoningIncluded/g)).toHaveLength(1);
+    });
+
+    it('runs the shipped `turn` policy over thinking: every closed turn loses its thinking, the open turn keeps its own, and the request stays pair-clean', async () => {
+        // THE POLICY, end to end: no hand-driven write here at all — the built-in's tier rule
+        // produced these flags. The tool switches are pinned OFF so thinking is the ONLY thing this
+        // pass can withhold, which makes the request difference unambiguous.
+        const policy = {
+            enabled: true,
+            dropSupersededToolCalls: false,
+            dropInvalidToolCallsOnceAnswered: false,
+            dropOldThoughts: 'turn'
+        };
+
+        const { writer, seen } = await thinkingRun({ seed: thinkingSeed(), turns: TOOL_TURNS, settings: policy });
+
+        // Request 1: both seeded assistant entries sit at or before the last user entry (the run's
+        // own `go`), so both are CLOSED turns and neither sends its thinking. Nothing else moved.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer' },
+            { role: 'user', content: 'go' }
+        ]);
+
+        // Request 2: the run's OWN assistant entry — the open turn — keeps its thinking, in the same
+        // request that still omits both closed turns'.
+        expect(seen[1]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer' },
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [call('c1', 'alpha')],
+                reasoning: 'planning the c1 call'
+            },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' }
+        ]);
+        expect(seen.map(pairIssues)).toEqual([[], []]);
+        expect(seen.map(carriesFlag)).toEqual([false, false]);
+
+        // Canonical: the two closed turns are flagged, the open turn is not, and every thinking TEXT
+        // is still stored — the flag is a switch, not a deletion.
+        expect(
+            writer.agent.messages.map((message, index) => ({
+                index,
+                thinking: message.role === 'assistant' ? message.reasoning ?? null : null,
+                flag: (message as { reasoningIncluded?: boolean }).reasoningIncluded
+            }))
+        ).toEqual([
+            { index: 0, thinking: null, flag: undefined },
+            { index: 1, thinking: null, flag: undefined },
+            { index: 2, thinking: 'the first thought', flag: false },
+            { index: 3, thinking: null, flag: undefined },
+            { index: 4, thinking: 'the second thought', flag: false },
+            { index: 5, thinking: null, flag: undefined },
+            { index: 6, thinking: 'planning the c1 call', flag: undefined },
+            { index: 7, thinking: null, flag: undefined },
+            { index: 8, thinking: 'the final thought', flag: undefined }
+        ]);
+
+        // A SECOND RUN makes everything from the first run a CLOSED turn, and the policy re-derives
+        // it: the thinking of the entry that was OPEN a moment ago (indexes 6 and 8) leaves now, and
+        // nothing that was flagged is un-flagged. This is the re-derive claim from the spec — the
+        // rule is a function of the transcript, not a note the plugin keeps.
+        await writer('again');
+
+        // The request the second run's first iteration sent, in full: the four closed turns travel
+        // WITHOUT their thinking, the entries themselves (including the tool-call block and its
+        // answer) travel unchanged, and the new `again` prompt is last.
+        const third = seen[2];
+
+        expect(third).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')] },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'settled' },
+            { role: 'user', content: 'again' }
+        ]);
+        expect(pairIssues(third)).toEqual([]);
+        expect(carriesFlag(third)).toBe(false);
+
+        // Exactly FOUR flagged entries now — 2, 4, 6 and 8 — and the second run's own answer (index
+        // 10, the new OPEN turn) is not among them. The scripted stream's last frame is what this run
+        // replays, so it answers in one iteration and the transcript stops at index 10.
+        expect(seen).toHaveLength(3);
+        expect(
+            writer.agent.messages.map((message, index) => ({
+                index,
+                flag: (message as { reasoningIncluded?: boolean }).reasoningIncluded
+            }))
+        ).toEqual([
+            { index: 0, flag: undefined },
+            { index: 1, flag: undefined },
+            { index: 2, flag: false },
+            { index: 3, flag: undefined },
+            { index: 4, flag: false },
+            { index: 5, flag: undefined },
+            { index: 6, flag: false },
+            { index: 7, flag: undefined },
+            { index: 8, flag: false },
+            { index: 9, flag: undefined },
+            { index: 10, flag: undefined }
+        ]);
+        // And the text of every one of those four withheld thoughts is still in canonical state: the
+        // policy withheld replay, not the record.
+        expect(
+            writer.agent.messages.filter(
+                (message, index) =>
+                    (message as { reasoningIncluded?: boolean }).reasoningIncluded === false &&
+                    typeof message.reasoning === 'string' &&
+                    message.reasoning.length > 0
+            ).map((message) => message.reasoning)
+        ).toEqual(['the first thought', 'the second thought', 'planning the c1 call', 'the final thought']);
+    });
+
+    it('with the tier off, the identical transcript and run send every recorded thought and store no flag at all', async () => {
+        // THE CONTROL for the case above — H2's first half in a real run: `dropOldThoughts: "off"`
+        // is the engine's posture, so this request is the one the harness sent before this axis
+        // existed, key for key.
+        const { writer, seen } = await thinkingRun({
+            seed: thinkingSeed(),
+            turns: TOOL_TURNS,
+            settings: {
+                enabled: true,
+                dropSupersededToolCalls: false,
+                dropInvalidToolCallsOnceAnswered: false,
+                dropOldThoughts: 'off'
+            }
+        });
+
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer', reasoning: 'the first thought' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer', reasoning: 'the second thought' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(seen[1][6]).toStrictEqual({
+            role: 'assistant',
+            content: '',
+            toolCalls: [call('c1', 'alpha')],
+            reasoning: 'planning the c1 call'
+        });
+        // Nothing was written, so nothing persists: the durable document does not mention the field.
+        expect(JSON.stringify(writer.snapshot()).includes('reasoningIncluded')).toBe(false);
+        expect(writer.agent.messages.every((message) => (message as { included?: boolean }).included === undefined)).toBe(true);
+    });
+
+    // -------------------------------------------------------------------
+    // 13.1 — THE TIER ON THE WIRE (trimmer uplift H4, end to end)
+    // -------------------------------------------------------------------
+    // The two halves of the thought policy have lived in two files: §13 above pins what the
+    // PROJECTION does with a tier's flags (`withoutWithheldReasoning` drops the `reasoning` KEY
+    // from one request copy and moves nothing else), and src/transport/openai.test.ts pins what
+    // the TRANSPORT does with a projected entry (emit `reasoning_content` iff that entry carries
+    // a non-empty `reasoning`, omit it entirely otherwise). What neither file can show alone is
+    // the PAIRING — that the tier a real `turn.before` pass decided is the tier the provider
+    // actually receives. The tier→wire link was previously only IMPLIED by the two suites
+    // describing the same shape in the same words.
+    //
+    // So this case runs the shipped chain with nothing substituted:
+    //   1. the auto-discovered `context-trimmer` BUILT-IN (no host plugin, no hand-driven
+    //      `setReasoningIncluded`) configured only through `pluginSettings` via the
+    //      `trimmerProvider` above — the tool switches are pinned off so thinking is the only
+    //      thing that pass can withhold, which makes the wire difference unambiguous;
+    //   2. the real projection that pass writes through — `scripted` records the exact request
+    //      copy the harness built for each iteration, and that object IS what a transport is
+    //      handed, so capturing it here is not a mock of the transport's input, it is one;
+    //   3. the real transport building a request over a stubbed `fetch`, in the same
+    //      `sendToProvider` shape section 4 established (:793-821).
+    //
+    // The fixture is §13's own (`thinkingSeed` + `TOOL_TURNS`), and the payload compared is the
+    // TOOL-LOOP continuation: the only request that carries BOTH halves of the claim at once —
+    // two CLOSED turns with recorded thinking (the seeded answers) and the run's own OPEN-turn
+    // entry (the tool call, with the thinking that produced it).
+    // -------------------------------------------------------------------
+
+    // The wire capture: an SSE body the transport can stream to completion, a `fetch` stub that
+    // records the request it was answering, and the parsed body back. Same trio as section 4's
+    // `sendToProvider`; `afterEach` already calls `vi.unstubAllGlobals()`.
+    const sseBody = (frames: string[]): ReadableStream<Uint8Array> => {
+        const encoder = new TextEncoder();
+
+        return new ReadableStream({
+            start(controller) {
+                for (const frame of frames) controller.enqueue(encoder.encode(frame));
+                controller.close();
+            }
+        });
+    };
+
+    const wireBodyOf = async (messages: HarnessMessage[]): Promise<Record<string, unknown>> => {
+        const fetchMock = vi.fn(async () => new Response(sseBody(['data: [DONE]\n\n']), { status: 200 }));
+
+        vi.stubGlobal('fetch', fetchMock);
+
+        for await (const event of openAICompatible({ baseURL: 'http://x/v1' })({ model: 'm', messages })) {
+            // The frames are not the subject; the request BODY the transport built is.
+            void event;
+        }
+
+        const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+
+        return JSON.parse(String(init.body)) as Record<string, unknown>;
+    };
+
+    // A wire payload's `messages` list, narrowed once for the per-entry assertions below.
+    const wireMessagesOf = (body: Record<string, unknown>): Record<string, unknown>[] => body.messages as Record<string, unknown>[];
+
+    // One `tool_calls` entry in the wire's own shape: the payloads below are compared through
+    // `JSON.stringify`, so key ORDER is part of what is pinned, and the transport documents
+    // `reasoning_content` as written BEFORE `tool_calls`.
+    const wireCall = (id: string, name: string): Record<string, unknown> => ({
+        id,
+        type: 'function',
+        function: { name, arguments: '{}' }
+    });
+
+    // The same settings every tier run uses, with the tier omitted when `tier` is undefined —
+    // which is how the shipped DEFAULT is exercised, because an unlisted key resolves to the
+    // declared descriptor value (src/plugin/settings.ts), i.e. `dropOldThoughts: 'turn'`.
+    const tierSettings = (tier?: string): Record<string, boolean | string | number> => ({
+        enabled: true,
+        dropSupersededToolCalls: false,
+        dropInvalidToolCallsOnceAnswered: false,
+        ...(tier === undefined ? {} : { dropOldThoughts: tier })
+    });
+
+    it('puts the tier on the wire: `turn` echoes only the open turn, `all` is byte-identical to the pre-echo request, and `off` echoes every recorded thought (uplift H4)', async () => {
+        // One tier's TOOL-LOOP continuation, all the way to the provider payload. The projection
+        // assertions are the pair-clean invariants FIRST: if a tier moved a key, the pairing
+        // oracle fails here instead of hiding inside a byte diff.
+        const wireOf = async (tier?: string): Promise<Record<string, unknown>> => {
+            const { seen } = await thinkingRun({ seed: thinkingSeed(), turns: TOOL_TURNS, settings: tierSettings(tier) });
+
+            expect(seen).toHaveLength(2);
+            // INVARIANT 1 on every tier: the thinking axis removes a KEY, never an entry, so the
+            // oracle cannot see it — and no flag key reached a request object.
+            expect(seen.map(pairIssues)).toEqual([[], []]);
+            expect(seen.map(carriesFlag)).toEqual([false, false]);
+
+            return wireBodyOf(seen[1]);
+        };
+
+        // --- `turn`: exactly ONE echoed entry — the OPEN turn — and neither CLOSED turn. ------
+        const turn = await wireOf('turn');
+
+        expect(JSON.stringify(turn.messages)).toBe(
+            JSON.stringify([
+                { role: 'system', content: 'Write.' },
+                { role: 'user', content: 'question' },
+                { role: 'assistant', content: 'first answer' },
+                { role: 'user', content: 'second question' },
+                { role: 'assistant', content: 'second answer' },
+                { role: 'user', content: 'go' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    reasoning_content: 'planning the c1 call',
+                    tool_calls: [wireCall('c1', 'alpha')]
+                },
+                { role: 'tool', tool_call_id: 'c1', content: 'A' }
+            ])
+        );
+        // The closed turns' field is ABSENT, never `""` (a strict provider reads an empty string
+        // as a thinking block whose content is missing), and the total is exactly the number of
+        // entries this tier left eligible — so a per-entry omission cannot be confused with a
+        // whole-request one.
+        expect(wireMessagesOf(turn)[2]).not.toHaveProperty('reasoning_content');
+        expect(wireMessagesOf(turn)[4]).not.toHaveProperty('reasoning_content');
+        expect(JSON.stringify(turn).match(/reasoning_content/g)).toHaveLength(1);
+
+        // THE SHIPPED DEFAULT IS THIS TIER: the identical run with `dropOldThoughts` never
+        // supplied lands on the same bytes, so the payload above is the out-of-the-box wire.
+        const byDefault = await wireOf(undefined);
+
+        expect(JSON.stringify(byDefault.messages)).toBe(JSON.stringify(turn.messages));
+
+        // --- `all`: the pre-T8 payload, byte for byte. ---------------------------------------
+        const all = await wireOf('all');
+
+        // Declared in wire key order, because `JSON.stringify` of both sides compares BYTES:
+        // every withheld entry still travels, in the same slot, with the same `content` and the
+        // same `tool_calls`, and no thinking field anywhere — exactly what this transport sent
+        // before the echo existed.
+        const preEchoWire = [
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'second question' },
+            { role: 'assistant', content: 'second answer' },
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: '', tool_calls: [wireCall('c1', 'alpha')] },
+            { role: 'tool', tool_call_id: 'c1', content: 'A' }
+        ];
+
+        expect(JSON.stringify(all.messages)).toBe(JSON.stringify(preEchoWire));
+        // The substring is the whole claim: not one `reasoning`/`reasoning_content` key in the
+        // body, on any role.
+        expect(JSON.stringify(all)).not.toContain('reasoning');
+
+        // --- `off`: every recorded thought is echoed, in place. ------------------------------
+        const off = await wireOf('off');
+
+        expect(JSON.stringify(off.messages)).toBe(
+            JSON.stringify([
+                { role: 'system', content: 'Write.' },
+                { role: 'user', content: 'question' },
+                { role: 'assistant', content: 'first answer', reasoning_content: 'the first thought' },
+                { role: 'user', content: 'second question' },
+                { role: 'assistant', content: 'second answer', reasoning_content: 'the second thought' },
+                { role: 'user', content: 'go' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    reasoning_content: 'planning the c1 call',
+                    tool_calls: [wireCall('c1', 'alpha')]
+                },
+                { role: 'tool', tool_call_id: 'c1', content: 'A' }
+            ])
+        );
+        expect(JSON.stringify(off).match(/reasoning_content/g)).toHaveLength(3);
+
+        // THE PAIRING CLAIM, stated structurally rather than by eye: delete the echoed field
+        // from each payload and all three tiers produce the SAME request. The policy decided
+        // which thinking travels; it never reordered, reworded, re-paired or dropped an entry.
+        const withoutEcho = (body: Record<string, unknown>): string =>
+            JSON.stringify(
+                wireMessagesOf(body).map((message) => {
+                    const copy: Record<string, unknown> = { ...message };
+
+                    delete copy.reasoning_content;
+
+                    return copy;
+                })
+            );
+
+        expect(withoutEcho(turn)).toBe(withoutEcho(all));
+        expect(withoutEcho(turn)).toBe(withoutEcho(off));
+        expect(withoutEcho(turn)).toBe(JSON.stringify(preEchoWire));
     });
 });

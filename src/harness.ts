@@ -393,7 +393,7 @@ import {
 // The single context-inclusion normalizer (core/agent.ts). Direct module import,
 // the same convention as `./core/context-estimate` above: the projection needs it
 // and must not pay for the whole core barrel to get one helper.
-import { withIncluded } from './core/agent';
+import { withoutWithheldReasoning, withIncluded } from './core/agent';
 // Stable transcript addresses (context T1.2): the minting rule for the one canonical
 // creation point that lives HERE — a committed tool result. `setIncluded`'s new
 // `messageId` target reads the ids this mints (see `indexOfMessageId` in `emitTurnBefore`);
@@ -6568,6 +6568,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // key at all — not even `included: true` on a hand-built message. A custom
     // `HarnessStream` (not just the shipped transport) can therefore treat the
     // projection as flag-free data, and `turn.before` hooks receive the same value.
+    //
+    // THE SECOND AXIS (trimmer uplift T6) — `reasoningIncluded === false` on a canonical
+    // ASSISTANT entry. It does NOT skip anything: the entry still travels, in the same
+    // position, with its `content` and `toolCalls` untouched, so neither the ordering rules
+    // above nor the pairing contract can be affected by it. What it removes is the thinking
+    // text, and only from the COPY — `withoutWithheldReasoning` (core/agent.ts) omits the
+    // `reasoning` key and the flag key itself, so the request stays flag-free on both axes and
+    // the transport needs no new field: the ABSENCE of `reasoning` on a projected entry is the
+    // signal, which is what the transport's echo decision reads. Canonical state keeps the text
+    // and the flag, so re-enabling restores the previous request byte-for-byte exactly like the
+    // first axis does. With no flag anywhere on either axis the output is byte-identical to the
+    // pre-flag projection (the identity `src/harness.inclusion.test.ts` pins end to end).
+    //
+    // The request-copy of one EMITTED canonical entry: flag-free on both axes, with a withheld
+    // entry's thinking resolved out. Shared by the projection and by the plugin-override path
+    // (`emitTurnBefore`'s `requestOf`), which is the only other way a request body is built, so
+    // the two cannot disagree about what the provider sees.
+    const requestCopyOf = (message: HarnessMessage): HarnessMessage =>
+        withoutWithheldReasoning(withIncluded(message));
+
     const projectTranscript = (
         brain: Agent,
         pending: readonly HarnessPendingTool[]
@@ -6635,7 +6655,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 continue;
             }
 
-            projected.push(withIncluded(message));
+            projected.push(requestCopyOf(message));
 
             if (message.role !== 'assistant' || !message.toolCalls?.length) continue;
 
@@ -6656,7 +6676,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 const real = realById.get(call.id);
 
                 if (real !== undefined) {
-                    projected.push(withIncluded(real));
+                    // A tool RESULT can never carry the thinking flag (it is assistant-only), so
+                    // this is the same copy it always was; routing it through the one request-copy
+                    // helper is what keeps "no request object carries a flag key" a single rule.
+                    projected.push(requestCopyOf(real));
                     continue;
                 }
 
@@ -8685,6 +8708,61 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ];
         };
 
+        // Which ONE canonical message a target refers to — deliberately NOT a unit. The
+        // three target kinds and every refusal message are `resolveUnit`'s own, so the two
+        // controls refuse the same mistake in the same words; only the cascade differs, and
+        // that is a property of the flag, not of the addressing.
+        const resolveMessage = (target: HarnessContextEntry | number | string): HarnessMessage => {
+            const canonical = brain.messages;
+
+            if (typeof target === 'number') {
+                if (!Number.isInteger(target)) {
+                    throw new HarnessError(
+                        `turn.before setReasoningIncluded needs an integer transcript index; received ${String(target)}.`
+                    );
+                }
+
+                if (target < 0 || target >= canonical.length) {
+                    const bounds =
+                        canonical.length === 0
+                            ? 'it is empty, so no index is valid'
+                            : `(0-${String(canonical.length - 1)})`;
+
+                    throw new HarnessError(
+                        `turn.before setReasoningIncluded index ${String(target)} is outside this transcript ${bounds}.`
+                    );
+                }
+
+                return canonical[target];
+            }
+
+            if (typeof target === 'string') {
+                if (target.trim().length === 0) {
+                    throw new HarnessError(
+                        'turn.before setReasoningIncluded needs a non-empty messageId; received an empty string.'
+                    );
+                }
+
+                const index = indexOfMessageId(target);
+
+                if (index < 0) {
+                    throw new HarnessError(
+                        `turn.before setReasoningIncluded received a stale messageId ${JSON.stringify(target)}: no entry with that id is in the transcript. Read \`entries\` again after \`replaceHistory()\`.`
+                    );
+                }
+
+                return canonical[index];
+            }
+
+            const index = indexOfIssuedEntry(
+                target,
+                'setReasoningIncluded',
+                'turn.before setReasoningIncluded needs a transcript index, an entry from this turn, or a messageId.'
+            );
+
+            return canonical[index];
+        };
+
         const setIncluded = (
             target: HarnessContextEntry | number | string,
             included: unknown
@@ -8720,6 +8798,65 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // is still filtered. The flag write is allowed there precisely because it is
             // request-shaping and ephemeral, unlike `replaceHistory()` below, which
             // rewrites PERSISTENT state and is therefore refused on a branch run.
+            reportCanonicalWrite();
+        };
+
+        // THE SECOND AXIS (trimmer uplift T6) — one canonical write on one entry, mirroring
+        // `setIncluded` point for point on purpose: resolve the target, validate the value, THEN
+        // write in place, invalidate the shared projection cache so THE SAME REQUEST carries the
+        // change, and report one `agent_message` transcript change (batched with the round's other
+        // writes by `closeRoundObservations`, which is what keeps a multi-entry pass at one save).
+        //
+        // Two deliberate differences from `setIncluded`, both stated in ../types:
+        //   - NO cascade. Thinking belongs to exactly one message, so the write addresses exactly
+        //     that entry — `resolveMessage`, not `resolveUnit`;
+        //   - the entry is not excluded, so what the write changes is the CONTENT of its projection
+        //     copy: `projectTranscript`/`requestCopyOf` drop the `reasoning` key for a flagged entry
+        //     and never carry the flag itself. The transport sees an absence, not a new field.
+        //
+        // The value is checked before the role so a plugin holding a non-assistant entry still hears
+        // about its own typo in `included` first (the same ordering `setIncluded` documents), and
+        // BOTH checks happen before anything is written, so a refusal leaves the transcript
+        // byte-identical.
+        const setReasoningIncluded = (
+            target: HarnessContextEntry | number | string,
+            included: unknown
+        ): void => {
+            const message = resolveMessage(target);
+
+            if (typeof included !== 'boolean') {
+                throw new HarnessError(
+                    `turn.before setReasoningIncluded needs a boolean for \`reasoningIncluded\`; received ${shownValue(included)}.`
+                );
+            }
+
+            if (message.role !== 'assistant') {
+                throw new HarnessError(
+                    `turn.before setReasoningIncluded cannot switch thinking on ${roleArticle(message.role)} ${message.role} message: only an assistant entry carries reasoning, so only an assistant entry can withhold it.`
+                );
+            }
+
+            const assistant = message as Extract<HarnessMessage, { role: 'assistant' }>;
+
+            if (included as boolean) {
+                // Only `false` is storage, so re-enabling REMOVES the key — the exact inverse of
+                // withholding, and what keeps an unflagged transcript byte-identical forever
+                // (core/agent.ts `withIncluded` upholds the same rule on every copy).
+                delete assistant.reasoningIncluded;
+            } else {
+                assistant.reasoningIncluded = false;
+            }
+
+            // The flag moves what the request says, so the cached projection is stale exactly as a
+            // `setIncluded` write makes it: one rebuild, shared by every later handler's
+            // `currentMessages()` and by this round's request body.
+            inclusionChanged = true;
+
+            // Persistence and lanes, unchanged because this is the SAME CLASS of write: a root
+            // conversation reports the transcript change and any store that persists on it writes
+            // it; a worker lane pushes the touched committed prefix as one `transcript:patch` under
+            // the shared CAS rule (refused whole, re-derived next turn — no retry here); a branch
+            // round moved its own ephemeral copy and reports nothing.
             reportCanonicalWrite();
         };
 
@@ -8967,6 +9104,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // place, re-resolves the affected UNIT, re-projects for this same
                 // request, and notifies persistence. See `HarnessTurnBeforeContext`.
                 setIncluded,
+                // The second axis (trimmer uplift T6): withhold ONE assistant entry's thinking
+                // while the entry keeps travelling. Same resolve → validate → in-place write →
+                // re-project → notify shape, no cascade, assistant-only. See
+                // `HarnessTurnBeforeContext.setReasoningIncluded`.
+                setReasoningIncluded,
                 // Context editing (pipeline T3). Same primitive shape as `setIncluded`
                 // (resolve → validate → write in place → re-project → notify), text-only,
                 // and role-checked so no patch can reach a pairing key. See
@@ -9034,11 +9176,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // A hook hands back a readonly array; `turn()` expects the request's own
             // array, and copying also protects the harness from a hook that keeps
             // mutating it. An explicit transcript WINS over re-projection (the plugin
-            // said exactly what it wants sent), and every entry passes through
-            // `withIncluded` so a plugin-authored `included: true` cannot reach the
-            // provider: the projection itself is always flag-free, and now so is every
-            // override.
-            return final.map(withIncluded);
+            // said exactly what it wants sent), and every entry passes through the SAME
+            // request copy the projection uses, so a plugin-authored `included: true`
+            // cannot reach the provider AND a plugin that hands back a canonical entry
+            // whose thinking is withheld gets the SAME request the projection would have
+            // built for it. THIS PATH IS REQUEST-ONLY: `setTranscript` and a returned
+            // `{ transcript }` never touch committed history (../types says so, and the
+            // next turn re-projects the real transcript), so the flag is resolved OUT here
+            // rather than kept — nothing downstream can re-read the decision from a list
+            // that exists only as this round's body.
+            return final.map(requestCopyOf);
         };
 
         // The run-level part of the round's answer (T2.2 rule 3): `pause`/`stop` are

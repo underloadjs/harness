@@ -138,6 +138,15 @@ export type HarnessToolCall = {
 // result would leave a `tool_calls[]` entry with no answer (or an orphan result),
 // which the strict pairing contract of an OpenAI-compatible transport rejects.
 //
+// THE SECOND AXIS — `reasoningIncluded?: boolean`, the assistant variant only (trimmer
+// uplift T6). It follows the SAME storage rules as `included` (absent = included, only
+// `false` is stored, re-enabling deletes the key) and the same whitelisting duty in
+// snapshot/branch, but it does NOT exclude the entry: the entry still travels, and the
+// projection resolves the flag by OMITTING `reasoning` from that entry's request copy.
+// There is no unit cascade (thinking belongs to one entry) and no new transport field
+// (the absence of `reasoning` IS the signal). See the field's own comment below and
+// `HarnessTurnBeforeContext.setReasoningIncluded`.
+//
 // HOST HYGIENE (context T6.1/T6.3) — the rule a host that stores its OWN copy of a
 // transcript has to keep: because only `false` is storage, a persisted copy should
 // OMIT the key rather than write `included: true`. The runtime does not reject a
@@ -201,6 +210,30 @@ export type HarnessMessage =
           // the union). For a tool-call turn the flag covers the WHOLE unit: this
           // message, every matching result, and its pending placeholders.
           included?: boolean;
+          // THE SECOND AXIS (trimmer uplift T6): withhold this entry's THINKING from the
+          // model request while the entry itself still travels. Same storage convention as
+          // `included` — absent means included, `false` is the only excluding value, and
+          // re-enabling DELETES the key — because the overwhelming majority of entries never
+          // carry it and every pre-flag transcript must keep restoring byte-for-byte.
+          //
+          // It is an ASSISTANT-only field, and there is deliberately NO key on the other
+          // roles: `reasoning` itself exists only here, so a flag beside it can too.
+          //
+          // RESOLVED OUT OF THE PROJECTION (this is what makes it different from
+          // `included`). An entry flagged `false` is still EMITTED in the request — same
+          // position, same `content`, same `toolCalls`, so provider pairing is untouched —
+          // but its projection copy OMITS `reasoning` ENTIRELY, and no request object ever
+          // carries the flag key. The transport therefore needs no new field: the wire signal
+          // for "this backend does not get the thinking back" is the ABSENCE of `reasoning`
+          // on a projected entry (T8 keys the transport's echo off exactly that).
+          // core/agent.ts `withIncluded` + `withoutWithheldReasoning` are the two functions
+          // that own those rules, and src/harness.ts `projectTranscript` is where they run.
+          //
+          // Canonical state, seeds, branch/fork records and snapshots DO carry the key, so
+          // the decision survives a restart, a snapshot round-trip, a fork and a worker-lane
+          // `transcript:patch` (core/snapshot.ts and core/branch.ts whitelist it beside
+          // `included`).
+          reasoningIncluded?: boolean;
           // Stable transcript address for THIS turn (see the block comment on the
           // union), and therefore for the whole tool-call UNIT it opens: an id on the
           // assistant entry addresses its results too, through `setIncluded`'s unit
@@ -4154,6 +4187,51 @@ export type HarnessTurnBeforeContext = {
     // `messageId`, an entry that is not this turn's entry (including one made stale by
     // `replaceHistory`), or a `messageId` that no longer names a transcript entry.
     setIncluded: (target: HarnessContextEntry | number | string, included: unknown) => void;
+    // THE SECOND AXIS (trimmer uplift T6) — withhold one assistant entry's THINKING while the
+    // entry itself keeps travelling. Same primitive shape as `setIncluded` on purpose: the same
+    // three targets, the same strict-boolean check before any write, the same in-place write on
+    // the canonical message, the same projection-cache invalidation so the change lands on THIS
+    // request, and the same single `agent_message` transcript change — which is still the only
+    // durability mechanism there is.
+    //
+    // WHAT IT CHANGES, AND WHAT IT DOES NOT. The entry is NOT excluded: it stays in the request,
+    // in the same position, with its `content` and `toolCalls` intact, so provider pairing rules
+    // (`src/transport/openai.ts`) are untouched and `pairIssues`-style oracles cannot see this
+    // flag at all. What leaves is the thinking: the projection RESOLVES the flag OUT, so the
+    // emitted copy of a flagged entry OMITS the `reasoning` key entirely and no request object
+    // ever carries `reasoningIncluded` (core/agent.ts `withIncluded` keeps the copy flag-free and
+    // `withoutWithheldReasoning` performs the omission, both run by `src/harness.ts`
+    // `projectTranscript`). The transport therefore needs no new field — the ABSENCE of
+    // `reasoning` on a projected entry is the wire signal, and the transport's echo decision
+    // keys off exactly that presence check.
+    //
+    // NO UNIT CASCADE, unlike `setIncluded`. Thinking belongs to exactly ONE message, so the
+    // write addresses exactly that entry — targeting the assistant entry of a tool-call block
+    // does not touch its results, and no result can carry this flag.
+    //
+    // ASSISTANT ENTRIES ONLY. A non-assistant target is refused the way `edit` refuses
+    // `reasoning` on a non-assistant entry: there is no thinking there to withhold.
+    //
+    // `false` stores `reasoningIncluded: false`; `true` REMOVES the key, because only `false` is
+    // ever stored (an unflagged transcript stays byte-identical, and re-enabling is the exact
+    // inverse of withholding). A plugin pass that is withhold-only never writes `true` — the
+    // `true` side exists for the operator and the host API.
+    //
+    // CANONICAL STATE CARRIES IT. Canonical entries, seeds, branch/fork records and snapshots
+    // keep the key, so the decision survives a restart, a `snapshot()`/`restore()` round-trip, a
+    // fork, and a worker-lane `transcript:patch` (core/snapshot.ts and core/branch.ts whitelist it
+    // beside `included`; the lane's CAS refusal is the shared "refuse whole, re-derive next turn"
+    // rule — see `setIncluded` above). A branch run applies it to its own EPHEMERAL copy, its
+    // request is still resolved, and it reports no change.
+    //
+    // Throws a `HarnessError` for an index outside the transcript, a non-integer index, a
+    // non-boolean `reasoningIncluded`, an empty `messageId`, an entry that is not this turn's
+    // entry (including one made stale by `replaceHistory()`), a `messageId` that no longer names a
+    // transcript entry, or a target whose role is not `assistant`.
+    setReasoningIncluded: (
+        target: HarnessContextEntry | number | string,
+        included: unknown
+    ) => void;
     // Edit the TEXT of one canonical transcript entry in place (pipeline T3). The other
     // half of R4 — "switch inclusion, edit an entry within its role's rules, and
     // nothing else": history is never deleted (T3.3), so the only mutation besides a

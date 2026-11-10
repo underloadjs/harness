@@ -401,21 +401,89 @@ compactor now does (it declines to act on a branch round at all).
 
 ### The two shipped context passes — who owns what
 
-Both built-ins subscribe `turn.before`, and compaction is dispatched first
-(manifest order, `src/plugin/manifest.ts`). With **both** enabled the
-trimmer's rule is a superset of compaction's failure-retry pruning: it
-matches on the tool **name** alone (no argument fingerprint), declares no
-`minTokens` floor and no cooldown, and runs on every turn — so every unit
-compaction would prune for being superseded, the trimmer prunes as well,
-and normally well before compaction's trigger and floor gates let it act.
-Compaction's per-model trigger then mainly governs its OWN additional
-pressure behaviour — the floor, the tail horizon and the cooldown that
-shape a pass at scale — rather than the failure-retry pruning. Seeding
-`context-trimmer` off (`PATCH /v1/harness/plugins/context-trimmer` with
-`{ "settings": { "enabled": false } }`) restores compaction-only pruning,
-which is why the compaction fixtures disable it
-(`src/plugin/context-compaction.test.ts`, `src/server/persistence.test.ts`)
-instead of reasoning about the overlap.
+The posture, in one sentence: **the engine core trims nothing** — the projection is a pure
+skip filter over canonical history and nothing in it windows, truncates, elides or reorders —
+**and `context-trimmer` is the one place trimming happens**, one rule per switch. Both
+built-ins subscribe `turn.before`, and compaction is dispatched first (manifest order,
+`src/plugin/manifest.ts`).
+
+The trimmer's settings (`PATCH /v1/harness/plugins/context-trimmer`, read live on the next
+turn of every session) ARE the policy surface:
+
+| Switch | Default | What it decides |
+|---|---|---|
+| `enabled` | `true` | The framework's reserved key: hook delivery on or off. Off stops every policy below and undoes no flag an earlier turn wrote |
+| `dropSupersededToolCalls` | `true` | The shipped rule, verbatim: a fully answered unit whose every committed result `failed` or `rejected`, where EVERY tool NAME it called has a `completed` answer in a still-included later unit, stops being sent — as a whole unit |
+| `dropInvalidToolCallsOnceAnswered` | `true` | The same rule generalised over `invalidOutcomes`. Independent of the row above; with both off, no tool unit is ever withheld — the engine's posture |
+| `invalidOutcomes` | `"failed,rejected"` | The closed set `failed` \| `rejected` \| `cancelled` \| `empty` the generalisation may act on. Unknown names are dropped (so is `completed`), the pass says which it used, and a set that resolves to nothing disables the generalisation |
+| `dropOldThoughts` | `"turn"` | Which thinking stops being replayed: `off`, `turn` (the open turn keeps its thinking, every closed turn's is withheld) or `all`. Any other string behaves as `turn` and the diagnostic says so |
+| `thoughtKeepUnits` | `0` | The recent-N tier on top of that tier; every value above `0` is documented as cache-hostile |
+| `supersedeMatch` | `"name"` | `name` is the shipped loosening; `fingerprint` is compaction's exact rule (`src/core/argument-fingerprint.ts`), which makes the two passes agree by construction — the value that makes compaction's failure-retry prune redundant, per the overlap note below |
+| `dropDuplicateCalls` | `false` | Withhold an earlier unit a later unit re-ran with an identical fingerprint — the only switch that can withhold work the model actually used |
+| `minTokens` / `minThoughtChars` | `0` | A pass under the floor writes nothing at all. The tool floor never gates thinking, because the estimator does not count `reasoning` (`src/core/context-estimate.ts`) |
+| `safetyUnits` | `0` | Units at the END of the transcript no tool trim may touch; `0` removes the horizon |
+| `maxUnits` | `0` | Cap on how many tool units ONE pass withholds; `0` is unbounded |
+
+A `string` tier accepts any string at the PATCH edge (that edge owns the declared type and the
+published numeric bounds, never the content of a string), so the closed set is the plugin's
+decision: an unrecognised value runs as its documented fallback and the pass diagnostic names
+the value submitted beside the value used.
+
+Three things no switch changes, and each setting's text says so rather than letting an
+operator discover them: a unit is withheld **whole** or not at all (provider pairing is
+unit-atomic, so half a unit never leaves); an **unanswered** call is never touched; and every
+policy is **withhold-only inside a session** — flipping a switch off stops new writes and
+restores nothing, which is the property that lets the compactor skip any phase check against
+this pass (`src/plugins/context-compaction.plugin.ts` reasons about exactly that). A branch
+round and an internal agent's transcript are never trimmed, and no setting is even read on
+either.
+
+What compaction still owns alone is the pressure problem: its per-model trigger
+(`contextLimit`, `modelLimits`), its savings floor, its tail horizon and its cooldown shape a
+whole-conversation pass, and in `summarize` mode it spends a model turn the trimmer never
+spends.
+
+**The overlap, resolved deliberately (task T9, ratified 2026-11-10): compaction keeps its
+failure-retry pruning.** Both passes can name the same superseded failed unit, and the answer is
+the runtime's, not a new phase check, priority, or knob:
+
+- **Who writes.** The first pass dispatched in a round that has a candidate acts — compaction is
+  dispatched first (`src/plugin/manifest.ts` scan order), then the trimmer. The other pass reads
+  the LIVE unit flag (`src/core/context-pruning.ts` `groupUnits` → `unit.included`, and
+  `planTrimmedUnits` step (1) in `src/plugins/context-trimmer.plugin.ts`), proposes nothing, and
+  therefore reports nothing: a round with BOTH built-ins enabled produces exactly one
+  `setIncluded(leader, false)` for that unit and exactly one pass line. Pinned by the
+  `context-compaction × context-trimmer overlap` cases in
+  `src/plugin/context-compaction.test.ts`, at the action level (the recorded write count) and
+  through a real harness (the flags, the request, the diagnostic owners, the round's save
+  count).
+- **What `supersedeMatch: 'fingerprint'` changes.** It swaps the trimmer's evidence rule for
+  compaction's exact one (`toolCallFingerprint(name, canonicalArguments)`,
+  `src/core/argument-fingerprint.ts`) instead of the looser name-only match, so on that value
+  the two rules select the same unit by construction; on the shipped default (`name`) the
+  trimmer's rule is a strict superset of compaction's. Either way compaction's failure-retry
+  prune is redundant-but-harmless for that class — its own `minTokens` / `safetyTurns` /
+  cooldown gates still decide whether it acts at all, and if it acts first, the trimmer simply
+  finds the unit already withheld.
+- **Why the prune stays.** It is the eviction path for an operator who wants the compacting pass
+  to own it: with `dropSupersededToolCalls` and `dropInvalidToolCallsOnceAnswered` off (or
+  `enabled: false` on the whole trimmer, `PATCH /v1/harness/plugins/context-trimmer`),
+  compaction prunes superseded failures under its own floor and horizon — and compaction keeps
+  the roles the trimmer can never take: the pressure trigger, the `summarize` retention range,
+  and the summary entry that pass commits into the transcript.
+- **What no switch touches.** Both passes are withhold-only, and a withheld unit is exactly one
+  `false` flag, so a double pass cannot double-write and an operator "off" restores nothing.
+  That monotonicity is the compactor's stated reason for needing no phase check against this
+  pass (`src/plugins/context-compaction.plugin.ts`, the section on the other shipped
+  `turn.before` pass), and it still holds with twelve trimmer switches and the thinking flag:
+  the trimmer's only two writers take the literal `false` — `setIncluded(entry, false)` and
+  `setReasoningIncluded(entry, false)` — and it calls no `setTranscript`, no `edit`, no
+  `replaceHistory`.
+
+The compaction fixtures still switch the trimmer off through their settings provider
+(`src/plugin/context-compaction.test.ts`, `src/server/persistence.test.ts`) — not because the
+two passes fight, but so each of those cases measures ONE plugin's numbers; the overlap cases
+are the ones that leave it at its declared defaults.
 
 The trigger reads one setting beyond `contextLimit`
 (`src/plugins/context-compaction.plugin.ts`):
@@ -642,7 +710,10 @@ the missing UI marker for an excluded turn),
 `docs/tasks/2026-11-09-progressive-compaction.md`
 (the policy that consumes all of this), and the shipped built-ins
 `src/plugins/context-compaction.plugin.ts`,
-`src/plugins/context-trimmer.plugin.ts` (the same `turn.before` boundary with
-no limit, no floor and no cooldown — the smallest policy that still writes
-canonical state and reports it), and
+`src/plugins/context-trimmer.plugin.ts` (the same `turn.before` boundary, and
+the one place trimming happens: every rule is its own switch, the economy
+knobs `minTokens`/`minThoughtChars`/`safetyUnits`/`maxUnits` are declared and
+default to off — no limit, no floor, no horizon unless the operator asks —
+and it is still the smallest policy that writes canonical state and reports
+it), and
 `src/plugins/async-ping.plugin.ts` as worked examples.

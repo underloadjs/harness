@@ -181,6 +181,11 @@ export const blockDetailCacheKeyOf = (sessionId: string | undefined, turnId: str
  * open, which is exactly the stale-serve this fingerprint exists to prevent. The value is
  * spelled out (`included`/`excluded`/absent) so an ABSENT verdict — the bar's own segment
  * model, which never carries the field — cannot collide with either published state.
+ *
+ * Uplift T7 needed no change here, and that is worth stating: the thinking axis a `reasoning`
+ * segment now publishes rides on this SAME `included` figure (../server/api.ts
+ * `getSessionTurnBlock` resolves it through the recorded thinking text), so a withheld thought
+ * invalidates the entry of a riding thought exactly as a switched tool round does.
  */
 export const blockDetailFingerprintOf = (block: ContextBlock): string =>
     [
@@ -269,16 +274,25 @@ const STATE_FACTS: Readonly<Record<StepDisplayState, { tone: BlockDetailTone; gl
 /**
  * T7/R6: the inclusion chip, which answers three different questions and must not blur them.
  *
- *   - `included === false` — the reader's OWN exclusion: the transcript unit is withheld from
- *     the requests that follow, and this verdict WINS over any per-kind reading, because it
- *     is the one state a human set (../shared/turn-display.ts:541 documents the tri-state);
+ *   - `included === false` — the reader's OWN exclusion: what this segment shows is withheld
+ *     from the requests that follow, and this verdict WINS over any per-kind reading, because it
+ *     is the one state a human set (../shared/turn-display.ts documents the tri-state). For a
+ *     `reasoning` segment this is the THINKING axis: the entry keeps travelling, its thinking
+ *     stops riding (trimmer uplift T7);
  *   - `included === true` — the same control switched the other way, phrased as the positive
  *     "in the prompt" so the pair reads as one switch rather than as two different questions;
  *   - ABSENT — a different question again: the server could not name ONE transcript entry
- *     behind this segment (a thinking window streams several entries, an instruction block
- *     joins several messages, a legacy record has no call id), so there is nothing to switch
- *     and the chip states what the PROJECTOR knows — the static per-kind `inPrompt` verdict,
- *     the same words it carried before this control existed.
+ *     behind this segment, so there is nothing to switch here. WHAT THE CHIP THEN SAYS DEPENDS
+ *     ON THE KIND, and that is the whole of F8:
+ *       * a call, a prompt, an instruction set: the projector's static per-kind `inPrompt`
+ *         verdict is a claim about THAT segment class and stays exactly as it was;
+ *       * a `reasoning` window: `inPrompt: false` is NOT a claim about the class any more.
+ *         Whether a window's thinking rides in the next request is decided per entry by the
+ *         context trimmer's thinking policy (`dropOldThoughts` and the `reasoningIncluded`
+ *         flag it writes, T6/T8): a CLOSED turn's thinking is withheld under the shipped
+ *         default while the OPEN turn's is sent, and `off` sends all of it. So the chip states
+ *         WHERE the decision lives instead of stating a verdict it cannot have — and it says
+ *         no absolute, because an absolute about thinking is what this fix removed.
  */
 const inclusionFactOf = (block: ContextBlock): BlockDetailFact => {
     if (block.included === false) {
@@ -286,6 +300,14 @@ const inclusionFactOf = (block: ContextBlock): BlockDetailFact => {
     }
 
     if (block.included === true) return { fact: 'prompt', text: 'in the prompt', tone: 'ok', glyph: '✓' };
+
+    if (block.kind === 'reasoning') {
+        // Policy wording, not a property of the segment class (F8). Truthful in every tier:
+        // under `turn` a closed window is out and the open one is in, under `all` every window
+        // is out, under `off` every window is in — the chip cannot know which, and it does not
+        // pretend to.
+        return { fact: 'prompt', text: 'replay decided by the thinking policy' };
+    }
 
     return { fact: 'prompt', text: block.inPrompt === true ? 'in the prompt' : 'not replayed into the prompt' };
 };

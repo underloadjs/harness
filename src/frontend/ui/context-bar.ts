@@ -62,6 +62,7 @@ import {
     contextBarToneOf,
     contextSegmentLabelOf,
     contextSegmentTitleOf,
+    formatContextCharCount,
     layoutContextBar
 } from '../view-context';
 import type { ContextBarLayout, ContextBarModel } from '../view-context';
@@ -83,6 +84,94 @@ export const CONTEXT_BAR_ON_SEGMENT_TEXT = '#0b0d12';
 // A flex row this crowded prints no in-segment labels either — one text node per segment
 // is real layout cost at hundreds, and the bar is being read as a picture at that point.
 export const CONTEXT_BAR_DOM_LABEL_LIMIT = 12;
+
+// THE THINKING NOTE (trimmer uplift F8, acceptance criterion H5 — "UI truth")
+// --------------------------------------------------------------------------
+// `../view-context.ts` mints ONE trailing clause for every block the server marks
+// `inPrompt !== true`: "not replayed into the prompt". For a TOOL block that is a fact the
+// projector earned. For a REASONING block it is the projector's STATIC per-kind verdict
+// (`../server/turn-projector.ts` stamps the whole class `inPrompt: false`), and once
+// `dropOldThoughts` exists that sentence stops being a property of the class: under the
+// shipped default tier (`turn`) the OPEN turn's thinking IS replayed into the prompt, so the
+// bar would be stating a falsehood on a per-segment absolute it cannot see.
+//
+// The bar CANNOT resolve a per-entry verdict — one activation is the only request it ever
+// makes (see "THE BAR NEVER FETCHES" above), and the join that names the entry behind a
+// thinking segment lives on the block-detail route, which is exactly where
+// ./context-detail.ts `inclusionFactOf` renders a real chip. What the bar CAN say is the
+// truth it does hold: this strip cannot tell the reader which side of the thinking policy the
+// segment fell on. Hence the wording below, in place of the absolute.
+//
+// The exact string is the dialog chip's ABSENT wording, duplicated deliberately rather than
+// imported: ./context-detail.ts drags the dialog's whole graph (a fetch, a Markdown block)
+// and the bar's "does not fetch, builds no card" rule is what keeps a 500-segment board
+// free. ./context-bar.test.ts pins both spellings so the two surfaces cannot drift silently,
+// and the RENDERED note states no absolute of its own — acceptance H5 asks that the word
+// "never" appear nowhere in the thinking wording.
+export const CONTEXT_BAR_THINKING_NOTE = 'replay decided by the thinking policy';
+
+/**
+ * The bar's hover/accessible text for ONE segment: the model's string verbatim, except that
+ * a THINKING segment the server marked `inPrompt !== true` carries
+ * `CONTEXT_BAR_THINKING_NOTE` where the model would have put the static absolute (F8/H5).
+ *
+ * Every other segment is byte-identical BY CONSTRUCTION — the guard returns the model's own
+ * string, and even the thinking path re-uses it: `inPrompt` is read in exactly ONE place in
+ * `contextSegmentTitleOf` (that trailing clause), so asking for the in-prompt form and
+ * appending the note here is the whole substitution. No string surgery, no duplicated
+ * figures, nothing that could drift from the model's own numbers.
+ */
+export const contextBarSegmentTitleOf = (block: ContextBlock): string => {
+    if (block.kind !== 'reasoning' || block.inPrompt === true) return contextSegmentTitleOf(block);
+
+    return `${contextSegmentTitleOf({ ...block, inPrompt: true })} · ${CONTEXT_BAR_THINKING_NOTE}`;
+};
+
+/** Position + the bar's title: the label one segment carries in DOM mode and in the live region. */
+export const contextBarSegmentLabelOf = (block: ContextBlock, index: number, total: number): string => {
+    if (block.kind !== 'reasoning' || block.inPrompt === true) return contextSegmentLabelOf(block, index, total);
+
+    // Same substitution, applied one level up: `contextSegmentLabelOf` owns the "N of M" prefix,
+    // so re-using it keeps the position wording in the model instead of copying it here.
+    return `${contextSegmentLabelOf({ ...block, inPrompt: true }, index, total)} · ${CONTEXT_BAR_THINKING_NOTE}`;
+};
+
+/**
+ * True when EVERY byte the server marked `inPrompt !== true` belongs to a thinking segment.
+ *
+ * That is the only case in which the bar's aggregate figure may take the policy wording: a
+ * byte that is un-in-prompt for a NON-thinking reason (today only a withheld tool unit could
+ * be, and the projector does not stamp one) really is absent from the request, so a mixed
+ * strip keeps the model's literal count and stays honest.
+ */
+const unpromptedBytesAreThinkingOnly = (model: ContextBarModel): boolean => {
+    if (model.unpromptedChars <= 0) return false;
+
+    for (const block of model.blocks) {
+        if (block.inPrompt !== true && block.kind !== 'reasoning') return false;
+    }
+
+    return true;
+};
+
+/**
+ * The bar's ACCESSIBLE name: the model's summary, with the aggregate
+ * "N characters not replayed into the prompt" clause re-worded the same way the segments are
+ * whenever every one of those characters is thinking (F8/H5 — the same absolute, in the
+ * strip's own `aria-label`).
+ *
+ * The mechanism is a COPY with `unpromptedChars: 0`: that drops the model's clause without
+ * touching its count of segments, total characters, recorded time or unmeasured segments, and
+ * the replacement clause re-prints the SAME server figure through the same formatter, so the
+ * number and the wording cannot disagree with each other or with the tooltip.
+ */
+export const contextBarAccessibleNameOf = (model: ContextBarModel): string => {
+    const figures = contextBarSummaryOf(model);
+
+    if (!unpromptedBytesAreThinkingOnly(model)) return figures;
+
+    return `${contextBarSummaryOf({ ...model, unpromptedChars: 0 })} · ${formatContextCharCount(model.unpromptedChars)} characters' ${CONTEXT_BAR_THINKING_NOTE}`;
+};
 
 export type ContextBarActivateInput = {
     block: ContextBlock;
@@ -420,7 +509,10 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         //     (T22, R24 — the character totals moved into `aria-label` alone, so losing the
         //     printed line never loses the figure). `styles.css` right-aligns it, which is
         //     where the reader's eye already is after reading the bar left to right.
-        const summary = model === undefined ? CONTEXT_BAR_LABEL : contextBarSummaryOf(model);
+        // `contextBarAccessibleNameOf` is the model's summary with ONE clause re-worded: the
+        // aggregate thinking count, which the projector marks per KIND and a policy then
+        // decides (F8/H5). The visible line never carried that clause, so it is untouched.
+        const summary = model === undefined ? CONTEXT_BAR_LABEL : contextBarAccessibleNameOf(model);
         const stats = model === undefined ? '' : contextBarStatsOf(model);
 
         element.setAttribute('aria-label', summary);
@@ -464,7 +556,7 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
                     const option = document.createElement('span');
                     option.className = 'context-bar-option';
                     option.dataset.index = String(segment.index);
-                    option.textContent = contextSegmentLabelOf(segment.block, segment.index, model.blocks.length);
+                    option.textContent = contextBarSegmentLabelOf(segment.block, segment.index, model.blocks.length);
                     nodes.push(option);
                 }
             }
@@ -503,8 +595,8 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         const total = model?.blocks.length ?? 0;
         const block = focused >= 0 && focused < total ? model?.blocks[focused] : undefined;
 
-        live.textContent = block === undefined ? '' : contextSegmentLabelOf(block, focused, total);
-        element.title = block === undefined ? '' : contextSegmentTitleOf(block);
+        live.textContent = block === undefined ? '' : contextBarSegmentLabelOf(block, focused, total);
+        element.title = block === undefined ? '' : contextBarSegmentTitleOf(block);
 
         paint();
     };
@@ -550,8 +642,8 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             button.dataset.durationKnown = segment.durationKnown ? 'true' : 'false';
             button.dataset.heightPx = String(segment.heightPx);
             button.dataset.heightShare = String(Math.round(segment.heightShare * 10_000) / 10_000);
-            button.setAttribute('aria-label', contextSegmentLabelOf(segment.block, segment.index, blocks.length));
-            button.title = contextSegmentTitleOf(segment.block);
+            button.setAttribute('aria-label', contextBarSegmentLabelOf(segment.block, segment.index, blocks.length));
+            button.title = contextBarSegmentTitleOf(segment.block);
             // The flex weight carries the layout's WIDTH share and the inline style carries
             // its HEIGHT, so both modes are sized by one arithmetic (R28).
             button.style.flexGrow = String(Math.max(1, Math.round(segment.share * 10_000)));

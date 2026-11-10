@@ -239,6 +239,31 @@ const applyIncluded = (
     }
 };
 
+// The persisted THINKING-inclusion flag (trimmer uplift T6 — `HarnessMessage.reasoningIncluded`).
+//
+// The same minimal-delta contract as `included` immediately above, and the reason it has to be:
+// the withheld-thinking decision is transcript state, so a snapshot → restore → continue round must
+// carry it or the model silently gets the reasoning of every older turn back after a restart.
+// Only the literal `false` is stored; a snapshot that carries `reasoningIncluded: true` (a host
+// that round-trips its own JSON, or a hand-edited file) is accepted and NORMALIZED to the absent
+// form, so `restore -> snapshot` stays idempotent. A non-boolean value is refused like any other
+// mistyped field.
+//
+// It is assistant-only, exactly like `reasoning` itself: the assistant whitelist below is the only
+// place that admits the key, so a `reasoningIncluded` on a user or tool entry is refused rather
+// than quietly dropped — the same treatment `reasoning` on a non-assistant entry gets.
+const applyReasoningIncluded = (
+    message: HarnessMessage,
+    record: Record<string, unknown>,
+    label: string
+): void => {
+    if (record.reasoningIncluded === undefined) return;
+
+    if (readSnapshotBoolean(record.reasoningIncluded, `${label}.reasoningIncluded`) === false) {
+        (message as Extract<HarnessMessage, { role: 'assistant' }>).reasoningIncluded = false;
+    }
+};
+
 // The persisted tool outcome (compaction T1.4 — the reader side of core/tool-outcome.ts).
 //
 // Same minimal-delta contract as `included` directly above: ABSENT means `completed`, so
@@ -395,9 +420,13 @@ export const readHarnessMessages = (
             case 'assistant': {
                 readSnapshotKeys(
                     record,
-                    ['role', 'content', 'toolCalls', 'reasoning', 'included', 'messageId'],
+                    // `reasoningIncluded` is the second context flag (trimmer uplift T6): it must
+                    // be listed beside `reasoning`/`included` or a transcript with a withheld
+                    // thinking turn refuses to restore at all — this reader's key whitelist IS the
+                    // persistence contract for a per-message field.
+                    ['role', 'content', 'toolCalls', 'reasoning', 'included', 'reasoningIncluded', 'messageId'],
                     entryLabel,
-                    ['toolCalls', 'reasoning', 'included', 'messageId']
+                    ['toolCalls', 'reasoning', 'included', 'reasoningIncluded', 'messageId']
                 );
 
                 const message: Extract<HarnessMessage, { role: 'assistant' }> = {
@@ -417,6 +446,11 @@ export const readHarnessMessages = (
                 }
 
                 applyIncluded(message, record, entryLabel);
+                // AFTER `applyIncluded`, so a restored message's key order matches what the
+                // control writes onto a canonical message (`included` first, then
+                // `reasoningIncluded`) and a byte comparison of a live transcript against its own
+                // restore stays honest.
+                applyReasoningIncluded(message, record, entryLabel);
                 applyMessageId(message, allocate(readMessageId(record, entryLabel)));
                 return message;
             }

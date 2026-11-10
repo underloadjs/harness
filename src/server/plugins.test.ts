@@ -435,9 +435,28 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
             mode: 'summarize'
         });
         expect(plugins.values('async-ping')).toEqual({ intervalMs: 600000 });
-        // The third built-in declares ONLY `enabled` — the key the framework owns — so its
-        // effective map is one entry, and the row's switch and its Rule-0 read agree on it.
-        expect(plugins.values('context-trimmer')).toEqual({ enabled: true });
+        // The third built-in, as of the 2026-11-10 switch split: `enabled` (the key the
+        // framework owns, so the row's switch and its Rule-0 read are one value) plus the eleven
+        // policy switches declared by `src/plugins/context-trimmer.plugin.ts`. EVERY default is
+        // spelled out — this is the map the Plugins pane renders and the plugin reads on a host
+        // that has stored nothing, so a default that moves without a test noticing is a
+        // behaviour change nobody approved.
+        expect(plugins.values('context-trimmer')).toEqual({
+            enabled: true,
+            dropSupersededToolCalls: true,
+            dropInvalidToolCallsOnceAnswered: true,
+            invalidOutcomes: 'failed,rejected',
+            dropOldThoughts: 'turn',
+            thoughtKeepUnits: 0,
+            supersedeMatch: 'name',
+            dropDuplicateCalls: false,
+            minTokens: 0,
+            minThoughtChars: 0,
+            safetyUnits: 0,
+            maxUnits: 0
+        });
+        // `snapshot()` is the OVERRIDE map, not the effective map: nothing has been written, so
+        // twelve new descriptors seed no overrides at all.
         expect(plugins.snapshot()).toEqual({});
     });
 

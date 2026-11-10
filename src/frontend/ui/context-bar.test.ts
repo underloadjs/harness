@@ -21,6 +21,13 @@
 // rendering. The bar calls its `onActivate` callback and stops; the request belongs to the
 // dialog (./context-detail.test.ts) and to the tile (../ui/turns-context-bar.test.ts).
 //
+// F8 / uplift H5 pins the WORDING SPLIT on the un-in-prompt clause: a REASONING segment says
+// `replay decided by the thinking policy` (the projector marks that whole class
+// `inPrompt: false` per KIND, while `dropOldThoughts` decides per ENTRY), and every other
+// un-in-prompt segment keeps the model's absolute byte-for-byte. ./context-bar.ts carries the
+// argument for why the bar cannot resolve a per-entry verdict; the pins below are the exact
+// strings, both modes.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/context-bar.test.ts
 
 import type { ContextBlock } from '../../shared/turn-display';
@@ -40,6 +47,7 @@ import type { ContextBarActivateInput } from './context-bar';
 import {
     CONTEXT_BAR_DOM_LABEL_LIMIT,
     CONTEXT_BAR_ON_SEGMENT_TEXT,
+    CONTEXT_BAR_THINKING_NOTE,
     mountContextBar,
     resolveContextBarTrackHeights
 } from './context-bar';
@@ -219,8 +227,47 @@ describe('context bar, DOM mode', () => {
         // says it in pixels.
         expect(first.title).toBe('prompt · user · 100 characters · time not recorded');
         expect(first.getAttribute('aria-label')).toBe('1 of 3 · prompt · user · 100 characters · time not recorded');
-        expect(second.title).toBe('reasoning · reasoning · 200 characters · 800ms · not replayed into the prompt');
+        expect(second.title).toBe('reasoning · reasoning · 200 characters · 800ms · replay decided by the thinking policy');
         expect(third.title).toBe('bash · tool · error · 300 characters · args 20 + result 1,184 · 800ms');
+    });
+
+    it('says the thinking POLICY on a thinking segment, and keeps the absolute everywhere else (uplift F8 / H5)', () => {
+        // WHY THIS IS THE PIN. `../view-context.ts` prints one clause for EVERY block the server
+        // marks `inPrompt !== true`, and `../server/turn-projector.ts` mints that flag for the
+        // whole REASONING CLASS. Once `dropOldThoughts` exists (shipped default `turn`, which
+        // replays the OPEN turn's thinking) that clause is no longer a property of the class,
+        // and the bar has no per-entry verdict to read — only the block-detail route can name
+        // the entry behind a segment. So the bar states the policy for thinking, and keeps the
+        // fact for every segment that is un-in-prompt for a real reason.
+        expect(CONTEXT_BAR_THINKING_NOTE).toBe('replay decided by the thinking policy');
+
+        const bar = mount([
+            // A thinking segment, `inPrompt: false` by KIND: the policy note, not the absolute.
+            block({ id: '0-reasoning-a', kind: 'reasoning', name: 'reasoning', chars: 100, inPrompt: false }),
+            // A thinking segment the server marks IN the prompt: the model's string, clause-free.
+            // The substitution tracks the verdict, never the kind.
+            block({ id: '0-reasoning-b', kind: 'reasoning', name: 'thought', chars: 50, inPrompt: true }),
+            // A NON-thinking segment with the same flag: there the sentence is a fact, so it
+            // stays byte-identical to what the model prints.
+            block({ id: '0-user-prompt', kind: 'user', name: 'prompt', chars: 40, inPrompt: false })
+        ]);
+
+        const [withheld, replayed, prompt] = Array.from(bar.element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+
+        expect(withheld.title).toBe('reasoning · reasoning · 100 characters · 800ms · replay decided by the thinking policy');
+        expect(replayed.title).toBe('thought · reasoning · 50 characters · 800ms');
+        expect(prompt.title).toBe('prompt · user · 40 characters · 800ms · not replayed into the prompt');
+        expect(withheld.getAttribute('aria-label')).toBe('1 of 3 · reasoning · reasoning · 100 characters · 800ms · replay decided by the thinking policy');
+        // The absolute is gone from the thinking segment, and the bar does not over-correct into
+        // an "always"/"never" claim of its own (acceptance H5 asks for exactly that).
+        expect(withheld.title).not.toContain('not replayed');
+        expect(withheld.title).not.toContain('never');
+        // THE AGGREGATE, same rule: 140 un-in-prompt characters here, 40 of them NOT thinking, so
+        // the model's literal count stands — zeroing it out would hide a real omission.
+        expect(bar.element.getAttribute('aria-label')).toBe(
+            'context bar: width is time taken, height is recorded characters · 3 segments · 190 characters' +
+                ' · 2.4s of recorded time · 140 characters not replayed into the prompt'
+        );
     });
 
     it('labels the segments only where the bar is big enough to hold a name', () => {
@@ -250,7 +297,7 @@ describe('context bar, DOM mode', () => {
         expect(bar.element.getAttribute('role')).toBe('group');
         expect(bar.element.getAttribute('aria-label')).toBe(
             'context bar: width is time taken, height is recorded characters · 3 segments · 600 characters' +
-                ' · 1.6s of recorded time · 1 segment has no recorded time · 200 characters not replayed into the prompt'
+                ' · 1.6s of recorded time · 1 segment has no recorded time · 200 characters\' replay decided by the thinking policy'
         );
         expect(bar.element.querySelector('.context-bar-caption')?.textContent).toBe('3 segments');
         // The banned-on-screen wording (the user's screenshot): the visible line never
@@ -634,9 +681,9 @@ describe('context bar, canvas mode', () => {
         // the thing the reader is looking at.
         expect(fake.outlines).toEqual([[11, 13, 292, 22]]);
         expect(bar.element.querySelector('.context-bar-live')?.textContent).toBe(
-            '2 of 3 · reasoning · reasoning · 200 characters · 800ms · not replayed into the prompt'
+            '2 of 3 · reasoning · reasoning · 200 characters · 800ms · replay decided by the thinking policy'
         );
-        expect(bar.element.title).toBe('reasoning · reasoning · 200 characters · 800ms · not replayed into the prompt');
+        expect(bar.element.title).toBe('reasoning · reasoning · 200 characters · 800ms · replay decided by the thinking policy');
 
         bar.setFocused(-1);
         expect(bar.element.querySelector('.context-bar-live')?.textContent).toBe('');
@@ -649,7 +696,7 @@ describe('context bar, canvas mode', () => {
 
         expect(Array.from(bar.element.querySelectorAll('.context-bar-option')).map((node) => node.textContent)).toEqual([
             '1 of 3 · prompt · user · 100 characters · time not recorded',
-            '2 of 3 · reasoning · reasoning · 200 characters · 800ms · not replayed into the prompt',
+            '2 of 3 · reasoning · reasoning · 200 characters · 800ms · replay decided by the thinking policy',
             '3 of 3 · bash · tool · error · 300 characters · args 20 + result 1,184 · 800ms'
         ]);
         expect(bar.element.querySelector('canvas')?.getAttribute('aria-hidden')).toBe('true');

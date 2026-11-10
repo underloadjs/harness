@@ -2148,9 +2148,17 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                             name: 'reasoning',
                             ...(stamp === undefined ? {} : { at: stamp }),
                             chars: 0,
-                            // Thinking is recorded and shown, never replayed into the
-                            // next request — the one segment class that is not prompt
-                            // text, stated explicitly rather than left to a bar.
+                            // THE STATIC FALLBACK VERDICT, per kind, and nothing more
+                            // (uplift T7/F8). This bar folds one TURN's events and never
+                            // sees a transcript, so it cannot know whether THIS window's
+                            // thinking rides in the next request: what decides that is the
+                            // context trimmer's thinking policy (`dropOldThoughts`, and the
+                            // per-entry `reasoningIncluded` flag it writes — T6/T8), which
+                            // withholds a CLOSED turn's thinking and keeps the OPEN turn's.
+                            // The value stays here because a client needs an answer when the
+                            // server cannot name the entry behind the segment; where it can,
+                            // the block detail read publishes the real verdict in `included`
+                            // (../shared/turn-display.ts `inPrompt`).
                             inPrompt: false,
                             eventFrom: index,
                             eventTo: index

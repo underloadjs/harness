@@ -1,6 +1,6 @@
 # Context Trimmer uplift — the engine trims nothing, the trimmer is the only trimmer, and it needs switches
 
-Status: **open, unstarted.** Written 2026-11-10 as a pick-up-and-complete brief, not as a
+Status: **implemented 2026-11-10** (T1–T9 landed; T10's numbers are in [## Measurements](#measurements-t10-2026-11-10--offline-stub-replay-no-live-model) at the end). Written 2026-11-10 as a pick-up-and-complete brief, not as a
 finding log. The ask, in one sentence: **the engine core must not trim context by default
 (everything recorded stays in the request), and the shipped `context-trimmer` built-in becomes
 the one place trimming happens, driven by several independent switches — at minimum
@@ -179,6 +179,21 @@ about it or the transcript stops restoring:
 | `ContextBlock.included` is a **deliberately separate, tri-state** axis from `inPrompt`, published only by the block-detail route (the one read that holds both the recorded event and the live transcript); ABSENT means "this server could not name the entry behind the segment" | `src/shared/turn-display.ts:536-565` |
 | The join can only name a **tool** segment's entry: `blockCallIdOf` returns `undefined` for every non-`tool` kind, so a reasoning block's `included` is always ABSENT and the chip falls back to the static verdict | `src/server/api.ts:785-803`; the chip's three-way reading `src/frontend/ui/context-detail.ts:275-291` (`inclusionFactOf`) |
 
+> **Annotated 2026-11-10 — T8 landed, so the second row of the table above (the wire assistant
+> entry) is HISTORICAL.** The row saying
+> the wire assistant entry is `role` + `content` (+ `tool_calls`) and that **`reasoning` is
+> dropped** no longer describes the shipped transport: `wireMessage` (`src/transport/openai.ts:295`)
+> now writes `wire.reasoning_content = message.reasoning` **iff a projected entry carries
+> non-empty `reasoning`** (`src/transport/openai.ts:349-351`), and the projection removes
+> `reasoning` from an entry whose thinking is withheld
+> (`withoutWithheldReasoning`, `src/core/agent.ts:245-250`). Withholding therefore changes the
+> request. What this table still states correctly: the estimator is **blind to thinking**
+> (`src/core/context-estimate.ts:34`, "WHAT IS NEVER COUNTED: `reasoning`") — which is why
+> `minThoughtChars` is a character floor — and the request-**parameter** half
+> (`reasoning_effort`, `thinking.keep`, `clear_thinking`, `chat_template_kwargs`) is still
+> unreachable and still waits on issue 0001 (F6). The echo emits `reasoning_content` **only**,
+> never a second `reasoning` field (Part I, "Two more things…").
+
 ---
 
 ## Part C — Findings
@@ -237,6 +252,21 @@ So "drop old thoughts" is currently a no-op dressed as a switch. It becomes real
 the switch has exactly one honest implementation: **it decides which recorded thinking stays
 eligible for replay, and it says so in the diagnostic** — the flag is written now, the wire
 honours it later. Everything else (T6) is the mechanism question.
+
+> **Annotated 2026-11-10 — T6 + T8 landed; the middle bullet ("the transport **never** sends it")
+> is no longer true.** The write target now exists: the per-entry flag `HarnessMessage.reasoningIncluded`, written by
+> `context.setReasoningIncluded(entry, false)` (`src/plugins/context-trimmer.plugin.ts:1417`),
+> resolved OUT of projection copies (`src/core/agent.ts:196-250`), so "the transport **never**
+> sends it / withholding it changes **nothing** about the request" is no longer true — an entry
+> whose thinking is withheld projects without `reasoning` and the wire carries no
+> `reasoning_content` for it (`src/transport/openai.ts:349-351`). The "zero saved tokens" bullet
+> still holds **as an estimate** (`reasoning` is still not counted,
+> `src/core/context-estimate.ts:34`), which is why the thoughts floor is `minThoughtChars`, not
+> `minTokens`. And the last clause is still the live boundary: the switch decides **which recorded
+> thinking stays eligible for replay**; telling a provider what to do with old thinking
+> (`thinking.keep` / `clear_thinking` / `preserve_thinking` / `reasoning_effort`) remains the
+> parameter half, still gated on issue 0001 (F6). No live DeepSeek/Kimi/Anthropic round-trip was
+> observed for the echo (Part K).
 
 The two candidate mechanisms, with their costs, in T6. The short version:
 
@@ -704,6 +734,66 @@ switch the trimmer off via a fixture provider — the seam stays valid either wa
 seeding unless the decision changed them; one new test asserting **exactly one** pass withholds a
 given superseded unit.
 
+**Decision — taken 2026-11-10, and this is the decision the task asked for: compaction KEEPS its
+failure-retry pruning.** The uplift stays behaviour-neutral, and the overlap is resolved by what
+the two passes already are — not by a comment, a phase check, a priority, or a new knob:
+
+- **Which pass owns the eviction.** Whichever pass is dispatched first with a candidate writes
+  the flag; the other reads the LIVE unit flag (`src/core/context-pruning.ts` `groupUnits` →
+  `unit.included`, and `planTrimmedUnits` step (1)) and proposes nothing. Dispatch order is
+  compaction then trimmer (`src/plugin/manifest.ts` scan order = registration order at equal
+  priority, `src/plugin/hooks.ts`), so a round with both enabled produces exactly ONE
+  `setIncluded(leader, false)` and exactly ONE pass line — and the same holds in the reverse
+  order, which is why the answer does not depend on ordering.
+- **What `supersedeMatch: 'fingerprint'` changes.** It swaps the trimmer's evidence rule for
+  compaction's exact one (`toolCallFingerprint(name, canonicalArguments)`,
+  `src/core/argument-fingerprint.ts`), so on that value the two rules select the same unit **by
+  construction**; on the shipped default (`name`) the trimmer's rule is a strict superset.
+  Compaction's prune is therefore redundant-but-harmless for that class: its own
+  `minTokens`/`safetyTurns`/cooldown gates still decide whether it fires, and if it fires first
+  the trimmer simply finds the unit already withheld. Both passes are withhold-only and
+  idempotent, so a double pass cannot double-write.
+- **Why the prune stays.** It is the eviction path for an operator who wants the compacting pass
+  to own it (`dropSupersededToolCalls` + `dropInvalidToolCallsOnceAnswered` off, or the whole
+  trimmer off), and compaction keeps the roles the trimmer can never take: the pressure trigger
+  (`contextLimit`/`modelLimits`), the `summarize` retention range, and the summary entry that
+  pass commits.
+- **Where it is written, in operator-facing prose.** `docs/plugins.md`, the "The two shipped
+  context passes — who owns what" section (the one T2/T3 rewrote): the paragraph that used to
+  end "instead of reasoning about the overlap" now states who writes, what `fingerprint` changes,
+  why the prune stays, and what no switch touches. The compaction fixtures still seed the trimmer
+  off — so each of those cases measures ONE plugin's numbers, not because the passes fight.
+- **F7 re-verified 2026-11-10 (after T3/T3b/T4/T5/T6): nothing restores.** The trimmer touches
+  exactly two mutation controls, both with the literal `false` —
+  `context.setIncluded(entry, false)` (`src/plugins/context-trimmer.plugin.ts:1403`) and
+  `context.setReasoningIncluded(entry, false)` (`:1417`) — plus `pause()`/`resume()` (`:1555`,
+  `:1560`), which move thread state, not context. No `setTranscript`, no `edit`, no
+  `replaceHistory`, no `api.threads.*` write anywhere in the plugin, and no call site in any
+  non-test source passes `true`: `grep -rn "setIncluded(\|setReasoningIncluded(" src
+  --include="*.ts" | grep -v "\.test\."` returns the two trimmer sites, two compaction sites
+  (`src/plugins/context-compaction.plugin.ts:801` exclude prune, `:1116` summarize finalize) and
+  comment text only, all four writes literal `false`. The new thinking flag cannot smuggle a
+  restore through a `replaceHistory` round-trip either: `reasoningIncluded` is on the snapshot
+  allowlist (`src/core/snapshot.ts:427`, read back at `:260-263`, literal `false` only) and the
+  branch copy's (`src/core/branch.ts:600`, `:467-474`), and `withIncluded` resolves it OUT of
+  projection copies (`src/core/agent.ts:196-219`). So the assumption at
+  `src/plugins/context-compaction.plugin.ts:196-228` still holds. One wording caveat, for whoever
+  next edits that header: its citation `~351` has drifted (the writer is at `~1403`) and the
+  sentence names only `setIncluded`, while T6 added a second withhold-only flag — the conclusion
+  is unchanged, the enumeration is not exhaustive any more.
+- *Check evidence:* `npx vitest run src/plugin/context-compaction.test.ts
+  src/server/persistence.test.ts` → **110 passed / 0 failed** (compaction 71, persistence 39),
+  no seeding, so both fixture-provider seams are still valid. The new
+  `context-compaction × context-trimmer overlap` describe in the first file is the "exactly one
+  pass" test: three cases — the premise that BOTH rules select the same unit at either matcher
+  (`planTrimmedUnits` vs `planContextPruning` over one fixture), the action-level write count
+  with both actions run in ONE round in both dispatch orders (exactly one
+  `setIncluded:1:false`, exactly one diagnostic, byte-exact for each owner), and a real-harness
+  round with both built-ins at their declared defaults (one withholding diagnostic owned by
+  `context-compaction`, no `context-trimmer` line, the unit flagged once, a pair-clean request,
+  four `agent_message` writes) against a trimmer-off control whose flags and pass line are
+  identical.
+
 **T10 — Measure, with the instrument the ask implies: steps and wall clock, not tokens.**
 Run the same task set through at least three configurations — all policies off (the engine
 posture), `dropOldThoughts: "turn"` (the proposed default), and `dropOldThoughts: "off"` — and
@@ -769,6 +859,50 @@ heading exists and states why.
    write that down rather than discover it.
 6. **Does compaction stop doing failure-retry pruning once `supersedeMatch: 'fingerprint'` makes
    the two rules identical** (T9)? Decide with the paragraph, not with a comment.
+
+### Decisions recorded (2026-11-10)
+
+The six answers, as taken. 1–5 landed with T3/T3b/T4/T5/T6; 6 is in Part G, T9.
+
+1. **Thought mechanism: the per-entry flag (Option A)**, shipped as
+   `HarnessMessage.reasoningIncluded` with a `setReasoningIncluded` control. Reversible, mirroring
+   `included`; Option B (`edit(entry, {reasoning: ''})`) was rejected as a destructive text edit —
+   the transcript would stop carrying thinking a reader had been shown, against "nothing is
+   deleted … can be switched back on".
+2. **The flag is resolved OUT of projection copies**, exactly like `included` — a projection copy
+   carries no flag key at all, and `turn.before`'s `currentMessages()` agrees with the transport
+   because both read the same projection (`src/core/agent.ts` `withIncluded` +
+   `withoutWithheldReasoning`, run by `harness.ts` `projectTranscript`). **The wire signal for the
+   transport echo is the ABSENCE of `reasoning` on a projected entry.** Canonical entries, seeds,
+   branch records and snapshots DO carry the flag (the two allowlists T-B5 warns about).
+3. **`dropOldThoughts: 'all'` stays available**, including against a replaying transport, with its
+   cost stated in the setting text (E4/E6: current-turn omission is where every measured failure
+   mode lands) rather than removed by a guard.
+4. **`empty` as an invalid outcome stays off by default — permanently**, until a real-corpus count
+   exists. A zero-hit `grep` is indistinguishable from a stub, and the false positive deletes the
+   one fact that proves the agent already looked.
+5. **A mid-session `PATCH` moves the cache divergence point: documented, not frozen.** Settings are
+   process-wide and live (`src/server/plugins.ts:8-15`) and no per-session settings surface exists
+   (Part "Out of scope"), so the answer is the sentence in the setting text and in
+   `docs/plugins.md`, not a per-conversation policy freeze.
+6. **Compaction's failure-retry pruning is kept.** `supersedeMatch: 'fingerprint'` makes the
+   trimmer's rule identical to compaction's (and `'name'`, the default, a strict superset), so
+   compaction's prune is redundant-but-harmless for that class and stays as the operator's lever
+   for making the compacting pass own eviction; compaction keeps its summarise/summary role. Full
+   reasoning, the F7 re-audit and the exactly-one-pass test are recorded under T9.
+
+Two more things this entry discovered while landing the phases, recorded so the next reader does
+not re-decide them:
+
+- **The transport echo emits `reasoning_content` ONLY.** T8's "and, where the model needs the
+  other spelling, `reasoning`" is **deferred to issue 0001's capability surface**: there is no
+  per-model dialect flag, and dual-emitting a second non-standard field is precisely the
+  unknown-field rejection the site's previous drop-everything posture guarded against
+  (`src/transport/openai.ts` ~318-331, `docs/issues/blocking-provider-request-body-extension.md`).
+- **T5 → T6 reassignment.** `minThoughtChars` enforcement, and the test proving a `minTokens > 0`
+  never suppresses a thoughts write, landed with **T6** rather than T5: the floor has nothing to
+  measure until the thinking axis exists, and T5's own gates run on the combined TOOL candidate
+  set.
 
 ## Deferred, recorded so nobody builds it by accident
 
@@ -881,4 +1015,107 @@ ratified reasoning for every guard), `src/core/context-pruning.ts` (unit mirror 
 rule + `PruneOptions`), `src/plugins/context-compaction.plugin.ts:196-228` (the two passes'
 interaction), `src/harness.ts:6548-6683` (the projection), `src/server/plugins.ts:1-60`
 (the settings plane), `src/shared/turn-display.ts:536-565` (the two inclusion axes).
+
+**Shipped 2026-11-10 (T2 + T3 + T3b):** the posture now holds in code and in the settings surface — the engine core trims nothing by default and `context-trimmer` is the one place trimming happens, driven by twelve declared switches (`enabled`, `dropSupersededToolCalls`, `dropInvalidToolCallsOnceAnswered`, `invalidOutcomes`, `dropOldThoughts`, `thoughtKeepUnits`, `supersedeMatch`, `dropDuplicateCalls`, `minTokens`, `minThoughtChars`, `safetyUnits`, `maxUnits`), each read per turn behind the existing guards, each defaulted to today's behaviour byte-for-byte, every `string` tier reporting the value it actually used, and `docs/plugins.md` now states that posture instead of the one-switch trimmer.
+
+---
+
+## Measurements (T10, 2026-11-10) — offline stub replay, no live model
+
+**Why the bench did not produce these numbers.** The instrument the ask points at
+(`packages/underload/bench`) **cannot express a `context-trimmer` configuration at all** — it
+never builds the harness, so there is no plugin and no settings surface to switch:
+
+| Check | Evidence (all under `packages/underload/bench/`) |
+|---|---|
+| No harness dependency — nothing in the bench can construct `harness()` or load a plugin | `package.json:16-21` (deps are `@presource/core`, `@presource/react`, react, react-dom); `grep -rn -i harness src` → one hit, a test comment (`src/dashboard/components/modules/RunBar.test.tsx:237`); `grep -rn "trimmer\|dropOldThoughts\|reasoningIncluded" src` → **no hits** |
+| A run is `(prompt, iterations, concurrency, endpoint, transport)` — there is no settings plane to carry twelve switches | `src/core/types.ts:127-139` (`BenchConfig`); `src/dashboard/framework/types.ts:64-75` (the spec: `iterations`/`concurrency`/`baseUrl`/`createProvider`) |
+| The engine measures ONE model call per iteration, not a context-managed conversation | `src/core/runner.ts:236-320` (`runBench` → `measureRun` → one `provider.generate`) |
+| Its message shape cannot carry the content classes the trimmer acts on — no `toolCalls`, no `tool` role, no `reasoning` on a message | `src/core/types.ts:52-55` (`BenchMessage` = `role: 'user' \| 'assistant' \| 'system'` + `content: string`) |
+| `growing-context` is not a trace replay: it generates fresh text each step and replays only assistant `content` | `src/dashboard/scenarios/growing-context.ts:331` (`streamConversation`), `:412` (`history.push({ role: 'assistant', content })`) |
+| `usage.cached` is not even a field the bench can hold | `src/core/types.ts:19-26` (`BenchUsage` = promptTokens / completionTokens / totalTokens) |
+| The offline knob it DOES have is the transport, not the context policy | `src/dashboard/plugins/model-bench.ts:38-42`, `:70` (`createProvider`; the offline stub is `src/dashboard/plugins/demo-transport.ts`); `src/core/provider.ts:238-243` (`fetchImpl`, the mocked-fetch pattern pinned at `src/core/provider.test.ts:44`) |
+
+Building what is missing — a `harness()`-backed `createProvider`, a per-run settings surface, and
+tool/reasoning in `BenchMessage` — is new bench infrastructure, which this task was told not to
+build. **The numbers below therefore come from the same mocked-provider pattern one level up, at
+the harness's existing seam:** `harness({ pluginSettings })` plus an injected scripted
+`HarnessStream`, driven from a disposable probe (git-ignored `Temp/`, `.gitignore:40`):
+
+```bash
+cd packages/underload/harness
+npx vitest run --config Temp/t10/vitest.config.ts     # Temp/t10/probe.test.ts → Temp/t10/out.json
+# → 1 test file passed / 1 test passed (the probe asserts only that each arm made 2 provider requests)
+```
+
+Fixture (one thread, one round): two **closed** turns carrying `reasoning` on every assistant
+entry, a failed `read` unit (920-char failure body) superseded by a later completed `read` of the
+same name, then an **open** turn the run creates that thinks, calls `grep`, and answers (two
+provider requests). `context-compaction` is seeded `enabled: false` in every arm so each row
+measures exactly ONE pass — the same fixture convention the suite uses
+(`src/plugin/context-compaction.test.ts:515-530`, `src/server/persistence.test.ts:2614`).
+
+> **Every row is an offline stub replay — no live model.** A scripted provider never reacts to
+> what it is sent, so **steps / tool calls to resolve and the thinking-shortening effect are NOT
+> measured here** (Part K). What a stub does measure, and what these columns are, is the
+> **harness's request composition** and the **pass diagnostics**.
+
+### 1. The brief's metric list, per configuration
+
+| Config (trimmer settings; compaction off) | Tool calls / model turns to resolve | Wall time | `usage.cached` ratio | Pass diagnostics |
+|---|---|---|---|---|
+| **A — all policies off** (`dropSupersededToolCalls: false`, `dropInvalidToolCallsOnceAnswered: false`, `dropOldThoughts: 'off'`) — the engine posture | 2 turns / 1 tool call — **scripted; identical by construction, so NOT an over-pruning signal** | 9.8 ms (stub latency only; this arm ran first and absorbs module warm-up) | **absent** — the stub reports `usage` with no `cached` figure, and `HarnessUsage.cached` is optional and never defaulted (`src/types/index.ts:374-379`) | **none** — 0 diagnostics, 0 transcript writes |
+| **B — declared defaults** (`{}`: `dropOldThoughts: 'turn'`, every other key its declared default) | 2 turns / 1 tool call — same, scripted | 3.7 ms (same caveat) | absent (same) | **1 pass line**: `context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4` `\|` `context-trimmer withheld 3 thinking entry(s): #3 msg-4 closed 43 chars via dropOldThoughts=turn; #5 msg-6 closed 26 chars via dropOldThoughts=turn; #7 msg-8 closed 27 chars via dropOldThoughts=turn` |
+| **C — defaults but `dropOldThoughts: 'off'`** | 2 turns / 1 tool call — same, scripted | 1.1 ms (same caveat) | absent (same) | **1 pass line**: `context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4` — no thinking line at all |
+
+**Reproducibility.** A second run reproduced every column of both tables **except wall time**,
+which is warm-up noise at stub latency (A 9.8 → 12.4 ms, B 3.7 → 3.0 ms, C 1.1 → 2.3 ms). The
+wall-clock column is recorded because the brief asks for it; under a scripted provider it carries
+no information about the policies — that is precisely the number Part K says needs a live model.
+
+### 2. What the stub does measure: request composition per configuration
+
+| Config | Provider requests | Messages sent (req 1 → req 2) | Content chars sent (req 1) | Thinking replayed (req 1 → req 2) | Entries carrying `reasoning` (req 1 → req 2) | Canonical writes | `agent_message` notifications |
+|---|---|---|---|---|---|---|---|
+| **A** | 2 | 9 → 11 | 994 | 144 → 184 chars | 4 → 5 | none | 5 |
+| **B** | 2 | **7** → 9 | **74** | **0** → **40** chars | **0** → **1** | `included: false` on msg-2 + msg-3 (the withheld unit); `reasoningIncluded: false` on msg-4, msg-6, msg-8 | 6 |
+| **C** | 2 | **7** → 9 | **74** | **96** → 136 chars | 3 → 4 | `included: false` on msg-2 + msg-3 | 6 |
+
+What the columns actually say (this part is a finding, not a fixture artefact):
+
+- **A vs C isolates the tool policy.** Both replay every closed turn's thinking; only C drops the
+  superseded unit — 9 → 7 messages and 994 → 74 content chars on request 1 (the 920-char failure
+  body plus its leader leave as a whole unit, pair-clean). **A writes nothing and reports
+  nothing**, which is acceptance criterion H1 observed end to end through a real round.
+- **C vs B isolates the thoughts policy.** Messages and tool text are identical; the only
+  difference is 96 chars of closed-turn thinking replayed under C and 0 under B, **and both keep
+  the open turn's thinking** — B's request 2 carries `reasoning` (40 chars) on the entry that
+  produced the pending `grep` call. That is H4's posture, read off the request rather than
+  asserted from a unit test.
+- **The wire half is a documented mapping, not a measured byte here.** The probe reads the
+  projected request (`HarnessStreamRequest.messages`); the transport then emits
+  `reasoning_content` iff such an entry carries non-empty `reasoning`
+  (`src/transport/openai.ts:349-351`), so the `reasoning` columns above are exactly one step
+  before the field the provider sees. No live round-trip observed (Part K).
+- **The write cost of a pass** shows up as 6 `agent_message` notifications under B/C vs 5 under
+  A — the single coalesced per-round write the pass adds (F4/B5's cost, one per pass that writes).
+
+### 3. Why the live numbers are still absent, and what a live run would need
+
+- **No live model was run at all.** The bench's shipped provider targets the LAN gateway
+  (`src/core/provider.ts:28-33`) and sends no `Authorization` header because credentials are
+  injected server-side (`:17-19`) — so an offline machine cannot reach a reasoning model, and the
+  harness has no gateway run recorded for these configurations either.
+- To measure what the brief actually asks, a live run needs: (a) a bench transport **backed by
+  `harness()`** so the trimmer settings are in the loop at all, (b) a per-run settings surface
+  mapped to the twelve keys, (c) `BenchUsage.cached` to carry the provider's cache figure
+  (`src/core/types.ts:19-26` has no such field), and (d) a **steps/turns counter taken from the
+  harness round**, not the bench's iteration count.
+- With that in place the measurements to record are the brief's, in this order: **tool calls /
+  model turns to resolve** (the over-pruning detector, E4's AgentDiet `Step`), **wall clock**,
+  `usage.cached` ratio (the cache-divergence claim in E3), and the one the ask points at —
+  **whether the model's *next* thinking gets shorter when previous turns' thinking is withheld**
+  (`BenchGeneration.reasoning`, `src/core/types.ts:30-46`, is exactly the field that would carry
+  it). None of those four was observable from a scripted provider, so none is claimed above.
+
 

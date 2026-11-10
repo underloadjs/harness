@@ -407,9 +407,13 @@ describe('one bar per turn', () => {
         // right-aligned under the track, and the phrase that used to lead it is only the
         // accessible name. The unit still has to be spelled out, so a reader can never
         // mistake this strip for a context-window gauge.
+        // The TRAILING clause names the thinking POLICY rather than an absolute (uplift F8/H5):
+        // all 200 un-in-prompt characters here belong to the `reasoning` block, and the bar
+        // re-words that one count because `dropOldThoughts` decides it per ENTRY while the
+        // projector marks the whole class — ./context-bar.ts `contextBarAccessibleNameOf`.
         expect(bar.getAttribute('aria-label')).toBe(
             'context bar: width is time taken, height is recorded characters · 5 segments · 1,574 characters' +
-                ' · 2.4s of recorded time · 2 segments have no recorded time · 200 characters not replayed into the prompt'
+                ' · 2.4s of recorded time · 2 segments have no recorded time · 200 characters\' replay decided by the thinking policy'
         );
         expect(bar.querySelector('.context-bar-caption')?.textContent).toBe('5 segments');
         // T22 (R24): count only on the printed line. The label phrase that used to head it,

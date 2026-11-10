@@ -148,6 +148,13 @@ const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve
 // the dialog must not conflate any two of them.
 const switchedDetail = (included: boolean): TurnBlockDetail => ({ ...toolDetail(), included });
 
+// Uplift T7 (F8): the same three verdicts on a THINKING window, where the field addresses the
+// entry's `reasoningIncluded` flag rather than an exclusion unit (../server/api.ts
+// `getSessionTurnBlock` joins it through the recorded thinking text). Three answers, and the
+// absent one is the case F8 changed: the bar's model carries no verdict, so the chip may not
+// claim the thinking is out of the prompt.
+const thinkSwitchedDetail = (included: boolean): TurnBlockDetail => ({ ...thinkDetail(), included });
+
 // ---------------------------------------------------------------------------
 // The dialog surface
 // ---------------------------------------------------------------------------
@@ -447,11 +454,25 @@ describe('the metadata line', () => {
         ]);
     });
 
-    it('marks thinking as bytes the prompt never carried', () => {
+    // Uplift T7 (F8): the static `inPrompt: false` the projector stamps on a thinking window is
+    // the FALLBACK verdict for a server that cannot name the transcript entry behind it, not a
+    // claim about the segment class. Whether a window's thinking rides in the requests that
+    // follow is decided per entry by the trimmer's thinking policy (T6's `reasoningIncluded`
+    // flag; `turn` withholds a closed turn's thinking and keeps the open one, `all` withholds
+    // every thought, `off` sends all of them). So when no verdict was published, the chip states
+    // WHERE the decision lives — no absolute, because an absolute about thinking is what this
+    // fix removed (../shared/turn-display.ts documents the same rule on the field).
+    it('states where a thinking window is decided when the server published no verdict', () => {
         const factsOfThink = blockDetailFactsOf(thinkDetail());
 
-        expect(factsOfThink).toContainEqual({ fact: 'prompt', text: 'not replayed into the prompt' });
+        expect(factsOfThink).toContainEqual({ fact: 'prompt', text: 'replay decided by the thinking policy' });
         expect(factsOfThink).toContainEqual({ fact: 'events', text: 'events 7-9' });
+        // Every OTHER kind still answers with the projector's recorded claim, unchanged: this is
+        // a thinking-window fix, not a rewording of the whole facts line.
+        expect(blockDetailFactsOf(meta({ inPrompt: false }))).toContainEqual({ fact: 'prompt', text: 'not replayed into the prompt' });
+        expect(blockDetailFactsOf(promptDetail())).toContainEqual({ fact: 'prompt', text: 'in the prompt' });
+        expect(blockDetailFactsOf(systemDetail())).toContainEqual({ fact: 'prompt', text: 'in the prompt' });
+        expect(blockDetailFactsOf(answerDetail())).toContainEqual({ fact: 'prompt', text: 'in the prompt' });
     });
 });
 
@@ -503,6 +524,57 @@ describe('the inclusion switch', () => {
         // The model rule the DOM follows, stated once: addressable exactly when the server named
         // the transcript entry behind the segment.
         expect([meta(), meta({ included: true }), meta({ included: false })].map(blockInclusionIsSwitchable)).toEqual([
+            false,
+            true,
+            true
+        ]);
+    });
+
+    // Uplift T7 (F8): the same control on a THINKING window, where `included` is that entry's
+    // thinking axis. A published verdict means the server named the ONE entry whose `reasoning`
+    // is exactly this window's recorded bytes, so the switch has something to switch; the static
+    // `inPrompt: false` these windows carry does not, and silence now says "the thinking policy
+    // decides" instead of restating that fallback.
+    it('switches a thinking window through its thinking, and says who decides when it cannot', () => {
+        // VERDICT `true`: the thinking rides in the requests that follow. The chip reads exactly
+        // like the tool chip in that state — one switch, one pair of wordings — which is the
+        // point of routing both axes through the same field.
+        const on = openBlockDetail({ block: thinkSwitchedDetail(true), turnId: 't1', sessionId: 's1' });
+
+        expect(inclusionChip()?.tagName).toBe('BUTTON');
+        expect(inclusionChip()?.getAttribute('aria-pressed')).toBe('true');
+        expect(chipText()).toBe('in the prompt');
+        expect(inclusionChip()?.dataset.tone).toBe('ok');
+        expect(inclusionChip()?.querySelector('.block-detail-fact-glyph')?.textContent).toBe('✓');
+        on.close();
+
+        // VERDICT `false`: this thinking is withheld from the requests that follow while the
+        // entry itself keeps travelling (../types reasoningIncluded).
+        const off = openBlockDetail({ block: thinkSwitchedDetail(false), turnId: 't1', sessionId: 's1' });
+
+        expect(inclusionChip()?.tagName).toBe('BUTTON');
+        expect(inclusionChip()?.getAttribute('aria-pressed')).toBe('false');
+        expect(chipText()).toBe('excluded from context');
+        expect(inclusionChip()?.dataset.tone).toBe('danger');
+        expect(inclusionChip()?.querySelector('.block-detail-fact-glyph')?.textContent).toBe('✕');
+        off.close();
+
+        // NO VERDICT: plain span, no tone, no glyph — and the WORDING is about the policy, not
+        // about the prompt. The assertion that pins F8 itself is that no absolute survives here:
+        // a closed window is out under `turn`, in under `off`, and the chip cannot tell which.
+        openBlockDetail({ block: thinkDetail(), turnId: 't1', sessionId: 's1' });
+
+        expect(inclusionChip()?.tagName).toBe('SPAN');
+        expect(inclusionChip()?.hasAttribute('aria-pressed')).toBe(false);
+        expect(chipText()).toBe('replay decided by the thinking policy');
+        expect(inclusionChip()?.dataset.tone).toBeUndefined();
+        expect(inclusionChip()?.querySelector('.block-detail-fact-glyph')).toBeNull();
+        expect(chipText() ?? '').not.toMatch(/never|always|not replayed/i);
+
+        // Addressability follows the published verdict alone — a thinking window is a control
+        // exactly when the server named its entry, and the static `inPrompt: false` never makes
+        // one on its own.
+        expect([thinkDetail(), thinkSwitchedDetail(true), thinkSwitchedDetail(false)].map(blockInclusionIsSwitchable)).toEqual([
             false,
             true,
             true
@@ -705,6 +777,22 @@ describe('the inclusion switch', () => {
 
         expect([absent.split(':').pop(), on.split(':').pop(), off.split(':').pop()]).toEqual(['', 'included', 'excluded']);
         expect(new Set([absent, on, off]).size).toBe(3);
+
+        // T7: the same rule has to hold for a THINKING window, because that is the segment whose
+        // published verdict arrived after this cache was written. Nothing changed in the field
+        // list — the thinking axis rides on the SAME `included` figure the tool axis uses — so
+        // invalidation is automatic; this pins it, because a withheld thought served from a
+        // riding thought's entry would put the old chip text back on screen after a click.
+        const [thinkAbsent, thinkOn, thinkOff] = [thinkDetail(), thinkSwitchedDetail(true), thinkSwitchedDetail(false)].map(
+            blockDetailFingerprintOf
+        );
+
+        expect([thinkAbsent.split(':').pop(), thinkOn.split(':').pop(), thinkOff.split(':').pop()]).toEqual([
+            '',
+            'included',
+            'excluded'
+        ]);
+        expect(new Set([thinkAbsent, thinkOn, thinkOff]).size).toBe(3);
     });
 });
 
